@@ -19,6 +19,12 @@
 //! rounded one, as the reference does. A launch may also record each program's largest normalized
 //! magnitude, an FP32 vector the caller reduces (specs/worker.md 9, the residual and normalization
 //! rows of the MiniMax-H3 table).
+//!
+//! The residual and the rows a projection reads may be two element types: the video VAE's decoder
+//! holds its stream in FP32 while its projections read and write FP16, which is what the reference's
+//! autocast does to these same kernels. Each descriptor's `dtype` is the residual's and the learned
+//! vectors', and `activation` is the type of the update and of the normalized rows; a key names it
+//! only when the two differ, so every single-type key is the key it always was.
 
 use std::fmt;
 
@@ -38,7 +44,7 @@ pub const RESIDUAL_BLOCK: u32 = 1024;
 /// One compilation of `weighted_rms_norm`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct WeightedRmsNormDescriptor {
-    /// Element type of the rows, the weight and the output.
+    /// Element type of the rows and the weight.
     pub dtype: DType,
     /// Elements per row.
     pub columns: u32,
@@ -46,16 +52,27 @@ pub struct WeightedRmsNormDescriptor {
     pub tile: u32,
     /// Whether each program records its largest normalized magnitude.
     pub absmax: bool,
+    /// Element type of the output, when it is narrower than the rows.
+    pub activation: DType,
 }
 
 impl fmt::Display for WeightedRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", self.dtype)
             .field("columns", self.columns)
             .field("tile", self.tile)
-            .field("absmax", self.absmax)
-            .finish(formatter)
+            .field("absmax", self.absmax);
+        activation_of(key, self.dtype, self.activation).finish(formatter)
+    }
+}
+
+/// A key's `activation` field: named only where it differs from the residual's type.
+fn activation_of(key: Key, dtype: DType, activation: DType) -> Key {
+    if activation == dtype {
+        key
+    } else {
+        key.field("activation", activation)
     }
 }
 
@@ -101,7 +118,7 @@ impl Op for WeightedRmsNorm {
             .require_row(Self::NAME, descriptor.dtype, columns)?;
         args.out.require_shape(Self::NAME, args.x.shape)?;
         args.out
-            .require_row(Self::NAME, descriptor.dtype, columns)?;
+            .require_row(Self::NAME, descriptor.activation, columns)?;
 
         let partials = matches(
             &args.partials,
@@ -131,14 +148,18 @@ impl Op for WeightedRmsNorm {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The mean square reduces the row in FP32; the normalized value rounds once into the output
         // type.
-        Tolerance::rounding(u64::from(descriptor.columns), DType::F32, descriptor.dtype)
+        Tolerance::rounding(
+            u64::from(descriptor.columns),
+            DType::F32,
+            descriptor.activation,
+        )
     }
 }
 
 /// One compilation of `scaled_residual_rms_norm`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ScaledResidualRmsNormDescriptor {
-    /// Element type of the residual, the update, the scale, the weight and both outputs.
+    /// Element type of the residual, the scale and the weight.
     pub dtype: DType,
     /// Elements per row.
     pub columns: u32,
@@ -148,17 +169,19 @@ pub struct ScaledResidualRmsNormDescriptor {
     pub update_bias: bool,
     /// Whether each program records its largest normalized magnitude.
     pub absmax: bool,
+    /// Element type of the update and of the normalized rows.
+    pub activation: DType,
 }
 
 impl fmt::Display for ScaledResidualRmsNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", self.dtype)
             .field("columns", self.columns)
             .field("tile", self.tile)
             .field("update_bias", self.update_bias)
-            .field("absmax", self.absmax)
-            .finish(formatter)
+            .field("absmax", self.absmax);
+        activation_of(key, self.dtype, self.activation).finish(formatter)
     }
 }
 
@@ -200,9 +223,12 @@ impl Op for ScaledResidualRmsNorm {
     ) -> Result<()> {
         check_descriptor(Self::NAME, descriptor.columns, descriptor.tile)?;
         let columns = u64::from(descriptor.columns);
-        for (name, view) in [("residual", &args.hidden), ("update", &args.update)] {
+        for (name, view, dtype) in [
+            ("residual", &args.hidden, descriptor.dtype),
+            ("update", &args.update, descriptor.activation),
+        ] {
             view.require_rank(Self::NAME, 2)?;
-            view.require_row(Self::NAME, descriptor.dtype, columns)?;
+            view.require_row(Self::NAME, dtype, columns)?;
             if view.shape.dim(0) != args.hidden.shape.dim(0) {
                 return Err(Error::argument(
                     Self::NAME,
@@ -238,7 +264,7 @@ impl Op for ScaledResidualRmsNorm {
             .require_row(Self::NAME, descriptor.dtype, columns)?;
         args.out.require_shape(Self::NAME, args.hidden.shape)?;
         args.out
-            .require_row(Self::NAME, descriptor.dtype, columns)?;
+            .require_row(Self::NAME, descriptor.activation, columns)?;
         let partials = matches(
             &args.partials,
             descriptor.absmax,
@@ -274,11 +300,14 @@ impl Op for ScaledResidualRmsNorm {
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // The gated update rounds twice into the residual, and the mean square reduces the row in
         // FP32 before the normalized value rounds once into the output type.
-        let statistics =
-            Tolerance::rounding(u64::from(descriptor.columns), DType::F32, descriptor.dtype);
+        let statistics = Tolerance::rounding(
+            u64::from(descriptor.columns),
+            DType::F32,
+            descriptor.activation,
+        );
         Tolerance::new(
             statistics.atol,
-            statistics.rtol + 3.0 * descriptor.dtype.unit_roundoff() as f32,
+            statistics.rtol + 3.0 * descriptor.activation.unit_roundoff() as f32,
         )
     }
 }
@@ -286,7 +315,7 @@ impl Op for ScaledResidualRmsNorm {
 /// One compilation of `scaled_residual_layer_norm`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct ScaledResidualLayerNormDescriptor {
-    /// Element type of the residual, the update, the scale, the affine parameters and the output.
+    /// Element type of the residual, the scale and the affine parameters.
     pub dtype: DType,
     /// Elements per row.
     pub columns: u32,
@@ -296,17 +325,19 @@ pub struct ScaledResidualLayerNormDescriptor {
     pub update_bias: bool,
     /// Whether each program records its largest normalized magnitude.
     pub absmax: bool,
+    /// Element type of the update and of the normalized rows.
+    pub activation: DType,
 }
 
 impl fmt::Display for ScaledResidualLayerNormDescriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
+        let key = Key::new()
             .field("dtype", self.dtype)
             .field("columns", self.columns)
             .field("tile", self.tile)
             .field("update_bias", self.update_bias)
-            .field("absmax", self.absmax)
-            .finish(formatter)
+            .field("absmax", self.absmax);
+        activation_of(key, self.dtype, self.activation).finish(formatter)
     }
 }
 
@@ -350,9 +381,12 @@ impl Op for ScaledResidualLayerNorm {
     ) -> Result<()> {
         check_descriptor(Self::NAME, descriptor.columns, descriptor.tile)?;
         let columns = u64::from(descriptor.columns);
-        for (name, view) in [("residual", &args.hidden), ("update", &args.update)] {
+        for (name, view, dtype) in [
+            ("residual", &args.hidden, descriptor.dtype),
+            ("update", &args.update, descriptor.activation),
+        ] {
             view.require_rank(Self::NAME, 2)?;
-            view.require_row(Self::NAME, descriptor.dtype, columns)?;
+            view.require_row(Self::NAME, dtype, columns)?;
             if view.shape.dim(0) != args.hidden.shape.dim(0) {
                 return Err(Error::argument(
                     Self::NAME,
@@ -388,7 +422,7 @@ impl Op for ScaledResidualLayerNorm {
         }
         args.out.require_shape(Self::NAME, args.hidden.shape)?;
         args.out
-            .require_row(Self::NAME, descriptor.dtype, columns)?;
+            .require_row(Self::NAME, descriptor.activation, columns)?;
         let partials = matches(
             &args.partials,
             descriptor.absmax,

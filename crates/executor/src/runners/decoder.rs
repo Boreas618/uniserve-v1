@@ -64,7 +64,7 @@ fn block_rows<M: nn::capability::Decoder + ?Sized>(model: &M, layout: &Layout) -
 /// A decoder's buckets differ by canvas, and its columns are sized by the largest of them: the clip
 /// the bucket was captured for reads exactly its own prefix, the way an encoder's columns are read.
 struct DecoderColumns {
-    /// `[voxels, channels]` the clip's latents, in the decoder's own element type.
+    /// `[voxels, channels]` the clip's latents, in the type the decoder reads them in.
     latents: Column,
     /// The clip's raster, `[channels, frames, rows, columns]`, in the decoder's own element type.
     raster: Column,
@@ -75,12 +75,18 @@ impl DecoderColumns {
     /// `(layout, name)` and `fill` puts the model's bytes in the cache the graph addresses
     /// (`walk` reads `self.tables.views`), so a host column per table would be a second copy that
     /// nothing reads — and the second copy is what let a staged buffer land in a table's place.
-    fn new(device: DeviceId, layout: &Layout, dtype: DType, rows: u64) -> Result<Self> {
+    fn new(
+        device: DeviceId,
+        layout: &Layout,
+        latent: DType,
+        dtype: DType,
+        rows: u64,
+    ) -> Result<Self> {
         let video = layout.video;
         let elements = rows
             .checked_mul(u64::from(video.channels))
             .ok_or_else(|| Error::Invalid("a clip's latent extent overflows".into()))?;
-        let latents = Column::new(device, dtype, elements)?;
+        let latents = Column::new(device, latent, elements)?;
         Ok(Self {
             latents,
             // Sized by `size_raster` when a bucket is first staged: the raster's frame count is the
@@ -123,8 +129,10 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// at bind: a bucket the model refuses is a plan that names a canvas its decoder does not serve,
     /// and the refusal belongs at load rather than at a capture.
     layouts: std::collections::BTreeMap<Bucket, Layout>,
-    /// The element type the latents and the raster are stated in, as the model declares it.
+    /// The element type the raster is stated in, as the model declares it.
     dtype: DType,
+    /// The element type the model reads its latents in.
+    latent: DType,
     columns: DecoderColumns,
     /// The bucket the columns are staged for, so a capture of a canvas knows how far they run.
     /// The calls of the batch staged last, which its replay answers.
@@ -250,8 +258,9 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             )
         })?;
         let dtype = model.element_type();
+        let latent = model.latent_type();
         let rows = block_rows(model.as_ref(), layout)?;
-        let columns = DecoderColumns::new(binding.device, layout, dtype, rows)?;
+        let columns = DecoderColumns::new(binding.device, layout, latent, dtype, rows)?;
         let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
         Ok(Self {
             id: binding.id,
@@ -266,6 +275,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             tables: Tables::new(),
             layouts,
             dtype,
+            latent,
             columns,
             calls: Vec::new(),
             staged: None,
@@ -663,7 +673,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let bytes = unsafe { crossing.as_slice() };
         let converted = nn::weights::convert(
             published.dtype,
-            self.dtype,
+            self.latent,
             bytes,
             "the denoiser's trajectory",
         )
@@ -688,9 +698,9 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         .map_err(|_| Error::Invalid("a clip's latent extent overflows".into()))?;
         let channels = video.channels as usize;
         let element = usize::try_from(
-            self.dtype
+            self.latent
                 .bytes()
-                .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", self.dtype)))?,
+                .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", self.latent)))?,
         )
         .map_err(|_| Error::Invalid("an element wider than memory".into()))?;
         let plane = video.height as usize * video.width as usize;
@@ -770,7 +780,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let rows = block_rows(self.model.as_ref(), layout)?;
         Ok(TensorView::new(
             self.columns.latents.device.ptr,
-            self.dtype,
+            self.latent,
             Shape::new(&[rows, u64::from(video.channels)]),
         ))
     }

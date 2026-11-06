@@ -405,10 +405,9 @@ impl Deployment {
         )?);
         programs.extend(crate::video_vae::VideoDecoder::programs(
             &self.config.video_vae,
-            self.types.video,
         )?);
         programs.extend(crate::output::VideoPostprocessor::programs(
-            self.types.video,
+            crate::video_vae::ACTIVATION,
             rasters,
         ));
         programs.extend(crate::encoding::VideoEncoder::programs(

@@ -611,7 +611,7 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
             canvas.height / ratio,
             canvas.width / ratio,
         );
-        let plan = minimax_h3::decoding::video_arena(&config.video_vae, &latent, decode)?;
+        let plan = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?;
         distinct_names(
             &format!("the decode plan at {}x{}", canvas.width, canvas.height),
             &plan,
@@ -675,11 +675,11 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
             frames: 1,
             ..latent
         };
-        let clip: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent, decode)?
+        let clip: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &latent)?
             .iter()
             .map(|buffer| buffer.bytes())
             .sum();
-        let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &still, decode)?
+        let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &still)?
             .iter()
             .map(|buffer| buffer.bytes())
             .sum();
@@ -814,7 +814,7 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
         }
     }
     let tile = minimax_h3::video_vae::Canvas::clip(&config.video_vae, 16, 16);
-    let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile, decode)?
+    let one: u64 = minimax_h3::decoding::video_arena(&config.video_vae, &tile)?
         .iter()
         .map(|buffer| buffer.bytes())
         .sum();

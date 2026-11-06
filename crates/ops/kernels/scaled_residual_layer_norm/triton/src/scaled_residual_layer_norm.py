@@ -16,7 +16,7 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit(do_not_specialize=["eps", "scale_width"])
 def _scaled_residual_layer_norm_kernel(
     hidden_ptr,
     update_ptr,
@@ -26,6 +26,7 @@ def _scaled_residual_layer_norm_kernel(
     bias_ptr,
     output_ptr,
     eps,
+    scale_width,
     HAS_UPDATE_BIAS: tl.constexpr,  # noqa: N803
     WIDTH: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
@@ -46,7 +47,9 @@ def _scaled_residual_layer_norm_kernel(
             update_bias_ptr + columns, mask=columns < WIDTH, other=0.0
         ).to(tl.float32)
     scale = tl.load(
-        scale_ptr + columns, mask=columns < WIDTH, other=0.0
+        scale_ptr + tl.where(scale_width == 1, 0, columns),
+        mask=columns < WIDTH,
+        other=0.0,
     ).to(tl.float32)
 
     residual = hidden + update * scale
@@ -68,7 +71,7 @@ def _scaled_residual_layer_norm_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["eps"])
+@triton.jit(do_not_specialize=["eps", "scale_width"])
 def _scaled_residual_layer_norm_absmax_kernel(
     hidden_ptr,
     update_ptr,
@@ -79,6 +82,7 @@ def _scaled_residual_layer_norm_absmax_kernel(
     output_ptr,
     partials_ptr,
     eps,
+    scale_width,
     HAS_UPDATE_BIAS: tl.constexpr,  # noqa: N803
     WIDTH: tl.constexpr,  # noqa: N803
     BLOCK: tl.constexpr,  # noqa: N803
@@ -99,7 +103,9 @@ def _scaled_residual_layer_norm_absmax_kernel(
             update_bias_ptr + columns, mask=columns < WIDTH, other=0.0
         ).to(tl.float32)
     scale = tl.load(
-        scale_ptr + columns, mask=columns < WIDTH, other=0.0
+        scale_ptr + tl.where(scale_width == 1, 0, columns),
+        mask=columns < WIDTH,
+        other=0.0,
     ).to(tl.float32)
 
     residual = hidden + update * scale

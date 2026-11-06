@@ -63,10 +63,8 @@ use nn::capability::{
 use nn::{PhaseKind, TensorView};
 
 use nn::forward::Arena;
-use nn::layers::{Linear, WeightOrder};
 use nn::tensor::DevicePtr;
 use nn::weights::WeightLoader;
-use nn::weights::WeightRequest;
 use nn::{DType, Forward, Shape};
 
 /// What the recorder takes, printed for `--help`.
@@ -743,70 +741,22 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         .copied()
         .ok_or("a clip with no tiles to decode")?
         .canvas;
-    let model_width = config.decoder_num_attention_heads * config.decoder_attention_head_dim;
 
-    let projection = loader
-        .load(&WeightRequest::region(
-            "virtual.proj_in.weight",
-            0,
-            Shape::new(&[u64::from(model_width), u64::from(config.latent_channels)]),
-        ))
-        .map_err(|error| error.to_string())?;
-    // The checkpoint's first affine carries a bias (`decoder.proj_in.bias`), which the loader reads
-    // beside the weight; a harness without it records the no-epilogue gemm the model never launches.
-    let bias = loader
-        .load(&WeightRequest::region(
-            "virtual.proj_in.bias",
-            0,
-            Shape::new(&[u64::from(model_width)]),
-        ))
-        .map_err(|error| error.to_string())?;
-    let input =
-        Linear::new(projection, Some(bias), WeightOrder::NxK).map_err(|error| error.to_string())?;
     let spatial = config.spatial_compression();
     let raster = (clip_canvas.width * spatial, clip_canvas.height * spatial);
-    let decoder = VideoDecoder::load(&config, &[raster], DType::F32, input, &mut loader)
-        .map_err(|error| error.to_string())?;
+    let decoder =
+        VideoDecoder::load(&config, &[raster], &mut loader).map_err(|error| error.to_string())?;
 
     let arena = Arena::new(DevicePtr::new(0), 1 << 40);
     let forward = Forward::recording(&arena);
-    let scratch = decoder
-        .scratch(&forward, &clip_canvas)
-        .map_err(|error| error.to_string())?;
-    let latents = arena
-        .tensor(
-            DType::F32,
-            Shape::new(&[canvas.voxels(), u64::from(config.latent_channels)]),
-        )
-        .map_err(|error| error.to_string())?;
-    // The layout declares `video_positions` as FP32 (`video_vae::table_specs`), so the decode step
-    // reads the table at that type; a harness that hands it i32 records a rotation nothing launches.
-    let positions = arena
-        .tensor(DType::F32, Shape::new(&[3, canvas.rows()]))
-        .map_err(|error| error.to_string())?;
-    // The decoder writes one row per token, and a row is the pixels and frames its final projection
-    // produces: three channels over the temporal and both spatial upsamples, not the model's width.
-    let out_channels = u64::from(config.out_channels)
-        * u64::from(config.temporal_compression())
-        * u64::from(config.spatial_compression())
-        * u64::from(config.spatial_compression());
-    let out = arena
-        .tensor(DType::F32, Shape::new(&[canvas.rows(), out_channels]))
-        .map_err(|error| error.to_string())?;
-
-    let mut recorded = Recorded::default();
-    ops::capture::set_sink(Some(&mut recorded));
-    let run = decoder.decode(&forward, &clip_canvas, latents, positions, out, &scratch);
-    ops::capture::set_sink(None);
-    run.map_err(|error| error.to_string())?;
-
     // **The stitch, over the clip's whole grid.** A one-tile decode launches no seam blend, so a
     // harness that stops at `decode` records none of the `cross_fade` rows the walk states - and the
     // blends are what the decoder cannot skip: every offered canvas is multi-column and multi-row.
-    // `decode_clip` decodes each tile again through the same decoder and writes it into the clip's
-    // raster, blending it with the tiles above and to its left in `Tile` order.
-    let stitches = minimax_h3::decoding::ClipDecoder::new(&config, DType::F32)
-        .map_err(|error| error.to_string())?;
+    // `decode_clip` decodes every tile through the decoder and writes each into the clip's raster,
+    // blending it with the tiles above and to its left in `Tile` order.
+    let mut recorded = Recorded::default();
+    let stitches =
+        minimax_h3::decoding::ClipDecoder::new(&config).map_err(|error| error.to_string())?;
     let grid = tiles.tiles(&config, &clip_canvas);
     let clip_voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
     let clip_latents = arena
@@ -821,7 +771,7 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
     // The clip's raster in pixels: three channels over the clip's frames and the request's raster.
     let clip_out = arena
         .tensor(
-            DType::F32,
+            minimax_h3::video_vae::ACTIVATION,
             Shape::new(&[
                 u64::from(minimax_h3::output::Rgb::CHANNELS),
                 // The raster's frame axis is in **pixels**: each latent frame decodes to the VAE's
@@ -833,6 +783,15 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
             ]),
         )
         .map_err(|error| error.to_string())?;
+    let clip_stitch_table = arena
+        .tensor(
+            DType::I32,
+            Shape::new(&[
+                u64::from(height) + u64::from(width),
+                ops::tile_stitch::TABLE_WIDTH,
+            ]),
+        )
+        .map_err(|error| error.to_string())?;
     ops::capture::set_sink(Some(&mut recorded));
     let stitched = stitches.decode_clip(
         &forward,
@@ -840,6 +799,7 @@ fn video_decoder(request: &Request) -> Result<Vec<(String, String)>, String> {
         &grid,
         clip_latents,
         clip_positions,
+        clip_stitch_table,
         clip_out,
     );
     ops::capture::set_sink(None);

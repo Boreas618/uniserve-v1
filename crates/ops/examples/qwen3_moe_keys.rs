@@ -323,6 +323,8 @@ fn main() {
     lines.push((
         "qk_norm_rope".to_owned(),
         key(&QkNormRopeDescriptor {
+            factors: ops::tensor::DType::F32,
+            strided: false,
             dtype,
             output: dtype,
             head_dim: HEAD_DIM,

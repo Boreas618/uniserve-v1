@@ -47,6 +47,7 @@ mod rows;
 mod sampler;
 mod segment;
 mod segments;
+mod tile_stitch;
 mod transpose;
 mod unpatchify;
 
@@ -88,6 +89,7 @@ pub use rows::Rows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use segment::{SegmentAttention, SegmentTables};
 pub use segments::VsaTiles;
+pub use tile_stitch::{TileGrid, TileStitch};
 pub use transpose::Transpose;
 pub use unpatchify::UnpatchifyVideo;
 

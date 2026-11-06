@@ -348,6 +348,55 @@ impl Attention {
         max_kv_len: u32,
         out: TensorView,
     ) -> Result<()> {
+        self.dense_launch(
+            f,
+            (query, key, value),
+            (cu_seq_lens_q, cu_seq_lens_k),
+            max_kv_len,
+            None,
+            out,
+        )
+    }
+
+    /// One launch over `offsets`' packed sequences, none longer than `longest` rows.
+    ///
+    /// The offsets serve both sides, because each sequence attends itself. A caller that wrote the
+    /// offsets knows the longest row, and the module sizes its schedule by it: left to the packed token
+    /// count, a launch of many equal sequences asks for that many times the programs it needs.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the call's operands, its offsets and its two bounds are the design's argument list"
+    )]
+    pub fn attend_packed(
+        &self,
+        f: &Forward,
+        query: TensorView,
+        key: TensorView,
+        value: TensorView,
+        offsets: TensorView,
+        max_kv_len: u32,
+        longest: u32,
+        out: TensorView,
+    ) -> Result<()> {
+        self.dense_launch(
+            f,
+            (query, key, value),
+            (Some(offsets), Some(offsets)),
+            max_kv_len,
+            Some(u64::from(longest)),
+            out,
+        )
+    }
+
+    fn dense_launch(
+        &self,
+        f: &Forward,
+        (query, key, value): (TensorView, TensorView, TensorView),
+        (cu_seq_lens_q, cu_seq_lens_k): (Option<TensorView>, Option<TensorView>),
+        max_kv_len: u32,
+        longest: Option<u64>,
+        out: TensorView,
+    ) -> Result<()> {
         if !matches!(
             self.backend,
             AttentionBackend::Dense | AttentionBackend::Fp32
@@ -390,6 +439,7 @@ impl Attention {
             scale: self.scale,
             window_left: self.window.map_or(-1, |window| window as i32),
             causal: self.causal,
+            longest,
         };
 
         f.operate::<DenseAttention>(&descriptor, args)

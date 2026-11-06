@@ -63,10 +63,32 @@ def parse_key(key, dimensions):
             )
         fields[name] = value
         remaining = rest[len(value) :].removeprefix("_")
-    missing = sorted(set(dimensions) - set(fields))
-    if missing:
-        raise SystemExit(f"{key}: the descriptor names no {missing}")
+    # A descriptor may leave a declared dimension out of its key: an operator
+    # prints a field only for the variant that has it (a narrowed rotation names
+    # its width, an unweighted normalization its flag), so the package's spec
+    # answers for what is missing.
     return fields
+
+
+def fields_of(key, manifest):
+    """The descriptor's fields, against whichever of the package's shapes fits.
+
+    A package may declare one table of dimensions or several, one per key shape:
+    an operator prints some fields only for the variant that has them (a narrowed
+    rotation names its width, a sectioned one its axes), so a key is read against
+    each shape in turn and the first that covers it answers.
+    """
+    described = manifest["kernel"]["descriptors"]
+    shapes = described if isinstance(described, list) else [described]
+    for shape in shapes:
+        if not shape.get("dimensions"):
+            continue
+        try:
+            return parse_key(key, shape["dimensions"])
+        except SystemExit:
+            continue
+    named = [sorted(shape.get("dimensions", {})) for shape in shapes]
+    raise SystemExit(f"{key}: no declared shape covers it (shapes: {named})")
 
 
 def compile_one(package, target, key, out, spec):
@@ -78,13 +100,20 @@ def compile_one(package, target, key, out, spec):
     compilation options.
     """
     manifest = tomllib.loads((package / "package.toml").read_text())
-    fields = parse_key(key, manifest["kernel"]["descriptors"]["dimensions"])
+    fields = fields_of(key, manifest)
     described = spec(fields, manifest.get("parameters", {}), target)
     compiled = triton.compile(
         ASTSource(
             described["kernel"],
             described["signature"],
             described["constexprs"],
+            # The arguments a package states are multiples of sixteen, which is what lets the compiler
+            # load and store whole vectors. A module is compiled ahead of its launches, so nothing
+            # observes a pointer here: the statement is the package's, about its operator's views.
+            {
+                (list(described["signature"]).index(name),): [["tt.divisibility", 16]]
+                for name in described.get("aligned", ())
+            },
         ),
         target=GPUTarget("cuda", capability(target), WARP_SIZE),
         options=described["options"],

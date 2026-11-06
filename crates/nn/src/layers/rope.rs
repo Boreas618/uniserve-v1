@@ -16,6 +16,9 @@ use ops::rope::{
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::launch::{PDL, QK_NORM_TOKENS, ROTARY_BLOCK};
+
+/// The tokens one program of the strided form normalizes, per head.
+const STRIDED_TOKENS: u32 = 8;
 use crate::weights::Weight;
 
 /// The position axes of a sectioned rotation: M-RoPE's cut of the head into one section per axis.
@@ -220,6 +223,23 @@ impl Rotary {
         Self::factors_descriptor_of(self.rotated, self.scale, self.sections, positions)
     }
 
+    /// The factor table's descriptor at an element type of the caller's.
+    ///
+    /// FP32 is every trained transformer's table; a model whose reference rounds the factors to its
+    /// activation type states that type here, and the table's type is the only thing that moves.
+    pub fn factors_descriptor_at(
+        rotated: u32,
+        scale: f32,
+        sections: Option<Sections>,
+        positions: ops::DType,
+        factors: ops::DType,
+    ) -> FactorsDescriptor {
+        FactorsDescriptor {
+            dtype: factors,
+            ..Self::factors_descriptor_of(rotated, scale, sections, positions)
+        }
+    }
+
     /// The factor table's descriptor, from the rotation's numbers alone.
     pub fn factors_descriptor_of(
         rotated: u32,
@@ -293,7 +313,67 @@ impl Rotary {
             block: head.next_power_of_two().min(1024) as u32,
             affine,
             pdl: PDL,
+            factors: ops::DType::F32,
+            strided: false,
         }
+    }
+
+    /// The strided form's descriptor (`ops::rope::QkNormRopeDescriptor::strided`): queries and keys
+    /// of `dtype`, factors of `factors`, no learned scale, turned in place.
+    pub fn strided_descriptor_of(
+        head_dim: u32,
+        heads: u32,
+        rotation: Rotation,
+        epsilon: f32,
+        rotated: u32,
+        dtype: ops::DType,
+        factors: ops::DType,
+    ) -> QkNormRopeDescriptor {
+        QkNormRopeDescriptor {
+            rows: STRIDED_TOKENS,
+            factors,
+            strided: true,
+            ..Self::apply_descriptor_of(
+                head_dim, heads, heads, rotation, epsilon, rotated, dtype, dtype, false,
+            )
+        }
+    }
+
+    /// Normalize and rotate `query` and `key` in place: views of `[tokens, heads, head_dim]` into
+    /// wider rows.
+    ///
+    /// `cosine` and `sine` are `[table rows, rotated / 2]` of a type the caller chose; token `t` reads
+    /// row `t % table rows`, so tiles decoded in one launch share one table. The normalization has no
+    /// learned scale.
+    pub fn apply_strided(
+        &self,
+        f: &Forward,
+        query: TensorView,
+        key: TensorView,
+        cosine: TensorView,
+        sine: TensorView,
+    ) -> Result<()> {
+        let descriptor = Self::strided_descriptor_of(
+            self.head_dim,
+            self.q_heads,
+            self.rotation,
+            self.epsilon,
+            self.rotated,
+            query.dtype,
+            cosine.dtype,
+        );
+        let args = QkNormRopeArgs {
+            query,
+            key,
+            q_weight: None,
+            k_weight: None,
+            cosine,
+            sine,
+            q_out: query,
+            k_out: key,
+        };
+
+        f.operate::<QkNormRope>(&descriptor, args)
     }
 
     pub fn factors(
@@ -305,9 +385,9 @@ impl Rotary {
     ) -> Result<()> {
         let columns = u64::from(self.rotated / 2);
         cosine
-            .require_row("Rotary::factors", ops::DType::F32, columns)
+            .require_row("Rotary::factors", cosine.dtype, columns)
             .map_err(Error::from)?;
-        sine.require_row("Rotary::factors", ops::DType::F32, columns)
+        sine.require_row("Rotary::factors", cosine.dtype, columns)
             .map_err(Error::from)?;
         let axes = self
             .sections
@@ -343,7 +423,13 @@ impl Rotary {
                 ),
             ));
         }
-        let descriptor = self.factors_descriptor(positions.dtype);
+        let descriptor = Self::factors_descriptor_at(
+            self.rotated,
+            self.scale,
+            self.sections,
+            positions.dtype,
+            cosine.dtype,
+        );
         let args = FactorsArgs {
             positions,
             frequencies: self.frequencies.view(),

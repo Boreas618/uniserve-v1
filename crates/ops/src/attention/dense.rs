@@ -156,6 +156,12 @@ pub struct DenseArgs {
     pub window_left: i32,
     /// Whether the module applies the causal mask the descriptor names.
     pub causal: bool,
+    /// The longest query sequence, when the caller knows it from the offsets it wrote.
+    ///
+    /// The module sizes its schedule by this, so a launch of many equal sequences that left it to the
+    /// packed token count would ask for that many times the programs and retire the surplus empty.
+    /// `None` is the bound the offsets alone give: every token in one sequence.
+    pub longest: Option<u64>,
 }
 
 /// The call structure a package's entry receives.
@@ -454,9 +460,9 @@ impl Op for DenseAttention {
             batch: to_i64(operator, batch)?,
             q_tokens: to_i64(operator, q_tokens)?,
             kv_tokens: to_i64(operator, kv_tokens)?,
-            // The longest row is only known from the offsets on the device; the packed token count
-            // bounds it, and the module's schedule only pads.
-            max_q_len: to_i64(operator, q_tokens)?,
+            // The longest row is only known from the offsets on the device unless the caller stated
+            // it; the packed token count bounds it, and the module's schedule only pads.
+            max_q_len: to_i64(operator, args.longest.unwrap_or(q_tokens))?,
             max_kv_len: to_i64(operator, u64::from(descriptor.max_kv_len))?,
             q_heads: to_i64(operator, q_heads)?,
             kv_heads: to_i64(operator, kv_heads)?,
