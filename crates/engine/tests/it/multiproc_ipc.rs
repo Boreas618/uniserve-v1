@@ -9,8 +9,9 @@
 //! Info, admission, retirement, close and signals; token batches run the
 //! stub's text runtime (prefill, decode, verification, sampling, logprobs and
 //! device token relays). The executable comes from
-//! `UNISERVE_WORKER_EXECUTABLE` or the repository environment's
-//! `.venv/bin/uniserve`. Several tests replace that executable with a
+//! `UNISERVE_WORKER_EXECUTABLE`, the repository environment's
+//! `.venv/bin/uniserve` or the target directory's own build of it. Several
+//! tests replace that executable with a
 //! small wrapper script that records an executor's process id, exits a chosen rank, starts a relaunched rank as a
 //! stand-in that reports changed executor info, registers under another build
 //! or for an earlier launch, or holds a rank's exit until its peers have
@@ -278,13 +279,7 @@ fn worker_group_args() -> ExecutorProcessArgs {
 }
 
 fn worker_executable() -> PathBuf {
-    std::env::var_os("UNISERVE_WORKER_EXECUTABLE")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join(".venv/bin/uniserve")
-        })
+    crate::support::uniserve_executable()
 }
 
 /// Places a batch's buffer spans at the same offsets on every rank of the

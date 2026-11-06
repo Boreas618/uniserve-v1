@@ -264,14 +264,23 @@ pub(crate) fn daemon() -> String {
 }
 
 /// The `uniserve` executable the executors run as, and that starts the node's
-/// Storage Server: `UNISERVE_WORKER_EXECUTABLE`, or else the repository
-/// environment's.
+/// Storage Server: `UNISERVE_WORKER_EXECUTABLE`, the repository environment's,
+/// or else the one this target directory built, which a checkout without a
+/// Python environment has once `cargo build --bin uniserve` ran.
 pub(crate) fn uniserve_executable() -> std::path::PathBuf {
-    std::env::var_os("UNISERVE_WORKER_EXECUTABLE")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .join(".venv/bin/uniserve")
-        })
+    if let Some(named) = std::env::var_os("UNISERVE_WORKER_EXECUTABLE") {
+        return std::path::PathBuf::from(named);
+    }
+    let environment = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(".venv/bin/uniserve");
+    if environment.exists() {
+        return environment;
+    }
+    // This test binary lies at `<target>/<profile>/deps/`.
+    std::env::current_exe()
+        .ok()
+        .and_then(|tests| Some(tests.parent()?.parent()?.join("uniserve")))
+        .filter(|built| built.exists())
+        .unwrap_or(environment)
 }
