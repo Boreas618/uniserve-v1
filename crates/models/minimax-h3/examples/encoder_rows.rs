@@ -306,6 +306,7 @@ fn run() -> Result<(), String> {
                 &plan,
                 Scene {
                     pixels: &blocks,
+                    packed: None,
                     blended,
                 },
             );

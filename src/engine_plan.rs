@@ -640,6 +640,22 @@ impl EpochPlan {
         })
     }
 
+    /// The snapshot of the base revision this export continues, when it pins one.
+    ///
+    /// A FastH3 export holds its own DiT and schedulers and reads every directory it omits from the
+    /// base release it was trained on (`fastvideo_inference.json`'s `base_model_revision`). The two
+    /// are one checkpoint to everything below this file.
+    fn media_base(&self) -> Result<Option<PathBuf>> {
+        frontend::model::assets::pipeline::pinned_snapshot(&self.checkpoint)
+            .with_context(|| format!("reading the base {} pins", self.checkpoint.display()))
+    }
+
+    /// The media checkpoint's typed configuration, the base it pins included.
+    fn media_config(&self) -> Result<minimax_h3::Config> {
+        let base = self.media_base()?;
+        Ok(minimax_h3::Config::read(&self.checkpoint, base.as_deref())?)
+    }
+
     /// The runners a media rank serves `device` with: one per block the pipeline holds.
     ///
     /// **Three runners, one stream each.** An encoder writes the hidden states a denoise step reads,
@@ -679,8 +695,9 @@ impl EpochPlan {
         let capacities = prompt_capacities(&self.build.video, longest)?;
         // The checkpoint's own statement of what it serves, read once: the candidates are per task,
         // and a task the checkpoint does not serve gets no graph.
-        let config = minimax_h3::Config::read(&self.checkpoint, None)?;
-        let candidates = media_candidates(&config, &self.build.video, &capacities)?;
+        let config = self.media_config()?;
+        let tasks = self.media_tasks(&config)?;
+        let candidates = media_candidates(&tasks, &self.build.video, &capacities)?;
 
         // The buckets the deployment captures: an encode bucket per (rows, prompt capacity) and a
         // decode bucket per canvas. A denoiser derives its own from the candidates it walks, so the
@@ -718,6 +735,7 @@ impl EpochPlan {
         )?;
         let denoiser = pipeline
             .transformer()
+            .or(pipeline.transformer_ref())
             .context("the checkpoint holds no transformer, so no denoising step could run")?;
         // The encoder writes its hidden states in the deployment's effective type, which the daemon
         // resolved against the checkpoint before it wrote this build config (a `dtype` of `auto`
@@ -864,6 +882,7 @@ impl EpochPlan {
             // A video unit's frames are the model's schedule, not this plan's arithmetic: the
             // postprocessor states the one home of `CLIP_FRAMES * n + OVERLAP_FRAMES`.
             video_units,
+            Arc::new(minimax_h3::encoding::ConditionFormat::new(&config, dtype)?),
         );
         runners.push(NamedRunner::new(RunnerId(4), Box::new(media)));
         Ok(runners)
@@ -1072,6 +1091,12 @@ impl EpochPlan {
     /// The media class's parallel shape is the deployment's, and the page states it beside the
     /// component it splits; the same reader the launcher used answers it here, so a rank and the
     /// engine that started it cannot disagree about the group's degrees.
+    /// The tasks this deployment serves: those of the checkpoint's network the page places.
+    fn media_tasks(&self, config: &minimax_h3::Config) -> Result<Vec<nn::VideoTask>> {
+        let groups = self.deployment_groups()?;
+        served_tasks(&config.serving(), groups.as_deref(), &self.checkpoint)
+    }
+
     fn deployment_groups(&self) -> Result<Option<Vec<engine::ExecutorGroupConfig>>> {
         let Some(path) = self.build.worker_groups.as_ref() else {
             return Ok(None);
@@ -1130,9 +1155,13 @@ impl EpochPlan {
                 // §8: the deployment's own representation, which the daemon resolved against the
                 // checkpoint before it wrote this build config (`dtype = "auto"` never reaches a
                 // main process as `auto`: it arrives as the checkpoint's own type).
-                let opened = nn::Checkpoint::open(&self.checkpoint)?;
+                let base = self.media_base()?;
+                let opened = match &base {
+                    Some(base) => nn::Checkpoint::open_roots(&[&self.checkpoint, base])?,
+                    None => nn::Checkpoint::open(&self.checkpoint)?,
+                };
                 let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
-                let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+                let config = self.media_config()?;
                 // **The media class's parallel shape is the deployment's, and the deployment file
                 // is where it is stated.** The build config carries the tensor-parallel width and
                 // no sequence degree, so a rank that read its tensor place alone would either
@@ -1154,10 +1183,8 @@ impl EpochPlan {
                 // condition capacity, so two tasks are two partitions and one deployment holds one.
                 // A construction stating their union would serve both; the model offers none, and
                 // this does not invent one.
-                // **What a deployment of this checkpoint serves, not everything its architecture
-                // can express**: a distilled export serves the one task its contract states, and a
-                // partition carries one task's block set and condition capacity.
-                let task = served_task(&config.serving(), &self.checkpoint)?;
+                // The tasks of the network the deployment page places: a checkpoint may hold two.
+                let tasks = self.media_tasks(&config)?;
                 // **The prompt capacity is the deployment's, and the denoiser's packed prefix holds
                 // it.** A layout reserves one row per prompt token, so the text capacity a model is
                 // built with and the prompt capacities the deployment prepares buckets for are one
@@ -1181,17 +1208,27 @@ impl EpochPlan {
                 // directory, so it is not a component a task's weights place - but the decode
                 // runner takes it as the video decoder's second entry point, and a rank that held
                 // the decoder without it would publish a timeline's first clip and say nothing.
-                let partition = minimax_h3::Partition::serving(
+                let mut partition = minimax_h3::Partition::serving(
                     &config,
-                    task,
+                    tasks[0],
                     ulysses,
                     tensor_parallel,
                     tensor_rank,
                     sequence_rank,
                 )?;
-                // The condition capacity is the task's (the block set is placed for it); the text
-                // capacity is the deployment's, from the ladder above.
-                let partition = partition.sized(text_capacity, partition.condition_rows);
+                for task in &tasks[1..] {
+                    partition = partition.also_serving(&config, *task)?;
+                }
+                // The text capacity is the deployment's, from the ladder above, and so is the
+                // condition capacity when it states one: the rows a request's references take
+                // follow their rasters, which the task's own default cannot know.
+                let partition = partition.sized(
+                    text_capacity,
+                    self.build
+                        .video
+                        .max_condition_rows
+                        .unwrap_or(partition.condition_rows),
+                );
                 let partition = partition.placing(
                     partition
                         .blocks
@@ -1210,7 +1247,7 @@ impl EpochPlan {
                 // took one and not the other would refuse every longer prompt at the packed prefix,
                 // minutes into a load and in a component that never saw the deployment's number. The
                 // disagreement is named here instead, before any runner is bound.
-                if let Some(denoiser) = model.transformer() {
+                if let Some(denoiser) = model.transformer().or(model.transformer_ref()) {
                     let held = denoiser.rules().arrangement().text_rows;
                     let largest = capacities.last().copied().unwrap_or(0);
                     if capacities.iter().any(|capacity| *capacity > held) {
@@ -1330,11 +1367,27 @@ impl EpochPlan {
                 };
                 let clips = frame_clips()?;
                 let frames = (self.build.video.max_seconds * f64::from(minimax_h3::FPS)).round();
+                let Served::Media(pipeline) = served else {
+                    bail!("a media rank's report reads the media pipeline it holds");
+                };
+                // A deployment that places no condition encoder takes no condition at all, and its
+                // capacity is the packing's least unit rather than rows a request may fill.
+                let condition_rows = pipeline
+                    .transformer()
+                    .or(pipeline.transformer_ref())
+                    .filter(|denoiser| denoiser.places_encoders())
+                    .map_or(0, |denoiser| denoiser.rules().arrangement().condition_rows);
                 let bounds = MediaBounds {
                     prompt_tokens: self.max_kv_len(served)?,
                     video_units: clips.units(clips.align_up(frames as u32)),
+                    condition_rows,
                 };
-                (facts, media_rank_report(device, &host, bounds)?)
+                let denoiser = if pipeline.transformer_ref().is_some() {
+                    "transformer_ref"
+                } else {
+                    "transformer"
+                };
+                (facts, media_rank_report(device, &host, bounds, denoiser)?)
             }
         };
         // The ranks of this process agree over the group the main process formed at start, and a
@@ -1391,11 +1444,11 @@ impl EpochPlan {
         // which the frontend plans a request against and no capacity figure implies.
         let mut info = planned.plan.info.clone();
         if let Served::Media(pipeline) = served {
-            let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+            let config = self.media_config()?;
             info.video_denoiser = Some(denoiser_report(
                 pipeline,
                 &self.build.video,
-                &config.serving(),
+                &self.media_tasks(&config)?,
             )?);
         }
         Ok((memory, info, graph))
@@ -1470,6 +1523,32 @@ struct MediaBounds {
     prompt_tokens: u32,
     /// The clips of the longest video the deployment serves.
     video_units: u32,
+    /// The denoiser rows a request's conditions may take: what its layout reserves for them.
+    condition_rows: u32,
+}
+
+impl MediaBounds {
+    /// The pixels of a request's conditions, at most.
+    ///
+    /// A condition's pixels are its rows times the pixels of one row: a row is one latent patch, 32
+    /// pixels square, of one latent frame, and a clip's latent frame covers up to `clip_frames /
+    /// clip_latents` of its frames rounded up.
+    fn condition_pixels(&self) -> u32 {
+        let side = minimax_h3::CANVAS_MULTIPLE;
+        let frames = minimax_h3::CLIP_FRAMES.div_ceil(minimax_h3::CLIP_LATENTS);
+        self.condition_rows.saturating_mul(side * side * frames)
+    }
+
+    /// The samples of a request's tracks, at most: two rows of a latent frame each.
+    fn condition_samples(&self) -> u32 {
+        (self.condition_rows / minimax_h3::config::AUDIO_CHANNELS)
+            .saturating_mul(minimax_h3::AUDIO_HOP)
+    }
+
+    /// The vision tower's patch rows of a prompt, at most: `merge²` of each placeholder.
+    fn vision_patches(&self, merge: u32) -> u32 {
+        self.prompt_tokens.saturating_mul(merge * merge)
+    }
 }
 
 /// The products `component` publishes, under the names a request's graph asks for them.
@@ -1493,10 +1572,28 @@ fn media_outputs(component: &str, bounds: &MediaBounds) -> Vec<ipc::OutputInfo> 
         raster_axes: None,
     };
     match component {
-        "text_encoder" => vec![output(product::CONDITIONING, Some(bounds.prompt_tokens))],
-        "transformer" => vec![
+        "text_encoder" => vec![
+            output(product::CONDITIONING, Some(bounds.prompt_tokens)),
+            output(product::VISION_FEATURES, Some(bounds.prompt_tokens)),
+        ],
+        "transformer" | "transformer_ref" => vec![
             output(product::VIDEO_LATENTS, None),
             output(product::AUDIO_LATENTS, None),
+        ],
+        "media_reader" => vec![
+            output(product::CONDITION_PIXELS, Some(bounds.condition_pixels())),
+            output(product::CONDITION_SAMPLES, Some(bounds.condition_samples())),
+            output(product::VISION_PIXELS, Some(bounds.vision_patches(2))),
+        ],
+        "latent_encoder" => vec![
+            output(
+                product::CONDITION_VIDEO_LATENTS,
+                Some(bounds.condition_rows),
+            ),
+            output(
+                product::CONDITION_AUDIO_LATENTS,
+                Some(bounds.condition_rows),
+            ),
         ],
         "video_decoder" => vec![output(product::VIDEO_UNITS, Some(bounds.video_units))],
         "video_codec" => vec![output(product::ENCODED_UNITS, Some(bounds.video_units))],
@@ -1520,6 +1617,7 @@ fn media_rank_report(
     device: DeviceId,
     host: &str,
     bounds: MediaBounds,
+    denoiser: &str,
 ) -> Result<executor::capacity::Report> {
     use ipc::MediaCall;
     let at = std::time::SystemTime::now()
@@ -1530,8 +1628,15 @@ fn media_rank_report(
     // hold nothing any pool asks for.
     let mut media_components = std::collections::BTreeMap::new();
     media_components.insert(MediaCall::TextEncoding, "text_encoder".to_owned());
-    media_components.insert(MediaCall::LatentPreparation, "transformer".to_owned());
-    media_components.insert(MediaCall::Denoising, "transformer".to_owned());
+    media_components.insert(MediaCall::LatentPreparation, denoiser.to_owned());
+    media_components.insert(MediaCall::Denoising, denoiser.to_owned());
+    // A conditioned request's own calls: a rank that takes none states an empty bound for them, and
+    // a request's graph holds them only when it carries conditions.
+    if bounds.condition_rows > 0 {
+        media_components.insert(MediaCall::MediaReading, "media_reader".to_owned());
+        media_components.insert(MediaCall::VisionEncoding, "text_encoder".to_owned());
+        media_components.insert(MediaCall::LatentEncoding, "latent_encoder".to_owned());
+    }
     media_components.insert(MediaCall::VideoDecoding, "video_decoder".to_owned());
     media_components.insert(MediaCall::AudioDecoding, "audio_decoder".to_owned());
     media_components.insert(MediaCall::VideoEncoding, "video_codec".to_owned());
@@ -1896,17 +2001,15 @@ fn prompt_capacity(video: &daemon::options::VideoOptions, longest: u32) -> Resul
 
 /// The condition counts a task's warm graph is captured with.
 ///
-/// A warm request states the **most** a request of its task carries, because the graph is captured
-/// once and a request may carry fewer: `fl2va` anchors a first and a last frame, and `t2va` carries
-/// no condition media at all. `ref2va`'s count is the deployment's `references` limit - a reference
-/// video's length is a request's, so the number is not the task's - and it is `None` rather than a
-/// guess.
-fn task_conditions(task: nn::VideoTask) -> Option<(u32, u32, u32)> {
-    Some(match task {
-        nn::VideoTask::TextToVideoAudio => (0, 0, 0),
+/// A graph is captured for a layout, and a layout's capacities are the deployment's: what a request
+/// fills of them reaches the graph through its state tables, written at its first step. So a warm
+/// request needs no condition of its own, and `ref2va`'s references, whose count and rasters are the
+/// request's, state none. `fl2va` anchors a first and a last frame whatever it asks for.
+fn task_conditions(task: nn::VideoTask) -> (u32, u32, u32) {
+    match task {
+        nn::VideoTask::TextToVideoAudio | nn::VideoTask::ReferenceToVideoAudio => (0, 0, 0),
         nn::VideoTask::FirstLastToVideoAudio => (1, 1, 0),
-        nn::VideoTask::ReferenceToVideoAudio => return None,
-    })
+    }
 }
 
 /// The least legal timeline of at least `frames` frames (`17 * n + 5`).
@@ -1948,7 +2051,7 @@ fn snap_frames(frames: u32) -> Result<u32> {
 /// serves, and the frames are the deployment's longest clip at the model's frame rate - the model
 /// snaps them to a legal count itself, which is why the request states the plain figure.
 fn media_candidates(
-    config: &minimax_h3::Config,
+    tasks: &[nn::VideoTask],
     video: &daemon::options::VideoOptions,
     capacities: &[u32],
 ) -> Result<Vec<executor::runners::denoiser::WarmRequest>> {
@@ -2000,15 +2103,8 @@ fn media_candidates(
             // serves (`Config::tasks`), the daemon refuses a request of any other task against that
             // statement, and a candidate stated here for a task the checkpoint does not serve would
             // be a graph nothing fills.
-            for task in config.tasks() {
-                let (first_frames, last_frames, references) =
-                    task_conditions(task).with_context(|| {
-                        format!(
-                            "this checkpoint serves {task:?} and a warm graph of that task states \
-                             its reference count, which is the deployment's `references` limit \
-                             rather than a number of the task's"
-                        )
-                    })?;
+            for task in tasks.iter().copied() {
+                let (first_frames, last_frames, references) = task_conditions(task);
                 for capacity in capacities {
                     candidates.push(executor::runners::denoiser::WarmRequest {
                         task,
@@ -2248,33 +2344,55 @@ pub(crate) struct Placement {
     load_options: qwen3_moe::LoadOptions,
 }
 
-/// The one task this deployment serves, from the checkpoint's own statement.
+/// The tasks this deployment serves: those the checkpoint states, on the network the page places.
 ///
-/// A partition carries one task's block set and one task's condition capacity: the condition encoders
-/// are placed for the conditioned tasks and the capacity is [`minimax_h3::partition::condition_rows`]
-/// of the task, so two tasks are two partitions and one deployment holds one. The checkpoint states
-/// which it serves (`Config::tasks`, read from the export's own record), and a checkpoint that states
-/// several is refused here naming them, rather than served with one task's arrangement for another
-/// task's request.
-fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTask> {
-    match tasks {
-        [] => bail!(
+/// A release holds two networks, `transformer` and `transformer_ref`, and a deployment runs one: the
+/// page's component says which, and that network's tasks are the deployment's. A deployment with no
+/// page has no such statement, so it serves what the checkpoint states when that is one network's.
+fn served_tasks(
+    stated: &[nn::VideoTask],
+    groups: Option<&[engine::ExecutorGroupConfig]>,
+    checkpoint: &Path,
+) -> Result<Vec<nn::VideoTask>> {
+    if stated.is_empty() {
+        bail!(
             "the checkpoint {} states no task, so no denoiser partition can be sized for one",
             checkpoint.display()
-        ),
-        [task] => Ok(*task),
-        several => bail!(
-            "the checkpoint states {} tasks ({}) and one partition serves one task's block set and \
-             condition capacity: a deployment serving several needs a construction that states their \
-             union",
-            several.len(),
-            several
-                .iter()
-                .map(|task| format!("{task:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        );
     }
+    let reference = |task: &nn::VideoTask| *task == nn::VideoTask::ReferenceToVideoAudio;
+    let Some(groups) = groups else {
+        if stated.iter().all(reference) || !stated.iter().any(reference) {
+            return Ok(stated.to_vec());
+        }
+        bail!(
+            "the checkpoint {} holds two networks and this deployment states no page to place one",
+            checkpoint.display()
+        );
+    };
+    let places = |name: &str| {
+        groups
+            .iter()
+            .any(|group| group.components.contains_key(name))
+    };
+    let served: Vec<nn::VideoTask> = stated
+        .iter()
+        .copied()
+        .filter(|task| {
+            if reference(task) {
+                places(REFERENCE_COMPONENT)
+            } else {
+                places(DENOISER_COMPONENT)
+            }
+        })
+        .collect();
+    if served.is_empty() {
+        bail!(
+            "the checkpoint {} states {stated:?} and the deployment places no network of them",
+            checkpoint.display()
+        );
+    }
+    Ok(served)
 }
 
 /// This rank's sequence split, and its place in it, as the deployment page states them.
@@ -2296,8 +2414,8 @@ fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTa
 /// group from another's when the name the launch states is the daemon's process group.
 const DENOISER_COMPONENT: &str = "transformer";
 
-/// The same node of a reference deployment, whose denoiser is the reference DiT.
-const REFERENCE_DENOISER_COMPONENT: &str = "transformer_ref";
+/// The reference denoiser's node in the page: an OmniRef deployment names it instead.
+const REFERENCE_COMPONENT: &str = "transformer_ref";
 
 /// The component a media rank's tensor group splits.
 const TEXT_COMPONENT: &str = "text_encoder";
@@ -2337,7 +2455,7 @@ fn media_parallel(
         .iter()
         .filter(|candidate| {
             candidate.components.contains_key(DENOISER_COMPONENT)
-                || candidate.components.contains_key(REFERENCE_DENOISER_COMPONENT)
+                || candidate.components.contains_key(REFERENCE_COMPONENT)
         })
         .collect();
     // Both sides as a pair in either refusal: the launch's name is the daemon's roster label and the
@@ -2505,6 +2623,9 @@ fn host_phases() -> Vec<PhaseId> {
         engine::PhaseKind::AudioEncode,
         engine::PhaseKind::Mux,
         engine::PhaseKind::LatentPrepare,
+        engine::PhaseKind::MediaRead,
+        engine::PhaseKind::VisionEncoding,
+        engine::PhaseKind::LatentEncoding,
     ]
     .into_iter()
     .map(|kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits")))
@@ -2530,6 +2651,10 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
             Variant::AudioEncode => engine::PhaseKind::AudioEncode,
             Variant::Mux => engine::PhaseKind::Mux,
             Variant::LatentPrepare => engine::PhaseKind::LatentPrepare,
+            Variant::MediaRead => engine::PhaseKind::MediaRead,
+            // The two encoders whose work a later call computes are answered as they arrive, under
+            // the phase of either: a bucket of this variant names no one of them.
+            Variant::ConditionEncode => engine::PhaseKind::VisionEncoding,
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill
@@ -2759,34 +2884,31 @@ mod tests {
         );
     }
 
-    /// One partition serves one task, and the checkpoint's own statement decides which.
-    ///
-    /// The condition encoders are placed for the conditioned tasks and the condition capacity is that
-    /// task's, so a second task is a second partition. A checkpoint that states several is refused
-    /// naming them, rather than served with one task's arrangement for another task's request.
+    /// A checkpoint with no page serves what it states when that is one network's, and a checkpoint
+    /// that states no task serves nothing.
     #[test]
-    fn the_served_task_is_the_one_the_checkpoint_states() {
+    fn the_served_tasks_are_those_of_the_checkpoints_one_network() {
         let checkpoint = Path::new("/models/fasth3");
-        let one = served_task(&[nn::VideoTask::TextToVideoAudio], checkpoint)
-            .expect("a checkpoint that states one task serves it");
-        assert_eq!(one, nn::VideoTask::TextToVideoAudio);
-        let none = served_task(&[], checkpoint).expect_err("no task is no partition");
+        let tasks = [
+            nn::VideoTask::TextToVideoAudio,
+            nn::VideoTask::FirstLastToVideoAudio,
+        ];
+        assert_eq!(
+            served_tasks(&tasks, None, checkpoint).expect("one network's tasks"),
+            tasks.to_vec()
+        );
+        let none = served_tasks(&[], None, checkpoint).expect_err("no task is no partition");
         assert!(
             format!("{none:#}").contains("states no task"),
             "the refusal says the checkpoint states none: {none:#}"
         );
-        let several = served_task(
-            &[
-                nn::VideoTask::TextToVideoAudio,
-                nn::VideoTask::FirstLastToVideoAudio,
-            ],
-            checkpoint,
-        )
-        .expect_err("two tasks are two partitions");
-        let sentence = format!("{several:#}");
+        let both = [
+            nn::VideoTask::TextToVideoAudio,
+            nn::VideoTask::ReferenceToVideoAudio,
+        ];
         assert!(
-            sentence.contains("TextToVideoAudio") && sentence.contains("FirstLastToVideoAudio"),
-            "the refusal names the tasks: {sentence}"
+            served_tasks(&both, None, checkpoint).is_err(),
+            "two networks need a page to choose between them"
         );
     }
 

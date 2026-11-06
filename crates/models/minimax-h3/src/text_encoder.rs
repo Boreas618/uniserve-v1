@@ -5,8 +5,9 @@
 //! checkpoint's decoder layers, and returns the last retained layer's raw hidden state - the
 //! checkpoint's final normalization is not part of H3's conditioning path (`network.norm =
 //! Identity`). The tower's merged tokens replace the prompt's image and video placeholder tokens,
-//! and the three DeepStack feature tables are added to the residual stream after the block each was
-//! merged from (`uniserve/models/transformer.py::_traverse`, lines 408-419).
+//! and DeepStack feature `j` is added to the residual stream after retained layer `j`, whichever
+//! tower block it was merged from (`uniserve/models/encoder.py::_deepstack`, and
+//! `uniserve/models/transformer.py::_traverse` for the addition).
 //!
 //! ## The layer recurrence
 //!
@@ -908,19 +909,15 @@ impl TextEncoder {
         let layers = (0..retained)
             .map(|index| Layer::load(loader, config, &rank, index))
             .collect::<Result<Vec<_>>>()?;
-        let deepstack_layers = config
-            .vision
-            .deepstack_visual_indexes
-            .iter()
-            .map(|index| *index as usize)
-            .collect::<Vec<_>>();
-        for &layer in &deepstack_layers {
-            if layer >= retained as usize {
-                return Err(Error::config(format!(
-                    "DeepStack feature after block {layer}, but H3 retains {retained} blocks"
-                )));
-            }
+        // The checkpoint's `deepstack_visual_indexes` name the *tower's* blocks; the language model
+        // adds the features in that order after its own first layers.
+        let features = config.vision.deepstack_visual_indexes.len();
+        if features > retained as usize {
+            return Err(Error::config(format!(
+                "{features} DeepStack features, but H3 retains {retained} blocks"
+            )));
         }
+        let deepstack_layers = (0..features).collect::<Vec<_>>();
         let sections = sections_of(config)?;
         Ok(Self {
             config: config.clone(),
@@ -1236,7 +1233,7 @@ impl TextEncoder {
             .factors(f, prepared.positions, buffers.cosine, buffers.sine)
             .map_err(Error::from)?;
 
-        // 4. The retained layers, with each DeepStack table added after the block it came from.
+        // 4. The retained layers, with DeepStack table `j` added after layer `j`.
         let offsets = inputs.batch.query_offsets;
         let mut carried = None;
         let mut next = 0;
