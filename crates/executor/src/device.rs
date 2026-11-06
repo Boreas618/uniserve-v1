@@ -263,7 +263,6 @@ impl Executor {
             shadow_attached: false,
             activity: Arc::clone(&activity),
             sticky: None,
-            born: Instant::now(),
             waits: true,
             pending_landing: None,
         };
@@ -627,6 +626,13 @@ pub enum Probe {
 }
 
 /// The device thread's state: the runners, the streams only it issues to, and the queue.
+/// Milliseconds from the first time this was asked to `at`, one clock for every device's lines.
+fn since_start(at: Instant) -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    let start = *START.get_or_init(Instant::now);
+    at.saturating_duration_since(start).as_millis() as u64
+}
+
 /// How often a device thread looks at a replay in flight while it waits for the next command.
 const LANDING_POLL: Duration = Duration::from_micros(100);
 
@@ -652,8 +658,6 @@ struct Launched {
 }
 
 struct Device {
-    /// When this device's thread began, which a batch's log lines are timed against.
-    born: Instant,
     /// Whether a job's device work is waited for before the job answers.
     waits: bool,
     /// The replay the command just served left running.
@@ -734,7 +738,28 @@ impl Device {
                 continue;
             }
             let result = self.serve(&entry);
-            // A replay that was in flight lands now, with the one behind it already on the stream.
+            let result = match (result, self.pending_landing.take()) {
+                (Ok(Step::Done(output)), Some(pending)) => {
+                    let landing = Launched {
+                        entry,
+                        output,
+                        pending,
+                    };
+                    // A host call has nothing left on its stream, so it answers now and the replay
+                    // in flight keeps running. A replay stays in flight, and the one before it
+                    // lands with this one already on the stream.
+                    if matches!(landing.pending.landed.query(), Ok(true)) {
+                        self.land(queue, landing);
+                    } else {
+                        if let Some(previous) = launched.take() {
+                            self.land(queue, previous);
+                        }
+                        launched = Some(landing);
+                    }
+                    continue;
+                }
+                (result, _) => result,
+            };
             if let Some(landing) = launched.take() {
                 self.land(queue, landing);
             }
@@ -743,17 +768,6 @@ impl Device {
                 // last step, so nothing completes here.
                 continue;
             }
-            let result = match (result, self.pending_landing.take()) {
-                (Ok(Step::Done(output)), Some(pending)) => {
-                    launched = Some(Launched {
-                        entry,
-                        output,
-                        pending,
-                    });
-                    continue;
-                }
-                (result, _) => result,
-            };
             // What was in hand, read **after** the command: `perform` is what writes it, and it is
             // taken when a command completes, so a string read before the command is the one the
             // previous command left - empty. Reading it before the command therefore wrapped no
@@ -846,8 +860,8 @@ impl Device {
             batch = pending.batch,
             staged_ms = pending.staged_ms,
             total_ms = pending.started.elapsed().as_millis() as u64,
-            began_ms = pending.started.duration_since(self.born).as_millis() as u64,
-            ended_ms = self.born.elapsed().as_millis() as u64,
+            began_ms = since_start(pending.started),
+            ended_ms = since_start(Instant::now()),
             "a media batch was served"
         );
         if let Err(error) = &result {
@@ -917,8 +931,8 @@ impl Device {
                         batch = batch.id.0,
                         staged_ms = staged.as_millis() as u64,
                         total_ms = started.elapsed().as_millis() as u64,
-                        began_ms = started.duration_since(self.born).as_millis() as u64,
-                        ended_ms = self.born.elapsed().as_millis() as u64,
+                        began_ms = since_start(started),
+                        ended_ms = since_start(Instant::now()),
                         "a media batch was served"
                     );
                 }
