@@ -312,13 +312,7 @@ fn run() -> Result<(), String> {
                 blended,
             },
         );
-        // The grid's tile columns, which is what the stitcher's ring is a block wide per column of.
-        let columns = {
-            let mut starts: Vec<u32> = clip.plan().tiles.iter().map(|t| t.columns.0).collect();
-            starts.sort_unstable();
-            starts.dedup();
-            starts.len()
-        };
+        let columns = clip.plan().tiles.len();
         // The raster plan is the model's statement of what a raster driver allocates - the encoder's
         // set, then the stitcher's ring and hand-off - and the check below is that the driver takes
         // exactly it. The tool prices nothing of its own here: a formula in this file was a second

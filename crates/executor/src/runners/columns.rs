@@ -104,6 +104,50 @@ impl Column {
     }
 }
 
+/// A region a graph reads and writes on the device alone, whose address never moves.
+///
+/// A [`Column`] is the host's way in: its device view is its pinned buffer, so every read and write
+/// of it crosses to host memory. That is right for what the host stages, and wrong for what a
+/// forward works in: a residual stream read and written by every layer ran thirty times slower
+/// there than in device memory.
+pub(crate) struct Region {
+    /// What a captured graph addresses.
+    pub(crate) device: TensorView,
+    /// The allocation `device` names, held as long as a graph may address it.
+    _storage: platform::DeviceAllocation,
+}
+
+impl Region {
+    /// A region of `numel` elements of `dtype` on `device`.
+    pub(crate) fn new(device: DeviceId, dtype: DType, numel: u64) -> Result<Self> {
+        let bytes = dtype
+            .bytes()
+            .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?
+            .checked_mul(numel)
+            .ok_or_else(|| Error::Invalid("a region's extent overflows".into()))?;
+        let bytes = usize::try_from(bytes)
+            .map_err(|_| Error::Invalid("a region is larger than memory".into()))?;
+        let storage = platform::DeviceAllocation::linear(device, bytes)?;
+        Ok(Self {
+            device: TensorView::new(
+                ops::DevicePtr::new(storage.address()),
+                dtype,
+                ops::Shape::new(&[numel]),
+            ),
+            _storage: storage,
+        })
+    }
+
+    /// The first `elements` of the region, as a view the batch reads.
+    pub(crate) fn extent(&self, elements: std::ops::Range<u64>) -> TensorView {
+        TensorView::new(
+            self.device.ptr,
+            self.device.dtype,
+            ops::Shape::new(&[elements.end - elements.start]),
+        )
+    }
+}
+
 /// `values` as the bytes of the column's element type, in the host's byte order.
 pub(crate) fn encode_i32(buffer: &mut Vec<u8>, values: &[i32]) {
     buffer.clear();

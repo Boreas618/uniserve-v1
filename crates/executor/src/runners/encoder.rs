@@ -37,7 +37,7 @@ use crate::arena::{Pools, StreamId};
 use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
 use crate::plan::{Bucket, Buckets, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
-use crate::runners::columns::{Column, encode_i32};
+use crate::runners::columns::{Column, Region, encode_i32};
 use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{self, Product, Products};
 use crate::runners::tables::Tables;
@@ -67,11 +67,14 @@ struct EncoderColumns {
     logits_rows: Column,
     /// `[tokens × hidden]` the encoded states, in the model's own element type.
     ///
-    /// A column rather than arena scratch: the states are a product another call of the same
+    /// A region rather than arena scratch: the states are a product another call of the same
     /// request reads, so the region they live in must be the runner's for as long as it serves
     /// rather than a reservation the captured graph happens to address. One region holds every
     /// request of the largest bucket this runner stages, one request's rows after another.
-    hidden: Column,
+    ///
+    /// **On the device, not a column**, because the stack's residual stream is these rows: every
+    /// layer reads and writes them, and in pinned host memory each normalization took 1.7 ms.
+    hidden: Region,
 }
 
 impl EncoderColumns {
@@ -87,7 +90,7 @@ impl EncoderColumns {
             seq_lens: Column::new(device, DType::I32, rows64)?,
             query_offsets: Column::new(device, DType::I32, rows64 + 1)?,
             logits_rows: Column::new(device, DType::I32, rows64)?,
-            hidden: Column::new(device, shape.dtype, hidden)?,
+            hidden: Region::new(device, shape.dtype, hidden)?,
         })
     }
 }

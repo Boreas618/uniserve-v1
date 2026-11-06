@@ -487,13 +487,40 @@ fn check_ranges(ranges: &[Range<usize>], rows: usize, name: &str) -> Result<()> 
     Ok(())
 }
 
+/// Each condition's rows of `product`, in request order, `width` elements to a row.
+///
+/// The ranges were checked not to overlap, which is what lets every decoder hold its own rows at
+/// once.
+fn rows_of<'a, T>(
+    product: Option<&'a mut [T]>,
+    ranges: impl Iterator<Item = Range<usize>>,
+    width: usize,
+) -> Vec<Option<&'a mut [T]>> {
+    let mut ordered: Vec<(usize, Range<usize>)> = ranges.enumerate().collect();
+    let mut rows: Vec<Option<&'a mut [T]>> = Vec::new();
+    rows.resize_with(ordered.len(), || None);
+    let Some(mut rest) = product else {
+        return rows;
+    };
+    ordered.retain(|(_, range)| !range.is_empty());
+    ordered.sort_by_key(|(_, range)| range.start);
+    let mut cursor = 0;
+    for (index, range) in ordered {
+        let (_, tail) = rest.split_at_mut((range.start - cursor) * width);
+        let (own, tail) = tail.split_at_mut(range.len() * width);
+        rows[index] = Some(own);
+        rest = tail;
+        cursor = range.end;
+    }
+    rows
+}
+
 /// Decodes every condition into its rows of the products.
 ///
-/// Every reference video's FFmpeg decode runs on a thread of its own from the
-/// start, beside the library's decoders on this thread: each image and audio
-/// track in request order, then each video's frames once they arrived. A
-/// video's first `vae_frames` frames fill its pixel rows; all `frames` frames
-/// are returned, because the vision packer reads the frames past the product.
+/// Every condition decodes on a thread of its own, the conditions being independent: each reference
+/// video's FFmpeg decode, each image and each audio track. A video's first `vae_frames` frames fill
+/// its pixel rows once they arrive; all `frames` frames are returned, because the vision packer
+/// reads the frames past the product.
 ///
 /// # Errors
 ///
@@ -505,8 +532,8 @@ pub fn read_conditions(
     conditions: &[ConditionRead<'_>],
     products: &mut ConditionProducts<'_>,
 ) -> Result<Vec<Option<DecodedVideo>>> {
-    let mut pixels = products.pixels.as_deref_mut();
-    let mut samples = products.samples.as_deref_mut();
+    let pixels = products.pixels.as_deref_mut();
+    let samples = products.samples.as_deref_mut();
 
     // Every condition's rows must be what its plan decodes to, and together
     // the conditions must fill each product exactly (`Conditions.rows`).
@@ -623,38 +650,40 @@ pub fn read_conditions(
             }
         }
 
-        // Decode the images and audio tracks in request order on this thread,
-        // as the reference's media thread does.
-        for condition in conditions {
+        // Each image and audio track on a thread of its own: an enlarged image and a track's
+        // decoding share nothing, and a request waits for the last of them.
+        let mut pixels = rows_of(pixels, conditions.iter().map(|c| c.pixels.clone()), 3);
+        let mut samples = rows_of(samples, conditions.iter().map(|c| c.samples.clone()), 2);
+        let mut decoders = Vec::with_capacity(conditions.len());
+        for (index, condition) in conditions.iter().enumerate() {
             if let Some(plan) = condition.image {
-                let product = pixels.as_deref_mut().ok_or_else(|| {
+                let out = pixels[index].take().ok_or_else(|| {
                     Error::Plan("a condition's pixels have no product".to_owned())
                 })?;
-                let encoded = encoded_bytes(&condition.source)?;
-                read_image(
-                    &encoded,
-                    &plan,
-                    &mut product[condition.pixels.start * 3..condition.pixels.end * 3],
-                )?;
+                decoders.push(scope.spawn(move || {
+                    read_image(&encoded_bytes(&condition.source)?, &plan, out)
+                }));
             }
             if let Some(plan) = condition.audio {
-                let product = samples.as_deref_mut().ok_or_else(|| {
+                let out = samples[index].take().ok_or_else(|| {
                     Error::Plan("a condition's samples have no product".to_owned())
                 })?;
-                let encoded = encoded_bytes(&condition.source)?;
-                read_audio(
-                    &encoded,
-                    &plan,
-                    &mut product[condition.samples.start * 2..condition.samples.end * 2],
-                )?;
+                decoders.push(scope.spawn(move || {
+                    read_audio(&encoded_bytes(&condition.source)?, &plan, out)
+                }));
             }
+        }
+        for decoder in decoders {
+            decoder
+                .join()
+                .map_err(|_| Error::Codec("a condition's decoding thread failed".to_owned()))??;
         }
 
         // The videos' frames arrive after the library's decoders; copy each
         // video's encoded prefix into its pixel rows and hand the whole
         // buffer back.
         let mut decoded = Vec::with_capacity(conditions.len());
-        for (condition, handle) in conditions.iter().zip(videos) {
+        for (index, (condition, handle)) in conditions.iter().zip(videos).enumerate() {
             let Some(handle) = handle else {
                 decoded.push(None);
                 continue;
@@ -665,11 +694,10 @@ pub fn read_conditions(
             let clip = condition
                 .video
                 .ok_or_else(|| Error::Codec("a video condition has no clip".to_owned()))?;
-            let product = pixels
-                .as_deref_mut()
+            let product = pixels[index]
+                .take()
                 .ok_or_else(|| Error::Plan("a condition's pixels have no product".to_owned()))?;
-            product[condition.pixels.start * 3..condition.pixels.end * 3]
-                .copy_from_slice(&frames[..condition.pixels.len() * 3]);
+            product.copy_from_slice(&frames[..condition.pixels.len() * 3]);
             decoded.push(Some(DecodedVideo {
                 clip,
                 pixels: frames,

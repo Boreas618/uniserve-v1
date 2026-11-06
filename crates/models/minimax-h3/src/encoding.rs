@@ -92,6 +92,22 @@ impl ConditionFormat {
     }
 }
 
+/// The threads a host stage on a request's critical path shares its work over.
+fn workers() -> usize {
+    std::thread::available_parallelism().map_or(1, |count| count.get().min(16))
+}
+
+/// Runs `work` over `items`, a run of them on each of `workers` threads.
+fn share<T: Send>(items: &mut [T], workers: usize, work: impl Fn(&mut T) + Sync) {
+    let run = items.len().div_ceil(workers.max(1)).max(1);
+    let work = &work;
+    std::thread::scope(|scope| {
+        for items in items.chunks_mut(run) {
+            scope.spawn(move || items.iter_mut().for_each(work));
+        }
+    });
+}
+
 impl nn::capability::MediaFormat for ConditionFormat {
     fn condition_pixels(
         &self,
@@ -112,16 +128,41 @@ impl nn::capability::MediaFormat for ConditionFormat {
             )));
         }
         // `[frames, rows, columns, 3]` to `[3, frames, rows, columns]`, each byte through the
-        // normalisation the reference applies in FP32.
-        for frame in 0..frames {
-            for pixel in 0..area {
-                let source = (frame * area + pixel) * channels;
-                let values = normalize([rgb[source], rgb[source + 1], rgb[source + 2]]);
-                for (channel, value) in values.iter().enumerate() {
-                    out[(channel * frames + frame) * area + pixel] = *value;
-                }
+        // normalisation the reference applies in FP32. A byte has 256 values, so the normalisation
+        // is a table of them, and a frame's pixels are shared out in bands: this runs on a request's
+        // critical path, and a reference image at its encoding size is twenty million elements.
+        let mut table = [[0.0_f32; 256]; 3];
+        for byte in 0..=u8::MAX {
+            let values = normalize([byte; 3]);
+            for (channel, value) in values.iter().enumerate() {
+                table[channel][usize::from(byte)] = *value;
             }
         }
+        let table = &table;
+        let workers = workers();
+        let band = area.div_ceil(workers.div_ceil(frames.max(1))).max(1);
+        let mut planes: Vec<_> = out.chunks_mut(area).map(|plane| plane.chunks_mut(band)).collect();
+        let mut bands = Vec::new();
+        for frame in 0..frames {
+            let mut first = frame * area;
+            while let (Some(red), Some(green), Some(blue)) = (
+                planes[frame].next(),
+                planes[frames + frame].next(),
+                planes[2 * frames + frame].next(),
+            ) {
+                let pixels = red.len();
+                bands.push((first, red, green, blue));
+                first += pixels;
+            }
+        }
+        share(&mut bands, workers, |(first, red, green, blue)| {
+            let source = &rgb[*first * channels..(*first + red.len()) * channels];
+            for (index, pixel) in source.chunks_exact(channels).enumerate() {
+                red[index] = table[0][usize::from(pixel[0])];
+                green[index] = table[1][usize::from(pixel[1])];
+                blue[index] = table[2][usize::from(pixel[2])];
+            }
+        });
         Ok(())
     }
 
@@ -176,31 +217,42 @@ impl nn::capability::MediaFormat for ConditionFormat {
         let mean = self.pixels.mean.map(|value| value * 255.0);
         let std = self.pixels.std.map(|value| value * 255.0);
         let (patch, merge, temporal) = (patch as usize, merge as usize, temporal as usize);
-        let mut at = 0_usize;
-        for step in 0..time as usize {
-            for block_row in 0..rows as usize / merge {
-                for block_column in 0..columns as usize / merge {
-                    for merge_row in 0..merge {
-                        for merge_column in 0..merge {
-                            let top = (block_row * merge + merge_row) * patch;
-                            let left = (block_column * merge + merge_column) * patch;
-                            for channel in 0..channels {
-                                for offset in 0..temporal {
-                                    // A short temporal patch repeats the last frame: one image is
-                                    // one frame repeated.
-                                    let frame = (step * temporal + offset).min(frames as usize - 1);
-                                    let plane = (frame * channels + channel) * area;
-                                    for y in 0..patch {
-                                        let line = plane + (top + y) * width + left;
-                                        for x in 0..patch {
-                                            let value = (f32::from(planes[line + x])
-                                                - mean[channel])
-                                                / std[channel];
-                                            let bits = bfloat16(value).to_le_bytes();
-                                            out[at] = bits[0];
-                                            out[at + 1] = bits[1];
-                                            at += 2;
-                                        }
+        // A byte has 256 values, so a channel's normalised BF16 is a table of them.
+        let mut table = vec![[0_u8; 2]; channels * 256];
+        for channel in 0..channels {
+            for byte in 0..=u8::MAX {
+                table[channel * 256 + usize::from(byte)] =
+                    bfloat16((f32::from(byte) - mean[channel]) / std[channel]).to_le_bytes();
+            }
+        }
+        let table = &table;
+        // One band is one temporal patch's row of merge blocks: its bytes follow its predecessor's,
+        // so the bands are shared out as they lie in `out`.
+        let block_rows = rows as usize / merge;
+        let block_columns = columns as usize / merge;
+        let band = patches / (time as usize * block_rows) * width_bytes;
+        let mut bands: Vec<(usize, &mut [u8])> = out.chunks_mut(band).enumerate().collect();
+        share(&mut bands, workers(), |(index, out)| {
+            let (step, block_row) = (*index / block_rows, *index % block_rows);
+            let mut at = 0_usize;
+            for block_column in 0..block_columns {
+                for merge_row in 0..merge {
+                    for merge_column in 0..merge {
+                        let top = (block_row * merge + merge_row) * patch;
+                        let left = (block_column * merge + merge_column) * patch;
+                        for channel in 0..channels {
+                            for offset in 0..temporal {
+                                // A short temporal patch repeats the last frame: one image is one
+                                // frame repeated.
+                                let frame = (step * temporal + offset).min(frames as usize - 1);
+                                let plane = (frame * channels + channel) * area;
+                                for y in 0..patch {
+                                    let line = plane + (top + y) * width + left;
+                                    for x in 0..patch {
+                                        let bits = table[channel * 256 + usize::from(planes[line + x])];
+                                        out[at] = bits[0];
+                                        out[at + 1] = bits[1];
+                                        at += 2;
                                     }
                                 }
                             }
@@ -208,7 +260,7 @@ impl nn::capability::MediaFormat for ConditionFormat {
                     }
                 }
             }
-        }
+        });
         Ok(())
     }
 
@@ -362,6 +414,30 @@ impl Clip {
             return Ok(1);
         }
         Ok(frames.div_ceil(self.frames) * self.latents - self.token_drop)
+    }
+
+    /// The clips a condition of `frames` frames is cut into, in order.
+    ///
+    /// Each clip is encoded alone, as the reference's `clips` and `latent_slices` cut it
+    /// (`encoding.py:125-139`): the frames it reads and the latent frames it writes, the last clip
+    /// holding what is left of both. A still is one clip of one frame.
+    pub fn spans(&self, frames: u32) -> Result<Vec<ClipSpan>> {
+        let total = self.latent_frames(frames)?;
+        let mut spans = Vec::with_capacity(frames.div_ceil(self.frames) as usize);
+        let (mut first, mut latent) = (0, 0);
+        while first < frames {
+            let length = self.frames.min(frames - first);
+            let latents = self.latents.min(total - latent);
+            spans.push(ClipSpan {
+                first,
+                frames: length,
+                latent,
+                latents,
+            });
+            first += length;
+            latent += latents;
+        }
+        Ok(spans)
     }
 }
 
@@ -1458,6 +1534,19 @@ fn distinct(extents: &[Extent]) -> Vec<Extent> {
     seen
 }
 
+/// One clip of a condition: the frames it reads and the latent frames it writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ClipSpan {
+    /// The clip's first frame.
+    pub first: u32,
+    /// Its frames.
+    pub frames: u32,
+    /// The first latent frame it writes.
+    pub latent: u32,
+    /// The latent frames it writes.
+    pub latents: u32,
+}
+
 /// The buffers one tile extent's encode works in, reserved once for a whole run of tiles.
 ///
 /// A run's tiles are not uniform - the right and bottom edges of a grid are shorter - so a scratch holds
@@ -1864,9 +1953,9 @@ impl VideoEncoder {
                 self.stack.input_channels
             )));
         }
-        if frames != 1 && frames != u64::from(self.stack.clip.frames) {
+        if frames == 0 || frames > u64::from(self.stack.clip.frames) {
             return Err(Error::config(format!(
-                "a video encoder reads one still (one frame) or one {}-frame clip, not {frames}",
+                "a video encoder reads one still or one clip of at most {} frames, not {frames}",
                 self.stack.clip.frames
             )));
         }
@@ -1936,6 +2025,11 @@ impl VideoEncoder {
     /// cut and padded, not generated.
     pub fn latent_frames(&self, frames: u32) -> Result<u32> {
         self.stack.clip.latent_frames(frames)
+    }
+
+    /// The clips a **condition** of `frames` frames is cut into, in order ([`Clip::spans`]).
+    pub fn clips(&self, frames: u32) -> Result<Vec<ClipSpan>> {
+        self.stack.clip.spans(frames)
     }
 
     /// Project the stitched moments to the posterior's two fields: one call, after the stitch.
@@ -2947,12 +3041,12 @@ pub fn video_encoder_run_arena(
 ///
 /// `extents` are the tile extents the run reserves, one per distinct extent; their first is the
 /// tile whose latent size the stitcher's block is taken from, because a run's tiles are uniform and
-/// `Scene::encode` refuses a run whose tiles are not. `columns` is the grid's tile columns and
+/// `Scene::encode` refuses a run whose tiles are not. `tiles` is the grid's tiles and
 /// `latent_frames` the raster's frame extent - the stitcher blends the raster the caller funds.
 pub fn video_raster_arena(
     config: &VideoVaeConfig,
     extents: &[Extent],
-    columns: usize,
+    tiles: usize,
     latent_frames: u32,
 ) -> Result<Vec<crate::decoding::Buffer>> {
     let mut plan = video_encoder_run_arena(config, extents)?;
@@ -2961,7 +3055,7 @@ pub fn video_raster_arena(
         .ok_or_else(|| Error::config("a raster plan without a tile".to_owned()))?;
     plan.extend(crate::tiled_encode::stitch_arena(
         config,
-        columns,
+        tiles,
         u64::from(latent_frames),
         u64::from(tile.height / SPATIAL_RATIO),
         u64::from(tile.width / SPATIAL_RATIO),
@@ -3426,15 +3520,7 @@ mod tests {
         let names: Vec<&str> = raster.iter().map(|buffer| buffer.name.as_str()).collect();
         assert_eq!(
             names[set.len()..],
-            [
-                "stitch.ring0.0",
-                "stitch.ring0.1",
-                "stitch.ring0.2",
-                "stitch.ring1.0",
-                "stitch.ring1.1",
-                "stitch.ring1.2",
-                "stitch.handed",
-            ],
+            ["stitch.tiles", "stitch.handed"],
             "the stitcher's blocks follow the set in `encode`'s own order"
         );
         assert!(
@@ -3976,6 +4062,39 @@ mod tests {
             width: 48,
         };
         assert!(conditioning_arena(&config, 1, odd).is_err());
+    }
+
+    /// A condition's clips cover its frames and its latent frames, whole clips and then what is
+    /// left, the reference's `clips` and `latent_slices`.
+    #[test]
+    fn a_condition_is_cut_into_its_clips() {
+        let clip = encoder_stack().clip;
+        assert_eq!(
+            clip.spans(1).unwrap(),
+            [ClipSpan {
+                first: 0,
+                frames: 1,
+                latent: 0,
+                latents: 1
+            }]
+        );
+        let video = clip.spans(39).unwrap();
+        assert_eq!(video.len(), 3);
+        assert_eq!(
+            video[2],
+            ClipSpan {
+                first: 34,
+                frames: 5,
+                latent: 10,
+                latents: 2
+            }
+        );
+        for frames in [22, 39, 56, 124, 362] {
+            let spans = clip.spans(frames).unwrap();
+            let last = spans.last().unwrap();
+            assert_eq!(last.first + last.frames, frames);
+            assert_eq!(last.latent + last.latents, clip.latent_frames(frames).unwrap());
+        }
     }
 
     #[test]
