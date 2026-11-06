@@ -660,7 +660,7 @@ mod tests {
     fn packed(n: u64, k: u64, layout: ScaleLayout) -> QuantizedWeight {
         QuantizedWeight {
             packed: weight(DType::U8, &[n, k / 2]),
-            scales: weight(DType::U8, layout.shape(n, k).dims()),
+            scales: weight(DType::F8E4M3, layout.shape(n, k).dims()),
             global_scale: 0.125,
             layout,
             input_scale: Some(weight(DType::F32, &[1])),
@@ -691,8 +691,9 @@ mod tests {
     /// product's own check, called here as the descriptor is built.
     #[test]
     fn a_scales_plane_declared_as_bytes_is_refused_where_the_key_is_built() {
-        // The fixture's scales plane is `U8`, which is the wrong declaration this test needs.
-        let scales = packed(8, 64, ScaleLayout::Swizzled128X4);
+        let layout = ScaleLayout::Swizzled128X4;
+        let mut scales = packed(8, 64, layout);
+        scales.scales = weight(DType::U8, layout.shape(8, 64).dims());
         let projection =
             Nvfp4Linear::new(&scales, None, ScaleLayout::Swizzled128X4, DType::BF16, 128).unwrap();
         let error = projection
