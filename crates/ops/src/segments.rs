@@ -445,8 +445,8 @@ impl Op for VsaComposeGatedRows {
             .i32(stride(&args.fine, 1)?)
             .i32(stride(&args.gate, 0)?)
             .i32(stride(&args.gate, 1)?)
-            .i32(stride(&args.compressed, 1)?)
             .i32(stride(&args.compressed, 0)?)
+            .i32(stride(&args.compressed, 1)?)
             .i64(args.owner_rows as i64)
             .i64(args.start as i64)
             .i64(args.count as i64);
