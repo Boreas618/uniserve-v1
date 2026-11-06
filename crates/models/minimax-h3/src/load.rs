@@ -839,8 +839,9 @@ pub fn load(
                 // Weightless: the splice's only constants are the reference's ImageNet means and standard
                 // deviations, uploaded once as the two `[3]` weights the byte step reads. It reads and
                 // writes the video decoder's rasters, so it holds their element type - the decoder's,
-                // which is the checkpoint's, not a constant here.
-                let dtype = deployment(Component::VideoDecoder)?;
+                // which is the type the checkpoint stores it in whatever the deployment states for
+                // the rest of the pipeline.
+                let dtype = stored_dtype(checkpoint, Component::VideoDecoder.directories()[0])?;
                 let bytes = |values: [f32; 3]| -> Vec<u8> {
                     values
                         .iter()
