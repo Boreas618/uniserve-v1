@@ -183,11 +183,15 @@ impl Op for CopyBlock {
         // is one parameter more than the kernel has, which reaches the driver as an unnamed argument
         // rather than as a refusal.
         arguments.u64(elements).u32(COPY).flag(false);
-        kernel.launch(
-            LaunchGrid::covering(elements, u64::from(COPY))?,
-            &mut arguments,
-            stream,
-        )
+        // A last axis one program wide or more is walked a row at a time (the package's fast path),
+        // so the grid counts each row's blocks rather than the elements.
+        let grid = if extents[3] >= u64::from(COPY) {
+            let rows = extents[0] * extents[1] * extents[2];
+            LaunchGrid::linear(rows * extents[3].div_ceil(u64::from(COPY)))?
+        } else {
+            LaunchGrid::covering(elements, u64::from(COPY))?
+        };
+        kernel.launch(grid, &mut arguments, stream)
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {

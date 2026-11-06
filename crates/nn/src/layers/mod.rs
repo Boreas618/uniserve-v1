@@ -87,7 +87,7 @@ pub use rotate::Rotate;
 pub use rows::Rows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use segment::{SegmentAttention, SegmentTables};
-pub use segments::VsaTiles;
+pub use segments::{SELECT_FLOOR, VsaTiles};
 pub use transpose::Transpose;
 pub use unpatchify::UnpatchifyVideo;
 

@@ -36,6 +36,9 @@ use crate::weights::Weight;
 /// The rows one tile holds: the block size VSA selects with.
 const DEFAULT_TILE: u32 = 64;
 
+/// The fewest lanes a selection is compiled with, however few tiles a layout holds.
+pub const SELECT_FLOOR: u32 = 256;
+
 /// The tile-selection layer of a video sparse attention block.
 pub struct VsaTiles {
     tile_rows: u32,
@@ -673,10 +676,8 @@ impl VsaTiles {
             ));
         }
         let tiles = scores.shape.dim(2);
-        // The compiled lane width is the deployment's tile **bound**, not this request's count: the
-        // count travels as the package's `tiles` argument, and a program built for the bound ranks
-        // any request up to it. One class per deployment, and the launch refuses a request the bound
-        // cannot cover rather than compiling a module for it.
+        // A layout past the deployment's bound has no scratch sized for it, so it is refused here
+        // rather than compiled for.
         if self.max_tiles == 0 {
             return Err(Error::shape(
                 "VsaTiles",
@@ -693,7 +694,10 @@ impl VsaTiles {
                 ),
             ));
         }
-        let descriptor = self.select_descriptor(u64::from(self.max_tiles))?;
+        // The lanes are this layout's own tiles, not the deployment's bound: a graph is captured for
+        // one layout, and a program over the bound's lanes ranks and masks them all for every query
+        // tile of every head.
+        let descriptor = self.select_descriptor(tiles.max(u64::from(SELECT_FLOOR)))?;
         let args = segments::SelectTilesArgs {
             scores,
             segments,

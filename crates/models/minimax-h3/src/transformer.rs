@@ -646,6 +646,15 @@ impl Transformer {
             programs.launch::<ops::segments::VsaAddGatedTiles>(
                 &tiles_layer.add_gated_tiles_descriptor(dtype),
             );
+            // One program per power of two a layout's tiles can round to: the selection is compiled
+            // for the layout it serves rather than for the deployment's bound.
+            let mut lanes = nn::layers::SELECT_FLOOR;
+            while lanes < tiles.next_power_of_two() {
+                programs.launch::<ops::segments::VsaSelectTiles>(
+                    &tiles_layer.select_descriptor(u64::from(lanes))?,
+                );
+                lanes *= 2;
+            }
             programs.launch::<ops::segments::VsaSelectTiles>(
                 &tiles_layer.select_descriptor(u64::from(tiles))?,
             );
