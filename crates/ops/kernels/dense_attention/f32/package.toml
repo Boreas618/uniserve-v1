@@ -63,9 +63,14 @@ architectures = ["sm_100a", "sm_100f"]
 
 # `dtype_f32_kv_f32_out_f32_head_dim_64_q_heads_8_kv_heads_8_mask_dense_window_false`
 # — the audio encoder's shape in the operator's own test — is one of these cells, and
-# adding `_cu_seq_lens_false` is the one-sequence form of it.
-[kernel.descriptors]
+# adding `_cu_seq_lens_false` is the one-sequence form of it. `ops` prints that field only for
+# the form without sequence offsets, so the two forms are two key shapes of this one backend.
+[[kernel.descriptors]]
+dimensions = { dtype = ["f32"], kv = ["f32"], out = ["f32"], head_dim = ["64", "72", "128", "256"], q_heads = ["8", "16", "24", "32", "56", "64"], kv_heads = ["1", "2", "4", "8", "16", "32", "56"], mask = ["causal", "dense"], window = ["false", "true"] }
+
+[[kernel.descriptors]]
 dimensions = { dtype = ["f32"], kv = ["f32"], out = ["f32"], head_dim = ["64", "72", "128", "256"], q_heads = ["8", "16", "24", "32", "56", "64"], kv_heads = ["1", "2", "4", "8", "16", "32", "56"], mask = ["causal", "dense"], window = ["false", "true"], cu_seq_lens = ["false"] }
+
 [parameters]
 # The work item this backend is built for: query rows per tile. The script compiles
 # the mask and the sequence form only, so this names the shape the module is

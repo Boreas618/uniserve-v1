@@ -148,8 +148,11 @@ def main():
     package, descriptor, target, out = arguments()
     manifest = manifest_of(package)
     entry = launch_entry(manifest)
-    dimensions = manifest["kernel"]["descriptors"]["dimensions"]
-    named = split(descriptor, dimensions.keys())
+    # A key's fields are one of the package's two shapes, so its names are their union.
+    shapes = manifest["kernel"]["descriptors"]
+    named = split(
+        descriptor, {name for shape in shapes for name in shape["dimensions"]}
+    )
 
     for field in ("dtype", "kv", "out"):
         if named[field] != "f32":

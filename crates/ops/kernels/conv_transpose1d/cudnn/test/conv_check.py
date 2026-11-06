@@ -4,10 +4,11 @@
     python conv_check.py <module_dir> --op conv3d --tf32 false
     python conv_check.py <module_dir> --op conv1d --dtype bf16 --groups 1
     python conv_check.py <module_dir> --op conv_transpose1d --stride 2
+    python conv_check.py <module_dir> --op conv3d --channels-last true
 
 ``<module_dir>`` is what ``resolve`` hands a runner: the directory holding
 ``module.so``. The module is loaded as a runner loads it, called with the call
-structure of ``crates/ops/src/conv.rs`` (732 bytes, ``error`` at 216), and
+structure of ``crates/ops/src/conv.rs`` (728 bytes, ``error`` at 216), and
 compared with ``torch.nn.functional``'s convolution in FP64.
 
 The tolerance is the operator's, not a guess: `conv.rs::tolerance` declares
@@ -22,6 +23,10 @@ products. Two things this check makes visible rather than hides:
   the FP32 one.
 * A ``bf16``/``f16`` convolution keeps the same bound with ``u_out`` of its own
   element type.
+
+``--channels-last true`` stores the input and the output with the channel axis fastest and leaves
+the filter packed, which is the order `conv.rs` declares. A bias is on by default, so that run also
+reads the bias against the output's order.
 
 ``--expect-refusal <phrase>`` inverts the run: it passes when the entry refuses the
 call with a message containing the phrase, and fails when the call is served. That is
@@ -134,6 +139,12 @@ def main() -> int:
     parser.add_argument("--groups", type=int, default=1)
     parser.add_argument("--bias", choices=["true", "false"], default="true")
     parser.add_argument(
+        "--channels-last",
+        choices=["true", "false"],
+        default="false",
+        help="store the input and the output with the channel axis fastest",
+    )
+    parser.add_argument(
         "--expect-key",
         default=None,
         help="the descriptor key the module was built for, to check the flags against",
@@ -190,21 +201,42 @@ def main() -> int:
     dtype = TORCH_TYPES[arguments.dtype]
     spatial = [arguments.length] * rank
 
-    def axes(text):
-        """The three-axis geometry array a call passes, from the flag's triplet."""
+    def axes(text, unit=1):
+        """The three-axis geometry array a call passes, from the flag's triplet.
+
+        ``unit`` is what an axis the flag leaves out takes: 1 for a filter, a stride and a dilation,
+        and 0 for a padding, because `conv.rs`'s 1-d geometry pads only its length.
+        """
         parts = [int(part) for part in text.split("x")]
-        return parts + [1] * (3 - len(parts))
+        return parts + [unit] * (3 - len(parts))
 
     kernel = axes(arguments.kernel)[:rank]
     stride = axes(arguments.stride)[:rank]
-    padding = axes(arguments.padding)[:rank]
+    padding = axes(arguments.padding, 0)[:rank]
     dilation = axes(arguments.dilation)[:rank]
     input_channels = arguments.channels
     out_channels = arguments.out_channels
     group_channels = input_channels // arguments.groups
 
-    x = torch.randn(
-        arguments.batch, input_channels, *spatial, dtype=dtype, device=device
+    def stored(tensor):
+        """The tensor in the storage the call's order names; its logical shape does not move."""
+        if arguments.channels_last == "false":
+            return tensor
+        last = tensor.dim() - 1
+        return (
+            tensor.permute(0, *range(2, tensor.dim()), 1)
+            .contiguous()
+            .permute(0, last, *range(1, last))
+        )
+
+    x = stored(
+        torch.randn(
+            arguments.batch,
+            input_channels,
+            *spatial,
+            dtype=dtype,
+            device=device,
+        )
     )
     if arguments.op == "conv_transpose1d":
         weight = torch.randn(
@@ -242,7 +274,7 @@ def main() -> int:
     # The output's own extents, from the reference: the call carries them, and a
     # module that disagreed with them would refuse the launch.
     out_shape = list(expected.shape)
-    out = torch.empty(out_shape, dtype=dtype, device=device)
+    out = stored(torch.empty(out_shape, dtype=dtype, device=device))
 
     def padded(shape):
         """A five-entry extent list: the leading axes, the spatial ones, then ones."""
@@ -259,11 +291,12 @@ def main() -> int:
     call.out_shape = (ctypes.c_int64 * 5)(*padded(out_shape))
     call.kernel = (ctypes.c_int32 * 3)(*axes(arguments.kernel))
     call.stride = (ctypes.c_int32 * 3)(*axes(arguments.stride))
-    call.padding = (ctypes.c_int32 * 3)(*axes(arguments.padding))
+    call.padding = (ctypes.c_int32 * 3)(*axes(arguments.padding, 0))
     call.dilation = (ctypes.c_int32 * 3)(*axes(arguments.dilation))
     call.groups = arguments.groups
     call.transposed = 1 if arguments.op == "conv_transpose1d" else 0
     call.tf32 = 1 if arguments.tf32 == "true" else 0
+    call.channels_last = 1 if arguments.channels_last == "true" else 0
 
     stream = torch.cuda.current_stream().cuda_stream
     status = entry(ctypes.byref(call), ctypes.c_void_p(stream))
@@ -289,6 +322,7 @@ def main() -> int:
     largest = expected.abs().max().item()
     print(
         f"{arguments.op}, {arguments.dtype}, tf32 {arguments.tf32}, "
+        f"channels-last {arguments.channels_last}, "
         f"in {tuple(x.shape)} filter {tuple(weight.shape)} out {tuple(out_shape)}, "
         f"{taps} taps"
     )
