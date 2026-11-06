@@ -7046,10 +7046,16 @@ fn schedulers(
         placement: executor::batch::Placement {
             queue_depth: plan.queue_depth(),
             ranks: plan.world_size(),
-            components: engine::ExecutorGroupConfig::single_component(
-                ipc::DEFAULT_COMPONENT,
-                plan.world_size(),
-            ),
+            // Every component the rank reports is placed on the group's ranks. A text rank reports
+            // the one default component, and a media rank one per block of its pipeline, which the
+            // scheduler reads a call's width and owner from.
+            components: rank
+                .components
+                .iter()
+                .flat_map(|component| {
+                    engine::ExecutorGroupConfig::single_component(&component.name, plan.world_size())
+                })
+                .collect(),
         },
         max_model_len: plan.max_kv_len(model)?,
     };
