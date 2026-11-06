@@ -44,6 +44,13 @@ struct Args {
     frames: u32,
     /// The prompt capacity the deployment prepares, which is the layout's text rows.
     text_tokens: Option<u32>,
+    /// The width the runner sizes its conditioning columns at.
+    ///
+    /// One number for both buffers is what `DenoiserShape::width` gives a runner today: the text
+    /// encoder's hidden width. The served walk's stop - `gather_rows: out is [rows, 5376],
+    /// [rows, 5120] expected` - is this width against the rows the denoiser reads, so the walk takes
+    /// it as an input and refuses the pair when they disagree.
+    column_width: Option<u32>,
     ulysses: usize,
     dtype: DType,
 }
@@ -63,6 +70,7 @@ fn run() -> Result<(), String> {
         height: 768,
         frames: 124,
         text_tokens: None,
+        column_width: None,
         ulysses: 1,
         dtype: DType::BF16,
     };
@@ -75,6 +83,9 @@ fn run() -> Result<(), String> {
             "--height" => args.height = number(&value("--height"), "--height")?,
             "--frames" => args.frames = number(&value("--frames"), "--frames")?,
             "--text-tokens" => args.text_tokens = Some(number(&value("--text-tokens"), "--text-tokens")?),
+            "--column-width" => {
+                args.column_width = Some(number(&value("--column-width"), "--column-width")?)
+            }
             "--ulysses" => args.ulysses = number(&value("--ulysses"), "--ulysses")? as usize,
             "--dtype" => {
                 let stated = value("--dtype").to_ascii_lowercase();
@@ -135,10 +146,10 @@ fn run() -> Result<(), String> {
     let layout = layouts.cover(&request);
 
     // 1. The widths the checkpoint states, and the one the model adds to them.
+    let mut disagreements: Vec<String> = Vec::new();
     let transformer = &denoiser.transformer;
     let hidden = u64::from(transformer.hidden_size);
     let text_dim = u64::from(transformer.text_dim);
-    let mut disagreements: Vec<String> = Vec::new();
     println!("widths");
     println!("  hidden_size          {hidden}   (the packed rows, and the stack's own width)");
     println!("  text_dim             {text_dim}   (the text encoder's features)");
@@ -169,6 +180,18 @@ fn run() -> Result<(), String> {
             "  **two widths**: a runner that sizes both from {text_dim} hands the refiner a buffer \
              too narrow for its own output"
         );
+    }
+    // What the runner actually sizes its two columns at, which is the input the served walk met.
+    // One number for both is `DenoiserShape::width`'s answer: the encoder's.
+    let column = u64::from(args.column_width.unwrap_or(transformer.text_dim));
+    println!("  runner columns       text [{column}], source [{column}]");
+    if column != hidden {
+        disagreements.push(format!(
+            "the runner sizes the text column at {column} and the denoiser reads rows {hidden} \
+             wide: `gather_rows` will refuse `out is [rows, {hidden}], [rows, {column}] expected` \
+             - the runner's `text` column takes `Denoiser::text_width`, and the encoder's product \
+             fills `source`"
+        ));
     }
 
     // 2. The layout: a capacity, not a prompt.
