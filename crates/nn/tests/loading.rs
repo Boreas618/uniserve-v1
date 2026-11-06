@@ -670,13 +670,13 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         "one packed table per projection, of two experts each"
     );
     assert_eq!(stack.global_scale.dtype(), DType::F32);
-    // The store received the values in reading order, then the scales, then the reciprocals, then
+    // The store received the values in reading order, then the scales, then the tensor scales, then
     // the stack's encode scale.
     assert_eq!(store.published.len(), 4);
     assert_eq!(store.published[0].1, expected);
     assert_eq!(store.published[0].0.layout, WeightLayout::NVFP4_VALUES);
     assert_eq!(store.published[2].0.layout, WeightLayout::ROW_MAJOR);
-    let reciprocals: Vec<f32> = store.published[2]
+    let tensor_scales: Vec<f32> = store.published[2]
         .1
         .as_chunks::<4>()
         .0
@@ -684,9 +684,9 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
         .map(|word| f32::from_le_bytes(*word))
         .collect();
     assert_eq!(
-        reciprocals,
-        [2.0, 1.0, 2.0, 1.0],
-        "1 / (0.5 · (e + 1)) as one packed row per projection: up's two experts, then gate's"
+        tensor_scales,
+        [0.5, 1.0, 0.5, 1.0],
+        "0.5 · (e + 1) as one packed row per projection: up's two experts, then gate's"
     );
     // The neutral encode scale is one value per stack, published so the encoder reads a device
     // operand: a stack that encodes nothing multiplies by one.
@@ -1018,14 +1018,14 @@ fn shard_with_header(dir: &Path, name: &str, header: &str, payload: &[u8]) -> st
 fn a_header_naming_fp8_and_fp4_opens_with_those_types() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
-    // Four tensors, laid out back to back: 16 packed bytes, 4 block scales, 2 bytes, 4 bf16s.
-    let payload: Vec<u8> = (0..48).map(|byte| byte as u8).collect();
+    // Four tensors, laid out back to back: 8 bytes of sixteen codes, 4 block scales, 2 bytes, 2 bf16s.
+    let payload: Vec<u8> = (0..18).map(|byte| byte as u8).collect();
     let header = concat!(
         r#"{"__metadata__":{"format":"pt"},"#,
-        r#""packed":{"dtype":"F4_E2M1","shape":[2,8],"data_offsets":[0,16]},"#,
-        r#""scales":{"dtype":"F8_E4M3","shape":[4],"data_offsets":[16,20]},"#,
-        r#""pair":{"dtype":"U8","shape":[2],"data_offsets":[20,22]},"#,
-        r#""weight":{"dtype":"BF16","shape":[2],"data_offsets":[22,26]}}"#
+        r#""packed":{"dtype":"F4","shape":[2,8],"data_offsets":[0,8]},"#,
+        r#""scales":{"dtype":"F8_E4M3","shape":[4],"data_offsets":[8,12]},"#,
+        r#""pair":{"dtype":"U8","shape":[2],"data_offsets":[12,14]},"#,
+        r#""weight":{"dtype":"BF16","shape":[2],"data_offsets":[14,18]}}"#
     );
     shard_with_header(root, "model.safetensors", header, &payload);
 
@@ -1033,14 +1033,14 @@ fn a_header_naming_fp8_and_fp4_opens_with_those_types() {
     let packed = checkpoint.read("packed").unwrap();
     assert_eq!(packed.dtype, DType::F4E2M1);
     assert_eq!(packed.shape.dims(), &[2, 8]);
-    assert_eq!(packed.bytes, payload[0..16]);
+    assert_eq!(packed.bytes, payload[0..8]);
     let scales = checkpoint.read("scales").unwrap();
     assert_eq!(scales.dtype, DType::F8E4M3);
-    assert_eq!(scales.bytes, payload[16..20]);
+    assert_eq!(scales.bytes, payload[8..12]);
     assert_eq!(checkpoint.read("pair").unwrap().dtype, DType::U8);
     let weight = checkpoint.read("weight").unwrap();
     assert_eq!(weight.dtype, DType::BF16);
-    assert_eq!(weight.bytes, payload[22..26]);
+    assert_eq!(weight.bytes, payload[14..18]);
 }
 
 /// A dtype name the operator ABI has no type for is refused by name at open, not read as something
@@ -1049,7 +1049,7 @@ fn a_header_naming_fp8_and_fp4_opens_with_those_types() {
 fn a_header_the_abi_cannot_express_is_refused_by_name() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
-    let payload = vec![0u8; 4];
+    let payload = vec![0u8; 1];
     shard_with_header(
         root,
         "model.safetensors",
@@ -1068,14 +1068,14 @@ fn a_header_the_abi_cannot_express_is_refused_by_name() {
     shard_with_header(
         root,
         "model.safetensors",
-        r#"{"weight":{"dtype":"BF16","shape":[8],"data_offsets":[0,64]}}"#,
+        r#"{"weight":{"dtype":"BF16","shape":[32],"data_offsets":[0,64]}}"#,
         &payload,
     );
     let text = match Checkpoint::open(root) {
-        Ok(_) => panic!("the payload is four bytes"),
+        Ok(_) => panic!("the payload is one byte"),
         Err(error) => format!("{error}"),
     };
-    assert!(text.contains("claims bytes"), "{text}");
+    assert!(text.contains("not fully covered"), "{text}");
 }
 
 /// A real NVFP4 export stores its block scales as `F8_E4M3`, one byte per sixteen elements: the

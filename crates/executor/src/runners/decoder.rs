@@ -816,12 +816,31 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 },
             )
             .map_err(Error::from)?;
-        self.splice_clip(&forward, bucket, &layout)?;
         if first {
             self.pool()?
                 .record(self.stream_id(), bucket, arena.used())?;
         }
         Ok(())
+    }
+
+    /// Splices the clip a replay just decoded, on the stream that replayed it.
+    ///
+    /// This is not part of the walk. A graph holds one bucket's decode, and a splice belongs to a
+    /// request: which clip of the timeline this is, how many frames it keeps and how many it fades
+    /// are that request's, and they change from clip to clip, so a capture has none to record. The
+    /// stream's order is what lets it read the raster the graph wrote.
+    fn splice_replayed(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
+        if self.postprocessor.is_none() {
+            return Ok(());
+        }
+        let kernels = self.lifecycle.generation_named(generation)?;
+        let stream = self.stream.clone();
+        let base = self.pool()?.base(self.stream_id())?;
+        let reserved = self.pool()?.reserved();
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let forward = nn::Forward::new(&stream, &kernels, &arena);
+        let layout = self.layout(bucket)?;
+        self.splice_clip(&forward, bucket, &layout)
     }
 
     /// Writes the clip a replay just decoded into its request's timeline.
@@ -1171,6 +1190,7 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
                 if let Some(counters) = &self.counters {
                     counters.launches(captured.kernel_nodes());
                 }
+                self.splice_replayed(*bucket, *generation)?;
                 // The clip is written by the graph that just launched, and the stream's order is
                 // what makes the view readable: a reader's copy is issued after this one.
                 self.publish(*bucket)?;
