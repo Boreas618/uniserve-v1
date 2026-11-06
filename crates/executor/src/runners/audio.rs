@@ -27,7 +27,7 @@ use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchOutput, Job, Jobs};
+use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
 use crate::plan::{Bucket, Buckets, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
@@ -71,6 +71,8 @@ pub struct AudioDecoderRunner<M: Decoder + Send + Sync> {
     dtype: DType,
     columns: AudioColumns,
     /// The bucket the columns are staged for, so a capture knows what it walked.
+    /// The calls of the batch staged last, which its replay answers.
+    calls: Vec<CallId>,
     staged: Option<Bucket>,
     /// The epoch's product store, or `None` when the executor attached none. A decode then stages no
     /// latents and publishes nothing, and a reader refuses by name rather than reading a column's
@@ -145,6 +147,7 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
             layouts,
             dtype,
             columns,
+            calls: Vec::new(),
             staged: None,
             products: None,
             staged_request: None,
@@ -415,6 +418,7 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
             ))
         })?;
         self.stage(&batch, bucket)?;
+        self.calls.clone_from(&batch.calls);
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
             bucket,
@@ -518,7 +522,7 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
                 // what makes the view readable: a reader's copy is issued after this one.
                 self.publish(*bucket)?;
                 Ok(BatchOutput {
-                    calls: Vec::new(),
+                    calls: answered(&mut self.calls),
                     timing: ipc::TimingCounters {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()

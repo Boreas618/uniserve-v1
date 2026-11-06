@@ -38,7 +38,7 @@ use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchOutput, Job, Jobs};
+use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
 use crate::plan::{Bucket, Buckets, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
@@ -127,6 +127,8 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     dtype: DType,
     columns: DecoderColumns,
     /// The bucket the columns are staged for, so a capture of a canvas knows how far they run.
+    /// The calls of the batch staged last, which its replay answers.
+    calls: Vec<CallId>,
     staged: Option<Bucket>,
     /// The raster's element count for the bucket staged last: a clip's raster is a function of its
     /// bucket, and the column is sized for the largest one.
@@ -258,6 +260,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             layouts,
             dtype,
             columns,
+            calls: Vec::new(),
             staged: None,
             raster_elements: 0,
             products: None,
@@ -1087,6 +1090,7 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
             ))
         })?;
         self.stage(&batch, bucket)?;
+        self.calls.clone_from(&batch.calls);
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
             bucket,
@@ -1198,7 +1202,7 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
                 // launched: the stream's order is what makes it readable, and the completion that
                 // turns it into an artifact is the transport's rather than this step's.
                 Ok(BatchOutput {
-                    calls: Vec::new(),
+                    calls: answered(&mut self.calls),
                     timing: ipc::TimingCounters {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()
