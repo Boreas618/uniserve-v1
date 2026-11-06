@@ -40,7 +40,7 @@ use serde_json::Value;
 
 use models::ModelDescription;
 
-pub use args::{FLAG_PATHS, ServeArgs, Stated, overridden, printed, resolve_text};
+pub use args::{FLAG_PATHS, Listen, ServeArgs, Stated, overridden, printed, resolve_text};
 pub use values::{ChatTemplateContentFormatOption, ImageSize};
 
 /// Environment variable read for the API key when `server_config.api_key`
@@ -220,6 +220,10 @@ pub struct ServeConfig {
     /// the leader binds; required with several nodes.
     pub dist_init_addr: Option<String>,
     pub server_config: ServerOptions,
+    /// The daemon's own HTTP server (`admin_config`): the address this node's
+    /// admin API listens on (design §7.7). The application's server is
+    /// `server_config`'s, which the frontend reads.
+    pub admin_config: AdminOptions,
     pub load_config: LoadOptions,
     pub kv_cache_config: KvCacheOptions,
     pub scheduler_config: SchedulerOptions,
@@ -267,6 +271,7 @@ impl Default for ServeConfig {
             node_rank: 0,
             dist_init_addr: None,
             server_config: ServerOptions::default(),
+            admin_config: AdminOptions::default(),
             load_config: LoadOptions::default(),
             kv_cache_config: KvCacheOptions::default(),
             scheduler_config: SchedulerOptions::default(),
@@ -317,6 +322,32 @@ pub struct ServerOptions {
     /// Add an `X-Request-Id` response header with the ID the request ran
     /// under.
     pub request_id_headers: bool,
+}
+
+/// The daemon's HTTP server (`admin_config`): the address this node's admin
+/// API listens on (design §7.7). The application's own server is
+/// `server_config`'s; the two are separate options so the management API and
+/// the application API can listen at different addresses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AdminOptions {
+    /// TCP address the server listens on.
+    pub host: String,
+    /// TCP port the server listens on.
+    pub port: u16,
+    /// Unix domain socket to listen on instead of TCP; a stale socket file
+    /// is replaced and the socket file is removed at shutdown.
+    pub uds: Option<String>,
+}
+
+impl Default for AdminOptions {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_owned(),
+            port: 8000,
+            uds: None,
+        }
+    }
 }
 
 impl Default for ServerOptions {
@@ -910,6 +941,7 @@ impl Default for MigrationOptions {
 pub fn with_daemon_options(current: &ServeConfig, target: &ServeConfig) -> ServeConfig {
     ServeConfig {
         server_config: target.server_config.clone(),
+        admin_config: target.admin_config.clone(),
         logging_config: target.logging_config.clone(),
         chat_config: target.chat_config.clone(),
         image_fetch_config: target.image_fetch_config.clone(),
@@ -927,6 +959,7 @@ pub fn with_daemon_options(current: &ServeConfig, target: &ServeConfig) -> Serve
 /// daemon applies; the engine spec covers every other option.
 pub fn daemon_options_differ(current: &ServeConfig, target: &ServeConfig) -> bool {
     current.server_config != target.server_config
+        || current.admin_config != target.admin_config
         || current.logging_config != target.logging_config
         || current.chat_config != target.chat_config
         || current.image_fetch_config != target.image_fetch_config
@@ -1289,6 +1322,19 @@ impl ServeConfig {
                 "`server_config.host` must not be empty"
             ),
         }
+        // The daemon binds `admin_config`'s address, so an empty one fails
+        // here rather than at the bind.
+        let admin = &self.admin_config;
+        match &admin.uds {
+            Some(path) => anyhow::ensure!(
+                !path.trim().is_empty(),
+                "`admin_config.uds` must not be empty"
+            ),
+            None => anyhow::ensure!(
+                !admin.host.trim().is_empty(),
+                "`admin_config.host` must not be empty"
+            ),
+        }
         // A smaller capacity admits no request and a larger one exceeds what
         // the video API accepts.
         let seconds = MIN_VIDEO_SECONDS..=MAX_VIDEO_SECONDS;
@@ -1344,7 +1390,6 @@ impl ServeConfig {
     /// `u32` fields; and when the deployment file cannot be read.
     pub fn engine_spec(&self) -> anyhow::Result<wire::EngineSpec> {
         let graphs = &self.cuda_graph_config;
-        let flashinfer = &self.flashinfer_config;
         let kv_cache = &self.kv_cache_config;
         let worker = &self.worker_config;
         let text = |path: &Option<PathBuf>| {
@@ -1357,7 +1402,6 @@ impl ServeConfig {
                 .with_context(|| format!("`{option}` exceeds the worker field width"))
         };
         let scheduling = wire::Scheduling {
-            policy: word(&self.scheduler_config.policy),
             max_batch: bounded(
                 self.scheduler_config.max_batch.get(),
                 "scheduler_config.max_batch",
@@ -1376,8 +1420,6 @@ impl ServeConfig {
                 .chunked_prefill_size
                 .map(|size| bounded(size.get(), "scheduler_config.chunked_prefill_size"))
                 .transpose()?,
-            expected_speedup: self.speculative_config.expected_speedup,
-            refill_token_cost: self.speculative_config.refill_token_cost,
         };
         Ok(wire::EngineSpec {
             // A deployment is what one leader serves under its served name.
@@ -1471,15 +1513,6 @@ impl ServeConfig {
                     &graphs.prefill_token_sizes,
                 )?,
                 flow_shapes: distinct("cuda_graph_config.flow_shapes", &graphs.flow_shapes)?,
-            }),
-            flashinfer: Some(wire::FlashInfer {
-                workspace_size: flashinfer.workspace_size,
-                use_tensor_core: flashinfer.use_tensor_core,
-                decode_backend: flashinfer.decode_backend.as_str().to_owned(),
-                prefill_backend: flashinfer.prefill_backend.as_str().to_owned(),
-                decode_split_tile_size: flashinfer.decode_split_tile_size.map(NonZeroU32::get),
-                prefill_split_tile_size: flashinfer.prefill_split_tile_size.map(NonZeroU32::get),
-                split_kv: flashinfer.split_kv,
             }),
             // Video workers size resident media state for the longest
             // duration served and provision only the frame counts the API

@@ -28,7 +28,7 @@ use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_util::either::Either;
 use tracing::trace;
 
-use crate::options::ServerOptions;
+use crate::options::{AdminOptions, ServerOptions};
 
 /// Runtime listener type used by the OpenAI-compatible HTTP server, which is
 /// either a TCP listener or a Unix-domain listener.
@@ -84,19 +84,49 @@ impl Drop for SocketFile {
     }
 }
 
+/// The address a listener binds: the TCP host and port, or a Unix socket in
+/// place of them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BindAddress<'a> {
+    pub(crate) host: &'a str,
+    pub(crate) port: u16,
+    pub(crate) uds: Option<&'a str>,
+}
+
+impl<'a> From<&'a ServerOptions> for BindAddress<'a> {
+    fn from(server: &'a ServerOptions) -> Self {
+        Self {
+            host: &server.host,
+            port: server.port,
+            uds: server.uds.as_deref(),
+        }
+    }
+}
+
+impl<'a> From<&'a AdminOptions> for BindAddress<'a> {
+    fn from(admin: &'a AdminOptions) -> Self {
+        Self {
+            host: &admin.host,
+            port: admin.port,
+            uds: admin.uds.as_deref(),
+        }
+    }
+}
+
 impl Listener {
-    /// Binds the listener `server` states: a Unix-domain socket at `uds`,
+    /// Binds the listener `address` states: a Unix-domain socket at `uds`,
     /// else TCP on `host` and `port`.
     ///
     /// Binding a Unix-domain socket first removes a stale socket file at its
     /// path (see `remove_stale_socket`); it fails with `EADDRINUSE` when the
     /// path holds a live server's socket or a file that is not a socket. The
     /// bound socket's file is removed when the listener is dropped.
-    pub(crate) async fn bind(server: &ServerOptions) -> Result<Self> {
-        match &server.uds {
+    pub(crate) async fn bind<'a, A: Into<BindAddress<'a>>>(address: A) -> Result<Self> {
+        let address = address.into();
+        match address.uds {
             Some(path) => Self::bind_unix(Path::new(path)).await,
             None => Ok(Self::Tcp(
-                TcpListener::bind((server.host.as_str(), server.port)).await?,
+                TcpListener::bind((address.host, address.port)).await?,
             )),
         }
     }

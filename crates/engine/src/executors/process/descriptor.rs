@@ -4,7 +4,7 @@
 
 use anyhow::{Context, bail};
 use ipc::{DEFAULT_COMPONENT, ExpertParallelDescriptor, LaunchDescriptor};
-use proto::request::{FlashInferBackend, GraphPolicy, LoadFormat};
+use proto::request::{GraphPolicy, LoadFormat};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -21,12 +21,6 @@ impl ExecutorProcessArgs {
     pub const DEFAULT_MEM_FRACTION_STATIC: f64 = 0.70;
     /// Attention provider name: a native kernel chosen per call.
     pub const DEFAULT_ATTENTION_BACKEND: &'static str = "auto";
-    /// FlashInfer workspace capacity in bytes.
-    pub const DEFAULT_FLASHINFER_WORKSPACE_SIZE: u64 = 512 * 1024 * 1024;
-    /// FlashInfer backend of decode attention.
-    pub const DEFAULT_FLASHINFER_DECODE_BACKEND: FlashInferBackend = FlashInferBackend::Fa2;
-    /// FlashInfer backend of prefill attention.
-    pub const DEFAULT_FLASHINFER_PREFILL_BACKEND: FlashInferBackend = FlashInferBackend::Auto;
     /// The `ffmpeg` executable a media reader decodes reference videos with.
     pub const DEFAULT_FFMPEG: &'static str = "ffmpeg";
     /// The longest video duration, in seconds, the video API admits; the
@@ -110,13 +104,6 @@ impl Default for ExecutorProcessArgs {
             video_resolutions: Vec::new(),
             video_aspect_ratios: Vec::new(),
             canvas_sampling: None,
-            flashinfer_workspace_size: Self::DEFAULT_FLASHINFER_WORKSPACE_SIZE,
-            flashinfer_use_tensor_core: None,
-            flashinfer_decode_backend: Self::DEFAULT_FLASHINFER_DECODE_BACKEND,
-            flashinfer_prefill_backend: Self::DEFAULT_FLASHINFER_PREFILL_BACKEND,
-            flashinfer_decode_split_tile_size: None,
-            flashinfer_prefill_split_tile_size: None,
-            flashinfer_split_kv: true,
             fence_probes: false,
             fence_components: Vec::new(),
             fence_probes_off: Vec::new(),
@@ -332,13 +319,6 @@ impl ExecutorProcessArgs {
             video_resolutions: self.video_resolutions.clone(),
             video_aspect_ratios: self.video_aspect_ratios.clone(),
             canvas_sampling: self.canvas_sampling,
-            flashinfer_workspace_size: self.flashinfer_workspace_size,
-            flashinfer_use_tensor_core: self.flashinfer_use_tensor_core,
-            flashinfer_decode_backend: self.flashinfer_decode_backend.as_str().to_owned(),
-            flashinfer_prefill_backend: self.flashinfer_prefill_backend.as_str().to_owned(),
-            flashinfer_decode_split_tile_size: self.flashinfer_decode_split_tile_size,
-            flashinfer_prefill_split_tile_size: self.flashinfer_prefill_split_tile_size,
-            flashinfer_disable_split_kv: !self.flashinfer_split_kv,
             fence_probes: self.fence_probes,
             fence_components: self.fence_components.clone(),
             fence_probes_off: self.fence_probes_off.clone(),

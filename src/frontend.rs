@@ -33,7 +33,7 @@ pub(crate) fn run(args: daemon::options::ServeArgs, log: &LogLevels) -> Result<E
         log.log_level.as_deref(),
         log.log_level_http.as_deref(),
     );
-    let (config, stated) = args.resolve()?;
+    let (config, stated) = args.resolve_for(daemon::options::Listen::Frontend)?;
     let options = options(&config)?;
     info!(
         model = %options.model,
