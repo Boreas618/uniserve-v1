@@ -1653,6 +1653,18 @@ impl Leader {
         if next.programs == filled {
             return Ok(None);
         }
+        // What the configuration names is a part of what serves: the rest of an epoch's programs
+        // come from the store. A target that resolves to what the epoch runs changes nothing,
+        // whatever else the same apply changed.
+        if self
+            .epochs()
+            .serving()
+            .is_some_and(|(_, record)| {
+                record.kernels == next.programs.kernels && record.policy == next.programs.policy
+            })
+        {
+            return Ok(None);
+        }
         // The reverted-update refusal is the daemon's record's, checked when
         // the update executes (`Epochs::unavailable`): this decision holds no
         // record of its own.
