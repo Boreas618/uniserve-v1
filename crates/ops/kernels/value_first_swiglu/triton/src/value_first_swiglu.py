@@ -35,8 +35,7 @@ def _value_first_swiglu_kernel(
     flag is off are never dereferenced.
     """
     # Flattened projections can exceed int32 offsets, so index in int64.
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    offsets = offsets.to(tl.int64)
+    offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     row = offsets // width
     column = offsets - row * width

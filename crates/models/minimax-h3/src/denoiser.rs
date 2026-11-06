@@ -701,8 +701,7 @@ impl Layouts {
             &canvas,
             request.text_tokens,
             &segments,
-            // The prompt's vision rows arrive with `VideoRequest`'s condition shapes.
-            &[],
+            &vision_spans(request),
             packing::Sparsity {
                 sparsity,
                 reference_keep,
@@ -827,9 +826,7 @@ impl Layouts {
             &canvas,
             text_tokens,
             &segments,
-            // The prompt's vision rows arrive with `VideoRequest`'s condition shapes; until then a
-            // prompt is all text and every row takes the text clock.
-            &[],
+            &vision_spans(request),
         )?;
         let rows = tables.groups.len();
         let video_rows = packing.video_rows as usize;
@@ -962,6 +959,18 @@ impl Layouts {
             audio,
         })
     }
+}
+
+/// The prompt rows a request's vision blocks occupy, as the packing reads them: `[start, stop)`.
+///
+/// `VideoRequest` states a span by its first row and its rows, which is what a run of the prompt's
+/// tags is; the packing marks every row of the half-open range.
+fn vision_spans(request: &VideoRequest<'_>) -> Vec<(u32, u32)> {
+    request
+        .vision_spans
+        .iter()
+        .map(|(first, rows)| (*first, first + rows))
+        .collect()
 }
 
 /// The frame count a request is snapped to.
@@ -1124,6 +1133,88 @@ impl Denoiser {
         let canvas = canvas_of(request)?;
         packing::condition_segments(&conditions_of(request), &canvas, self.config.clip)
     }
+
+}
+
+/// The pieces of `request`'s conditions, in the order the packing holds them.
+///
+/// The draws are the reference's: one per visual condition, in packed order, each at the condition's
+/// own latent shape, leading the request's one stream (`denoiser.py`, `condition_noise_shapes`). An
+/// audio reference draws nothing. `hop` is the samples of one audio latent frame, which a track is
+/// padded to; a deployment that holds no audio encoder states none, and a track is then refused.
+fn pieces_of(
+    config: &DenoiserConfig,
+    hop: Option<u64>,
+    request: &VideoRequest,
+) -> Result<Vec<nn::capability::ConditionPiece>> {
+    let canvas = canvas_of(request)?;
+    let segments = packing::condition_segments(&conditions_of(request), &canvas, config.clip)?;
+    let channels = config.transformer.video_channels;
+    let mut cursor = 0_u64;
+    let mut pieces = Vec::with_capacity(segments.len());
+    for segment in segments {
+        let shape = request
+            .conditions
+            .get(segment.condition as usize)
+            .ok_or_else(|| {
+                Error::config(format!(
+                    "a segment of condition {} in a request of {}",
+                    segment.condition,
+                    request.conditions.len()
+                ))
+            })?;
+        let draw = segment.visual.map(|visual| LatentShape {
+            channels,
+            frames: visual.frames,
+            height: visual.raster.height,
+            width: visual.raster.width,
+        });
+        let track = if shape.audio_samples > 0 {
+            let hop = hop.ok_or_else(|| {
+                Error::config(
+                    "a request carries a soundtrack and this deployment holds no condition \
+                     encoder"
+                        .to_owned(),
+                )
+            })?;
+            Some([
+                u64::from(crate::config::AUDIO_CHANNELS),
+                1,
+                crate::encoding::padded_samples(u64::from(shape.audio_samples), hop)?,
+            ])
+        } else {
+            None
+        };
+        pieces.push(nn::capability::ConditionPiece {
+            condition: segment.condition,
+            role: match shape.role {
+                ConditionRole::FirstFrame => nn::capability::MediaRole::FirstFrame,
+                ConditionRole::LastFrame => nn::capability::MediaRole::LastFrame,
+                ConditionRole::Reference => nn::capability::MediaRole::Reference,
+            },
+            rows: segment.video_rows(),
+            audio_rows: segment.audio_rows(),
+            pixels: segment.visual.map(|_| {
+                [
+                    1,
+                    u64::from(crate::encoding::PIXEL_CHANNELS),
+                    u64::from(shape.frames),
+                    u64::from(shape.height),
+                    u64::from(shape.width),
+                ]
+            }),
+            track,
+            draw,
+            draw_offset: cursor,
+        });
+        cursor += draw.map_or(0, |draw| {
+            u64::from(draw.channels)
+                * u64::from(draw.frames)
+                * u64::from(draw.height)
+                * u64::from(draw.width)
+        });
+    }
+    Ok(pieces)
 }
 
 /// The rows a request's conditions encode to, and their noise draws.
@@ -1665,6 +1756,31 @@ impl nn::capability::Denoiser for Denoiser {
         Ok(())
     }
 
+    fn condition_pieces(
+        &self,
+        request: &VideoRequest<'_>,
+    ) -> nn::Result<Vec<nn::capability::ConditionPiece>> {
+        let hop = self.encoders.as_ref().map(|encoders| encoders.audio.hop());
+        pieces_of(&self.config, hop, request).map_err(flattened)
+    }
+
+    fn draw_condition_noise(
+        &self,
+        f: &Forward,
+        seed: nn::capability::Seed,
+        piece: &nn::capability::ConditionPiece,
+        out: TensorView,
+    ) -> nn::Result<()> {
+        nn::Noise::new().draw(
+            f,
+            out,
+            nn::NoiseKey::Scalar(seed.0),
+            0,
+            0,
+            piece.draw_offset,
+        )
+    }
+
     fn prepare_latents<'a>(
         &self,
         f: &Forward,
@@ -1975,9 +2091,11 @@ pub fn denoise_arena(
         // widened before the projection reads them. A stack whose own element type is already FP32
         // reads them in place and leaves this buffer untouched; the plan sizes for the widening.
         push(plan, &format!("{name}.wide"), "f32", rows * hidden);
+        // The fused heads are FP32 tables, as the projection they replace is, so the row a step
+        // gathers out of them is FP32 whatever the stack's type is.
         if student {
-            push(plan, &format!("{name}.head"), element, out * hidden);
-            push(plan, &format!("{name}.head_bias"), element, out);
+            push(plan, &format!("{name}.head"), "f32", out * hidden);
+            push(plan, &format!("{name}.head_bias"), "f32", out);
         }
     }
 
@@ -2379,8 +2497,14 @@ impl Denoiser {
                 let start = u32::try_from(start).map_err(|_| {
                     Error::config("a condition row start above u32::MAX".to_owned())
                 })?;
-                self.transformer
-                    .project_audio(f, encoded, row_range(text, start, rows)?)?;
+                // The projection's output is FP32, and the one rounding is the copy into the rows
+                // (`denoiser.py`: `audio_input(rows, output_dtype=torch.float32).to(out.dtype)`).
+                let hidden = u64::from(self.config.transformer.hidden_size);
+                let projected = f.arena().tensor(DType::F32, Shape::new(&[rows, hidden]))?;
+                self.transformer.project_audio(f, encoded, projected)?;
+                nn::layers::ScaledAdd
+                    .forward(f, row_range(text, start, rows)?, projected, 1.0, 0.0)
+                    .map_err(Error::from)?;
             }
             if piece.rows > 0 {
                 let visual = u32::try_from(start).map_err(|_| {
@@ -2495,56 +2619,29 @@ impl Denoiser {
             DType::F32,
             Shape::new(&[in_channels, frames, tile_height, tile_width]),
         )?;
-        let copy = nn::layers::CopyBlock::new(DType::F32)?;
-        let mut tiles = Vec::with_capacity(plan.tiles.len());
-        for tile in &plan.tiles {
-            let (tile_height, tile_width) = (
-                u64::from(tile.rows.1) * compression,
-                u64::from(tile.columns.1) * compression,
-            );
-            let source = TensorView::with_strides(
-                raster.offset_elements(
-                    u64::from(tile.rows.0) * compression * width
-                        + u64::from(tile.columns.0) * compression,
-                ),
-                raster.dtype,
-                Shape::new(&[in_channels, frames, tile_height, tile_width]),
-                raster.strides,
-            );
-            let packed = [
-                frames * tile_height * tile_width,
-                tile_height * tile_width,
-                tile_width,
-                1,
-            ];
-            let mut destination_strides = [0_i64; ops::copy_block::RANK];
-            for (axis, stride) in packed.iter().enumerate() {
-                destination_strides[axis] = i64::try_from(*stride).map_err(|_| {
-                    Error::config("a condition tile is larger than i64 strides address".to_owned())
-                })?;
-            }
-            let destination = TensorView::with_strides(
-                buffer.offset_elements(0),
-                DType::F32,
-                Shape::new(&[in_channels, frames, tile_height, tile_width]),
-                nn::Strides::new(&packed),
-            );
-            copy.forward(f, source, destination, &destination_strides)?;
-            // The encoder's tile view is the packed copy at the shape it pads from, with the batch
-            // axis the scene's contract asks for.
-            tiles.push(TensorView::with_strides(
-                buffer.offset_elements(0),
-                DType::F32,
-                Shape::new(&[1, in_channels, frames, tile_height, tile_width]),
-                nn::Strides::new(&[
-                    in_channels * frames * tile_height * tile_width,
-                    frames * tile_height * tile_width,
-                    tile_height * tile_width,
-                    tile_width,
-                    1,
-                ]),
-            ));
-        }
+        // Each tile's block of the piece's raster, which the encoding packs into `buffer` just before
+        // it reads it: one buffer serves every tile only because a tile is encoded before the next
+        // is copied, and copying them all first would encode the last tile's pixels every time.
+        let tiles = plan
+            .tiles
+            .iter()
+            .map(|tile| {
+                TensorView::with_strides(
+                    raster.offset_elements(
+                        u64::from(tile.rows.0) * compression * width
+                            + u64::from(tile.columns.0) * compression,
+                    ),
+                    raster.dtype,
+                    Shape::new(&[
+                        in_channels,
+                        frames,
+                        u64::from(tile.rows.1) * compression,
+                        u64::from(tile.columns.1) * compression,
+                    ]),
+                    raster.strides,
+                )
+            })
+            .collect::<Vec<_>>();
 
         let moment_channels = 2 * video_channels;
         let run = f.arena().tensor(
@@ -2557,6 +2654,7 @@ impl Denoiser {
             &plan,
             crate::tiled_encode::Scene {
                 pixels: &tiles,
+                packed: Some(buffer),
                 blended: run,
             },
         )?;
@@ -2611,8 +2709,14 @@ impl Denoiser {
                 VISUAL_CONDITION_TIME,
             )
             .map_err(Error::from)?;
-        self.transformer
-            .project(f, clean, row_range(text, start, rows)?)?;
+        // The projection's output is FP32, and the one rounding is the copy into the rows
+        // (`denoiser.py`: `video_input(anchored, output_dtype=torch.float32).to(out.dtype)`).
+        let hidden = u64::from(self.config.transformer.hidden_size);
+        let projected = f.arena().tensor(DType::F32, Shape::new(&[rows, hidden]))?;
+        self.transformer.project(f, clean, projected)?;
+        nn::layers::ScaledAdd
+            .forward(f, row_range(text, start, rows)?, projected, 1.0, 0.0)
+            .map_err(Error::from)?;
         Ok(())
     }
 
@@ -4125,6 +4229,81 @@ mod tests {
             conditions: &SHAPES,
             ..request(121, 832, 480)
         }
+    }
+
+    /// A condition's pieces follow the packing, not the request: a keyframe leads, and each draw
+    /// starts where the visual condition packed before it ended. An audio reference takes a place in
+    /// the list and none in the stream, which is what keeps every later draw where the reference's
+    /// is.
+    #[test]
+    fn the_pieces_are_in_packed_order_and_their_draws_partition_the_stream() {
+        const SHAPES: [nn::capability::ConditionShape; 3] = [
+            nn::capability::ConditionShape {
+                role: ConditionRole::Reference,
+                frames: 0,
+                height: 0,
+                width: 0,
+                audio_samples: 1_000,
+            },
+            nn::capability::ConditionShape {
+                role: ConditionRole::Reference,
+                frames: 1,
+                height: 64,
+                width: 128,
+                audio_samples: 0,
+            },
+            nn::capability::ConditionShape {
+                role: ConditionRole::FirstFrame,
+                frames: 1,
+                height: 480,
+                width: 832,
+                audio_samples: 0,
+            },
+        ];
+        let request = VideoRequest {
+            task: nn::capability::VideoTask::ReferenceToVideoAudio,
+            first_frames: 1,
+            references: 2,
+            text_tokens: 15,
+            conditions: &SHAPES,
+            ..request(121, 832, 480)
+        };
+        let rule = layouts();
+        let pieces = pieces_of(&rule.config, Some(800), &request).expect("the conditions pack");
+        assert_eq!(
+            pieces.iter().map(|piece| piece.condition).collect::<Vec<_>>(),
+            [2, 0, 1],
+            "the keyframe leads, and the references keep their request order"
+        );
+        let keyframe = u64::from(rule.config.transformer.video_channels) * 30 * 52;
+        assert_eq!(pieces[0].draw_offset, 0);
+        assert_eq!(pieces[0].pixels, Some([1, 3, 1, 480, 832]));
+        assert!(pieces[1].draw.is_none(), "an audio reference draws nothing");
+        assert_eq!(pieces[1].draw_offset, keyframe);
+        assert_eq!(
+            pieces[1].track,
+            Some([2, 1, 1_600]),
+            "a track is padded to whole latent frames"
+        );
+        assert_eq!(pieces[1].audio_rows, 4);
+        assert_eq!(pieces[2].draw_offset, keyframe);
+        assert_eq!(pieces[2].rows, 2 * 4);
+
+        // A track with no encoder to read it is refused, not conditioned on nothing.
+        assert!(pieces_of(&rule.config, None, &request).is_err());
+    }
+
+    /// A request names a vision block by its first row and its rows, as a run of the prompt's tags
+    /// is; the packing marks `[start, stop)`. A span that reached the packing unchanged would read a
+    /// row count as a stop, and the block would take the text tag past its first rows.
+    #[test]
+    fn a_vision_span_reaches_the_packing_as_a_half_open_range() {
+        let spans = [(3, 4), (10, 1)];
+        let request = VideoRequest {
+            vision_spans: &spans,
+            ..request(121, 832, 480)
+        };
+        assert_eq!(vision_spans(&request), [(3, 7), (10, 11)]);
     }
 
     #[test]

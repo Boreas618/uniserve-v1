@@ -308,6 +308,7 @@ fn run() -> Result<(), String> {
             &clip.plan(),
             minimax_h3::tiled_encode::Scene {
                 pixels: &views,
+                packed: None,
                 blended,
             },
         );

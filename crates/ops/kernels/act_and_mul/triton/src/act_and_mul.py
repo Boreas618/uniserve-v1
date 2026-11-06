@@ -71,9 +71,10 @@ def _act_and_mul_kernel(
     """
     _pdl_prologue(PDL)
 
-    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    start = tl.program_id(0)
     if WIDE:
-        offsets = offsets.to(tl.int64)
+        start = start.to(tl.int64)
+    offsets = start * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < elements
     row = offsets // n_cols
     column = offsets - row * n_cols

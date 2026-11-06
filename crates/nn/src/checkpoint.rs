@@ -453,6 +453,14 @@ impl Checkpoint {
         &self.root
     }
 
+    /// Every directory this checkpoint spans, the first root's first.
+    ///
+    /// A pipeline's sidecars live in these directories rather than in a shard set: a processor has
+    /// no weights, so no component answers for it.
+    pub fn roots(&self) -> &[PathBuf] {
+        &self.roots
+    }
+
     /// Whether this checkpoint is a pipeline of components rather than one model's shards.
     pub fn is_pipeline(&self) -> bool {
         !self.components.is_empty()
