@@ -1067,16 +1067,20 @@ impl MainProcess {
             .context("this process serves no rank")?;
         // The group's products, which every rank's runners reach through their own view of them.
         let group_products = GroupProducts::new(ranks.len());
+        let rank_count = ranks.len() as u32;
         for (rank_index, rank) in ranks.into_iter().enumerate() {
             let LoadedRank {
                 plan: rank_plan,
                 client,
                 model,
                 mut memory,
-                inventory,
+                mut inventory,
                 graph,
                 groups,
             } = rank;
+            // The scheduler sees the group as one pool, and each rank encodes its own units, so the
+            // pool holds every rank's host tasks.
+            inventory.host_task_capacity *= rank_count;
             // The device's one pool set is the resident owners' allocator (§4.1): it is opened with
             // the memory and handed to the executor thread, so every owner and every runner books
             // against the same allowance.

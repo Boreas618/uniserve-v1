@@ -22,8 +22,8 @@ A program is one block of ``QUERIES`` query tiles of one head. It walks the key 
 time with a running softmax, so every pooled value row is read once per block of queries rather
 than once per query tile: reading them per query tile made this the largest kernel of a denoising
 step. The running form is the exact softmax up to rounding: the maximum so far rescales what was
-already summed, and the sum divides once at the end. The product is one FP32 matrix step, without
-TF32, because the reference's product is FP32.
+already summed, and the sum divides once at the end. The product is one matrix step in three TF32
+products, whose error matches an FP32 product's, as `vsa_scores` measures it.
 """
 
 import triton
@@ -86,7 +86,7 @@ def _vsa_compress_pooled_kernel(
             mask=live[:, None] & lane_live[None, :],
             other=0.0,
         ).to(tl.float32)
-        summed = summed * rescale[:, None] + tl.dot(weights, values, input_precision="ieee")
+        summed = summed * rescale[:, None] + tl.dot(weights, values, input_precision="tf32x3")
         peak = peak_now
     total = tl.where(total == 0.0, 1.0, total)
     compressed = summed / total[:, None]
