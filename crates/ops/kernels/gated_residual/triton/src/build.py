@@ -25,6 +25,8 @@ def spec(fields, parameters, target):
     """The compilation of one gated_residual descriptor."""
     dtype = "*" + DTYPES[fields["dtype"]]
     return {
+        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
+        "aligned": ["hidden_ptr", "update_ptr", "gate_ptr", "row_indices_ptr", "gate_row_stride"],
         "kernel": kernels._gated_residual_kernel,
         "signature": {
             "hidden_ptr": dtype,

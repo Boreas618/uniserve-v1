@@ -28,7 +28,7 @@ use std::ffi::c_void;
 pub use platform::DataType as CollectiveType;
 pub use platform::DevicePtr as PlatformDevicePtr;
 pub use platform::Error as PlatformError;
-pub use platform::nccl::{Communicator, ReduceOp};
+pub use platform::nccl::{Communicator, ReduceOp, group as collective_group};
 pub use platform::{
     Allocator, Buffer, CaptureStatus, Cluster, Device, DeviceRange, Event, EventFlags, Function,
     FunctionAttribute, LaunchConfig, Library, NativeLibrary, PoolKind, Stream,

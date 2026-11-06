@@ -41,6 +41,8 @@ def spec(fields, parameters, target):
     row = int(fields["query_row_stride"])
     key_row = int(fields["key_row_stride"])
     return {
+        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
+        "aligned": ["query", "key", "value", "query_weight", "key_weight", "cosine", "sine", "variable_block_sizes", "pooled_query", "pooled_key", "pooled_value"],
         "kernel": kernels._prepare_tiles_kernel,
         "signature": {
             "query": dtype,

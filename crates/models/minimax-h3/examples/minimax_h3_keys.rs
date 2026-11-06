@@ -679,10 +679,15 @@ fn main() {
             Ok(stated) => lines.extend(stated),
             Err(error) => panic!("the DiTs state no rows: {error}"),
         }
-        // The text stack at the deployment's tensor degree: its heads and widths are a rank's.
-        match deployment.text_rows(&partition, &[text_tokens.unwrap_or(1024)]) {
-            Ok(stated) => lines.extend(stated),
-            Err(error) => panic!("the text encoder states no rows: {error}"),
+        // The text stack at the deployment's tensor degree: its heads and widths are a rank's, and
+        // the embedding's rows start where each rank's shard of the vocabulary does.
+        for tensor_rank in 0..tensor_parallel {
+            let mut partition = partition;
+            partition.tensor_rank = tensor_rank;
+            match deployment.text_rows(&partition, &[text_tokens.unwrap_or(1024)]) {
+                Ok(stated) => lines.extend(stated),
+                Err(error) => panic!("the text encoder states no rows: {error}"),
+            }
         }
     }
     let audio = &config.audio_vae;
