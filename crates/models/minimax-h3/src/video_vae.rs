@@ -731,6 +731,10 @@ impl VideoDecoder {
             ACTIVATION,
         ));
 
+        // The gather of a clip's rows out of the trajectory, one strided copy per tile.
+        programs
+            .launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::descriptor_of(STREAM));
+
         // The two crossings between the stream's type and the activation's: the restored latents
         // round down, and the projected voxels widen into the stream.
         programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(ACTIVATION, STREAM));
@@ -1665,6 +1669,71 @@ impl Decoder for VideoDecoder {
         STREAM
     }
 
+    /// One strided copy per tile: a tile's voxels are a rectangle of every frame of the window, and a
+    /// row of the block holds a voxel's channels, which lie a whole timeline apart in the trajectory.
+    fn gather_latents(
+        &self,
+        f: &Forward,
+        layout: &nn::capability::Layout,
+        trajectory: TensorView,
+        first: u32,
+        block: TensorView,
+    ) -> nn::Result<()> {
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "VideoDecoder",
+            problem,
+        };
+        let channels = u64::from(self.config.latent_channels);
+        let (height, width) = (
+            u64::from(layout.video.height),
+            u64::from(layout.video.width),
+        );
+        let plane = height * width;
+        let voxels = trajectory.numel() / channels;
+        let clip = Canvas::clip(&self.config, layout.video.height, layout.video.width);
+        let frames = u64::from(clip.frames);
+        if trajectory.numel() % channels != 0
+            || (u64::from(first) + frames) * plane > voxels
+            || trajectory.dtype != STREAM
+            || block.dtype != STREAM
+        {
+            return Err(refuse(format!(
+                "a clip of {frames} latent frames from frame {first} of a {plane}-voxel raster is \
+                 past a trajectory of {} {} elements in {channels} channels",
+                trajectory.numel(),
+                trajectory.dtype
+            )));
+        }
+        let tiles = Tiles::of(&self.config, &clip)
+            .map_err(|error| refuse(format!("the clip's tile grid: {error}")))?
+            .tiles(&self.config, &clip);
+        let copy = nn::layers::CopyBlock::new(STREAM)?;
+        let mut row = 0_u64;
+        for tile in &tiles {
+            let (top, bottom) = tile.latent_rows;
+            let (left, right) = tile.latent_columns;
+            let (rows, columns) = (u64::from(bottom - top), u64::from(right - left));
+            let shape = Shape::new(&[channels, frames, rows, columns]);
+            let start = u64::from(first) * plane + u64::from(top) * width + u64::from(left);
+            let source = TensorView::with_strides(
+                trajectory.offset_elements(start),
+                STREAM,
+                shape,
+                nn::Strides::new(&[voxels, plane, width, 1]),
+            );
+            let strides = [1, rows * columns * channels, columns * channels, channels];
+            let destination = TensorView::with_strides(
+                block.offset_elements(row * channels),
+                STREAM,
+                shape,
+                nn::Strides::new(&strides),
+            );
+            copy.forward(f, source, destination, &strides.map(|stride| stride as i64))?;
+            row += frames * rows * columns;
+        }
+        Ok(())
+    }
+
     /// The latent layout one clip's raster decodes from.
     ///
     /// The argument is the **decoded raster** - frames, rows and columns of the media this block
@@ -2596,6 +2665,7 @@ pub(crate) mod tests {
             "the two crossings of the stream's type"
         );
         assert_eq!(count("tile_stitch"), 1, "the whole output path");
+        assert_eq!(count("copy_block"), 1, "the gather out of the trajectory");
 
         // One attention whatever the clip: the sequences and their rows are launch values, so the
         // decoder's programs do not depend on the raster a request asks for.

@@ -1489,7 +1489,11 @@ fn stage_timeline(args: &Args) -> Result<()> {
     let raster_bytes = channels * u64::from(clip_frames) * pixels * raster_element;
     let tail_bytes = channels * 5 * pixels * raster_element;
     let frames_bytes = u64::from(args.timeline_frames) * pixels * channels;
-    let held_bytes = block_bytes + raster_bytes + tail_bytes + frames_bytes + (1 << 20);
+    let trajectory_room = std::fs::metadata(&source)
+        .map_err(|error| Failure::message(format!("{}: {error}", source.display())))?
+        .len();
+    let held_bytes =
+        block_bytes + raster_bytes + tail_bytes + frames_bytes + trajectory_room + (1 << 20);
     let scratch_bytes = decoder.arena_bytes(&layout)?.max(args.arena_gib << 30);
     let allocator = weights.allocator();
     let total = usize::try_from(held_bytes + scratch_bytes).unwrap_or(usize::MAX);
@@ -1522,39 +1526,38 @@ fn stage_timeline(args: &Args) -> Result<()> {
     let scratch = DevicePtr::new(region.address() + held_bytes);
 
     // The trajectory: `[channels, voxels]` over the whole timeline.
-    let trajectory = std::fs::read(&source)
+    let trajectory_bytes = std::fs::read(&source)
         .map_err(|error| Failure::message(format!("{}: {error}", source.display())))?;
-    let voxels = trajectory.len() / (usize::try_from(latent_channels).unwrap_or(1) * element);
-    let plane = (args.latent_height * args.latent_width) as usize;
+    let trajectory = held.tensor(
+        STREAM,
+        Shape::new(&[(trajectory_bytes.len() / element) as u64]),
+    )?;
+    // SAFETY: `trajectory` is `trajectory_bytes`' length, and the bytes outlive the copy, which is
+    // waited on.
+    unsafe {
+        platform::memcpy_async(
+            trajectory.ptr.address(),
+            trajectory_bytes.as_ptr() as u64,
+            trajectory_bytes.len(),
+            &stream,
+        )?;
+    }
+    stream.synchronize()?;
     let directory = args.out.join("timeline");
     std::fs::create_dir_all(&directory)
         .map_err(|error| Failure::message(format!("{}: {error}", directory.display())))?;
 
     for (index, splice) in splices.iter().enumerate() {
-        // The clip's window, in the rows the block states.
-        let start = decoder.clip_start(index as u32) as usize * plane;
-        let width_channels = usize::try_from(latent_channels).unwrap_or(0);
-        let mut staged = vec![0_u8; rows.len() * width_channels * element];
-        for (row, voxel) in rows.iter().enumerate() {
-            for channel in 0..width_channels {
-                let from = (channel * voxels + start + *voxel as usize) * element;
-                let to = (row * width_channels + channel) * element;
-                staged[to..to + element].copy_from_slice(&trajectory[from..from + element]);
-            }
-        }
-        // SAFETY: `block` is `staged`'s length and `staged` outlives the copy, which is waited on.
-        unsafe {
-            platform::memcpy_async(
-                block.ptr.address(),
-                staged.as_ptr() as u64,
-                staged.len(),
-                &stream,
-            )?;
-        }
-        stream.synchronize()?;
         let started = std::time::Instant::now();
         let arena = Arena::new(scratch, scratch_bytes);
         let forward = Forward::new(&stream, &generation, &arena);
+        decoder.gather_latents(
+            &forward,
+            &layout,
+            trajectory,
+            decoder.clip_start(index as u32),
+            block,
+        )?;
         // The capability's `decode`, not the inherent tile decoder of the same name.
         nn::capability::Decoder::decode(
             &decoder,

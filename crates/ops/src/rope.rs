@@ -802,7 +802,11 @@ mod tests {
     use super::*;
 
     fn descriptor(affine: bool) -> QkNormRopeDescriptor {
+        factors: DType::F32,
+        strided: false,
         QkNormRopeDescriptor {
+            factors: DType::F32,
+            strided: false,
             dtype: DType::BF16,
             output: DType::BF16,
             head_dim: 128,
@@ -836,6 +840,8 @@ mod tests {
         );
         // H3's 96-of-128 rotary: the same descriptor with a narrower rotation is another module.
         let partial = QkNormRopeDescriptor {
+            factors: DType::F32,
+            strided: false,
             rotated: 96,
             ..descriptor(true)
         };
@@ -849,6 +855,8 @@ mod tests {
     fn a_rotation_that_leaves_a_head_or_has_no_pair_is_refused() {
         for rotated in [0, 127, 130] {
             let descriptor = QkNormRopeDescriptor {
+                factors: DType::F32,
+                strided: false,
                 rotated,
                 ..descriptor(true)
             };
