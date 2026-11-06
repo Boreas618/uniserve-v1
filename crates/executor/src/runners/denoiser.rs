@@ -323,27 +323,16 @@ impl DenoiseColumns {
 /// (`crate::runners::products`).
 const STEP_PRODUCTS: &[Product] = &[Product::Text];
 
-/// The products a step of a *conditioned* layout reads: the two above, and the conditioning
-/// sequence's encoded states.
-///
-/// `condition_elements` is the per-request fact that decides between this list and
-/// [`STEP_PRODUCTS`]: it counts the elements a request's conditions cover, and a task whose request
-/// carries none - a prompt alone, or a first and last frame the latents already hold - has no
-/// conditioning sequence for an encoder to encode. Requiring a source product there would refuse a
-/// task for something no call can produce, which is the same defect as requiring the raw condition
-/// media (`crate::runners::products`).
-const CONDITIONED_STEP_PRODUCTS: &[Product] = &[Product::Text, Product::Source];
-
 /// The products a step of `layout` reads, in the order a refusal names them.
 ///
-/// The text rows are the prompt's encoded states and every task reads them; a layout with
-/// conditioning elements reads its conditioning rows as well.
-fn step_products(layout: &nn::capability::Layout) -> &'static [Product] {
-    if layout.condition_elements > 0 {
-        CONDITIONED_STEP_PRODUCTS
-    } else {
-        STEP_PRODUCTS
-    }
+/// **One list for every layout, because one product has a producer.** `Product::Text` is what the
+/// encoder publishes (`crate::runners::encoder`), and `Product::Source` is published by nobody -
+/// the product table says so as a contract (`crate::runners::products`) - so a conditioned layout
+/// that required it refused every step with `absent(request, Source)` before the conditioner could
+/// run. The encoder's rows are the conditioner's input as well as a prompt's: where they land is
+/// decided by [`DenoiserRunner::seed`], not by asking the store for a second name for them.
+fn step_products(_layout: &nn::capability::Layout) -> &'static [Product] {
+    STEP_PRODUCTS
 }
 
 /// The rows of one request's conditioning and the encoder's width: `(text_rows + condition_rows)`
@@ -791,22 +780,26 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // the shorter kind's copy land inside the wrong column's row (`conditioning_width`).
         let text_bytes = rows * text_width * element;
         let source_bytes = rows * source_width * element;
+        // **The encoder's rows go where the model consumes them next.** A conditioner that widens
+        // reads `source` and writes `text` in place, so the product lands in `source` and `text`
+        // belongs to the fold alone - copying it into `text` as well would be a second, mis-strided
+        // copy of the same bytes (`text_width != source_width`, so the rows would not line up). A
+        // model with no conditioner reads the encoder's rows themselves, so they land in `text`.
+        let folded = text_width != source_width;
         for row in &pending {
             let (request, index) = (row.request, row.index);
-            for (kind, column) in [
-                (Product::Text, &mut self.columns.text),
-                (Product::Source, &mut self.columns.source),
-            ] {
+            let kind = Product::Text;
+            let (column, bytes) = if folded {
+                (&mut self.columns.source, source_bytes)
+            } else {
+                (&mut self.columns.text, text_bytes)
+            };
+            {
                 // **The copy is the store's, not this runner's.** A deployment can put the text
                 // phase on its own GPU, so the product may be on another device or another stream,
                 // and only the store holds both ends: it waits on the producer's write before this
                 // stream copies. A runner issuing its own `memcpy_async` from another device's
                 // region would be reading bytes no ordering protects.
-                let bytes = if matches!(kind, Product::Text) {
-                    text_bytes
-                } else {
-                    source_bytes
-                };
                 let Some(published) = products.product(request, kind)? else {
                     return Err(products::absent(request, kind));
                 };
@@ -1763,18 +1756,17 @@ mod product_tests {
     #[test]
     fn the_first_absent_kind_is_the_one_a_step_refuses() {
         let store = Store {
-            held: vec![Product::Text],
+            held: vec![Product::VideoLatents],
         };
-        let missing =
-            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
+        let missing = missing_product(&store, request(), STEP_PRODUCTS).expect("a store answers");
         assert_eq!(
             missing,
-            Some(Product::Source),
-            "the encoder's features are the first kind this store lacks"
+            Some(Product::Text),
+            "the encoder's rows are the first kind this store lacks"
         );
-        let refusal = products::absent(request(), Product::Source).to_string();
+        let refusal = products::absent(request(), Product::Text).to_string();
         assert!(
-            refusal.contains("source"),
+            refusal.contains("text"),
             "the refusal names the kind: {refusal}"
         );
     }
@@ -1784,18 +1776,16 @@ mod product_tests {
     #[test]
     fn a_store_holding_every_kind_leaves_nothing_missing() {
         let full = Store {
-            held: CONDITIONED_STEP_PRODUCTS.to_vec(),
+            held: STEP_PRODUCTS.to_vec(),
         };
-        let missing =
-            missing_product(&full, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
+        let missing = missing_product(&full, request(), STEP_PRODUCTS).expect("a store answers");
         assert_eq!(missing, None);
 
         let empty = Store { held: Vec::new() };
-        let missing =
-            missing_product(&empty, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
+        let missing = missing_product(&empty, request(), STEP_PRODUCTS).expect("a store answers");
         assert_eq!(
             missing,
-            CONDITIONED_STEP_PRODUCTS.first().copied(),
+            STEP_PRODUCTS.first().copied(),
             "an empty store is refused for the first kind the step reads, not for the last"
         );
     }
@@ -1823,18 +1813,21 @@ mod product_tests {
         assert_eq!(step_products(&layout), STEP_PRODUCTS);
         assert_eq!(step_products(&layout).len(), 1);
 
+        // A conditioned layout asks for the same one kind: the encoder's rows are the conditioner's
+        // input, and no producer exists for a second name of them.
         layout.condition_elements = 3;
-        assert_eq!(step_products(&layout), CONDITIONED_STEP_PRODUCTS);
+        assert_eq!(step_products(&layout), STEP_PRODUCTS);
 
         let store = Store {
             held: vec![Product::Text],
         };
-        let missing =
-            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
+        let missing = missing_product(&store, request(), step_products(&layout))
+            .expect("a store answers");
         assert_eq!(
-            missing,
-            Some(Product::Source),
-            "a conditioned layout asks a store holding only the prompt's states for the source"
+            missing, None,
+            "a store holding the encoder's rows leaves a conditioned step nothing missing: the \
+             conditioner reads those rows, and asking for `Source` refused a step for a product no \
+             call publishes"
         );
     }
 
