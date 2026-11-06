@@ -78,6 +78,45 @@ fn compiles(interpreter: &Path) -> bool {
         .is_ok_and(|output| output.status.success())
 }
 
+/// Whether an interpreter imports the Program Server's own Python package, which a package that
+/// stages a vendor artifact runs from its compile script.
+fn carries_the_fetcher(interpreter: &Path) -> bool {
+    std::process::Command::new(interpreter)
+        .args(["-c", "import uniserve_program_server"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+/// An interpreter for a compile script that runs `uniserve_program_server`.
+///
+/// `python()` may answer a `PATH` interpreter that has Triton and nothing of the Program Server: the
+/// serving environment is one. That package is the repository's own source, and it reads nothing but
+/// the standard library, so such an interpreter is given it the way a host's store build is, by
+/// `PYTHONPATH`. A compile runs from the installed copy of its package, which is not under the
+/// repository, so its script cannot find this directory by itself. The launcher goes in `temporary`
+/// and the environment under the crate, which carries the package, is answered as it is.
+fn with_the_fetcher(interpreter: &Path, temporary: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    if carries_the_fetcher(interpreter) {
+        return interpreter.to_path_buf();
+    }
+    let source = repository().join("crates/program-server/python/src");
+    let launcher = temporary.join("python-with-the-fetcher");
+    std::fs::write(
+        &launcher,
+        format!(
+            "#!/bin/sh\nPYTHONPATH=\"{}${{PYTHONPATH:+:$PYTHONPATH}}\" exec \"{}\" \"$@\"\n",
+            source.display(),
+            interpreter.display()
+        ),
+    )
+    .expect("the interpreter's launcher");
+    std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+        .expect("the launcher's mode");
+    launcher
+}
+
 /// The sentence a witness prints when this host has no Python environment.
 const NO_PYTHON: &str = "SKIPPED (provisioning): no Python environment with Triton; set \
      UNISERVE_PROGRAM_SERVER_PYTHON or `uv sync --project crates/program-server/python`";
@@ -610,15 +649,15 @@ fn a_cuda_package_builds_the_module_its_manifest_declares() {
         eprintln!("SKIPPED: the tree holds no CUDA package");
         return;
     };
+    let temporary = tempfile::tempdir().unwrap();
     let toolchains = ToolchainConfig {
         nvcc: None,
-        python: python.clone(),
+        python: with_the_fetcher(&python, temporary.path()),
         wasm: None,
         max_jobs: 2,
     };
     // A package of the tree declares one toolkit version, and a version change
     // is a new revision; the witness builds this host's toolkit instead.
-    let temporary = tempfile::tempdir().unwrap();
     let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains) else {
         eprintln!("SKIPPED (provisioning): this host reports no nvcc version to build with");
         return;

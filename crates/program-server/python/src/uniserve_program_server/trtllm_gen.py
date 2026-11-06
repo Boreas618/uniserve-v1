@@ -32,6 +32,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -107,6 +108,11 @@ CHECKSUMS = "checksums.txt"
 #: How many files are fetched at once.
 WORKERS = 16
 
+#: How many times one file is asked for. The repository resets a connection now and then under
+#: `WORKERS` parallel fetches, and that says nothing about the file; a reset fails the whole build
+#: only when it keeps happening.
+ATTEMPTS = 5
+
 
 class ArtifactError(RuntimeError):
     """The artifact cannot be fetched, verified or staged."""
@@ -153,18 +159,27 @@ def download(relative: str, destination: Path) -> None:
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(url_of(relative), headers={"User-Agent": "uniserve"})
-    try:
-        with urllib.request.urlopen(request, timeout=120) as response:
-            if response.status != 200:
-                raise ArtifactError(f"fetching {relative}: HTTP {response.status}")
-            with tempfile.NamedTemporaryFile(
-                dir=destination.parent, delete=False
-            ) as temporary:
-                shutil.copyfileobj(response, temporary)
-                staged = Path(temporary.name)
-    except (urllib.error.URLError, OSError) as error:
-        raise ArtifactError(f"fetching {url_of(relative)}: {error}") from error
-    staged.replace(destination)
+    for attempt in range(1, ATTEMPTS + 1):
+        staged = None
+        try:
+            with urllib.request.urlopen(request, timeout=120) as response:
+                if response.status != 200:
+                    raise ArtifactError(f"fetching {relative}: HTTP {response.status}")
+                with tempfile.NamedTemporaryFile(
+                    dir=destination.parent, delete=False
+                ) as temporary:
+                    staged = Path(temporary.name)
+                    shutil.copyfileobj(response, temporary)
+            staged.replace(destination)
+            return
+        except (urllib.error.URLError, OSError) as error:
+            if staged is not None:
+                staged.unlink(missing_ok=True)
+            # The repository's own refusal of the file is an answer, and asking again repeats it.
+            refused = isinstance(error, urllib.error.HTTPError) and error.code < 500
+            if refused or attempt == ATTEMPTS:
+                raise ArtifactError(f"fetching {url_of(relative)}: {error}") from error
+            time.sleep(attempt)
 
 
 def checksums(offline: bool = False) -> dict[str, str]:
