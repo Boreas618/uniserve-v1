@@ -24,6 +24,14 @@ pub struct Lane<A: HostAction> {
     pool: Arc<HostPool<A>>,
 }
 
+impl<A: HostAction> Clone for Lane<A> {
+    fn clone(&self) -> Self {
+        Self {
+            pool: Arc::clone(&self.pool),
+        }
+    }
+}
+
 impl<A: HostAction> Lane<A> {
     /// The lane over `pool`.
     pub fn new(pool: Arc<HostPool<A>>) -> Self {

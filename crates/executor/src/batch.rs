@@ -923,12 +923,16 @@ impl Executors {
     ///
     /// A video decode is one unit of the timeline and needs no other unit, so the devices that serve
     /// the phase take the units in turn instead of each decoding the same one: a device's clip is
-    /// independent of its neighbours' but for the tail the decoder hands across.
+    /// independent of its neighbours' but for the tail the decoder hands across. A video encode
+    /// follows its unit, so the device that decoded a clip encodes it from its own column.
     fn device_of_unit(&self, batch: &Batch) -> Result<Option<&Arc<crate::device::Executor>>> {
         let Some(media) = &batch.media else {
             return Ok(None);
         };
-        if media.computation.call != ipc::MediaCall::VideoDecoding {
+        if !matches!(
+            media.computation.call,
+            ipc::MediaCall::VideoDecoding | ipc::MediaCall::VideoEncoding
+        ) {
             return Ok(None);
         }
         let serving: Vec<&Arc<crate::device::Executor>> = self

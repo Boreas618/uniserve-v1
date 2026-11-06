@@ -42,6 +42,12 @@ use proto::request::{GenerationFeatures, GenerationLimits, GraphPolicy};
 
 use crate::engine_main::Launch;
 
+/// One deployment's output and the media lane its stages run on.
+type SharedCodec = (
+    Arc<executor::runners::media::Output>,
+    executor::host::Lane<executor::runners::media::MediaWork>,
+);
+
 /// One epoch's build config, resolved against the node the main process runs on.
 /// The catalogue of prefill buckets a rank captures, and where its bound came from (§4.5).
 ///
@@ -114,6 +120,8 @@ impl Served {
 
 #[derive(Clone)]
 pub(crate) struct EpochPlan {
+    /// The output and the media lane the ranks of this plan share, once the first rank made them.
+    codec: Arc<std::sync::Mutex<Option<SharedCodec>>>,
     /// The epoch's build config, which the daemon wrote (§7.2).
     build: daemon::epoch::BuildConfig,
     /// The checkpoint this rank serves.
@@ -297,6 +305,7 @@ impl EpochPlan {
             world_size: launch.world_size as usize,
             queue_depth: launch.queue_depth as usize,
             group: launch.group.clone(),
+            codec: Arc::default(),
             watchdog_override: launch.watchdog_timeout_s.map(Duration::from_secs),
             placement,
         })
@@ -365,6 +374,35 @@ impl EpochPlan {
     /// a timeline's units in turn over every rank.
     pub(crate) fn serves_output(&self) -> bool {
         self.rank == 0
+    }
+
+    /// Whether this rank decodes the track: the group's last.
+    ///
+    /// The units of a timeline go to the ranks in turn from the first, so the last rank is the one
+    /// a timeline's remainder leaves free, and the track runs beside the other ranks' last clips.
+    fn serves_track(&self) -> bool {
+        self.rank as usize + 1 == self.world_size
+    }
+
+    /// The deployment's one output and media lane, which every rank's media stage shares.
+    fn codec(
+        &self,
+        rates: executor::runners::media::Rates,
+        blocking: &executor::blocking::ThreadPool,
+    ) -> Result<SharedCodec> {
+        let mut codec = self
+            .codec
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(shared) = codec.as_ref() {
+            return Ok(shared.clone());
+        }
+        let shared = (
+            Arc::new(executor::runners::media::Output::from_env(rates)?),
+            blocking.lane::<executor::runners::media::MediaWork>(BlockingKind::Media)?,
+        );
+        *codec = Some(shared.clone());
+        Ok(shared)
     }
 
     /// The catalogue of prefill buckets this rank captures, and whether the deployment stated it.
@@ -844,16 +882,11 @@ impl EpochPlan {
             NamedRunner::new(RunnerId(1), Box::new(denoise)),
             NamedRunner::new(RunnerId(2), Box::new(decode)),
         ];
-        // A rank past the first holds the whole sample after every step and decodes its share of
-        // the timeline's clips; the track and the artifact are the first rank's.
-        if !self.serves_output() {
-            return Ok(runners);
-        }
         let audio_decoder = pipeline.audio_decoder().context(
             "the checkpoint holds no audio decoder, so no track could be decoded or encoded and \
              every response would be a clip with no sound",
         )?;
-        if !audio_buckets.is_empty() {
+        if self.serves_track() && !audio_buckets.is_empty() {
             let audio_set = Buckets::new(audio_buckets);
             let audio = executor::runners::AudioDecoderRunner::new(
                 Binding {
@@ -873,18 +906,29 @@ impl EpochPlan {
         // and they own the process's media lane because encoding and muxing are not device work
         // (2.4). The two numbers they work at are the checkpoint's: the frame rate the timeline is
         // measured in and the sample clock the track was decoded at.
+        //
+        // A rank past the first encodes the units it decoded and nothing else: the reader, the
+        // track's encoder and the muxer serve on one rank, and the units meet in the one output.
+        let (output, lane) = self.codec(
+            media_host::Rates {
+                frame_rate: minimax_h3::config::FPS,
+                audio_rate: audio_decoder.sampling_rate(),
+            },
+            blocking,
+        )?;
         let media = media_host::MediaStage::new(
             Binding {
                 id: RunnerId(4),
-                phases: host_phases(),
+                phases: if self.serves_output() {
+                    host_phases()
+                } else {
+                    unit_phases()
+                },
                 device,
                 stream: stream("media")?,
             },
-            Arc::new(media_host::Output::from_env(media_host::Rates {
-                frame_rate: minimax_h3::config::FPS,
-                audio_rate: audio_decoder.sampling_rate(),
-            })?),
-            blocking.lane::<media_host::MediaWork>(executor::blocking::BlockingKind::Media)?,
+            output,
+            lane,
             // A video unit's frames are the model's schedule, not this plan's arithmetic: the
             // postprocessor states the one home of `CLIP_FRAMES * n + OVERLAP_FRAMES`.
             video_units,
@@ -2630,6 +2674,13 @@ fn video_units(frames: u32) -> executor::Result<Vec<u32>> {
 ///
 /// They serve no graph, so no bucket states them: the mechanism plans each call by its phase, and a
 /// device that did not state these three would refuse the first encode of every request.
+/// The one host call every rank serves: the encode of the units it decoded.
+fn unit_phases() -> Vec<PhaseId> {
+    vec![PhaseId(
+        u16::try_from(engine::phase_id(engine::PhaseKind::VideoEncode).0).expect("a phase id fits"),
+    )]
+}
+
 fn host_phases() -> Vec<PhaseId> {
     [
         engine::PhaseKind::VideoEncode,

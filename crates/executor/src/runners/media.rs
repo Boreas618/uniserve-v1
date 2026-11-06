@@ -136,6 +136,8 @@ pub struct MediaWork {
 pub enum Stage {
     /// One unit's `[frames, rows, columns, 3]` frames into the encoded unit it covers.
     Unit {
+        /// The unit's place in the request's timeline.
+        index: u32,
         /// Frames this unit covers.
         frames: u32,
         /// Raster rows of a frame.
@@ -205,6 +207,7 @@ impl HostAction for MediaWork {
     fn run(&self) -> Result<Self::Output> {
         let outcome = match self.stage {
             Stage::Unit {
+                index,
                 frames,
                 height,
                 width,
@@ -213,6 +216,7 @@ impl HostAction for MediaWork {
                 self.output.encode_clip(
                     self.request,
                     &self.units,
+                    index as usize,
                     (frames, height, width),
                     bytes,
                 )?;
@@ -280,14 +284,24 @@ pub struct Output {
     rates: Rates,
     /// The requests whose assembly this output opened. The media crate refuses a second open for
     /// one request, which is the rule that keeps two units of a request from starting two
-    /// containers, so the first clip of a request opens and every later one appends.
+    /// containers, so the first clip of a request opens and every later one appends. The lock is
+    /// held across the open, because the ranks encode a request's units at once and a unit must
+    /// not reach an assembly another rank is still opening.
     opened: std::sync::Mutex<std::collections::HashSet<u64>>,
-    /// How many units each request's assembly holds, counted as they are appended.
-    ///
-    /// A unit's place in the timeline is what says how many frames it covers, and the mechanism's
-    /// encode batch states no extent to carry it: the count is this output's own record of the
-    /// appends, which is the same order the muxer checks against `units` when it finishes.
-    appended: std::sync::Mutex<std::collections::HashMap<u64, usize>>,
+    /// Each request's encoded units on their way into its assembly.
+    assemblies: std::sync::Mutex<std::collections::HashMap<u64, Assembly>>,
+}
+
+/// One request's encoded units on their way into its assembly.
+///
+/// The muxer takes units in the timeline's order and the ranks finish them in any order, so a unit
+/// that arrives before its turn waits here, and the unit that completes a run takes the run in.
+#[derive(Default)]
+struct Assembly {
+    /// The units the assembly holds, which is the next one's place.
+    appended: usize,
+    /// The framed units that arrived before their turn, by place.
+    waiting: std::collections::BTreeMap<usize, Vec<u8>>,
 }
 
 impl Output {
@@ -313,20 +327,8 @@ impl Output {
             media,
             rates,
             opened: std::sync::Mutex::new(std::collections::HashSet::new()),
-            appended: std::sync::Mutex::new(std::collections::HashMap::new()),
+            assemblies: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
-    }
-
-    /// How many units of `request`'s timeline this output has appended.
-    ///
-    /// The stage that encodes a unit needs the frames that unit covers, and the mechanism's batch
-    /// states them nowhere: a media encode is sized by the raster and the assembly, never by an
-    /// extent, so the place in the timeline is read from what this output has already appended.
-    pub fn units_appended(&self, request: RequestKey) -> usize {
-        crate::lock(&self.appended)
-            .get(&request_id(request))
-            .copied()
-            .unwrap_or(0)
     }
 
     /// The rates every artifact of this output is built at.
@@ -337,7 +339,9 @@ impl Output {
     /// Encodes one clip of `request` into the unit it covers.
     ///
     /// `units` is the request's timeline as the model's schedule states it - the kept frame count
-    /// of each clip, in order - which fixes the assembly the first call opens. `clip` is the bytes
+    /// of each clip, in order - which fixes the assembly the first call opens. `index` is this
+    /// unit's place in it: the ranks encode their own units at once, so the place is the batch's
+    /// statement rather than a count of what arrived first. `clip` is the bytes
     /// the `video_decoder` component published -
     /// `[frames, height, width, 3]` uint8, the postprocessor's own order - and `shape` is
     /// `(frames, height, width)` of this unit. Nothing is converted here: a postprocessor that
@@ -346,6 +350,7 @@ impl Output {
         &self,
         request: RequestKey,
         units: &[u32],
+        index: usize,
         shape: (u32, u32, u32),
         clip: &[u8],
     ) -> Result<()> {
@@ -356,22 +361,21 @@ impl Output {
                  decoder's clips and the assembly's timeline are the same list"
             )));
         }
-        let opening = {
+        {
             let mut opened = self
                 .opened
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            opened.insert(request_id(request))
-        };
-        if opening {
-            self.media.open_mux(
-                request_id(request),
-                width,
-                height,
-                self.rates.frame_rate,
-                self.rates.audio_rate,
-                units,
-            )?;
+            if opened.insert(request_id(request)) {
+                self.media.open_mux(
+                    request_id(request),
+                    width,
+                    height,
+                    self.rates.frame_rate,
+                    self.rates.audio_rate,
+                    units,
+                )?;
+            }
         }
         let decoded = unit_frames as usize * height as usize * width as usize * 3;
         if clip.len() != decoded {
@@ -396,12 +400,13 @@ impl Output {
         // The row is the store's framing, a length before the unit, and the assembly reads the unit.
         framed.truncate(written);
         framed.drain(..size_of::<u64>());
-        self.media.append_units(request_id(request), &[framed])?;
-        // The append is what says this unit has its place: the next encode of this request reads
-        // the schedule's following entry, so the count moves only after the encoder accepted it.
-        *crate::lock(&self.appended)
-            .entry(request_id(request))
-            .or_insert(0) += 1;
+        let mut assemblies = crate::lock(&self.assemblies);
+        let assembly = assemblies.entry(request_id(request)).or_default();
+        assembly.waiting.insert(index, framed);
+        while let Some(unit) = assembly.waiting.remove(&assembly.appended) {
+            self.media.append_units(request_id(request), &[unit])?;
+            assembly.appended += 1;
+        }
         Ok(())
     }
 
@@ -434,6 +439,7 @@ impl Output {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&request_id(request));
+        crate::lock(&self.assemblies).remove(&request_id(request));
         Ok(self.media.finish_mux(request_id(request))?)
     }
 
@@ -445,6 +451,7 @@ impl Output {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .remove(&request_id(request));
+        crate::lock(&self.assemblies).remove(&request_id(request));
         self.media.close_mux(request_id(request));
     }
 }
@@ -774,8 +781,6 @@ pub struct MediaStage {
     /// The frames of each video unit of a request's timeline: the model's schedule, handed in as a
     /// function because it is the model's arithmetic and the executor holds no copy of it.
     units_of: fn(u32) -> Result<Vec<u32>>,
-    /// The video units of each request staged so far, which is the next unit's place.
-    units_staged: std::collections::HashMap<RequestKey, usize>,
     /// What `submit` staged, one entry per call of the batch it was handed, and what `serve`
     /// performs call by call.
     ///
@@ -829,7 +834,6 @@ impl MediaStage {
             lane,
             products: None,
             units_of,
-            units_staged: std::collections::HashMap::new(),
             pending: Vec::new(),
             format,
             conditions: std::collections::HashMap::new(),
@@ -1058,15 +1062,14 @@ impl MediaStage {
 /// Stages every request of one host-call batch, in the batch's order.
 ///
 /// A batch holds one call per request, and the requests need not be at the same place in their
-/// timelines: each request states its own canvas, its own frame count and its own count of
-/// appended units, so the entry a request takes is its own. Answering the first and leaving the
+/// timelines: each request states its own canvas, its own frame count and its own unit, so the
+/// entry a request takes is its own. Answering the first and leaving the
 /// rest would complete a call whose stage never ran - the mux of that request would then wait for
 /// units nothing encoded.
 fn stage_batch(
     computation: crate::plan::Computation,
     requests: &[crate::batch::StagedRequest],
     units_of: &dyn Fn(u32) -> Result<Vec<u32>>,
-    appended: &dyn Fn(RequestKey) -> usize,
 ) -> Result<Vec<StagedCall>> {
     let mut staged_calls = Vec::with_capacity(requests.len());
     for request in requests {
@@ -1075,7 +1078,7 @@ fn stage_batch(
             computation,
             (request.width, request.height),
             &units,
-            appended(request.request),
+            request.unit as usize,
             request.handed,
         )?;
         staged_calls.push(StagedCall {
@@ -1135,6 +1138,7 @@ fn staged(
             let (width, height) = canvas;
             Ok((
                 Stage::Unit {
+                    index: index as u32,
                     frames,
                     height,
                     width,
@@ -1183,25 +1187,7 @@ impl Runner for MediaStage {
         let requests = (0..batch.calls.len())
             .map(|index| media.request(index))
             .collect::<Result<Vec<_>>>()?;
-        let staged_calls = stage_batch(
-            computation,
-            &requests,
-            &|frames| (self.units_of)(frames),
-            &|request| self.units_staged.get(&request).copied().unwrap_or(0),
-        )?;
-        // A unit's place is counted as it is staged: the encodes run on the media lane, so what has
-        // been appended lags what the next batch must read.
-        for staged_call in &staged_calls {
-            match staged_call.stage {
-                Stage::Unit { .. } => {
-                    *self.units_staged.entry(staged_call.request).or_insert(0) += 1;
-                }
-                Stage::Mux => {
-                    self.units_staged.remove(&staged_call.request);
-                }
-                _ => {}
-            }
-        }
+        let staged_calls = stage_batch(computation, &requests, &|frames| (self.units_of)(frames))?;
         let mut prepared = Vec::with_capacity(staged_calls.len());
         let mut jobs = Vec::with_capacity(staged_calls.len());
         for ((call, staged_call), request) in batch
@@ -1338,11 +1324,12 @@ mod tests {
         let units = [17_u32, 22];
         let (height, width) = (16_u32, 16_u32);
         let mut unit_bytes = 0_usize;
-        for frames in units {
+        // The ranks finish a timeline's units in any order, and the assembly takes them in its own.
+        for (index, frames) in units.iter().copied().enumerate().rev() {
             let pixels = vec![0x40_u8; frames as usize * height as usize * width as usize * 3];
             unit_bytes += pixels.len();
             output
-                .encode_clip(request, &units, (frames, height, width), &pixels)
+                .encode_clip(request, &units, index, (frames, height, width), &pixels)
                 .expect("a unit encodes");
         }
         // The track the session's timeline covers, by the container's own rule: the audio decoder
@@ -1389,7 +1376,7 @@ mod tests {
         );
         let request = RequestKey::new(0, ipc::RequestId(1), 0);
         let error = output
-            .encode_clip(request, &[17, 22], (17, 2, 2), &[0_u8; 16])
+            .encode_clip(request, &[17, 22], 0, (17, 2, 2), &[0_u8; 16])
             .expect_err("a short clip");
         let message = format!("{error}");
         assert!(
@@ -1409,7 +1396,7 @@ mod tests {
     ///
     /// The mechanism batches media requests as they arrive, and a host bucket states no bound, so a
     /// batch of two encodes is two requests whose artifacts are being assembled at once. Each has
-    /// its own canvas, its own frame count and its own count of appended units: staging the first
+    /// its own canvas, its own frame count and its own unit: staging the first
     /// and answering the batch would leave the second's mux waiting for a unit nothing encoded.
     #[test]
     fn a_batch_of_two_requests_stages_both_at_their_own_entries() {
@@ -1426,8 +1413,9 @@ mod tests {
                 frames: 56,
                 handed: 0,
             },
+            // The second request's first unit is already through; the first request's is not.
             crate::batch::StagedRequest {
-                unit: 0,
+                unit: 1,
                 request: ipc::RequestKey::new(1, ipc::RequestId(8), 0),
                 conditioning: Vec::new(),
                 step: 0,
@@ -1445,15 +1433,13 @@ mod tests {
             tokens: 0,
             extent: crate::plan::Extent::None,
         };
-        // The second request has already had one unit appended; the first has had none.
-        let appended = |request: ipc::RequestKey| usize::from(request.request_id.0 == 8);
         let units_of = |frames: u32| match frames {
             56 => Ok(vec![22_u32, 22, 12]),
             39 => Ok(vec![22_u32, 17]),
             other => Err(crate::Error::Invalid(format!("no schedule for {other}"))),
         };
 
-        let staged_calls = stage_batch(video, &requests, &units_of, &appended).expect("both");
+        let staged_calls = stage_batch(video, &requests, &units_of).expect("both");
         assert_eq!(
             staged_calls
                 .iter()
@@ -1463,6 +1449,7 @@ mod tests {
                 (
                     requests[0].request,
                     Stage::Unit {
+                        index: 0,
                         frames: 22,
                         height: 768,
                         width: 1344,
@@ -1471,6 +1458,7 @@ mod tests {
                 (
                     requests[1].request,
                     Stage::Unit {
+                        index: 1,
                         frames: 17,
                         height: 768,
                         width: 768,
@@ -1500,6 +1488,7 @@ mod tests {
             staged(video, (1344, 768), &units, 0, 0).expect("a video encode"),
             (
                 Stage::Unit {
+                    index: 0,
                     frames: 17,
                     height: 768,
                     width: 1344,
@@ -1511,6 +1500,7 @@ mod tests {
             staged(video, (1344, 768), &units, 1, 0).expect("the timeline's second unit"),
             (
                 Stage::Unit {
+                    index: 1,
                     frames: 22,
                     height: 768,
                     width: 1344,
