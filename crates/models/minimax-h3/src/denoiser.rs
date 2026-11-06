@@ -2683,8 +2683,13 @@ impl Denoiser {
     ) -> Result<()> {
         // The refiner's rows are the denoiser's conditioning (`denoiser.py:510-532`): every task's
         // text passes through it once, in place over the runner's `text` buffer, and the encoder's
-        // own features arrive in `source`. A request with no source has no conditioning to refine -
-        // and no text either, since the encoder always writes what the refiner reads.
+        // own features arrive in `source`.
+        //
+        // The two widths are what makes the refiner the column's only producer: the encoder's
+        // features are `text_dim` (5120) and the conditioning column is `hidden_size` (5376), so
+        // nothing on the encoder's side writes a row of `text`. A request with no source therefore
+        // asks this model to denoise a column nothing projected - the shape a model whose encoder
+        // width *is* its column width has, and never this one's served path.
         //
         // A conditioned request's condition rows, below the prompt's: the encoders write them from
         // `media`, at the offsets the layout's own counts place them, and the two writes are
