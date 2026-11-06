@@ -57,7 +57,7 @@ fn run() -> Result<(), String> {
         recipe.device = device;
     }
     let dump = flags.dump;
-    let module = recipe.module_dir(&recipe_path);
+    let module = recipe.module_dir();
     let metadata = Metadata::read(&module)?;
     let baked = Baked::read(&module)?;
     let mut launch = Launch::plan(&recipe, &metadata, &baked)?;
@@ -115,7 +115,7 @@ fn run() -> Result<(), String> {
         .synchronize()
         .map_err(|error| format!("the launch: {error}"))?;
 
-    let written = dump_buffers(&recipe, &buffers, &stream, &module, &recipe_path, dump)?;
+    let written = dump_buffers(&recipe, &buffers, &stream, &module, dump)?;
     println!(
         "launched {} on device {}: grid {:?} block {:?} shared {} cluster {:?} pdl {} \
          cooperative {}; {} buffers written",
@@ -253,10 +253,9 @@ fn dump_buffers(
     buffers: &BTreeMap<String, DeviceAllocation>,
     stream: &Stream,
     module: &Path,
-    recipe_path: &Path,
     dump: Option<PathBuf>,
 ) -> Result<usize, String> {
-    let directory = dump.unwrap_or_else(|| recipe.dump_dir(recipe_path));
+    let directory = dump.unwrap_or_else(|| recipe.dump_dir());
     let mut written = 0;
     for (name, plan) in &recipe.buffers {
         let Some(destination) = &plan.dump else {
