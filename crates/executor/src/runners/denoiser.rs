@@ -671,6 +671,15 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // capture that has to be thrown away.** The pool is the runtime's policy (a share of the
         // device per stream); the model states what one evaluation reserves. A share below the plan
         // is a refusal naming both numbers, and it is asked before anything is filled.
+        self.claim()?;
+        for bucket in self.capture_order() {
+            self.fill(bucket)?;
+        }
+        Ok(())
+    }
+
+    /// Claims the arena the largest bucket's evaluation plans.
+    fn claim(&mut self) -> Result<()> {
         let plans = self.buckets.clone();
         let mut needed = 0;
         for plan in &plans {
@@ -686,9 +695,6 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         if needed > 0 {
             let stream = self.stream_id();
             self.pool()?.claim(stream, needed)?;
-        }
-        for bucket in self.capture_order() {
-            self.fill(bucket)?;
         }
         Ok(())
     }
@@ -1548,6 +1554,10 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
         self.tables.attach(Arc::clone(&pools));
         self.lifecycle.attach_pools(Arc::clone(&pools));
         self.pools = Some(pools);
+    }
+
+    fn claim_arena(&mut self) -> Result<()> {
+        self.claim()
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
