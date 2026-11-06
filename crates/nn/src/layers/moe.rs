@@ -503,7 +503,7 @@ pub fn router_bytes(tokens: u64, geometry: MoeGeometry, dtype: DType) -> Result<
 /// each tile's expert and live-row count, the two route maps, and the two counters.
 ///
 /// The exchange sizes this half at the rows it **receives** and over the experts this rank holds, so
-/// the same six terms appear twice on an expert-parallel path with different numbers in them.
+/// the same seven terms appear twice on an expert-parallel path with different numbers in them.
 pub fn sort_bytes(tokens: u64, geometry: MoeGeometry) -> Result<u64> {
     let MoeGeometry {
         top, experts, tile, ..
@@ -516,6 +516,7 @@ pub fn sort_bytes(tokens: u64, geometry: MoeGeometry) -> Result<u64> {
         tiles * 4,        // each tile's live rows
         tokens * top * 4, // the permuted row of each expanded route
         routes * 4,       // the expanded row of each permuted position
+        routes * 4,       // the token row of each permuted position
         4,                // the padded row count
         4,                // the non-empty tile count
     ] {
@@ -732,6 +733,8 @@ struct Routes {
     expanded_to_permuted: TensorView,
     /// `[max_permuted_rows]` i32: the expanded route of each permuted row.
     permuted_to_expanded: TensorView,
+    /// `[max_permuted_rows]` i32: the token row each permuted row gathers.
+    permuted_to_token: TensorView,
     /// `[1]` i32: the live tiles.
     num_non_exiting_tiles: TensorView,
 }
@@ -1274,6 +1277,7 @@ impl Moe {
         let tile_to_limit = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
         let expanded_to_permuted = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
         let permuted_to_expanded = arena.tensor(DType::I32, Shape::new(&[rows]))?;
+        let permuted_to_token = arena.tensor(DType::I32, Shape::new(&[rows]))?;
         let total_padded_tokens = arena.tensor(DType::I32, Shape::new(&[1]))?;
         let num_non_exiting_tiles = arena.tensor(DType::I32, Shape::new(&[1]))?;
         let sort = self.sort_descriptor(self.experts);
@@ -1284,6 +1288,7 @@ impl Moe {
             tile_to_limit,
             expanded_to_permuted,
             permuted_to_expanded,
+            permuted_to_token,
             total_padded_tokens,
             num_non_exiting_tiles,
             live_tokens: f.live_of(),
@@ -1300,6 +1305,7 @@ impl Moe {
             tile_to_limit,
             expanded_to_permuted,
             permuted_to_expanded,
+            permuted_to_token,
             num_non_exiting_tiles,
         })
     }
@@ -1664,7 +1670,7 @@ impl Moe {
             global_scale: up_gate.global_scale.view(),
             tile_to_expert: routes.tile_to_expert,
             tile_to_limit: routes.tile_to_limit,
-            permuted_to_expanded: routes.permuted_to_expanded,
+            permuted_to_token: routes.permuted_to_token,
             num_non_exiting_tiles: routes.num_non_exiting_tiles,
             out: gated,
             workspace,
@@ -1897,6 +1903,7 @@ impl Moe {
         let tile_to_limit = arena.tensor(DType::I32, Shape::new(&[tiles]))?;
         let expanded_to_permuted = arena.tensor(DType::I32, Shape::new(&[received, top]))?;
         let permuted_to_expanded = arena.tensor(DType::I32, Shape::new(&[rows]))?;
+        let permuted_to_token = arena.tensor(DType::I32, Shape::new(&[rows]))?;
         let total_padded_tokens = arena.tensor(DType::I32, Shape::new(&[1]))?;
         let num_non_exiting_tiles = arena.tensor(DType::I32, Shape::new(&[1]))?;
         let sort = self.sort_descriptor(self.local);
@@ -1907,6 +1914,7 @@ impl Moe {
             tile_to_limit,
             expanded_to_permuted,
             permuted_to_expanded,
+            permuted_to_token,
             total_padded_tokens,
             num_non_exiting_tiles,
             // The expert-parallel path's `tokens` is `received` - the routes this rank holds,
@@ -2285,7 +2293,7 @@ pub(super) mod tests {
         };
         assert_eq!(
             routing_bytes(15, geometry, DType::BF16).expect("the prefix"),
-            68_864
+            130_304
         );
         assert_eq!(
             dense_bytes(15, geometry, DType::BF16).expect("the permuted pair"),
@@ -2301,7 +2309,7 @@ pub(super) mod tests {
                 false,
             )
             .expect("dense step"),
-            86_576_384
+            86_637_824
         );
         assert_eq!(
             encoded_bytes(
@@ -2324,7 +2332,7 @@ pub(super) mod tests {
                 true,
             )
             .expect("encoded step"),
-            94_286_592
+            94_348_032
         );
         assert_eq!(
             encoded_scratch_bytes(15_360, 2048, 768),

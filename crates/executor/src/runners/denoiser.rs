@@ -126,6 +126,10 @@ pub struct DenoiserShape {
     /// The width of the encoded conditioning rows: the text encoder's hidden width, which a layout
     /// counts rows of and states no width for.
     pub width: u32,
+    /// The width of the rows the denoiser reads (`nn::Denoiser::text_width`). A conditioner between
+    /// the encoder and the denoiser may widen them, so `text` is sized by this and `source`, which
+    /// holds what the encoder wrote, by `width`.
+    pub text_width: u32,
 }
 
 /// The elements of one latent's block.
@@ -233,12 +237,13 @@ impl DenoiseColumns {
             None => 1,
         };
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-        let text = width * u64::from(shape.width.max(1));
+        let text = width * u64::from(shape.text_width.max(1));
+        let source = width * u64::from(shape.width.max(1));
         Ok(Self {
             video: Column::new(device, shape.sample, rows * video)?,
             audio: Column::new(device, shape.sample, rows * audio)?,
             text: Column::new(device, shape.stack, rows * text)?,
-            source: Column::new(device, shape.stack, rows * text)?,
+            source: Column::new(device, shape.stack, rows * source)?,
             step: Column::new(device, DType::I64, 1)?,
             staged: Staged::default(),
         })
@@ -258,7 +263,8 @@ impl DenoiseColumns {
         };
         Staged::zero(&mut self.staged.audio, rows * audio)?;
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-        let text = u64::from(shape.width.max(1));
+        let text = u64::from(shape.text_width.max(1));
+        let source = u64::from(shape.width.max(1));
         let bytes = shape
             .stack
             .bytes()
@@ -267,7 +273,7 @@ impl DenoiseColumns {
         // The conditioner folds these into `text`, so a warm capture must read defined features as
         // well as defined rows: an uninitialised buffer would make the capture's output depend on
         // whatever the allocator last held.
-        Staged::zero(&mut self.staged.source, rows * width * text * bytes)?;
+        Staged::zero(&mut self.staged.source, rows * width * source * bytes)?;
         self.staged.step = vec![0u8; 8];
         Ok(())
     }
@@ -318,17 +324,18 @@ fn step_products(layout: &nn::capability::Layout) -> &'static [Product] {
     }
 }
 
-/// The rows and width of one request's conditioning in the columns: `(text_rows + condition_rows)`
-/// rows of `width` elements each.
+/// The rows of one request's conditioning in the columns, and the two widths they have:
+/// `(text_rows + condition_rows)` rows of `text_width` elements in `text` and of `width` in `source`.
 ///
 /// One statement for the two readers that need it - the view a step hands the model
 /// ([`DenoiserRunner::conditioning`]) and the copies that fill it from the store
 /// ([`DenoiserRunner::seed`]). Two statements of this arithmetic would be a step that reads a row
 /// the copies never filled, which is a plausible clip rather than an error.
-fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (u64, u64) {
+fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (u64, u64, u64) {
     let rows = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-    let width = u64::from(shape.width.max(1));
-    (rows, width)
+    let text = u64::from(shape.text_width.max(1));
+    let source = u64::from(shape.width.max(1));
+    (rows, text, source)
 }
 
 /// How a product's bytes fill one row of a conditioning column: `(copied, zeroed)`.
@@ -674,11 +681,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         media: &'a [nn::capability::MediaInput],
     ) -> Result<Conditioning<'a>> {
         let layout = layout_of(bucket)?;
-        let (rows, width) = conditioning_row(&self.shape, &layout);
-        let view = self.columns.text.shaped(&[rows * width]);
+        let (rows, text_width, width) = conditioning_row(&self.shape, &layout);
+        let view = self.columns.text.shaped(&[rows * text_width]);
         let text = view
-            .at(view.offset_elements(u64::from(index) * rows * width))
-            .reshape(Shape::new(&[rows, width]));
+            .at(view.offset_elements(u64::from(index) * rows * text_width))
+            .reshape(Shape::new(&[rows, text_width]));
         let features = self.columns.source.shaped(&[rows * width]);
         let source = features
             .at(features.offset_elements(u64::from(index) * rows * width))
@@ -726,17 +733,17 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let pending = self.pending.clone();
         let stream = self.stream.clone();
         let layout = layout_of(bucket)?;
-        let (rows, width) = conditioning_row(&self.shape, &layout);
+        let (rows, text_width, width) = conditioning_row(&self.shape, &layout);
         let element = u64::from(self.shape.stack.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
         })?);
-        let bytes = rows * width * element;
         for row in &pending {
             let (request, index) = (row.request, row.index);
-            for (kind, column) in [
-                (Product::Text, &mut self.columns.text),
-                (Product::Source, &mut self.columns.source),
+            for (kind, column, row_width) in [
+                (Product::Text, &mut self.columns.text, text_width),
+                (Product::Source, &mut self.columns.source, width),
             ] {
+                let bytes = rows * row_width * element;
                 // **The copy is the store's, not this runner's.** A deployment can put the text
                 // phase on its own GPU, so the product may be on another device or another stream,
                 // and only the store holds both ends: it waits on the producer's write before this
