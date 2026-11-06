@@ -108,6 +108,7 @@ mod transfer;
 pub mod peer;
 /// The scheduler's name for one phase (§4.5).
 pub mod phase;
+pub mod product;
 pub mod program;
 /// The vocabulary of a program-layer update (§7.3).
 pub mod update;

@@ -27,36 +27,7 @@ pub(crate) struct Canvas {
     pub(crate) height: u32,
 }
 
-/// Product names, as the worker's components declare their outputs.
-pub(crate) mod product {
-    /// The media reader's RGB24 pixels of every visual condition, `[pixels,
-    /// 3]` bytes in request order, each condition's frames whole.
-    pub(crate) const CONDITION_PIXELS: &str = "condition_pixels";
-    /// The media reader's stereo PCM of every audio track, `[samples, 2]` in
-    /// request order.
-    pub(crate) const CONDITION_SAMPLES: &str = "condition_samples";
-    /// The media reader's vision processor patches of every vision block,
-    /// `[patches, features]` in presentation order.
-    pub(crate) const VISION_PIXELS: &str = "vision_pixels";
-    /// The vision encoder's token features, one row per vision placeholder.
-    pub(crate) const VISION_FEATURES: &str = "vision_features";
-    /// The text encoder's prompt features, one row per presentation token.
-    pub(crate) const CONDITIONING: &str = "conditioning";
-    /// The latent encoder's visual condition rows in request order.
-    pub(crate) const CONDITION_VIDEO_LATENTS: &str = "condition_video_latents";
-    /// The latent encoder's audio condition rows in request order.
-    pub(crate) const CONDITION_AUDIO_LATENTS: &str = "condition_audio_latents";
-    /// The denoiser's final video latents.
-    pub(crate) const VIDEO_LATENTS: &str = "video_latents";
-    /// The denoiser's final audio latents.
-    pub(crate) const AUDIO_LATENTS: &str = "audio_latents";
-    /// The video decoder's RGB media units.
-    pub(crate) const VIDEO_UNITS: &str = "video_units";
-    /// The video codec's encoded media unit rows.
-    pub(crate) const ENCODED_UNITS: &str = "encoded_units";
-    /// The audio decoder's PCM track.
-    pub(crate) const AUDIO_SAMPLES: &str = "audio_samples";
-}
+pub(crate) use ipc::product;
 
 /// One product a request reserves at admission.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
