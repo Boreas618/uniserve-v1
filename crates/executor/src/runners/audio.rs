@@ -240,6 +240,11 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
                 "the audio decoder runner loaded before its device's pools were attached",
             ));
         }
+        self.claim()
+    }
+
+    /// Claims the arena the largest bucket's decode plans.
+    fn claim(&mut self) -> Result<()> {
         let mut needed = 0;
         for bucket in self.capture_order() {
             let layout = self.layout(bucket)?;
@@ -484,6 +489,10 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
 
     fn attach_products(&mut self, products: Arc<dyn Products>) {
         self.products = Some(products);
+    }
+
+    fn claim_arena(&mut self) -> Result<()> {
+        self.claim()
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {

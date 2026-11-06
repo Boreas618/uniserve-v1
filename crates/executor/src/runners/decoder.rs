@@ -355,6 +355,15 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         // device per stream - and the model states what one decode of a layout reserves, so a share
         // below the plan is refused while the deployment is being assembled, naming the bucket and
         // both numbers, rather than at the first frame that reaches the arena.
+        self.claim()?;
+        for bucket in self.capture_order() {
+            self.fill(bucket)?;
+        }
+        Ok(())
+    }
+
+    /// Claims the arena the largest bucket's decode plans.
+    fn claim(&mut self) -> Result<()> {
         let mut needed = 0;
         for bucket in self.capture_order() {
             let layout = Self::layout_of(&self.model, bucket)?;
@@ -369,9 +378,6 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         if needed > 0 {
             let stream = self.stream_id();
             self.pool()?.claim(stream, needed)?;
-        }
-        for bucket in self.capture_order() {
-            self.fill(bucket)?;
         }
         Ok(())
     }
@@ -1237,6 +1243,10 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
 
     fn attach_products(&mut self, products: Arc<dyn Products>) {
         self.products = Some(products);
+    }
+
+    fn claim_arena(&mut self) -> Result<()> {
+        self.claim()
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
