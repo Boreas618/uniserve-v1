@@ -684,8 +684,6 @@ impl EpochPlan {
                 stack: dtype,
                 sample: minimax_h3::denoiser::SAMPLE_DTYPE,
                 width: hidden,
-                // The model's own statement of the width its conditioner writes, asked once here so
-                // no runner asks again (`nn::capability::Denoiser::text_width`).
                 text_width: nn::capability::Denoiser::text_width(denoiser.as_ref())
                     .unwrap_or(hidden),
             },
