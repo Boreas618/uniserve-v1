@@ -223,8 +223,8 @@ impl Op for VsaAddGatedTiles {
             .i32(stride(&args.output, 1)?)
             .i32(stride(&args.gate, 0)?)
             .i32(stride(&args.gate, 1)?)
-            .i32(stride(&args.compressed, 1)?)
-            .i32(stride(&args.compressed, 0)?);
+            .i32(stride(&args.compressed, 0)?)
+            .i32(stride(&args.compressed, 1)?);
         kernel.launch(
             LaunchGrid::new([rows / u64::from(descriptor.block_rows), heads, 1])?,
             &mut arguments,

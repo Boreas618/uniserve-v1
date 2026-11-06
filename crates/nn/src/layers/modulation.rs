@@ -255,7 +255,8 @@ impl GatedResidual {
         self.gate.shape().last() as u32
     }
 
-    /// Fold `update` into `hidden`, both `[rows, width]`; `hidden` is written in place.
+    /// Fold `update` into `hidden`, both `[rows, width]`; the sum overwrites `update`, as the
+    /// kernel writes it, and `hidden` is left as it was.
     ///
     /// `row_indices` is `[rows]` and selects the gate row each activation row multiplies by. The row
     /// count is the launch's, not the descriptor's: a clip's token count changes with every request,

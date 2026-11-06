@@ -139,8 +139,8 @@ impl Layer {
     /// One layer from `hidden` into `out`, modulated by the step's gathered rows.
     ///
     /// `modulation` is this layer's `[3 · groups, 6 · hidden]` table and `rows` the `[tokens]`
-    /// AdaLN row each token reads. `out` receives the layer's output, so the stack alternates two
-    /// buffers and never copies the residual.
+    /// AdaLN row each token reads. The layer's output lands in `hidden`, and `out` holds the
+    /// attention's residual in between, so no copy of the residual is made.
     #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
@@ -200,8 +200,10 @@ impl Layer {
         // rounding is stated per site rather than per operator.
         let (value, gate) = projection_halves(packed);
         self.gated.forward(f, gate, value, mlp)?;
-        self.down.forward(f, mlp, update)?;
-        Ok(GatedResidual::new(gate_mlp)?.forward(f, out, update, rows)?)
+        // `hidden` is spent by now, so the down projection lands there, and the gated residual
+        // writes over its `update` operand: the layer's output is `hidden`, in place.
+        self.down.forward(f, mlp, hidden)?;
+        Ok(GatedResidual::new(gate_mlp)?.forward(f, out, hidden, rows)?)
     }
 }
 
@@ -1246,29 +1248,20 @@ impl Transformer {
         if let Some(trace) = trace {
             trace.check(self.layers.len(), tokens, width, hidden.dtype)?;
         }
-        let mut alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
+        let alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
         let scratch = Scratch::reserve(self, f, hidden, total_rows)?;
-        let mut current = hidden;
         for (index, layer) in self.layers.iter().enumerate() {
             adaln.layer(f, index, entries, modulation)?;
             layer.forward(
-                f, current, alternate, per_layer, rows, factors, visible, segments, &scratch,
+                f, hidden, alternate, per_layer, rows, factors, visible, segments, &scratch,
             )?;
-            std::mem::swap(&mut current, &mut alternate);
             // A diagnosis reads the layer's packed output as it stands: the same rows the next
             // layer reads, copied into the caller's view by an identity gather.
             if let Some(trace) = trace
                 && let Some(position) = trace.layers.iter().position(|layer| *layer == index as u32)
             {
-                nn::layers::gather_rows(f, current, trace.index, trace.views[position])?;
+                nn::layers::gather_rows(f, hidden, trace.index, trace.views[position])?;
             }
-        }
-        // An odd number of layers leaves the stack's output one buffer away from the caller's.
-        if current.ptr != hidden.ptr {
-            return Err(Error::Unsupported(
-                "the H3 stack ends in the alternate buffer; the caller must read the returned view"
-                    .to_owned(),
-            ));
         }
         Ok(())
     }
