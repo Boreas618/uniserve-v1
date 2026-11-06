@@ -570,6 +570,9 @@ impl MediaStage {
                 handle: ipc::ArtifactHandle::PosixShm { name: locator.name },
                 bytes: locator.bytes,
             });
+            // The artifact holds what the request's products were for, so their life ends here: a
+            // decoder's column is refused to the next request until they do.
+            self.products()?.forget(prepared.request);
         }
         Ok(BatchOutput {
             calls: vec![answer],
