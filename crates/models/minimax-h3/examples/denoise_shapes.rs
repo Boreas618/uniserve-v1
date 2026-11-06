@@ -24,7 +24,7 @@ use std::process::ExitCode;
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::{self, Layouts};
 use minimax_h3::partition::{Partition, Ulysses};
-use nn::capability::VideoRequest;
+use nn::capability::{ConditionRole, ConditionShape, VideoRequest};
 use nn::{DType, VideoTask};
 
 fn main() -> ExitCode {
@@ -53,12 +53,14 @@ struct Args {
     column_width: Option<u32>,
     ulysses: usize,
     dtype: DType,
+    /// The task the request is served for: `t2va`, `fl2va` or `ref2va`.
+    task: VideoTask,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: denoise_shapes --root <checkpoint> [--width W] [--height H] [--frames F] \
-         [--text-tokens N] [--ulysses D] [--dtype bf16|f16|f32]"
+         [--text-tokens N] [--ulysses D] [--dtype bf16|f16|f32] [--task t2va|fl2va|ref2va]"
     );
     std::process::exit(2)
 }
@@ -73,6 +75,7 @@ fn run() -> Result<(), String> {
         column_width: None,
         ulysses: 1,
         dtype: DType::BF16,
+        task: VideoTask::TextToVideoAudio,
     };
     let mut arguments = std::env::args().skip(1);
     while let Some(flag) = arguments.next() {
@@ -82,11 +85,23 @@ fn run() -> Result<(), String> {
             "--width" => args.width = number(&value("--width"), "--width")?,
             "--height" => args.height = number(&value("--height"), "--height")?,
             "--frames" => args.frames = number(&value("--frames"), "--frames")?,
-            "--text-tokens" => args.text_tokens = Some(number(&value("--text-tokens"), "--text-tokens")?),
+            "--text-tokens" => {
+                args.text_tokens = Some(number(&value("--text-tokens"), "--text-tokens")?)
+            }
             "--column-width" => {
                 args.column_width = Some(number(&value("--column-width"), "--column-width")?)
             }
             "--ulysses" => args.ulysses = number(&value("--ulysses"), "--ulysses")? as usize,
+            "--task" => {
+                args.task = match value("--task").as_str() {
+                    "t2va" => VideoTask::TextToVideoAudio,
+                    "fl2va" => VideoTask::FirstLastToVideoAudio,
+                    "ref2va" => VideoTask::ReferenceToVideoAudio,
+                    other => {
+                        return Err(format!("--task takes t2va, fl2va or ref2va, not `{other}`"));
+                    }
+                }
+            }
             "--dtype" => {
                 let stated = value("--dtype").to_ascii_lowercase();
                 args.dtype = match stated.as_str() {
@@ -104,7 +119,7 @@ fn run() -> Result<(), String> {
     }
 
     let config = Config::read(&args.root, None).map_err(|error| error.to_string())?;
-    let task = VideoTask::TextToVideoAudio;
+    let task = args.task;
     let serving = Partition::serving(
         &config,
         task,
@@ -130,17 +145,58 @@ fn run() -> Result<(), String> {
         .arrangement(&denoiser)
         .map_err(|error| error.to_string())?;
     let layouts = Layouts::new(denoiser.clone(), arrangement).map_err(|error| error.to_string())?;
+    // A conditioned task states its conditions and the counts that name them: a first-and-last-frame
+    // request anchors two frames of the canvas, and a reference is a clip of its own raster. The
+    // condition rows they produce are the layout's, and their offsets are what `write_state` writes.
+    let conditions: Vec<ConditionShape> = match task {
+        VideoTask::TextToVideoAudio => Vec::new(),
+        VideoTask::FirstLastToVideoAudio => vec![
+            ConditionShape {
+                role: ConditionRole::FirstFrame,
+                frames: 1,
+                height: args.height,
+                width: args.width,
+                audio_samples: 0,
+            },
+            ConditionShape {
+                role: ConditionRole::LastFrame,
+                frames: 1,
+                height: args.height,
+                width: args.width,
+                audio_samples: 0,
+            },
+        ],
+        VideoTask::ReferenceToVideoAudio => vec![ConditionShape {
+            role: ConditionRole::Reference,
+            frames: 8,
+            height: args.height,
+            width: args.width,
+            audio_samples: 0,
+        }],
+    };
+    let first_frames = conditions
+        .iter()
+        .filter(|shape| shape.role == ConditionRole::FirstFrame)
+        .count() as u32;
+    let last_frames = conditions
+        .iter()
+        .filter(|shape| shape.role == ConditionRole::LastFrame)
+        .count() as u32;
+    let references = conditions
+        .iter()
+        .filter(|shape| shape.role == ConditionRole::Reference)
+        .count() as u32;
     let request = VideoRequest {
         task,
         width: args.width,
         height: args.height,
         frames: args.frames,
         fps: minimax_h3::config::FPS,
-        first_frames: 0,
-        last_frames: 0,
-        references: 0,
+        first_frames,
+        last_frames,
+        references,
         text_tokens: text_rows,
-        conditions: &[],
+        conditions: &conditions,
         vision_spans: &[],
     };
     let layout = layouts.cover(&request);
@@ -171,7 +227,9 @@ fn run() -> Result<(), String> {
     // it (`nn::capability::Denoiser::text_width`, H3 answering `hidden_size`); from a configuration
     // the two halves are the same two numbers.
     println!("conditioning");
-    println!("  text   [rows, {hidden}]   what the denoiser reads (prepare_conditioning writes it)");
+    println!(
+        "  text   [rows, {hidden}]   what the denoiser reads (prepare_conditioning writes it)"
+    );
     println!("  source [rows, {text_dim}]   what the text encoder wrote");
     if text_dim == hidden {
         println!("  one width: the refiner does not widen, so a runner may size both alike");
@@ -184,7 +242,7 @@ fn run() -> Result<(), String> {
     // What the runner actually sizes its two columns at, which is the input the served walk met.
     // One number for both is `DenoiserShape::width`'s answer: the encoder's.
     let column = u64::from(args.column_width.unwrap_or(transformer.text_dim));
-    println!("  runner columns       text [{column}], source [{column}]");
+    println!("  runner columns       text [{column}], source [{text_dim}]");
     if column != hidden {
         disagreements.push(format!(
             "the runner sizes the text column at {column} and the denoiser reads rows {hidden} \
@@ -195,7 +253,7 @@ fn run() -> Result<(), String> {
     }
 
     // 2. The layout: a capacity, not a prompt.
-    println!("layout");
+    println!("layout of {task:?}");
     println!(
         "  text_rows {}  condition_rows {}  condition_elements {}",
         layout.text_rows, layout.condition_rows, layout.condition_elements
@@ -210,12 +268,16 @@ fn run() -> Result<(), String> {
         layout.video.channels, layout.video.frames, layout.video.height, layout.video.width
     );
     if let Some(audio) = layout.audio {
-        println!("  audio latent [channels {}, frames {}]", audio.channels, audio.frames);
+        println!(
+            "  audio latent [channels {}, frames {}]",
+            audio.channels, audio.frames
+        );
     }
 
     // 3. The checks that are statements about statements.
     let tokens = u64::from(
-        denoiser::packed_rows(&denoiser, &arrangement, &layout).map_err(|error| error.to_string())?,
+        denoiser::packed_rows(&denoiser, &arrangement, &layout)
+            .map_err(|error| error.to_string())?,
     );
     if layout.text_rows != arrangement.text_rows {
         disagreements.push(format!(
@@ -257,6 +319,35 @@ fn run() -> Result<(), String> {
     }
     println!("  total {total} elements at {}", args.dtype);
 
+    // 6. The stage's floor, which is the LARGER of the evaluation and the prompt's fold: the two
+    // occupy the same offsets, because the capture walk runs the evaluation alone from the region's
+    // base and the fold runs only on the live path, before the first replay.
+    let fold_rows = layout.text_rows.saturating_add(layout.condition_rows);
+    let fold = minimax_h3::conditioning::fold_bytes(
+        &denoiser.transformer,
+        fold_rows,
+        fold_rows,
+        arrangement.shard,
+        args.dtype,
+    );
+    // The plan's own reservation, not the element count times one width: a plan carries `f32`,
+    // `bf16` and `i32` entries, and the executor sums each entry's own width.
+    let evaluation = minimax_h3::decoding::arena_reservation(&plan);
+    println!(
+        "floor  max(evaluation {} MiB, fold {} MiB) = {} MiB",
+        evaluation / (1 << 20),
+        fold / (1 << 20),
+        evaluation.max(fold) / (1 << 20)
+    );
+    if fold > evaluation {
+        disagreements.push(format!(
+            "the prompt's fold reserves {} MiB and one evaluation {evaluation} MiB: the floor is \
+             the fold here, and a deployment sized by the evaluation alone would stop at its first \
+             request",
+            fold / (1 << 20)
+        ));
+    }
+
     // 5. The state tables the runner writes from this layout, with their values.
     //
     // `prepare_state` is the executor's per-request call and `write_state` is a host function, so
@@ -268,9 +359,10 @@ fn run() -> Result<(), String> {
     let mut written: Vec<Vec<u8>> = Vec::with_capacity(specs.len());
     for spec in &specs {
         let elements = spec.shape.dims().iter().product::<u64>();
-        let width = spec.dtype.bytes().ok_or_else(|| {
-            format!("the state table `{}` is {}", spec.name, spec.dtype)
-        })?;
+        let width = spec
+            .dtype
+            .bytes()
+            .ok_or_else(|| format!("the state table `{}` is {}", spec.name, spec.dtype))?;
         let bytes = usize::try_from(elements * width)
             .map_err(|_| format!("the state table `{}` is larger than memory", spec.name))?;
         written.push(vec![0u8; bytes]);
@@ -291,7 +383,10 @@ fn run() -> Result<(), String> {
     }
 
     if disagreements.is_empty() {
-        println!("denoise shapes: {} statement(s) agree", plan.len() + 6 + specs.len());
+        println!(
+            "denoise shapes: {} statement(s) agree",
+            plan.len() + 6 + specs.len()
+        );
         Ok(())
     } else {
         for disagreement in &disagreements {
