@@ -118,7 +118,11 @@ fn channels_last_strides(shape: Shape) -> Strides {
 /// reads the same bytes in another order and produces wrong numbers with no error anywhere. A model
 /// that wants the order but not the storage needs a permute in front of the convolution, and this is
 /// where that gap is named rather than measured.
-fn channels_last_storage(owner: &'static str, operand: &'static str, view: TensorView) -> Result<()> {
+fn channels_last_storage(
+    owner: &'static str,
+    operand: &'static str,
+    view: TensorView,
+) -> Result<()> {
     if view.shape.rank() != 5 {
         return Err(Error::shape(
             owner,
