@@ -52,14 +52,34 @@ def _copy_block_kernel(
     when a flat index is turned back into coordinates; the extents are the destination's axis order
     and the source's strides are given in that same order, which is where a permutation lives.
     """
-    index = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
-    live = index < total
     # The extents arrive unsigned and the index is signed: one signedness for the decomposition, or
     # Triton refuses the modulo rather than guessing which one was meant.
     e0 = e0.to(tl.int64)
     e1 = e1.to(tl.int64)
     e2 = e2.to(tl.int64)
     e3 = e3.to(tl.int64)
+    program = tl.program_id(0).to(tl.int64)
+
+    # A last axis at least one block wide is walked a row at a time: the three leading coordinates
+    # are one scalar decomposition per program, where the general path below divides four times per
+    # lane in 64 bits, which is what a copy of a wide block spends its time on.
+    if e3 >= BLOCK:
+        blocks = (e3 + BLOCK - 1) // BLOCK
+        row = program // blocks
+        lanes = (program % blocks) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+        inside = lanes < e3
+        c2 = row % e2
+        rest = row // e2
+        c1 = rest % e1
+        c0 = rest // e1
+        source_row = c0 * s0 + c1 * s1 + c2 * s2
+        out_row = c0 * d0 + c1 * d1 + c2 * d2
+        value = tl.load(source_ptr + source_row + lanes * s3, mask=inside, other=0)
+        tl.store(out_ptr + out_row + lanes * d3, value, mask=inside)
+        return
+
+    index = program * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+    live = index < total
 
     # Unrolled rather than looped over a list of tuples: Triton's AST transformer reads a Python
     # ``for`` over a literal list as a loop over tensors and refuses it.
