@@ -263,6 +263,7 @@ impl Executor {
             shadow_attached: false,
             activity: Arc::clone(&activity),
             sticky: None,
+            born: Instant::now(),
             waits: true,
             pending_landing: None,
         };
@@ -651,6 +652,8 @@ struct Launched {
 }
 
 struct Device {
+    /// When this device's thread began, which a batch's log lines are timed against.
+    born: Instant,
     /// Whether a job's device work is waited for before the job answers.
     waits: bool,
     /// The replay the command just served left running.
@@ -843,6 +846,8 @@ impl Device {
             batch = pending.batch,
             staged_ms = pending.staged_ms,
             total_ms = pending.started.elapsed().as_millis() as u64,
+            began_ms = pending.started.duration_since(self.born).as_millis() as u64,
+            ended_ms = self.born.elapsed().as_millis() as u64,
             "a media batch was served"
         );
         if let Err(error) = &result {
@@ -912,6 +917,8 @@ impl Device {
                         batch = batch.id.0,
                         staged_ms = staged.as_millis() as u64,
                         total_ms = started.elapsed().as_millis() as u64,
+                        began_ms = started.duration_since(self.born).as_millis() as u64,
+                        ended_ms = self.born.elapsed().as_millis() as u64,
                         "a media batch was served"
                     );
                 }

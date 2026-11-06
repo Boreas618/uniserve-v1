@@ -734,6 +734,10 @@ impl VideoDecoder {
         // The gather of a clip's rows out of the trajectory, one strided copy per tile.
         programs
             .launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::descriptor_of(STREAM));
+        // The tail a clip leaves its successor, out of the clip's raster.
+        programs.launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::wide_descriptor_of(
+            ACTIVATION,
+        ));
 
         // The two crossings between the stream's type and the activation's: the restored latents
         // round down, and the projected voxels widen into the stream.

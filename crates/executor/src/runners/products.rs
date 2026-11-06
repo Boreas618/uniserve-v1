@@ -247,6 +247,22 @@ pub trait Products: Send + Sync {
         stream: &platform::Stream,
     ) -> Result<bool>;
 
+    /// Orders `stream` after `kind`'s write and answers its region, for a reader that reads it in
+    /// place: `None` when the request holds no such product.
+    ///
+    /// The region stays the producer's, and a reader on another device reads it where it lies. Only
+    /// a region in pinned host storage may be read from another device.
+    fn lent(
+        &self,
+        _request: RequestKey,
+        _kind: Product,
+        _stream: &platform::Stream,
+    ) -> Result<Option<TensorView>> {
+        Err(crate::Error::Invalid(
+            "this store lends no region to a reader".into(),
+        ))
+    }
+
     /// Copies `request`'s `kind` product into host memory and waits for the copy to land.
     ///
     /// This is the read the media work makes. `crates/media`'s encoders and muxer take host bytes,
@@ -463,6 +479,15 @@ impl Products for RankProducts {
         stream: &platform::Stream,
     ) -> Result<bool> {
         self.store(kind).copy_into(request, kind, destination, stream)
+    }
+
+    fn lent(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        stream: &platform::Stream,
+    ) -> Result<Option<TensorView>> {
+        self.store(kind).lent(request, kind, stream)
     }
 
     fn stage(
@@ -701,6 +726,31 @@ impl Products for Held {
             })),
             None => Ok(None),
         }
+    }
+
+    fn lent(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        stream: &platform::Stream,
+    ) -> Result<Option<TensorView>> {
+        let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
+        let Some(placed) = placed else {
+            return Ok(None);
+        };
+        let read = (stream.device(), StreamId(stream.raw()));
+        if route((placed.device, placed.stream), read) == Route::AfterTheWriter {
+            let Some(written) = placed.written.as_ref() else {
+                return Err(crate::Error::Invalid(format!(
+                    "request {} lends {} written on device {} with no record of its write",
+                    request.request_id.0,
+                    kind.name(),
+                    placed.device.0
+                )));
+            };
+            stream.wait_event(written)?;
+        }
+        Ok(Some(placed.view))
     }
 
     fn copy_into(

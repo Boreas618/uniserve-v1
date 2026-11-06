@@ -178,9 +178,6 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// first splice from the schedule's own overlap count, which is the model's number rather than
     /// this runner's, and reused after.
     tail: Option<Column>,
-    /// The predecessor clip's tail, copied from the store: the clip before this one may have been
-    /// decoded by another rank.
-    incoming: Option<Column>,
     /// The frames the staged request's timeline holds, from its own row
     /// (`StagedRequest::frames`): the schedule's length, which is what the last clip's keep depends
     /// on.
@@ -298,7 +295,6 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             postprocessor,
             frames: None,
             tail: None,
-            incoming: None,
             staged_frames: None,
             staged_keep: None,
             diag: crate::runners::diag::Diag::from_env(),
@@ -940,7 +936,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let overlap = successor.max(splice.overlap);
         self.size_tail(channels, height, width, overlap, schedule.len() as u32)?;
         let previous = if splice.overlap > 0 {
-            Some(self.predecessor_tail(request, index, channels, height, width, splice.overlap)?)
+            Some(self.predecessor_tail(request, index)?)
         } else {
             None
         };
@@ -992,7 +988,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 },
             )
             .map_err(Error::from)?;
-        self.keep_tail(request, index, &clip, channels, height, width, successor)?;
+        self.keep_tail(forward, request, index, &clip, channels, height, width, successor)?;
         self.staged_keep = Some(splice.keep);
         self.staged_first = splice.first;
         Ok(())
@@ -1031,13 +1027,6 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         {
             self.tail = Some(Column::new(self.device, self.dtype, slots)?);
         }
-        if self
-            .incoming
-            .as_ref()
-            .is_none_or(|column| column.device.numel() < elements)
-        {
-            self.incoming = Some(Column::new(self.device, self.dtype, elements)?);
-        }
         Ok(())
     }
 
@@ -1046,32 +1035,11 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     /// The predecessor may be on another rank, decoding at the same time, so this waits for the
     /// publication. A decode needs nothing but its own latents, so no rank waits on one that waits
     /// on it, and the wait is bounded by one decode; the bound here names a rank that never answers.
-    fn predecessor_tail(
-        &self,
-        request: ipc::RequestKey,
-        index: u32,
-        channels: u32,
-        height: u32,
-        width: u32,
-        overlap: u32,
-    ) -> Result<TensorView> {
+    fn predecessor_tail(&self, request: ipc::RequestKey, index: u32) -> Result<TensorView> {
         let store = self
             .products
             .as_ref()
             .ok_or_else(|| crate::runners::products::no_store(request))?;
-        let incoming = self.incoming.as_ref().ok_or_else(|| {
-            Error::Invariant("a clip fades and no incoming tail column was sized".into())
-        })?;
-        let view = TensorView::new(
-            incoming.device.ptr,
-            self.dtype,
-            Shape::new(&[
-                u64::from(channels),
-                u64::from(overlap),
-                u64::from(height),
-                u64::from(width),
-            ]),
-        );
         let kind = Product::Tail(index - 1);
         let deadline = std::time::Instant::now() + TAIL_WAIT;
         while !store.holds(request, kind) {
@@ -1085,20 +1053,25 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             }
             std::thread::sleep(std::time::Duration::from_micros(200));
         }
-        if !store.copy_into(request, kind, &view, &self.stream)? {
-            return Err(crate::runners::products::absent(request, kind));
-        }
-        Ok(view)
+        // The tail lies in pinned host storage, which every device reads, so the splice reads it
+        // where its rank left it: a copy between two pinned regions is the driver's host copy, which
+        // waits for this stream and holds the device thread for the clip just launched.
+        store
+            .lent(request, kind, &self.stream)?
+            .ok_or_else(|| crate::runners::products::absent(request, kind))
     }
 
     /// Keeps the clip's last `overlap` frames for the next clip's fade, and publishes them.
     ///
     /// The tail is one contiguous run per channel of the clip's own raster (`[channels, frames, rows,
-    /// columns]`), so this is `channels` copies on the runner's stream and no arithmetic. It has to
-    /// happen before the next decode, which writes over the clip's column.
+    /// columns]`), so this is one block copy on the runner's stream and no arithmetic. It has to
+    /// happen before the next decode, which writes over the clip's column. Both columns are pinned
+    /// host memory, which the driver's `cuMemcpyAsync` copies on the host once the stream drains, so
+    /// the copy is a kernel: a memcpy here held the device thread for the whole decode.
     #[allow(clippy::too_many_arguments)]
     fn keep_tail(
         &self,
+        forward: &nn::Forward,
         request: ipc::RequestKey,
         index: u32,
         clip: &TensorView,
@@ -1113,41 +1086,30 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         if overlap == 0 {
             return Ok(());
         }
-        let element = self
-            .dtype
-            .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", self.dtype)))?;
         let frames = clip.shape.dim(1);
         let start = frames
             .checked_sub(u64::from(overlap))
             .ok_or_else(|| Error::Invalid("a clip is shorter than its own tail".into()))?;
-        let bytes = usize::try_from(
-            u64::from(overlap)
-                .saturating_mul(u64::from(height))
-                .saturating_mul(u64::from(width))
-                .saturating_mul(element),
-        )
-        .map_err(|_| Error::Invalid("a clip's tail is larger than memory".into()))?;
         let stride = u64::from(overlap)
             .saturating_mul(u64::from(height))
             .saturating_mul(u64::from(width));
         let slot = u64::from(index) * u64::from(channels) * stride;
-        for channel in 0..u64::from(channels) {
-            let source = clip.element(&[channel, start, 0, 0]);
-            let destination = tail.device.element(&[slot + channel * stride]);
-            // SAFETY: both regions are this runner's own buffers, the source's run of `bytes` lies
-            // inside the clip's raster (its frames axis is at least `overlap` long) and the
-            // destination's inside the tail column, sized for exactly this overlap; the copy is
-            // ordered on the runner's stream before the next clip's splice reads it.
-            unsafe {
-                platform::memcpy_async(
-                    destination.address(),
-                    source.address(),
-                    bytes,
-                    &self.stream,
-                )?;
-            }
-        }
+        let plane = frames
+            .saturating_mul(u64::from(height))
+            .saturating_mul(u64::from(width));
+        let block = Shape::new(&[u64::from(channels), 1, 1, stride]);
+        let source = TensorView::with_strides(
+            clip.element(&[0, start, 0, 0]),
+            self.dtype,
+            block,
+            nn::Strides::new(&[plane, stride, stride, 1]),
+        );
+        let destination = TensorView::new(tail.device.element(&[slot]), self.dtype, block);
+        let strides = [stride as i64, stride as i64, stride as i64, 1];
+        nn::layers::CopyBlock::new(self.dtype)
+            .map_err(Error::from)?
+            .forward_wide(forward, source, destination, &strides)
+            .map_err(Error::from)?;
         let store = self
             .products
             .as_ref()
@@ -1212,6 +1174,13 @@ fn timeline_frame(column: &Column, first: u32, height: u32, width: u32) -> ops::
 impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
     fn phases(&self) -> &[ipc::PhaseId] {
         &self.phases
+    }
+
+    /// A clip's replay reads and writes on the stream, in order, and each clip keeps its own frames
+    /// in the timeline, so the next clip can be launched behind it and a finished clip's encode runs
+    /// beside it. The diagnosis reads the columns between clips, so it waits for each.
+    fn overlaps_replays(&self) -> bool {
+        !self.diag.enabled()
     }
 
     fn stream(&self) -> Option<&platform::Stream> {
