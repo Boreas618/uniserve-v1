@@ -588,7 +588,7 @@ impl fmt::Display for Bucket {
             ),
             Extent::Latents(layout) => write!(
                 formatter,
-                "{}/{} rows/{} latents {}x{}x{}{}",
+                "{}/{} rows/{} latents {}x{}x{}{} and {} condition rows",
                 self.variant,
                 self.rows,
                 layout.video.frames,
@@ -599,7 +599,8 @@ impl fmt::Display for Bucket {
                     " with audio"
                 } else {
                     ""
-                }
+                },
+                layout.condition_rows
             ),
             Extent::Clip {
                 frames,

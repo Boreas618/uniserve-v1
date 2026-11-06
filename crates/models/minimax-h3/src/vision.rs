@@ -549,13 +549,15 @@ impl Block {
             )?;
         }
 
-        attention.attend_dense(
+        // One sequence per time step, packed in one launch: the key bound is every step together
+        // and the longest row is one step, so a video block of several steps launches as an image.
+        attention.attend_packed(
             f,
             buffers.as_heads(buffers.rotated_query, heads, head_dim)?,
             buffers.as_heads(buffers.rotated_key, heads, head_dim)?,
             buffers.as_heads(buffers.value, heads, head_dim)?,
-            Some(image.lengths),
-            Some(image.lengths),
+            image.lengths,
+            rows.patches,
             rows.sequence,
             buffers.as_heads(buffers.attended, heads, head_dim)?,
         )?;
@@ -990,14 +992,14 @@ impl VisionTower {
             .forward(f, buffers.hidden, buffers.normalized)
             .map_err(Error::from)?;
 
-        // One bidirectional call per time step of this grid: the descriptor's key bound is the
-        // grid's own `height · width` (the reference's attention declares none), and its scale the
-        // head's `head_dim^-0.5` (`uniserve/nn/attention/layer.py:90`).
+        // One bidirectional launch over the grid's time steps: the descriptor's key bound is the
+        // block's own patches (the reference's attention declares none), and its scale the head's
+        // `head_dim^-0.5` (`uniserve/nn/attention/layer.py:90`).
         let attention = Attention::dense(
             self.head_dim,
             self.heads,
             self.heads,
-            rows.sequence,
+            rows.patches,
             false,
             None,
             (self.head_dim as f32).sqrt().recip(),
