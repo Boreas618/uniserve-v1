@@ -43,6 +43,8 @@ def spec(fields, parameters, target):
     fp8 = output == FP8
     stored = FP8_TRITON if fp8 else DTYPES[output]
     return {
+        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
+        "aligned": ["hidden_ptr", "update_ptr", "gate_ptr", "weight_ptr", "shift_ptr", "scale_ptr", "row_indices_ptr", "output_ptr", "retain_ptr", "gate_row_stride", "shift_row_stride", "scale_row_stride"],
         "kernel": kernels._modulated_rms_kernel,
         "signature": {
             "hidden_ptr": dtype,

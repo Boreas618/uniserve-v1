@@ -197,6 +197,55 @@ impl Group {
         Ok(Transfer { landing })
     }
 
+    /// Starts delivering rows `first..first + count` of this rank's rows to every member, and
+    /// theirs here, in place in `gathered`.
+    ///
+    /// `gathered` is the whole sequence `[members * owner_rows, width]`, member by member, and this
+    /// rank's rows of the interval are already in its own block. A row lands where the sequence
+    /// holds it, so an interval of every member arrives without a copy and the sequence is whole
+    /// once each interval's transfer is finished.
+    pub fn start_gather_rows(
+        &self,
+        gathered: TensorView,
+        owner_rows: u64,
+        first: u64,
+        count: u64,
+        stream: &Stream,
+    ) -> Result<Transfer> {
+        let width = gathered.shape.last();
+        let (elements, dtype) = self.collective(gathered, gathered, "gather_rows")?;
+        let elements = elements.min(usize::try_from(count * width).unwrap_or(usize::MAX));
+        let bytes = dtype.bytes() * elements;
+        let block = |member: u64| {
+            let at = gathered.offset_elements((member * owner_rows + first) * width);
+            range(gathered.at(at), bytes)
+        };
+        self.fork.record(stream).map_err(Error::Platform)?;
+        self.lane
+            .wait_event(&self.fork)
+            .map_err(Error::Platform)?;
+        {
+            let communicator = self.locked();
+            let rank = communicator.rank();
+            ops::platform::collective_group(|| {
+                for peer in 0..self.ranks as i32 {
+                    if peer != rank {
+                        communicator.send(&self.lane, block(rank as u64), elements, dtype, peer)?;
+                        communicator.recv(&self.lane, block(peer as u64), elements, dtype, peer)?;
+                    }
+                }
+                Ok(())
+            })
+            .map_err(Error::Platform)?;
+        }
+        Self::settled(&self.lane)?;
+        let landing = self.next.fetch_add(1, Ordering::Relaxed) % LANDINGS;
+        self.landings[landing]
+            .record(&self.lane)
+            .map_err(Error::Platform)?;
+        Ok(Transfer { landing })
+    }
+
     /// Orders `stream` after `transfer`.
     pub fn finish(&self, transfer: Transfer, stream: &Stream) -> Result<()> {
         stream

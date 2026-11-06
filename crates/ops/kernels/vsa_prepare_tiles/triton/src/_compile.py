@@ -85,6 +85,13 @@ def compile_one(package, target, key, out, spec):
             described["kernel"],
             described["signature"],
             described["constexprs"],
+            # The arguments a package states are multiples of sixteen, which is what lets the compiler
+            # load and store whole vectors. A module is compiled ahead of its launches, so nothing
+            # observes a pointer here: the statement is the package's, about its operator's views.
+            {
+                (list(described["signature"]).index(name),): [["tt.divisibility", 16]]
+                for name in described.get("aligned", ())
+            },
         ),
         target=GPUTarget("cuda", capability(target), WARP_SIZE),
         options=described["options"],

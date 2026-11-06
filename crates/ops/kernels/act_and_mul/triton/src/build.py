@@ -27,6 +27,8 @@ def spec(fields, parameters, target):
     # than sm_100 cannot, so the module is compiled without it there.
     pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
     return {
+        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
+        "aligned": ["gate_ptr", "value_ptr", "out_ptr", "elements", "gate_row_stride", "value_row_stride"],
         "kernel": kernels._act_and_mul_kernel,
         "signature": {
             "gate_ptr": dtype,

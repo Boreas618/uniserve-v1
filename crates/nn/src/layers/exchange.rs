@@ -57,6 +57,20 @@ impl UlyssesExchange {
         self.group(f)?.start_all_to_all(send, recv, f.stream()?)
     }
 
+    /// Starts delivering rows `first..first + count` of this rank's `owner_rows` to every member and
+    /// theirs here, in place in the whole sequence `gathered`.
+    pub fn start_gather(
+        &self,
+        f: &Forward,
+        gathered: TensorView,
+        owner_rows: u64,
+        first: u64,
+        count: u64,
+    ) -> Result<crate::Transfer> {
+        self.group(f)?
+            .start_gather_rows(gathered, owner_rows, first, count, f.stream()?)
+    }
+
     /// Orders the forward's stream after `transfer`: what it received is readable from here on.
     pub fn finish(&self, f: &Forward, transfer: crate::Transfer) -> Result<()> {
         self.group(f)?.finish(transfer, f.stream()?)

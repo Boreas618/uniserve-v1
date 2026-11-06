@@ -2194,6 +2194,12 @@ pub fn denoise_arena(
         element,
         groups * 3 * 6 * hidden,
     );
+    push(
+        &mut plan,
+        "step.following",
+        element,
+        groups * 3 * 6 * hidden,
+    );
     push(&mut plan, "alternate", element, tokens * hidden);
     push(&mut plan, "normalized", element, tokens * hidden);
     push(&mut plan, "update", element, tokens * hidden);

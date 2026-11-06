@@ -41,6 +41,8 @@ pub struct Sparse {
     exchange: Option<UlyssesExchange>,
     /// How this rank reaches its heads.
     projection: Projection,
+    /// This rank's place in the group: which block of the gathered sequence holds its rows.
+    rank: u64,
 }
 
 impl Sparse {
@@ -167,6 +169,7 @@ impl Sparse {
             tile_rows,
             exchange,
             projection: partition.projection,
+            rank: partition.sequence_rank as u64,
         })
     }
 
@@ -202,7 +205,7 @@ impl Sparse {
         scratch: &Scratch,
         out: TensorView,
     ) -> Result<()> {
-        self.attend(f, normalized, factors, sizes, segments, keep, scratch)?;
+        self.attend(f, normalized, factors, sizes, segments, keep, scratch, Vec::new())?;
         // The compression is folded into the fine rows, in place, and one binding names both the
         // buffer the fold writes and the buffer the projection reads: `add_gated` modifies its first
         // argument only, so folding into any other buffer would drop this branch without a shape
@@ -224,6 +227,38 @@ impl Sparse {
         self.exchange.is_some()
     }
 
+    /// Whether this layer's input rows are gathered ahead of it: the gather mode reads the whole
+    /// sequence, and what fills it is started as the rows are normalized, which the layer before
+    /// does interval by interval.
+    pub fn gathers_ahead(&self) -> bool {
+        self.exchange.is_some() && self.projection == Projection::Gather
+    }
+
+    /// This rank's rows `first..first + count` of the gathered sequence, of its `own` rows.
+    pub fn gathered_rows(&self, scratch: &Scratch, own: u64, first: u64, count: u64) -> TensorView {
+        let rows = scratch.gathered_rows;
+        let width = rows.shape.last();
+        rows.at(rows.offset_elements((self.rank * own + first) * width))
+            .reshape(Shape::new(&[count, width]))
+    }
+
+    /// Starts delivering rows `first..first + count` of this rank's `own`, which
+    /// [`Self::gathered_rows`] holds, and every member's rows of that interval here.
+    pub fn start_gather(
+        &self,
+        f: &Forward,
+        scratch: &Scratch,
+        own: u64,
+        first: u64,
+        count: u64,
+    ) -> Result<nn::Transfer> {
+        let exchange = self
+            .exchange
+            .as_ref()
+            .ok_or_else(|| Error::config("a layer of one rank gathers no rows".to_owned()))?;
+        Ok(exchange.start_gather(f, scratch.gathered_rows, own, first, count)?)
+    }
+
     /// Attends this rank's heads of every row, up to the fine rows and the compression.
     ///
     /// In the exchange mode the four projections alternate with their transfers: each member's
@@ -241,6 +276,7 @@ impl Sparse {
         segments: TensorView,
         keep: TensorView,
         scratch: &Scratch,
+        arrived: Vec<nn::Transfer>,
     ) -> Result<Option<nn::Transfer>> {
         // The sequence is whole here whatever this rank owns of it: the buffers below are the rows of
         // every member, in member order, for this rank's heads.
@@ -265,8 +301,15 @@ impl Sparse {
                 Some(gate)
             }
             _ => {
-                let source =
-                    projected_rows(f, exchange, self.projection, normalized, scratch.gathered_rows)?;
+                let source = match exchange {
+                    Some(exchange) => {
+                        for transfer in arrived {
+                            exchange.finish(f, transfer)?;
+                        }
+                        scratch.gathered_rows
+                    }
+                    None => normalized,
+                };
                 self.query
                     .forward(f, exchange, source, scratch.staging, scratch.query)?;
                 self.key
@@ -374,11 +417,17 @@ impl Sparse {
         let (fine, gate) = (scratch.fine.reshape(shape), scratch.gate.reshape(shape));
         let slots: Vec<u32> = (0..members as u32).collect();
         let unit = (u64::from(self.tile_rows) / members).max(1);
-        let span = own.div_ceil(RETURN_INTERVALS).next_multiple_of(unit);
+        let total: u64 = RETURN_SHARES.iter().sum();
         let mut returning = Vec::new();
         let mut first = 0;
-        while first < own {
-            let count = span.min(own - first);
+        let mut reached = 0;
+        for share in RETURN_SHARES {
+            reached += share;
+            let end = (own * reached / total).next_multiple_of(unit).min(own);
+            if end == first {
+                continue;
+            }
+            let count = end - first;
             let block = Shape::new(&[members, count, heads, width]);
             let at = first * members * heads * width;
             let payload = scratch
@@ -406,7 +455,7 @@ impl Sparse {
                 landed,
                 transfer: exchange.start(f, payload, landed)?,
             });
-            first += count;
+            first = end;
         }
         Ok(returning)
     }
@@ -434,11 +483,12 @@ impl Sparse {
     }
 }
 
-/// How many intervals an owner's rows return in.
+/// The intervals an owner's rows return in, as shares of the rows.
 ///
-/// The first interval's transfer is the part of the return nothing hides, and an interval's output
-/// projection and feed-forward take longer per row than its transfer.
-const RETURN_INTERVALS: u64 = 3;
+/// The first interval's transfer is the part of the return nothing hides, and the last interval's
+/// gather is the part of the next layer's input nothing hides, so the two ends are the small ones:
+/// an interval's output projection and feed-forward take longer per row than either transfer.
+const RETURN_SHARES: [u64; 4] = [1, 2, 2, 1];
 
 /// One interval of this rank's rows on its way back from the members that attended it.
 pub struct Returning {

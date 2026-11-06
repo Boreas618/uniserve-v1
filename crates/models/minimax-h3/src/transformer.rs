@@ -153,18 +153,18 @@ impl Layer {
         visible: Option<&Visible>,
         segments: Option<&Segments>,
         scratch: &Scratch,
-    ) -> Result<()> {
+        next: Option<(&Layer, TensorView)>,
+        arrived: Vec<nn::Transfer>,
+    ) -> Result<Vec<nn::Transfer>> {
         let width = hidden.shape.last();
-        let (shift_attention, scale_attention, gate_attention) = chunks(modulation, width, 0)?;
+        let (_, _, gate_attention) = chunks(modulation, width, 0)?;
         let (shift_mlp, scale_mlp, gate_mlp) = chunks(modulation, width, 3)?;
         let normalized = scratch.normalized;
         let update = scratch.update;
 
         // Attention: normalize, attend, and fold the gated update into `out` while normalizing the
         // feed-forward's input.
-        let attention_norm =
-            ModulatedRmsNorm::new(self.norm1, shift_attention, scale_attention, None, self.eps)?;
-        attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
+        let attention_norm = self.attention_norm(modulation, width)?;
         let mlp_norm = ModulatedRmsNorm::new(
             self.norm2,
             shift_mlp,
@@ -184,6 +184,17 @@ impl Layer {
             let tables = segments.ok_or_else(|| {
                 Error::Unsupported("a sparse layer was handed no segment views".to_owned())
             })?;
+            let own = hidden.rows();
+            let ahead = sparse.gathers_ahead();
+            let mut arrived = arrived;
+            // The stack's first layer has no layer before it to start its gather.
+            if !ahead {
+                attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
+            } else if arrived.is_empty() {
+                let rows_here = sparse.gathered_rows(views, own, 0, own);
+                attention_norm.forward(f, hidden, None, rows, rows_here, None, None)?;
+                arrived.push(sparse.start_gather(f, views, own, 0, own)?);
+            }
             let gate = sparse.attend(
                 f,
                 normalized,
@@ -192,8 +203,10 @@ impl Layer {
                 tables.segments,
                 tables.keep,
                 views,
+                arrived,
             )?;
-            for interval in sparse.deliver(f, gate, views, hidden.rows())? {
+            let mut gathering = Vec::new();
+            for interval in sparse.deliver(f, gate, views, own)? {
                 let (first, count) = (interval.first, interval.count);
                 let part = |view: TensorView| row_interval(view, first, count);
                 let selected = rows
@@ -212,9 +225,25 @@ impl Layer {
                     part(scratch.packed),
                     part(scratch.mlp),
                 )?;
+                // These rows are the next layer's input, and its attention reads the whole
+                // sequence, so they leave now, beside the rest of this layer.
+                if ahead && let Some((layer, modulation)) = next {
+                    let rows_here = sparse.gathered_rows(views, own, first, count);
+                    layer.attention_norm(modulation, width)?.forward(
+                        f,
+                        part(hidden),
+                        None,
+                        selected,
+                        rows_here,
+                        None,
+                        None,
+                    )?;
+                    gathering.push(sparse.start_gather(f, views, own, first, count)?);
+                }
             }
-            return Ok(());
+            return Ok(gathering);
         }
+        attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
         self.attention.forward(
             f,
             normalized,
@@ -235,7 +264,14 @@ impl Layer {
             normalized,
             scratch.packed,
             scratch.mlp,
-        )
+        )?;
+        Ok(Vec::new())
+    }
+
+    /// The normalization of this layer's attention input, under its `modulation` table.
+    fn attention_norm(&self, modulation: TensorView, width: u64) -> Result<ModulatedRmsNorm> {
+        let (shift, scale, _) = chunks(modulation, width, 0)?;
+        Ok(ModulatedRmsNorm::new(self.norm1, shift, scale, None, self.eps)?)
     }
 
     /// The block after attention, over any rows of the layer: `update` is the attention's output
@@ -1342,16 +1378,36 @@ impl Transformer {
             hidden.dtype,
             Shape::new(&[u64::from(groups.count()), adaln.layer_width()]),
         )?;
-        let per_layer = modulation.reshape(Shape::new(&[u64::from(groups.count()) * 3, 6 * width]));
+        // Two tables, because a layer's last rows are normalized for the next layer while the
+        // layer still reads its own.
+        let following = arena.tensor(modulation.dtype, modulation.shape)?;
+        let tables = [modulation, following];
+        let per_layer = tables
+            .map(|table| table.reshape(Shape::new(&[u64::from(groups.count()) * 3, 6 * width])));
         if let Some(trace) = trace {
             trace.check(self.layers.len(), tokens, width, hidden.dtype)?;
         }
         let alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
         let scratch = Scratch::reserve(self, f, hidden, total_rows)?;
+        adaln.layer(f, 0, entries, tables[0])?;
+        let mut arrived = Vec::new();
         for (index, layer) in self.layers.iter().enumerate() {
-            adaln.layer(f, index, entries, modulation)?;
-            layer.forward(
-                f, hidden, alternate, per_layer, rows, factors, visible, segments, &scratch,
+            let next = self.layers.get(index + 1);
+            if next.is_some() {
+                adaln.layer(f, index + 1, entries, tables[(index + 1) % 2])?;
+            }
+            arrived = layer.forward(
+                f,
+                hidden,
+                alternate,
+                per_layer[index % 2],
+                rows,
+                factors,
+                visible,
+                segments,
+                &scratch,
+                next.map(|layer| (layer, per_layer[(index + 1) % 2])),
+                arrived,
             )?;
             // A diagnosis reads the layer's packed output as it stands: the same rows the next
             // layer reads, copied into the caller's view by an identity gather.
