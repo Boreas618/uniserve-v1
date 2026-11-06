@@ -125,10 +125,17 @@ pub struct DenoiserShape {
     pub sample: DType,
     /// The width of the encoded conditioning rows: the text encoder's hidden width, which a layout
     /// counts rows of and states no width for.
+    ///
+    /// **This is `source`'s width, not necessarily `text`'s.** A conditioner may widen what the
+    /// denoiser reads, and the model states that width itself (`Denoiser::text_width`), so the pair
+    /// is resolved in [`conditioning_width`] rather than read from here twice.
     pub width: u32,
-    /// The width of the rows the denoiser reads (`nn::Denoiser::text_width`). A conditioner between
-    /// the encoder and the denoiser may widen them, so `text` is sized by this and `source`, which
-    /// holds what the encoder wrote, by `width`.
+    /// The width of the rows the denoiser reads (`nn::Denoiser::text_width`), which `text` is sized
+    /// by while `source`, holding what the encoder wrote, is sized by [`Self::width`].
+    ///
+    /// **The shape is where the model's statement lives, not the runner.** The planning boundary asks
+    /// the model once (`src/engine_plan.rs`) and puts the answer here, so a runner never asks the model
+    /// a second time and two statements of one width cannot drift.
     pub text_width: u32,
 }
 
@@ -213,15 +220,29 @@ struct DenoiseColumns {
     /// The audio latents, in the same per-request blocks; one element when a bucket serves a task
     /// with no soundtrack, so the column is never empty.
     audio: Column,
-    /// `[requests x (text_rows + condition_rows) x width]` conditioning rows.
+    /// `[requests x (text_rows + condition_rows) x text_width]` conditioning rows.
     text: Column,
     /// `[requests x (text_rows + condition_rows) x width]` the text encoder's own features.
     ///
     /// A model with a conditioner between the encoder and the denoiser reads these and folds them
-    /// into `text` in place ([`nn::Denoiser::prepare_conditioning`]), so both buffers are the same
-    /// shape and both are the runner's: the conditioner runs inside a captured forward, and a buffer
-    /// it allocated would be a capture that allocates.
+    /// into `text` in place ([`nn::Denoiser::prepare_conditioning`]).
+    ///
+    /// **Both buffers are the runner's even though the conditioner runs eagerly, once per request and
+    /// outside the graph** ([`DenoiserRunner::first_step`]): `text` is the region the captured graph
+    /// reads, so an output buffer the conditioner allocated for itself would be a per-request
+    /// allocation no capture addresses, and `source` is where [`DenoiserRunner::seed`] puts the
+    /// encoder's bytes on the store's clock.
     source: Column,
+    /// The encoder's width: elements in one `source` row.
+    source_width: u64,
+    /// What the denoiser reads: elements in one `text` row.
+    ///
+    /// **Two widths, because a conditioner may widen.** H3's refiner projects the encoder's 5120
+    /// columns into the stack's 5376, so a runner that sized both buffers from the encoder's width
+    /// handed the conditioner one too narrow for its own output - and no launch refused until the
+    /// packed rows were gathered, as `out is [rows, 5376], [rows, 5120] expected`. The model states
+    /// the second width (`Denoiser::text_width`); `None` is one width.
+    text_width: u64,
     /// `[1]` `i64`: the step index the coefficients are selected by (`Conditioning::step`).
     step: Column,
     /// The host side of each column.
@@ -237,15 +258,16 @@ impl DenoiseColumns {
             None => 1,
         };
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-        let text = width * u64::from(shape.text_width.max(1));
-        let source = width * u64::from(shape.width.max(1));
+        let (source_width, text_width) = conditioning_width(&shape);
         Ok(Self {
             video: Column::new(device, shape.sample, rows * video)?,
             audio: Column::new(device, shape.sample, rows * audio)?,
-            text: Column::new(device, shape.stack, rows * text)?,
-            source: Column::new(device, shape.stack, rows * source)?,
+            text: Column::new(device, shape.stack, rows * width * text_width)?,
+            source: Column::new(device, shape.stack, rows * width * source_width)?,
             step: Column::new(device, DType::I64, 1)?,
             staged: Staged::default(),
+            source_width,
+            text_width,
         })
     }
 
@@ -263,17 +285,17 @@ impl DenoiseColumns {
         };
         Staged::zero(&mut self.staged.audio, rows * audio)?;
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-        let text = u64::from(shape.text_width.max(1));
-        let source = u64::from(shape.width.max(1));
         let bytes = shape
             .stack
             .bytes()
             .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", shape.stack)))?;
-        Staged::zero(&mut self.staged.text, rows * width * text * bytes)?;
+        let text_bytes = rows * width * self.text_width * bytes;
+        Staged::zero(&mut self.staged.text, text_bytes)?;
         // The conditioner folds these into `text`, so a warm capture must read defined features as
         // well as defined rows: an uninitialised buffer would make the capture's output depend on
         // whatever the allocator last held.
-        Staged::zero(&mut self.staged.source, rows * width * source * bytes)?;
+        let source_bytes = rows * width * self.source_width * bytes;
+        Staged::zero(&mut self.staged.source, source_bytes)?;
         self.staged.step = vec![0u8; 8];
         Ok(())
     }
@@ -301,41 +323,45 @@ impl DenoiseColumns {
 /// (`crate::runners::products`).
 const STEP_PRODUCTS: &[Product] = &[Product::Text];
 
-/// The products a step of a *conditioned* layout reads: the two above, and the conditioning
-/// sequence's encoded states.
-///
-/// `condition_elements` is the per-request fact that decides between this list and
-/// [`STEP_PRODUCTS`]: it counts the elements a request's conditions cover, and a task whose request
-/// carries none - a prompt alone, or a first and last frame the latents already hold - has no
-/// conditioning sequence for an encoder to encode. Requiring a source product there would refuse a
-/// task for something no call can produce, which is the same defect as requiring the raw condition
-/// media (`crate::runners::products`).
-const CONDITIONED_STEP_PRODUCTS: &[Product] = &[Product::Text, Product::Source];
-
 /// The products a step of `layout` reads, in the order a refusal names them.
 ///
-/// The text rows are the prompt's encoded states and every task reads them; a layout with
-/// conditioning elements reads its conditioning rows as well.
-fn step_products(layout: &nn::capability::Layout) -> &'static [Product] {
-    if layout.condition_elements > 0 {
-        CONDITIONED_STEP_PRODUCTS
-    } else {
-        STEP_PRODUCTS
-    }
+/// **One list for every layout, because one product has a producer.** `Product::Text` is what the
+/// encoder publishes (`crate::runners::encoder`), and `Product::Source` is published by nobody -
+/// the product table says so as a contract (`crate::runners::products`) - so a conditioned layout
+/// that required it refused every step with `absent(request, Source)` before the conditioner could
+/// run. The encoder's rows are the conditioner's input as well as a prompt's: where they land is
+/// decided by [`DenoiserRunner::seed`], not by asking the store for a second name for them.
+fn step_products(_layout: &nn::capability::Layout) -> &'static [Product] {
+    STEP_PRODUCTS
 }
 
-/// The rows of one request's conditioning in the columns, and the two widths they have:
-/// `(text_rows + condition_rows)` rows of `text_width` elements in `text` and of `width` in `source`.
+/// The rows of one request's conditioning and the encoder's width: `(text_rows + condition_rows)`
+/// rows, the encoder writing `width` elements in each.
 ///
 /// One statement for the two readers that need it - the view a step hands the model
-/// ([`DenoiserRunner::conditioning`]) and the copies that fill it from the store
-/// ([`DenoiserRunner::seed`]). Two statements of this arithmetic would be a step that reads a row
-/// the copies never filled, which is a plausible clip rather than an error.
-fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (u64, u64, u64) {
+/// ([`DenoiserRunner::conditioning`]) and the rows [`DenoiserRunner::seed`] gives their bytes to.
+/// Two statements of this arithmetic would be a step that reads a row the copies never filled, which
+/// is a plausible clip rather than an error.
+///
+/// **`width` is `source`'s alone.** A conditioner may widen what the denoiser reads, so `text`'s
+/// width is the model's statement and the pair is resolved in [`conditioning_width`].
+fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (u64, u64) {
     let rows = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-    let text = u64::from(shape.text_width.max(1));
+    let width = u64::from(shape.width.max(1));
+    (rows, width)
+}
+
+/// The two widths one request's conditioning columns hold: `(source, text)`.
+///
+/// `source` is what the text encoder wrote, which [`DenoiserShape::width`] states; `text` is what
+/// the denoiser reads, which [`DenoiserShape::text_width`] states - the planning boundary asked the
+/// model once and equal to the encoder's width when the model has no conditioner. **One width for both
+/// is the defect this pair removes**: the conditioner's own output then does not fit the buffer it
+/// writes, and the refusal arrives one operator later, at the gather.
+fn conditioning_width(shape: &DenoiserShape) -> (u64, u64) {
     let source = u64::from(shape.width.max(1));
-    (rows, text, source)
+    let text = u64::from(shape.text_width.max(1));
+    (source, text)
 }
 
 /// How a product's bytes fill one row of a conditioning column: `(copied, zeroed)`.
@@ -672,7 +698,20 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         })
     }
 
+    /// The rows and the two widths one request's conditioning occupies: `(rows, source, text)`.
+    ///
+    /// Read from the columns rather than recomputed, so the view a step hands the model and the row
+    /// size [`Self::seed`] fills are the ones the buffers were allocated for.
+    fn conditioning_row(&self, layout: &nn::capability::Layout) -> (u64, u64, u64) {
+        let (rows, _) = conditioning_row(&self.shape, layout);
+        (rows, self.columns.source_width, self.columns.text_width)
+    }
+
     /// The conditioning of request `index` of `bucket`, over the tables of its layout.
+    ///
+    /// `text` and `source` are two views of **two widths**: a conditioner may widen what the
+    /// denoiser reads, so a step that handed the model one width for both would address the wrong
+    /// columns of one of them.
     fn conditioning<'a>(
         &self,
         bucket: Bucket,
@@ -681,15 +720,15 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         media: &'a [nn::capability::MediaInput],
     ) -> Result<Conditioning<'a>> {
         let layout = layout_of(bucket)?;
-        let (rows, text_width, width) = conditioning_row(&self.shape, &layout);
+        let (rows, source_width, text_width) = self.conditioning_row(&layout);
         let view = self.columns.text.shaped(&[rows * text_width]);
         let text = view
             .at(view.offset_elements(u64::from(index) * rows * text_width))
             .reshape(Shape::new(&[rows, text_width]));
-        let features = self.columns.source.shaped(&[rows * width]);
+        let features = self.columns.source.shaped(&[rows * source_width]);
         let source = features
-            .at(features.offset_elements(u64::from(index) * rows * width))
-            .reshape(Shape::new(&[rows, width]));
+            .at(features.offset_elements(u64::from(index) * rows * source_width))
+            .reshape(Shape::new(&[rows, source_width]));
         Ok(Conditioning {
             text,
             source: Some(source),
@@ -733,17 +772,36 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let pending = self.pending.clone();
         let stream = self.stream.clone();
         let layout = layout_of(bucket)?;
-        let (rows, text_width, width) = conditioning_row(&self.shape, &layout);
+        let (rows, source_width, text_width) = self.conditioning_row(&layout);
         let element = u64::from(self.shape.stack.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
         })?);
+        // One row's size per kind: the two columns are two widths, so a single number would make
+        // the shorter kind's copy land inside the wrong column's row (`conditioning_width`).
+        let text_bytes = rows * text_width * element;
+        let source_bytes = rows * source_width * element;
+        // **The encoder's rows go where the model consumes them next.** A conditioner that widens
+        // reads `source` and writes `text` in place, so the product lands in `source` and `text`
+        // belongs to the fold alone - copying it into `text` as well would be a second, mis-strided
+        // copy of the same bytes (`text_width != source_width`, so the rows would not line up). A
+        // model with no conditioner reads the encoder's rows themselves, so they land in `text`.
+        //
+        // The reference settles the direction: its `condition()` takes the encoder's features as the
+        // conditioner's **input** and its `text_condition` is written only by the conditioner's
+        // output, for every task. The two widths are therefore the only statement the interface makes
+        // about whether a conditioner runs (`Denoiser::text_width` answers `None` for no conditioner
+        // and for one that keeps the encoder's width alike), which is why the branch reads them
+        // rather than asking a second question.
+        let folded = text_width != source_width;
         for row in &pending {
             let (request, index) = (row.request, row.index);
-            for (kind, column, row_width) in [
-                (Product::Text, &mut self.columns.text, text_width),
-                (Product::Source, &mut self.columns.source, width),
-            ] {
-                let bytes = rows * row_width * element;
+            let kind = Product::Text;
+            let (column, bytes) = if folded {
+                (&mut self.columns.source, source_bytes)
+            } else {
+                (&mut self.columns.text, text_bytes)
+            };
+            {
                 // **The copy is the store's, not this runner's.** A deployment can put the text
                 // phase on its own GPU, so the product may be on another device or another stream,
                 // and only the store holds both ends: it waits on the producer's write before this
@@ -785,13 +843,19 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// Issues each pending row's first step: the model's own draw and fold, on the replay's arena
-    /// and stream, before the captured graph launches.
+    /// Issues each pending row's first step: the model's own draw, its conditioner and its fold, on
+    /// the replay's arena and stream, before the captured graph launches.
     ///
     /// A trajectory's value at step zero is not a step: it is `Denoiser::draw_noise` (Philox
     /// addressed by the request's seed and the element's index, section 9) followed by
     /// `Denoiser::prepare_latents` (the schedule's start over that draw), and both take a
-    /// `Forward` because their operators reserve scratch in an arena.
+    /// `Forward` because their operators reserve scratch in an arena. `Denoiser::prepare_conditioning`
+    /// runs between them: the encoder's rows are raw until it refines them, and the fold reads
+    /// `cond.text`, so refining after the fold would start the schedule from unrefined rows.
+    ///
+    /// **None of the three is in the captured graph.** Each runs once per request, and a graph
+    /// replays once per step; `prepare_conditioning` writes `text` in place, so a refinement inside
+    /// the graph would compound over the schedule.
     ///
     /// The replay's arena is the one its captured graph addresses: `Pool::base` is the stream's
     /// range and `Pool::begin` answers only whether a bucket is planning or replaying, so the same
@@ -824,6 +888,13 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             let latents = self.latents(bucket, row.index)?;
             let cond = self.conditioning(bucket, row.index, &state, &media)?;
             self.model.draw_noise(&forward, row.seed, layout, latents)?;
+            // **The conditioner, eager and once per request, outside the graph.** `text` holds the
+            // encoder's rows as `seed` copied them; this folds `source` into it in place, so every
+            // replay of the bucket reads rows refined for its own request. It is not a graph node
+            // because a graph replays once per *step* while this runs once per *request* - a
+            // refinement inside the captured graph would compound over the schedule, and `text` is
+            // written in place.
+            self.model.prepare_conditioning(&forward, cond)?;
             self.model.prepare_latents(&forward, cond, latents)?;
         }
         Ok(())
@@ -989,6 +1060,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             source,
             step,
             staged,
+            // The widths are the allocation's, read where it was made; this borrow moves bytes.
+            source_width: _,
+            text_width: _,
         } = &mut self.columns;
         video.write(&staged.video)?;
         audio.write(&staged.audio)?;
@@ -1377,6 +1451,33 @@ mod tests {
         }
     }
 
+    /// A widening conditioner gets a `text` column wider than its `source` one, by exactly the
+    /// width the model states - and a model that keeps the encoder's width gets one width.
+    ///
+    /// The stop this closes was `out is [19904, 5376], [19904, 5120] expected`. A gather cannot
+    /// change a row's width (`head::gather_rows` requires `[count, table width]`), so a runner that
+    /// sized both conditioning columns from the encoder's width handed the conditioner a buffer too
+    /// narrow for its own output, and the refusal arrived one operator later than the mistake. Both
+    /// models are asserted, so an implementation that always used one of the two numbers - either one
+    /// - fails here rather than at a gather.
+    #[test]
+    fn a_widening_conditioner_writes_into_a_text_column_of_its_own_width() {
+        // H3's refiner projects the encoder's 5120 columns into the stack's 5376.
+        let widened = DenoiserShape {
+            stack: DType::BF16,
+            sample: DType::F32,
+            width: 5120,
+            text_width: 5376,
+        };
+        assert_eq!(conditioning_width(&widened), (5120, 5376));
+        // A model with no conditioner, or one that keeps the encoder's width.
+        let kept = DenoiserShape {
+            text_width: 5120,
+            ..widened
+        };
+        assert_eq!(conditioning_width(&kept), (5120, 5120));
+    }
+
     /// A layout survives the bucket that carries it and the reader that unwraps it.
     ///
     /// The equality is the seam's own: a runner hands the model the layout its bucket carries, and
@@ -1556,12 +1657,13 @@ mod tests {
 #[cfg(test)]
 mod product_tests {
     use super::*;
-    use std::sync::Mutex;
 
     /// A product store that answers for exactly the kinds it was given.
+    ///
+    /// It records nothing about how a caller asks: whether a kind is present is the store's
+    /// answer, and how many questions a step put to it is not a fact about the deployment.
     struct Store {
         held: Vec<Product>,
-        asked: Mutex<Vec<Product>>,
     }
 
     impl Products for Store {
@@ -1611,7 +1713,6 @@ mod product_tests {
             _device: platform::DeviceId,
             _stream: StreamId,
         ) -> Result<Option<TensorView>> {
-            self.asked.lock().unwrap().push(kind);
             Ok(self
                 .held
                 .contains(&kind)
@@ -1662,37 +1763,37 @@ mod product_tests {
     #[test]
     fn the_first_absent_kind_is_the_one_a_step_refuses() {
         let store = Store {
-            held: vec![Product::Text],
-            asked: Mutex::new(Vec::new()),
+            held: vec![Product::VideoLatents],
         };
-        let missing =
-            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
+        let missing = missing_product(&store, request(), STEP_PRODUCTS).expect("a store answers");
         assert_eq!(
             missing,
-            Some(Product::Source),
-            "the encoder's features are the first kind this store lacks"
+            Some(Product::Text),
+            "the encoder's rows are the first kind this store lacks"
         );
-        let refusal = products::absent(request(), Product::Source).to_string();
+        let refusal = products::absent(request(), Product::Text).to_string();
         assert!(
-            refusal.contains("source"),
+            refusal.contains("text"),
             "the refusal names the kind: {refusal}"
         );
     }
 
-    /// A store holding every kind a step reads has nothing missing, and it is asked in one pass.
+    /// A store holding every kind a step reads has nothing missing, and a store holding none names
+    /// the first kind the step would have read.
     #[test]
     fn a_store_holding_every_kind_leaves_nothing_missing() {
-        let store = Store {
-            held: CONDITIONED_STEP_PRODUCTS.to_vec(),
-            asked: Mutex::new(Vec::new()),
+        let full = Store {
+            held: STEP_PRODUCTS.to_vec(),
         };
-        let missing =
-            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
+        let missing = missing_product(&full, request(), STEP_PRODUCTS).expect("a store answers");
         assert_eq!(missing, None);
+
+        let empty = Store { held: Vec::new() };
+        let missing = missing_product(&empty, request(), STEP_PRODUCTS).expect("a store answers");
         assert_eq!(
-            store.asked.lock().unwrap().len(),
-            CONDITIONED_STEP_PRODUCTS.len(),
-            "each kind is asked once"
+            missing,
+            STEP_PRODUCTS.first().copied(),
+            "an empty store is refused for the first kind the step reads, not for the last"
         );
     }
 
@@ -1719,19 +1820,21 @@ mod product_tests {
         assert_eq!(step_products(&layout), STEP_PRODUCTS);
         assert_eq!(step_products(&layout).len(), 1);
 
+        // A conditioned layout asks for the same one kind: the encoder's rows are the conditioner's
+        // input, and no producer exists for a second name of them.
         layout.condition_elements = 3;
-        assert_eq!(step_products(&layout), CONDITIONED_STEP_PRODUCTS);
+        assert_eq!(step_products(&layout), STEP_PRODUCTS);
 
         let store = Store {
             held: vec![Product::Text],
-            asked: Mutex::new(Vec::new()),
         };
-        let missing =
-            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
+        let missing = missing_product(&store, request(), step_products(&layout))
+            .expect("a store answers");
         assert_eq!(
-            missing,
-            Some(Product::Source),
-            "a conditioned layout asks a store holding only the prompt's states for the source"
+            missing, None,
+            "a store holding the encoder's rows leaves a conditioned step nothing missing: the \
+             conditioner reads those rows, and asking for `Source` refused a step for a product no \
+             call publishes"
         );
     }
 
