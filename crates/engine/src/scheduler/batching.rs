@@ -896,6 +896,7 @@ impl Scheduler {
                     height: sampling.height,
                     text_rows: u32::try_from(state.request.prompt_token_ids.len())
                         .unwrap_or(u32::MAX),
+                    conditioned: !state.request.conditions.is_empty(),
                 }
             });
         let mut stated = executor::plan::Computation {
