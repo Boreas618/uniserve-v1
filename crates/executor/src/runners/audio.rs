@@ -240,10 +240,22 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
                 "the audio decoder runner loaded before its device's pools were attached",
             ));
         }
-        let offered = self.pool()?.reserved_on(self.stream_id());
+        self.claim()
+    }
+
+    /// Claims the arena the largest bucket's decode plans.
+    fn claim(&mut self) -> Result<()> {
+        let mut needed = 0;
         for bucket in self.capture_order() {
             let layout = self.layout(bucket)?;
-            super::floor::checked(bucket, self.model.arena_bytes(&layout), offered)?;
+            needed = needed.max(
+                super::floor::checked(bucket, self.model.arena_bytes(&layout), u64::MAX)?
+                    .unwrap_or(0),
+            );
+        }
+        if needed > 0 {
+            let stream = self.stream_id();
+            self.pool()?.claim(stream, needed)?;
         }
         Ok(())
     }
@@ -477,6 +489,10 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
 
     fn attach_products(&mut self, products: Arc<dyn Products>) {
         self.products = Some(products);
+    }
+
+    fn claim_arena(&mut self) -> Result<()> {
+        self.claim()
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {

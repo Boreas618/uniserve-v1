@@ -693,17 +693,30 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // capture that has to be thrown away.** The pool is the runtime's policy (a share of the
         // device per stream); the model states what one evaluation reserves. A share below the plan
         // is a refusal naming both numbers, and it is asked before anything is filled.
-        let offered = self.pool()?.reserved_on(self.stream_id());
-        let plans = self.buckets.clone();
-        for plan in &plans {
-            floor::checked(
-                plan.bucket,
-                self.model.arena_bytes(&plan.warm.view()),
-                offered,
-            )?;
-        }
+        self.claim()?;
         for bucket in self.capture_order() {
             self.fill(bucket)?;
+        }
+        Ok(())
+    }
+
+    /// Claims the arena the largest bucket's evaluation plans.
+    fn claim(&mut self) -> Result<()> {
+        let plans = self.buckets.clone();
+        let mut needed = 0;
+        for plan in &plans {
+            needed = needed.max(
+                floor::checked(
+                    plan.bucket,
+                    self.model.arena_bytes(&plan.warm.view()),
+                    u64::MAX,
+                )?
+                .unwrap_or(0),
+            );
+        }
+        if needed > 0 {
+            let stream = self.stream_id();
+            self.pool()?.claim(stream, needed)?;
         }
         Ok(())
     }
@@ -1253,8 +1266,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             ..
         } = &mut self.columns;
         // The refined rows are the request's for its whole schedule: `first_step` folds them once,
-        // and every later step reads them where they are. Only a first step starts from zeros.
+        // and every later step reads them where they are. Only a first step starts from zeros, and
+        // that write is the host's own, so the previous request's last launch is waited out first.
         if self.staged_step == Some(0) {
+            stream.synchronize()?;
             text.write(&staged.text)?;
             source.write(&staged.source)?;
         }
@@ -1563,24 +1578,11 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
         self.lifecycle.attach_pools(Arc::clone(&pools));
-        // One evaluation's plan is this stream's share of the device: the even share is a default,
-        // and a served canvas's evaluation is the largest arena a device holds. An eighth above the
-        // plan keeps a walk that reserves in another order from running off the end of the range.
-        let plan = self
-            .buckets
-            .iter()
-            .filter_map(|plan| self.model.arena_bytes(&plan.warm.view()).ok())
-            .max()
-            .unwrap_or(0);
-        let share = plan + plan / 8;
-        if let Err(error) = pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .state_share(self.stream_id(), share)
-        {
-            tracing::warn!(%error, share, "a denoiser stated its share too late");
-        }
         self.pools = Some(pools);
+    }
+
+    fn claim_arena(&mut self) -> Result<()> {
+        self.claim()
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {

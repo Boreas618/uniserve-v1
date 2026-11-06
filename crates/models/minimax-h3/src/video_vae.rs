@@ -36,7 +36,6 @@
 //! it as a declared composition rather than a difference (design 10: the comparison is a diagnosis,
 //! never an acceptance gate).
 
-use crate::config::AttentionKind;
 use crate::output::VideoPostprocessor;
 use crate::{Error, Result, VideoVaeConfig};
 
@@ -506,11 +505,6 @@ pub struct VideoDecoder {
     output: Linear,
     rotary: Rotary,
     place: Rows,
-    /// The index table that places each voxel row of the stream: for every latent voxel of one clip, the
-    /// packed row of the patch it lies in, under **this deployment's** packing. A sparse deployment orders
-    /// its rows by spatiotemporal tile, so the table differs from the dense one and is the model's own
-    /// constant, published at load by [`pack_voxel_rows`].
-    voxel_rows: Weight,
     /// The offsets of the decoder's **one** sequence: `[0, rows]`, a constant of a **tile** rather than
     /// a checkpoint tensor. The dense attention's flash backend serves the packed form only — it hands
     /// the vendor's `cu_seqlens` path its offsets and refuses a null table — so one tile is the packed
@@ -527,87 +521,6 @@ pub struct VideoDecoder {
     /// type every activation and scratch buffer holds. The design's `dtype = "auto"` converts nothing,
     /// so this is read from the checkpoint rather than stated.
     dtype: DType,
-}
-
-/// The packed row of every latent voxel one clip's decode reads, in clip-then-raster order.
-///
-/// One clip's voxel rows: for every voxel of the clip's latent raster, the packed row it belongs to.
-///
-/// The decoder has one token per **latent voxel** - the VAE's patch is `1 x 2 x 2` latent cells and the
-/// transformer reads one token per cell - so this table is four times longer than the denoiser's row
-/// table: each voxel names the packed row of the `2 x 2` patch it lies in. It describes **one clip**,
-/// because that is what the checkpoint's `video_vae.voxel_rows` holds and all a decode ever reads; how
-/// many clips a request has is the runner's question and the splice's, not this table's.
-///
-/// The checkpoint holds no such table — its `video_vae` tensors are the weights and the state tables —
-/// so the model publishes this one as a constant of the canvas at load ([`pack_voxel_rows`]), and it is
-/// the arithmetic below rather than a stored tensor that decides what the table says.
-fn voxel_rows(
-    config: &VideoVaeConfig,
-    attention: AttentionKind,
-    latent_height: u32,
-    latent_width: u32,
-) -> Result<Vec<u32>> {
-    let raster = crate::packing::LatentRaster {
-        height: latent_height,
-        width: latent_width,
-    };
-    // A clip's own window of latent frames, which is the timeline of exactly one clip.
-    let clip = Canvas::clip(config, latent_height, latent_width);
-    let order = crate::packing::video_order_of(attention, clip.frames, raster)?;
-    let mut packed_of_raster = vec![0_u32; order.len()];
-    for (packed, raster_row) in order.iter().enumerate() {
-        packed_of_raster[*raster_row as usize] = u32::try_from(packed)
-            .map_err(|_| Error::config("a packed row wider than a table entry".to_owned()))?;
-    }
-    let tokens = u64::from(raster.patch_rows());
-    let side = u64::from(crate::packing::PATCH_SIDE);
-    let columns = u64::from(latent_width) / side;
-    let mut rows = Vec::with_capacity(clip.voxels() as usize);
-    for frame in 0..u64::from(clip.frames) {
-        for height in 0..u64::from(latent_height) {
-            for column in 0..u64::from(latent_width) {
-                let patch = frame * tokens + (height / side) * columns + column / side;
-                rows.push(packed_of_raster[patch as usize]);
-            }
-        }
-    }
-    Ok(rows)
-}
-
-/// Publish the one voxel-row table a deployment's decode reads, encoded as the gather's `i32` indices.
-///
-/// The packed order is the deployment's: dense packing reads the raster order, a sparse deployment reads
-/// spatiotemporal tiles, so a decoder handed a sparsely packed latent cannot be read through the dense
-/// table — the entries would name another voxel's row. One table per decoder, built from the packing this
-/// decoder serves; [`voxel_rows`] is the arithmetic and this is only its encoding.
-fn pack_voxel_rows(
-    loader: &mut WeightLoader,
-    config: &VideoVaeConfig,
-    attention: AttentionKind,
-    canvas: Canvas,
-) -> Result<Weight> {
-    let rows = voxel_rows(config, attention, canvas.height, canvas.width)?;
-    if rows.len() as u64 != canvas.voxels() {
-        return Err(Error::config(format!(
-            "the decoder's voxel table names {} rows for a tile of {} voxels",
-            rows.len(),
-            canvas.voxels()
-        )));
-    }
-    let mut bytes = Vec::with_capacity(rows.len() * 4);
-    for row in &rows {
-        let row = i32::try_from(*row)
-            .map_err(|_| Error::config("a packed row wider than an index".to_owned()))?;
-        bytes.extend_from_slice(&row.to_le_bytes());
-    }
-    Ok(loader.constant(
-        "video_vae.voxel_rows",
-        DType::I32,
-        Shape::new(&[rows.len() as u64]),
-        &bytes,
-        "minimax-h3",
-    )?)
 }
 
 /// The canvas of the grid's largest tile, whose position table every tile's is a slice of.
@@ -627,10 +540,7 @@ fn largest_tile(config: &VideoVaeConfig, latent_height: u32, latent_width: u32) 
 /// The one table a layout's decode reads, keyed by its latent extents.
 ///
 /// The model's arithmetic, keyed by the **layout**: the rotary positions of the largest tile of the latent
-/// raster, which every other tile's positions are a slice of because the tiles are uniform. There is one
-/// table and not two: the clip's voxel rows are published once at load by [`pack_voxel_rows`] from the
-/// deployment's own packing, so a per-layout copy of them would be a second source of truth for a value
-/// that never varies with the layout.
+/// raster, which every other tile's positions are a slice of because the tiles are uniform.
 pub(crate) fn table_specs(
     config: &VideoVaeConfig,
     latent_height: u32,
@@ -865,7 +775,8 @@ impl VideoDecoder {
             ));
         }
 
-        // The three placements into the token stream: every row-major gather is one program.
+        // The two placements into the token stream, the register rows and the zero row: every
+        // row-major gather is one program.
         programs.launch::<RowsOp>(&Rows::descriptor_of(dtype, rows::Mode::Replace, width));
 
         // The rotation's table once, then its application in every layer.
@@ -919,13 +830,6 @@ impl VideoDecoder {
         for (_, _, blend) in crate::decoding::ClipDecoder::new(config, dtype)?.blends() {
             programs.launch::<CrossFadeOp>(&blend.descriptor());
         }
-        // The stitch copies each seam's neighbour into one contiguous block before the blend reads it:
-        // `cross_fade` addresses its sources flat, and a neighbour in a raster wider than the tile is
-        // not one contiguous block. One copy serves every seam and every canvas, whatever the tile's
-        // extents, because its key is the pair of element types and the extents are a launch value.
-        use ops::copy_block::CopyBlock as CopyBlockOp;
-        programs.launch::<CopyBlockOp>(&nn::layers::CopyBlock::descriptor_of(dtype));
-
         // One dense attention for the whole decoder: the clip's row count is a launch value, not a
         // key field, so the largest sequence the decoder was accepted for states the program too.
         let attention = block_attention(head, heads, width, dtype)?;
@@ -954,7 +858,6 @@ impl VideoDecoder {
     pub fn load(
         config: &VideoVaeConfig,
         rasters: &[(u32, u32)],
-        attention: AttentionKind,
         dtype: DType,
         input: Linear,
         loader: &mut WeightLoader,
@@ -1039,7 +942,7 @@ impl VideoDecoder {
         // its trailing zero row go, and a decode writes them into a **tile's** token buffer
         // (`decode_clip` hands `decode` one tile at a time). A table whose positions started past the
         // clip's voxels therefore indexed a tile-sized buffer with a clip-sized offset - a write past
-        // the buffer for every tile but the last, which is the defect `voxel_rows` was corrected for.
+        // the buffer for every tile but the last.
         // The grid's tiles are uniform, so one tile's offsets serve every tile and every canvas.
         let tile = largest_tile(config, canvas.height, canvas.width)?;
         let register_rows = indices(
@@ -1174,21 +1077,10 @@ impl VideoDecoder {
             output,
             rotary,
             place: Rows::new(dtype, u64::from(width))?,
-            // **A tile's permutation, not the clip's.** `decode` scatters a tile's rows with
-            // `place.replace(stream, projected, voxel_rows)` and `stream` is the tile's, so a clip-built
-            // table indexes a 1,797-row buffer with positions up to the clip's 16,127 - a write past the
-            // buffer for every tile after the first. The grid's tiles are uniform (`decode_clip` refuses
-            // a grid of two sizes), so one tile's table serves the clip.
-            voxel_rows: pack_voxel_rows(
-                loader,
-                config,
-                attention,
-                largest_tile(config, canvas.height, canvas.width)?,
-            )?,
             offsets: {
-                // `[0, rows]`: one sequence starting at row zero, **of one tile** - the same subject as
-                // `voxel_rows` and for the same reason. `decode` hands the attention a tile's rows and
-                // this table bounds the sequence it describes, so a clip-sized total made the kernel read
+                // `[0, rows]`: one sequence starting at row zero, **of one tile**. `decode` hands the
+                // attention a tile's rows and this table bounds the sequence it describes, so a
+                // clip-sized total made the kernel read
                 // a sequence the buffer does not hold: past the tile's rows for every tile but the first
                 // on a served canvas. Where the flash form is not served the table is unused, and the
                 // tile's rows are still the right constant.
@@ -1240,9 +1132,9 @@ fn linear(loader: &mut WeightLoader, name: &str, from: u64, to: u64, bias: bool)
 
 /// The constants a decoder of this canvas publishes, as `(name, bytes)`.
 ///
-/// `load` builds five tensors the export does not hold - the zero row the token layout appends, the
-/// two index tables that address them, the rotary frequencies and the voxel rows - and a caller that
-/// reserves device storage before loading has to know what they cost: the pool charges a block per
+/// `load` builds tensors the export does not hold - the zero row the token layout appends, the two
+/// index tables that address the trailing rows, the rotary frequencies and the sequence offsets - and
+/// a caller that reserves device storage before loading has to know what they cost: the pool charges a block per
 /// publish, so a reservation computed from the checkpoint's names alone is short by every one of
 /// these. The list is one statement of them, and `load` checks what it publishes against it, so the
 /// two cannot drift.
@@ -1264,11 +1156,6 @@ pub fn constants(
         (
             format!("video_vae.rotary.{rotated}.{}", config.decoder_rope_theta),
             u64::from(rotated / 2) * 4,
-        ),
-        // One tile's, for the same reason `load` publishes a tile's: see the note there.
-        (
-            "video_vae.voxel_rows".to_owned(),
-            largest_tile(config, canvas.height, canvas.width)?.voxels() * 4,
         ),
         // `[0, rows]`: two `i32`s, and the one constant `load` publishes that this list did not state -
         // so a caller reserving by the list was short of it by a rounding step, and a check that every
@@ -1430,7 +1317,7 @@ impl VideoDecoder {
     /// ([`crate::decoding::video_arena`]) and this is what makes that true.
     /// The rasters this decoder serves: the deployment's canvases, every one of them.
     ///
-    /// The constants a decode reads are a **tile's** (its voxel permutation, its register and zero-row
+    /// The constants a decode reads are a **tile's** (its register and zero-row offsets, its sequence
     /// offsets) or a **width's** (the zero row, the rotary frequencies), so they are the same for every
     /// canvas this deployment names: serving another raster costs a lookup, not a table.
     pub fn canvases(&self) -> &[Canvas] {
@@ -1460,7 +1347,7 @@ impl VideoDecoder {
     ///
     /// [`Tiles`] splits the clip's canvas into tiles of at most the configured tile size, so a tile at
     /// the canvas's edge can be smaller than the rest and "the largest" and "the first in grid order"
-    /// are different questions. [`Self::scratch`] asks this one because the fourteen transformer
+    /// are different questions. [`Self::scratch`] asks this one because the thirteen transformer
     /// buffers are reserved once for a whole clip and reused by every tile: sizing them by the clip
     /// reserved the grid's worth for a decode that holds one tile's, and [`Self::decode`] validates a
     /// tile's block against this ceiling rather than against the clip's extents.
@@ -1478,17 +1365,15 @@ impl VideoDecoder {
     }
 
     pub fn scratch(&self, f: &Forward, canvas: &Canvas) -> Result<TileScratch> {
-        // One tile's, not the clip's: the clip is decoded tile by tile and these fourteen buffers are
+        // One tile's, not the clip's: the clip is decoded tile by tile and these thirteen buffers are
         // reserved once and reused, so a clip-sized reservation is the grid's worth for one tile's use.
         let tile = self.largest_tile(canvas)?;
         let rows = tile.rows();
-        let voxels = tile.voxels();
         let width = u64::from(self.width);
         let ffn = width * u64::from(self.ffn_mult);
         let half = u64::from(rotary(&self.config)?.0 / 2);
         Ok(TileScratch {
             stream: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
-            projected: f.arena().tensor(self.dtype, Shape::new(&[voxels, width]))?,
             cosine: f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?,
             sine: f.arena().tensor(DType::F32, Shape::new(&[rows, half]))?,
             normalized: f.arena().tensor(self.dtype, Shape::new(&[rows, width]))?,
@@ -1564,10 +1449,17 @@ impl VideoDecoder {
         }
 
         let stream = scratch.stream;
-        let projected = scratch.projected;
-        self.input.forward(f, latents, projected)?;
-        self.place
-            .replace(f, stream, projected, self.voxel_rows.view())?;
+        // The sequence is the tile's voxels in the order they arrive, then the register rows, then the
+        // zero row (`video_vae.py`, `Transformer.forward`: `cat((hidden, registers, zeros))`). The token
+        // row of a voxel is therefore its own index and the projection writes straight into the
+        // stream's leading rows: the unpatchify and the position table read those rows by the same
+        // index.
+        let voxel_rows = TensorView::new(
+            stream.offset_elements(0),
+            stream.dtype,
+            Shape::new(&[voxels, u64::from(self.width)]),
+        );
+        self.input.forward(f, latents, voxel_rows)?;
         self.place
             .replace(f, stream, self.registers.view(), self.register_rows.view())?;
         self.place
@@ -1646,11 +1538,10 @@ impl VideoDecoder {
     }
 }
 
-/// The transformer's scratch for one tile: fourteen buffers, reserved once per clip.
+/// The transformer's scratch for one tile: thirteen buffers, reserved once per clip.
 #[derive(Clone, Copy)]
 pub struct TileScratch {
     stream: TensorView,
-    projected: TensorView,
     cosine: TensorView,
     sine: TensorView,
     normalized: TensorView,
@@ -1746,7 +1637,7 @@ impl Decoder for VideoDecoder {
     /// be holding this checkpoint's compression in its own code.
     ///
     /// **The decoder is built for one canvas** (`VideoDecoder::load` takes it), because its register
-    /// rows, its voxel-row table and its sequence offsets are the canvas's constants rather than a
+    /// rows and its sequence offsets are the canvas's constants rather than a
     /// request's. So this states that canvas's layout and refuses any other clip by both extents:
     /// a runner that handed it another canvas would capture a graph whose constants belong to a
     /// different raster.
@@ -1839,7 +1730,7 @@ impl Decoder for VideoDecoder {
     /// Decode one clip: every tile of its canvas, stitched into `out.video`.
     ///
     /// `latents` is the clip's `[voxels, latent_channels]` rows in tile order — the runner gathers them
-    /// through the checkpoint's own `video_vae.voxel_rows` — `state` holds this block's one table, `video_positions`
+    /// through [`Self::latent_rows`] — `state` holds this block's one table, `video_positions`
     /// `[3, rows]` axis-major in radians, and `out.video` is the clip's raster. The raster is
     /// `[channels, frames, rows, columns]` in the decoder's own element type: the layers on this path —
     /// the unpatchify, the seam blends and the byte step — all read a planar channels-first raster, and
@@ -2036,44 +1927,53 @@ pub fn fold_input_affine(
 pub(crate) mod tests {
     use super::*;
 
-    /// The voxel-row table is **one tile's**, not the clip's. It is the destination index of the
-    /// decode's scatter into a tile-sized stream, so a clip-sized table writes past that stream for
-    /// every tile after the first - and the declaration a runner reserves by has to say the same
-    /// length the published table has.
+    /// The sequence is the tile's voxels in the order they arrive, then the trailing rows
+    /// (`video_vae.py`: `cat((hidden, registers, zeros))`), so a voxel's token row is its own index: the
+    /// position table and the unpatchify read the same row. The input projection therefore writes the
+    /// stream's leading rows and only the register rows and the zero row are placed. Scattering the
+    /// voxels through the denoiser's patch rows sent the four voxels of a `2 x 2` patch to one token and
+    /// left three quarters of the sequence unwritten, which decoded as the right scene in a mosaic.
     #[test]
-    fn a_multi_tile_canvass_voxel_table_is_a_tiles_not_the_clips() {
+    fn the_input_projection_fills_the_streams_leading_rows() {
+        struct Launches(Vec<&'static str>);
+        impl ops::capture::Sink for Launches {
+            fn launched(&mut self, operator: &'static str, _key: &str) {
+                self.0.push(operator);
+            }
+        }
         let config = video_config();
-        let canvas = Canvas::clip(&config, 3 * config.spatial_compression(), 17);
-        let grid = Tiles::of(&config, &canvas)
-            .expect("a grid")
-            .tiles(&config, &canvas);
-        assert!(
-            grid.len() > 1,
-            "the canvas must need more than one tile, or the two lengths agree: {} tile(s)",
-            grid.len()
-        );
-
-        let tile = largest_tile(&config, canvas.height, canvas.width).expect("a tile");
-        assert!(
-            tile.voxels() < canvas.voxels(),
-            "a tile must be smaller than the clip: {} against {}",
-            tile.voxels(),
-            canvas.voxels()
-        );
-
-        let declared = constants(&config, canvas, 64, DType::F32).expect("the declaration");
-        let bytes = declared
-            .iter()
-            .find(|(name, _)| name == "video_vae.voxel_rows")
-            .map(|(_, bytes)| *bytes)
-            .expect("the voxel-row declaration");
+        let canvas = Canvas::clip(&config, 16, 16);
+        let decoder = stated_decoder(&config, canvas);
+        let arena = nn::Arena::new(nn::DevicePtr::new(0), 1 << 40);
+        let forward = nn::Forward::recording(&arena);
+        let scratch = decoder.scratch(&forward, &canvas).expect("the scratch");
+        let latents = arena
+            .tensor(
+                DType::F32,
+                Shape::new(&[canvas.voxels(), u64::from(config.latent_channels)]),
+            )
+            .expect("the latents");
+        let positions = arena
+            .tensor(DType::F32, Shape::new(&[3, canvas.rows()]))
+            .expect("the positions");
+        let out = arena
+            .tensor(DType::F32, Shape::new(&[canvas.rows(), 3 * 4 * 16 * 16]))
+            .expect("the tokens");
+        let mut launches = Launches(Vec::new());
+        ops::capture::set_sink(Some(&mut launches));
+        let decoded = decoder.decode(&forward, &canvas, latents, positions, out, &scratch);
+        ops::capture::set_sink(None);
+        decoded.expect("a recorded tile");
         assert_eq!(
-            bytes,
-            tile.voxels() * 4,
-            "the declared table is one tile's {} voxels of i32, not the clip's",
-            tile.voxels()
+            launches.0[..3],
+            ["gemm", "rows", "rows"],
+            "the projection, then the registers and the zero row"
         );
-        assert!(bytes < canvas.voxels() * 4, "and it is short of the clip's");
+        assert_eq!(
+            launches.0.iter().filter(|name| **name == "rows").count(),
+            2,
+            "nothing else is placed"
+        );
     }
 
     /// A clip's transformer scratch is **one tile's**, and the plan states one tile's: the two must
@@ -2194,15 +2094,7 @@ pub(crate) mod tests {
         let input = Linear::new(projection, Some(bias), WeightOrder::NxK).expect("a linear");
         let spatial = config.spatial_compression();
         let raster = (canvas.width * spatial, canvas.height * spatial);
-        VideoDecoder::load(
-            config,
-            &[raster],
-            AttentionKind::Dense,
-            DType::F32,
-            input,
-            &mut loader,
-        )
-        .expect("the decoder")
+        VideoDecoder::load(config, &[raster], DType::F32, input, &mut loader).expect("the decoder")
     }
 
     /// The clip a canvas decodes: the raster's pixels and its native frame count.
@@ -2359,61 +2251,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_voxel_table_names_packed_rows_and_follows_the_deployment_packing() {
-        let config = video_config();
-        let canvas = crate::config::Canvas {
-            short_edge: 768,
-            aspect: (7, 4),
-            width: 1344,
-            height: 768,
-        };
-        let raster = crate::packing::latent_raster(&canvas).expect("raster");
-        let clip = Canvas::clip(&config, raster.height, raster.width);
-        let side = crate::packing::PATCH_SIDE;
-        let sparse = AttentionKind::sparse(64, 0.8, None).expect("a sparse kind");
-
-        // The gather writes `destination[indices[voxel]] = source[voxel]`, so every entry must name a
-        // packed row of the clip. A table copied from the voxel indices runs to four times that bound
-        // and scatters the clip's tokens past the end of the stream - which is why this is asserted
-        // rather than assumed.
-        for attention in [AttentionKind::Dense, sparse] {
-            let rows =
-                voxel_rows(&config, attention, raster.height, raster.width).expect("voxel rows");
-            let packed = clip.rows();
-            assert_eq!(rows.len() as u64, clip.voxels());
-            assert!(
-                rows.iter().all(|row| u64::from(*row) < packed),
-                "a table entry names a row outside the clip's {packed} packed rows"
-            );
-            // Each video row is named once per voxel of its own patch, so the counts are the patch's
-            // area and nothing else: no row is skipped and none is named twice as often. The register
-            // and tail rows of the clip are not voxels and are named by no entry.
-            let mut counts = vec![0_u32; clip.rows() as usize];
-            for row in &rows {
-                counts[*row as usize] += 1;
-            }
-            let video = (clip.frames * raster.patch_rows()) as usize;
-            assert!(
-                counts[..video].iter().all(|count| *count == side * side),
-                "{attention:?} names the clip's video rows unevenly"
-            );
-            assert!(
-                counts[video..].iter().all(|count| *count == 0),
-                "{attention:?} names a register or tail row with a voxel"
-            );
-        }
-
-        // The deployments do not read the same table: a sparse packing orders the rows by tile, so a
-        // decoder built for one packing cannot be read through the other's.
-        let dense = voxel_rows(&config, AttentionKind::Dense, raster.height, raster.width)
-            .expect("the dense table");
-        let tiled =
-            voxel_rows(&config, sparse, raster.height, raster.width).expect("the tiled one");
-        assert_ne!(dense, tiled, "{dense:?}");
-    }
-
-    #[test]
-    fn the_decoder_tables_name_one_voxel_and_one_position_per_row() {
+    fn the_decoder_table_names_one_position_per_row() {
         let config = video_config();
         let canvas = crate::config::Canvas {
             short_edge: 768,
@@ -2423,53 +2261,10 @@ pub(crate) mod tests {
         };
         // The layout's own extents: the canvas over the spatial compression.
         let raster = crate::packing::latent_raster(&canvas).expect("raster");
-        // One entry per latent voxel of **one clip** - the checkpoint's own `video_vae.voxel_rows` - and
-        // the values are the packed rows of the patches those voxels lie in, not the voxel indices,
-        // which is the factor of the patch area apart. How many clips a request has is the runner's
-        // question, so no clip count appears here.
-        let rows =
-            voxel_rows(&config, AttentionKind::Dense, raster.height, raster.width).expect("rows");
         let clip = Canvas::clip(&config, raster.height, raster.width);
-        assert_eq!(rows.len() as u64, clip.voxels());
-        let side = u64::from(crate::packing::PATCH_SIDE);
-        let columns = u64::from(raster.width) / side;
-        let per_frame = u64::from(raster.patch_rows());
-        // Dense packing is the identity, so the first clip's first frame names its own patch rows in
-        // order, each one repeated for the `2 x 2` voxels that share it.
-        for (index, row) in rows[..(raster.height * raster.width) as usize]
-            .iter()
-            .enumerate()
-        {
-            let (height, column) = (
-                index as u64 / u64::from(raster.width),
-                index as u64 % u64::from(raster.width),
-            );
-            assert_eq!(
-                u64::from(*row),
-                (height / side) * columns + column / side,
-                "voxel ({height}, {column}) names its patch's packed row"
-            );
-        }
-        // Every value is a row of the packed sequence the denoiser writes.
-        let packed = crate::packing::video_order_of(AttentionKind::Dense, clip.frames, raster)
-            .expect("order")
-            .len() as u64;
-        assert!(rows.iter().all(|row| u64::from(*row) < packed));
-        assert!(per_frame < packed);
         // The position table is axis-major over the largest tile's rows, and the register rows and the
         // trailing zero row carry no coordinate.
         let tile = largest_tile(&config, raster.height, raster.width).expect("a tile");
-        // **The table the decoder publishes is a tile's, and every entry is a row of the tile-sized
-        // stream the decode scatters into.** That bound is the whole reason the placement is in bounds:
-        // a clip-built table names the clip's rows, up to nine times a tile's on a served canvas, and
-        // `Rows::replace` writes `destination[index]` with no row check of its own.
-        let tile_rows = voxel_rows(&config, AttentionKind::Dense, tile.height, tile.width)
-            .expect("the tile's rows");
-        assert_eq!(tile_rows.len() as u64, tile.voxels());
-        assert!(
-            tile_rows.iter().all(|row| u64::from(*row) < tile.rows()),
-            "every entry is a row of the tile's stream, and the stream is `tile.rows()` tall"
-        );
         let table = positions(&tile).expect("positions");
         assert_eq!(table.len() as u64, 3 * tile.rows());
         for channel in 0..3u64 {
@@ -2890,7 +2685,7 @@ pub(crate) mod tests {
         // three projections and `proj_out` fold a bias, while `to_out`, the packed feed-forward
         // projection and `ff.net.2` carry none.
         assert_eq!(count("gemm"), 2);
-        assert_eq!(count("rows"), 1, "three placements, one program");
+        assert_eq!(count("rows"), 1, "two placements, one program");
         assert_eq!(count("rotary_factors"), 1);
         assert_eq!(count("qk_norm_rope"), 1);
         assert_eq!(count("rms_norm"), 1);
@@ -2898,19 +2693,6 @@ pub(crate) mod tests {
         assert_eq!(count("scaled_residual"), 1);
         assert_eq!(count("value_first_swiglu"), 1);
         assert_eq!(count("unpatchify_video"), 1);
-        // The stitch's third family: each seam's neighbour is copied into one contiguous block before
-        // the blend reads it, because a blend addresses its sources flat and a neighbour in a raster
-        // wider than the tile is not one contiguous block. One copy serves every seam of every canvas.
-        assert_eq!(count("copy_block"), 1);
-        // A copy's key names its element types as `source_*_out_*`, not `dtype_*`: the two operands
-        // are the only thing that selects the program, and this decoder states them as one pair.
-        assert!(
-            programs
-                .iter()
-                .any(|(name, key)| name == "copy_block" && key.contains("source_bf16_out_bf16")),
-            "the copy states the deployment's element type twice, as its source and its out: {programs:?}"
-        );
-
         // The stitch compiles one blend per seam width on each of the two axes.
         let blends = crate::decoding::ClipDecoder::new(&config, DType::BF16)
             .expect("the stitch")
