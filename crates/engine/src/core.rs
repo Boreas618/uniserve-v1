@@ -1845,9 +1845,12 @@ impl SchedulerHandle {
         &self,
         ranks: Vec<scheduling::guest::view::RankView>,
     ) -> Option<crate::scheduler::TrialState> {
+        // A scheduler answers at its next command boundary, and one whose executor has no wake
+        // reaches it when its park ends, which is `IDLE_LIVENESS_POLL` away at most.
+        const POLICY_STATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
         self.commands
             .policy_state(ranks)
-            .recv_timeout(std::time::Duration::from_millis(200))
+            .recv_timeout(POLICY_STATE_WAIT)
             .ok()
             .flatten()
     }
