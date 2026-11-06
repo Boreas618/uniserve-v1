@@ -149,6 +149,14 @@ impl Scheduler {
         {
             state.admission_state = WorkerRegistration::Registered;
         }
+        // A completed call is the request advancing, so its deadline restarts: a media request
+        // emits no token, and without this one that outlives the policy's timeout reads as starved.
+        if valid {
+            let now =
+                scheduling::guest::Nanos(crate::clock::now_monotonic_us().saturating_mul(1_000));
+            self.watchdog
+                .advanced(scheduling::guest::RequestId(id.0), now);
+        }
 
         // A request that already failed only drains its remaining calls. A
         // worker that refuses the request states why, and the client is told.

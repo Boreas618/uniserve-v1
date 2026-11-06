@@ -463,6 +463,7 @@ impl nn::capability::Decoder for VideoPostprocessor {
                 splice.overlap
             )));
         }
+        let clip = Raster::cropped(clip).map_err(|error| refuse(format!("{error}")))?;
         let raster = Raster::of(clip).map_err(|error| refuse(format!("{error}")))?;
         // The checkpoint's clip is 25 decoded frames: 17 the timeline keeps and, after three padding
         // frames, a five-frame tail. A clip a successor follows hands that tail on; the clip that ends the
@@ -543,6 +544,33 @@ struct Raster {
 }
 
 impl Raster {
+    /// A decode's own frames, without the ones it leads with.
+    ///
+    /// The decoder emits whole latent frames, so its raster runs past a clip's frames, and the
+    /// surplus leads: the reference left-pads a clip to the temporal compression and crops those
+    /// frames from the decoded timeline (`decoded[:, :, padding:]`).
+    fn cropped(clip: TensorView) -> Result<TensorView> {
+        if clip.shape.rank() != 4 || clip.shape.dim(1) < u64::from(CLIP_OUTPUT_FRAMES) {
+            return Err(Error::config(format!(
+                "a decoded clip is [channels, at least {CLIP_OUTPUT_FRAMES} frames, rows, columns], \
+                 not {:?}",
+                clip.shape.dims()
+            )));
+        }
+        let leading = clip.shape.dim(1) - u64::from(CLIP_OUTPUT_FRAMES);
+        Ok(TensorView::with_strides(
+            clip.element(&[0, leading, 0, 0]),
+            clip.dtype,
+            Shape::new(&[
+                clip.shape.dim(0),
+                u64::from(CLIP_OUTPUT_FRAMES),
+                clip.shape.dim(2),
+                clip.shape.dim(3),
+            ]),
+            nn::Strides::new(clip.strides.as_slice()),
+        ))
+    }
+
     /// The raster `[channels, frames, rows, columns]` a `clip` view describes.
     fn of(clip: TensorView) -> Result<Self> {
         if clip.shape.rank() != 4 || clip.shape.dim(0) != u64::from(Rgb::CHANNELS) {

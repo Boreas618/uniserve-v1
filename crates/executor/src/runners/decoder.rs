@@ -171,6 +171,11 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// The frames the splice staged last wrote for the staged request's clip: the extent the product
     /// states, taken from the schedule rather than recomputed here.
     staged_keep: Option<u32>,
+    /// The timeline frame the clip staged last starts at, and the unit it is.
+    staged_first: u32,
+    staged_unit: u32,
+    /// The units of `published_for`'s timeline this runner has published.
+    published_units: u32,
 }
 
 /// Whether a decode of `request` may start while a clip published under `published` is still held.
@@ -273,6 +278,9 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             spliced: std::collections::HashMap::new(),
             staged_frames: None,
             staged_keep: None,
+            staged_first: 0,
+            staged_unit: 0,
+            published_units: 0,
         })
     }
 
@@ -445,6 +453,32 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         Ok(())
     }
 
+    /// Sizes the frames column for a timeline of `frames` frames.
+    ///
+    /// Each clip keeps its frames at their place in the timeline, so a decode that runs ahead of the
+    /// encodes leaves every clip readable until its own encode copies it.
+    fn size_timeline(&mut self, bucket: Bucket, frames: u32) -> Result<()> {
+        let Extent::Clip { height, width, .. } = bucket.extent else {
+            return Ok(());
+        };
+        if self.postprocessor.is_none() {
+            return Ok(());
+        }
+        let elements = u64::from(frames)
+            .checked_mul(u64::from(height))
+            .and_then(|elements| elements.checked_mul(u64::from(width)))
+            .and_then(|elements| elements.checked_mul(3))
+            .ok_or_else(|| Error::Invalid("a timeline's raster extent overflows".into()))?;
+        if self
+            .frames
+            .as_ref()
+            .is_none_or(|column| column.device.numel() < elements)
+        {
+            self.frames = Some(Column::new(self.device, DType::U8, elements)?);
+        }
+        Ok(())
+    }
+
     /// The one clip a decode bucket serves, or the refusal that names how many the batch carries.
     ///
     /// The bucket's extent names one raster, so a batch of two requests for it describes two clips in
@@ -529,12 +563,15 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         // The column may still hold another request's clip: the store is where that clip's life
         // ends, so the store is asked.
         let still_held = match (self.products.as_deref(), self.published_for) {
-            (Some(store), Some(last)) if last != request => store.holds(last, Product::Video),
+            (Some(store), Some(last)) if last != request => {
+                (0..self.published_units).any(|unit| store.holds(last, Product::Video(unit)))
+            }
             _ => false,
         };
         clip_is_releasable(request, self.published_for, still_held)?;
         self.staged_request = Some(request);
         self.staged_frames = Some(media.request(0)?.frames);
+        self.size_timeline(bucket, media.request(0)?.frames)?;
         // **The trajectory is the denoiser's product, and the store is where it lives.** A staged row
         // is the request's conditioning blob and its parameter record; the latent trajectory is
         // explicitly not the batch's (`MediaColumns::staged`: "It does not own what the model
@@ -776,7 +813,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let written = crate::runners::products::written_on(&self.stream)?;
         products.publish(
             request,
-            Product::Video,
+            Product::Video(self.staged_unit),
             self.device,
             self.stream_id(),
             Some(written),
@@ -784,6 +821,10 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         )?;
         // The column now holds this request's clip until a reader forgets it: that is what a second
         // decode of another request is refused against.
+        if self.published_for != Some(request) {
+            self.published_units = 0;
+        }
+        self.published_units = self.published_units.max(self.staged_unit + 1);
         self.published_for = Some(request);
         Ok(())
     }
@@ -930,7 +971,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             )
         })?;
         let video = TensorView::new(
-            column.device.ptr,
+            timeline_frame(column, splice.first, height, width),
             DType::U8,
             Shape::new(&[
                 u64::from(splice.keep),
@@ -961,6 +1002,8 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             self.spliced.insert(request, index + 1);
         }
         self.staged_keep = Some(splice.keep);
+        self.staged_first = splice.first;
+        self.staged_unit = index;
         Ok(())
     }
 
@@ -1057,11 +1100,17 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             Error::Invariant("a splice wrote frames and the schedule's keep was not staged".into())
         })?;
         Ok(TensorView::new(
-            column.device.ptr,
+            timeline_frame(column, self.staged_first, height, width),
             DType::U8,
             Shape::new(&[u64::from(keep), u64::from(height), u64::from(width), 3_u64]),
         ))
     }
+}
+
+/// Where timeline frame `first` of a `[frames, rows, columns, 3]` byte column starts.
+fn timeline_frame(column: &Column, first: u32, height: u32, width: u32) -> ops::DevicePtr {
+    let elements = u64::from(first) * u64::from(height) * u64::from(width) * 3;
+    TensorView::new(column.device.ptr, DType::U8, Shape::new(&[1])).offset_elements(elements)
 }
 
 impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {

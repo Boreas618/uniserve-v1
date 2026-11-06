@@ -6,16 +6,21 @@
 // `uniserve_dense_attention` runs one call — packed sequences, no cache, no page
 // table.
 //
-// One query tile of `kTileQ` rows is three steps per head:
+// One query tile is three launches for every head at once:
 //
-//   1. cuBLASLt computes the tile's scores  S = scale * Q_tile · K^T   into FP32
-//      scratch (`kTileQ` rows by the call's key extent);
+//   1. a batched cuBLASLt product computes the tile's scores
+//      S = scale * Q_tile · K^T  into FP32 scratch, one matrix per head;
 //   2. a kernel masks the scores the tile's rows may not read, and writes the
 //      row-normalized weights  p_j = exp(s_j - max_j s_j) / sum_j p_j  back into
 //      the same scratch, zeroing everything outside each row's own sequence;
-//   3. cuBLASLt computes the tile's  out = P · V  into an FP32 tile, and a kernel
-//      copies the tile's real rows — the rows the call's offsets name — into the
-//      caller's output.
+//   3. a batched cuBLASLt product computes  out = P · V  straight into the caller's
+//      output, through its strides.
+//
+// The launches are what a captured graph holds, so their count is the graph's size:
+// a tile is as tall as `kScoreBytes` of scratch allows, and a head is a batch entry
+// rather than a loop. A decoder's clip makes hundreds of these calls, and a schedule
+// of a small tile per head was millions of nodes in one graph, which the driver
+// could not launch.
 //
 // The arithmetic is the operator's: every score is one FP32 product accumulated in
 // FP32, the exponentials and their sum are FP32, and the only rounding after them
@@ -87,9 +92,13 @@
 
 namespace {
 
-/// Query rows one work item covers. A tile is the unit the score product is
-/// computed for, so it is also the scratch's row count: `kTileQ * keys` floats.
+/// The granularity of a query tile's rows. A tile is the unit the score product is
+/// computed for, so its rows are also the scratch's: `rows * keys` floats per head.
 constexpr int64_t kTileQ = 64;
+
+/// The bytes one tile's scores may take, over all the heads of one product. It sets
+/// how tall a tile is, and so how many launches a call makes.
+constexpr int64_t kScoreBytes = 1024ll * 1024ll * 1024ll;
 
 /// Threads of the masking and copy kernels.
 constexpr int kThreads = 256;
@@ -146,6 +155,9 @@ struct Matrix {
   int64_t rows;
   int64_t columns;
   int64_t leading;
+  /// The matrices one product covers, and the elements between two of them.
+  int64_t batch;
+  int64_t batch_stride;
 };
 
 /// The plan of one product: the layouts, the algorithm cuBLASLt chose for them and
@@ -182,13 +194,15 @@ struct PlanKey {
   Matrix b;
   Matrix d;
 
+  static bool same(const Matrix& left, const Matrix& right) {
+    return left.rows == right.rows && left.columns == right.columns &&
+           left.leading == right.leading && left.batch == right.batch &&
+           left.batch_stride == right.batch_stride;
+  }
+
   bool operator==(const PlanKey& other) const {
     return device == other.device && transpose_a == other.transpose_a &&
-           k == other.k && a.rows == other.a.rows && a.columns == other.a.columns &&
-           a.leading == other.a.leading && b.rows == other.b.rows &&
-           b.columns == other.b.columns && b.leading == other.b.leading &&
-           d.rows == other.d.rows && d.columns == other.d.columns &&
-           d.leading == other.d.leading;
+           k == other.k && same(a, other.a) && same(b, other.b) && same(d, other.d);
   }
 };
 
@@ -200,7 +214,9 @@ struct PlanKeyHash {
                               key.a.leading,     key.b.rows,
                               key.b.columns,     key.b.leading,
                               key.d.rows,        key.d.columns,
-                              key.d.leading};
+                              key.d.leading,     key.a.batch,
+                              key.a.batch_stride, key.b.batch_stride,
+                              key.d.batch_stride};
     for (int64_t value : values) {
       hash ^= static_cast<size_t>(value) + 0x9e3779b97f4a7c15ull + (hash << 6) +
               (hash >> 2);
@@ -258,11 +274,21 @@ class Plans {
  private:
   static bool layout(cublasLtMatrixLayout_t* into, const Matrix& matrix,
                      std::string* error) {
-    const cublasStatus_t status =
+    cublasStatus_t status =
         cublasLtMatrixLayoutCreate(into, CUDA_R_32F,
                                    static_cast<uint64_t>(matrix.rows),
                                    static_cast<uint64_t>(matrix.columns),
                                    matrix.leading);
+    if (status == CUBLAS_STATUS_SUCCESS) {
+      const int32_t batch = static_cast<int32_t>(matrix.batch);
+      status = cublasLtMatrixLayoutSetAttribute(*into, CUBLASLT_MATRIX_LAYOUT_BATCH_COUNT,
+                                                &batch, sizeof(batch));
+    }
+    if (status == CUBLAS_STATUS_SUCCESS) {
+      status = cublasLtMatrixLayoutSetAttribute(
+          *into, CUBLASLT_MATRIX_LAYOUT_STRIDED_BATCH_OFFSET, &matrix.batch_stride,
+          sizeof(matrix.batch_stride));
+    }
     if (status != CUBLAS_STATUS_SUCCESS) {
       *error = std::string("describing a matrix: ") + cublas_status(status);
       return false;
@@ -381,28 +407,22 @@ __device__ float reduce_sum(float value, float* shared) {
 
 /// Masks one tile's scores and turns them into the row-normalized weights.
 ///
-/// `blockIdx.x` is the tile row; the row's own sequence comes from the offsets, and
-/// every column outside that sequence's visible keys is zeroed, so the following
-/// product over all of the call's keys reads nothing of another sequence. A tile
-/// row past the packed token count is no row of the tensor: it is zeroed and its
-/// output is never written.
+/// `blockIdx.x` is the tile row and `blockIdx.y` the head; the row's own sequence
+/// comes from the offsets, and every column outside that sequence's visible keys is
+/// zeroed, so the following product over all of the call's keys reads nothing of
+/// another sequence.
 ///
 /// `kOffsets` is the descriptor's `cu_seq_lens`: a module compiled for the launch
 /// that carries no table reads its one row range from the call's extents instead.
 template <bool kOffsets>
-__global__ void mask_softmax_kernel(float* tile, int64_t columns,
+__global__ void mask_softmax_kernel(float* tile, int64_t columns, int64_t head_stride,
                                    const int32_t* cu_q, const int32_t* cu_k,
-                                   int batch, int64_t first_row, int64_t q_tokens,
+                                   int batch, int64_t first_row,
                                    int64_t window_left, int causal) {
   __shared__ float shared[kThreads];
   const int64_t row = first_row + blockIdx.x;
-  float* line = tile + static_cast<int64_t>(blockIdx.x) * columns;
-  if (row >= q_tokens || columns <= 0) {
-    for (int64_t column = threadIdx.x; column < columns; column += blockDim.x) {
-      line[column] = 0.0f;
-    }
-    return;
-  }
+  float* line = tile + static_cast<int64_t>(blockIdx.y) * head_stride +
+                static_cast<int64_t>(blockIdx.x) * columns;
 
   // One sequence without offsets: every query row attends the whole key extent.
   int64_t first_key = 0;
@@ -453,25 +473,6 @@ __global__ void mask_softmax_kernel(float* tile, int64_t columns,
   for (int64_t column = threadIdx.x; column < columns; column += blockDim.x) {
     const bool counted = column >= begin && column < end;
     line[column] = counted ? line[column] * inverse : 0.0f;
-  }
-}
-
-/// Copies one tile's real rows of one head into the caller's output.
-///
-/// The tile's rows are `first_row` onwards; a row past the packed token count
-/// belongs to no sequence and is not written, so the tile's padding cannot reach
-/// the rows of the sequence that follows it.
-__global__ void copy_rows_kernel(const float* tile, float* out,
-                                 int64_t o_stride_tokens, int64_t first_row,
-                                 int64_t q_tokens, int64_t head_dim) {
-  const int64_t row = first_row + blockIdx.x;
-  if (row >= q_tokens) {
-    return;
-  }
-  const float* source = tile + static_cast<int64_t>(blockIdx.x) * head_dim;
-  float* target = out + row * o_stride_tokens;
-  for (int64_t column = threadIdx.x; column < head_dim; column += blockDim.x) {
-    target[column] = source[column];
   }
 }
 
@@ -585,56 +586,88 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
     return fail(call, "creating the cuBLASLt handle: %s", cublas_status(status));
   }
 
-  // The two products of one work item, as cuBLASLt reads them. Both compute the
-  // transpose of what the call names, because a row-major buffer is its transpose
-  // read column-major and neither cuBLASLt nor this module transposes anything:
+  // A product covers every head that reads its own keys, as one batch. Heads that share keys
+  // are a batch per key head instead, whose key stride is zero.
+  const int64_t group = call->q_heads / call->kv_heads;
+  const int64_t heads = group == 1 ? call->q_heads : group;
+  const int64_t passes = call->q_heads / heads;
+  const int64_t key_batch_stride = group == 1 ? call->kv_stride_heads : 0;
+
+  // A tile as tall as the scratch allows, and the call's rows spread evenly over the tiles.
+  const int64_t row_bytes = heads * call->kv_tokens * static_cast<int64_t>(sizeof(float));
+  int64_t tallest = kScoreBytes / row_bytes / kTileQ * kTileQ;
+  if (tallest < kTileQ) {
+    tallest = kTileQ;
+  }
+  const int64_t tiles = (call->q_tokens + tallest - 1) / tallest;
+  const int64_t even = (call->q_tokens + tiles - 1) / tiles;
+  const int64_t tile_rows = tiles == 1 ? call->q_tokens : (even + kTileQ - 1) / kTileQ * kTileQ;
+
+  // The two products of one tile, as cuBLASLt reads them. Both compute the transpose of what
+  // the call names, because a row-major buffer is its transpose read column-major and neither
+  // cuBLASLt nor this module transposes anything:
   //
-  //   scores:  D = S^T = [keys, tile]      A = K stored [head_dim, keys], T
-  //                                        B = Q tile stored [head_dim, tile]
-  //   product: D = out^T = [head_dim, tile] A = V stored [head_dim, keys]
-  //                                        B = weights stored [keys, tile]
-  const Matrix score_a{call->head_dim, call->kv_tokens, call->kv_stride_tokens};
-  const Matrix score_b{call->head_dim, kTileQ, call->q_stride_tokens};
-  const Matrix score_d{call->kv_tokens, kTileQ, call->kv_tokens};
-  const Matrix product_a{call->head_dim, call->kv_tokens, call->kv_stride_tokens};
-  const Matrix product_b{call->kv_tokens, kTileQ, call->kv_tokens};
-  const Matrix product_d{call->head_dim, kTileQ, call->head_dim};
-
+  //   scores:  D = S^T = [keys, rows]        A = K stored [head_dim, keys], T
+  //                                          B = Q tile stored [head_dim, rows]
+  //   product: D = out^T = [head_dim, rows]  A = V stored [head_dim, keys]
+  //                                          B = weights stored [keys, rows]
+  struct Products {
+    Plan* score;
+    Plan* value;
+  };
   std::string error;
-  Plan* score = plans().of(PlanKey{device, 1, call->head_dim, score_a, score_b, score_d},
-                           handle, &error);
-  if (score == nullptr) {
-    return fail(call, "the score product: %s", error.c_str());
+  auto products_of = [&](int64_t rows, Products* into) -> int32_t {
+    const Matrix keys_or_values{call->head_dim, call->kv_tokens, call->kv_stride_tokens,
+                                heads, key_batch_stride};
+    const Matrix queries_of{call->head_dim, rows, call->q_stride_tokens, heads,
+                            call->q_stride_heads};
+    const Matrix weights_of{call->kv_tokens, rows, call->kv_tokens, heads,
+                            rows * call->kv_tokens};
+    const Matrix out_of{call->head_dim, rows, call->o_stride_tokens, heads,
+                        call->o_stride_heads};
+    into->score = plans().of(
+        PlanKey{device, 1, call->head_dim, keys_or_values, queries_of, weights_of}, handle,
+        &error);
+    if (into->score == nullptr) {
+      return fail(call, "the score product: %s", error.c_str());
+    }
+    into->value = plans().of(
+        PlanKey{device, 0, call->kv_tokens, keys_or_values, weights_of, out_of}, handle,
+        &error);
+    if (into->value == nullptr) {
+      return fail(call, "the value product: %s", error.c_str());
+    }
+    return 0;
+  };
+  const int64_t last_rows = call->q_tokens - (tiles - 1) * tile_rows;
+  Products whole{};
+  Products last{};
+  if (const int32_t refused = products_of(tile_rows, &whole); refused != 0) {
+    return refused;
   }
-  Plan* product =
-      plans().of(PlanKey{device, 0, call->kv_tokens, product_a, product_b, product_d},
-                 handle, &error);
-  if (product == nullptr) {
-    return fail(call, "the value product: %s", error.c_str());
+  if (const int32_t refused = products_of(last_rows, &last); refused != 0) {
+    return refused;
   }
 
-  // The scratch of one work item: the weights tile every product reads and writes,
-  // and the tile the output product lands in before its real rows are copied out.
-  // Both are stream-ordered, so tiles reused in enqueue order cannot overlap, and
-  // two calls on different streams own their own.
-  const size_t weights_bytes =
-      static_cast<size_t>(kTileQ) * static_cast<size_t>(call->kv_tokens) * sizeof(float);
-  const size_t output_bytes =
-      static_cast<size_t>(kTileQ) * static_cast<size_t>(call->head_dim) * sizeof(float);
+  // The scratch of one tile: the weights every product reads and writes, stream-ordered, so
+  // tiles reused in enqueue order cannot overlap, and two calls on different streams own their
+  // own. The output is the caller's: the value product writes it through its strides.
+  const size_t weights_bytes = static_cast<size_t>(heads) * static_cast<size_t>(tile_rows) *
+                               static_cast<size_t>(call->kv_tokens) * sizeof(float);
   void* raw = nullptr;
-  cudaError_t allocated =
-      cudaMallocAsync(&raw, weights_bytes + output_bytes, queue);
+  cudaError_t allocated = cudaMallocAsync(&raw, weights_bytes, queue);
   if (allocated != cudaSuccess) {
-    return fail(call, "allocating %zu bytes of scratch: %s",
-                weights_bytes + output_bytes, cudaGetErrorString(allocated));
+    return fail(call, "allocating %zu bytes of scratch: %s", weights_bytes,
+                cudaGetErrorString(allocated));
   }
   auto* scratch = static_cast<float*>(raw);
   float* weights = scratch;
-  float* tile = scratch + kTileQ * call->kv_tokens;
 
-  const size_t workspace_bytes =
-      score->workspace_bytes > product->workspace_bytes ? score->workspace_bytes
-                                                        : product->workspace_bytes;
+  size_t workspace_bytes = 0;
+  for (const Plan* plan : {whole.score, whole.value, last.score, last.value}) {
+    workspace_bytes = plan->workspace_bytes > workspace_bytes ? plan->workspace_bytes
+                                                              : workspace_bytes;
+  }
   void* workspace = nullptr;
   if (workspace_bytes > 0) {
     allocated = cudaMallocAsync(&workspace, workspace_bytes, queue);
@@ -649,21 +682,26 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
   const auto* keys = static_cast<const float*>(call->key);
   const auto* values = static_cast<const float*>(call->value);
   auto* out = static_cast<float*>(call->out);
-  const int64_t group = call->q_heads / call->kv_heads;
   const float scale = static_cast<float>(call->scale);
   const float one = 1.0f;
   const float zero = 0.0f;
-  const int64_t tiles = (call->q_tokens + kTileQ - 1) / kTileQ;
 
   for (int64_t at = 0; at < tiles; ++at) {
-    const int64_t first_row = at * kTileQ;
-    for (int64_t head = 0; head < call->q_heads; ++head) {
-      const int64_t group_head = head / group;
+    const int64_t first_row = at * tile_rows;
+    const bool final_tile = at + 1 == tiles;
+    const int64_t rows = final_tile ? last_rows : tile_rows;
+    const Products& products = final_tile ? last : whole;
+    for (int64_t pass = 0; pass < passes; ++pass) {
+      const int64_t first_head = pass * heads;
+      const int64_t key_head = group == 1 ? 0 : pass;
       const float* query =
-          queries + head * call->q_stride_heads + first_row * call->q_stride_tokens;
-      const float* key = keys + group_head * call->kv_stride_heads;
-      const float* value = values + group_head * call->kv_stride_heads;
-      float* target = out + head * call->o_stride_heads;
+          queries + first_head * call->q_stride_heads + first_row * call->q_stride_tokens;
+      const float* key = keys + key_head * call->kv_stride_heads;
+      const float* value = values + key_head * call->kv_stride_heads;
+      float* target =
+          out + first_head * call->o_stride_heads + first_row * call->o_stride_tokens;
+      const Plan* score = products.score;
+      const Plan* product = products.value;
 
       status = cublasLtMatmul(handle, score->operation, &scale, key, score->a, query,
                               score->b, &zero, weights, score->c, weights,
@@ -674,16 +712,16 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
         if (workspace != nullptr) {
           cudaFreeAsync(workspace, queue);
         }
-        return fail(call, "the score product of tile %lld, head %lld: %s",
-                    static_cast<long long>(at), static_cast<long long>(head),
-                    cublas_status(status));
+        return fail(call, "the score product of tile %lld: %s",
+                    static_cast<long long>(at), cublas_status(status));
       }
-      mask_softmax_kernel<UNISERVE_SEQUENCES == 1><<<kTileQ, kThreads, 0, queue>>>(
-          weights, call->kv_tokens, call->cu_seq_lens_q, call->cu_seq_lens_k,
-          static_cast<int>(call->batch), first_row, call->q_tokens,
-          call->window_left, UNISERVE_CAUSAL);
+      mask_softmax_kernel<UNISERVE_SEQUENCES == 1>
+          <<<dim3(static_cast<unsigned>(rows), static_cast<unsigned>(heads)), kThreads, 0,
+             queue>>>(weights, call->kv_tokens, rows * call->kv_tokens, call->cu_seq_lens_q,
+                      call->cu_seq_lens_k, static_cast<int>(call->batch), first_row,
+                      call->window_left, UNISERVE_CAUSAL);
       status = cublasLtMatmul(handle, product->operation, &one, value, product->a,
-                              weights, product->b, &zero, tile, product->c, tile,
+                              weights, product->b, &zero, target, product->c, target,
                               product->d, &product->algorithm, workspace,
                               workspace_bytes, queue);
       if (status != CUBLAS_STATUS_SUCCESS) {
@@ -691,13 +729,9 @@ extern "C" int32_t UNISERVE_ENTRY(UniserveDenseAttentionCall* call, void* stream
         if (workspace != nullptr) {
           cudaFreeAsync(workspace, queue);
         }
-        return fail(call, "the value product of tile %lld, head %lld: %s",
-                    static_cast<long long>(at), static_cast<long long>(head),
-                    cublas_status(status));
+        return fail(call, "the value product of tile %lld: %s",
+                    static_cast<long long>(at), cublas_status(status));
       }
-      copy_rows_kernel<<<kTileQ, kThreads, 0, queue>>>(
-          tile, target, call->o_stride_tokens, first_row, call->q_tokens,
-          call->head_dim);
     }
   }
 
