@@ -43,7 +43,7 @@ use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchOutput, Job, Jobs};
+use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
 use crate::plan::{Bucket, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
@@ -476,6 +476,8 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     /// A batch is one step, so this is filled by `submit` and consumed by the replay that follows;
     /// a second `submit` before a replay would be a second batch, which the executor does not do.
     pending: Vec<Pending>,
+    /// The calls of the batch staged last, which its replay answers.
+    calls: Vec<CallId>,
 }
 
 impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
@@ -536,6 +538,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             diag: Diag::from_env(),
             staged_step: None,
             pending: Vec::new(),
+            calls: Vec::new(),
         })
     }
 
@@ -1242,6 +1245,7 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
         }
         let step = step.ok_or_else(|| Error::Invalid("a denoise batch of no request".into()))?;
         self.stage_step(&step)?;
+        self.calls.clone_from(&batch.calls);
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
             bucket,
@@ -1371,7 +1375,7 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 // reads them through its own products: the stream's order is what makes them
                 // readable, and the wait is the executor's on the runner's stream.
                 Ok(BatchOutput {
-                    calls: Vec::new(),
+                    calls: answered(&mut self.calls),
                     timing: TimingCounters {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()

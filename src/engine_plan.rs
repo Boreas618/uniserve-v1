@@ -1210,7 +1210,13 @@ impl EpochPlan {
                         proto::request::ModelDtype::Float32 => ipc::PrefixCacheDtype::Float32,
                     },
                 };
-                (facts, media_rank_report(device, &host)?)
+                let clips = frame_clips()?;
+                let frames = (self.build.video.max_seconds * f64::from(minimax_h3::FPS)).round();
+                let bounds = MediaBounds {
+                    prompt_tokens: self.max_kv_len(served)?,
+                    video_units: clips.units(clips.align_up(frames as u32)),
+                };
+                (facts, media_rank_report(device, &host, bounds)?)
             }
         };
         // One rank's host group: this rank alone, which is what a world of one rank is. A
@@ -1350,35 +1356,43 @@ pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capa
     })
 }
 
+/// The largest extents a request of this deployment states, which admission holds a request to.
+struct MediaBounds {
+    /// The prompt's tokens: what the text encoder's largest bucket holds.
+    prompt_tokens: u32,
+    /// The clips of the longest video the deployment serves.
+    video_units: u32,
+}
+
 /// The products `component` publishes, under the names a request's graph asks for them.
 ///
-/// They are names and not storage: a media rank's products stay in the process, in the product store,
-/// and the scheduler books nothing for a rank with no buffer pool. So a product's only shape is the
-/// axis a request's extent binds, and that axis has no bound of its own here, because the frontend's
-/// plan has already held the request to what the deployment serves.
-fn media_outputs(component: &str) -> Vec<ipc::OutputInfo> {
+/// A media rank's products stay in the process, in the product store, and the scheduler books
+/// nothing for a rank with no buffer pool. So what this states is the name and the one axis a
+/// request's extent binds, with the deployment's real bound on it: admission refuses a request past
+/// that bound, which is the check a batch that fits no bucket would otherwise fail much later. The
+/// element type and the inner axes are the model's and nothing on such a rank reads them, so a
+/// product is stated as bytes along that axis, and a product with no request extent as one byte.
+fn media_outputs(component: &str, bounds: &MediaBounds) -> Vec<ipc::OutputInfo> {
     use ipc::product;
-    let output = |name: &str, extent: bool| ipc::OutputInfo {
+    let output = |name: &str, extent: Option<u32>| ipc::OutputInfo {
         name: name.to_owned(),
         dtype: ipc::DType::U8,
         shape_bound: ipc::ShapeBound {
-            dims: vec![if extent {
-                ipc::DimBound::Device { max: u32::MAX }
-            } else {
-                ipc::DimBound::Static(1)
-            }],
+            dims: vec![extent.map_or(ipc::DimBound::Static(1), |max| ipc::DimBound::Device {
+                max,
+            })],
         },
         raster_axes: None,
     };
     match component {
-        "text_encoder" => vec![output(product::CONDITIONING, true)],
+        "text_encoder" => vec![output(product::CONDITIONING, Some(bounds.prompt_tokens))],
         "transformer" => vec![
-            output(product::VIDEO_LATENTS, false),
-            output(product::AUDIO_LATENTS, false),
+            output(product::VIDEO_LATENTS, None),
+            output(product::AUDIO_LATENTS, None),
         ],
-        "video_decoder" => vec![output(product::VIDEO_UNITS, true)],
-        "video_codec" => vec![output(product::ENCODED_UNITS, true)],
-        "audio_decoder" => vec![output(product::AUDIO_SAMPLES, false)],
+        "video_decoder" => vec![output(product::VIDEO_UNITS, Some(bounds.video_units))],
+        "video_codec" => vec![output(product::ENCODED_UNITS, Some(bounds.video_units))],
+        "audio_decoder" => vec![output(product::AUDIO_SAMPLES, None)],
         _ => Vec::new(),
     }
 }
@@ -1394,9 +1408,10 @@ fn media_outputs(component: &str) -> Vec<ipc::OutputInfo> {
 /// class hands on - the encoded conditioning rows, the latent trajectory, the decoded clip - stays
 /// in the process, through the product store, and a report that claimed otherwise would have the
 /// capacity plan reserve storage for transfers no rank makes.
-pub(crate) fn media_rank_report(
+fn media_rank_report(
     device: DeviceId,
     host: &str,
+    bounds: MediaBounds,
 ) -> Result<executor::capacity::Report> {
     use ipc::MediaCall;
     let at = std::time::SystemTime::now()
@@ -1425,7 +1440,7 @@ pub(crate) fn media_rank_report(
         .into_iter()
         .map(|name| ipc::ComponentInfo {
             name: name.clone(),
-            outputs: media_outputs(name),
+            outputs: media_outputs(name, &bounds),
         })
         .collect();
     Ok(executor::capacity::Report {
@@ -1937,10 +1952,8 @@ fn denoiser_report(
     video: &daemon::options::VideoOptions,
     checkpoint_tasks: &[nn::VideoTask],
 ) -> Result<ipc::VideoDenoiserInfo> {
-    use minimax_h3::{AUDIO_SAMPLE_RATE, CLIP_FRAMES, CLIP_LATENTS, FPS};
-    use models::video::{
-        Canvas, DenoiserInfo, FrameClips, ReferenceLimits, ServedCanvas, VideoTask,
-    };
+    use minimax_h3::{AUDIO_SAMPLE_RATE, FPS};
+    use models::video::{Canvas, DenoiserInfo, ReferenceLimits, ServedCanvas, VideoTask};
     let denoisers: Vec<_> = [pipeline.transformer(), pipeline.transformer_ref()]
         .into_iter()
         .flatten()
@@ -1959,10 +1972,6 @@ fn denoiser_report(
     let tasks: Vec<VideoTask> = VideoTask::ALL.into_iter().filter(|task| served(*task)).collect();
     let steps = first.schedule().num_steps()?;
     let shifts = &first.config().schedule.shifts;
-    // The fewest frames are one whole clip and the tail, and the tail's latent frames are what the
-    // timeline holds past the clip's.
-    let min_frames = CLIP_FRAMES + CLIP_LATENTS;
-    let latent_frames = minimax_h3::packing::video_latent_frames(min_frames)?;
     let report = DenoiserInfo {
         tasks: tasks.iter().map(|task| task.as_str().to_owned()).collect(),
         schedule_points: steps + 1,
@@ -1970,12 +1979,7 @@ fn denoiser_report(
         audio_shift: f64::from(shifts.audio),
         frame_rate: FPS,
         audio_sample_rate: AUDIO_SAMPLE_RATE,
-        frames: FrameClips {
-            min_frames,
-            clip_frames: CLIP_FRAMES,
-            clip_latent_frames: CLIP_LATENTS,
-            tail_latent_frames: latent_frames - CLIP_LATENTS,
-        },
+        frames: frame_clips()?,
         canvases: named_canvases(video)?
             .into_iter()
             .map(|canvas| ServedCanvas {
@@ -2013,6 +2017,20 @@ fn denoiser_report(
             .collect(),
         denoise_steps: steps,
         description: report.encode().context("encoding the denoiser's report")?,
+    })
+}
+
+/// The checkpoint's timeline rule. The fewest frames are one whole clip and the tail, and the tail's
+/// latent frames are what the timeline holds past the clip's.
+fn frame_clips() -> Result<models::video::FrameClips> {
+    use minimax_h3::{CLIP_FRAMES, CLIP_LATENTS};
+    let min_frames = CLIP_FRAMES + CLIP_LATENTS;
+    let latent_frames = minimax_h3::packing::video_latent_frames(min_frames)?;
+    Ok(models::video::FrameClips {
+        min_frames,
+        clip_frames: CLIP_FRAMES,
+        clip_latent_frames: CLIP_LATENTS,
+        tail_latent_frames: latent_frames - CLIP_LATENTS,
     })
 }
 

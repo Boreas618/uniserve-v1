@@ -247,6 +247,17 @@ pub struct BatchColumns {
     pub max_kv_len: u32,
 }
 
+/// The answers to a replay that served `calls`, leaving `calls` empty.
+///
+/// A media call's result is a product, which its runner published under the request's name, so a
+/// call reports that it ran and nothing else.
+pub(crate) fn answered(calls: &mut Vec<CallId>) -> Vec<CallOutput> {
+    calls
+        .drain(..)
+        .map(|call| CallOutput::completed(call, Vec::new(), RowState::default()))
+        .collect()
+}
+
 /// One media computation's columns: the buffers the model prepared, per request (4.5).
 ///
 /// A media computation is not staged from typed token columns. What a denoiser, an encoder or a
