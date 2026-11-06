@@ -235,11 +235,6 @@ fn a_launch_names_the_host_whose_daemon_is_absent() {
     );
 }
 
-/// Spawns the default two-rank stub group from `worker_group_args`.
-fn spawn_worker_group() -> anyhow::Result<ExecutorGroup> {
-    ExecutorGroup::spawn(worker_group_args())
-}
-
 /// Launch arguments for a two-rank stub group on the local host's CPU.
 ///
 /// Both ranks hold the single `model` component, with `QUEUE_DEPTH` batches
@@ -935,7 +930,7 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
     use std::os::unix::fs::PermissionsExt as _;
 
     // The ranks are `media_worker` processes speaking the rank protocol. Each
-    // answers Info with a real stub group's executor info, completes every
+    // answers Info with the simulated rank's executor info, completes every
     // call it receives and attaches a shared-memory media payload to a
     // completion, selected by case: a valid payload from rank 0
     // ("retained"), a payload on a call identity the batch never carried
@@ -943,11 +938,10 @@ fn media_storage_is_owned_through_worker_result_validation() -> anyhow::Result<(
     // declaring one byte more than it stores ("short-storage").
     let template = tempfile::tempdir()?;
     let info_path = template.path().join("info.json");
-    {
-        let mut worker = spawn_worker_group()?;
-        std::fs::write(&info_path, serde_json::to_vec(worker.info())?)?;
-        worker.close()?;
-    }
+    std::fs::write(
+        &info_path,
+        serde_json::to_vec(engine::SimEngine::new().mut_info_for_test())?,
+    )?;
     let executable = serde_json::to_string(&std::env::current_exe()?)?;
     for case in ["retained", "unknown-call", "rank-output", "short-storage"] {
         let directory = tempfile::tempdir()?;
@@ -1083,7 +1077,7 @@ fn media_worker() -> anyhow::Result<()> {
     // take the launch descriptor it answers with.
     let mut server = Channel::connect(argument("--engine")?)?;
     server.send(&Registration::Worker {
-        worker_id: argument("--worker-id")?.clone(),
+        worker_id: argument("--executor-id")?.clone(),
         rank: argument("--rank")?.parse()?,
         generation: argument("--generation")?.parse()?,
         version: ipc::VERSION.into(),
