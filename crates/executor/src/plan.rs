@@ -85,6 +85,14 @@ pub enum Variant {
     /// so this call computes nothing: it is the mechanism's step between a prompt's encoding and
     /// the first denoising call.
     LatentPrepare,
+    /// One request's condition media read on the host: its bytes decoded and laid out as the
+    /// model's encoders read them, in storage a later call of the request reads.
+    MediaRead,
+    /// A condition encoder's own call, whose work a later call computes: the vision tower runs
+    /// inside the text encoding that splices its rows, and the latent encoders inside the
+    /// denoiser's first step, whose conditioner writes their rows. So this call computes nothing:
+    /// it is the mechanism's step between the media read and the call that consumes it.
+    ConditionEncode,
 }
 
 impl Variant {
@@ -103,6 +111,8 @@ impl Variant {
             Self::AudioEncode => "audio_encode",
             Self::Mux => "mux",
             Self::LatentPrepare => "latent_prepare",
+            Self::MediaRead => "media_read",
+            Self::ConditionEncode => "condition_encode",
         }
     }
 
@@ -122,6 +132,8 @@ impl Variant {
                 | Self::AudioEncode
                 | Self::Mux
                 | Self::LatentPrepare
+                | Self::MediaRead
+                | Self::ConditionEncode
         )
     }
 
@@ -133,21 +145,28 @@ impl Variant {
     pub const fn host(self) -> bool {
         matches!(
             self,
-            Self::VideoEncode | Self::AudioEncode | Self::Mux | Self::LatentPrepare
+            Self::VideoEncode
+                | Self::AudioEncode
+                | Self::Mux
+                | Self::LatentPrepare
+                | Self::MediaRead
+                | Self::ConditionEncode
         )
     }
 
     /// The computation a media call is, and `None` for a call no variant states yet.
     ///
-    /// The three encoders are one computation because they write one thing - the conditioning the
-    /// denoiser reads - and differ only in which tower produced it; the three decoders likewise
-    /// produce one raster for one muxer. A call with no variant is not served, which the mechanism
-    /// reads as a capability the executor does not state rather than as a batch to send anyway.
+    /// The three decoders produce one raster for one muxer. The text encoding is the one encode a
+    /// device runs as a call of its own; the vision and latent encodings are computed by the calls
+    /// that consume them ([`Variant::ConditionEncode`]). A call with no variant is not served, which
+    /// the mechanism reads as a capability the executor does not state rather than as a batch to
+    /// send anyway.
     pub const fn of_media(call: ipc::MediaCall) -> Option<Self> {
         match call {
-            ipc::MediaCall::TextEncoding
-            | ipc::MediaCall::VisionEncoding
-            | ipc::MediaCall::LatentEncoding => Some(Self::Encode),
+            ipc::MediaCall::TextEncoding => Some(Self::Encode),
+            ipc::MediaCall::VisionEncoding | ipc::MediaCall::LatentEncoding => {
+                Some(Self::ConditionEncode)
+            }
             ipc::MediaCall::Denoising => Some(Self::Denoise),
             ipc::MediaCall::ImageDecoding | ipc::MediaCall::VideoDecoding => Some(Self::Decode),
             // The audio half of a response: its own bucket, matching the `AudioDecoding` call this
@@ -159,7 +178,7 @@ impl Variant {
             ipc::MediaCall::AudioEncoding => Some(Self::AudioEncode),
             ipc::MediaCall::Muxing => Some(Self::Mux),
             ipc::MediaCall::LatentPreparation => Some(Self::LatentPrepare),
-            ipc::MediaCall::MediaReading => None,
+            ipc::MediaCall::MediaReading => Some(Self::MediaRead),
         }
     }
 
@@ -1005,17 +1024,17 @@ mod tests {
             "a captured bucket holds the canvas it was captured for and no other"
         );
 
-        // A call no variant states is served nowhere, and the mechanism reads that as the
-        // capability it is.
-        let unstated = Computation {
+        // A media read is host work: a plan that states no host bucket for it serves it nowhere,
+        // and the mechanism reads that as the capability it is.
+        let read = Computation {
             call: ipc::MediaCall::MediaReading,
             rows: 1,
             tokens: 0,
             extent: Extent::None,
         };
-        assert!(!unstated.stated(), "a media read states no variant");
-        assert_eq!(plan.select_media(&unstated), None);
-        assert_eq!(tracks.select_media(&unstated), None);
+        assert!(read.stated(), "a media read is a computation");
+        assert_eq!(plan.select_media(&read), None);
+        assert_eq!(tracks.select_media(&read), None);
     }
 
     /// The two families are refused by name rather than served from one another's graphs: a media

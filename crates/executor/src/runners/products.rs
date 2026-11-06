@@ -21,16 +21,15 @@
 //!   streams; a runner that issued its own cross-device copy would be ordering against a stream it
 //!   does not hold.
 //!
-//! # What is deliberately not a product here
+//! # A request's raw condition media
 //!
-//! **The request's raw condition media.** `nn::capability::Conditioning::media` is a `MediaInput` per
-//! condition - the input's pixels, its audio and its anchoring draw, all device views the media
-//! reader produced - and a conditioner encodes them in its own forward. It is an **input** to the
-//! conditioning rather than a row of it, it is per condition rather than per request, and the
-//! scheduler already names each condition's product (`MediaFlowState::condition_media`, keyed by the
-//! condition's own name). A region named `(request, kind)` cannot carry a list, so putting it here
-//! would state a mechanism the other side cannot use. The kinds below are the ones a request has
-//! exactly one of, which is what makes one name per kind enough.
+//! `nn::capability::Conditioning::media` is a `MediaInput` per condition - the input's pixels, its
+//! audio and its anchoring draw - and a conditioner encodes them in its own forward. The media reader
+//! lays a request's conditions out one after another in three regions, the three the scheduler names
+//! (`ipc::product`): [`Product::ConditionPixels`], [`Product::ConditionSamples`] and
+//! [`Product::VisionPixels`]. A request has exactly one of each, which is what makes one name per
+//! kind enough, and a reader finds one condition's rows from the extents the request's own
+//! conditioning states.
 //!
 //! # What a runner may assume
 //!
@@ -64,22 +63,23 @@ use crate::arena::StreamId;
 /// | --- | --- | --- |
 /// | [`Product::Text`] | the encoder runner | the denoiser, through `copy_into` |
 /// | [`Product::VideoLatents`] | the denoiser runner | the decoder, through `copy_into` |
-/// | [`Product::AudioLatents`] | the denoiser runner | nothing yet - `ref2va` only |
+/// | [`Product::AudioLatents`] | the denoiser runner | the audio decode |
 /// | [`Product::Video`] | the decoder runner | the media encode, when it writes the artifact |
-/// | [`Product::Source`], [`Product::Images`], [`Product::Audio`] | **nobody** - a reference condition, `ref2va` only | - |
+/// | [`Product::ConditionPixels`], [`Product::ConditionSamples`] | the media stage's read | the denoiser's first step |
+/// | [`Product::VisionPixels`] | the media stage's read | the text encoding |
 /// | [`Product::Track`] | the audio decode runner | the audio encode, when it writes the artifact |
 ///
 /// A kind nobody published is not a hole a reader falls into: the store answers `None` and a refusal
-/// names the product and the request, which is what `ref2va` reports today.
+/// names the product and the request.
 pub enum Product {
     /// `[text_rows, width]` encoded prompt: the text encoder's rows.
     Text,
-    /// The text encoder's own features, which a conditioner folds into `Text` in place.
-    Source,
-    /// `[rows, …]` encoded reference image.
-    Images,
-    /// `[rows, …]` encoded reference audio.
-    Audio,
+    /// Every visual condition's pixels, in request order, as its encoder reads them.
+    ConditionPixels,
+    /// Every audio track's samples, in request order, as the audio encoder reads them.
+    ConditionSamples,
+    /// Every vision block's patch rows, in presentation order.
+    VisionPixels,
     /// `[channels, frames, rows, columns]` the video latent trajectory: a denoise advances it step
     /// by step and a decode then reads it.
     VideoLatents,
@@ -102,7 +102,7 @@ pub enum Product {
     /// `[channels, samples]` the decoded audio track, in the same sense as [`Product::Video`].
     ///
     /// The audio decode runner publishes it and an audio encode reads it. It is a different product
-    /// from [`Product::Audio`] on purpose: that one is a request's reference audio condition (an
+    /// from [`Product::ConditionSamples`] on purpose: that one is a request's reference audio (an
     /// input the media reader produced), and this one is what this request's own denoising produced:
     /// a conditioner reads the first, the muxer's audio encode reads the second, and a store that
     /// gave them one name would let a `ref2va` request read its input as its output.
@@ -114,9 +114,9 @@ impl Product {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Text => "text",
-            Self::Source => "source",
-            Self::Images => "images",
-            Self::Audio => "audio",
+            Self::ConditionPixels => "condition pixels",
+            Self::ConditionSamples => "condition samples",
+            Self::VisionPixels => "vision pixels",
             Self::VideoLatents => "video latents",
             Self::AudioLatents => "audio latents",
             Self::Video(_) => "video",
@@ -179,6 +179,26 @@ pub trait Products: Send + Sync {
         device: DeviceId,
         stream: StreamId,
     ) -> Result<Option<TensorView>>;
+
+    /// Orders `stream` after the write of `request`'s `kind` product and answers its view, to read
+    /// in place.
+    ///
+    /// This is the read of a product too large to copy for one use: a request's condition media is
+    /// read once, by the forward that encodes it, so a copy would double its bytes for nothing. The
+    /// view is only for a reader on the writer's device, because a view cannot cross one, and only
+    /// for work issued on `stream` after this call. `None` is a product no call of `request`
+    /// produced.
+    fn ordered(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        stream: &platform::Stream,
+    ) -> Result<Option<TensorView>> {
+        let _ = (request, kind, stream);
+        Err(crate::Error::Invalid(
+            "this product store cannot order a read in place: it holds no device".into(),
+        ))
+    }
 
     /// Whether `request` has a `kind` product, **whatever device and stream it lives on**.
     ///
@@ -478,6 +498,44 @@ impl Products for Held {
         Ok(Some(placed.view))
     }
 
+    fn ordered(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        stream: &platform::Stream,
+    ) -> Result<Option<TensorView>> {
+        let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
+        let Some(placed) = placed else {
+            return Ok(None);
+        };
+        if placed.device != stream.device() {
+            return Err(crate::Error::Invalid(format!(
+                "request {} reads its {} region in place on device {} and it was written on device \
+                 {}: a view does not cross a device, so such a reader asks for a copy (`copy_into`)",
+                request.request_id.0,
+                kind.name(),
+                stream.device().0,
+                placed.device.0
+            )));
+        }
+        let read = (stream.device(), StreamId(stream.raw()));
+        if route((placed.device, placed.stream), read) == Route::AfterTheWriter {
+            let Some(written) = placed.written.as_ref() else {
+                return Err(crate::Error::Invalid(format!(
+                    "request {} reads {} on stream {} and it was written on stream {} with no \
+                     record of its write: a producer that expects a crossing reader states the \
+                     event (`written_on`) when it publishes",
+                    request.request_id.0,
+                    kind.name(),
+                    stream.raw(),
+                    placed.stream.0
+                )));
+            };
+            stream.wait_event(written)?;
+        }
+        Ok(Some(placed.view))
+    }
+
     fn holds(&self, request: RequestKey, kind: Product) -> bool {
         crate::lock(&self.entries).contains_key(&(request, kind))
     }
@@ -687,9 +745,9 @@ mod tests {
     fn every_kind_of_product_has_a_name_of_its_own() {
         let kinds = [
             Product::Text,
-            Product::Source,
-            Product::Images,
-            Product::Audio,
+            Product::VisionPixels,
+            Product::ConditionPixels,
+            Product::ConditionSamples,
             Product::VideoLatents,
             Product::AudioLatents,
             Product::Video(0),
@@ -772,7 +830,7 @@ mod tests {
         store
             .publish(
                 request(1),
-                Product::Images,
+                Product::ConditionPixels,
                 DeviceId(0),
                 StreamId(1),
                 None,
@@ -781,7 +839,7 @@ mod tests {
             .expect("a store accepts a view");
 
         let refusal = store
-            .borrow(request(1), Product::Images, DeviceId(0), StreamId(4))
+            .borrow(request(1), Product::ConditionPixels, DeviceId(0), StreamId(4))
             .expect_err("another stream needs the writer's event")
             .to_string();
         assert!(refusal.contains("stream 4"), "names the reader: {refusal}");
@@ -795,7 +853,7 @@ mod tests {
         let store = Held::new();
         assert!(
             store
-                .borrow(request(1), Product::Audio, DeviceId(0), StreamId(1))
+                .borrow(request(1), Product::ConditionSamples, DeviceId(0), StreamId(1))
                 .expect("an absent product is not an error")
                 .is_none(),
             "nothing wrote this kind"

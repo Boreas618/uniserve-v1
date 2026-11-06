@@ -1689,6 +1689,7 @@ fn encode_raster(args: &Args) -> Result<(u32, u32, u32, PathBuf)> {
             &plan,
             minimax_h3::tiled_encode::Scene {
                 pixels: &views,
+                packed: None,
                 blended,
             },
         )

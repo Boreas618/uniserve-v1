@@ -220,9 +220,10 @@ struct DenoiseColumns {
     /// The audio latents, in the same per-request blocks; one element when a bucket serves a task
     /// with no soundtrack, so the column is never empty.
     audio: Column,
-    /// `[requests x (text_rows + condition_rows) x text_width]` conditioning rows.
+    /// `[requests x (text_rows + condition_rows + 1) x text_width]` conditioning rows: the prefix
+    /// source, whose last row is the zero row every generated and padding row gathers.
     text: Column,
-    /// `[requests x (text_rows + condition_rows) x width]` the text encoder's own features.
+    /// `[requests x (text_rows + condition_rows + 1) x width]` the text encoder's own features.
     ///
     /// A model with a conditioner between the encoder and the denoiser reads these and folds them
     /// into `text` in place ([`nn::Denoiser::prepare_conditioning`]).
@@ -257,7 +258,7 @@ impl DenoiseColumns {
             Some(audio) => numel(&audio)?,
             None => 1,
         };
-        let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
+        let width = prefix_rows(layout);
         let (source_width, text_width) = conditioning_width(&shape);
         Ok(Self {
             video: Column::new(device, shape.sample, rows * video)?,
@@ -284,7 +285,7 @@ impl DenoiseColumns {
             None => shape.sample.bytes().unwrap_or(1),
         };
         Staged::zero(&mut self.staged.audio, rows * audio)?;
-        let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
+        let width = prefix_rows(layout);
         let bytes = shape
             .stack
             .bytes()
@@ -335,8 +336,17 @@ fn step_products(_layout: &nn::capability::Layout) -> &'static [Product] {
     STEP_PRODUCTS
 }
 
-/// The rows of one request's conditioning and the encoder's width: `(text_rows + condition_rows)`
-/// rows, the encoder writing `width` elements in each.
+/// The rows of one request's prefix source: the prompt's, the conditions' and the zero row.
+///
+/// The packing gathers every generated and padding row from the row past the text and condition
+/// capacities (`DensePacking::zero_row`), so that row is part of the column: a column that ended
+/// before it would hand every such row whatever follows the allocation.
+fn prefix_rows(layout: &Layout) -> u64 {
+    u64::from(layout.text_rows) + u64::from(layout.condition_rows) + 1
+}
+
+/// The rows of one request's conditioning and the encoder's width: [`prefix_rows`] rows, the
+/// encoder writing `width` elements in each.
 ///
 /// One statement for the two readers that need it - the view a step hands the model
 /// ([`DenoiserRunner::conditioning`]) and the rows [`DenoiserRunner::seed`] gives their bytes to.
@@ -346,9 +356,8 @@ fn step_products(_layout: &nn::capability::Layout) -> &'static [Product] {
 /// **`width` is `source`'s alone.** A conditioner may widen what the denoiser reads, so `text`'s
 /// width is the model's statement and the pair is resolved in [`conditioning_width`].
 fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (u64, u64) {
-    let rows = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
     let width = u64::from(shape.width.max(1));
-    (rows, width)
+    (prefix_rows(layout), width)
 }
 
 /// The two widths one request's conditioning columns hold: `(source, text)`.
@@ -671,17 +680,35 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // capture that has to be thrown away.** The pool is the runtime's policy (a share of the
         // device per stream); the model states what one evaluation reserves. A share below the plan
         // is a refusal naming both numbers, and it is asked before anything is filled.
-        let offered = self.pool()?.reserved();
+        self.state_range()?;
+        for bucket in self.capture_order() {
+            self.fill(bucket)?;
+        }
+        Ok(())
+    }
+
+    /// States this stream's range to the pools, before its first use, and checks the model's plan
+    /// against it.
+    ///
+    /// The model's plan is the floor of what this stream needs: a share below it serves nothing, and
+    /// the even share counts every stream, including those that map no range. So the plan is what
+    /// the range is, up to what the device's graph storage leaves.
+    fn state_range(&mut self) -> Result<()> {
         let plans = self.buckets.clone();
+        let stream = self.stream_id();
+        let needed = plans
+            .iter()
+            .filter_map(|plan| self.model.arena_bytes(&plan.warm.view()).ok())
+            .max()
+            .unwrap_or(0);
+        self.pool()?.widen(stream, needed)?;
+        let offered = self.pool()?.range(stream);
         for plan in &plans {
             floor::checked(
                 plan.bucket,
                 self.model.arena_bytes(&plan.warm.view()),
                 offered,
             )?;
-        }
-        for bucket in self.capture_order() {
-            self.fill(bucket)?;
         }
         Ok(())
     }
@@ -965,7 +992,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         self.fill(bucket)?;
         self.state_of_request(bucket)?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.range(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, &kernels, &arena);
         let layout = layout_of(bucket)?;
@@ -974,13 +1001,19 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let state = self
             .tables
             .views(self.lifecycle.generation.number(), &key, &tables)?;
-        // A denoising step reads no condition media: the media reader's views belong to a
-        // conditioner's forward, and this is a denoiser's first step.
-        let media: [nn::capability::MediaInput; 0] = [];
         for row in &self.pending {
             let latents = self.latents(bucket, row.index)?;
+            // The raw media a conditioner encodes, each visual piece with its anchoring draw: the
+            // request's first step is the one forward that reads them.
+            let media = self.media_of(row, &forward)?;
             let cond = self.conditioning(bucket, row.index, &state, &media)?;
-            self.model.draw_noise(&forward, row.seed, layout, latents)?;
+            // The stream's first elements are the conditions' draws, so the trajectory's offsets
+            // are the request's own and not the warm request's the bucket was captured from.
+            let drawn = Layout {
+                condition_elements: self.model.layout(&row.stated.view()).condition_elements,
+                ..layout
+            };
+            self.model.draw_noise(&forward, row.seed, drawn, latents)?;
             // **The conditioner, eager and once per request, outside the graph.** `text` holds the
             // encoder's rows as `seed` copied them; this folds `source` into it in place, so every
             // replay of the bucket reads rows refined for its own request. It is not a graph node
@@ -992,9 +1025,118 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             }
             self.model.prepare_conditioning(&forward, cond)?;
             self.dump("conditioner", "text", cond.text);
+            for (index, piece) in media.iter().enumerate() {
+                if let Some(pixels) = piece.pixels {
+                    self.dump("media", &format!("pixels_{index}"), pixels);
+                }
+                if let Some(audio) = piece.audio {
+                    self.dump("media", &format!("samples_{index}"), audio);
+                }
+                if let Some(noise) = piece.noise {
+                    self.dump("media", &format!("draw_{index}"), noise);
+                }
+            }
+            if self.diag.enabled() {
+                for (table, view) in tables.iter().zip(state.iter()) {
+                    self.dump("state", table.name, *view);
+                }
+            }
             self.model.prepare_latents(&forward, cond, latents)?;
         }
         Ok(())
+    }
+
+    /// The raw media of `row`'s conditions, in the order the model packs them.
+    ///
+    /// The media reader left each kind in one region, conditions in request order, so a piece's
+    /// place in its region is the sum of the extents of the conditions before it. Those extents are
+    /// the model's statement ([`nn::capability::ConditionPiece`]), and the two regions are read in
+    /// place: a condition is read once, by this forward.
+    fn media_of(
+        &self,
+        row: &Pending,
+        forward: &nn::Forward<'_>,
+    ) -> Result<Vec<nn::capability::MediaInput>> {
+        let pieces = self
+            .model
+            .condition_pieces(&row.stated.view())
+            .map_err(Error::from)?;
+        if pieces.is_empty() {
+            return Ok(Vec::new());
+        }
+        let products = self
+            .products
+            .as_ref()
+            .ok_or_else(|| products::no_store(row.request))?;
+        let region = |kind: Product, wanted: bool| -> Result<Option<TensorView>> {
+            if !wanted {
+                return Ok(None);
+            }
+            products
+                .ordered(row.request, kind, &self.stream)?
+                .map(Some)
+                .ok_or_else(|| products::absent(row.request, kind))
+        };
+        let pixels = region(
+            Product::ConditionPixels,
+            pieces.iter().any(|piece| piece.pixels.is_some()),
+        )?;
+        let samples = region(
+            Product::ConditionSamples,
+            pieces.iter().any(|piece| piece.track.is_some()),
+        )?;
+        let mut offsets = vec![(0_u64, 0_u64); row.stated.conditions.len()];
+        let elements = |extents: &[u64]| extents.iter().product::<u64>();
+        let mut ordered: Vec<&nn::capability::ConditionPiece> = pieces.iter().collect();
+        ordered.sort_by_key(|piece| piece.condition);
+        let (mut pixel_at, mut sample_at) = (0_u64, 0_u64);
+        for piece in ordered {
+            offsets[piece.condition as usize] = (pixel_at, sample_at);
+            pixel_at += piece.pixels.as_ref().map_or(0, |shape| elements(shape));
+            sample_at += piece.track.as_ref().map_or(0, |shape| elements(shape));
+        }
+        let view = |source: Option<TensorView>, at: u64, shape: &[u64]| -> Result<TensorView> {
+            let source = source.ok_or_else(|| {
+                Error::Invalid(format!(
+                    "request {} states a piece the media reader left no region for",
+                    row.request.request_id.0
+                ))
+            })?;
+            Ok(source.at(source.offset_elements(at)).reshape(Shape::new(shape)))
+        };
+        let mut media = Vec::with_capacity(pieces.len());
+        for piece in &pieces {
+            let (pixel_at, sample_at) = offsets[piece.condition as usize];
+            let noise = match piece.draw {
+                Some(draw) => {
+                    let view = forward
+                        .arena()
+                        .tensor(self.shape.sample, latent_shape(&draw))?;
+                    self.model
+                        .draw_condition_noise(forward, row.seed, piece, view)
+                        .map_err(Error::from)?;
+                    Some(view)
+                }
+                None => None,
+            };
+            media.push(nn::capability::MediaInput {
+                role: piece.role,
+                rows: piece.rows,
+                audio_rows: piece.audio_rows,
+                pixels: piece
+                    .pixels
+                    .as_ref()
+                    .map(|shape| view(pixels, pixel_at, shape))
+                    .transpose()?,
+                audio: piece
+                    .track
+                    .as_ref()
+                    .map(|shape| view(samples, sample_at, shape))
+                    .transpose()?,
+                noise,
+            });
+        }
+        Ok(media)
     }
 
     /// Writes the pending request's own state tables over the ones the capture read.
@@ -1261,7 +1403,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         }
         let stream = self.stream.clone();
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.range(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, kernels, &arena);
         self.model
@@ -1309,7 +1451,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.range(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, &kernels, &arena);
         let layout = layout_of(bucket)?;
@@ -1345,7 +1487,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload()?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.range(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, generation, &arena);
         let layout = layout_of(bucket)?;
@@ -1665,6 +1807,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
+        self.state_range()?;
         self.fill_constants(&kernels)?;
         let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)

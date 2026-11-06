@@ -1,0 +1,31 @@
+# FastH3 OmniRef on one GPU of one host: no sequence parallelism and a single-rank text encoder.
+# This is the smallest deployment that serves a `ref2va` request whole - one reference denoiser rank,
+# one decoder, one encoder, and the condition encoders the denoiser's first step reads through.
+#
+# Every component is placed on this rank, the media ones included: `video_codec`, `muxer` and
+# `media_reader` work on the host inside the main process (the executor's `Media` lane, `MediaStage`),
+# and a main process serves CUDA devices only. A card of 141 GiB or more holds the weights: about
+# 65 GiB of DiT, 48 GiB of text encoder and 10 GiB of VAE.
+[[worker_groups]]
+id = "model"
+ranks = ["cuda:0"]
+queue_depth = 6
+
+[worker_groups.components.transformer_ref]
+
+[worker_groups.components.text_encoder]
+tensor_parallel_size = 1
+
+[worker_groups.components.video_decoder]
+
+[worker_groups.components.audio_decoder]
+distribution = "temporal_units"
+
+[worker_groups.components.latent_encoder]
+distribution = "temporal_units"
+
+[worker_groups.components.video_codec]
+
+[worker_groups.components.muxer]
+
+[worker_groups.components.media_reader]

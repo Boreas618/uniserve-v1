@@ -117,14 +117,20 @@ impl Plan {
 /// in. The caller keeps the rows `Plan::crop` names, shifted back by `Plan::origin`.
 #[derive(Clone, Copy, Debug)]
 pub struct Scene<'a> {
-    /// Tile `i`'s pixels, `[1, in_channels, frames, tile_height, tile_width]`, in plan order.
+    /// Tile `i`'s pixels, in plan order.
     ///
-    /// Each view is **packed**: `nn::layers::FramePad` pads a frame's rows in place of the source's
-    /// own, so it requires a frame's rows to be contiguous in the view it reads, and a tile cut from a
-    /// wider raster has the raster's row stride instead of the tile's width. A caller whose raster is
-    /// one buffer therefore copies each tile's block out first (one tile is a few megabytes against the
-    /// encoder's set); a caller that uploads tiles as separate buffers passes them as they are.
+    /// Without [`Self::packed`] each view is `[1, in_channels, frames, tile_height, tile_width]` and
+    /// **packed**: `nn::layers::FramePad` pads a frame's rows in place of the source's own, so it
+    /// requires a frame's rows to be contiguous in the view it reads. A caller that uploads tiles as
+    /// separate buffers passes them as they are. With it, each view is the tile's block of a wider
+    /// raster, `[in_channels, frames, tile_height, tile_width]` at the raster's strides.
     pub pixels: &'a [TensorView],
+    /// The one buffer a tile cut from a wider raster is packed into, just before it is encoded.
+    ///
+    /// A tile cut from a raster has the raster's row stride instead of the tile's width, so its
+    /// block is copied out first (one tile is a few megabytes against the encoder's set). One buffer
+    /// serves every tile because a tile is copied only once the tile before it was encoded.
+    pub packed: Option<TensorView>,
     /// The run's stitched latents, `[channels, frames, run_rows, latent_columns]`.
     pub blended: TensorView,
 }
@@ -166,6 +172,44 @@ pub fn stitch_arena(
         elements: block,
     });
     Ok(plan)
+}
+
+/// Copies a tile's block of a wider raster into `buffer` and answers it as the encoder reads it.
+fn pack_tile(f: &Forward, block: TensorView, buffer: TensorView) -> Result<TensorView> {
+    let (channels, frames, height, width) = (
+        block.shape.dim(0),
+        block.shape.dim(1),
+        block.shape.dim(2),
+        block.shape.dim(3),
+    );
+    let packed = [frames * height * width, height * width, width, 1];
+    let mut destination_strides = [0_i64; ops::copy_block::RANK];
+    for (axis, stride) in packed.iter().enumerate() {
+        destination_strides[axis] = i64::try_from(*stride).map_err(|_| {
+            Error::config("a condition tile is larger than i64 strides address".to_owned())
+        })?;
+    }
+    let destination = TensorView::with_strides(
+        buffer.offset_elements(0),
+        DType::F32,
+        Shape::new(&[channels, frames, height, width]),
+        Strides::new(&packed),
+    );
+    nn::layers::CopyBlock::new(DType::F32)?.forward(f, block, destination, &destination_strides)?;
+    // The encoder's tile view is the packed copy at the shape it pads from, with the batch axis the
+    // scene's contract asks for.
+    Ok(TensorView::with_strides(
+        buffer.offset_elements(0),
+        DType::F32,
+        Shape::new(&[1, channels, frames, height, width]),
+        Strides::new(&[
+            channels * frames * height * width,
+            frames * height * width,
+            height * width,
+            width,
+            1,
+        ]),
+    ))
 }
 
 /// The tiled encoding of one raster: the tile grid, and the band arithmetic over it.
@@ -306,7 +350,11 @@ impl ClipEncoder {
         plan: &Plan,
         scene: Scene<'_>,
     ) -> Result<()> {
-        let Scene { pixels, blended } = scene;
+        let Scene {
+            pixels,
+            packed,
+            blended,
+        } = scene;
         if blended.shape.rank() != 4 {
             return Err(Error::config(format!(
                 "the raster is {:?}, not [channels, frames, rows, columns]",
@@ -349,7 +397,10 @@ impl ClipEncoder {
         // smaller than a tile is the case where they would not be.
         let frames = pixels
             .first()
-            .map(|tile| u32::try_from(tile.shape.dim(2)).unwrap_or(0))
+            .map(|tile| {
+                let axis = if packed.is_some() { 1 } else { 2 };
+                u32::try_from(tile.shape.dim(axis)).unwrap_or(0)
+            })
             .unwrap_or(0);
         let scratch = encoder.reserve(f, &plan.tile_extents(frames))?;
 
@@ -399,7 +450,11 @@ impl ClipEncoder {
                 ]),
                 Strides::new(&[strides[0], strides[0], strides[1], strides[2], strides[3]]),
             );
-            encoder.encode_tile(f, &scratch, pixels[index], out)?;
+            let tile_pixels = match packed {
+                Some(buffer) => pack_tile(f, pixels[index], buffer)?,
+                None => pixels[index],
+            };
+            encoder.encode_tile(f, &scratch, tile_pixels, out)?;
 
             let placed = self.place_in(blended, plan, tile, block)?;
             let above = match tile.fades_above() {
