@@ -605,6 +605,13 @@ impl Leader {
                 .install_programs(commands, config, engines, world)
                 .await
                 .context("installing the epoch's programs in its main processes")?;
+            // A committed world's tensors are what the next world starts from: until it is
+            // published its storage is private to it, and a target of another world finds nothing.
+            let publishing = Arc::clone(&control);
+            tokio::task::spawn_blocking(move || publishing.publish_worlds(&[world], &mut None))
+                .await
+                .context("publishing the first world")?
+                .context("publishing the first world")?;
             // The epoch's programs serve, which is what the standbys were waiting to prepare from.
             for replica in leader.replicas() {
                 replica.prepare_standby();
@@ -2048,6 +2055,7 @@ impl Replica {
         } = target;
         let mut served = updates.epochs().served();
         let serving_config = config.clone();
+        let publishing = Arc::clone(&control);
         tokio::spawn(async move {
             let sink = stats_sink(
             replica.model_name.clone(),
@@ -2133,6 +2141,16 @@ impl Replica {
                 *locked(&replica.config) = config_before;
                 replica.hold.serve(previous);
                 warn!(engine, epoch, "the switch returned this replica to the previous epoch");
+            }
+            if committed {
+                // The committed target is what the next switch starts from.
+                let published = tokio::task::spawn_blocking(move || {
+                    publishing.publish_worlds(&[epoch], &mut None)
+                })
+                .await;
+                if !matches!(published, Ok(Ok(()))) {
+                    warn!(epoch, "publishing the committed epoch's world failed: {published:?}");
+                }
             }
         });
     }
