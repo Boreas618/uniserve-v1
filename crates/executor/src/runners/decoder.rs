@@ -355,16 +355,29 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         // device per stream - and the model states what one decode of a layout reserves, so a share
         // below the plan is refused while the deployment is being assembled, naming the bucket and
         // both numbers, rather than at the first frame that reaches the arena.
-        let offered = self.pool()?.reserved();
+        self.claim()?;
+        for bucket in self.capture_order() {
+            self.fill(bucket)?;
+        }
+        Ok(())
+    }
+
+    /// Claims the arena the largest bucket's decode plans.
+    fn claim(&mut self) -> Result<()> {
+        let mut needed = 0;
         for bucket in self.capture_order() {
             let layout = Self::layout_of(&self.model, bucket)?;
             // One rule for both media runners, so the two cannot read an absent plan and a refused
-            // one differently: `floor::checked` passes over a decoder that states no plan, refuses
-            // any other answer by name, and refuses a share below the plan with both numbers.
-            super::floor::checked(bucket, self.model.arena_bytes(&layout), offered)?;
+            // one differently: `floor::checked` passes over a decoder that states no plan and refuses
+            // any other answer by name.
+            needed = needed.max(
+                super::floor::checked(bucket, self.model.arena_bytes(&layout), u64::MAX)?
+                    .unwrap_or(0),
+            );
         }
-        for bucket in self.capture_order() {
-            self.fill(bucket)?;
+        if needed > 0 {
+            let stream = self.stream_id();
+            self.pool()?.claim(stream, needed)?;
         }
         Ok(())
     }
@@ -842,7 +855,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload()?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, generation, &arena);
         let layout = self.layout(bucket)?;
@@ -889,7 +902,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, &kernels, &arena);
         let layout = self.layout(bucket)?;
@@ -1230,6 +1243,10 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
 
     fn attach_products(&mut self, products: Arc<dyn Products>) {
         self.products = Some(products);
+    }
+
+    fn claim_arena(&mut self) -> Result<()> {
+        self.claim()
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
