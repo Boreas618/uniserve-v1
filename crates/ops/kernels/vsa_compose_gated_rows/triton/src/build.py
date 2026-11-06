@@ -32,6 +32,8 @@ def spec(fields, parameters, target):
     """The compilation of one vsa_compose_gated_rows descriptor."""
     dtype = "*" + DTYPES[fields["dtype"]]
     return {
+        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
+        "aligned": ["output", "fine", "compressed", "gate", "fine_stride_row", "fine_stride_head", "gate_stride_row", "gate_stride_head", "compressed_stride_head", "compressed_stride_tile", "owner_rows", "start", "count"],
         "kernel": kernels._compose_gated_rows_kernel,
         "signature": {
             "output": dtype,

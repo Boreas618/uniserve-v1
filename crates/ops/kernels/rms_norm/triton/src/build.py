@@ -27,6 +27,8 @@ def spec(fields, parameters, target):
     # launch; the launch repeats it as a word the kernel does not read.
     pdl = fields["pdl"] == "true" and _compile.capability(target) >= 100
     return {
+        # Every operand is an arena tensor or a weight, whose rows start on sixteen-byte bounds.
+        "aligned": ["x_ptr", "w_ptr", "y_ptr"] + (["columns"] if int(fields["columns"]) % 16 == 0 else []),
         "kernel": kernels._rms_norm_kernel,
         "signature": {
             "x_ptr": dtype,
