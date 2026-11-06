@@ -921,6 +921,17 @@ pub trait Decoder {
     /// the point of this boundary is that the alternative - guessing - is silent.
     fn element_type(&self) -> DType;
 
+    /// For each row of the latent block [`Self::decode`] reads, the clip's voxel it holds, counted
+    /// frame by frame, row by row.
+    ///
+    /// `None` reads each voxel once, in that order. A decoder that works in overlapping tiles lists
+    /// its tiles' voxels instead, so a voxel two tiles share has two rows and the block is longer
+    /// than the clip.
+    fn latent_rows(&self, layout: &Layout) -> Result<Option<Vec<u32>>> {
+        let _ = layout;
+        Ok(None)
+    }
+
     /// The latent layout one clip's raster decodes from.
     ///
     /// [`Clip`] is the runtime's own extent - frames, rows and columns of the decoded raster - and
