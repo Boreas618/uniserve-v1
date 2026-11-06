@@ -303,7 +303,9 @@ impl MediaStorage {
                         holding.extend(members.iter().map(|rank| *rank as u32));
                     }
                 }
-                holding.retain(|rank| *rank < ranks);
+                // A rank with no pool keeps its products in its own process, in the product store: it
+                // backs nothing here, so a reservation books no bytes and binds no span on it.
+                holding.retain(|rank| rank_bytes.get(*rank as usize).is_some_and(|bytes| *bytes > 0));
                 (name.to_owned(), holding.into_iter().collect())
             })
             .collect();

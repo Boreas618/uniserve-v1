@@ -1350,6 +1350,39 @@ pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capa
     })
 }
 
+/// The products `component` publishes, under the names a request's graph asks for them.
+///
+/// They are names and not storage: a media rank's products stay in the process, in the product store,
+/// and the scheduler books nothing for a rank with no buffer pool. So a product's only shape is the
+/// axis a request's extent binds, and that axis has no bound of its own here, because the frontend's
+/// plan has already held the request to what the deployment serves.
+fn media_outputs(component: &str) -> Vec<ipc::OutputInfo> {
+    use ipc::product;
+    let output = |name: &str, extent: bool| ipc::OutputInfo {
+        name: name.to_owned(),
+        dtype: ipc::DType::U8,
+        shape_bound: ipc::ShapeBound {
+            dims: vec![if extent {
+                ipc::DimBound::Device { max: u32::MAX }
+            } else {
+                ipc::DimBound::Static(1)
+            }],
+        },
+        raster_axes: None,
+    };
+    match component {
+        "text_encoder" => vec![output(product::CONDITIONING, true)],
+        "transformer" => vec![
+            output(product::VIDEO_LATENTS, false),
+            output(product::AUDIO_LATENTS, false),
+        ],
+        "video_decoder" => vec![output(product::VIDEO_UNITS, true)],
+        "video_codec" => vec![output(product::ENCODED_UNITS, true)],
+        "audio_decoder" => vec![output(product::AUDIO_SAMPLES, false)],
+        _ => Vec::new(),
+    }
+}
+
 /// What a media rank advertises of itself: the calls its blocks serve, and which component serves
 /// each.
 ///
@@ -1388,9 +1421,11 @@ pub(crate) fn media_rank_report(
         .collect();
     let components: Vec<ipc::ComponentInfo> = media_components
         .values()
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
         .map(|name| ipc::ComponentInfo {
             name: name.clone(),
-            outputs: Vec::new(),
+            outputs: media_outputs(name),
         })
         .collect();
     Ok(executor::capacity::Report {
