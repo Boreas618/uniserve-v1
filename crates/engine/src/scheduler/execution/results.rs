@@ -154,6 +154,16 @@ impl Scheduler {
         // worker that refuses the request states why, and the client is told.
         if !already_failed {
             if !valid {
+                tracing::warn!(
+                    kind = ?call.kind,
+                    status = ?record.status,
+                    code = ?record.error_code,
+                    message = ?record.error_message,
+                    step = record.step_index,
+                    media_output_valid,
+                    step_valid,
+                    "a media call's result fails the request"
+                );
                 let refusal = (record.error_code == Some(ipc::ErrorCode::InputError))
                     .then(|| record.error_message.clone())
                     .flatten();
