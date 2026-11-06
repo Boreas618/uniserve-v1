@@ -24,6 +24,17 @@ to know (`safetensors` states it, and an unknown one is skipped by name rather t
 Bfloat16, float16, float32, float8 and integer tensors are all read as fixed-width unsigned words,
 one width per dtype, so nothing is converted. A `F4` (packed E2M1) tensor is a byte of two codes and
 is scanned as bytes, which answers "every byte zero" - the packed path's own test.
+
+`--values` answers the other question a zero count cannot: **what a tensor holds**. A calibration
+scalar is one element and is never zero, so the scan above passes it, while its magnitude is what
+decides whether an activation encoded against it survives the quantization at all:
+
+    # every scale of layer 0's attention, as numbers
+    python tools/checkpoint_zeros.py <root> --tensors 'layers.0.attention.' --values 8
+
+The decode is the element type's own: a float8 byte is E4M3 or E5M2 by the tensor's dtype, a
+bfloat16 is the high half of a float32, and an integer prints as an integer. Nothing is converted
+that the file does not state, and a dtype this script cannot decode is skipped by name.
 """
 
 import argparse
@@ -73,6 +84,68 @@ def headers(root: pathlib.Path):
             yield shard, name, entry["dtype"], tuple(entry["shape"]), begin, end
 
 
+def decoded(dtype: str, raw: bytes):
+    """The first `len(raw)` elements of `dtype` as numbers, or `None` when this script cannot."""
+    array = np.frombuffer(raw, dtype=np.uint8)
+    if dtype == "F32":
+        return [float(v) for v in np.frombuffer(raw, dtype="<f4")]
+    if dtype == "F16":
+        return [float(v) for v in np.frombuffer(raw, dtype="<f2")]
+    if dtype == "BF16":
+        # A bfloat16 is a float32's high half: widening shifts the mantissa into place.
+        words = np.frombuffer(raw, dtype="<u2").astype(np.uint32) << 16
+        return [float(v) for v in words.view(np.float32)]
+    if dtype in ("F8_E4M3", "F8_E5M2"):
+        # E4M3: four exponent bits biased by 7 over three mantissa bits, no infinity and `0x7f`/`0xff`
+        # NaN. E5M2: five exponent bits biased by 15 over two mantissa bits, with both, as IEEE does.
+        # The subnormal step is the smallest exponent's ULP: `2**(1 - bias - mantissa_bits)`.
+        values = []
+        for byte in array:
+            byte = int(byte)
+            sign = -1.0 if byte & 0x80 else 1.0
+            if dtype == "F8_E4M3":
+                exponent, mantissa, bias, bits = (byte >> 3) & 0xF, byte & 0x7, 7, 3
+                if exponent == 0xF and mantissa == 0x7:
+                    values.append(float("nan"))
+                elif exponent == 0:
+                    values.append(sign * mantissa * 2.0**-9)
+                else:
+                    values.append(sign * (1.0 + mantissa / 8.0) * 2.0 ** (exponent - bias))
+            else:
+                exponent, mantissa, bias, bits = (byte >> 2) & 0x1F, byte & 0x3, 15, 2
+                if exponent == 0x1F:
+                    values.append(float("nan") if mantissa else sign * float("inf"))
+                elif exponent == 0:
+                    values.append(sign * mantissa * 2.0**-16)
+                else:
+                    values.append(sign * (1.0 + mantissa / 4.0) * 2.0 ** (exponent - bias))
+        return values
+    integers = {
+        "BOOL": "<u1",
+        "U8": "<u1",
+        "I8": "<i1",
+        "U16": "<u2",
+        "I16": "<i2",
+        "U32": "<u4",
+        "I32": "<i4",
+        "U64": "<u8",
+        "I64": "<i8",
+    }
+    if dtype in integers:
+        return [int(v) for v in np.frombuffer(raw, dtype=integers[dtype])]
+    return None
+
+
+def values_of(shard: pathlib.Path, dtype: str, begin: int, end: int, count: int):
+    """Up to `count` decoded elements of one tensor, or `None` when its dtype is not decoded."""
+    width = ELEMENTS.get(dtype, (1, ()))[0]
+    with shard.open("rb") as handle:
+        (length,) = np.frombuffer(handle.read(8), dtype="<u8")
+        handle.seek(8 + int(length) + begin)
+        raw = handle.read(min(end - begin, count * width))
+    return decoded(dtype, raw)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("root", help="the checkpoint directory holding the safetensors shards")
@@ -84,15 +157,37 @@ def main() -> int:
         help="report a tensor when at least this share of its words is zero (default: all of it)",
     )
     parser.add_argument("--chunk", type=int, default=1 << 26, help="bytes read at a time")
+    parser.add_argument(
+        "--values",
+        type=int,
+        default=0,
+        metavar="N",
+        help="also print the first N elements of each matched tensor, decoded by its own dtype",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=40,
+        help="with --values, print at most this many tensors (default: 40)",
+    )
     arguments = parser.parse_args()
 
     root = pathlib.Path(arguments.root)
     empty = 0
     scanned_tensors = 0
     skipped = set()
+    printed = 0
     for shard, name, dtype, shape, begin, end in headers(root):
         if arguments.tensors and arguments.tensors not in name:
             continue
+        if arguments.values and printed < arguments.limit:
+            shown = values_of(shard, dtype, begin, end, arguments.values)
+            if shown is None:
+                skipped.add(dtype)
+            else:
+                printed += 1
+                body = ", ".join(f"{value:g}" for value in shown)
+                print(f"{name}\t{dtype}\t{shape}\t[{body}]")
         if dtype not in ELEMENTS:
             skipped.add(dtype)
             continue
@@ -128,6 +223,7 @@ def main() -> int:
     print(
         f"# {scanned_tensors} tensor(s) scanned, {empty} of them hold no nonzero element"
         + (f", reported at a zero share of {arguments.fraction:g}" if arguments.fraction < 1 else "")
+        + (f", {printed} printed as values" if arguments.values else "")
     )
     return 0
 
