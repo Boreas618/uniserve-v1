@@ -99,8 +99,8 @@ def hook_steps():
     evaluation = [0]
 
     def snapshot(state, index):
-        floats = [value for value in state if value.dtype.is_floating_point and value.numel() > 1000]
-        for name, value in zip(("video", "audio"), sorted(floats, key=lambda v: -v.numel())):
+        # The layout's state fields lead with the two samples, video first.
+        for name, value in zip(("video", "audio"), state):
             save(f"denoiser/latents_{name}_{index}", value)
 
     def wrapped(self, prepared, step, conditioning, *state):
