@@ -656,8 +656,13 @@ message ToMember {
 }
 
 message Forwarded {
+  // The connection at the leader that asked: its answer and the exit report of a launch go back
+  // down it.
   uint64 engine = 1;
   Request request = 2;
+  // Whom the request is answered for: the engine number a process states, or the epoch's own owner
+  // for a client. It differs from `engine` for a client, whose launches are the deployment's.
+  uint64 owner = 3;
 }
 
 // What travels from a member daemon to the leader.

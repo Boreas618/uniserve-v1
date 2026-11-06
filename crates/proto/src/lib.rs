@@ -71,7 +71,7 @@ pub const PROTOCOL_MAJOR: u32 = 2;
 /// the daemon can compare it with the epoch's own before it moves the
 /// frontend; unstated is a process that holds none, which is minor 4's
 /// behaviour.
-pub const PROTOCOL_MINOR: u32 = 5;
+pub const PROTOCOL_MINOR: u32 = 6;
 
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled
