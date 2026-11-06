@@ -262,8 +262,10 @@ impl Sparse {
             counts: scratch.counts,
             sizes,
         };
-        self.fine
-            .forward(f, query, key, value, &tables, scratch.fine)?;
+        // The fine rows are `[rows, heads, width]` for the attention and the fold, and the same
+        // bytes are `[rows, inner]` for the projection that reads them.
+        let fine = scratch.fine.reshape(shape);
+        self.fine.forward(f, query, key, value, &tables, fine)?;
 
         // Branch 3: one compression per (head, query tile) from the pooled scores and values, a
         // dense softmax over every *live* key tile in FP32 with one rounding to the rows' dtype. A
@@ -280,10 +282,8 @@ impl Sparse {
         // buffer the fold writes and the buffer the projection reads: `add_gated` modifies its first
         // argument only, so folding into any other buffer would drop this branch without a shape
         // ever saying so (`vsa/segments.py:461-478`).
-        let composed = scratch.fine;
-        self.tiles
-            .add_gated(f, composed, scratch.compressed, gate)?;
-        Ok(self.output.forward(f, composed, out)?)
+        self.tiles.add_gated(f, fine, scratch.compressed, gate)?;
+        Ok(self.output.forward(f, scratch.fine, out)?)
     }
 }
 

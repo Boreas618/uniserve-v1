@@ -30,13 +30,17 @@
 //! the decoder's output carries `affine = false` because `proj_out`'s epilogue already adds the bias.
 //! They are `Option` views rather than null pointers: the descriptor's flag says which launch form
 //! this is, and a launch that disagrees with it in either direction is refused.
+//!
+//! The destination may be a block inside a larger raster, as a decoder's tile is inside its clip:
+//! its three outer strides travel as launch words and its rows stay contiguous, which is
+//! [`crate::tensor::row_writable`]'s rule.
 
 use std::fmt;
 
 use crate::descriptor::Key;
 use crate::kernel::{Arguments, Kernel, LaunchGrid};
 use crate::platform::Stream;
-use crate::tensor::{DType, Shape, Strides, TensorView};
+use crate::tensor::{DType, Shape, TensorView, row_writable};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
@@ -133,7 +137,7 @@ impl Args {
     }
 
     /// Whether this launch may run at all: the operands' shapes, their element types, the affine
-    /// pair's presence against the compiled form, and the destination's contiguity.
+    /// pair's presence against the compiled form, and the destination's row layout.
     ///
     /// It is separate from `launch` so that the contract is reachable without a device: a kernel is
     /// only loadable on one, and a check that cannot be run is a check nobody has run.
@@ -200,19 +204,9 @@ impl Args {
                 }
             }
         }
-        // The raster is written contiguously: the program addresses the destination as a flat
-        // element range, so a destination whose rows interleave would be written to the wrong voxels.
-        // A tile inside a larger raster needs the three outer strides as launch words, which the
-        // program does not take yet; refusing here is what keeps that from being a silent wrong answer.
-        if self.out.strides != Strides::row_major(out_shape) {
-            return Err(Error::argument(
-                Unpatchify::NAME,
-                format!(
-                    "the raster is written contiguously; found strides {} for {out_shape}",
-                    self.out.strides
-                ),
-            ));
-        }
+        // A row is written contiguously and no two rows overlap: the three outer strides are launch
+        // words, so a tile inside a larger raster is a block like any other.
+        row_writable(&self.out, Unpatchify::NAME)?;
         Ok(())
     }
 }
@@ -233,6 +227,7 @@ impl Op for Unpatchify {
         stream: &Stream,
     ) -> Result<()> {
         args.validate(descriptor)?;
+        let strides = row_writable(&args.out, Self::NAME)?;
         let mut arguments = Arguments::new();
         arguments.view(args.tokens);
         if let (Some(scale), Some(bias)) = (args.scale, args.bias) {
@@ -250,6 +245,9 @@ impl Op for Unpatchify {
             .u32(args.patch_frames)
             .u32(args.patch_height)
             .u32(args.patch_width)
+            .u64(strides[0])
+            .u64(strides[1])
+            .u64(strides[2])
             .u32(descriptor.block)
             .flag(descriptor.pdl);
         // The grid walks the output's elements: one thread writes one voxel, so a token's voxels are
@@ -280,6 +278,7 @@ impl Op for Unpatchify {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tensor::Strides;
 
     fn latents() -> Descriptor {
         Descriptor {
@@ -406,7 +405,7 @@ mod tests {
 
         // The row check itself: the raster's shape is right and its innermost axis is not contiguous,
         // so the program would address the wrong voxels. This is the branch `require_row` adds over
-        // `require_shape`, and it is the one a tile inside a larger raster would hit.
+        // `require_shape`.
         let shape = Shape::new(&[24, 37, 48, 84]);
         launch.out = TensorView::with_strides(
             crate::tensor::DevicePtr::new(0x3000),
@@ -419,6 +418,27 @@ mod tests {
             .expect_err("a raster written column-major");
         let text = error.to_string();
         assert!(text.contains("last axis"), "{text}");
+    }
+
+    #[test]
+    fn a_tile_inside_a_larger_raster_is_admitted() {
+        // The tile is the patch grid's raster, placed in a clip three times as wide and as tall: its
+        // rows are contiguous and its outer strides are the clip's.
+        let mut launch = grid();
+        let descriptor = latents();
+        launch.tokens = contiguous(DType::F16, &[launch.tokens(), launch.token_width()]);
+        let per_channel = contiguous(DType::F16, &[u64::from(launch.channels)]);
+        launch.scale = Some(per_channel);
+        launch.bias = Some(per_channel);
+        let tile = launch.raster();
+        let (rows, columns) = (3 * tile.dim(2), 3 * tile.dim(3));
+        launch.out = TensorView::with_strides(
+            crate::tensor::DevicePtr::new(0x3000),
+            DType::F16,
+            tile,
+            Strides::new(&[tile.dim(1) * rows * columns, rows * columns, columns, 1]),
+        );
+        launch.validate(&descriptor).expect("a tile of a clip");
     }
 
     #[test]
