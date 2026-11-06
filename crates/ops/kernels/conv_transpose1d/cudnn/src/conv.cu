@@ -391,12 +391,9 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
   row_major(x_dims, x_strides);
   row_major(y_dims, y_strides);
   row_major(w_dims, w_strides);
-  if (transposed) {
-    // The layer's weight is `[c, k, …]` in memory and `[k, c, …]` to the
-    // backward-data pass: the same bytes with the two channel axes exchanged.
-    std::swap(w_dims[0], w_dims[1]);
-    std::swap(w_strides[0], w_strides[1]);
-  }
+  // A transposed layer's weight is `[in, out, …]`, and that is already the filter the backward-data
+  // pass reads: its `dy` is the layer's input, so the filter's `k` is `in`, and its `dx` the layer's
+  // output, so its `c` is `out`. The axes stay as they are.
 
   void* x = nullptr;
   void* w = nullptr;
@@ -963,13 +960,11 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
   void* variant = nullptr;
   bool built = library.backend_create(kDescriptorVariantPack, &variant) == kSuccess;
   const int64_t uids[3] = {kUidX, kUidW, kUidY};
-  // **Each pointer must be the tensor its descriptor describes.** A forward convolution's `X` id is the
-  // layer's input and its `Y` the output; the backward-data pass of a transposed one has `dx` - the
-  // layer's output - in `X` and `dy` - its input - in `Y`. Binding both ids to the forward arrangement
-  // gave a transposed convolution a graph describing one tensor and a pack supplying another.
-  void* pointers[3] = {const_cast<void*>(call->transposed != 0 ? call->out : call->input),
-                       const_cast<void*>(call->weight),
-                       const_cast<void*>(call->transposed != 0 ? call->input : call->out)};
+  // **Each pointer is the tensor its descriptor describes.** The id `X` is the descriptor of the
+  // layer's input and `Y` of its output, in both passes: a transposed pass reads `dy` from `X`'s
+  // descriptor and writes `dx` through `Y`'s, and the graph above is what names them so.
+  void* pointers[3] = {const_cast<void*>(call->input), const_cast<void*>(call->weight),
+                       const_cast<void*>(call->out)};
   built = built && library.backend_set(variant, kAttrVariantPackDataPointers, kTypeVoidPtr, 3,
                                        pointers) == kSuccess &&
           library.backend_set(variant, kAttrVariantPackUniqueIds, kTypeInt64, 3, uids) ==
