@@ -921,6 +921,7 @@ impl Scheduler {
                 width: state.request.sampling.width,
                 height: state.request.sampling.height,
                 frames: state.request.sampling.num_frames,
+                handed: u32::try_from(call.inputs.len()).unwrap_or(u32::MAX),
             });
         }
         batch.media = Some(executor::batch::MediaColumns::staged(stated, &requests));

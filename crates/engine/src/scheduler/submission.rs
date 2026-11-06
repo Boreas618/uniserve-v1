@@ -869,6 +869,7 @@ mod tests {
             width: 768,
             height: 768,
             frames: 121,
+            handed: 0,
         }
     }
 
