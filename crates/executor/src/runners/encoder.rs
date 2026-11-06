@@ -9,6 +9,12 @@
 //! Its model-declared tables are the one thing it holds that a language model does not: `state`,
 //! allocated when the runner loads and viewed at every capture (`runners::tables`).
 //!
+//! **A prompt that carries vision blocks runs eagerly.** A graph is captured for a layout, and a
+//! prompt's vision grids are the request's: a captured graph per grid would be one per image size a
+//! client can send, and the tower's tables differ with every one. So such a prompt is walked once,
+//! operator by operator, over its own layout and tables ([`EncoderRunner::encode_vision`]), as the
+//! reference walks it (`uniserve/runner/encoder.py`: only a prompt without vision tokens is captured).
+//!
 //! **It keeps no cache and therefore no state group.** The state group of §8 is what a recurrent
 //! model must checkpoint at a boundary it declares, and an encoder computes its hidden states from
 //! the rows it was handed and carries nothing across batches: so this runner takes no snapshot,
@@ -21,9 +27,10 @@ use std::sync::{Arc, Mutex};
 
 use ipc::TimingCounters;
 use nn::capability::{
-    Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, TokenBatch,
+    Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
+    TokenBatch,
 };
-use ops::{DType, PhaseKind};
+use ops::{DType, PhaseKind, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
@@ -32,7 +39,7 @@ use crate::plan::{Bucket, Buckets, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, encode_i32};
 use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
-use crate::runners::products::{Product, Products};
+use crate::runners::products::{self, Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
@@ -144,6 +151,37 @@ pub struct EncoderRunner<M: Encoder + Send + Sync> {
     /// than a running sum, so the publish reads the same numbers the encode read: a call's span is
     /// its real tokens, and whatever the mechanism put before or after it is not this runner's.
     pending: Vec<(ipc::RequestKey, u32, u32)>,
+    /// The vision blocks of the prompt staged last, when it carries any: the replay of that batch
+    /// walks the encode instead of launching a graph.
+    vision: Option<VisionPrompt>,
+    /// The block-by-block diagnosis, off unless `UNISERVE_DIAG_DIR` names a directory.
+    diag: crate::runners::diag::Diag,
+}
+
+/// A prompt's vision blocks, as its conditioning states them.
+struct VisionPrompt {
+    /// The request the patch rows were read for.
+    request: ipc::RequestKey,
+    /// Each block's `[time, rows, columns]` patch grid, in presentation order.
+    grids: Vec<[u32; 3]>,
+}
+
+/// The vision blocks a request's conditioning presents, in presentation order.
+///
+/// Every condition with a conditioner's view is one block, and they are presented in request order
+/// (`models::video::presentation`). An audio reference and a `ref2va` keyframe present none.
+fn vision_grids(conditioning: &[u8]) -> Result<Vec<[u32; 3]>> {
+    let decoded = models::video::Conditioning::decode(conditioning).map_err(|error| {
+        Error::Invalid(format!(
+            "a media request's conditioning does not decode: {error}"
+        ))
+    })?;
+    Ok(decoded
+        .conditions
+        .iter()
+        .filter_map(|condition| condition.vision.as_ref())
+        .map(|vision| [vision.grid.t, vision.grid.h, vision.grid.w])
+        .collect())
 }
 
 impl<M: Encoder + Send + Sync> EncoderRunner<M> {
@@ -190,6 +228,8 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             staged: None,
             products: None,
             pending: Vec::new(),
+            vision: None,
+            diag: crate::runners::diag::Diag::from_env(),
         })
     }
 
@@ -357,10 +397,30 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         // numbers its calls by position, so the name the store is keyed by is kept here with the
         // token rows that request covers (`Batch::media`'s record is where a request is named).
         self.pending.clear();
+        self.vision = None;
         if let Some(media) = &batch.media {
             for (index, (first, rows)) in spans(&threads.query_offsets)?.into_iter().enumerate() {
-                self.pending
-                    .push((media.request(index)?.request, first, rows));
+                let staged = media.request(index)?;
+                self.pending.push((staged.request, first, rows));
+                self.diag
+                    .write_bytes("encoder", "conditioning.json", &staged.conditioning);
+                let grids = vision_grids(&staged.conditioning)?;
+                if grids.is_empty() {
+                    continue;
+                }
+                // One walk serves one prompt: its tables are that prompt's, and a batch of two
+                // would read one set of tables over the other's rows.
+                if threads.seq_lens.len() != 1 {
+                    return Err(Error::Invalid(format!(
+                        "a batch of {} prompts carries vision blocks, and a prompt with vision \
+                         blocks is encoded alone",
+                        threads.seq_lens.len()
+                    )));
+                }
+                self.vision = Some(VisionPrompt {
+                    request: staged.request,
+                    grids,
+                });
             }
         }
         // The columns are sized for the largest bucket the runner was bound with; a batch planned
@@ -425,10 +485,9 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
     /// batch of two clips for the same reason), and it belongs to execution rather than here: this
     /// runner states the region's lifetime, and the scheduler states when a second encode may run.
     ///
-    /// Only `Text` is published. The conditioning rows a `ref2va` request lays out are a different
-    /// packing of a vision tower's features rather than a slice of this sequence, and this encoder
-    /// writes one region (`EncoderOutputs::hidden`); publishing a second product from it would be
-    /// the executor inventing the model's layout arithmetic.
+    /// Only `Text` is published, because this encoder writes one region
+    /// (`EncoderOutputs::hidden`): a vision tower's features are spliced into it by the encode that
+    /// read them, and a condition's rows are the denoiser's conditioner's to write.
     fn publish(&self) -> Result<()> {
         let Some(products) = self.products.as_ref() else {
             // A runner whose store was not attached publishes nothing. The consumer that reads a
@@ -460,6 +519,173 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         Ok(())
     }
 
+    /// Encodes a prompt that carries vision blocks, operator by operator.
+    ///
+    /// The layout is the prompt's own - its presented tokens and its blocks' grids - so its tables
+    /// are written for this prompt alone, into pinned storage the device reads in place, and the
+    /// walk reads them there. The arena is the stream's, whose bucket extents a graph of this runner
+    /// addresses: nothing of a graph is live between its replays, so this walk may reuse it.
+    fn encode_vision(&mut self, bucket: Bucket, generation: u64, prompt: VisionPrompt) -> Result<()> {
+        let kernels = self.lifecycle.generation_named(generation)?;
+        let stream = self.stream.clone();
+        let tokens = u32::try_from(self.ids.len())
+            .map_err(|_| Error::Invalid("a prompt of more tokens than a u32 counts".into()))?;
+        let layout = EncoderLayout {
+            rows: tokens,
+            tokens,
+            images: prompt
+                .grids
+                .iter()
+                .map(|grid| ImageShape { grid: *grid })
+                .collect(),
+        };
+        let tables = self.model.state_tables(&layout);
+        let mut host = Vec::with_capacity(tables.len());
+        for table in &tables {
+            host.push(vec![0_u8; usize::try_from(Tables::plan_bytes(std::slice::from_ref(table))?)
+                .map_err(|_| Error::Invalid("a table is larger than memory".into()))?]);
+        }
+        self.model
+            .prepare_state(&EncoderPrompt { ids: &self.ids }, &layout, &mut host)
+            .map_err(Error::from)?;
+        let mut held = Vec::with_capacity(tables.len());
+        let mut state = Vec::with_capacity(tables.len());
+        for (table, bytes) in tables.iter().zip(&host) {
+            let mut buffer = platform::PinnedBuffer::new(self.device, bytes.len().max(1))?;
+            // SAFETY: the buffer was allocated above and no device work reads it yet.
+            unsafe {
+                buffer.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+            }
+            state.push(TensorView::new(
+                ops::DevicePtr::new(buffer.address()),
+                table.dtype,
+                table.shape,
+            ));
+            held.push(buffer);
+        }
+
+        let products = self
+            .products
+            .as_ref()
+            .ok_or_else(|| products::no_store(prompt.request))?;
+        let patches = products
+            .ordered(prompt.request, Product::VisionPixels, &stream)?
+            .ok_or_else(|| products::absent(prompt.request, Product::VisionPixels))?;
+        let width = patches.shape.dim(1);
+        let mut images = Vec::with_capacity(prompt.grids.len());
+        let mut first = 0_u64;
+        for grid in &prompt.grids {
+            let rows = u64::from(grid[0]) * u64::from(grid[1]) * u64::from(grid[2]);
+            images.push(ImageInput {
+                pixels: patches
+                    .at(patches.offset_elements(first * width))
+                    .reshape(ops::Shape::new(&[rows, width])),
+            });
+            first += rows;
+        }
+
+        let base = self.pool()?.base(self.stream_id())?;
+        let reserved = self.pool()?.range(self.stream_id());
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let forward = nn::Forward::new(&stream, &kernels, &arena);
+        let rows = u64::from(tokens);
+        let hidden_width = u64::from(self.shape.hidden.max(1));
+        let batch = TokenBatch {
+            positions: self.columns.positions.extent(0..rows),
+            slot_mapping: self.columns.logits_rows.extent(0..rows.max(1)),
+            seq_lens: self.columns.seq_lens.extent(0..1),
+            query_offsets: self.columns.query_offsets.extent(0..2),
+            logits_rows: self.columns.logits_rows.extent(0..1),
+            phase: PhaseKind::Prefill,
+            page_size: 0,
+            num_tokens: tokens,
+            max_kv_len: bucket.tokens,
+            draft_lens: None,
+        };
+        let hidden = self
+            .columns
+            .hidden
+            .extent(0..rows * hidden_width)
+            .reshape(ops::Shape::new(&[rows, hidden_width]));
+        self.upload()?;
+        // The tower's residual stream and its merged rows, which the model writes into these views
+        // when the diagnosis asks for them. One block's stream is the only shape the model states.
+        let mut views = Vec::new();
+        if self.diag.enabled()
+            && let [grid] = prompt.grids.as_slice()
+        {
+            let patches = u64::from(grid[0]) * u64::from(grid[1]) * u64::from(grid[2]);
+            let merged = tables
+                .iter()
+                .find(|table| table.name == "vision_destinations")
+                .map_or(0, |table| table.shape.dim(0));
+            views = vec![
+                forward
+                    .arena()
+                    .tensor(self.shape.dtype, ops::Shape::new(&[patches, self.diag_tower_width()]))?,
+                forward
+                    .arena()
+                    .tensor(self.shape.dtype, ops::Shape::new(&[merged, hidden_width]))?,
+            ];
+        }
+        self.model
+            .encode(
+                &forward,
+                EncoderInputs {
+                    ids: self.columns.ids.extent(0..rows),
+                    batch,
+                    images: &images,
+                    layout: &layout,
+                    state: &state,
+                    diagnostics: &views,
+                },
+                EncoderOutputs { hidden },
+            )
+            .map_err(Error::from)?;
+        // The tables are this prompt's alone and the walk just queued reads them.
+        stream.synchronize()?;
+        if self.diag.enabled() {
+            let _ = self.diag.write(
+                self.device,
+                &stream,
+                "encoder",
+                "prompt_ids",
+                self.columns.ids.extent(0..rows),
+            );
+            let _ = self
+                .diag
+                .write(self.device, &stream, "encoder", "patches", patches);
+            let _ = self.diag.write(
+                self.device,
+                &stream,
+                "encoder",
+                "hidden",
+                self.columns
+                    .hidden
+                    .extent(0..rows * hidden_width)
+                    .reshape(ops::Shape::new(&[rows, hidden_width])),
+            );
+            for (table, view) in tables.iter().zip(&state) {
+                let _ = self
+                    .diag
+                    .write(self.device, &stream, "encoder", table.name, *view);
+            }
+            for (name, view) in ["vision_hidden", "vision_merged"].iter().zip(&views) {
+                let _ = self.diag.write(self.device, &stream, "encoder", name, *view);
+            }
+        }
+        drop(held);
+        Ok(())
+    }
+
+    /// The tower's own width, which only the checkpoint states.
+    fn diag_tower_width(&self) -> u64 {
+        std::env::var("UNISERVE_DIAG_TOWER_WIDTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1152)
+    }
+
     /// Walks the encode once for `bucket`, recording every operator launch's nodes into the
     /// generation's capture (4.5).
     fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
@@ -470,7 +696,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload()?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.range(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let batch = self.token_batch(bucket)?;
         let forward = nn::Forward::new(&stream, generation, &arena);
@@ -633,6 +859,18 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
             Job::Replay {
                 bucket, generation, ..
             } => {
+                if let Some(prompt) = self.vision.take() {
+                    let launched = std::time::Instant::now();
+                    self.encode_vision(*bucket, *generation, prompt)?;
+                    self.publish()?;
+                    return Ok(BatchOutput {
+                        calls: answered(&mut self.calls),
+                        timing: TimingCounters {
+                            device_us: launched.elapsed().as_micros() as u64,
+                            ..Default::default()
+                        },
+                    });
+                }
                 let stream = self.stream.clone();
                 self.upload()?;
                 let (served, captured) = self

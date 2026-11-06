@@ -86,6 +86,22 @@ impl Diag {
             })
     }
 
+    /// Writes `bytes` as `<block>/<name>` under the diagnosis directory, as they stand.
+    ///
+    /// For what a tensor cannot hold: the request's own plan, which the reference half reads to run
+    /// the same request.
+    pub(crate) fn write_bytes(&self, block: &str, name: &str, bytes: &[u8]) {
+        let Some(root) = self.dir.as_ref() else {
+            return;
+        };
+        let directory = root.join(block);
+        if let Err(error) = std::fs::create_dir_all(&directory)
+            .and_then(|()| std::fs::write(directory.join(name), bytes))
+        {
+            tracing::warn!(block, name, error = %error, "a diagnosis dump was not written");
+        }
+    }
+
     fn dump(
         &self,
         root: &Path,
@@ -133,6 +149,8 @@ fn widen(dtype: DType, payload: &[u8]) -> Result<(DType, Vec<u8>)> {
     match dtype {
         DType::F32 => Ok((DType::F32, payload.to_vec())),
         DType::F16 => Ok((DType::F16, payload.to_vec())),
+        // A table of indices is compared exactly, so it keeps its integers.
+        DType::I32 => Ok((DType::I32, payload.to_vec())),
         DType::BF16 => {
             let mut out = Vec::with_capacity(payload.len() * 2);
             for pair in payload.chunks_exact(2) {
@@ -156,9 +174,10 @@ fn npy(shape: &[u64], dtype: DType, payload: &[u8]) -> Result<Vec<u8>> {
     let descr = match dtype {
         DType::F32 => "<f4",
         DType::F16 => "<f2",
+        DType::I32 => "<i4",
         other => {
             return Err(Error::Invalid(format!(
-                "a dump is written as `f4` or `f2`, not {other}"
+                "a dump is written as `f4`, `f2` or `i4`, not {other}"
             )));
         }
     };

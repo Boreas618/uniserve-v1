@@ -13,11 +13,20 @@
 //! where they run. [`MediaWork`] is that lane's action: one stage of one request's artifact, with
 //! the bytes the stage reads already in host memory. It has no graph, no bucket and no device
 //! stream, which is why the three media calls a `t2va` request ends with are not device variants.
+//!
+//! **A conditioned request starts here too.** Its media reading decodes the bytes its conditions
+//! publish in shared memory ([`read_conditions`]) into three pinned regions, laid out as the model's
+//! encoders read them ([`nn::capability::MediaFormat`]), and publishes them as products: the text
+//! encoding reads the patch rows and the denoiser's first step the pixels and the samples. A pinned
+//! buffer is an address the device reads directly, so nothing is copied onto the device to be read
+//! once.
 
-use std::sync::Arc;
+use std::os::unix::fs::FileExt as _;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ipc::RequestKey;
+use nn::capability::MediaFormat;
 
 use crate::Result;
 use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
@@ -25,6 +34,60 @@ use crate::host::{HostAction, Lane, Outcome};
 use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::products::{Product, Products};
+
+/// One request's conditions, as its media reading leaves them for the calls that read them.
+///
+/// Each region holds every condition of its kind one after another, in request order, and a reader
+/// finds a condition's rows from the extents its conditioning states. The buffers are the storage
+/// behind the views the store publishes (the store owns no memory), so they live until the request's
+/// artifact is assembled.
+#[derive(Default)]
+pub struct ConditionRegions {
+    /// Every visual condition's pixels, as `nn::capability::MediaInput::pixels` reads them: FP32.
+    pixels: Option<platform::PinnedBuffer>,
+    /// Every audio track, as `nn::capability::MediaInput::audio` reads it: FP32.
+    samples: Option<platform::PinnedBuffer>,
+    /// Every vision block's patch rows, in the model's patch type.
+    patches: Option<platform::PinnedBuffer>,
+}
+
+/// The extents one request's regions take, from its conditioning alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RegionExtents {
+    /// FP32 elements of the pixel region: one per byte of RGB the conditions decode to.
+    pixels: u64,
+    /// FP32 elements of the sample region.
+    samples: u64,
+    /// Patch rows of the vision region.
+    patches: u64,
+}
+
+impl RegionExtents {
+    /// What `conditioning`'s conditions take, as `format` lays them out.
+    fn of(conditioning: &models::video::Conditioning, format: &dyn MediaFormat) -> Result<Self> {
+        let mut extents = Self::default();
+        for condition in &conditioning.conditions {
+            extents.pixels += condition.pixel_bytes();
+            if let Some(track) = condition.media.audio() {
+                extents.samples += 2 * format.track_samples(track.samples)?;
+            }
+            if let Some(vision) = &condition.vision {
+                extents.patches += vision.grid.patches();
+            }
+        }
+        Ok(extents)
+    }
+}
+
+/// What one host call reads a request's conditions with.
+struct ConditionRead {
+    /// The request's plan of them.
+    conditioning: models::video::Conditioning,
+    /// The regions the read fills, shared with the stage that publishes them when it ends.
+    regions: Arc<Mutex<ConditionRegions>>,
+    /// How the model's encoders read what the media decodes to.
+    format: Arc<dyn MediaFormat>,
+}
 
 /// The rates one request's artifact is built at.
 ///
@@ -64,6 +127,8 @@ pub struct MediaWork {
     input: Option<platform::PinnedBuffer>,
     /// The media group's host encoder, one per deployment.
     output: Arc<Output>,
+    /// What a media reading reads, and nothing for any other stage.
+    read: Option<ConditionRead>,
 }
 
 /// The three stages of a request's artifact.
@@ -92,6 +157,8 @@ pub enum Stage {
     Hand,
     /// The end of the request's assembly: the MP4's bytes are the stage's answer.
     Mux,
+    /// A request's condition media decoded into its regions.
+    Read,
 }
 
 impl MediaWork {
@@ -113,6 +180,7 @@ impl MediaWork {
             stage,
             input,
             output,
+            read: None,
         }
     }
 
@@ -158,6 +226,22 @@ impl HostAction for MediaWork {
             }
             Stage::Mux => Ok(Some(self.output.finish(self.request)?)),
             Stage::Open | Stage::Hand => Ok(None),
+            Stage::Read => {
+                let read = self.read.as_ref().ok_or_else(|| {
+                    crate::Error::Invalid(
+                        "a media reading was staged with no conditions to read".into(),
+                    )
+                })?;
+                let mut regions = crate::lock(&read.regions);
+                read_conditions(
+                    &self.output.media,
+                    self.output.rates,
+                    &read.conditioning,
+                    read.format.as_ref(),
+                    &mut regions,
+                )?;
+                Ok(None)
+            }
         };
         if outcome.is_err() {
             // A stage that fails ends its request short of an artifact, so the assembly this
@@ -372,6 +456,280 @@ impl Rates {
     }
 }
 
+/// The bytes one condition's media was published as, read from shared memory.
+fn published_bytes(source: &models::video::MediaLocator) -> Result<Vec<u8>> {
+    let read = |error: std::io::Error| {
+        crate::Error::Invalid(format!(
+            "reading the published media {:?} of {} byte(s): {error}",
+            source.name, source.bytes
+        ))
+    };
+    let file = ipc::SharedMemory::open(&source.name, false).map_err(read)?;
+    let length = usize::try_from(source.bytes)
+        .map_err(|_| crate::Error::Invalid("a condition is larger than memory".into()))?;
+    let mut bytes = vec![0_u8; length];
+    file.read_exact_at(&mut bytes, 0).map_err(read)?;
+    Ok(bytes)
+}
+
+/// `[frames, height, width, 3]` interleaved RGB as `[frames, 3, height, width]` planes.
+fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> {
+    let area = height * width;
+    let mut planes = vec![0_u8; frames * 3 * area];
+    for frame in 0..frames {
+        let pixels = &rgb[frame * area * 3..(frame + 1) * area * 3];
+        let plane = &mut planes[frame * 3 * area..(frame + 1) * 3 * area];
+        for (index, pixel) in pixels.chunks_exact(3).enumerate() {
+            plane[index] = pixel[0];
+            plane[area + index] = pixel[1];
+            plane[2 * area + index] = pixel[2];
+        }
+    }
+    planes
+}
+
+/// One vision block's frames, `[frames, height, width, 3]` RGB at `raster`, as its patch rows.
+///
+/// The tower reads a grid's own pixels, so each frame is resized to the grid first: the reference's
+/// `pack_pixels` does the same, in the same order (`uniserve/models/qwen3_vl/encoder.py`).
+fn pack_block(
+    format: &dyn MediaFormat,
+    rgb: &[u8],
+    frames: u32,
+    raster: (u32, u32),
+    grid: [u32; 3],
+    out: &mut [u8],
+) -> Result<()> {
+    let (height, width) = raster;
+    let side = format.patch_side();
+    let (rows, columns) = (grid[1] * side, grid[2] * side);
+    let planes = planes_of(rgb, frames as usize, height as usize, width as usize);
+    let planes = if (rows, columns) == (height, width) {
+        planes
+    } else {
+        let frame = 3 * height as usize * width as usize;
+        let mut resized = Vec::with_capacity(frames as usize * 3 * (rows * columns) as usize);
+        for source in planes.chunks_exact(frame) {
+            resized.extend(media::resample::bicubic_antialias_u8(
+                source, 3, height, width, rows, columns,
+            )?);
+        }
+        resized
+    };
+    format
+        .patches(&planes, frames, grid, out)
+        .map_err(crate::Error::from)
+}
+
+/// Decodes one request's conditions into `regions`, in request order.
+///
+/// `crates/media` decodes the bytes into RGB frames and stereo PCM at their planned extents; the
+/// model's format then lays them out as its encoders read them. A reference video's frames past its
+/// encoded prefix are the vision tower's alone, which is why the reader hands them back.
+fn read_conditions(
+    media: &media::MediaRunner,
+    rates: Rates,
+    conditioning: &models::video::Conditioning,
+    format: &dyn MediaFormat,
+    regions: &mut ConditionRegions,
+) -> Result<()> {
+    use media::read::{AudioPlan, ConditionProducts, ConditionSource, ImagePlan, VideoClip};
+    use models::video::ConditionMedia;
+
+    let conditions = &conditioning.conditions;
+    let bytes = conditions
+        .iter()
+        .map(|condition| published_bytes(&condition.source))
+        .collect::<Result<Vec<_>>>()?;
+    // A reference video is read by an external process, which takes a file: the shared memory
+    // object the frontend published is one.
+    let files = conditions
+        .iter()
+        .map(|condition| match condition.media {
+            ConditionMedia::Video { .. } => ipc::SharedMemory::open(&condition.source.name, false)
+                .map(Some)
+                .map_err(|error| {
+                    crate::Error::Invalid(format!(
+                        "opening the published media {:?}: {error}",
+                        condition.source.name
+                    ))
+                }),
+            _ => Ok(None),
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let audio_plan = |track: &models::video::AudioClip| -> Result<AudioPlan> {
+        let index = |value: u64| {
+            usize::try_from(value)
+                .map_err(|_| crate::Error::Invalid("a track is larger than memory".into()))
+        };
+        Ok(AudioPlan {
+            native_rate: track.sample_rate,
+            start: index(track.start_sample)?,
+            source_samples: index(track.source_samples)?,
+            samples: index(track.samples)?,
+            rate: rates.audio_rate,
+        })
+    };
+    let mut reads = Vec::with_capacity(conditions.len());
+    let (mut pixel_rows, mut sample_rows) = (0_usize, 0_usize);
+    for (index, condition) in conditions.iter().enumerate() {
+        let (image, video) = match &condition.media {
+            ConditionMedia::Image(fit) => (
+                Some(ImagePlan {
+                    resized: (fit.resized.width, fit.resized.height),
+                    window: (fit.left, fit.top, fit.size.width, fit.size.height),
+                }),
+                None,
+            ),
+            ConditionMedia::Video { clip, .. } => (
+                None,
+                Some(VideoClip {
+                    frame_rate: rates.frame_rate,
+                    canvas: (clip.canvas.width, clip.canvas.height),
+                    frames: clip.frames,
+                    vae_frames: clip.vae_frames,
+                    start_frame: clip.start_frame,
+                }),
+            ),
+            ConditionMedia::Audio(_) => (None, None),
+        };
+        let pixels = usize::try_from(condition.pixel_bytes() / 3)
+            .map_err(|_| crate::Error::Invalid("a condition is larger than memory".into()))?;
+        let audio = condition.media.audio().map(audio_plan).transpose()?;
+        let samples = audio.map_or(0, |plan| plan.samples);
+        let source = match files[index].as_ref() {
+            Some(file) => ConditionSource::File(file),
+            None => ConditionSource::Bytes(&bytes[index]),
+        };
+        reads.push(media::read::ConditionRead {
+            source,
+            image,
+            video,
+            audio,
+            pixels: pixel_rows..pixel_rows + pixels,
+            samples: sample_rows..sample_rows + samples,
+        });
+        pixel_rows += pixels;
+        sample_rows += samples;
+    }
+
+    let mut rgb = vec![0_u8; pixel_rows * 3];
+    let mut pcm = vec![0_f32; sample_rows * 2];
+    let decoded = media.read_conditions(
+        &reads,
+        &mut ConditionProducts {
+            pixels: (pixel_rows > 0).then_some(rgb.as_mut_slice()),
+            samples: (sample_rows > 0).then_some(pcm.as_mut_slice()),
+        },
+    )?;
+
+    // Each condition's own rows, in the regions the encoders read.
+    let mut pixels_at = 0_usize;
+    let mut samples_at = 0_usize;
+    let mut patches_at = 0_usize;
+    let patch_bytes = usize::try_from(
+        u64::from(format.patch_width())
+            * format
+                .patch_dtype()
+                .bytes()
+                .ok_or_else(|| crate::Error::Invalid("a patch row has no whole-byte size".into()))?,
+    )
+    .map_err(|_| crate::Error::Invalid("a patch row is larger than memory".into()))?;
+    for (index, condition) in conditions.iter().enumerate() {
+        let read = &reads[index];
+        if let Some((frames, canvas)) = condition.media.pixels() {
+            let source = &rgb[read.pixels.start * 3..read.pixels.end * 3];
+            let region = regions
+                .pixels
+                .as_mut()
+                .ok_or_else(|| crate::Error::Invalid("a condition's pixels have no region".into()))?;
+            // SAFETY: nothing reads the region before this call publishes it, and it was allocated
+            // for this request alone.
+            let floats = unsafe { region.as_mut_slice() };
+            let (_, floats, _) = unsafe { floats.align_to_mut::<f32>() };
+            condition_rows(format, source, frames, canvas, &mut floats[pixels_at..])?;
+            pixels_at += source.len();
+        }
+        if let Some(track) = condition.media.audio() {
+            let padded = 2 * usize::try_from(format.track_samples(track.samples)?)
+                .map_err(|_| crate::Error::Invalid("a track is larger than memory".into()))?;
+            let region = regions
+                .samples
+                .as_mut()
+                .ok_or_else(|| crate::Error::Invalid("a track has no region".into()))?;
+            // SAFETY: as for the pixels above.
+            let floats = unsafe { region.as_mut_slice() };
+            let (_, floats, _) = unsafe { floats.align_to_mut::<f32>() };
+            format.track(
+                &pcm[read.samples.start * 2..read.samples.end * 2],
+                track.samples,
+                &mut floats[samples_at..samples_at + padded],
+            )?;
+            samples_at += padded;
+        }
+        if let Some(vision) = &condition.vision {
+            let grid = [vision.grid.t, vision.grid.h, vision.grid.w];
+            let rows = usize::try_from(vision.grid.patches())
+                .map_err(|_| crate::Error::Invalid("a vision block is larger than memory".into()))?;
+            let region = regions
+                .patches
+                .as_mut()
+                .ok_or_else(|| crate::Error::Invalid("a vision block has no region".into()))?;
+            // SAFETY: as for the pixels above.
+            let out = unsafe { region.as_mut_slice() };
+            let out = &mut out[patches_at * patch_bytes..(patches_at + rows) * patch_bytes];
+            match decoded[index].as_ref() {
+                // A video's block reads the frames its conditioner sampled from every kept frame,
+                // and those frames are what the reader handed back.
+                Some(video) => {
+                    let (width, height) = video.clip.canvas;
+                    let frame = width as usize * height as usize * 3;
+                    let mut sampled = Vec::with_capacity(vision.frame_indices.len() * frame);
+                    for index in &vision.frame_indices {
+                        let start = *index as usize * frame;
+                        sampled.extend_from_slice(&video.pixels[start..start + frame]);
+                    }
+                    let frames = u32::try_from(vision.frame_indices.len()).map_err(|_| {
+                        crate::Error::Invalid("a video samples more frames than a u32".into())
+                    })?;
+                    pack_block(format, &sampled, frames, (height, width), grid, out)?;
+                }
+                None => {
+                    let (frames, canvas) = condition.media.pixels().ok_or_else(|| {
+                        crate::Error::Invalid(
+                            "the conditioner reads a condition with no pixels".into(),
+                        )
+                    })?;
+                    pack_block(
+                        format,
+                        &rgb[read.pixels.start * 3..read.pixels.end * 3],
+                        frames,
+                        (canvas.height, canvas.width),
+                        grid,
+                        out,
+                    )?;
+                }
+            }
+            patches_at += rows;
+        }
+    }
+    Ok(())
+}
+
+/// Lays one visual condition's RGB out as its encoder reads it, at the head of `out`.
+fn condition_rows(
+    format: &dyn MediaFormat,
+    rgb: &[u8],
+    frames: u32,
+    canvas: models::video::Canvas,
+    out: &mut [f32],
+) -> Result<()> {
+    format
+        .condition_pixels(rgb, frames, canvas.height, canvas.width, &mut out[..rgb.len()])
+        .map_err(crate::Error::from)
+}
+
 /// A request's identity for the media crate, whose assembly is keyed by a number.
 ///
 /// One deployment serves one epoch's requests, and the key already carries the epoch: the media
@@ -425,6 +783,11 @@ pub struct MediaStage {
     /// arrive, and a host bucket states no bound (`Bucket::holds_computation`) - so staging one entry
     /// would leave every request after the first without an answer.
     pending: Vec<Prepared>,
+    /// How the model's encoders read a request's decoded media.
+    format: Arc<dyn MediaFormat>,
+    /// The regions of the requests whose conditions were read, until their artifact is assembled:
+    /// the store's views name this storage and own none of it.
+    conditions: std::collections::HashMap<RequestKey, Arc<Mutex<ConditionRegions>>>,
 }
 
 /// One staged host call: the product's bytes, and the stage that reads them.
@@ -439,6 +802,8 @@ struct Prepared {
     stage: Stage,
     /// The product's bytes, and nothing for the mux, which reads what `output` holds.
     input: Option<platform::PinnedBuffer>,
+    /// What a media reading reads, and nothing for any other stage.
+    read: Option<ConditionRead>,
 }
 
 impl MediaStage {
@@ -453,6 +818,7 @@ impl MediaStage {
         output: Arc<Output>,
         lane: Lane<MediaWork>,
         units_of: fn(u32) -> Result<Vec<u32>>,
+        format: Arc<dyn MediaFormat>,
     ) -> Self {
         Self {
             id: binding.id,
@@ -465,7 +831,100 @@ impl MediaStage {
             units_of,
             units_staged: std::collections::HashMap::new(),
             pending: Vec::new(),
+            format,
+            conditions: std::collections::HashMap::new(),
         }
+    }
+
+    /// The regions `conditioning`'s conditions are read into, and the read that fills them.
+    fn prepare_read(&self, staged: &crate::batch::StagedRequest) -> Result<ConditionRead> {
+        let conditioning =
+            models::video::Conditioning::decode(&staged.conditioning).map_err(|error| {
+                crate::Error::Invalid(format!(
+                    "a media request's conditioning does not decode: {error}"
+                ))
+            })?;
+        let extents = RegionExtents::of(&conditioning, self.format.as_ref())?;
+        let region = |elements: u64, width: u64| -> Result<Option<platform::PinnedBuffer>> {
+            if elements == 0 {
+                return Ok(None);
+            }
+            let bytes = usize::try_from(elements * width)
+                .map_err(|_| crate::Error::Invalid("a condition is larger than memory".into()))?;
+            Ok(Some(platform::PinnedBuffer::new(self.device, bytes)?))
+        };
+        let row = u64::from(self.format.patch_width())
+            * self
+                .format
+                .patch_dtype()
+                .bytes()
+                .ok_or_else(|| crate::Error::Invalid("a patch row has no whole-byte size".into()))?;
+        let float = ops::DType::F32
+            .bytes()
+            .ok_or_else(|| crate::Error::Invalid("an FP32 has no whole-byte size".into()))?;
+        Ok(ConditionRead {
+            conditioning,
+            regions: Arc::new(Mutex::new(ConditionRegions {
+                pixels: region(extents.pixels, float)?,
+                samples: region(extents.samples, float)?,
+                patches: region(extents.patches, row)?,
+            })),
+            format: Arc::clone(&self.format),
+        })
+    }
+
+    /// Publishes what a media reading left in `regions`, for the calls of `request` that read it.
+    ///
+    /// The host finished writing before this runs, and the writes are not on any stream, so the
+    /// event is only what a crossing reader's ordering asks for: the store orders a reader on
+    /// another stream after it.
+    fn publish_regions(
+        &mut self,
+        request: RequestKey,
+        regions: Arc<Mutex<ConditionRegions>>,
+    ) -> Result<()> {
+        let format = Arc::clone(&self.format);
+        let products = Arc::clone(self.products()?);
+        let stream_id = crate::arena::StreamId(self.stream.raw());
+        {
+            let held = crate::lock(&regions);
+            let float = |buffer: &platform::PinnedBuffer| {
+                ops::TensorView::new(
+                    ops::DevicePtr::new(buffer.address()),
+                    ops::DType::F32,
+                    ops::Shape::new(&[buffer.len() as u64 / 4]),
+                )
+            };
+            let patch = |buffer: &platform::PinnedBuffer| -> Result<ops::TensorView> {
+                let dtype = format.patch_dtype();
+                let width = u64::from(format.patch_width());
+                let row = width * dtype.bytes().ok_or_else(|| {
+                    crate::Error::Invalid("a patch row has no whole-byte size".into())
+                })?;
+                Ok(ops::TensorView::new(
+                    ops::DevicePtr::new(buffer.address()),
+                    dtype,
+                    ops::Shape::new(&[buffer.len() as u64 / row, width]),
+                ))
+            };
+            let views = [
+                (Product::ConditionPixels, held.pixels.as_ref().map(float)),
+                (Product::ConditionSamples, held.samples.as_ref().map(float)),
+                (
+                    Product::VisionPixels,
+                    held.patches.as_ref().map(patch).transpose()?,
+                ),
+            ];
+            for (kind, view) in views {
+                let Some(view) = view else {
+                    continue;
+                };
+                let written = crate::runners::products::written_on(&self.stream)?;
+                products.publish(request, kind, self.device, stream_id, Some(written), &view)?;
+            }
+        }
+        self.conditions.insert(request, regions);
+        Ok(())
     }
 
     /// The store this runner reads the request's products from, and the refusal that names a
@@ -530,13 +989,18 @@ impl MediaStage {
                 timing: ipc::TimingCounters::default(),
             });
         }
-        let work = MediaWork::new(
+        let regions = prepared
+            .read
+            .as_ref()
+            .map(|read| Arc::clone(&read.regions));
+        let mut work = MediaWork::new(
             Arc::clone(&self.output),
             prepared.request,
             prepared.units,
             prepared.stage,
             prepared.input,
         );
+        work.read = prepared.read;
         let started = Instant::now();
         let task = self.lane.admit(work)?;
         let answered = match task.wait() {
@@ -554,6 +1018,13 @@ impl MediaStage {
                 ));
             }
         };
+        if let Some(regions) = regions {
+            self.publish_regions(prepared.request, regions)?;
+        }
+        // The artifact is assembled, so nothing reads the request's conditions any more.
+        if matches!(prepared.stage, Stage::Mux) {
+            self.conditions.remove(&prepared.request);
+        }
         let mut answer = CallOutput::completed(call, Vec::new(), RowState::default());
         if let Some(bytes) = answered.as_ref() {
             // The mux ends the request: its bytes are the artifact, published into a shared memory
@@ -671,7 +1142,10 @@ fn staged(
         Variant::AudioEncode => Ok((Stage::Track, Some(Product::Track))),
         Variant::Mux if handed > 0 => Ok((Stage::Hand, None)),
         Variant::Mux => Ok((Stage::Mux, None)),
-        Variant::LatentPrepare => Ok((Stage::Open, None)),
+        // A trajectory's opening computes nothing, and neither does an encoder whose work the call
+        // that consumes it runs.
+        Variant::LatentPrepare | Variant::ConditionEncode => Ok((Stage::Open, None)),
+        Variant::MediaRead => Ok((Stage::Read, None)),
         other => Err(crate::Error::Invalid(format!(
             "the media stage serves the artifact's three calls and was asked for a {other:?} batch"
         ))),
@@ -727,10 +1201,20 @@ impl Runner for MediaStage {
         }
         let mut prepared = Vec::with_capacity(staged_calls.len());
         let mut jobs = Vec::with_capacity(staged_calls.len());
-        for (call, staged_call) in batch.calls.iter().copied().zip(staged_calls) {
+        for ((call, staged_call), request) in batch
+            .calls
+            .iter()
+            .copied()
+            .zip(staged_calls)
+            .zip(requests.iter())
+        {
             let input = match staged_call.product {
                 Some(kind) => Some(self.stage_product(staged_call.request, kind)?),
                 None => None,
+            };
+            let read = match staged_call.stage {
+                Stage::Read => Some(self.prepare_read(request)?),
+                _ => None,
             };
             prepared.push(Prepared {
                 call,
@@ -738,6 +1222,7 @@ impl Runner for MediaStage {
                 units: staged_call.units,
                 stage: staged_call.stage,
                 input,
+                read,
             });
             jobs.push(Job::Host {
                 runner: self.id,
@@ -769,6 +1254,8 @@ impl Runner for MediaStage {
             Variant::AudioEncode,
             Variant::Mux,
             Variant::LatentPrepare,
+            Variant::MediaRead,
+            Variant::ConditionEncode,
         ]
             .into_iter()
             .map(crate::plan::Bucket::host)
@@ -811,6 +1298,20 @@ impl Runner for MediaStage {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Frames reach the resize as planes, one frame after another: an interleaved raster read as
+    /// planes would resize a mixture of the channels, and every shape would agree.
+    #[test]
+    fn interleaved_frames_become_planes_one_frame_after_another() {
+        // Two frames of one row of two pixels.
+        let rgb = [1_u8, 2, 3, 4, 5, 6, 11, 12, 13, 14, 15, 16];
+        assert_eq!(
+            planes_of(&rgb, 2, 1, 2),
+            [1, 4, 2, 5, 3, 6, 11, 14, 12, 15, 13, 16]
+        );
+    }
+
     use super::*;
 
     /// A request's two units and its track assemble into one MP4.

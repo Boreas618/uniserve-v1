@@ -62,6 +62,195 @@ use crate::{Error, Result};
 /// The spatial compression of the video encoder: input pixels per latent position.
 pub const SPATIAL_RATIO: u32 = 16;
 
+/// The channels of a condition's raster: RGB.
+pub const PIXEL_CHANNELS: u32 = 3;
+
+/// How H3's encoders read a request's decoded media, on the host.
+///
+/// Three layouts, one per encoder, each the reference's: the video encoder's normalised planar pixels
+/// (`encoding.py`, `unpack_pixels`), the vision tower's patch rows (`qwen3_vl/encoder.py`,
+/// `pack_pixels`) and the audio encoder's zero-padded channel rows (`encoding.py`, `unpack_samples`).
+#[derive(Clone, Debug)]
+pub struct ConditionFormat {
+    vision: crate::config::VisionConfig,
+    pixels: crate::config::PixelConfig,
+    /// The element type the tower's patch rows are rounded to: its weights' own.
+    dtype: DType,
+    /// Samples of one audio latent frame.
+    hop: u64,
+}
+
+impl ConditionFormat {
+    /// The format of `config`'s encoders, with the tower at `dtype`.
+    pub fn new(config: &crate::Config, dtype: DType) -> Result<Self> {
+        Ok(Self {
+            vision: config.text_encoder.vision.clone(),
+            pixels: config.text_encoder.pixels,
+            dtype,
+            hop: u64::from(AudioStack::of(&config.audio_vae)?.samples_per_latent),
+        })
+    }
+}
+
+impl nn::capability::MediaFormat for ConditionFormat {
+    fn condition_pixels(
+        &self,
+        rgb: &[u8],
+        frames: u32,
+        height: u32,
+        width: u32,
+        out: &mut [f32],
+    ) -> nn::Result<()> {
+        let area = height as usize * width as usize;
+        let frames = frames as usize;
+        let channels = PIXEL_CHANNELS as usize;
+        if rgb.len() != frames * area * channels || out.len() != rgb.len() {
+            return Err(refused(format!(
+                "{} RGB bytes and {} elements for {frames} frames of {height}x{width}",
+                rgb.len(),
+                out.len()
+            )));
+        }
+        // `[frames, rows, columns, 3]` to `[3, frames, rows, columns]`, each byte through the
+        // normalisation the reference applies in FP32.
+        for frame in 0..frames {
+            for pixel in 0..area {
+                let source = (frame * area + pixel) * channels;
+                let values = normalize([rgb[source], rgb[source + 1], rgb[source + 2]]);
+                for (channel, value) in values.iter().enumerate() {
+                    out[(channel * frames + frame) * area + pixel] = *value;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn patch_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn patch_width(&self) -> u32 {
+        crate::vision::BlockRows::tubelet(&self.vision)
+    }
+
+    fn patch_side(&self) -> u32 {
+        self.vision.patch_size
+    }
+
+    /// The processor's patch rows, op for op: `(byte - 255 · mean) / (255 · std)` in FP32, the last
+    /// frame repeated to a whole temporal patch, and rows over each temporal patch in merge-block
+    /// order, each one channel-major tubelet. The tower's projection rounds the pixels to its weights'
+    /// type, so the row is stored rounded (`TubeletEmbed`: `tubelets.to(self.weight.dtype)`).
+    fn patches(
+        &self,
+        planes: &[u8],
+        frames: u32,
+        grid: [u32; 3],
+        out: &mut [u8],
+    ) -> nn::Result<()> {
+        let [time, rows, columns] = grid;
+        let (patch, merge) = (self.vision.patch_size, self.vision.spatial_merge_size);
+        let temporal = self.vision.temporal_patch_size;
+        let channels = self.vision.in_channels as usize;
+        let (height, width) = ((rows * patch) as usize, (columns * patch) as usize);
+        let area = height * width;
+        let width_bytes = self.patch_width() as usize * 2;
+        let patches = time as usize * rows as usize * columns as usize;
+        if self.dtype != DType::BF16 {
+            return Err(refused(format!(
+                "H3's vision tower reads BF16 patch rows, not {}",
+                self.dtype
+            )));
+        }
+        if planes.len() != frames as usize * channels * area
+            || out.len() != patches * width_bytes
+            || frames == 0
+            || frames.div_ceil(temporal) != time
+        {
+            return Err(refused(format!(
+                "{} plane bytes and {} row bytes for {frames} frames on a {grid:?} grid",
+                planes.len(),
+                out.len()
+            )));
+        }
+        let mean = self.pixels.mean.map(|value| value * 255.0);
+        let std = self.pixels.std.map(|value| value * 255.0);
+        let (patch, merge, temporal) = (patch as usize, merge as usize, temporal as usize);
+        let mut at = 0_usize;
+        for step in 0..time as usize {
+            for block_row in 0..rows as usize / merge {
+                for block_column in 0..columns as usize / merge {
+                    for merge_row in 0..merge {
+                        for merge_column in 0..merge {
+                            let top = (block_row * merge + merge_row) * patch;
+                            let left = (block_column * merge + merge_column) * patch;
+                            for channel in 0..channels {
+                                for offset in 0..temporal {
+                                    // A short temporal patch repeats the last frame: one image is
+                                    // one frame repeated.
+                                    let frame = (step * temporal + offset).min(frames as usize - 1);
+                                    let plane = (frame * channels + channel) * area;
+                                    for y in 0..patch {
+                                        let line = plane + (top + y) * width + left;
+                                        for x in 0..patch {
+                                            let value = (f32::from(planes[line + x])
+                                                - mean[channel])
+                                                / std[channel];
+                                            let bits = bfloat16(value).to_le_bytes();
+                                            out[at] = bits[0];
+                                            out[at + 1] = bits[1];
+                                            at += 2;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn track_samples(&self, samples: u64) -> nn::Result<u64> {
+        padded_samples(samples, self.hop).map_err(|error| refused(error.to_string()))
+    }
+
+    /// `[samples, 2]` interleaved to `[2, 1, padded]`, each channel's tail zero.
+    fn track(&self, pcm: &[f32], samples: u64, out: &mut [f32]) -> nn::Result<()> {
+        let padded = self.track_samples(samples)? as usize;
+        let samples = samples as usize;
+        if pcm.len() != 2 * samples || out.len() != 2 * padded {
+            return Err(refused(format!(
+                "{} PCM values and {} elements for a track of {samples} samples",
+                pcm.len(),
+                out.len()
+            )));
+        }
+        out.fill(0.0);
+        for sample in 0..samples {
+            out[sample] = pcm[2 * sample];
+            out[padded + sample] = pcm[2 * sample + 1];
+        }
+        Ok(())
+    }
+}
+
+/// A conversion of a request's media refused, as the capability reports it.
+fn refused(problem: String) -> nn::Error {
+    nn::Error::Weight {
+        tensor: "minimax-h3".to_owned(),
+        problem,
+    }
+}
+
+/// `value` rounded to the nearest BF16, ties to even: the bits `torch`'s conversion writes.
+fn bfloat16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let bias = 0x7fff + ((bits >> 16) & 1);
+    (bits.wrapping_add(bias) >> 16) as u16
+}
+
 /// The extents of one tensor of the encoder's stack, in frames, rows and columns.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Extent {
@@ -1221,6 +1410,12 @@ impl Normalized {
     }
 }
 
+/// A `[channels, frames, rows, columns]` raster as the one sample a convolution reads.
+fn batched(view: TensorView) -> TensorView {
+    let dims = view.shape.dims();
+    view.reshape(Shape::new(&[1, dims[0], dims[1], dims[2], dims[3]]))
+}
+
 /// The extent of a five-axis tensor: `(batch, channels, frames, height, width)`.
 fn extent(view: TensorView) -> Result<(u64, u64, u64, u64, u64)> {
     if view.shape.rank() != 5 {
@@ -1756,7 +1951,9 @@ impl VideoEncoder {
     /// `moments` is a tile's or the whole run's `[2 · latent_channels, frames, rows, columns]`; `out` is
     /// the same shape. Nothing is reserved: the projection reads and writes the caller's views.
     pub fn project(&self, f: &Forward, moments: TensorView, out: TensorView) -> Result<()> {
-        self.moments.forward(f, moments, out).map_err(Error::from)
+        self.moments
+            .forward(f, batched(moments), batched(out))
+            .map_err(Error::from)
     }
 
     /// The posterior sample a condition reads: `moments` and the runner's `noise` to `out`.
@@ -1799,7 +1996,9 @@ impl VideoEncoder {
             view(noise.ptr),
             view(drawn.ptr),
         )?;
-        self.normalize.forward(f, drawn, out).map_err(Error::from)
+        self.normalize
+            .forward(f, batched(drawn), batched(out))
+            .map_err(Error::from)
     }
 
     /// One residual block: two normalized convolutions, added to the input or its projection.
@@ -3039,6 +3238,140 @@ impl GeGlu {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use nn::capability::MediaFormat as _;
+
+    /// The format of a tower of `patch`-pixel patches, two-frame tubelets and `2 x 2` merges.
+    fn format(patch: u32) -> ConditionFormat {
+        ConditionFormat {
+            vision: crate::config::VisionConfig {
+                depth: 1,
+                hidden_size: 8,
+                intermediate_size: 8,
+                num_heads: 1,
+                hidden_act: crate::config::VisionActivation::GeluTanh,
+                in_channels: 3,
+                patch_size: patch,
+                temporal_patch_size: 2,
+                spatial_merge_size: 2,
+                out_hidden_size: 8,
+                num_position_embeddings: 16,
+                deepstack_visual_indexes: Vec::new(),
+            },
+            pixels: crate::config::PixelConfig {
+                mean: [0.5; 3],
+                std: [0.5; 3],
+            },
+            dtype: DType::BF16,
+            hop: 800,
+        }
+    }
+
+    fn row_value(rows: &[u8], index: usize) -> f32 {
+        let bits = u16::from_le_bytes([rows[2 * index], rows[2 * index + 1]]);
+        f32::from_bits(u32::from(bits) << 16)
+    }
+
+    /// Patch rows run over merge blocks: the four patches of a `2 x 2` block are consecutive rows,
+    /// and a block's rows come before the next block's. A row-major walk of the patches would give
+    /// every merged token the wrong four, which no shape refuses.
+    #[test]
+    fn patch_rows_run_over_merge_blocks_and_a_row_is_one_channel_major_tubelet() {
+        let format = format(1);
+        // One frame of 2 rows by 4 columns, channel c of pixel (y, x) holding 8 c + 4 y + x.
+        let (height, width) = (2_usize, 4_usize);
+        let mut planes = vec![0_u8; 3 * height * width];
+        for channel in 0..3 {
+            for y in 0..height {
+                for x in 0..width {
+                    planes[(channel * height + y) * width + x] = (8 * channel + 4 * y + x) as u8;
+                }
+            }
+        }
+        let rows = 8;
+        let row = format.patch_width() as usize;
+        assert_eq!(row, 3 * 2);
+        let mut out = vec![0_u8; rows * row * 2];
+        format
+            .patches(&planes, 1, [1, 2, 4], &mut out)
+            .expect("one frame fills one temporal patch");
+        let pixel = |byte: u8| (f32::from(byte) - 127.5) / 127.5;
+        let rounded = |value: f32| f32::from_bits(u32::from(bfloat16(value)) << 16);
+        // The rows of the first block are pixels (0,0), (0,1), (1,0), (1,1); the second block's
+        // first row is pixel (0,2). A row is channel-major with its two frames inside a channel, and
+        // the one frame fills both.
+        let order = [(0, 0), (0, 1), (1, 0), (1, 1), (0, 2), (0, 3), (1, 2), (1, 3)];
+        for (index, (y, x)) in order.iter().enumerate() {
+            for channel in 0..3 {
+                let expected = rounded(pixel((8 * channel + 4 * y + x) as u8));
+                for frame in 0..2 {
+                    assert_eq!(
+                        row_value(&out, index * row + channel * 2 + frame),
+                        expected,
+                        "row {index} channel {channel} frame {frame}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// An image's temporal patch repeats its one frame, and a video's short last patch repeats its
+    /// last frame: a zero there would hand the tower a frame nobody decoded.
+    #[test]
+    fn a_short_temporal_patch_repeats_the_last_frame() {
+        let format = format(2);
+        let frame = 3 * 4 * 4;
+        // Three frames of 4 x 4, each one value: two temporal patches, the second one frame short.
+        let mut planes = vec![0_u8; 3 * frame];
+        for (index, value) in [10_u8, 20, 30].iter().enumerate() {
+            planes[index * frame..(index + 1) * frame].fill(*value);
+        }
+        let row = format.patch_width() as usize;
+        let rows = 2 * 2 * 2;
+        let mut out = vec![0_u8; rows * row * 2];
+        format
+            .patches(&planes, 3, [2, 2, 2], &mut out)
+            .expect("three frames fill two temporal patches");
+        let pixel = |byte: u8| f32::from_bits(u32::from(bfloat16((f32::from(byte) - 127.5) / 127.5)) << 16);
+        // Inside a channel the tubelet holds its frames in order, four pixels each.
+        assert_eq!(row_value(&out, 0), pixel(10));
+        assert_eq!(row_value(&out, 4), pixel(20));
+        let second = 4 * row;
+        assert_eq!(row_value(&out, second), pixel(30));
+        assert_eq!(row_value(&out, second + 4), pixel(30));
+    }
+
+    /// A condition's pixels are planar and normalised as the encoder reads them, and the track is
+    /// two channel rows padded to whole latent frames.
+    #[test]
+    fn a_conditions_pixels_are_planar_and_a_track_is_padded_channel_rows() {
+        let format = format(16);
+        let rgb = [255_u8, 0, 128, 0, 255, 128];
+        let mut out = [0.0_f32; 6];
+        format
+            .condition_pixels(&rgb, 1, 1, 2, &mut out)
+            .expect("one frame of two pixels");
+        let first = normalize([255, 0, 128]);
+        let second = normalize([0, 255, 128]);
+        assert_eq!(out, [first[0], second[0], first[1], second[1], first[2], second[2]]);
+
+        assert_eq!(format.track_samples(801).expect("a whole frame"), 1600);
+        let pcm = [1.0_f32, -1.0, 2.0, -2.0];
+        let mut track = vec![9.0_f32; 2 * 800];
+        format.track(&pcm, 2, &mut track).expect("two samples");
+        assert_eq!(&track[..3], &[1.0, 2.0, 0.0]);
+        assert_eq!(&track[800..803], &[-1.0, -2.0, 0.0]);
+    }
+
+    #[test]
+    fn a_bfloat16_rounds_to_nearest_even() {
+        assert_eq!(bfloat16(1.0), 0x3f80);
+        // Halfway between 0x3f80 and 0x3f81 rounds to the even one, and past it to the odd one.
+        assert_eq!(bfloat16(f32::from_bits(0x3f80_8000)), 0x3f80);
+        assert_eq!(bfloat16(f32::from_bits(0x3f80_8001)), 0x3f81);
+        assert_eq!(bfloat16(f32::from_bits(0x3f81_8000)), 0x3f82);
+    }
+
     /// The raster plan is the encoder's set followed by the stitcher's ring, and nothing else.
     ///
     /// `Scene::encode` reserves the set through `VideoEncoder::reserve` and then takes the stitcher's

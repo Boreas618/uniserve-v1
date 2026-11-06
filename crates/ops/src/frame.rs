@@ -754,13 +754,22 @@ impl Op for FrameNormPad {
                 ),
             ));
         }
-        if args.out.shape.dim(3) != height + args.top
-            || args.out.shape.dim(4) != width + args.left
+        // The padding is both sides of a frame and `top` and `left` place the source inside it, as
+        // `frame_pad` reads them: what lies past the source is the bottom and right padding.
+        if height + args.top > args.out.shape.dim(3)
+            || width + args.left > args.out.shape.dim(4)
             || args.out.shape.dim(2) != frames + args.front
         {
             return Err(Error::argument(
                 Self::NAME,
-                "the output's trailing extents do not follow from the padding".to_owned(),
+                format!(
+                    "a {frames}x{height}x{width} source at ({}, {}) after {} frames does not fit a \
+                     {:?} output",
+                    args.top,
+                    args.left,
+                    args.front,
+                    args.out.shape.dims()
+                ),
             ));
         }
         if args.groups == 0 || channels % args.groups != 0 {
