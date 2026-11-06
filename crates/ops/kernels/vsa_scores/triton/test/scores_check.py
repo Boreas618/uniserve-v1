@@ -4,10 +4,10 @@
 The kernel is a per-head contraction, so its arithmetic is checkable without a device: Triton's
 interpreter executes the kernel body with numpy-backed tensors, one program at a time, and the
 result is compared with the operator's definition from ``crates/ops/src/segments.rs`` — one dot
-product per (head, query tile, key tile) over the pooled rows, accumulated in FP32, with no scale
-and no softmax:
+product per (head, query tile, key tile) over the pooled rows, accumulated in FP32 and scaled, with
+no softmax, over operands in the layout the pooling writes:
 
-    scores[head, i, j] = Σ_w pooled_query[head, i, w] · pooled_key[head, j, w]
+    scores[head, i, j] = Σ_w pooled_query[i, head, w] · pooled_key[j, head, w] / sqrt(width)
 
     TRITON_INTERPRET=1 python scores_check.py [--package .] [--heads 3] [--width 128]
 
@@ -64,8 +64,8 @@ def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
     torch.manual_seed(seed)
     # Both operands are FP32: that is the type `vsa_prepare_tiles` pools a tile's per-head means
     # in, and the operator refuses anything else, so there is no element type to vary here.
-    query = torch.randn(heads, query_tiles, width, dtype=torch.float32)
-    key = torch.randn(heads, key_tiles, width, dtype=torch.float32)
+    query = torch.randn(query_tiles, heads, width, dtype=torch.float32)
+    key = torch.randn(key_tiles, heads, width, dtype=torch.float32)
     out = torch.full((heads, query_tiles, key_tiles), float("nan"), dtype=torch.float32)
 
     module._vsa_scores_kernel[(query_tiles, heads, 1)](
@@ -81,8 +81,9 @@ def run(module, *, heads, width, block, query_tiles, key_tiles, seed=23):
     )
 
     # The reference: the same operands in FP64, rounded once into FP32.
-    expected = torch.einsum(
-        "hiw,hjw->hij", query.to(torch.float64), key.to(torch.float64)
+    expected = (
+        torch.einsum("ihw,jhw->hij", query.to(torch.float64), key.to(torch.float64))
+        / width**0.5
     ).to(torch.float32)
 
     bound = declared_bound(width)
