@@ -43,6 +43,25 @@ fn exits_arrive_unasked_and_name_their_launch() {
 }
 
 #[test]
+fn an_exit_goes_to_the_connection_that_asked_for_the_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let daemon = start(&directory, "node");
+    let mut asker = Engine::connect(daemon.address().unwrap());
+    let mut other = Engine::connect(daemon.address().unwrap());
+
+    // Both clients' launches are the deployment's, so the report cannot be
+    // routed by owner: a client waiting for its own process must not read
+    // another client's exit as that process's.
+    asker.spawn(launch("node", "first", 0, 0, "/bin/false", &[]));
+    assert_eq!(asker.exit().group, "first");
+
+    // The exit was sent before this answer, so a report for `other` is
+    // already filed behind it when the answer arrives.
+    other.request(request::Kind::Nodes(Default::default()));
+    assert_eq!(other.reported_exits(), 0);
+}
+
+#[test]
 fn the_first_rank_serves_its_store_on_the_reserved_socket() {
     let directory = tempfile::tempdir().unwrap();
     let daemon = start(&directory, "node");
