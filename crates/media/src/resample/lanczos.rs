@@ -136,9 +136,8 @@ fn pass(
 ) -> Vec<u8> {
     if horizontal {
         let mut out = vec![0u8; output_width * input_height * channels];
-        for row in 0..input_height {
+        over_rows(&mut out, output_width * channels, |row, out_row| {
             let source_row = &source[row * input_width * channels..][..input_width * channels];
-            let out_row = &mut out[row * output_width * channels..][..output_width * channels];
             for column in 0..output_width {
                 let start = filter.starts[column];
                 let count = filter.counts[column];
@@ -152,15 +151,14 @@ fn pass(
                     out_row[column * channels + channel] = clip8(sum);
                 }
             }
-        }
+        });
         out
     } else {
         let mut out = vec![0u8; output_height * output_width * channels];
-        for row in 0..output_height {
+        over_rows(&mut out, output_width * channels, |row, out_row| {
             let start = filter.starts[row];
             let count = filter.counts[row];
             let weights = &filter.weights[row * filter.width..][..count];
-            let out_row = &mut out[row * output_width * channels..][..output_width * channels];
             for column in 0..output_width {
                 for channel in 0..channels {
                     let mut sum = ROUNDING_BIAS;
@@ -173,9 +171,29 @@ fn pass(
                     out_row[column * channels + channel] = clip8(sum);
                 }
             }
-        }
+        });
         out
     }
+}
+
+/// Runs `work` over every row of `out`, shared over the host's threads.
+///
+/// A reference image is enlarged on a request's critical path, and a row of a pass reads the source
+/// and writes its own bytes alone, so the rows run side by side and change no byte.
+fn over_rows(out: &mut [u8], row_bytes: usize, work: impl Fn(usize, &mut [u8]) + Sync) {
+    let rows = out.len() / row_bytes.max(1);
+    let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(16));
+    let run = rows.div_ceil(workers).max(1);
+    let work = &work;
+    std::thread::scope(|scope| {
+        for (band, rows) in out.chunks_mut(run * row_bytes).enumerate() {
+            scope.spawn(move || {
+                for (row, bytes) in rows.chunks_exact_mut(row_bytes).enumerate() {
+                    work(band * run + row, bytes);
+                }
+            });
+        }
+    });
 }
 
 /// Pillow's `clip8`: the fixed-point sum's integer part clamped to a byte.

@@ -505,15 +505,40 @@ fn published_bytes(source: &models::video::MediaLocator) -> Result<Vec<u8>> {
 fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> {
     let area = height * width;
     let mut planes = vec![0_u8; frames * 3 * area];
-    for frame in 0..frames {
-        let pixels = &rgb[frame * area * 3..(frame + 1) * area * 3];
-        let plane = &mut planes[frame * 3 * area..(frame + 1) * 3 * area];
-        for (index, pixel) in pixels.chunks_exact(3).enumerate() {
-            plane[index] = pixel[0];
-            plane[area + index] = pixel[1];
-            plane[2 * area + index] = pixel[2];
+    // A reference image at its encoding size is seven million pixels on a request's critical path,
+    // so a frame's pixels are shared out in bands of its three planes.
+    let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(16));
+    let band = area.div_ceil(workers.div_ceil(frames.max(1))).max(1);
+    let mut bands = Vec::new();
+    for (frame, block) in planes.chunks_mut((3 * area).max(1)).enumerate() {
+        let (red, rest) = block.split_at_mut(area);
+        let (green, blue) = rest.split_at_mut(area);
+        let mut first = frame * area;
+        for ((red, green), blue) in red
+            .chunks_mut(band)
+            .zip(green.chunks_mut(band))
+            .zip(blue.chunks_mut(band))
+        {
+            let pixels = red.len();
+            bands.push((first, red, green, blue));
+            first += pixels;
         }
     }
+    let run = bands.len().div_ceil(workers).max(1);
+    std::thread::scope(|scope| {
+        for bands in bands.chunks_mut(run) {
+            scope.spawn(move || {
+                for (first, red, green, blue) in bands {
+                    let pixels = &rgb[*first * 3..(*first + red.len()) * 3];
+                    for (index, pixel) in pixels.chunks_exact(3).enumerate() {
+                        red[index] = pixel[0];
+                        green[index] = pixel[1];
+                        blue[index] = pixel[2];
+                    }
+                }
+            });
+        }
+    });
     planes
 }
 
@@ -643,6 +668,7 @@ fn read_conditions(
         sample_rows += samples;
     }
 
+    let began = std::time::Instant::now();
     let mut rgb = vec![0_u8; pixel_rows * 3];
     let mut pcm = vec![0_f32; sample_rows * 2];
     let decoded = media.read_conditions(
@@ -652,6 +678,7 @@ fn read_conditions(
             samples: (sample_rows > 0).then_some(pcm.as_mut_slice()),
         },
     )?;
+    let read_ms = began.elapsed().as_millis() as u64;
 
     // Each condition's own rows, in the regions the encoders read.
     let mut pixels_at = 0_usize;
@@ -743,6 +770,11 @@ fn read_conditions(
             patches_at += rows;
         }
     }
+    tracing::info!(
+        read_ms,
+        total_ms = began.elapsed().as_millis() as u64,
+        "the conditions were decoded and laid out"
+    );
     Ok(())
 }
 

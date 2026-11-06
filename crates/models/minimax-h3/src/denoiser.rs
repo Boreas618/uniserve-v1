@@ -2730,6 +2730,12 @@ impl Denoiser {
                 nn::Strides::new(&strides[1..]),
             )
         };
+        // A condition is encoded a clip at a time, each clip alone: a still is one clip of one
+        // frame, and a reference video its whole clips and a shorter last one.
+        let frame_count = u32::try_from(frames)
+            .map_err(|_| Error::config("a condition of more frames than u32 holds".to_owned()))?;
+        let clips = encoders.video.clips(frame_count)?;
+        let longest = clips.iter().map(|clip| clip.frames).max().unwrap_or(1);
         // A run's tiles are uniform (the seam split keeps every tile at the tile size), so one
         // buffer holds any tile of this run and its extents are the plan's largest.
         // The run's raster is the whole encoding's: the plan is the identity crop, so the raster's
@@ -2742,8 +2748,6 @@ impl Denoiser {
         let (origin, end) = plan.extent();
         let run_rows = u64::from(end - origin);
         let run_columns = u64::from(wider / crate::encoding::SPATIAL_RATIO);
-        let frame_count = u32::try_from(frames)
-            .map_err(|_| Error::config("a condition of more frames than u32 holds".to_owned()))?;
         let latent_frames = u64::from(encoders.video.latent_frames(frame_count)?);
         let (tile_height, tile_width) = plan.tiles.iter().fold((0_u64, 0_u64), |held, tile| {
             (
@@ -2753,47 +2757,70 @@ impl Denoiser {
         });
         let buffer = f.arena().tensor(
             DType::F32,
-            Shape::new(&[in_channels, frames, tile_height, tile_width]),
+            Shape::new(&[in_channels, u64::from(longest), tile_height, tile_width]),
         )?;
-        // Each tile's block of the piece's raster, which the encoding packs into `buffer` just before
-        // it reads it: one buffer serves every tile only because a tile is encoded before the next
-        // is copied, and copying them all first would encode the last tile's pixels every time.
-        let tiles = plan
-            .tiles
-            .iter()
-            .map(|tile| {
-                TensorView::with_strides(
-                    raster.offset_elements(
-                        u64::from(tile.rows.0) * compression * width
-                            + u64::from(tile.columns.0) * compression,
-                    ),
-                    raster.dtype,
-                    Shape::new(&[
-                        in_channels,
-                        frames,
-                        u64::from(tile.rows.1) * compression,
-                        u64::from(tile.columns.1) * compression,
-                    ]),
-                    raster.strides,
-                )
-            })
-            .collect::<Vec<_>>();
+        // Each tile's block of a clip of the piece's raster, which the encoding packs into `buffer`
+        // just before it reads it: one buffer serves every tile only because a tile is encoded
+        // before the next is copied, and copying them all first would encode the last tile's pixels
+        // every time.
+        let tiles_of = |first: u32, length: u32| {
+            plan.tiles
+                .iter()
+                .map(|tile| {
+                    TensorView::with_strides(
+                        raster.offset_elements(
+                            u64::from(first) * height * width
+                                + u64::from(tile.rows.0) * compression * width
+                                + u64::from(tile.columns.0) * compression,
+                        ),
+                        raster.dtype,
+                        Shape::new(&[
+                            in_channels,
+                            u64::from(length),
+                            u64::from(tile.rows.1) * compression,
+                            u64::from(tile.columns.1) * compression,
+                        ]),
+                        raster.strides,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
 
         let moment_channels = 2 * video_channels;
         let run = f.arena().tensor(
             DType::F32,
             Shape::new(&[moment_channels, latent_frames, run_rows, run_columns]),
         )?;
-        clip.encode(
-            f,
-            &encoders.video,
-            &plan,
-            crate::tiled_encode::Scene {
-                pixels: &tiles,
-                packed: Some(buffer),
-                blended: run,
-            },
-        )?;
+        // One reservation for every clip, at the widest clip's blocks, then each clip into its own
+        // latent frames of the run.
+        let lengths: Vec<u32> = clips.iter().map(|clip| clip.frames).collect();
+        let widest = clips.iter().map(|clip| clip.latents).max().unwrap_or(1);
+        let widest = TensorView::with_strides(
+            run.element(&[0, 0, 0, 0]),
+            DType::F32,
+            Shape::new(&[moment_channels, u64::from(widest), run_rows, run_columns]),
+            run.strides,
+        );
+        let reserved = clip.reserve(f, &encoders.video, &plan, &lengths, widest)?;
+        for span in &clips {
+            let blended = TensorView::with_strides(
+                run.element(&[0, u64::from(span.latent), 0, 0]),
+                DType::F32,
+                Shape::new(&[moment_channels, u64::from(span.latents), run_rows, run_columns]),
+                run.strides,
+            );
+            clip.encode_in(
+                f,
+                &encoders.video,
+                &plan,
+                crate::tiled_encode::Scene {
+                    pixels: &tiles_of(span.first, span.frames),
+                    packed: Some(buffer),
+                    blended,
+                },
+                &reserved,
+            )?;
+        }
 
         // `quant_conv` once over the stitched raster, then the posterior's sample: the moments in,
         // the normalised latent out at half their width.
