@@ -1534,20 +1534,16 @@ def _restart_while_streaming(
         120,
         "the replaced daemon did not exit",
     )
-    assert _runs(successor)
+    # The one-body restart replaced `successor` in turn, so the daemon that
+    # serves now is the last of them.
+    assert _runs(successors[-1])
     status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
     assert status["deployment"]["engine"] == "ready", status
     assert _pids(log, "Engine") == engines_before
     lines = _log_lines(log)
     assert any("the engine attached" in line for line in lines)
-    # The workers read the checkpoint once, when the deployment started.
-    assert (
-        sum(
-            "uniserve.loading.rank: loaded numerical model" in line
-            for line in lines
-        )
-        == 1
-    )
+    # The main process read the checkpoint once, when the deployment started.
+    assert sum("the epoch's retained weights" in line for line in lines) == 1
     events = httpx.get(f"{base_url}/admin/events?after=0", timeout=10).json()
     messages = [event["message"] for event in events["events"]]
     assert any("after a hot restart" in message for message in messages), (
