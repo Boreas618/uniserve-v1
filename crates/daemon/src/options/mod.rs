@@ -1344,7 +1344,6 @@ impl ServeConfig {
     /// `u32` fields; and when the deployment file cannot be read.
     pub fn engine_spec(&self) -> anyhow::Result<wire::EngineSpec> {
         let graphs = &self.cuda_graph_config;
-        let flashinfer = &self.flashinfer_config;
         let kv_cache = &self.kv_cache_config;
         let worker = &self.worker_config;
         let text = |path: &Option<PathBuf>| {
@@ -1357,7 +1356,6 @@ impl ServeConfig {
                 .with_context(|| format!("`{option}` exceeds the worker field width"))
         };
         let scheduling = wire::Scheduling {
-            policy: word(&self.scheduler_config.policy),
             max_batch: bounded(
                 self.scheduler_config.max_batch.get(),
                 "scheduler_config.max_batch",
@@ -1376,8 +1374,6 @@ impl ServeConfig {
                 .chunked_prefill_size
                 .map(|size| bounded(size.get(), "scheduler_config.chunked_prefill_size"))
                 .transpose()?,
-            expected_speedup: self.speculative_config.expected_speedup,
-            refill_token_cost: self.speculative_config.refill_token_cost,
         };
         Ok(wire::EngineSpec {
             // A deployment is what one leader serves under its served name.
@@ -1471,15 +1467,6 @@ impl ServeConfig {
                     &graphs.prefill_token_sizes,
                 )?,
                 flow_shapes: distinct("cuda_graph_config.flow_shapes", &graphs.flow_shapes)?,
-            }),
-            flashinfer: Some(wire::FlashInfer {
-                workspace_size: flashinfer.workspace_size,
-                use_tensor_core: flashinfer.use_tensor_core,
-                decode_backend: flashinfer.decode_backend.as_str().to_owned(),
-                prefill_backend: flashinfer.prefill_backend.as_str().to_owned(),
-                decode_split_tile_size: flashinfer.decode_split_tile_size.map(NonZeroU32::get),
-                prefill_split_tile_size: flashinfer.prefill_split_tile_size.map(NonZeroU32::get),
-                split_kv: flashinfer.split_kv,
             }),
             // Video workers size resident media state for the longest
             // duration served and provision only the frame counts the API

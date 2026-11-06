@@ -208,16 +208,6 @@ pub struct LaunchDescriptor {
     pub video_aspect_ratios: Vec<String>,
     pub canvas_sampling: Option<CanvasSampling>,
 
-    /// FlashInfer attention options, in bytes and backend names.
-    pub flashinfer_workspace_size: u64,
-    /// `None` lets the backend decide.
-    pub flashinfer_use_tensor_core: Option<bool>,
-    pub flashinfer_decode_backend: String,
-    pub flashinfer_prefill_backend: String,
-    pub flashinfer_decode_split_tile_size: Option<u32>,
-    pub flashinfer_prefill_split_tile_size: Option<u32>,
-    pub flashinfer_disable_split_kv: bool,
-
     /// Whether the fence probes record: the device switch's initial state.
     #[serde(default)]
     pub fence_probes: bool,

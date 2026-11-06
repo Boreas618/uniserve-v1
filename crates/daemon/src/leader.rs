@@ -3574,8 +3574,7 @@ mod tests {
         use super::configurable;
         use proto::request::wire;
 
-        let scheduling = |policy: &str, batch, tokens: Option<u32>, running| wire::Scheduling {
-            policy: policy.to_owned(),
+        let scheduling = |batch, tokens: Option<u32>, running| wire::Scheduling {
             max_batch: batch,
             max_num_batched_tokens: tokens,
             max_running_requests: running,
@@ -3585,16 +3584,15 @@ mod tests {
             scheduling: Some(scheduling),
             ..Default::default()
         };
-        let served = spec(scheduling("fcfs", 128, None, 128));
+        let served = spec(scheduling(128, None, 128));
         let capacity = wire::BatchCapacity {
             max_batch: 128,
             max_num_batched_tokens: 8192,
             max_running_requests: 128,
         };
         let within = [
-            spec(scheduling("fcfs", 64, Some(4096), 64)),
-            spec(scheduling("priority", 128, None, 128)),
-            spec(scheduling("fcfs", 128, Some(8192), 128)),
+            spec(scheduling(64, Some(4096), 64)),
+            spec(scheduling(128, Some(8192), 128)),
         ];
         for updated in &within {
             assert!(
@@ -3604,9 +3602,9 @@ mod tests {
             assert!(!configurable(&served, updated, None), "{updated:?}");
         }
         let beyond = [
-            spec(scheduling("fcfs", 256, None, 128)),
-            spec(scheduling("fcfs", 128, Some(16384), 128)),
-            spec(scheduling("fcfs", 128, None, 256)),
+            spec(scheduling(256, None, 128)),
+            spec(scheduling(128, Some(16384), 128)),
+            spec(scheduling(128, None, 256)),
             served.clone(),
             wire::EngineSpec {
                 cuda_graphs: Some(wire::CudaGraphs::default()),
@@ -3621,10 +3619,10 @@ mod tests {
         }
         // A step's tokens the served spec states cannot return to the
         // engine's default in place.
-        let stated = spec(scheduling("fcfs", 128, Some(4096), 128));
+        let stated = spec(scheduling(128, Some(4096), 128));
         assert!(!configurable(
             &stated,
-            &spec(scheduling("priority", 128, None, 128)),
+            &spec(scheduling(128, None, 128)),
             Some(&capacity)
         ));
     }
