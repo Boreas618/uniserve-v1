@@ -298,7 +298,45 @@ impl Communicator {
         let _guard = self.context.enter()?;
 
         let api = api()?;
-        let all_to_all = api.all_to_all.clone()?;
+        // `ncclAlltoAll` is a late addition to NCCL (2.28), and what it does is a group of paired
+        // sends and receives, so a library without the symbol moves the same bytes the same way.
+        let Ok(all_to_all) = api.all_to_all.clone() else {
+            let block = elements_bytes(count, dtype)?;
+            // SAFETY: group calls take no arguments and nest per thread.
+            api.check(unsafe { (api.group_start)() }, "ncclGroupStart")?;
+            let mut posted = Ok(());
+            for peer in 0..self.size {
+                let offset = block * peer as usize;
+                // SAFETY: as in `all_reduce`, block `peer` of both buffers holds `count` elements.
+                let sent = unsafe {
+                    (api.send)(
+                        pointer(send.ptr().offset(offset)?),
+                        count,
+                        dtype.nccl(),
+                        peer,
+                        self.raw,
+                        stream.handle(),
+                    )
+                };
+                // SAFETY: as above.
+                let received = unsafe {
+                    (api.recv)(
+                        pointer(recv.ptr().offset(offset)?),
+                        count,
+                        dtype.nccl(),
+                        peer,
+                        self.raw,
+                        stream.handle(),
+                    )
+                };
+                posted = posted
+                    .and(api.check(sent, "ncclSend"))
+                    .and(api.check(received, "ncclRecv"));
+            }
+            // SAFETY: balances the start above on the same thread.
+            let ended = api.check(unsafe { (api.group_end)() }, "ncclGroupEnd");
+            return posted.and(ended);
+        };
         // SAFETY: as in `all_reduce`, with `size * count` elements in both.
         let status = unsafe {
             all_to_all(

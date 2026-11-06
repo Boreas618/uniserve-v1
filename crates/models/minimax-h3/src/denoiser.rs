@@ -65,6 +65,8 @@ pub struct Arrangement {
     pub condition_rows: u32,
     /// Rows of one sequence shard: the Ulysses degree.
     pub shard: u32,
+    /// This rank's place in the shard: which interval of the packed rows it owns.
+    pub rank: u32,
 }
 
 impl Arrangement {
@@ -92,7 +94,14 @@ impl Arrangement {
             text_rows,
             condition_rows,
             shard,
+            rank: 0,
         })
+    }
+
+    /// The same arrangement, for the rank at `rank` of the shard.
+    pub const fn at_rank(mut self, rank: u32) -> Self {
+        self.rank = rank;
+        self
     }
 }
 
@@ -492,7 +501,12 @@ impl Layouts {
         let rows = u64::from(packing.padded_tokens);
         let video = u64::from(packing.video_rows);
         let audio = u64::from(packing.audio_rows);
-        let mut tables = vec![
+        let (video_rows, audio_rows) = dense_rows(&packing);
+        let mut tables = owned_tables(
+            self.owned_rows(rows, &video_rows).0.len() as u64,
+            self.owned_rows(rows, &audio_rows).0.len() as u64,
+        );
+        tables.extend([
             // The row each modality's projected latents are scattered into: the layout places the
             // video rows first and the audio rows after them.
             StateTable {
@@ -567,9 +581,31 @@ impl Layouts {
                 dtype: DType::I32,
                 shape: Shape::new(&[1]),
             },
-        ];
+        ]);
         tables.sort_by_key(|table| table.name);
         Ok(tables)
+    }
+
+    /// The rows of one modality this rank owns: `(sources, slots)`.
+    ///
+    /// `packed` holds each of the modality's rows' place in the packed sequence, in the modality's
+    /// own order. A rank owns one contiguous `rows / shard` interval of the packed sequence, so
+    /// `sources[i]` is the modality row a rank projects and `slots[i]` the row of its own interval
+    /// that row lands in. At one rank every row is owned and the two are the identity and `packed`.
+    fn owned_rows(&self, rows: u64, packed: &[i32]) -> (Vec<i32>, Vec<i32>) {
+        let shard = u64::from(self.arrangement.shard.max(1));
+        let local = rows / shard;
+        let first = u64::from(self.arrangement.rank) * local;
+        let mut sources = Vec::new();
+        let mut slots = Vec::new();
+        for (index, row) in packed.iter().enumerate() {
+            let row = *row as u64;
+            if row >= first && row < first + local {
+                sources.push(index as i32);
+                slots.push((row - first) as i32);
+            }
+        }
+        (sources, slots)
     }
 
     /// The tables a sparse layout needs, in the order [`Layouts::write_state`] fills them.
@@ -584,7 +620,12 @@ impl Layouts {
         let tiles = u64::from(extent.padded_tokens / extent.tile);
         let video = u64::from(extent.video_grid.0 * extent.video_grid.1 * extent.video_grid.2);
         let audio = u64::from(extent.audio_rows);
-        let mut tables = vec![
+        let (video_rows, audio_rows) = segment_rows(&packed);
+        let mut tables = owned_tables(
+            self.owned_rows(rows, &video_rows).0.len() as u64,
+            self.owned_rows(rows, &audio_rows).0.len() as u64,
+        );
+        tables.extend([
             StateTable {
                 name: "audio_indices",
                 dtype: DType::I32,
@@ -660,7 +701,7 @@ impl Layouts {
                 dtype: DType::I32,
                 shape: Shape::new(&[tiles]),
             },
-        ];
+        ]);
         tables.sort_by_key(|table| table.name);
         Ok(tables)
     }
@@ -722,25 +763,21 @@ impl Layouts {
             .iter()
             .map(|size| *size as i32)
             .collect();
-        let audio: Vec<i32> = packing.audio_indices().map(|row| row as i32).collect();
-        // The table is read in raster order: the patch writes raster rows, the scatter puts row `r`
-        // at `table[r]`, and the gather before the head reads them back. So it holds the packed row
-        // of each raster row, which is what orders a sparse layout's video rows tile-major.
-        let mut video = vec![0_i32; packing.video_indices.len()];
-        for (packed, raster) in packing
-            .video_indices
-            .iter()
-            .zip(&packing.video_raster_indices)
-        {
-            video[*raster as usize] = *packed as i32;
-        }
+        let (video, audio) = segment_rows(&packing);
+        let packed_rows = u64::from(packing.extent.padded_tokens);
+        let (video_sources, video_slots) = self.owned_rows(packed_rows, &video);
+        let (audio_sources, audio_slots) = self.owned_rows(packed_rows, &audio);
         // The refiner's document: one prompt, so its queries are every padded row and its keys stop
         // at the prompt's last row. The prompt's row count is the media clock's own start.
         let refiner_q = integers(&[0, layout.text_rows as i32]);
         let refiner_k = integers(&[0, request.text_tokens as i32]);
-        let filled: [(&str, Vec<u8>); 12] = [
+        let filled: [(&str, Vec<u8>); 16] = [
             ("audio_indices", integers(&audio)),
+            ("audio_slots", integers(&audio_slots)),
+            ("audio_sources", integers(&audio_sources)),
             ("video_indices", integers(&video)),
+            ("video_slots", integers(&video_slots)),
+            ("video_sources", integers(&video_sources)),
             ("groups", integers(&tables.groups)),
             ("refiner_cu_seq_lens_q", refiner_q.clone()),
             ("refiner_cu_seq_lens_k", refiner_k.clone()),
@@ -832,18 +869,10 @@ impl Layouts {
             &[],
         )?;
         let rows = tables.groups.len();
-        let video_rows = packing.video_rows as usize;
-        let audio_rows = packing.audio_rows as usize;
-        // The layout places the video rows first and the audio rows after them, so each modality's
-        // scatter indices are its own contiguous range.
-        let mut video_indices = Vec::with_capacity(video_rows);
-        let mut audio_indices = Vec::with_capacity(audio_rows);
-        for index in 0..video_rows {
-            video_indices.push(index as i32);
-        }
-        for index in 0..audio_rows {
-            audio_indices.push((video_rows + index) as i32);
-        }
+        let (video_indices, audio_indices) = dense_rows(&packing);
+        let packed_rows = u64::from(packing.padded_tokens);
+        let (video_sources, video_slots) = self.owned_rows(packed_rows, &video_indices);
+        let (audio_sources, audio_slots) = self.owned_rows(packed_rows, &audio_indices);
         // One sequence: every query row sees the used key rows and no query sees a padding row.
         let queries = [0, rows as i32];
         let keys = [0, tables.used as i32];
@@ -854,7 +883,11 @@ impl Layouts {
         let refiner_q = integers(&[0, layout.text_rows as i32]);
         for (name, bytes) in [
             ("audio_indices", integers(&audio_indices)),
+            ("audio_slots", integers(&audio_slots)),
+            ("audio_sources", integers(&audio_sources)),
             ("video_indices", integers(&video_indices)),
+            ("video_slots", integers(&video_slots)),
+            ("video_sources", integers(&video_sources)),
             ("cu_seq_lens_k", integers(&keys)),
             ("cu_seq_lens_q", integers(&queries)),
             ("refiner_cu_seq_lens_k", refiner_k),
@@ -903,6 +936,50 @@ impl Layouts {
         }
         Ok(())
     }
+}
+
+/// The four tables that say which modality rows a rank owns (`Layouts::owned_rows`).
+fn owned_tables(video: u64, audio: u64) -> Vec<StateTable> {
+    [
+        ("audio_slots", audio),
+        ("audio_sources", audio),
+        ("video_slots", video),
+        ("video_sources", video),
+    ]
+    .into_iter()
+    .map(|(name, rows)| StateTable {
+        name,
+        dtype: DType::I32,
+        shape: Shape::new(&[rows]),
+    })
+    .collect()
+}
+
+/// Each modality's rows' places in a dense packing: `(video, audio)`.
+///
+/// The layout places the video rows first and the audio rows after them, so each modality's scatter
+/// indices are its own contiguous range.
+fn dense_rows(packing: &DensePacking) -> (Vec<i32>, Vec<i32>) {
+    let video = packing.video_rows as i32;
+    let audio = packing.audio_rows as i32;
+    ((0..video).collect(), (video..video + audio).collect())
+}
+
+/// Each modality's rows' places in a segment packing: `(video, audio)`.
+///
+/// The video table is read in raster order: the patch writes raster rows, the scatter puts row `r`
+/// at `table[r]`, and the gather before the head reads them back. So it holds the packed row of each
+/// raster row, which is what orders a sparse layout's video rows tile-major.
+fn segment_rows(packing: &packing::SegmentPacking) -> (Vec<i32>, Vec<i32>) {
+    let mut video = vec![0_i32; packing.video_indices.len()];
+    for (packed, raster) in packing
+        .video_indices
+        .iter()
+        .zip(&packing.video_raster_indices)
+    {
+        video[*raster as usize] = *packed as i32;
+    }
+    (video, packing.audio_indices().map(|row| row as i32).collect())
 }
 
 /// Where each modality's initial noise begins in the request's one Philox stream.
@@ -985,45 +1062,21 @@ fn audio_steps(rows: u32) -> Result<u32> {
         })
 }
 
-/// The stream offsets one rank's video and audio draws start at.
+/// The stream offsets a request's video and audio draws start at.
 ///
 /// A request's noise is **one stream addressed by element** (`denoiser.py:452-500`): the visual
-/// conditions' draws first, then the video's rows, then the audio's. Every rank draws its own rows
-/// of that same stream, so each offset advances by the rank's **global** first row. A shard's own
-/// row count, or a row width that is not multiplied in, puts rank 1's draw on rank 0's elements:
-/// at one rank the picture is right, at two it is wrong per rank and the aggregate looks plausible.
-fn draw_offsets(layout: Layout, audio_width: u64, rank: u32, shard: u32) -> Result<(u64, u64)> {
-    let shard = u64::from(shard.max(1));
-    let rank = u64::from(rank);
-    if rank >= shard {
-        return Err(Error::config(format!(
-            "rank {rank} is outside a shard of {shard}"
-        )));
-    }
-    let first_row = |rows: u64| rank * rows / shard;
+/// conditions' draws first, then the video's rows, then the audio's. Every rank of a Ulysses group
+/// holds the whole sample and draws the whole stream, so these are one pair for the group and every
+/// rank's trajectory starts from the same numbers a single rank's does.
+fn draw_offsets(layout: Layout) -> (u64, u64) {
+    let video = u64::from(layout.condition_elements);
     // One packed row is a 2x2 patch of one latent frame, so it covers four voxels' channels.
-    let row_elements = u64::from(layout.video.channels) * 4;
-    let video_rows = u64::from(layout.video.frames)
+    let elements = u64::from(layout.video.frames)
         * u64::from(layout.video.height / 2)
-        * u64::from(layout.video.width / 2);
-    let condition = u64::from(layout.condition_elements);
-    let video = condition + first_row(video_rows) * row_elements;
-    let audio_rows = audio_elements(layout)? / audio_width;
-    let audio = condition + video_rows * row_elements + first_row(audio_rows) * audio_width;
-    Ok((video, audio))
-}
-
-/// Elements of the audio latent a layout holds: `AUDIO_CHANNELS * audio_channels * steps`, the
-/// stereo pair of channel planes packed channel-major.
-///
-/// A rank's share of the *draw* is a share of the rows, not of the elements: the denoiser reads the
-/// latent as `[AUDIO_CHANNELS * steps, audio_channels]`, so `elements / audio_channels` rows is the
-/// row count a rank splits and a row is `audio_channels` elements wide.
-fn audio_elements(layout: Layout) -> Result<u64> {
-    let audio = layout
-        .audio
-        .ok_or_else(|| Error::config("a layout without audio has no audio stream".to_owned()))?;
-    Ok(u64::from(audio.channels) * u64::from(audio.frames))
+        * u64::from(layout.video.width / 2)
+        * u64::from(layout.video.channels)
+        * 4;
+    (video, video + elements)
 }
 
 /// The canvas a request is laid out at, rounded up to the model's 32-pixel grid.
@@ -1534,8 +1587,6 @@ impl nn::capability::Denoiser for Denoiser {
         let fold = crate::conditioning::fold_bytes(
             &self.config.transformer,
             rows,
-            rows,
-            self.shard,
             self.transformer.dtype(),
         );
         Ok(evaluation.max(fold))
@@ -1574,18 +1625,8 @@ impl nn::capability::Denoiser for Denoiser {
         out: nn::capability::Latents,
     ) -> nn::Result<()> {
         // One stream per request, addressed by element: the conditions' own draws first, then the
-        // video latents, then the audio latents. A shard's first row is not element zero, so each
-        // modality's offset carries the rank's global first row (`draw_offsets`).
-        let (video_offset, audio_offset) = draw_offsets(
-            layout,
-            u64::from(self.config.transformer.audio_channels),
-            self.rank,
-            self.shard,
-        )
-        .map_err(flattened)?;
-        // A rank splits the audio latent by rows, as it splits the video's, and a row is
-        // `audio_channels` elements: an offset that forgot the width would put every rank after the
-        // first at the wrong place of the stream, and at one rank nothing would show.
+        // video latents, then the audio latents.
+        let (video_offset, audio_offset) = draw_offsets(layout);
         // A layout with an audio stream and no audio latents would draw the video's noise and leave
         // the audio's undrawn, which is a silent disagreement rather than an absent stream.
         match (layout.audio, out.audio) {
@@ -1770,8 +1811,10 @@ impl nn::capability::Denoiser for Denoiser {
 }
 
 /// The state tables of a dense layout, in `table_specs`' order (sorted by name).
-const DENSE_TABLES: [&str; 12] = [
+const DENSE_TABLES: [&str; 16] = [
     "audio_indices",
+    "audio_slots",
+    "audio_sources",
     "cu_seq_lens_k",
     "cu_seq_lens_q",
     "groups",
@@ -1783,6 +1826,8 @@ const DENSE_TABLES: [&str; 12] = [
     "step",
     "token_tags",
     "video_indices",
+    "video_slots",
+    "video_sources",
 ];
 
 /// The state tables of a segment layout, in `segment_table_specs`' order (sorted by name).
@@ -1790,8 +1835,10 @@ const DENSE_TABLES: [&str; 12] = [
 /// A segment layout has no `cu_seq_lens` pair and carries four tables a dense one does not, so the
 /// two sets do not share positions: a name resolved against the wrong set silently reads another
 /// tensor. [`Tables`] picks the set from the deployment's attention kind for exactly that reason.
-const SEGMENT_TABLES: [&str; 14] = [
+const SEGMENT_TABLES: [&str; 18] = [
     "audio_indices",
+    "audio_slots",
+    "audio_sources",
     "groups",
     "modulation_indices",
     "position_ids",
@@ -1805,6 +1852,8 @@ const SEGMENT_TABLES: [&str; 14] = [
     "token_tags",
     "variable_block_sizes",
     "video_indices",
+    "video_slots",
+    "video_sources",
 ];
 
 /// A rank-one row table as the rows of width one a row gather moves.
@@ -1931,13 +1980,17 @@ pub fn denoise_arena(
     // One rank's share of the heads; the exchange's buffers are per rank, as the layers are.
     let local_heads = heads / u64::from(arrangement.shard);
     let groups = u64::from(groups);
-    let tokens = u64::from(packed_rows(config, arrangement, layout)?);
+    let total = u64::from(packed_rows(config, arrangement, layout)?);
+    // The rows a rank owns: everything before the attention's exchange, and everything after it.
+    let tokens = total / u64::from(arrangement.shard.max(1));
     let channels = u64::from(layout.video.channels);
     let frames = u64::from(layout.video.frames);
     let height = u64::from(layout.video.height);
     let columns = u64::from(layout.video.width);
     // The `1x2x2` patch: one row per latent frame and each pair of rows and columns.
     let video_rows = frames * (height / 2) * (columns / 2);
+    // A rank's share of them, at most its whole interval.
+    let own_video = video_rows.min(tokens);
     let patches = channels * 4;
     let rotated = u64::from(transformer.rope_frequency_dim) * 3;
     let audio = layout.audio.map(|audio| {
@@ -1992,14 +2045,17 @@ pub fn denoise_arena(
     // (`precision.py:106-117`, pinned at load) and read the widened FP32 rows, and the one rounding
     // into the packed rows is the narrowing that follows them.
     push(&mut plan, "patched", "f32", video_rows * patches);
-    push(&mut plan, "video.projected", "f32", video_rows * hidden);
+    push(&mut plan, "video.owned", "f32", own_video * patches);
+    push(&mut plan, "video.projected", "f32", own_video * hidden);
     push(
         &mut plan,
         "video.projected.stack",
         element,
-        video_rows * hidden,
+        own_video * hidden,
     );
-    if let Some((audio_rows, _)) = audio {
+    if let Some((audio_rows, audio_features)) = audio {
+        let audio_rows = audio_rows.min(tokens);
+        push(&mut plan, "audio.owned", "f32", audio_rows * audio_features);
         push(&mut plan, "audio.projected", "f32", audio_rows * hidden);
         push(
             &mut plan,
@@ -2008,8 +2064,8 @@ pub fn denoise_arena(
             audio_rows * hidden,
         );
     }
-    push(&mut plan, "cosine", "f32", tokens * rotated);
-    push(&mut plan, "sine", "f32", tokens * rotated);
+    push(&mut plan, "cosine", "f32", total * rotated);
+    push(&mut plan, "sine", "f32", total * rotated);
 
     // The stack: the step's gathered modulation, one alternate residual buffer, and the scratch
     // every layer shares.
@@ -2025,44 +2081,27 @@ pub fn denoise_arena(
     push(&mut plan, "update", element, tokens * hidden);
     push(&mut plan, "mlp.packed", element, tokens * 2 * ffn);
     push(&mut plan, "mlp", element, tokens * ffn);
+    let local = local_heads * head_dim;
     match config.attention {
         crate::config::AttentionKind::Dense => {
-            let inner = heads * head_dim;
-            let local = local_heads * head_dim;
-            for name in ["query", "key", "value", "rotated_query", "rotated_key"] {
+            for name in ["query", "key", "value", "rotated_query", "rotated_key", "attended"] {
                 push(
                     &mut plan,
                     &format!("attention.{name}"),
                     element,
-                    tokens * inner,
+                    total * local,
                 );
-            }
-            push(&mut plan, "attention.attended", element, tokens * local);
-            // A layer that does not communicate reserves nothing for the exchange: the three
-            // destinations and the gathered result are views of the buffers above, so one rank's
-            // plan is four entries shorter - 2.2 GiB at a served canvas.
-            if arrangement.shard > 1 {
-                for name in ["exchanged_query", "exchanged_key", "exchanged_value"] {
-                    push(
-                        &mut plan,
-                        &format!("attention.{name}"),
-                        element,
-                        tokens * local,
-                    );
-                }
-                push(&mut plan, "attention.gathered", element, tokens * inner);
             }
         }
         crate::config::AttentionKind::Sparse { .. } => {
-            let inner = local_heads * head_dim;
             // The segment packing rounds the rows to whole tiles, so this divides exactly.
-            let tiles = tokens / u64::from(config.attention.capacity_rows());
+            let tiles = total / u64::from(config.attention.capacity_rows());
             for name in ["query", "key", "value", "gate", "fine"] {
                 push(
                     &mut plan,
                     &format!("attention.{name}"),
                     element,
-                    tokens * inner,
+                    total * local,
                 );
             }
             for name in ["pooled_query", "pooled_key", "pooled_value"] {
@@ -2094,12 +2133,21 @@ pub fn denoise_arena(
             );
         }
     }
+    // A layer that does not communicate reserves nothing for it: the exchange's staging and the
+    // merged rows are views of buffers a rank of one already holds. The gather mode adds the whole
+    // sequence's normalized rows.
+    if arrangement.shard > 1 {
+        let inner = heads * head_dim;
+        push(&mut plan, "attention.staging", element, tokens * inner);
+        push(&mut plan, "attention.merged", element, tokens * inner);
+        push(&mut plan, "attention.gathered", element, total * hidden);
+    }
 
     // Each modality's head, in the order the forward reaches them: the norm, then a student's
     // gathered weight and bias.
     let student = u64::from(transformer.output_heads) > 1;
     head(
-        &mut plan, element, hidden, student, "video", video_rows, patches,
+        &mut plan, element, hidden, student, "video", own_video, patches,
     );
 
     // The output's modulation and the solver's one staging word.
@@ -2109,16 +2157,23 @@ pub fn denoise_arena(
 
     // The video step: the rows gathered out of the packed sequence, their groups, the velocity
     // at the patch width, and the velocity the solver writes into the latents from.
-    push(&mut plan, "video.hidden", element, video_rows * hidden);
-    push(&mut plan, "video.groups", "i32", video_rows);
+    push(&mut plan, "video.hidden", element, own_video * hidden);
+    push(&mut plan, "video.groups", "i32", own_video);
     // The prediction is FP32 from the head (`transformer.py:404-421`) and the solver reads one type
     // for the sample and the velocity, so neither of these is the stack's element type.
     push(
         &mut plan,
         "video.velocity_rows",
         "f32",
-        video_rows * patches,
+        own_video * patches,
     );
+    if arrangement.shard > 1 {
+        // The rows every member predicted, collected: a rank's in its own interval, then the whole
+        // sequence's, then the modality's in raster order.
+        push(&mut plan, "video.velocity_owned", "f32", tokens * patches);
+        push(&mut plan, "video.velocity_packed", "f32", total * patches);
+        push(&mut plan, "video.velocity_all", "f32", video_rows * patches);
+    }
     push(
         &mut plan,
         "video.velocity",
@@ -2126,23 +2181,29 @@ pub fn denoise_arena(
         channels * frames * height * columns,
     );
     if let Some((audio_rows, audio_features)) = audio {
+        let own_audio = audio_rows.min(tokens);
         head(
             &mut plan,
             element,
             hidden,
             student,
             "audio",
-            audio_rows,
+            own_audio,
             audio_features,
         );
-        push(&mut plan, "audio.hidden", element, audio_rows * hidden);
-        push(&mut plan, "audio.groups", "i32", audio_rows);
+        push(&mut plan, "audio.hidden", element, own_audio * hidden);
+        push(&mut plan, "audio.groups", "i32", own_audio);
         push(
             &mut plan,
             "audio.velocity",
             "f32",
-            audio_rows * audio_features,
+            own_audio * audio_features,
         );
+        if arrangement.shard > 1 {
+            push(&mut plan, "audio.velocity_owned", "f32", tokens * audio_features);
+            push(&mut plan, "audio.velocity_packed", "f32", total * audio_features);
+            push(&mut plan, "audio.velocity_all", "f32", audio_rows * audio_features);
+        }
     }
     Ok(plan)
 }
@@ -2217,6 +2278,21 @@ impl Denoiser {
             u64::from(config.hidden_size),
         )?);
         programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(SAMPLE_DTYPE, 1)?);
+        // The rows of each modality's sample this rank owns, gathered at the sample's own widths;
+        // under Ulysses the predicted rows are placed in the rank's interval and gathered back the
+        // same way once every member's have arrived.
+        let widths = [4 * u64::from(video), u64::from(config.audio_channels)];
+        for width in widths {
+            programs
+                .launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(SAMPLE_DTYPE, width)?);
+            if partition.ulysses_degree > 1 {
+                programs.launch::<ops::rows::Rows>(&nn::layers::Rows::descriptor_of(
+                    SAMPLE_DTYPE,
+                    ops::rows::Mode::Replace,
+                    width as u32,
+                ));
+            }
+        }
 
         // The conditioner's anchor mix over a patch's own columns, and the refine-in-place copy over a
         // text row's.
@@ -2647,9 +2723,7 @@ impl Denoiser {
         let rows = text.shape.dim(0).min(u64::from(self.refiner.rows()));
         let source = row_range(source, 0, rows)?;
         let text = row_range(text, 0, rows)?;
-        let total = u32::try_from(rows)
-            .map_err(|_| Error::checkpoint("a conditioning row count above u32::MAX".to_owned()))?;
-        self.refiner.forward(f, source, &documents, total, text)?;
+        self.refiner.forward(f, source, &documents, text)?;
         if let Some(trace) = trace {
             // The prompt's rows only: whatever the refiner wrote above them is unreachable and a
             // report that compared it would differ with nothing wrong.
@@ -2989,14 +3063,34 @@ impl Denoiser {
         // `target_f32_source_bf16`, 5376 wide).
         let arena = f.arena();
 
+        // This rank owns one contiguous interval of the packed rows, and the sample and the tables
+        // are the whole sequence's on every rank: a table a row reads is cut to the interval here,
+        // and each modality's owned rows are named by the rank's own `*_sources` and `*_slots`.
+        let shard = u64::from(self.shard.max(1));
+        if !tokens.is_multiple_of(shard) {
+            return Err(Error::config(format!(
+                "{tokens} packed rows do not divide over {shard} ranks"
+            )));
+        }
+        let local = tokens / shard;
+        let first = u64::from(self.rank) * local;
+        let own = |table: TensorView| {
+            table
+                .at(table.offset_elements(first))
+                .reshape(Shape::new(&[local]))
+        };
+
         // The packed rows: every row gathers its prefix source, so a generated row reads the zero
         // row and a text row reads itself.
-        let hidden = arena.tensor(dtype, Shape::new(&[tokens, hidden_size]))?;
-        nn::layers::gather_rows(f, cond.text, tables.get("prefix_index")?, hidden)?;
+        let hidden = arena.tensor(dtype, Shape::new(&[local, hidden_size]))?;
+        nn::layers::gather_rows(f, cond.text, own(tables.get("prefix_index")?), hidden)?;
 
         // The video rows: patchify, project, scatter.
         let video_indices = tables.get("video_indices")?;
         let video_rows = u64::from(video_indices.shape.dim(0) as u32);
+        let video_sources = tables.get("video_sources")?;
+        let video_slots = tables.get("video_slots")?;
+        let own_video = video_sources.shape.dim(0);
         // **The sample is the latent's own type, and the stack is the checkpoint's.** The reference
         // keeps its trajectory in FP32 (`denoiser.py:1206-1216` refuses anything else) and rounds
         // only inside a launch, so the boundary is crossed twice per evaluation and each crossing is
@@ -3015,11 +3109,15 @@ impl Denoiser {
         // The reference projects with `output_dtype=torch.float32` and narrows afterwards
         // (`denoiser.py:1216-1221`): the projection's weights are the checkpoint's, its activation
         // and its output are FP32, and the one rounding into the packed rows is the narrowing.
-        let projected = arena.tensor(DType::F32, Shape::new(&[video_rows, hidden_size]))?;
-        self.transformer.project(f, patched, projected)?;
-        let narrowed = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
-        nn::layers::ScaledAdd.forward(f, narrowed, projected, 1.0, 0.0)?;
-        nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, narrowed, video_indices)?;
+        if own_video > 0 {
+            let owned = arena.tensor(sample_dtype, Shape::new(&[own_video, channels * 4]))?;
+            nn::layers::gather_rows(f, patched, video_sources, owned)?;
+            let projected = arena.tensor(DType::F32, Shape::new(&[own_video, hidden_size]))?;
+            self.transformer.project(f, owned, projected)?;
+            let narrowed = arena.tensor(dtype, Shape::new(&[own_video, hidden_size]))?;
+            nn::layers::ScaledAdd.forward(f, narrowed, projected, 1.0, 0.0)?;
+            nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, narrowed, video_slots)?;
+        }
 
         // One audio stream or none. A layout with audio rows and no audio latents would otherwise
         // denoise the video and return it without sound, and a missing table where the layout has
@@ -3057,18 +3155,24 @@ impl Denoiser {
                 Shape::new(&[audio_rows, features]),
                 nn::Strides::new(&[features, 1]),
             );
-            // The audio's own two crossings, for the reason the video's: the latent is the sample's
-            // type and the projection's FP32 output is narrowed into the packed rows.
-            let projected = arena.tensor(DType::F32, Shape::new(&[audio_rows, hidden_size]))?;
-            self.transformer.project_audio(f, flat, projected)?;
-            let narrowed = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
-            nn::layers::ScaledAdd.forward(f, narrowed, projected, 1.0, 0.0)?;
-            nn::layers::Rows::new(dtype, hidden_size)?.replace(
-                f,
-                hidden,
-                narrowed,
-                audio_indices,
-            )?;
+            let audio_sources = tables.get("audio_sources")?;
+            let own_audio = audio_sources.shape.dim(0);
+            if own_audio > 0 {
+                let owned = arena.tensor(sample_dtype, Shape::new(&[own_audio, features]))?;
+                nn::layers::gather_rows(f, flat, audio_sources, owned)?;
+                // The audio's own two crossings, for the reason the video's: the latent is the
+                // sample's type and the projection's FP32 output is narrowed into the packed rows.
+                let projected = arena.tensor(DType::F32, Shape::new(&[own_audio, hidden_size]))?;
+                self.transformer.project_audio(f, owned, projected)?;
+                let narrowed = arena.tensor(dtype, Shape::new(&[own_audio, hidden_size]))?;
+                nn::layers::ScaledAdd.forward(f, narrowed, projected, 1.0, 0.0)?;
+                nn::layers::Rows::new(dtype, hidden_size)?.replace(
+                    f,
+                    hidden,
+                    narrowed,
+                    tables.get("audio_slots")?,
+                )?;
+            }
         }
 
         // The rotary tables and the visibility of the one packed sequence. Each of the three axes
@@ -3118,7 +3222,7 @@ impl Denoiser {
             &self.cache,
             step_index,
             hidden,
-            tables.get("modulation_indices")?,
+            own(tables.get("modulation_indices")?),
             Factors { cosine, sine },
             visible.as_ref(),
             segments.as_ref(),
@@ -3139,28 +3243,46 @@ impl Denoiser {
 
         // The solver's scale: one FP32 word the `step` table indexes into the coefficient table.
         let coefficient = arena.tensor(DType::F32, Shape::new(&[1, 1]))?;
-        let video_hidden = arena.tensor(dtype, Shape::new(&[video_rows, hidden_size]))?;
-        nn::layers::gather_rows(f, hidden, video_indices, video_hidden)?;
-        let video_groups = arena.tensor(DType::I32, Shape::new(&[video_rows]))?;
-        nn::layers::gather_rows(
+        // A rank predicts the rows it owns, and every rank then holds every row's prediction: the
+        // sample is whole on every rank, so the solver's update is the same arithmetic everywhere
+        // and the group's trajectories cannot drift apart.
+        let groups_table = own(tables.get("groups")?);
+        let predicted = if own_video > 0 {
+            let video_hidden = arena.tensor(dtype, Shape::new(&[own_video, hidden_size]))?;
+            nn::layers::gather_rows(f, hidden, video_slots, video_hidden)?;
+            let video_groups = arena.tensor(DType::I32, Shape::new(&[own_video]))?;
+            nn::layers::gather_rows(
+                f,
+                one_column(groups_table),
+                video_slots,
+                one_column(video_groups),
+            )?;
+            // The head is FP32 in the reference (`transformer.py:404-421`), so the prediction is
+            // written wide and never narrowed: the solver's sample is the latent's type and the
+            // velocity must be the same one.
+            let rows = arena.tensor(sample_dtype, Shape::new(&[own_video, channels * 4]))?;
+            self.transformer.velocity(
+                f,
+                video_hidden,
+                Modality::Video,
+                modulation,
+                video_groups,
+                step.index,
+                step_index,
+                rows,
+            )?;
+            Some(rows)
+        } else {
+            None
+        };
+        let velocity_rows = self.collected(
             f,
-            one_column(tables.get("groups")?),
+            predicted,
+            video_slots,
             video_indices,
-            one_column(video_groups),
-        )?;
-        // The head is FP32 in the reference (`transformer.py:404-421`), so the prediction is
-        // written wide and never narrowed: the solver's sample is the latent's type and the velocity
-        // must be the same one.
-        let velocity_rows = arena.tensor(sample_dtype, Shape::new(&[video_rows, channels * 4]))?;
-        self.transformer.velocity(
-            f,
-            video_hidden,
-            Modality::Video,
-            modulation,
-            video_groups,
-            step.index,
-            step_index,
-            velocity_rows,
+            channels * 4,
+            local,
+            tokens,
         )?;
         let velocity = arena.tensor(sample_dtype, video.shape)?;
         unpatch.forward(f, velocity_rows, velocity)?;
@@ -3179,26 +3301,42 @@ impl Denoiser {
 
         if let Some((audio, audio_indices)) = audio {
             let audio_rows = u64::from(audio_indices.shape.dim(0) as u32);
-            let audio_hidden = arena.tensor(dtype, Shape::new(&[audio_rows, hidden_size]))?;
-            nn::layers::gather_rows(f, hidden, audio_indices, audio_hidden)?;
-            let audio_groups = arena.tensor(DType::I32, Shape::new(&[audio_rows]))?;
-            nn::layers::gather_rows(
-                f,
-                one_column(tables.get("groups")?),
-                audio_indices,
-                one_column(audio_groups),
-            )?;
             let features = u64::from(self.config.transformer.audio_channels);
-            let velocity = arena.tensor(sample_dtype, Shape::new(&[audio_rows, features]))?;
-            self.transformer.velocity(
+            let audio_slots = tables.get("audio_slots")?;
+            let own_audio = audio_slots.shape.dim(0);
+            let predicted = if own_audio > 0 {
+                let audio_hidden = arena.tensor(dtype, Shape::new(&[own_audio, hidden_size]))?;
+                nn::layers::gather_rows(f, hidden, audio_slots, audio_hidden)?;
+                let audio_groups = arena.tensor(DType::I32, Shape::new(&[own_audio]))?;
+                nn::layers::gather_rows(
+                    f,
+                    one_column(groups_table),
+                    audio_slots,
+                    one_column(audio_groups),
+                )?;
+                let rows = arena.tensor(sample_dtype, Shape::new(&[own_audio, features]))?;
+                self.transformer.velocity(
+                    f,
+                    audio_hidden,
+                    Modality::Audio,
+                    modulation,
+                    audio_groups,
+                    step.index,
+                    step_index,
+                    rows,
+                )?;
+                Some(rows)
+            } else {
+                None
+            };
+            let velocity = self.collected(
                 f,
-                audio_hidden,
-                Modality::Audio,
-                modulation,
-                audio_groups,
-                step.index,
-                step_index,
-                velocity,
+                predicted,
+                audio_slots,
+                audio_indices,
+                features,
+                local,
+                tokens,
             )?;
             let flat = TensorView::with_strides(
                 audio.ptr,
@@ -3217,6 +3355,48 @@ impl Denoiser {
             )?;
         }
         Ok(())
+    }
+
+    /// Every row's prediction of one modality, in the modality's order, from the rows this rank
+    /// predicted.
+    ///
+    /// At one rank the predicted rows are all of them. A rank of a group places its rows in its own
+    /// interval of the packed sequence, every member's intervals are gathered in member order, and
+    /// the modality's rows are read out of the whole sequence by `indices`. The rows of an interval
+    /// no modality row lands in are never read, so they are left as the arena holds them.
+    #[allow(clippy::too_many_arguments)]
+    fn collected(
+        &self,
+        f: &Forward,
+        predicted: Option<TensorView>,
+        slots: TensorView,
+        indices: TensorView,
+        width: u64,
+        local: u64,
+        tokens: u64,
+    ) -> Result<TensorView> {
+        let arena = f.arena();
+        if self.shard <= 1 {
+            return predicted.ok_or_else(|| {
+                Error::config("one rank owns every row, and it predicted none".to_owned())
+            });
+        }
+        let interval = arena.tensor(SAMPLE_DTYPE, Shape::new(&[local, width]))?;
+        if let Some(predicted) = predicted {
+            nn::layers::Rows::new(SAMPLE_DTYPE, width)?.replace(f, interval, predicted, slots)?;
+        }
+        let sequence = arena.tensor(SAMPLE_DTYPE, Shape::new(&[tokens, width]))?;
+        let group = f.group.ok_or_else(|| {
+            Error::Unsupported(
+                "a sequence shard collects its predictions over a group, and this forward \
+                 carries none"
+                    .to_owned(),
+            )
+        })?;
+        group.all_gather(interval, sequence, f.stream()?)?;
+        let rows = arena.tensor(SAMPLE_DTYPE, Shape::new(&[indices.shape.dim(0), width]))?;
+        nn::layers::gather_rows(f, sequence, indices, rows)?;
+        Ok(rows)
     }
 
     /// Read one DiT partition and everything around it.
@@ -3349,7 +3529,6 @@ impl Denoiser {
         let refiner = crate::conditioning::TokenRefiner::load(
             &config.transformer,
             arrangement.text_rows,
-            partition,
             loader,
         )?;
         let rules = Layouts::new(config.clone(), arrangement)?;
@@ -3373,8 +3552,8 @@ impl Denoiser {
             rows,
             // The denoiser's own rank, not the text encoder's: the two shards are independent, and
             // with one tensor shard every rank's `tensor_rank` is 0 (`partition.rs`).
-            rank: partition.sequence_rank as u32,
-            shard: partition.ulysses_degree as u32,
+            rank: arrangement.rank,
+            shard: arrangement.shard,
         })
     }
 
@@ -3552,6 +3731,7 @@ mod tests {
                 text_rows: 128,
                 condition_rows: 64,
                 shard: 1,
+                rank: 0,
             },
         )
         .unwrap()
@@ -3743,6 +3923,7 @@ mod tests {
                 text_rows: 128,
                 condition_rows: 64,
                 shard: 2,
+                rank: 0,
             },
         )
         .unwrap();
@@ -3775,13 +3956,11 @@ mod tests {
             ] {
                 assert!(names.contains(name), "{name} is not in the plan");
             }
-            // A layer that does not communicate reserves nothing for the exchange, and its gathered
-            // result is the buffer it already holds: at one rank those four entries must be absent,
-            // because they cost `rows x inner` each and are never read.
+            // A layer that does not communicate reserves nothing for the exchange: at one rank these
+            // entries must be absent, because they cost a row of every head each and are never read.
             for name in [
-                "attention.exchanged_query",
-                "attention.exchanged_key",
-                "attention.exchanged_value",
+                "attention.staging",
+                "attention.merged",
                 "attention.gathered",
             ] {
                 assert!(
@@ -4144,11 +4323,6 @@ mod tests {
             u64::from(audio.channels) * u64::from(audio.frames),
             u64::from(crate::config::AUDIO_CHANNELS) * u64::from(channels) * u64::from(steps)
         );
-        // The rows the denoiser packs, and the width one of them spans.
-        assert_eq!(
-            audio_elements(layout).unwrap(),
-            u64::from(crate::config::AUDIO_CHANNELS * steps) * u64::from(channels)
-        );
     }
 
     #[test]
@@ -4178,38 +4352,47 @@ mod tests {
     }
 
     #[test]
-    fn a_shard_draws_disjoint_rows_of_one_stream() {
-        // One stream per request, addressed by element: the conditions first, then the video's rows,
-        // then the audio's. Two ranks of one shard must split it without overlapping and without a
-        // gap - the property that a per-shard row count, or a row width that is not multiplied in,
-        // breaks while a single rank still looks right.
+    fn every_rank_of_a_shard_draws_the_one_stream_a_single_rank_draws() {
+        // One stream per request, addressed by element: the conditions first, then the video's
+        // rows, then the audio's. Every rank holds the whole sample, so one pair of offsets serves
+        // the group and a rank's trajectory starts from the numbers one rank's does.
         let rule = layouts();
         let (layout, _) = rule.layout(&request(121, 1344, 768)).unwrap();
-        let width = u64::from(rule.config.transformer.audio_channels);
         let row_elements = u64::from(layout.video.channels) * 4;
         let video_rows = u64::from(layout.video.frames)
             * u64::from(layout.video.height / 2)
             * u64::from(layout.video.width / 2);
-        let audio = layout
-            .audio
-            .expect("a request that produces audio carries its latent");
-        let audio_rows = u64::from(audio.channels) * u64::from(audio.frames) / width;
         let condition = u64::from(layout.condition_elements);
-
-        let (video0, audio0) = draw_offsets(layout, width, 0, 2).unwrap();
-        let (video1, audio1) = draw_offsets(layout, width, 1, 2).unwrap();
-        // Rank 0 starts where the conditions end; rank 1 where rank 0's video rows end.
-        assert_eq!(video0, condition);
-        // Rank 0 holds the first `floor(rows / 2)` rows, so that is the gap to rank 1 - the same
-        // split `first_row` gives, derived here from the row count rather than from the function.
-        assert_eq!(video1 - video0, (video_rows / 2) * row_elements);
-        // The audio follows the whole video stream on both ranks, and splits by its own rows.
-        assert_eq!(audio0, condition + video_rows * row_elements);
-        assert_eq!(audio1 - audio0, (audio_rows / 2) * width);
-        // One rank is the whole stream, and its audio starts where the video ends.
-        let (video, audio) = draw_offsets(layout, width, 0, 1).unwrap();
+        let (video, audio) = draw_offsets(layout);
         assert_eq!(video, condition);
         assert_eq!(audio, condition + video_rows * row_elements);
+    }
+
+    #[test]
+    fn a_ranks_owned_rows_partition_each_modality() {
+        // Every row of a modality lands in exactly one rank's interval, at its place in that
+        // interval, and one rank owns everything with the identity for sources.
+        let mut rule = layouts();
+        let packed: Vec<i32> = (40..100).collect();
+        let rows = 128;
+        rule.arrangement.shard = 1;
+        rule.arrangement.rank = 0;
+        let (sources, slots) = rule.owned_rows(rows, &packed);
+        assert_eq!(sources, (0..60).collect::<Vec<i32>>());
+        assert_eq!(slots, packed);
+        rule.arrangement.shard = 4;
+        let mut seen = Vec::new();
+        for rank in 0..4 {
+            rule.arrangement.rank = rank;
+            let (sources, slots) = rule.owned_rows(rows, &packed);
+            assert_eq!(sources.len(), slots.len());
+            for (source, slot) in sources.iter().zip(&slots) {
+                assert_eq!(packed[*source as usize], rank as i32 * 32 + slot);
+                seen.push(*source);
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, (0..60).collect::<Vec<i32>>());
     }
 
     #[test]
@@ -4389,7 +4572,9 @@ mod tests {
                 }
                 // The audio table is addressed by audio row and names the packed row it occupies,
                 // so its length is the audio rows rather than every packed row.
-                "audio_indices" => assert_eq!(table.shape.dim(0), u64::from(packing.audio_rows)),
+                "audio_indices" | "audio_slots" | "audio_sources" => {
+                    assert_eq!(table.shape.dim(0), u64::from(packing.audio_rows));
+                }
                 // A run's table names both of its ends, so it carries one more entry than the run
                 // has row counts: the pack's used rows, or the prompt's tokens for the refiner's.
                 "cu_seq_lens_k"
@@ -4400,7 +4585,7 @@ mod tests {
                 "position_ids" => assert_eq!(table.shape.dims(), &[3, rows]),
                 // The video indices name the packed row of every video row, and video rows are
                 // patched: four voxels to a row.
-                "video_indices" => {
+                "video_indices" | "video_slots" | "video_sources" => {
                     assert_eq!(table.shape.dim(0), u64::from(packing.video_rows));
                 }
                 _ => assert_eq!(table.shape.dim(0), rows, "{}", table.name),
@@ -4437,7 +4622,7 @@ mod tests {
                 .expect("the layout names the table")
         };
         let prefix: Vec<i32> = decode_i32(&out[at("prefix_index")]);
-        assert_eq!(prefix.len(), tables[3].shape.dim(0) as usize);
+        assert_eq!(prefix.len(), tables[at("prefix_index")].shape.dim(0) as usize);
         // The prefix segment is packed after the generated rows, so the prompt's twelve rows sit at
         // `prefix_start()` and each points at its own source row.
         let first = rule.packing_of(&layout).unwrap().prefix_start() as usize;

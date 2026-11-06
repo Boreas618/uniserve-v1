@@ -1052,7 +1052,8 @@ impl crate::memory::weights::WeightStorage for Retained {
     /// A weight's bytes, mapped read-only on `device`; `None` when the server
     /// holds nothing under `key`.
     fn fetch(&self, device: DeviceId, key: &[u8; 32]) -> Result<Option<nn::Backing>> {
-        let Some(storage) = self.weight(device, Key(*key))? else {
+        let key = Self::device_key(key, &lock(&self.state).gpu(device)?);
+        let Some(storage) = self.weight(device, key)? else {
             return Ok(None);
         };
         Ok(Some(nn::Backing::new(
@@ -1119,6 +1120,7 @@ impl crate::memory::weights::WeightStorage for Retained {
         }
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
+        let key = Self::device_key(key, &gpu);
         // A weight is published as a DEVICE block: the record names a `cuMemCreate` allocation,
         // which is what a reader imports by its shareable handle, and kernels then address the
         // weight in device memory without a copy at read time. The allocation is the publisher's,
@@ -1149,13 +1151,8 @@ impl crate::memory::weights::WeightStorage for Retained {
             fabric: None,
         };
         let tensor = ::storage::TensorRecord {
-            key: Key(*key),
-            name: format!(
-                "weight-{}",
-                key.iter()
-                    .map(|byte| format!("{byte:02x}"))
-                    .collect::<String>()
-            ),
+            key,
+            name: format!("weight-{}", hex_key(&key.0)),
             storage: 0,
             offset: 0,
             dtype: "uint8".into(),
@@ -1171,7 +1168,7 @@ impl crate::memory::weights::WeightStorage for Retained {
             )
             .map_err(|error| storage_error("publishing a retained weight", error))?;
         drop(state);
-        let Some(storage) = self.weight(device, Key(*key))? else {
+        let Some(storage) = self.weight(device, key)? else {
             return Err(Error::Interface(
                 "a published weight was not found under its own key".into(),
             ));
@@ -1184,6 +1181,19 @@ impl crate::memory::weights::WeightStorage for Retained {
 }
 
 impl Retained {
+    /// The key one device's copy of a weight is held under.
+    ///
+    /// A weight's key names its content, and a record names the allocation on the device that
+    /// published it, so two ranks of one host asking for one key would both read the first one's
+    /// allocation: over the peer link, on every forward. Each device keeps its own copy instead.
+    fn device_key(key: &[u8; 32], gpu: &[u8; 16]) -> Key {
+        let mut digest = Sha256::new();
+        digest.update(b"uniserve-device-weight\0");
+        digest.update(key);
+        digest.update(gpu);
+        Key(digest.finalize().into())
+    }
+
     /// Publishes a page of the state a model keeps per unit under `key` (design 4.5, 8): the
     /// publisher allocates the exportable device block, `write` fills it with the page's blocks in
     /// the layout the destination scatters, and the record names that allocation, so a reader maps

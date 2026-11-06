@@ -144,6 +144,8 @@ pub struct EncoderRunner<M: Encoder + Send + Sync> {
     /// than a running sum, so the publish reads the same numbers the encode read: a call's span is
     /// its real tokens, and whatever the mechanism put before or after it is not this runner's.
     pending: Vec<(ipc::RequestKey, u32, u32)>,
+    /// The tensor group this runner's rank reduces over, absent when one rank holds the encoder.
+    group: Option<Arc<nn::Group>>,
 }
 
 impl<M: Encoder + Send + Sync> EncoderRunner<M> {
@@ -190,7 +192,15 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             staged: None,
             products: None,
             pending: Vec::new(),
+            group: None,
         })
+    }
+
+    /// This runner over the tensor `group`: every forward it runs carries the group.
+    #[must_use]
+    pub fn in_group(mut self, group: Option<Arc<nn::Group>>) -> Self {
+        self.group = group;
+        self
     }
 
     /// The buckets this runner captures: the media ones, largest first.
@@ -470,10 +480,14 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload()?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let batch = self.token_batch(bucket)?;
-        let forward = nn::Forward::new(&stream, generation, &arena);
+        let group = self.group.clone();
+        let forward = crate::runners::denoiser::grouped(
+            nn::Forward::new(&stream, generation, &arena),
+            group.as_deref(),
+        );
         let layout = self.layout(bucket);
         let tables = self.model.state_tables(&layout);
         let key = Self::key(bucket);

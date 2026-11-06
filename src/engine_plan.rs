@@ -112,6 +112,7 @@ impl Served {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct EpochPlan {
     /// The epoch's build config, which the daemon wrote (§7.2).
     build: daemon::epoch::BuildConfig,
@@ -141,6 +142,42 @@ pub(crate) struct EpochPlan {
     watchdog_override: Option<Duration>,
     /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the plan.
     placement: Placement,
+}
+
+/// A rank's places in its deployment's parallel groups.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ParallelShape {
+    /// Members of the denoiser's sequence group.
+    pub(crate) sequence: usize,
+    /// This rank's place in it.
+    pub(crate) sequence_rank: usize,
+    /// Members of the text encoder's tensor group.
+    pub(crate) tensor: usize,
+    /// This rank's place in it.
+    pub(crate) tensor_rank: usize,
+}
+
+impl Default for ParallelShape {
+    fn default() -> Self {
+        Self {
+            sequence: 1,
+            sequence_rank: 0,
+            tensor: 1,
+            tensor_rank: 0,
+        }
+    }
+}
+
+/// The collective groups a rank's runners issue on, absent where one rank holds the block.
+///
+/// Two groups rather than one because the two blocks run on two streams of a device: a collective of
+/// one must not queue behind the other's, and each communicator keeps one issue order.
+#[derive(Clone, Default)]
+pub(crate) struct RankGroups {
+    /// The denoiser's sequence group.
+    pub(crate) sequence: Option<Arc<nn::Group>>,
+    /// The text encoder's tensor group.
+    pub(crate) tensor: Option<Arc<nn::Group>>,
 }
 
 /// The refusal a stated graph tier earns, if any (§4.4, §4.5).
@@ -265,6 +302,70 @@ impl EpochPlan {
         })
     }
 
+    /// One plan per rank this process serves (§2.1: one main process drives every device of its
+    /// node, one executor each).
+    ///
+    /// A media deployment's ranks are its devices: a rank holds its own partition of the model on
+    /// its own device, so each is planned, loaded and opened as a rank of its own. The text class
+    /// keeps one plan, whose second device is refused where its runner is built.
+    pub(crate) fn ranks(&self) -> Result<Vec<Self>> {
+        if matches!(ModelClass::of(&self.checkpoint)?, ModelClass::CausalLm) {
+            return Ok(vec![self.clone()]);
+        }
+        let count = self.devices.len();
+        Ok(self
+            .devices
+            .iter()
+            .enumerate()
+            .map(|(index, device)| {
+                let mut plan = self.clone();
+                plan.devices = vec![*device];
+                plan.rank = self.rank + index as u32;
+                plan.world_size = count;
+                plan
+            })
+            .collect())
+    }
+
+    /// This rank as the one pool the scheduler plans against.
+    ///
+    /// The ranks of a group run one batch together, and `executor::batch::Executors` hands it to
+    /// each of them, so a scheduler sees the deployment as one rank whose batches are the group's.
+    pub(crate) fn scheduled(&self) -> Self {
+        let mut plan = self.clone();
+        plan.world_size = 1;
+        plan
+    }
+
+    /// The parallel groups this rank joins: `(sequence group's ranks, tensor group's ranks)` and its
+    /// place in each. A rank of a media deployment is in both; the text class joins neither here.
+    pub(crate) fn parallel_shape(&self) -> Result<ParallelShape> {
+        if matches!(ModelClass::of(&self.checkpoint)?, ModelClass::CausalLm) {
+            return Ok(ParallelShape::default());
+        }
+        let groups = self.deployment_groups()?;
+        let (ulysses, tensor, tensor_rank, sequence_rank) = media_parallel(
+            groups.as_deref(),
+            &self.group,
+            self.rank,
+            self.placement.tensor_parallel,
+            self.placement.tensor_rank,
+            self.world_size,
+        )?;
+        Ok(ParallelShape {
+            sequence: ulysses.degree,
+            sequence_rank,
+            tensor,
+            tensor_rank,
+        })
+    }
+
+    /// Whether this rank serves the blocks that run on one rank of the group: the decoders and the
+    /// host stage. The sequence and tensor groups run on every rank; the rest run on the first.
+    pub(crate) fn serves_output(&self) -> bool {
+        self.rank == 0
+    }
+
     /// The catalogue of prefill buckets this rank captures, and whether the deployment stated it.
     ///
     /// `Buckets::bounds` answers the largest prefill token count among the buckets this rank
@@ -314,6 +415,11 @@ impl EpochPlan {
     /// The Program Server's socket, which the rank's program client connects to.
     pub(crate) fn program_server(&self) -> &Path {
         &self.program_server
+    }
+
+    /// This rank's ordinal inside its group.
+    pub(crate) fn rank(&self) -> u32 {
+        self.rank
     }
 
     /// This rank's devices, in the order the daemon named them.
@@ -549,6 +655,7 @@ impl EpochPlan {
         pipeline: &Arc<minimax_h3::load::MinimaxH3>,
         generation: &Arc<Generation>,
         blocking: &executor::blocking::ThreadPool,
+        groups: &RankGroups,
     ) -> Result<Vec<NamedRunner>> {
         use executor::runners::decoder as media_decoder;
         use executor::runners::denoiser as media_denoiser;
@@ -611,9 +718,6 @@ impl EpochPlan {
         let denoiser = pipeline
             .transformer()
             .context("the checkpoint holds no transformer, so no denoising step could run")?;
-        let decoder = pipeline
-            .video_decoder()
-            .context("the checkpoint holds no video decoder, so no clip could be decoded")?;
         // The encoder writes its hidden states in the deployment's effective type, which the daemon
         // resolved against the checkpoint before it wrote this build config (a `dtype` of `auto`
         // never reaches a main process as `auto`).
@@ -640,7 +744,8 @@ impl EpochPlan {
             encode_set,
             media_encoder::EncoderShape { hidden, dtype },
             Arc::clone(generation),
-        )?;
+        )?
+        .in_group(groups.tensor.clone());
         let warm = executor::runners::warm::distinct(&**denoiser, &candidates);
         // The denoiser's own buckets are the layouts those candidates collapse to: its phase is
         // derived from them rather than named, so a rank that captures no denoise bucket states no
@@ -688,7 +793,19 @@ impl EpochPlan {
                     .unwrap_or(hidden),
             },
             Arc::clone(generation),
-        )?;
+        )?
+        .in_group(self.rank, groups.sequence.clone());
+        // The group's own work ends here: a rank past the first holds the whole sample after every
+        // step and serves no output.
+        if !self.serves_output() {
+            return Ok(vec![
+                NamedRunner::new(RunnerId(0), Box::new(encoder)),
+                NamedRunner::new(RunnerId(1), Box::new(denoise)),
+            ]);
+        }
+        let decoder = pipeline
+            .video_decoder()
+            .context("the checkpoint holds no video decoder, so no clip could be decoded")?;
         let decode = media_decoder::DecoderRunner::new(
             Binding {
                 id: RunnerId(2),
@@ -867,12 +984,13 @@ impl EpochPlan {
         memory: &mut Memory,
         generation: &Arc<Generation>,
         blocking: &executor::blocking::ThreadPool,
+        groups: &RankGroups,
     ) -> Result<Vec<NamedRunner>> {
         let Served::Text(model) = served else {
             let Served::Media(pipeline) = served else {
                 unreachable!("Served has two variants");
             };
-            return self.media_runners(device, pipeline, generation, blocking);
+            return self.media_runners(device, pipeline, generation, blocking, groups);
         };
         let mut runners: Vec<NamedRunner> = Vec::new();
         // One model per rank is loaded and mapped on the rank's first device, and a kernel on a
@@ -980,6 +1098,7 @@ impl EpochPlan {
         &self,
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
+        host_group: &executor::parallel::host::HostGroup,
     ) -> Result<(Served, Memory, ipc::MainProcessInfo, GraphStorage)> {
         let placement = &self.placement;
         match ModelClass::of(&self.checkpoint)? {
@@ -1006,7 +1125,7 @@ impl EpochPlan {
                     ops::fp4::ScaleLayout::Linear,
                 )?;
                 let served = Served::Text(Arc::new(model));
-                let (memory, info, graph) = self.open_memory(&served, storage)?;
+                let (memory, info, graph) = self.open_memory(&served, storage, host_group)?;
                 Ok((served, memory, info, graph))
             }
             ModelClass::Media => {
@@ -1075,11 +1194,16 @@ impl EpochPlan {
                 // The condition capacity is the task's (the block set is placed for it); the text
                 // capacity is the deployment's, from the ladder above.
                 let partition = partition.sized(text_capacity, partition.condition_rows);
-                let partition = partition.placing(
+                let partition = partition.placing(if self.serves_output() {
                     partition
                         .blocks
-                        .with(minimax_h3::Component::VideoPostprocessor),
-                );
+                        .with(minimax_h3::Component::VideoPostprocessor)
+                } else {
+                    partition
+                        .blocks
+                        .without(minimax_h3::Component::VideoDecoder)
+                        .without(minimax_h3::Component::AudioDecoder)
+                });
                 let dtype = match self.build.dtype {
                     proto::request::ModelDtype::Float16 => DType::F16,
                     proto::request::ModelDtype::BFloat16 => DType::BF16,
@@ -1105,7 +1229,7 @@ impl EpochPlan {
                     }
                 }
                 let served = Served::Media(Arc::new(model));
-                let (memory, info, graph) = self.open_memory(&served, storage)?;
+                let (memory, info, graph) = self.open_memory(&served, storage, host_group)?;
                 Ok((served, memory, info, graph))
             }
         }
@@ -1123,6 +1247,7 @@ impl EpochPlan {
         &self,
         served: &Served,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
+        group: &executor::parallel::host::HostGroup,
     ) -> Result<(Memory, ipc::MainProcessInfo, GraphStorage)> {
         let device = *self
             .devices
@@ -1219,21 +1344,11 @@ impl EpochPlan {
                 (facts, media_rank_report(device, &host, bounds)?)
             }
         };
-        // One rank's host group: this rank alone, which is what a world of one rank is. A
-        // deployment of several ranks forms its group over the peers' rendezvous at start, and
-        // until that exists a plan that agreed a block size over one member would be a plan this
-        // rank cannot honour - so it is refused rather than served.
-        if self.world_size != 1 {
-            bail!(
-                "this rank is one of {} ranks and the host group they agree capacity over is not \
-                 formed yet; capacity is planned for a world of one rank",
-                self.world_size
-            );
-        }
-        let group = executor::parallel::host::HostGroup::single(self.rank as usize);
+        // The ranks of this process agree over the group the main process formed at start, and a
+        // world of one rank is a group of one member.
         let planned = match served {
-            Served::Text(_) => executor::capacity::plan_rank(&facts, report, &group)?,
-            Served::Media(_) => executor::capacity::plan_media(&facts, report, &group)?,
+            Served::Text(_) => executor::capacity::plan_rank(&facts, report, group)?,
+            Served::Media(_) => executor::capacity::plan_media(&facts, report, group)?,
         };
         // The keys and values the plan fitted are the process's resident pool: a unit is a cache
         // unit, and the plan charged them all against the same device allowance the pools are
@@ -2126,6 +2241,7 @@ fn architectural_class(checkpoint: &Path) -> Result<String> {
 
 /// How this rank takes part in the deployment's parallel shape (§4.3, §5.1), as the build config
 /// fixes it and the daemon's launch places it.
+#[derive(Clone)]
 pub(crate) struct Placement {
     tensor_parallel: u32,
     tensor_rank: u32,
@@ -2182,6 +2298,12 @@ fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTa
 /// group from another's when the name the launch states is the daemon's process group.
 const DENOISER_COMPONENT: &str = "transformer";
 
+/// The same node of a reference deployment, whose denoiser is the reference DiT.
+const REFERENCE_DENOISER_COMPONENT: &str = "transformer_ref";
+
+/// The component a media rank's tensor group splits.
+const TEXT_COMPONENT: &str = "text_encoder";
+
 fn media_parallel(
     groups: Option<&[engine::ExecutorGroupConfig]>,
     group: &str,
@@ -2215,7 +2337,10 @@ fn media_parallel(
     let named = groups.iter().find(|candidate| candidate.id.0 == group);
     let denoisers: Vec<&engine::ExecutorGroupConfig> = groups
         .iter()
-        .filter(|candidate| candidate.components.contains_key(DENOISER_COMPONENT))
+        .filter(|candidate| {
+            candidate.components.contains_key(DENOISER_COMPONENT)
+                || candidate.components.contains_key(REFERENCE_DENOISER_COMPONENT)
+        })
         .collect();
     // Both sides as a pair in either refusal: the launch's name is the daemon's roster label and the
     // page's ids are the deployment's groups, and a reader who sees only one side cannot tell which
@@ -2245,6 +2370,27 @@ fn media_parallel(
                     .join(", ")
             )
         }
+    };
+    // The page states the text encoder's degree beside it, so the group's width is the page's and
+    // the rank's place in it is the rank's place in the component.
+    let (tensor_parallel, tensor_rank) = match placed.components.get(TEXT_COMPONENT) {
+        Some(text) if text.parallel_config.tensor_parallel_size > 1 => {
+            let position = if text.ranks.is_empty() {
+                rank
+            } else {
+                text.ranks
+                    .iter()
+                    .position(|member| *member == rank)
+                    .with_context(|| {
+                        format!(
+                            "this rank is {rank} and the group's text encoder holds ranks {:?}",
+                            text.ranks
+                        )
+                    })?
+            };
+            (text.parallel_config.tensor_parallel_size, position)
+        }
+        _ => (tensor_parallel, tensor_rank),
     };
     let mut splits = placed.components.iter().filter(|(_, component)| {
         !matches!(
@@ -2288,13 +2434,7 @@ fn media_parallel(
             *ulysses_degree,
             match projection {
                 ipc::HeadProjection::Exchange => minimax_h3::partition::Projection::Exchange,
-                // The stack loads whole attention projections on every rank and sends each member
-                // its head shard, which is the exchange mode: a gathered projection would be served
-                // weights its own page says it does not hold.
-                ipc::HeadProjection::Gather => bail!(
-                    "worker group {group:?} states the `gather` head projection, and this stack \
-                     loads whole attention projections on every rank: it implements `exchange`"
-                ),
+                ipc::HeadProjection::Gather => minimax_h3::partition::Projection::Gather,
             },
         ),
         other => bail!(

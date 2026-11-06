@@ -335,6 +335,17 @@ fn step_products(_layout: &nn::capability::Layout) -> &'static [Product] {
     STEP_PRODUCTS
 }
 
+/// `forward` over `group`, when the runner's rank is in one.
+pub(crate) fn grouped<'a>(
+    forward: nn::Forward<'a>,
+    group: Option<&'a nn::Group>,
+) -> nn::Forward<'a> {
+    match group {
+        Some(group) => forward.with_group(group),
+        None => forward,
+    }
+}
+
 /// The rows of one request's conditioning and the encoder's width: `(text_rows + condition_rows)`
 /// rows, the encoder writing `width` elements in each.
 ///
@@ -555,6 +566,8 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     pending: Vec<Pending>,
     /// Whether this load's constants are written.
     constants_filled: bool,
+    /// The sequence group this runner's rank exchanges over, absent at one rank.
+    group: Option<Arc<nn::Group>>,
     /// The calls of the batch staged last, which its replay answers.
     calls: Vec<CallId>,
     /// The steps those calls' trajectories have completed once the replay ran: a call reports it,
@@ -621,9 +634,18 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             staged_step: None,
             pending: Vec::new(),
             constants_filled: false,
+            group: None,
             calls: Vec::new(),
             steps_completed: 0,
         })
+    }
+
+    /// This runner as rank `rank` of the sequence `group`: every forward it runs carries the group.
+    #[must_use]
+    pub fn in_group(mut self, rank: u32, group: Option<Arc<nn::Group>>) -> Self {
+        self.diag = std::mem::replace(&mut self.diag, Diag::from_env()).for_rank(rank);
+        self.group = group;
+        self
     }
 
     /// The buckets this runner captures, largest first.
@@ -671,7 +693,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // capture that has to be thrown away.** The pool is the runtime's policy (a share of the
         // device per stream); the model states what one evaluation reserves. A share below the plan
         // is a refusal naming both numbers, and it is asked before anything is filled.
-        let offered = self.pool()?.reserved();
+        let offered = self.pool()?.reserved_on(self.stream_id());
         let plans = self.buckets.clone();
         for plan in &plans {
             floor::checked(
@@ -965,9 +987,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         self.fill(bucket)?;
         self.state_of_request(bucket)?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let forward = nn::Forward::new(&stream, &kernels, &arena);
+        let group = self.group.clone();
+        let forward = grouped(nn::Forward::new(&stream, &kernels, &arena), group.as_deref());
         let layout = layout_of(bucket)?;
         let tables = self.model.state_tables(&layout);
         let key = Self::key(bucket);
@@ -1261,7 +1284,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         }
         let stream = self.stream.clone();
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, kernels, &arena);
         self.model
@@ -1309,9 +1332,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let forward = nn::Forward::new(&stream, &kernels, &arena);
+        let group = self.group.clone();
+        let forward = grouped(nn::Forward::new(&stream, &kernels, &arena), group.as_deref());
         let layout = layout_of(bucket)?;
         let tables = self.model.state_tables(&layout);
         let key = Self::key(bucket);
@@ -1345,9 +1369,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload()?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let forward = nn::Forward::new(&stream, generation, &arena);
+        let group = self.group.clone();
+        let forward = grouped(nn::Forward::new(&stream, generation, &arena), group.as_deref());
         let layout = layout_of(bucket)?;
         let tables = self.model.state_tables(&layout);
         let key = Self::key(bucket);
@@ -1538,6 +1563,23 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
         self.lifecycle.attach_pools(Arc::clone(&pools));
+        // One evaluation's plan is this stream's share of the device: the even share is a default,
+        // and a served canvas's evaluation is the largest arena a device holds. An eighth above the
+        // plan keeps a walk that reserves in another order from running off the end of the range.
+        let plan = self
+            .buckets
+            .iter()
+            .filter_map(|plan| self.model.arena_bytes(&plan.warm.view()).ok())
+            .max()
+            .unwrap_or(0);
+        let share = plan + plan / 8;
+        if let Err(error) = pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .state_share(self.stream_id(), share)
+        {
+            tracing::warn!(%error, share, "a denoiser stated its share too late");
+        }
         self.pools = Some(pools);
     }
 

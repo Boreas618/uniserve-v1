@@ -47,6 +47,15 @@ impl Diag {
         Self { dir }
     }
 
+    /// The same diagnosis for rank `rank` of a group: the first rank writes where one rank does, so
+    /// the trees of a one-rank and a many-rank run pair by path, and each other rank beside it.
+    pub(crate) fn for_rank(mut self, rank: u32) -> Self {
+        if rank > 0 {
+            self.dir = self.dir.map(|dir| dir.join(format!("rank{rank}")));
+        }
+        self
+    }
+
     /// Whether a step runs operator by operator rather than from its graph: `UNISERVE_DIAG_EAGER`.
     pub(crate) fn eager(&self) -> bool {
         self.dir.is_some() && std::env::var_os("UNISERVE_DIAG_EAGER").is_some()

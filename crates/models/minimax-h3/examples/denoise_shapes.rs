@@ -326,8 +326,6 @@ fn run() -> Result<(), String> {
     let fold = minimax_h3::conditioning::fold_bytes(
         &denoiser.transformer,
         fold_rows,
-        fold_rows,
-        arrangement.shard,
         args.dtype,
     );
     // The plan's own reservation, not the element count times one width: a plan carries `f32`,

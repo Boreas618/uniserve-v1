@@ -106,6 +106,7 @@ use executor::hot_update::{Action, HotUpdate};
 use executor::memory::Memory;
 use executor::memory::retained::Retained;
 use executor::memory::weights::WeightStore;
+use executor::parallel::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT};
 use executor::runners::products::Held;
 use executor::watchdog::{Running, Watchdog};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
@@ -443,6 +444,168 @@ impl ProcessInterface {
     }
 }
 
+/// One rank of this process, loaded: what its executor is built from.
+struct LoadedRank {
+    /// The rank's own plan, whose one device is the rank's.
+    plan: EpochPlan,
+    /// The rank's Storage Server client, whose scope is the rank's.
+    client: Arc<Retained>,
+    /// The rank's partition of the model, mapped on its device.
+    model: crate::engine_plan::Served,
+    /// The rank's resident owners.
+    memory: Memory,
+    /// What the rank reports of itself.
+    inventory: ipc::MainProcessInfo,
+    /// The rank's graph storage figures.
+    graph: executor::device::GraphStorage,
+    /// The collective groups its runners issue on.
+    groups: crate::engine_plan::RankGroups,
+}
+
+// SAFETY: a rank is built on its load thread and handed once to the thread that spawns its executor,
+// and nothing in it belongs to the thread that built it. The field that needs this is the model: its
+// `nn::Block` holds `Arc<dyn Encoder>` and its siblings, whose trait objects state no `Send`, while the
+// concrete blocks behind them are the ones a runner already moves to its device thread
+// (`M: Encoder + Send + Sync`) and hold only device addresses and immutable host tables.
+unsafe impl Send for LoadedRank {}
+
+/// Loads every rank of this process, each on a thread of its own.
+///
+/// The ranks agree their capacity and exchange their communicators' ids over one host group, whose
+/// collectives every member must reach, so they run side by side rather than one after another; the
+/// weights of four ranks then also load at once. The group is the one the design's capacity plan
+/// agrees over, formed here over the loopback because this process holds all its members.
+fn load_ranks(
+    plans: Vec<EpochPlan>,
+    storage: &ipc::StorageLaunch,
+    launch: &Launch,
+    epoch: &Epoch,
+) -> Result<Vec<LoadedRank>> {
+    let count = plans.len();
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+        .context("binding the rendezvous of this process's ranks")?;
+    let address = listener
+        .local_addr()
+        .context("reading the rendezvous of this process's ranks")?
+        .to_string();
+    let mut listener = Some(listener);
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(count);
+        for (index, plan) in plans.into_iter().enumerate() {
+            let rendezvous = match listener.take() {
+                Some(listener) => Rendezvous::serve(address.clone(), listener),
+                None => Rendezvous::connect(address.clone()),
+            };
+            let handle = std::thread::Builder::new()
+                .name(format!("rank-load-{index}"))
+                .spawn_scoped(scope, move || {
+                    load_rank(plan, rendezvous, index, count, storage, launch, epoch)
+                })
+                .context("starting a rank's load")?;
+            handles.push(handle);
+        }
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("a rank's load panicked"))?
+            })
+            .collect()
+    })
+}
+
+/// Joins the group, opens the rank's collectives, loads its partition and opens its memory.
+fn load_rank(
+    plan: EpochPlan,
+    rendezvous: Rendezvous,
+    index: usize,
+    count: usize,
+    storage: &ipc::StorageLaunch,
+    launch: &Launch,
+    epoch: &Epoch,
+) -> Result<LoadedRank> {
+    let host = HostGroup::connect(rendezvous, index, count, STARTUP_TIMEOUT)
+        .context("joining this process's ranks")?;
+    // §8: the rank's Storage Server and its claim are the node's, which the daemon answered for; the
+    // retained weights outlive every world of the epoch, so the store is built once, before the
+    // model loads, and keeps what it maps for the epoch's life.
+    let client = Retained::connect(
+        storage,
+        &launch.group,
+        plan.rank(),
+        epoch.generation,
+        epoch.predecessor_world,
+    )
+    .context("connecting to the Storage Server")?;
+    // A weight's region is one device's address, so the store maps on the device this rank's model
+    // is loaded for; the client is shared, the mapping is not.
+    let device = *plan
+        .devices()
+        .first()
+        .context("this rank serves no device to map its weights on")?;
+    let shape = plan.parallel_shape()?;
+    // NCCL keeps its own device buffers, so a communicator opens before the capacity plan measures
+    // what is left of the device.
+    let groups = crate::engine_plan::RankGroups {
+        sequence: group_over(&host, device, shape.sequence, shape.sequence_rank, count)
+            .context("forming the sequence group")?,
+        tensor: group_over(&host, device, shape.tensor, shape.tensor_rank, count)
+            .context("forming the tensor group")?,
+    };
+    let mut weights = WeightStore::new(Arc::clone(&client), device);
+    // The load and the capacity plan are one call because the order between them is the plan's: the
+    // weights are mapped first, so what the plan measures is what is left of the device rather than
+    // what was there before the model.
+    let (model, memory, inventory, graph) = plan
+        .load_and_open(&mut weights, &mut &*client, &host)
+        .context("loading the epoch's model")?;
+    Ok(LoadedRank {
+        plan,
+        client,
+        model,
+        memory,
+        inventory,
+        graph,
+        groups,
+    })
+}
+
+/// The collective group of `size` ranks this rank is member `rank` of, absent for a group of one.
+///
+/// The first member draws the group's id and the host group carries it (`parallel`'s statement of
+/// what that channel is for); `Communicator::init` then blocks until every member joined.
+fn group_over(
+    host: &HostGroup,
+    device: platform::DeviceId,
+    size: usize,
+    rank: usize,
+    ranks: usize,
+) -> Result<Option<Arc<nn::Group>>> {
+    if size == 1 {
+        return Ok(None);
+    }
+    if size != ranks {
+        bail!(
+            "a parallel group of {size} ranks in a process of {ranks}: this process forms one \
+             group of all its ranks, and a deployment of several groups per host is not served"
+        );
+    }
+    let id = match rank {
+        0 => Some(platform::UniqueId::new()?),
+        _ => None,
+    };
+    let bytes = host.broadcast_bytes(id.as_ref().map(|id| &id.0[..]), 0)?;
+    let id = platform::UniqueId(bytes.try_into().map_err(|bytes: Vec<u8>| {
+        anyhow::anyhow!("a communicator's id is 128 bytes, not {}", bytes.len())
+    })?);
+    let size = i32::try_from(size).context("a group wider than NCCL addresses")?;
+    let member = i32::try_from(rank).context("a rank past what NCCL addresses")?;
+    let communicator = platform::Communicator::init(device, size, member, &id)
+        .context("joining a communicator")?;
+    Ok(Some(Arc::new(nn::Group::new(communicator, size as u64))))
+}
+
 /// Asks this node's daemon for the node's Storage Server (§8).
 ///
 /// The socket and the claim are runtime facts of the node: the daemon mints the claim when it starts
@@ -453,6 +616,7 @@ fn claim(
     launch: &Launch,
     host: &str,
     host_kv_cache: bool,
+    ranks: &[u32],
 ) -> Result<ipc::StorageLaunch> {
     let request = proto::process::Request {
         id: 1,
@@ -460,10 +624,13 @@ fn claim(
             proto::process::Claim {
                 host: host.to_owned(),
                 deployment: launch.deployment.clone(),
-                scopes: vec![proto::process::Scope {
-                    group: launch.group.clone(),
-                    rank: launch.rank,
-                }],
+                scopes: ranks
+                    .iter()
+                    .map(|rank| proto::process::Scope {
+                        group: launch.group.clone(),
+                        rank: *rank,
+                    })
+                    .collect(),
                 // A server the daemon starts for this claim takes the deployment's connector settings;
                 // the main process has none of its own to state.
                 server_arguments: Vec::new(),
@@ -638,12 +805,12 @@ pub(crate) struct MainProcess {
     /// executor thread per device, reached both by this process's own verbs (`precopy`,
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
     executors: Vec<Arc<Executor>>,
-    memory: Option<Memory>,
+    memory: Vec<Memory>,
     /// The rank's Storage Server client, kept for the two calls of §2.5 that reach its ledger and no
     /// other: a park gives the cache's segments back, and a wake maps them again. Every caller takes
     /// `&mut` of its own `&Retained` (`impl ExclusiveStorage for &Retained`), so the device thread can
     /// hold one beside the control thread without a lock.
-    storage: Option<Arc<Retained>>,
+    storage: Vec<Arc<Retained>>,
     /// Whether this process's segments are given back to the Storage Server: a park sets it, a wake
     /// clears it. It exists so a process that never parked sends no wake at all - a wake for a pool
     /// that never slept is a no-op, but its round trip would still wait behind a queued capture on
@@ -858,32 +1025,11 @@ impl MainProcess {
         // the model loads, and keeps what it maps for the epoch's life.
         // A host tier is the build config's, and it needs prefix caching to have pages to keep.
         let host_kv_cache = build.kv_cache.host_tier && build.kv_cache.prefix_caching;
-        let storage = claim(&mut process, launch, &epoch.host, host_kv_cache)?;
-        let client = Retained::connect(
-            &storage,
-            &launch.group,
-            launch.rank,
-            epoch.generation,
-            epoch.predecessor_world,
-        )
-            .context("connecting to the Storage Server")?;
-        // The client outlives every world of the epoch, and §2.5's park and wake reach its ledger
-        // through the memory owners: kept here so the park does not have to hold the connect.
-        let retained = Arc::clone(&client);
-        // A weight's region is one device's address, so the store maps on the device this rank's
-        // model is loaded for; the client is shared, the mapping is not.
-        let weight_device = *plan
-            .devices()
-            .first()
-            .context("this rank serves no device to map its weights on")?;
-        let mut weights = WeightStore::new(Arc::clone(&client), weight_device);
-        // One model per rank: every device's runner reads the same weights, so a second device costs
-        // one `Arc` and not a second load. The load and the capacity plan are one call because the
-        // order between them is the plan's: the weights are mapped first, so what the plan measures
-        // is what is left of the device rather than what was there before the model.
-        let (model, mut memory, inventory, graph) = plan
-            .load_and_open(&mut weights, &mut &*client)
-            .context("loading the epoch's model")?;
+        // §2.1: this process serves every rank of its node, each on its own device.
+        let rank_plans = plan.ranks()?;
+        let rank_numbers: Vec<u32> = rank_plans.iter().map(EpochPlan::rank).collect();
+        let storage = claim(&mut process, launch, &epoch.host, host_kv_cache, &rank_numbers)?;
+        let ranks = load_ranks(rank_plans, &storage, launch, &epoch)?;
 
         // The owners of §4 are opened before any thread that borrows them, and
         // released in reverse order by `close`. The weights are mapped before the capacity plan
@@ -906,56 +1052,88 @@ impl MainProcess {
 
         let mut executors = Vec::with_capacity(plan.devices().len());
         let mut generations = Vec::with_capacity(plan.devices().len());
-        // The device's one pool set is the resident owners' allocator (§4.1): it is opened with the
-        // memory and handed to the executor thread, so every owner and every runner books against
-        // the same allowance.
-        let pools = memory.pools();
         // A rank with no device serves nothing, and saying it here names the deployment's fault
         // rather than leaving the pool's figure to a plan that never sized one.
         if plan.devices().is_empty() {
             bail!("this rank serves no device");
         }
-        // The scratch pool's figure comes from the one call that sized it, with the memory: the
-        // shadow region and the state group's snapshot are one reservation (4.5), and a second
-        // computation here could disagree with the pool the allocator reserved.
-        let scratch = graph.scratch;
-        // The shadow region alone: the twins allocate it, and the reservation beside it holds the
-        // state group's snapshot too (7.3, 4.5).
-        let shadow = graph.shadow;
-        // The product store is the process's, not a device's: a runner on one device publishes a
-        // region a runner on another reads through the same store, so all of this process's
-        // executors share one (b01, `M8764`).
-        let products: Arc<dyn executor::runners::products::Products> = Arc::new(Held::new());
-        for device in plan.devices() {
-            let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
-            let runners = plan.runners(*device, &model, &mut memory, &generation, &blocking)?;
-            let executor = Executor::spawn(
-                *device,
-                runners,
-                plan.events(),
-                Arc::clone(&pools),
-                Arc::clone(&products),
-                scratch,
-                shadow,
-            )?;
-            // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it runs
-            // in is mapped before any batch: the executor books it from the scratch pool the graph
-            // storage sized. Nothing is serving yet, so the control thread waits here; `serve`
-            // never does (§2.4).
-            //
-            // §4.5's warmup is not here: the epoch's first generation holds no kernel until the
-            // daemon's precopy fills it - and a precopy that names no kernel (the startup switch)
-            // fills it from the store's built programs - so there is no bucket to warm yet. It runs
-            // at the first switchover, which is the boundary the first request is served at.
-            let shadow = executor.set_shadow()?;
-            device_command(&watchdog, *device, "shadow region", shadow)
-                .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
-            // §2.5's two commands reach the Storage Server's ledger from the device thread, which
-            // owns the stream a wake resets its units on, so the client is bound beside the cache
-            // handle rather than kept only here.
-            executor.bind_storage(Arc::clone(&client));
-            executors.push(Arc::new(executor));
-            generations.push(generation);
+        let mut memories = Vec::with_capacity(ranks.len());
+        let mut clients = Vec::with_capacity(ranks.len());
+        let mut models = Vec::with_capacity(ranks.len());
+        let mut inventories = Vec::with_capacity(ranks.len());
+        let first_plan = ranks
+            .first()
+            .map(|rank| rank.plan.scheduled())
+            .context("this process serves no rank")?;
+        for rank in ranks {
+            let LoadedRank {
+                plan: rank_plan,
+                client,
+                model,
+                mut memory,
+                inventory,
+                graph,
+                groups,
+            } = rank;
+            // The device's one pool set is the resident owners' allocator (§4.1): it is opened with
+            // the memory and handed to the executor thread, so every owner and every runner books
+            // against the same allowance.
+            let pools = memory.pools();
+            // The scratch pool's figure comes from the one call that sized it, with the memory: the
+            // shadow region and the state group's snapshot are one reservation (4.5), and a second
+            // computation here could disagree with the pool the allocator reserved.
+            let scratch = graph.scratch;
+            // The shadow region alone: the twins allocate it, and the reservation beside it holds
+            // the state group's snapshot too (7.3, 4.5).
+            let shadow = graph.shadow;
+            // A rank's products are its own: the group's encoders each write the rows their rank's
+            // denoiser reads, on their own device, so a store shared by the group would hold one
+            // rank's copy under the name the others read.
+            let products: Arc<dyn executor::runners::products::Products> =
+                Arc::new(Held::new());
+            for device in rank_plan.devices() {
+                let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
+                let runners = rank_plan.runners(
+                    *device,
+                    &model,
+                    &mut memory,
+                    &generation,
+                    &blocking,
+                    &groups,
+                )?;
+                let executor = Executor::spawn(
+                    *device,
+                    runners,
+                    rank_plan.events(),
+                    Arc::clone(&pools),
+                    Arc::clone(&products),
+                    scratch,
+                    shadow,
+                )?;
+                // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it
+                // runs in is mapped before any batch: the executor books it from the scratch pool
+                // the graph storage sized. Nothing is serving yet, so the control thread waits here;
+                // `serve` never does (§2.4).
+                //
+                // §4.5's warmup is not here: the epoch's first generation holds no kernel until the
+                // daemon's precopy fills it - and a precopy that names no kernel (the startup
+                // switch) fills it from the store's built programs - so there is no bucket to warm
+                // yet. It runs at the first switchover, which is the boundary the first request is
+                // served at.
+                let shadow = executor.set_shadow()?;
+                device_command(&watchdog, *device, "shadow region", shadow)
+                    .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
+                // §2.5's two commands reach the Storage Server's ledger from the device thread,
+                // which owns the stream a wake resets its units on, so the client is bound beside
+                // the cache handle rather than kept only here.
+                executor.bind_storage(Arc::clone(&client));
+                executors.push(Arc::new(executor));
+                generations.push(generation);
+            }
+            memories.push(memory);
+            clients.push(client);
+            models.push(model);
+            inventories.push(inventory);
         }
 
         // This node's schedulers, one thread per DP rank, each handing its batches to the executors
@@ -963,12 +1141,12 @@ impl MainProcess {
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
         let schedulers = schedulers(
-            &plan,
+            &first_plan,
             launch,
-            &memory,
-            &model,
+            &memories[0],
+            &models[0],
             &executors,
-            &inventory,
+            &inventories[0],
             control.wake(),
         )?;
 
@@ -980,8 +1158,8 @@ impl MainProcess {
             schedulers,
             stats_reporters,
             executors,
-            memory: Some(memory),
-            storage: Some(retained),
+            memory: memories,
+            storage: clients,
             slept: false,
             blocking,
             modules,
@@ -1110,7 +1288,7 @@ impl MainProcess {
     /// through the same ledger for the process's life. A pool that is not segmented has nothing to
     /// give back, and the line says that rather than reading as a release that happened.
     fn give_back_segments(&mut self) -> Result<()> {
-        let kept_before = self.memory.as_ref().map(Memory::mapped_resident);
+        let kept_before = self.memory.first().map(Memory::mapped_resident);
         // One command per device, and the control thread waits for each: the release is what the
         // successor's memory depends on, so a park that has not given its segments back is not
         // reported `Parked` yet. The device queue serialises commands, so this runs between
@@ -1123,7 +1301,7 @@ impl MainProcess {
             device_command(&self.watchdog, device, "the park's sleep", submission)?;
         }
         self.slept = true;
-        let kept = self.memory.as_ref().map(Memory::mapped_resident);
+        let kept = self.memory.first().map(Memory::mapped_resident);
         if let (Some(before), Some(after)) = (kept_before, kept) {
             tracing::info!(
                 given_back = before.saturating_sub(after),
@@ -1144,7 +1322,7 @@ impl MainProcess {
         if !self.slept {
             return Ok(());
         }
-        let kept_before = self.memory.as_ref().map(Memory::mapped_resident);
+        let kept_before = self.memory.first().map(Memory::mapped_resident);
         for executor in &self.executors {
             let device = executor.device();
             // No limit: this process takes back everything the Storage Server still holds for its
@@ -1162,7 +1340,7 @@ impl MainProcess {
         if let Ok(info) = self.engine_info() {
             self.announced = Some(info);
         }
-        let kept = self.memory.as_ref().map(Memory::mapped_resident);
+        let kept = self.memory.first().map(Memory::mapped_resident);
         if let (Some(before), Some(after)) = (kept_before, kept) {
             tracing::info!(
                 taken_back = after.saturating_sub(before),
@@ -4635,7 +4813,7 @@ impl MainProcess {
         // The caches a park handed back name segments of the pools below: they go before the
         // resident owners close, so nothing the memory releases is still described as parked.
         self.parked = None;
-        if let Some(memory) = self.memory.take() {
+        for memory in std::mem::take(&mut self.memory) {
             if let Err(error) = memory.close() {
                 tracing::warn!(%error, "closing the resident owners failed");
             }

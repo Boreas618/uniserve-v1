@@ -7,11 +7,12 @@
 //! puts its communicator in: it owns the communicator, serializes access to it on the one executor
 //! thread, and offers the collectives a layer needs through `&self`.
 //!
-//! One executor thread issues every job of its device (specs/worker.md 2.4), so the interior
-//! mutability here is not contention: it is the type-level statement that a forward borrows the
-//! group and does not own it.
+//! One executor thread issues every job of its device (specs/worker.md 2.4), so the lock here is not
+//! contention: it is the type-level statement that a forward borrows the group and does not own it,
+//! and it is what lets the runners of one device share a group by `Arc` across the move to their
+//! device thread.
 
-use std::cell::RefCell;
+use std::sync::{Mutex, MutexGuard};
 
 use ops::platform::{DeviceRange, PlatformDevicePtr};
 use ops::{CollectiveType, Communicator, ReduceOp, Stream};
@@ -26,7 +27,7 @@ fn range(view: TensorView, bytes: usize) -> DeviceRange {
 
 /// A rank's NCCL communicator, borrowed by forwards.
 pub struct Group {
-    communicator: RefCell<Communicator>,
+    communicator: Mutex<Communicator>,
     ranks: u64,
 }
 
@@ -34,7 +35,7 @@ impl Group {
     /// The group of `communicator`, whose member count is `ranks`.
     pub fn new(communicator: Communicator, ranks: u64) -> Self {
         Self {
-            communicator: RefCell::new(communicator),
+            communicator: Mutex::new(communicator),
             ranks,
         }
     }
@@ -46,7 +47,7 @@ impl Group {
 
     /// This rank's index, as NCCL reports it.
     pub fn rank(&self) -> i32 {
-        self.communicator.borrow().rank()
+        self.locked().rank()
     }
 
     /// Sum every rank's `view` into every rank's `view`, in place.
@@ -66,8 +67,7 @@ impl Group {
     ) -> Result<()> {
         let (count, dtype) = self.collective(send, recv, "all_reduce")?;
         let bytes = dtype.bytes() * count;
-        self.communicator
-            .borrow_mut()
+        self.locked()
             .all_reduce(
                 stream,
                 range(send, bytes),
@@ -99,8 +99,7 @@ impl Group {
             ));
         }
         let bytes = dtype.bytes();
-        self.communicator
-            .borrow_mut()
+        self.locked()
             .all_gather(
                 stream,
                 range(send, bytes * count),
@@ -111,20 +110,47 @@ impl Group {
             .map_err(Error::Platform)
     }
 
-    /// Exchange equal blocks with every rank: block `j` goes to rank `j`, rank `j`'s comes back.
+    /// Exchange equal blocks with every rank: block `j` of `send` goes to rank `j`, and block `j` of
+    /// `recv` is what rank `j` sent here.
+    ///
+    /// `send` and `recv` are the whole buffers, `ranks` blocks each, and NCCL's `count` is one
+    /// block's elements (`notes/exec/nccl-alltoall-count.md`).
     pub fn all_to_all(&self, send: TensorView, recv: TensorView, stream: &Stream) -> Result<()> {
-        let (count, dtype) = self.collective(send, recv, "all_to_all")?;
-        let bytes = dtype.bytes() * count * usize::try_from(self.ranks).unwrap_or(usize::MAX);
-        self.communicator
-            .borrow_mut()
-            .all_to_all(stream, range(send, bytes), range(recv, bytes), count, dtype)
+        let (elements, dtype) = self.collective(send, recv, "all_to_all")?;
+        let ranks = usize::try_from(self.ranks).unwrap_or(usize::MAX);
+        if recv.numel() != send.numel() || !elements.is_multiple_of(ranks.max(1)) {
+            return Err(Error::shape(
+                "Group::all_to_all",
+                format!(
+                    "sends {elements} elements and receives {}, which are not {ranks} equal blocks",
+                    recv.numel()
+                ),
+            ));
+        }
+        let bytes = dtype.bytes() * elements;
+        self.locked()
+            .all_to_all(
+                stream,
+                range(send, bytes),
+                range(recv, bytes),
+                elements / ranks.max(1),
+                dtype,
+            )
             .map_err(Error::Platform)
     }
 
     /// Run `call` with the underlying communicator, for an operator whose collective is not one of
-    /// the three above (`ops::exchange`, an expert transport).
+    /// the three above (an expert transport).
     pub fn with<R>(&self, call: impl FnOnce(&mut Communicator) -> Result<R>) -> Result<R> {
-        call(&mut self.communicator.borrow_mut())
+        call(&mut self.locked())
+    }
+
+    /// The communicator, for one call. A panic while it was held leaves nothing half-issued that
+    /// this type could repair, so a poisoned lock answers the communicator as it stands.
+    fn locked(&self) -> MutexGuard<'_, Communicator> {
+        self.communicator
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     /// The element count of one rank and the collective's element type.
