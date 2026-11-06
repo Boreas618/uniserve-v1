@@ -43,6 +43,9 @@ pub(super) trait World {
     fn has_capacity(&self, worker: &ExecutorGroupId) -> bool;
 }
 
+/// How often the waiting thread looks at the batches in flight.
+const REPORT_POLL: std::time::Duration = std::time::Duration::from_micros(50);
+
 /// What the mechanism executes through.
 ///
 /// Public because a scheduler is built with one: `Scheduler::new` takes a
@@ -158,12 +161,35 @@ impl Submissions {
             .spawn(move || {
                 // One waiting thread for the whole epoch: a submission's
                 // outcome is a device's, and the scheduler thread reads only
-                // what this thread has already collected.
-                while let Ok(pending) = pending.recv() {
-                    let outcome = pending.submission.wait();
-                    let report = BatchReport::from_output(pending.batch, outcome, &pending.calls);
-                    if reports.send(report).is_err() {
-                        break;
+                // what this thread has already collected. The devices finish
+                // in their own order, so a batch is reported when it ends: a
+                // report held behind an earlier batch on another device is a
+                // next call that many milliseconds late.
+                let mut held: Vec<Pending> = Vec::new();
+                loop {
+                    if held.is_empty() {
+                        match pending.recv() {
+                            Ok(next) => held.push(next),
+                            Err(_) => break,
+                        }
+                    }
+                    held.extend(pending.try_iter());
+                    let mut index = 0;
+                    let mut reported = false;
+                    while index < held.len() {
+                        let Some(outcome) = held[index].submission.outcome() else {
+                            index += 1;
+                            continue;
+                        };
+                        let done = held.remove(index);
+                        let report = BatchReport::from_output(done.batch, outcome, &done.calls);
+                        if reports.send(report).is_err() {
+                            return;
+                        }
+                        reported = true;
+                    }
+                    if !reported && !held.is_empty() {
+                        std::thread::sleep(REPORT_POLL);
                     }
                 }
             })
