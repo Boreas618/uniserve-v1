@@ -85,7 +85,7 @@ pub struct Layer {
 impl Layer {
     /// Every checkpoint tensor one stack layer reads, as complete names.
     ///
-    /// [`Layer::load`]'s own requests, in its order: the two norms, the feed-forward's two
+    /// The layer's own load requests, in its order: the two norms, the feed-forward's two
     /// projections, then the attention's.
     pub fn keys(index: u32, kind: AttentionKind) -> Vec<String> {
         let prefix = format!("transformer_blocks.{index}");

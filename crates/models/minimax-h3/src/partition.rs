@@ -17,7 +17,15 @@ use crate::checkpoint::TASK_DITS;
 use crate::denoiser::Arrangement;
 use crate::{Error, Result, config::Config};
 
-/// The text rows the released checkpoint's dense deployment holds: two 64-row units.
+/// The text rows the released checkpoint's own deployment holds: two 64-row units.
+///
+/// **A prompt capacity is the deployment's, not the checkpoint's.** The reference reserves one prefix
+/// row per prompt token and states a request's text rows as its prompt rounded up to the attention
+/// unit's tile (`packing.py:557`, `denoiser.py:411`), so the row count follows what the serving
+/// deployment prepares - `video_config.text_capacities`, 1024 as the release's validated setting and
+/// this constant as the smallest rung its own table names. A served deployment states its capacity
+/// with [`Partition::sized`]; a model built at another number refuses every longer prompt at the
+/// packed prefix.
 pub const RELEASED_TEXT_ROWS: u32 = 128;
 
 /// The condition rows it holds: three 64-row units, nine images, three videos and two keyframes.

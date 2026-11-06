@@ -245,6 +245,53 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
     handle.shutdown();
 }
 
+/// A request that ended leaves nothing for a boundary to wait on.
+///
+/// The batch that closes a request carries lifecycle commands alone, and the
+/// in-process arm answers those itself: no executor ever reports that batch. A
+/// window that kept it would never empty again, so every boundary that needs an
+/// empty window, a policy stage first of all, would wait for a result no one
+/// will send.
+#[test]
+fn a_policy_stage_applies_after_a_request_ended() {
+    let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
+        "model",
+    )]));
+    let batches: Arc<dyn Batches> = serving.clone();
+    let handle = SchedulerHandle::over_batches(
+        crate::support::serving::config(&serving, "in-process-completion"),
+        batches,
+    )
+    .expect("the pool serves");
+    install(&handle, &serving);
+
+    let mut events = handle
+        .submit(text_request(1, 8, 4))
+        .expect("the request is submitted");
+    let deadline = Instant::now() + FIRST_TOKEN;
+    let mut finished = false;
+    while !finished && Instant::now() < deadline {
+        match events.try_recv() {
+            Ok(Event::Finished { .. }) => finished = true,
+            Ok(refused @ (Event::Rejected { .. } | Event::Error { .. })) => {
+                panic!("the request was refused: {refused:?}")
+            }
+            Ok(_) => {}
+            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    assert!(finished, "the request ended");
+
+    // Stated as the next stage of an update: the candidate is prepared, and the
+    // switchover asks for a boundary with nothing in flight.
+    let source: Arc<dyn engine::PolicySource + Send + Sync> =
+        Arc::new(engine::PolicyBytes::new(crate::support::policy_module()));
+    answer(handle.precopy_policy(policy_program(&serving), source))
+        .expect("the next policy is precopied");
+    answer(handle.stage(Stage::Switchover)).expect("the next policy serves");
+    handle.shutdown();
+}
+
 /// An admitted request is worked on, in the phase the mechanism tells the
 /// policy it serves next.
 ///
