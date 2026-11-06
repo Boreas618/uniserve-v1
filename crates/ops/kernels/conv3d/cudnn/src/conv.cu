@@ -409,12 +409,9 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
     channels_last_strides(x_dims, x_strides);
     channels_last_strides(y_dims, y_strides);
   }
-  if (transposed) {
-    // The layer's weight is `[c, k, …]` in memory and `[k, c, …]` to the
-    // backward-data pass: the same bytes with the two channel axes exchanged.
-    std::swap(w_dims[0], w_dims[1]);
-    std::swap(w_strides[0], w_strides[1]);
-  }
+  // A transposed layer's weight is `[in, out, …]`, and that is already the filter the backward-data
+  // pass reads: its `dy` is the layer's input, so the filter's `k` is `in`, and its `dx` the layer's
+  // output, so its `c` is `out`. The axes stay as they are.
 
   void* x = nullptr;
   void* w = nullptr;
