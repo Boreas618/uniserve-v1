@@ -306,7 +306,9 @@ impl Output {
             self.rates.frame_rate,
             &mut framed,
         )?;
+        // The row is the store's framing, a length before the unit, and the assembly reads the unit.
         framed.truncate(written);
+        framed.drain(..size_of::<u64>());
         self.media.append_units(request_id(request), &[framed])?;
         // The append is what says this unit has its place: the next encode of this request reads
         // the schedule's following entry, so the count moves only after the encoder accepted it.
