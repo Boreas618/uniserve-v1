@@ -5,9 +5,7 @@
 //
 // What the entry owns: the checks that turn a misplaced operand into a message (the
 // compiled geometry, the operand dtypes, the scratch floor), the per-call tactic
-// choice, the per-column bias the artifact's kernels take (zeroed, because this
-// operator has none), and the device word the GEMM bounds its M by -- the padded route
-// count. What it does not own: any arithmetic. The product is the artifact's, and
+// choice, and the device word the GEMM bounds its M by -- the padded route count. What it does not own: any arithmetic. The product is the artifact's, and
 // everything the call states is either its geometry or an operand.
 
 #include "entry.h"
@@ -209,17 +207,16 @@ int launch(uniserve_route_gemm_nvfp4_call* call, void* stream) {
   if (config < 0) {
     return refuse(call, "no compiled tactic serves this problem's shape");
   }
-  // The arming: the artifact's own requirement for the chosen tactic, plus the two device
-  // words this entry owns (the padded route count and the zeroed per-column bias). A
-  // buffer shorter than that is refused with both numbers -- the plan sizes it, and a step
+  // The arming: the artifact's own requirement for the chosen tactic, plus the device word
+  // this entry owns (the padded route count). A buffer shorter than that is refused with both numbers -- the plan sizes it, and a step
   // that grows one is a host allocation inside a captured graph.
   size_t const required = product.getWorkspaceSizeInBytes(top_k, hidden, intermediate, experts,
                                                           routes, config);
-  // The scratch the entry owns: the padded route count (one i32), then the zeroed bias the
-  // artifact's kernels take (one f32 per output column), then the tactic's own.
-  size_t const bias_bytes = sizeof(float) * static_cast<size_t>(hidden);
-  size_t const bias_at = 16;
-  size_t const needed = bias_at + bias_bytes + required;
+  // The scratch the entry owns: the padded route count (one i32), then the tactic's own. No
+  // bias table: the kernels index one per expert, the operator has none, and a null pointer
+  // is what the runner takes for that.
+  size_t const workspace_at = 16;
+  size_t const needed = workspace_at + required;
   if (static_cast<size_t>(call->workspace_bytes) < needed) {
     char message[512];
     std::snprintf(message, sizeof(message),
@@ -231,8 +228,7 @@ int launch(uniserve_route_gemm_nvfp4_call* call, void* stream) {
 
   auto* seat = static_cast<unsigned char*>(call->workspace);
   auto* total_num_padded_tokens = reinterpret_cast<int32_t*>(seat);
-  auto* bias = reinterpret_cast<float*>(seat + bias_at);
-  void* bmm_workspace = static_cast<void*>(seat + bias_at + bias_bytes);
+  void* bmm_workspace = static_cast<void*>(seat + workspace_at);
   cudaStream_t const order = reinterpret_cast<cudaStream_t>(stream);
   // The GEMM bounds its M by the padded route count, which is this call's own value: it is
   // written on the stream, before the product, so the ordering is the stream's.
@@ -240,15 +236,6 @@ int launch(uniserve_route_gemm_nvfp4_call* call, void* stream) {
                        static_cast<unsigned int>(call->routes), 1,
                        reinterpret_cast<CUstream>(order)) != CUDA_SUCCESS) {
     return refuse(call, "the padded route count could not be written on the call's stream");
-  }
-
-  // The bias is zero, on the same stream and before the product: the operator has none, and
-  // the kernel's slot takes the additive identity rather than a value the model never
-  // stated.
-  if (cuMemsetD32Async(reinterpret_cast<CUdeviceptr>(bias), 0,
-                       static_cast<size_t>(bias_bytes / sizeof(float)),
-                       reinterpret_cast<CUstream>(order)) != CUDA_SUCCESS) {
-    return refuse(call, "the zeroed bias could not be written on the call's stream");
   }
 
   int device = 0;
@@ -259,7 +246,8 @@ int launch(uniserve_route_gemm_nvfp4_call* call, void* stream) {
   product.run(const_cast<void*>(call->hidden), const_cast<void*>(call->hidden_scale),
               const_cast<void*>(call->weights), const_cast<void*>(call->scales),
               const_cast<void*>(call->hidden_token_scale), /*perChannelScales=*/nullptr,
-              const_cast<float*>(static_cast<float const*>(call->global_scale)), bias, call->out,
+              const_cast<float*>(static_cast<float const*>(call->global_scale)),
+              /*bias=*/nullptr, call->out,
               /*outputScale=*/nullptr, top_k, hidden, intermediate, experts, routes,
               const_cast<int32_t*>(call->num_non_exiting_tiles),
               total_num_padded_tokens, const_cast<int32_t*>(call->tile_to_expert),
