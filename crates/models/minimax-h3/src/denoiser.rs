@@ -1508,10 +1508,33 @@ impl nn::capability::Denoiser for Denoiser {
     /// storage from the number the forward fills rather than from a literal beside it. Nothing here
     /// allocates or touches a device: the model states what its forward needs and the runtime owner
     /// allocates to it.
+    /// The stage's floor: **the larger of one evaluation and the prompt's fold**, because the two
+    /// reuse one region rather than following one another in it.
+    ///
+    /// The captured graph's nodes carry the offsets the planning walk recorded, and that walk starts
+    /// its arena at the region's base and runs the evaluation alone. The fold runs only on the live
+    /// path (`first_step`, before the first replay) and writes its result into the conditioning
+    /// column, so its scratch and the graph's buffers occupy the same offsets by construction: the
+    /// graph clobbers the fold's scratch, which is dead, and never the fold's output, which is a
+    /// column. Adding the two would refuse a deployment that serves - and the plan's entries are
+    /// storage the executor allocates by name, so an added entry is memory rather than a bound.
+    ///
+    /// The larger, then, and not the sum: at every deployment here the evaluation is the larger (the
+    /// fold is 532 MiB against the evaluation's 6.1 GiB at a 1024-row capacity), and the `max` is
+    /// stated rather than assumed because a deployment whose evaluation were smaller would need it.
     fn arena_bytes(&self, request: &VideoRequest<'_>) -> nn::Result<u64> {
         let layout = self.layout(request);
         let plan = self.denoise_arena(&layout).map_err(flattened)?;
-        Ok(crate::decoding::arena_reservation(&plan))
+        let evaluation = crate::decoding::arena_reservation(&plan);
+        let rows = layout.text_rows.saturating_add(layout.condition_rows);
+        let fold = crate::conditioning::fold_bytes(
+            &self.config.transformer,
+            rows,
+            rows,
+            self.shard,
+            self.transformer.dtype(),
+        );
+        Ok(evaluation.max(fold))
     }
 
     /// The denoising steps this checkpoint runs for `task`.
@@ -2683,8 +2706,13 @@ impl Denoiser {
     ) -> Result<()> {
         // The refiner's rows are the denoiser's conditioning (`denoiser.py:510-532`): every task's
         // text passes through it once, in place over the runner's `text` buffer, and the encoder's
-        // own features arrive in `source`. A request with no source has no conditioning to refine -
-        // and no text either, since the encoder always writes what the refiner reads.
+        // own features arrive in `source`.
+        //
+        // The two widths are what makes the refiner the column's only producer: the encoder's
+        // features are `text_dim` (5120) and the conditioning column is `hidden_size` (5376), so
+        // nothing on the encoder's side writes a row of `text`. A request with no source therefore
+        // asks this model to denoise a column nothing projected - the shape a model whose encoder
+        // width *is* its column width has, and never this one's served path.
         //
         // A conditioned request's condition rows, below the prompt's: the encoders write them from
         // `media`, at the offsets the layout's own counts place them, and the two writes are

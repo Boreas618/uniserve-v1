@@ -366,7 +366,11 @@ pub fn audio_arena(
         });
     };
     let mut length = u64::from(frames);
-    push("track".to_owned(), u64::from(config.latent_channels), length);
+    push(
+        "track".to_owned(),
+        u64::from(config.latent_channels),
+        length,
+    );
     push(
         "restored".to_owned(),
         u64::from(config.latent_channels),
