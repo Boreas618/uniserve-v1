@@ -86,6 +86,22 @@ impl Diag {
             })
     }
 
+    /// Writes `bytes` as `<block>/<name>` under the diagnosis directory, as they stand.
+    ///
+    /// For what a tensor cannot hold: the request's own plan, which the reference half reads to run
+    /// the same request.
+    pub(crate) fn write_bytes(&self, block: &str, name: &str, bytes: &[u8]) {
+        let Some(root) = self.dir.as_ref() else {
+            return;
+        };
+        let directory = root.join(block);
+        if let Err(error) = std::fs::create_dir_all(&directory)
+            .and_then(|()| std::fs::write(directory.join(name), bytes))
+        {
+            tracing::warn!(block, name, error = %error, "a diagnosis dump was not written");
+        }
+    }
+
     fn dump(
         &self,
         root: &Path,
@@ -123,8 +139,8 @@ impl Diag {
     }
 }
 
-/// The element type a dump is written in, and its bytes: `f32` as it stands, `f16` as it stands, and
-/// every other type widened to `f32`.
+/// The element type a dump is written in, and its bytes: `f32`, `f16` and `i32` as they stand, and
+/// `bf16` widened to `f32`.
 ///
 /// Widening is by the element's own value: BF16 is the top sixteen bits of an FP32, so a shift is
 /// the exact widening; the same is true of the low half, which is why `f16` is converted rather
@@ -133,6 +149,8 @@ fn widen(dtype: DType, payload: &[u8]) -> Result<(DType, Vec<u8>)> {
     match dtype {
         DType::F32 => Ok((DType::F32, payload.to_vec())),
         DType::F16 => Ok((DType::F16, payload.to_vec())),
+        // A table of indices is compared exactly, so it keeps its integers.
+        DType::I32 => Ok((DType::I32, payload.to_vec())),
         DType::BF16 => {
             let mut out = Vec::with_capacity(payload.len() * 2);
             for pair in payload.chunks_exact(2) {
@@ -142,7 +160,7 @@ fn widen(dtype: DType, payload: &[u8]) -> Result<(DType, Vec<u8>)> {
             Ok((DType::F32, out))
         }
         other => Err(Error::Invalid(format!(
-            "a dump is `f4` or `f2` and this tensor is {other}"
+            "a dump is `f4`, `f2` or `i4` and this tensor is {other}"
         ))),
     }
 }
@@ -156,9 +174,10 @@ fn npy(shape: &[u64], dtype: DType, payload: &[u8]) -> Result<Vec<u8>> {
     let descr = match dtype {
         DType::F32 => "<f4",
         DType::F16 => "<f2",
+        DType::I32 => "<i4",
         other => {
             return Err(Error::Invalid(format!(
-                "a dump is written as `f4` or `f2`, not {other}"
+                "a dump is written as `f4`, `f2` or `i4`, not {other}"
             )));
         }
     };
@@ -272,16 +291,25 @@ mod tests {
     /// test pinned the name in capitals, which is what the type printed before `Debug` was made to
     /// agree with `Display`; the refusal itself never lost its reason.
     #[test]
-    fn a_type_that_is_not_a_float_cannot_be_a_dump() {
-        let error = widen(DType::I32, &[0u8; 4]).unwrap_err();
+    fn a_type_a_dump_does_not_hold_is_refused() {
+        let error = widen(DType::I64, &[0u8; 8]).unwrap_err();
         let text = format!("{error}");
         assert!(
-            text.contains("a dump is `f4` or `f2`"),
+            text.contains("a dump is `f4`, `f2` or `i4`"),
             "the refusal no longer says what a dump may be: {text}"
         );
         assert!(
-            text.contains(&format!("this tensor is {}", DType::I32)),
+            text.contains(&format!("this tensor is {}", DType::I64)),
             "the refusal does not name the type it was given: {text}"
         );
+    }
+
+    /// A table of indices is compared exactly, so its integers reach the file as they stand.
+    #[test]
+    fn an_index_table_keeps_its_integers() {
+        let table = 7_i32.to_le_bytes();
+        let (dtype, bytes) = widen(DType::I32, &table).unwrap();
+        assert_eq!(dtype, DType::I32);
+        assert_eq!(bytes, table.to_vec());
     }
 }

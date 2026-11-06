@@ -105,26 +105,6 @@ pub struct Config {
     pub video_vae: VideoVaeConfig,
     /// The audio VAE: the BigVGAN decoder every task uses and the encoder `ref2va` uses.
     pub audio_vae: AudioVaeConfig,
-    /// The task the checkpoint's contract states it serves, for a distilled export.
-    ///
-    /// A student is distilled for one task and its `fastvideo_inference.json` says which; a release
-    /// states none and every task its DiT partitions serve is servable. It is kept apart from
-    /// [`Self::tasks`] because the two answer different questions: `tasks` is what the *architecture*
-    /// can express (which is what a walk and a diagnosis size themselves for), and this is what a
-    /// *deployment* of this checkpoint serves.
-    pub contract_task: Option<VideoTask>,
-}
-
-/// The rule that narrows an architecture's tasks to what a deployment of the checkpoint serves.
-///
-/// Stated as a free function because it is one sentence and two callers read it: the configuration
-/// and any walk that asks which task a *deployment* would serve rather than which the architecture
-/// can express.
-fn serving_tasks(tasks: &[VideoTask], contract: Option<VideoTask>) -> Vec<VideoTask> {
-    match contract {
-        Some(task) => vec![task],
-        None => tasks.to_vec(),
-    }
 }
 
 impl Config {
@@ -219,8 +199,6 @@ impl Config {
             denoisers,
             video_vae,
             audio_vae,
-            // The contract's task, when the checkpoint is a distilled export of one.
-            contract_task: layout.contract.as_ref().map(|contract| contract.task),
         };
         config.validate()?;
         Ok(config)
@@ -238,16 +216,14 @@ impl Config {
         }
     }
 
-    /// The tasks a **deployment** of this checkpoint serves.
+    /// The tasks a deployment of this checkpoint can serve: those of the network it holds.
     ///
-    /// A distilled export serves the task its contract states and no other: its student replaces one
-    /// partition's weights for one task, and a partition carries one task's block set and condition
-    /// capacity, so a deployment of it is one task. A release serves every task its partitions serve.
-    /// [`Self::tasks`] stays the *architecture's* answer, which is what a program walk and a
-    /// diagnosis of the conditioner size themselves for - a student's encoder exists even though its
-    /// contract serves no conditioned task.
+    /// A distilled export serves every task of the partition its student replaces, as the reference
+    /// reads it (`checkpoint.py`: "the student serves every task of the partition's network"). Which
+    /// partition a deployment runs is the deployment page's statement, so a release that holds both
+    /// serves the tasks of the one the page places.
     pub fn serving(&self) -> Vec<VideoTask> {
-        serving_tasks(&self.tasks(), self.contract_task)
+        self.tasks()
     }
 
     /// The tasks the checkpoint can serve: each DiT's, in canonical order.
@@ -573,37 +549,6 @@ mod tests {
     /// A distilled export serves the task its contract states; a release serves every task its
     /// partitions serve.
     ///
-    /// The two questions are different and both are asked: a **deployment** serves one task (a
-    /// partition carries one task's block set and condition capacity, and a student's contract says
-    /// which), while the *architecture* can express every task its DiTs name - which is what a
-    /// program walk and a diagnosis of the conditioner size themselves for, because a student's
-    /// encoder exists even though no deployment of it serves a conditioned task.
-    #[test]
-    fn a_contract_narrows_the_served_tasks_and_a_release_serves_them_all() {
-        let expressible = vec![
-            VideoTask::TextToVideoAudio,
-            VideoTask::FirstLastToVideoAudio,
-        ];
-        assert_eq!(
-            serving_tasks(&expressible, None),
-            expressible,
-            "a release serves everything its partitions serve"
-        );
-        assert_eq!(
-            serving_tasks(&expressible, Some(VideoTask::TextToVideoAudio)),
-            vec![VideoTask::TextToVideoAudio],
-            "an export serves the task its contract states and no other"
-        );
-        let layout = base_layout();
-        let config = Config::normalize(&layout, &sidecars(&layout)).expect("a base release");
-        assert_eq!(config.contract_task, None, "a release states no contract");
-        assert_eq!(
-            config.serving(),
-            config.tasks(),
-            "with no contract the served set is the architecture's"
-        );
-    }
-
     #[test]
     fn a_base_release_reads_both_partitions_with_the_uniform_grid() {
         let layout = base_layout();
