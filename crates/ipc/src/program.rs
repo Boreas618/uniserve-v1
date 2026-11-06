@@ -384,7 +384,7 @@ mod tests {
         );
         let command = ProgramCommand::Precopy {
             generation: 9,
-            programs: Box::new(programs),
+            programs: Box::new(programs.clone()),
             policy: program_server::Program {
                 backend: "fcfs".to_owned(),
                 revision: 4,
@@ -396,14 +396,28 @@ mod tests {
         let back = ProgramCommand::from_command(wire.clone(), 3)
             .expect("the wire form states a program command")
             .expect("and it is the program layer's");
-        assert_eq!(back, command);
+        // A daemon's precopy states no generation (`proto::process::Precopy`
+        // reserves the field, §7.3 step 2): the main process numbers the one it
+        // prepares, and `Report::Precopied` echoes the number back. What arrives
+        // is therefore the command for the generation after the one serving —
+        // the fixture's own number never crosses the wire.
+        let expected = ProgramCommand::Precopy {
+            generation: 4,
+            programs: Box::new(programs.clone()),
+            policy: program_server::Program {
+                backend: "fcfs".to_owned(),
+                revision: 4,
+                arguments: "chunked_prefill_size = 4096".parse().expect("the policy's arguments"),
+            },
+        };
+        assert_eq!(back, expected);
 
         // The daemon's form carries no modules, only names, revisions and
         // arguments (§6.3), and no step: the boundary is the main process's.
         let bytes = prost::Message::encoded_len(&wire);
         assert!(bytes < 512, "a precopy of one kernel is {bytes} bytes");
         assert_eq!(
-            command.to_command(),
+            expected.to_command(),
             ProgramCommand::from_command(wire, 3)
                 .expect("decodes")
                 .expect("is a program command")
