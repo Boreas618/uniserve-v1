@@ -679,6 +679,62 @@ fn an_activation_scale_whose_reciprocal_cannot_encode_is_refused() {
     assert_eq!(store.published[2].1, 10.0_f32.to_le_bytes().to_vec());
 }
 
+/// An expert stack publishes its experts' calibrated activation scales as the checkpoint states
+/// them, however small they are: no operand multiplies a value by them, so their reciprocal is data
+/// rather than the encoder's factor, and bounding it would refuse a checkpoint over a number
+/// nothing reads. The dense projection's own scale *is* that factor and is bounded there.
+#[test]
+fn an_expert_stacks_activation_scales_are_data_and_are_not_bounded() {
+    let directory = tempfile::tempdir().unwrap();
+    let directory = directory.path();
+    let values: Vec<u8> = (0..64).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..8).map(|byte| 0x20 + byte as u8).collect();
+    shard_typed(
+        directory,
+        "model.safetensors",
+        &[
+            ("experts.0.up_proj.weight", DType::U8, vec![2, 32], values),
+            (
+                "experts.0.up_proj.weight_scale",
+                DType::U8,
+                vec![2, 4],
+                scales,
+            ),
+            (
+                "experts.0.up_proj.weight_scale_2",
+                DType::F32,
+                vec![1],
+                0.5f32.to_le_bytes().to_vec(),
+            ),
+            // A factor of 1000, above the encoder's ceiling: data, not an operand.
+            (
+                "experts.0.up_proj.input_scale",
+                DType::F32,
+                vec![1],
+                0.001f32.to_le_bytes().to_vec(),
+            ),
+        ],
+    );
+
+    let checkpoint = Checkpoint::open(directory).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let stack = loader
+        .nvfp4_stack(
+            "layer.0.mlp.experts.up",
+            "experts",
+            &["up"],
+            1,
+            Nvfp4Names::vllm(),
+            nn::ValueLayout::Plain,
+            ops::fp4::ScaleLayout::Linear,
+            true,
+        )
+        .expect("a stack's activation scales are published, not used");
+    let published = stack.input_scale.expect("the stack carries them");
+    assert_eq!(published.dtype(), DType::F32);
+}
+
 /// An expert stack is its experts' encoded tensors concatenated in the operator's reading order —
 /// expert-major, up before gate — and its tensor scales become one reciprocal per expert **and
 /// projection**, because the checkpoint gives each expert's up and gate their own `weight_scale_2`.
