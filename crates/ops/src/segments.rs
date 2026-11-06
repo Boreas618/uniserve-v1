@@ -1016,9 +1016,9 @@ pub struct ScoresArgs {
 /// the sparse path has no scores, and nothing else fills the gap: `gemm` has no batch axis, and the
 /// contraction is per head.
 ///
-/// It is exactly a per-head dot product — no scale and no softmax, because the caller applies both
-/// afterwards (the selection only compares, and the attention scales its own products), so the
-/// program writes the raw sum of products and nothing else.
+/// It is a per-head dot product scaled by `1 / sqrt(width)`, as the reference's scores are: the
+/// selection only compares, but the compression's softmax reads the same scores. There is no
+/// softmax here.
 ///
 /// **The operands are the pooled tiles in the layout the pooling writes them**: a tile is the
 /// leading axis, then the head, then the feature. The scores are the other way round — head first —
