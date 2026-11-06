@@ -2182,9 +2182,7 @@ impl Denoiser {
         // the tensors it reads. Keyed from the stack it states four rows the forward never makes -
         // its per-head norms, its two modulation gathers and its attention - and lacks the four it
         // does.
-        programs.extend(crate::conditioning::TokenRefiner::programs(
-            config, dtype, boundary,
-        )?);
+        programs.extend(crate::conditioning::TokenRefiner::programs(config, boundary)?);
 
         let video = config.video_channels;
 
