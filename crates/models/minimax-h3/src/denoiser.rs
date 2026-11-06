@@ -3287,7 +3287,7 @@ impl Denoiser {
         let mut adaln_layers = Vec::with_capacity(config.transformer.num_hidden_layers as usize);
         let zeros = vec![0_u8; (entries * columns * unit) as usize];
         for index in 0..config.transformer.num_hidden_layers {
-            adaln_layers.push(loader.constant(
+            adaln_layers.push(loader.writable_constant(
                 &format!("minimax_h3.adaln.layers.{index}"),
                 table_type,
                 Shape::new(&[entries, columns]),
@@ -3295,7 +3295,7 @@ impl Denoiser {
                 "minimax-h3",
             )?);
         }
-        let adaln_output = loader.constant(
+        let adaln_output = loader.writable_constant(
             "minimax_h3.adaln.output",
             table_type,
             Shape::new(&[entries, 2 * hidden]),
