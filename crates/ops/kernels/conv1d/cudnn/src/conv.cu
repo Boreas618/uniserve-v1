@@ -27,6 +27,11 @@
 // zero in `ops`, so both paddings are the layer's own. A grouped transposed
 // convolution is not described by that pass in this layout and is refused.
 //
+// `channels_last` is the activations' storage, and all three operators take it: the shapes in the
+// call stay logical, and the input and the output get channels-last strides. The filter does not,
+// because a checkpoint stores it packed. The bias is the one thing outside cuDNN that reads the
+// output's order, so it is told it.
+//
 // The element types are the descriptor's, known when the descriptor's module is
 // compiled: `UNISERVE_CONV_INPUT_DTYPE`, `UNISERVE_CONV_WEIGHT_DTYPE` and
 // `UNISERVE_CONV_OUTPUT_DTYPE` carry the operator crate's `DType` numbers. cuDNN
@@ -388,9 +393,33 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
   std::memcpy(x_dims, call.input_shape, sizeof(x_dims));
   std::memcpy(w_dims, call.weight_shape, sizeof(w_dims));
   std::memcpy(y_dims, call.out_shape, sizeof(y_dims));
+  /// Channels-last strides of dimensions ordered `[n, c, spatial...]`: the channel axis runs fastest,
+  /// then the `kSpatial` axes from the innermost out, then the batch. cuDNN reads the format from the
+  /// strides. A 1-d convolution's `[l, 1, 1]` needs no case of its own: its two unit axes multiply
+  /// by one, so `l` takes the channel count as its stride, which is what `[n, l, c]` storage is.
+  auto channels_last_strides = [](const int64_t* dims, int64_t* strides) {
+    strides[1] = 1;
+    int64_t running = dims[1];
+    for (int32_t axis = kSpatial + 1; axis >= 2; --axis) {
+      strides[axis] = running;
+      running *= dims[axis];
+    }
+    strides[0] = running;
+  };
+
+  const bool channels_last = call.channels_last != 0;
   row_major(x_dims, x_strides);
   row_major(y_dims, y_strides);
   row_major(w_dims, w_strides);
+  if (channels_last) {
+    // The activations and the output are the two operands a channels-last *memory format*
+    // reorders. The filter is not one: a checkpoint stores every module's weight packed in
+    // `[out, in, kd, kh, kw]`, which is the KCRS form the filter descriptor wants, and no
+    // framework's channels-last format touches module weights. Reordering it here reads the
+    // filter at the wrong offsets while the numbers still look like a convolution.
+    channels_last_strides(x_dims, x_strides);
+    channels_last_strides(y_dims, y_strides);
+  }
   // A transposed layer's weight is `[in, out, …]`, and that is already the filter the backward-data
   // pass reads: its `dy` is the layer's input, so the filter's `k` is `in`, and its `dx` the layer's
   // output, so its `c` is `out`. The axes stay as they are.
@@ -491,7 +520,6 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
     void* heuristic = nullptr;
     std::vector<void*> configs;
     bool listed = false;
-    char tried[160] = {};
     // **A list longer than the array is a query cuDNN refuses, and a refused query reads exactly
     // like an empty one.** The count is asked for separately - zero elements, no array - and the
     // array is sized from the answer, so an exhaustive list is readable whatever its length. The
@@ -581,6 +609,7 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
       configs.resize(kept);
       return count > 0 ? count : 0;
     };
+    char tried[160] = {};
     const int32_t modes[3] = {kHeuristicModeA, kHeuristicModeB, kHeuristicModeFallback};
     const char* names[3] = {"shortlist", "exhaustive", "fallback"};
     for (int32_t at_mode = 0; built && at_mode < 3 && !listed; ++at_mode) {
@@ -635,7 +664,7 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
       // error, so a graph whose arithmetic is wrong reads exactly like a shape the library cannot
       // serve. The forward's axis is `(in + 2p - d(k-1) - 1)/s + 1` and the backward-data pass's is
       // `(dy - 1)s - 2p + d(k-1) + 1`; both are recomputed from the stated input, weight and
-      // geometry and printed beside the stated output.
+      // geometry, and the refusal prints them beside the stated output.
       int64_t implied[kSpatial] = {0, 0, 0};
       bool agrees = true;
       for (int32_t axis = 0; axis < kSpatial; ++axis) {
@@ -649,13 +678,17 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
         agrees = agrees && implied[axis] == y_dims[axis + 2];
       }
       // **The graph travels with the refusal.** An empty engine list is an answer about one exact
-      // request - these dims, these strides, this geometry, this element type and this permission -
-      // and the caller of this operator sees none of it. The two things that decide the cure come
-      // first, so a message truncated by its own room still says which lists were asked and whether
-      // the geometry agrees; the graph follows.
+      // request: these dims, these strides, this geometry, this element type and this permission.
+      // A reader given only the sentence has to guess which of them cuDNN would not take - and the
+      // caller of this operator cannot see them at all, because the descriptor carries no geometry.
       char why[512];
       std::snprintf(
           why, sizeof(why),
+          // The two things that decide the cure come first, so that a message truncated by its own
+          // room still says which lists were asked and whether the geometry agrees: `asked` names
+          // each list and what it said, and `geometry` compares the stated output with the one the
+          // input, weight and geometry imply. The graph follows, because a reader with only the
+          // verdict has to guess which shape cuDNN would not take.
           "cuDNN proposes no engine for this convolution: %s, asked %s, geometry %s (imply [%lld "
           "%lld %lld]); x [%lld %lld %lld %lld %lld] strides [%lld %lld %lld %lld %lld] type %d, "
           "w [%lld %lld %lld %lld %lld] type %d, y [%lld %lld %lld %lld %lld] type %d, kernel "
@@ -783,39 +816,41 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handl
   return made;
 }
 
-/// Adds a bias to a contiguous `[n, k, d, h, w]` output, one element per thread.
+/// Adds a bias to a dense output, one element per thread. `channel_stride` is the elements between
+/// two channels of one position: the spatial extent of `[n, k, d, h, w]` storage, 1 of channels-last
+/// storage, where the channel is the fastest axis.
 template <typename Element>
 __global__ void bias_kernel(Element* y, const Element* bias, int64_t elements, int64_t channels,
-                            int64_t spatial) {
+                            int64_t channel_stride) {
   const int64_t at = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (at >= elements) {
     return;
   }
-  const int64_t channel = (at / spatial) % channels;
+  const int64_t channel = (at / channel_stride) % channels;
   const float bias_value = static_cast<float>(bias[channel]);
   y[at] = static_cast<Element>(static_cast<float>(y[at]) + bias_value);
 }
 
 /// The kernel that adds the bias of the module's element type.
-void add_bias(void* y, const void* bias, int64_t elements, int64_t channels, int64_t spatial,
-              int32_t dtype, cudaStream_t stream) {
+void add_bias(void* y, const void* bias, int64_t elements, int64_t channels,
+              int64_t channel_stride, int32_t dtype, cudaStream_t stream) {
   const int64_t threads = 256;
   const int64_t blocks = (elements + threads - 1) / threads;
   switch (dtype) {
     case UNISERVE_CONV_DTYPE_F32:
       bias_kernel<<<blocks, threads, 0, stream>>>(static_cast<float*>(y),
                                                   static_cast<const float*>(bias), elements,
-                                                  channels, spatial);
+                                                  channels, channel_stride);
       break;
     case UNISERVE_CONV_DTYPE_F16:
       bias_kernel<<<blocks, threads, 0, stream>>>(static_cast<__half*>(y),
                                                   static_cast<const __half*>(bias), elements,
-                                                  channels, spatial);
+                                                  channels, channel_stride);
       break;
     case UNISERVE_CONV_DTYPE_BF16:
       bias_kernel<<<blocks, threads, 0, stream>>>(
           static_cast<__nv_bfloat16*>(y), static_cast<const __nv_bfloat16*>(bias), elements,
-          channels, spatial);
+          channels, channel_stride);
       break;
     default:
       break;
@@ -856,8 +891,11 @@ std::string plan_key(const uniserve_conv_call& call, int32_t device) {
   key += std::to_string(UNISERVE_CONV_OUTPUT_DTYPE);
   key += '_';
   key += std::to_string(UNISERVE_CONV_ENGINE);
-  // The engine the plan holds depends on the call's TF32 permission.
+  // The engine the plan holds depends on the call's TF32 permission...
   key += call.tf32 != 0 ? "_tf32" : "_exact";
+  // ...and on the iteration order, because the two orders' tensor descriptors are different
+  // plans over one engine: a plan cached for one would give the other the wrong strides.
+  key += call.channels_last != 0 ? "_ndhwc" : "_ncdhw";
   key += "_device_";
   key += std::to_string(device);
   return key;
@@ -876,11 +914,6 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
   // convolution may both grant and withhold the permission, and the engine selection
   // below is what makes the withholding real: with `tf32` clear, only an engine that
   // does not narrow its inputs is used.
-  if (call->channels_last != 0) {
-    return refuse(error,
-                  "this package has no channels-last path: it reads channels-first tensors only");
-  }
-
   if (call->tf32 != 0 && !kFp32Inputs) {
     return refuse(error,
                   "a convolution's tf32 value describes FP32 inputs only: this module's input "
@@ -992,8 +1025,8 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
     const int64_t channels = call->out_shape[1];
     const int64_t spatial = call->out_shape[2] * call->out_shape[3] * call->out_shape[4];
     const int64_t elements = call->out_shape[0] * channels * spatial;
-    add_bias(call->out, call->bias, elements, channels, spatial, UNISERVE_CONV_OUTPUT_DTYPE,
-             reinterpret_cast<cudaStream_t>(stream));
+    add_bias(call->out, call->bias, elements, channels, call->channels_last != 0 ? 1 : spatial,
+             UNISERVE_CONV_OUTPUT_DTYPE, reinterpret_cast<cudaStream_t>(stream));
     if (cudaGetLastError() != cudaSuccess) {
       if (workspace != nullptr) {
         cudaFreeAsync(workspace, reinterpret_cast<cudaStream_t>(stream));
