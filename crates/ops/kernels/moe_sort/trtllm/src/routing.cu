@@ -21,9 +21,9 @@
 //   2. `sort_permutation_kernel` — one block per local expert. Each block
 //      recomputes the counts (they are the block's own prefix over experts),
 //      then walks the routes in order and writes its expert's permuted rows:
-//      both `expanded_to_permuted[route]` and `permuted_to_expanded[row]` for
-//      every route that matches, and -1 into `permuted_to_expanded` for the rows
-//      of its last tile past its live ones.
+//      `expanded_to_permuted[route]`, `permuted_to_expanded[row]` and
+//      `permuted_to_token[row]` for every route that matches, and -1 into both
+//      permuted maps for the rows of its last tile past its live ones.
 //
 // So a route outside this rank's local window has an entry in neither map, and
 // no reader walks one: the combine runs after the exchange, over the rows a rank
@@ -191,6 +191,7 @@ __global__ void sort_permutation_kernel(uniserve_moe_sort_call call) {
     if (local_expert_of(call, route) == expert) {
       call.expanded_to_permuted[route] = static_cast<int32_t>(base + rank);
       call.permuted_to_expanded[base + rank] = static_cast<int32_t>(route);
+      call.permuted_to_token[base + rank] = static_cast<int32_t>(route / call.top);
       ++rank;
     }
   }
@@ -200,6 +201,7 @@ __global__ void sort_permutation_kernel(uniserve_moe_sort_call call) {
   // by the GEMMs, and -1 so a reader that walks the tile sees no route.
   for (int64_t row = own + threadIdx.x; row < limit; row += blockDim.x) {
     call.permuted_to_expanded[base + row] = -1;
+    call.permuted_to_token[base + row] = -1;
   }
 }
 

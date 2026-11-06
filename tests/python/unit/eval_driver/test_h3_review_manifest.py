@@ -11,6 +11,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from uniserve_eval.h3_review_manifest import condition_media, manifest
 
 
@@ -49,7 +51,10 @@ def profile(tmp_path: Path) -> Path:
     for filename, row in rows.items():
         (tmp_path / filename).write_text(json.dumps(row) + "\n")
 
-    config = tmp_path / "profile.toml"
+    # The tool resolves the profile's dataset paths against the repository
+    # root, which is one level above the directory the profile lives in.
+    (tmp_path / "uniserve_eval").mkdir()
+    config = tmp_path / "uniserve_eval" / "profile.toml"
     config.write_text(
         """
 [root]
@@ -94,6 +99,33 @@ def test_every_cell_has_a_task_a_checkpoint_a_seed_and_its_inputs(
     assert "audio: `media/ref.mp3` (reference)" in text
 
 
+def test_the_shipped_profile_names_the_three_checkpoints(
+    tmp_path: Path,
+) -> None:
+    """The page names checkpoints, not the deployment that served them."""
+    shipped = (
+        Path(__file__).resolve().parents[4] / "uniserve_eval" / "check_h3.toml"
+    )
+    baseline = tmp_path / "run"
+    for cell in (
+        "check-base-ref2va",
+        "check-fasth3-dmd-t2va",
+        "check-fasth3-dmd-fl2va",
+        "check-fasth3-omniref-ref2va",
+        "check-base-t2va",
+        "check-base-fl2va",
+    ):
+        write_cell(baseline, cell, f"{cell}.mp4")
+
+    text = manifest(shipped, baseline, None)
+
+    assert "`MiniMaxAI/MiniMax-H3`" in text
+    assert "`FastVideo/FastVideo-FastH3-8-Step-V2`" in text
+    assert "`FastVideo/FastVideo-FastH3-Omni-8-Step-V1`" in text
+    for server in ("base-reference", "base-transformer", "fasth3-dmd"):
+        assert f"| `{server}` |" not in text
+
+
 def test_the_candidate_column_is_empty_until_a_candidate_has_run(
     tmp_path: Path,
 ) -> None:
@@ -125,3 +157,29 @@ def test_a_candidate_mp4_is_named_beside_the_baseline_it_is_compared_with(
 def test_a_row_with_no_conditions_names_no_inputs() -> None:
     assert condition_media({"prompt": "x", "conditions": []}) == []
     assert condition_media({"prompt": "x"}) == []
+
+
+def test_a_candidate_alone_is_a_reviewable_run(tmp_path: Path) -> None:
+    """The design's confirmation is the candidate's six videos.
+
+    The earlier run's bundles need not survive on the host; a page that
+    required them would make the review impossible exactly when it matters.
+    """
+    config = profile(tmp_path)
+    candidate = tmp_path / "candidate"
+    write_cell(candidate, "check-t2va", "t2va.mp4")
+
+    text = manifest(config, None, candidate)
+
+    assert "Baseline run: not on this host" in text
+    assert "**Baseline MP4**: not on this host" in text
+    assert "**Candidate MP4**: `t2va.mp4`" in text
+    assert "Candidate run: `" in text
+
+
+def test_a_page_without_a_run_is_refused(tmp_path: Path) -> None:
+    """A page for no run would read as a review that found nothing."""
+    config = profile(tmp_path)
+
+    with pytest.raises(ValueError, match="needs a run"):
+        manifest(config, None, None)

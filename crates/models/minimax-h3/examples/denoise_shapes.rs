@@ -44,6 +44,13 @@ struct Args {
     frames: u32,
     /// The prompt capacity the deployment prepares, which is the layout's text rows.
     text_tokens: Option<u32>,
+    /// The width the runner sizes its conditioning columns at.
+    ///
+    /// One number for both buffers is what `DenoiserShape::width` gives a runner today: the text
+    /// encoder's hidden width. The served walk's stop - `gather_rows: out is [rows, 5376],
+    /// [rows, 5120] expected` - is this width against the rows the denoiser reads, so the walk takes
+    /// it as an input and refuses the pair when they disagree.
+    column_width: Option<u32>,
     ulysses: usize,
     dtype: DType,
 }
@@ -63,6 +70,7 @@ fn run() -> Result<(), String> {
         height: 768,
         frames: 124,
         text_tokens: None,
+        column_width: None,
         ulysses: 1,
         dtype: DType::BF16,
     };
@@ -75,6 +83,9 @@ fn run() -> Result<(), String> {
             "--height" => args.height = number(&value("--height"), "--height")?,
             "--frames" => args.frames = number(&value("--frames"), "--frames")?,
             "--text-tokens" => args.text_tokens = Some(number(&value("--text-tokens"), "--text-tokens")?),
+            "--column-width" => {
+                args.column_width = Some(number(&value("--column-width"), "--column-width")?)
+            }
             "--ulysses" => args.ulysses = number(&value("--ulysses"), "--ulysses")? as usize,
             "--dtype" => {
                 let stated = value("--dtype").to_ascii_lowercase();
@@ -135,10 +146,10 @@ fn run() -> Result<(), String> {
     let layout = layouts.cover(&request);
 
     // 1. The widths the checkpoint states, and the one the model adds to them.
+    let mut disagreements: Vec<String> = Vec::new();
     let transformer = &denoiser.transformer;
     let hidden = u64::from(transformer.hidden_size);
     let text_dim = u64::from(transformer.text_dim);
-    let mut disagreements: Vec<String> = Vec::new();
     println!("widths");
     println!("  hidden_size          {hidden}   (the packed rows, and the stack's own width)");
     println!("  text_dim             {text_dim}   (the text encoder's features)");
@@ -169,6 +180,18 @@ fn run() -> Result<(), String> {
             "  **two widths**: a runner that sizes both from {text_dim} hands the refiner a buffer \
              too narrow for its own output"
         );
+    }
+    // What the runner actually sizes its two columns at, which is the input the served walk met.
+    // One number for both is `DenoiserShape::width`'s answer: the encoder's.
+    let column = u64::from(args.column_width.unwrap_or(transformer.text_dim));
+    println!("  runner columns       text [{column}], source [{column}]");
+    if column != hidden {
+        disagreements.push(format!(
+            "the runner sizes the text column at {column} and the denoiser reads rows {hidden} \
+             wide: `gather_rows` will refuse `out is [rows, {hidden}], [rows, {column}] expected` \
+             - the runner's `text` column takes `Denoiser::text_width`, and the encoder's product \
+             fills `source`"
+        ));
     }
 
     // 2. The layout: a capacity, not a prompt.
@@ -234,8 +257,41 @@ fn run() -> Result<(), String> {
     }
     println!("  total {total} elements at {}", args.dtype);
 
+    // 5. The state tables the runner writes from this layout, with their values.
+    //
+    // `prepare_state` is the executor's per-request call and `write_state` is a host function, so
+    // this runs the same code the served walk runs before its first launch - and it is where
+    // `write_segment_state` refuses a table whose rows are not the packing's own.
+    let specs = layouts
+        .table_specs(&layout)
+        .map_err(|error| error.to_string())?;
+    let mut written: Vec<Vec<u8>> = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let elements = spec.shape.dims().iter().product::<u64>();
+        let width = spec.dtype.bytes().ok_or_else(|| {
+            format!("the state table `{}` is {}", spec.name, spec.dtype)
+        })?;
+        let bytes = usize::try_from(elements * width)
+            .map_err(|_| format!("the state table `{}` is larger than memory", spec.name))?;
+        written.push(vec![0u8; bytes]);
+    }
+    layouts
+        .write_state(&request, &layout, &mut written)
+        .map_err(|error| error.to_string())?;
+    println!("state tables  {} written", specs.len());
+    for (spec, bytes) in specs.iter().zip(&written) {
+        let non_zero = bytes.iter().filter(|byte| **byte != 0).count();
+        println!(
+            "  {:<20} {:<4} {:?}  {} byte(s), {non_zero} non-zero",
+            spec.name,
+            spec.dtype.to_string(),
+            spec.shape.dims(),
+            bytes.len()
+        );
+    }
+
     if disagreements.is_empty() {
-        println!("denoise shapes: {} statement(s) agree", plan.len() + 6);
+        println!("denoise shapes: {} statement(s) agree", plan.len() + 6 + specs.len());
         Ok(())
     } else {
         for disagreement in &disagreements {

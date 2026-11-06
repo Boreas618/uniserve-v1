@@ -5,8 +5,8 @@ argument signature in the order the operator launches them, the compile-time val
 dimensions give, and the compilation options. The Program Server's Triton source drives
 ``_compile`` with it.
 
-Nothing of the raster is baked in: the channels, the token grid, the patch and the block all travel
-as words, so one module of a form serves every clip and every canvas, and a request shape the
+Nothing of the raster is baked in: the channels, the token grid, the patch, the destination's three
+outer strides and the block all travel as words, so one module of a form serves every clip and every canvas, and a request shape the
 manifest never guessed is not a missing kernel. What is compiled is the element type and the affine
 form — the latter because its launch carries two more operands, so its signature has two more
 pointers; a non-affine module's does not, and a launch that hands them anyway is refused by the
@@ -50,6 +50,9 @@ def spec(fields, parameters, target):
             "patch_frames": "i32",
             "patch_height": "i32",
             "patch_width": "i32",
+            "out_stride0": "i64",
+            "out_stride1": "i64",
+            "out_stride2": "i64",
             "block": "i32",
             "pdl": "i32",
             "BLOCK": "constexpr",

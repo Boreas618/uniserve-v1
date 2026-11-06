@@ -34,7 +34,7 @@ struct uniserve_gather_gemm_nvfp4_call {
   const void* global_scale_gate;
   const int32_t* tile_to_expert;
   const int32_t* tile_to_limit;
-  const int32_t* permuted_to_expanded;
+  const int32_t* permuted_to_token;
   const int32_t* num_non_exiting_tiles;
   void* out;
   void* workspace;

@@ -268,7 +268,7 @@ int launch(uniserve_gather_gemm_nvfp4_call* call, void* stream) {
               /*bias=*/nullptr, /*gatedActAlpha=*/nullptr, /*gatedActBeta=*/nullptr,
               /*clampLimit=*/nullptr, /*permutedIdxToBiasRowIdx=*/nullptr, call->out,
               /*outputScale=*/nullptr, top_k, hidden, intermediate, experts, tokens,
-              const_cast<int32_t*>(call->permuted_to_expanded),
+              const_cast<int32_t*>(call->permuted_to_token),
               const_cast<int32_t*>(call->num_non_exiting_tiles), total_num_padded_tokens,
               const_cast<int32_t*>(call->tile_to_expert), const_cast<int32_t*>(call->tile_to_limit),
               bmm_workspace, /*useRoutingScalesOnInput=*/false, device, order, config,
