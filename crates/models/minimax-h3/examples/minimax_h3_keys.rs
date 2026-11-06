@@ -12,9 +12,9 @@
 //!
 //! ## The two flags, and why the canvases are one
 //!
-//! `--root` names the checkpoint the video encoder's rows are derived from (default
-//! `/opt/uv/models/MiniMax-H3`); its `vae/config.json` is the geometry, and the header prints the
-//! fields that decided the rows. `--rasters` names the canvases those rows cover, in `HxW`, defaulting
+//! `--root` names the checkpoint every derived row comes from (`MINIMAX_H3_CHECKPOINT` when the flag
+//! is absent, else `/opt/uv/models/MiniMax-H3`); its `vae/config.json` is the geometry, and the
+//! header prints the fields that decided the rows. `--rasters` names the canvases those rows cover, in `HxW`, defaulting
 //! to `NAMED_CANVASES` - **the six the model offers**, because a store built for one canvas stops at
 //! `no kernel` on any other.
 //!
@@ -288,7 +288,14 @@ fn main() {
     // rather than restating it: `--root`, or the deployment's own path. A generator that transcribed
     // these numbers could not be checked against the checkpoint at all.
     let mut arguments = std::env::args().skip(1);
-    let mut root = std::path::PathBuf::from("/opt/uv/models/MiniMax-H3");
+    //
+    // **One root.** Everything below that reads the checkpoint reads this value, so `--root` moves all
+    // of it at once. `MINIMAX_H3_CHECKPOINT` is the same statement made by the environment, and the
+    // flag overrides it.
+    let mut root = std::env::var_os("MINIMAX_H3_CHECKPOINT").map_or_else(
+        || "/opt/uv/models/MiniMax-H3".into(),
+        std::path::PathBuf::from,
+    );
     let mut rasters: Vec<(u32, u32)> = Vec::new();
     // The clip lengths the deployment serves, in video frames: the audio rows are stated once per
     // track length, so this is a deployment statement like `--rasters` and not a property of a model.
@@ -556,19 +563,17 @@ fn main() {
     //
     // This is the one place the generator reads the deployment rather than restating it, and it is
     // deliberate: a twenty-two field literal of the video VAE's config would be the largest written
-    // copy in this file, and the copies are what have been wrong all night. `MINIMAX_H3_CHECKPOINT`
-    // names another root; regenerating the list therefore needs the checkpoint, which a store build
-    // has by construction.
-    let root = std::env::var("MINIMAX_H3_CHECKPOINT")
-        .unwrap_or_else(|_| "/opt/uv/models/MiniMax-H3".to_owned());
-    let sidecar = format!("{root}/vae/config.json");
-    let values: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&sidecar)
-            .unwrap_or_else(|error| panic!("the video VAE's sidecar at {sidecar}: {error}")),
-    )
-    .unwrap_or_else(|error| panic!("{sidecar} is not JSON: {error}"));
+    // copy in this file, and the copies are what have been wrong all night. The root is the one
+    // `--root` states; regenerating the list therefore needs the checkpoint, which a store build has
+    // by construction.
+    let sidecar = root.join("vae/config.json");
+    let values: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap_or_else(|error| {
+            panic!("the video VAE's sidecar at {}: {error}", sidecar.display())
+        }))
+        .unwrap_or_else(|error| panic!("{} is not JSON: {error}", sidecar.display()));
     let video_vae = minimax_h3::config::VideoVaeConfig::parse(&values)
-        .unwrap_or_else(|error| panic!("{sidecar}: {error}"));
+        .unwrap_or_else(|error| panic!("{}: {error}", sidecar.display()));
     // **The canvases the deployment serves**, which are the ones the model offers - not the raster a
     // test case happens to use. The encoder's frame operators key on the canvas, so this is the whole
     // reason the rows are derived: a written set covers one canvas and leaves the others without a
@@ -903,7 +908,7 @@ fn header(
     // a layout is not a program key but a table the executor uploads - the distinction matters,
     // because only one of the two belongs in a list of programs.
     println!(
-        "# generator needs the checkpoint: the video encoder's rows are derived from `vae/config.json` (MINIMAX_H3_CHECKPOINT names another root), because its frame operators key on classes the raster derives and every canvas the model offers must be served."
+        "# generator needs the checkpoint: the video encoder's rows are derived from `vae/config.json` under `--root` (or MINIMAX_H3_CHECKPOINT), because its frame operators key on classes the raster derives and every canvas the model offers must be served."
     );
     println!(
         "# request-derived: a key computed from the request's own numbers cannot be a row here. \
@@ -1981,34 +1986,9 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
             }
             .to_string(),
         );
-        // The attention: 32 heads of 64 with as many key/value heads, a dense mask, no window.
-        //
-        // **The form follows the element type**, because the two programs serve different shapes and
-        // each key names its own. The FP32 program is a GEMM and a softmax over one sequence and
-        // reads no offsets, so its key carries `cu_seq_lens_false`; FlashAttention-4's kernel serves
-        // the packed form, takes the offsets table and refuses a null one, so its key carries no
-        // suffix at all. One sequence makes them arithmetically identical, and the layer states the
-        // same predicate (`video_vae.rs`'s `block_attention` and `packed`), so the element type alone
-        // decides - a clip decoded at the checkpoint's own FP16 must not ask the FP32 package for a
-        // row, nor the flash kernel for one at f32.
-        push(
-            "dense_attention",
-            ops::attention::DenseDescriptor {
-                query: vae,
-                key_value: vae,
-                output: vae,
-                head_dim: 64,
-                q_heads: 32,
-                kv_heads: 32,
-                mask: ops::attention::Mask::Dense,
-                windowed: false,
-                // A launch bound outside the key: one tile's rows are `voxels + registers + 1` for
-                // a 256 x 256 x 5 tile, and 2048 covers the largest tile the plan decodes.
-                max_kv_len: 2048,
-                cu_seq_lens: vae != DType::F32,
-            }
-            .to_string(),
-        );
+        // The attention is not stated here. The decoder declares its precision per layer, and its
+        // block attention is FlashAttention 4 at `video_vae::ACTIVATION`: the row is
+        // `VideoDecoder::programs`' own, and a row at this loop's `vae` is a launch nothing makes.
         // Its projections, at the VAE's own type: the input projection, the three q/k/v projections
         // and `proj_out` carry a bias, while `to_out` and `ff.net.2` fold theirs into the residuals.
         for epilogue in [ops::gemm::Epilogue::None, ops::gemm::Epilogue::Bias] {
