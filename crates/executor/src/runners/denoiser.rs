@@ -218,9 +218,13 @@ struct DenoiseColumns {
     /// `[requests x (text_rows + condition_rows) x width]` the text encoder's own features.
     ///
     /// A model with a conditioner between the encoder and the denoiser reads these and folds them
-    /// into `text` in place ([`nn::Denoiser::prepare_conditioning`]), so both buffers are the same
-    /// shape and both are the runner's: the conditioner runs inside a captured forward, and a buffer
-    /// it allocated would be a capture that allocates.
+    /// into `text` in place ([`nn::Denoiser::prepare_conditioning`]).
+    ///
+    /// **Both buffers are the runner's even though the conditioner runs eagerly, once per request and
+    /// outside the graph** ([`DenoiserRunner::first_step`]): `text` is the region the captured graph
+    /// reads, so an output buffer the conditioner allocated for itself would be a per-request
+    /// allocation no capture addresses, and `source` is where [`DenoiserRunner::seed`] puts the
+    /// encoder's bytes on the store's clock.
     source: Column,
     /// The encoder's width: elements in one `source` row.
     source_width: u64,
@@ -889,11 +893,12 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             let latents = self.latents(bucket, row.index)?;
             let cond = self.conditioning(bucket, row.index, &state, &media)?;
             self.model.draw_noise(&forward, row.seed, layout, latents)?;
-            // **The conditioner, once per request and outside the graph.** `text` holds the encoder's
-            // rows as `seed` copied them; this folds `source` into it in place, so every replay of the
-            // bucket reads rows refined for its own request. It is not a graph node because a graph
-            // replays once per *step* while this runs once per *request* - a refinement inside the
-            // captured graph would compound over the schedule, and `text` is written in place.
+            // **The conditioner, eager and once per request, outside the graph.** `text` holds the
+            // encoder's rows as `seed` copied them; this folds `source` into it in place, so every
+            // replay of the bucket reads rows refined for its own request. It is not a graph node
+            // because a graph replays once per *step* while this runs once per *request* - a
+            // refinement inside the captured graph would compound over the schedule, and `text` is
+            // written in place.
             self.model.prepare_conditioning(&forward, cond)?;
             self.model.prepare_latents(&forward, cond, latents)?;
         }
