@@ -12,9 +12,10 @@
 //! and it is what lets the runners of one device share a group by `Arc` across the move to their
 //! device thread.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use ops::platform::{CaptureStatus, DeviceRange, PlatformDevicePtr};
+use ops::platform::{CaptureStatus, DeviceRange, Event, EventFlags, PlatformDevicePtr};
 use ops::{CollectiveType, Communicator, ReduceOp, Stream};
 
 use crate::error::{Error, Result};
@@ -25,19 +26,51 @@ fn range(view: TensorView, bytes: usize) -> DeviceRange {
     DeviceRange::new(PlatformDevicePtr::from_address(view.ptr.address()), bytes)
 }
 
+/// The priority of a group's lane: the driver clamps it to the device's highest.
+const LANE_PRIORITY: i32 = -5;
+
+/// How many collectives a group holds in flight on its lane.
+const LANDINGS: usize = 16;
+
+/// A collective running on a group's lane, until a stream takes it up ([`Group::finish`]).
+#[must_use = "what a transfer writes is readable only on a stream that finished it"]
+pub struct Transfer {
+    landing: usize,
+}
+
 /// A rank's NCCL communicator, borrowed by forwards.
 pub struct Group {
     communicator: Mutex<Communicator>,
     ranks: u64,
+    /// The stream a started collective runs on, beside the forward's own, so a layer's compute
+    /// overlaps the transfer. Inside a capture the events below make it a branch of the graph.
+    lane: Stream,
+    /// Orders the lane after what the forward issued so far.
+    fork: Event,
+    /// Each started collective's end, which a forward's stream waits for.
+    landings: Vec<Event>,
+    /// The landing the next collective takes.
+    next: AtomicUsize,
 }
 
 impl Group {
     /// The group of `communicator`, whose member count is `ranks`.
-    pub fn new(communicator: Communicator, ranks: u64) -> Self {
-        Self {
+    pub fn new(communicator: Communicator, ranks: u64) -> Result<Self> {
+        // The lane's kernels take an SM as soon as one frees: they are small and everything on the
+        // forward's stream waits for them sooner or later, and a transfer queued behind a whole
+        // projection would run after it instead of beside it.
+        let lane =
+            Stream::with_priority(communicator.device(), LANE_PRIORITY).map_err(Error::Platform)?;
+        Ok(Self {
             communicator: Mutex::new(communicator),
             ranks,
-        }
+            lane,
+            fork: Event::new(EventFlags::default()),
+            landings: (0..LANDINGS)
+                .map(|_| Event::new(EventFlags::default()))
+                .collect(),
+            next: AtomicUsize::new(0),
+        })
     }
 
     /// How many ranks the group has.
@@ -140,6 +173,35 @@ impl Group {
             )
             .map_err(Error::Platform)?;
         Self::settled(stream)
+    }
+
+    /// Starts [`Self::all_to_all`] on the group's lane, after everything `stream` has issued.
+    ///
+    /// `stream` goes on at once, and what `recv` holds is readable on a stream that took the
+    /// transfer up ([`Self::finish`]). The buffers belong to the transfer until then.
+    pub fn start_all_to_all(
+        &self,
+        send: TensorView,
+        recv: TensorView,
+        stream: &Stream,
+    ) -> Result<Transfer> {
+        self.fork.record(stream).map_err(Error::Platform)?;
+        self.lane
+            .wait_event(&self.fork)
+            .map_err(Error::Platform)?;
+        self.all_to_all(send, recv, &self.lane)?;
+        let landing = self.next.fetch_add(1, Ordering::Relaxed) % LANDINGS;
+        self.landings[landing]
+            .record(&self.lane)
+            .map_err(Error::Platform)?;
+        Ok(Transfer { landing })
+    }
+
+    /// Orders `stream` after `transfer`.
+    pub fn finish(&self, transfer: Transfer, stream: &Stream) -> Result<()> {
+        stream
+            .wait_event(&self.landings[transfer.landing])
+            .map_err(Error::Platform)
     }
 
     /// Run `call` with the underlying communicator, for an operator whose collective is not one of

@@ -32,6 +32,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], heads = ["8", "16", "24", "32", "64"], tile_rows = ["64", "128"], width = ["64", "128"], block_rows = ["16"], slots = ["0", "0,1", "0,1,2,3", "0,1,2,3,4,5,6,7"], members = ["1", "2", "4", "8"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], heads = ["8", "14", "16", "24", "32", "64"], tile_rows = ["64", "128"], width = ["64", "128"], block_rows = ["16"], slots = ["0", "0,1", "0,1,2,3", "0,1,2,3,4,5,6,7"], members = ["1", "2", "4", "8"] }
 
 [parameters]

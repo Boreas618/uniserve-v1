@@ -94,6 +94,37 @@ impl HeadProjection {
         self.members[0].weight().dtype
     }
 
+    /// Projects this rank's `rows` for every member into `staging`, one member's block after
+    /// another, and starts delivering each member its heads of the whole sequence into `out`.
+    pub(crate) fn start(
+        &self,
+        f: &Forward,
+        exchange: &UlyssesExchange,
+        rows: TensorView,
+        staging: TensorView,
+        out: TensorView,
+    ) -> Result<nn::Transfer> {
+        self.project(f, rows, staging, out.shape.last())?;
+        Ok(exchange.start(f, staging, out)?)
+    }
+
+    /// Each member's heads of `rows`, `local` columns wide, as blocks of `staging`.
+    fn project(
+        &self,
+        f: &Forward,
+        rows: TensorView,
+        staging: TensorView,
+        local: u64,
+    ) -> Result<()> {
+        let shape = Shape::new(&[rows.rows(), local]);
+        let block = rows.rows() * local;
+        for (member, projection) in self.members.iter().enumerate() {
+            let at = staging.offset_elements(member as u64 * block);
+            projection.forward(f, rows, staging.at(at).reshape(shape))?;
+        }
+        Ok(())
+    }
+
     /// Projects `rows` and writes this rank's heads of the whole sequence into `out`.
     ///
     /// `rows` is this rank's rows in the exchange mode and the gathered sequence otherwise, and
@@ -108,14 +139,8 @@ impl HeadProjection {
     ) -> Result<()> {
         match (self.members.as_slice(), exchange) {
             ([only], _) => Ok(only.forward(f, rows, out)?),
-            (members, Some(exchange)) => {
-                let local = out.shape.last();
-                let shape = Shape::new(&[rows.rows(), local]);
-                let block = rows.rows() * local;
-                for (member, projection) in members.iter().enumerate() {
-                    let at = staging.offset_elements(member as u64 * block);
-                    projection.forward(f, rows, staging.at(at).reshape(shape))?;
-                }
+            (_, Some(exchange)) => {
+                self.project(f, rows, staging, out.shape.last())?;
                 Ok(exchange.exchange(f, staging, out)?)
             }
             (members, None) => Err(Error::Unsupported(format!(
@@ -158,11 +183,20 @@ impl HeadsToRows {
         out: TensorView,
     ) -> Result<()> {
         exchange.exchange(f, attended, staging)?;
-        let members = exchange.ranks();
+        Self::merge(f, exchange.ranks(), staging, out)
+    }
+
+    /// Sets the blocks of `received`, one per member, side by side in `out`.
+    pub(crate) fn merge(
+        f: &Forward,
+        members: u64,
+        received: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
         let rows = out.rows();
         let local = out.shape.last() / members;
         let block = [members, rows, 1, local];
-        let source = staging.reshape(Shape::new(&block));
+        let source = received.reshape(Shape::new(&block));
         let destination = TensorView::with_strides(
             out.ptr,
             out.dtype,
@@ -175,7 +209,7 @@ impl HeadsToRows {
             local as i64,
             1,
         ];
-        Ok(CopyBlock::new(out.dtype)?.forward(f, source, destination, &strides)?)
+        Ok(CopyBlock::new(out.dtype)?.forward_wide(f, source, destination, &strides)?)
     }
 }
 

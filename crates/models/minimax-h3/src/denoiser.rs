@@ -2257,6 +2257,7 @@ pub fn denoise_arena(
     if arrangement.shard > 1 {
         let inner = heads * head_dim;
         push(&mut plan, "attention.staging", element, tokens * inner);
+        push(&mut plan, "attention.returned", element, tokens * inner);
         push(&mut plan, "attention.merged", element, tokens * inner);
         push(&mut plan, "attention.gathered", element, total * hidden);
     }
@@ -4064,6 +4065,7 @@ mod tests {
             // entries must be absent, because they cost a row of every head each and are never read.
             for name in [
                 "attention.staging",
+                "attention.returned",
                 "attention.merged",
                 "attention.gathered",
             ] {

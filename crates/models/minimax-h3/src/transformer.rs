@@ -165,6 +165,56 @@ impl Layer {
         let attention_norm =
             ModulatedRmsNorm::new(self.norm1, shift_attention, scale_attention, None, self.eps)?;
         attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
+        let mlp_norm = ModulatedRmsNorm::new(
+            self.norm2,
+            shift_mlp,
+            scale_mlp,
+            Some(gate_attention),
+            self.eps,
+        )?
+        .with_retain();
+        let residual = GatedResidual::new(gate_mlp)?;
+        // Under Ulysses the attended rows return interval by interval, and what follows attention
+        // reads a row alone, so an interval's output projection and feed-forward run while the
+        // later intervals travel (`uniserve/nn/attention/vsa/segments.py`).
+        if let (attention::Layer::Sparse(sparse), attention::LayerScratch::Sparse(views)) =
+            (&self.attention, &scratch.attention)
+            && sparse.exchanges()
+        {
+            let tables = segments.ok_or_else(|| {
+                Error::Unsupported("a sparse layer was handed no segment views".to_owned())
+            })?;
+            let gate = sparse.attend(
+                f,
+                normalized,
+                factors,
+                tables.sizes,
+                tables.segments,
+                tables.keep,
+                views,
+            )?;
+            for interval in sparse.deliver(f, gate, views, hidden.rows())? {
+                let (first, count) = (interval.first, interval.count);
+                let part = |view: TensorView| row_interval(view, first, count);
+                let selected = rows
+                    .at(rows.offset_elements(first))
+                    .reshape(nn::Shape::new(&[count]));
+                sparse.receive(f, interval, views, part(update))?;
+                self.feed_forward(
+                    f,
+                    &mlp_norm,
+                    &residual,
+                    part(hidden),
+                    part(update),
+                    part(out),
+                    selected,
+                    part(normalized),
+                    part(scratch.packed),
+                    part(scratch.mlp),
+                )?;
+            }
+            return Ok(());
+        }
         self.attention.forward(
             f,
             normalized,
@@ -174,25 +224,45 @@ impl Layer {
             &scratch.attention,
             update,
         )?;
+        self.feed_forward(
+            f,
+            &mlp_norm,
+            &residual,
+            hidden,
+            update,
+            out,
+            rows,
+            normalized,
+            scratch.packed,
+            scratch.mlp,
+        )
+    }
+
+    /// The block after attention, over any rows of the layer: `update` is the attention's output
+    /// for them, and the layer's output lands in `hidden`.
+    #[allow(clippy::too_many_arguments)]
+    fn feed_forward(
+        &self,
+        f: &Forward,
+        mlp_norm: &ModulatedRmsNorm,
+        residual: &GatedResidual,
+        hidden: TensorView,
+        update: TensorView,
+        out: TensorView,
+        rows: TensorView,
+        normalized: TensorView,
+        packed: TensorView,
+        mlp: TensorView,
+    ) -> Result<()> {
         // The MLP norm folds the attention's gated update into the residual and copies the result
         // out: the block's second residual reads it after the down projection has overwritten
         // `update`, and `retain` is what lets one launch produce both the normalized feed-forward
         // input and that residual base (`crates/ops/kernels/modulated_rms_norm`: with `update` the
         // kernel stores the gated sum, and with `retain` it copies the same value out).
-        let mlp_norm = ModulatedRmsNorm::new(
-            self.norm2,
-            shift_mlp,
-            scale_mlp,
-            Some(gate_attention),
-            self.eps,
-        )?
-        .with_retain();
         mlp_norm.forward(f, hidden, Some(update), rows, normalized, None, Some(out))?;
 
         // Feed-forward: the packed value and gate halves, the gated activation, the down
         // projection, and the second gated residual into the retained residual.
-        let packed = scratch.packed;
-        let mlp = scratch.mlp;
         self.gate_up.forward(f, normalized, packed)?;
         // The reference's activation is stepwise here (`transformer.py:84-88`), so the packed
         // projection is read as its two halves and gated with one rounding each - the video
@@ -203,8 +273,15 @@ impl Layer {
         // `hidden` is spent by now, so the down projection lands there, and the gated residual
         // writes over its `update` operand: the layer's output is `hidden`, in place.
         self.down.forward(f, mlp, hidden)?;
-        Ok(GatedResidual::new(gate_mlp)?.forward(f, out, hidden, rows)?)
+        Ok(residual.forward(f, out, hidden, rows)?)
     }
+}
+
+/// Rows `first..first + count` of a `[rows, width]` view.
+fn row_interval(view: TensorView, first: u64, count: u64) -> TensorView {
+    let width = view.shape.last();
+    view.at(view.offset_elements(first * width))
+        .reshape(nn::Shape::new(&[count, width]))
 }
 
 /// One evaluation's selected layer outputs, as the caller's own diagnostic views.
@@ -659,10 +736,18 @@ impl Transformer {
                 &tiles_layer.select_descriptor(u64::from(tiles))?,
             );
             programs.launch::<SparseAttention>(&fine.descriptor_of(dtype));
+            if partition.ulysses_degree > 1 {
+                let slots: Vec<u32> = (0..partition.ulysses_degree as u32).collect();
+                programs.launch::<ops::segments::VsaComposeGatedRows>(
+                    &tiles_layer.compose_descriptor(dtype, &slots),
+                );
+            }
         }
         // A Ulysses group sets each member's heads side by side once its rows are back.
         if partition.ulysses_degree > 1 {
-            programs.launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::descriptor_of(dtype));
+            programs.launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::wide_descriptor_of(
+                dtype,
+            ));
         }
 
         // Every projection of the stack: the video and audio entrances, the four of each block's

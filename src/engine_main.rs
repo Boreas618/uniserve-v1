@@ -603,7 +603,7 @@ fn group_over(
     let member = i32::try_from(rank).context("a rank past what NCCL addresses")?;
     let communicator = platform::Communicator::init(device, size, member, &id)
         .context("joining a communicator")?;
-    Ok(Some(Arc::new(nn::Group::new(communicator, size as u64))))
+    Ok(Some(Arc::new(nn::Group::new(communicator, size as u64)?)))
 }
 
 /// Asks this node's daemon for the node's Storage Server (§8).

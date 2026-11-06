@@ -65,7 +65,7 @@ pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLo
 pub use error::{Error, Result};
 pub use exchange::ExchangeViews;
 pub use forward::{Arena, AttentionProbe, Forward};
-pub use group::Group;
+pub use group::{Group, Transfer};
 pub use layers::{
     Activation, AdaptivePool, Attention, AttentionBackend, AudioActivation, Candidates, Conv1d,
     Conv3d, ConvGeometry, ConvTranspose1d, CrossFade, Embedding, FrameMoments, FrameNormPad,
