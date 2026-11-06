@@ -17,6 +17,10 @@ with `affine`:  out = value · scale[c] + bias[c]
 The program walks the *output*: one lane writes one voxel, so a token's voxels are written by the
 lanes that own them, no lane waits for another, and a token buffer with spare rows is never read.
 Every product and sum is FP32 and the store rounds once into the output's element type.
+
+The raster may be a block inside a larger one, as a decoder's tile is inside its clip: a lane's flat
+position decodes into channel, frame, row and column, and those address the destination through its
+three outer strides. A row stays contiguous, so the column needs no stride of its own.
 """
 
 import triton
@@ -24,11 +28,23 @@ import triton.language as tl
 
 
 @triton.jit
-def _token_offsets(offsets, channels, frames, height, width, patch_frames, patch_height, patch_width):
-    """The token offset and the channel a raster offset reads, and whether it is inside the raster.
+def _token_offsets(
+    offsets,
+    channels,
+    frames,
+    height,
+    width,
+    patch_frames,
+    patch_height,
+    patch_width,
+    out_stride0,
+    out_stride1,
+    out_stride2,
+):
+    """The token offset a raster position reads, where it is written, its channel, and its liveness.
 
     The raster decomposes into channel, frame, row and column; each of those inverts the packing
-    into the token and the position inside its patch.
+    into the token and the position inside its patch, and addresses the destination by its strides.
     """
     patch_frames = patch_frames.to(tl.int64)
     patch_height = patch_height.to(tl.int64)
@@ -66,8 +82,9 @@ def _token_offsets(offsets, channels, frames, height, width, patch_frames, patch
         ((channel * patch_frames + inner_frame) * patch_height + inner_row) * patch_width
         + inner_column
     )
+    destination = channel * out_stride0 + frame * out_stride1 + row * out_stride2 + column
     # A token row holds `channels · patch_volume` values.
-    return token * (channels * patch_volume) + patch_channel, channel, live, volume
+    return token * (channels * patch_volume) + patch_channel, destination, channel, live
 
 
 @triton.jit
@@ -81,6 +98,9 @@ def _unpatchify_video_kernel(
     patch_frames,
     patch_height,
     patch_width,
+    out_stride0,
+    out_stride1,
+    out_stride2,
     block,
     pdl,
     BLOCK: tl.constexpr,
@@ -91,14 +111,24 @@ def _unpatchify_video_kernel(
     dependent launch is a launching decision.
     """
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
-    source, _channel, live, volume = _token_offsets(
-        offsets, channels, frames, height, width, patch_frames, patch_height, patch_width
+    source, destination, _channel, live = _token_offsets(
+        offsets,
+        channels,
+        frames,
+        height,
+        width,
+        patch_frames,
+        patch_height,
+        patch_width,
+        out_stride0,
+        out_stride1,
+        out_stride2,
     )
     value = tl.load(tokens_ptr + source, mask=live).to(tl.float32)
     tl.store(
-        out_ptr + offsets,
+        out_ptr + destination,
         value.to(out_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
-        mask=offsets < volume,
+        mask=live,
     )
 
 
@@ -115,6 +145,9 @@ def _unpatchify_video_affine_kernel(
     patch_frames,
     patch_height,
     patch_width,
+    out_stride0,
+    out_stride1,
+    out_stride2,
     block,
     pdl,
     BLOCK: tl.constexpr,
@@ -126,15 +159,25 @@ def _unpatchify_video_affine_kernel(
     reaches a kernel.
     """
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
-    source, channel, live, volume = _token_offsets(
-        offsets, channels, frames, height, width, patch_frames, patch_height, patch_width
+    source, destination, channel, live = _token_offsets(
+        offsets,
+        channels,
+        frames,
+        height,
+        width,
+        patch_frames,
+        patch_height,
+        patch_width,
+        out_stride0,
+        out_stride1,
+        out_stride2,
     )
     # Every product and sum is FP32; the store rounds once into the raster's type.
     value = tl.load(tokens_ptr + source, mask=live).to(tl.float32)
     scale = tl.load(scale_ptr + channel, mask=live, other=0.0).to(tl.float32)
     bias = tl.load(bias_ptr + channel, mask=live, other=0.0).to(tl.float32)
     tl.store(
-        out_ptr + offsets,
+        out_ptr + destination,
         (value * scale + bias).to(out_ptr.dtype.element_ty, fp_downcast_rounding="rtne"),
-        mask=offsets < volume,
+        mask=live,
     )

@@ -1177,6 +1177,12 @@ pub struct SimEngine {
     canvas_sampling: Option<ipc::CanvasSampling>,
     /// How the simulated executor speculates, when it runs a drafter.
     speculation: Option<SimSpeculation>,
+    /// Bytes each published media artifact declares beyond what it stores.
+    ///
+    /// A rank's report states its payload's extent, and the engine claims the
+    /// object by that statement; a test states the disagreement a rank can
+    /// report and cannot store ([`SimEngine::overstate_published_media`]).
+    media_overstatement: u64,
     /// The executor groups the simulated deployment runs: one named `sim` unless
     /// a test names more.
     ///
@@ -1359,6 +1365,7 @@ impl SimEngine {
             non_finite_candidate: None,
             canvas_sampling: None,
             speculation: None,
+            media_overstatement: 0,
             predicated_release: None,
             pace: None,
             stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1516,6 +1523,7 @@ impl SimEngine {
         non_finite_candidate: Option<u32>,
         canvas_sampling: Option<ipc::CanvasSampling>,
         speculation: Option<SimSpeculation>,
+        media_overstatement: u64,
         call: &Call,
         request: &mut SimRequestState,
     ) -> anyhow::Result<CallOutput> {
@@ -1880,7 +1888,11 @@ impl SimEngine {
                         call.request_key.request_id.0
                     );
                     record.media_output =
-                        Some(publish_media("uniserve-video-", payload.as_bytes())?);
+                        Some(publish_media(
+                        "uniserve-video-",
+                        payload.as_bytes(),
+                        media_overstatement,
+                    )?);
                 }
             }
             CallKind::Media(MediaCall::ImageDecoding) => {
@@ -1906,7 +1918,8 @@ impl SimEngine {
                             synthetic_feedback_values(seed, request.image_index, height, width);
                         ipc::append_feedback(&mut media, &values, ipc::PixelRange::SignedUnit);
                     }
-                    record.media_output = Some(publish_media("uniserve-image-", &media)?);
+                    record.media_output =
+                        Some(publish_media("uniserve-image-", &media, media_overstatement)?);
                 }
             }
         }
@@ -2193,6 +2206,17 @@ impl SimEngine {
         Pace(permits)
     }
 
+    /// States every media artifact the simulator publishes as declaring
+    /// `extra_bytes` more than the object stores.
+    ///
+    /// A rank's report states its payload's extent, and the engine claims the
+    /// object by that statement: a declaration that outruns the storage is
+    /// what the claim must refuse (`ipc::SharedMediaError::Short`), rather
+    /// than map fewer bytes than the report promised.
+    pub fn overstate_published_media(&mut self, extra_bytes: u64) {
+        self.media_overstatement = extra_bytes;
+    }
+
     /// Refuses request `id` for `reason` at each of its media calls.
     pub fn refuse_request(&mut self, id: RequestId, reason: &str) {
         self.refused.insert(id, reason.to_owned());
@@ -2394,8 +2418,14 @@ fn set_cache_lengths(lengths: &mut CallOutput, visible: u32) {
 /// Publishes bytes as an immutable POSIX shared-memory artifact.
 ///
 /// The object is left in place under its generated name; the engine claims it
-/// by that name and unlinks it when it opens the result.
-fn publish_media(prefix: &str, bytes: &[u8]) -> anyhow::Result<ipc::MediaOutput> {
+/// by that name and unlinks it when it opens the result. `extra_bytes` is
+/// declared in the report without being written: the disagreement between a
+/// statement of extent and its storage that the claim refuses.
+fn publish_media(
+    prefix: &str,
+    bytes: &[u8],
+    extra_bytes: u64,
+) -> anyhow::Result<ipc::MediaOutput> {
     use std::io::Write;
 
     let mut storage = tempfile::Builder::new()
@@ -2411,7 +2441,7 @@ fn publish_media(prefix: &str, bytes: &[u8]) -> anyhow::Result<ipc::MediaOutput>
 
     Ok(ipc::MediaOutput {
         handle: ipc::ArtifactHandle::PosixShm { name },
-        bytes: bytes.len() as u64,
+        bytes: bytes.len() as u64 + extra_bytes,
     })
 }
 
@@ -2593,6 +2623,7 @@ impl SimEngine {
                 non_finite_candidate,
                 canvas_sampling,
                 speculation,
+                self.media_overstatement,
                 &call,
                 request,
             )?;

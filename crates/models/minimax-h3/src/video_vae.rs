@@ -1666,6 +1666,31 @@ pub struct TileScratch {
 }
 
 impl Decoder for VideoDecoder {
+    /// The voxels of every tile, in the order `decode_clip` reads them: each tile's own latent slice,
+    /// frame by frame, so a voxel in an overlap has one row per tile that holds it.
+    fn latent_rows(&self, layout: &nn::capability::Layout) -> nn::Result<Option<Vec<u32>>> {
+        let refuse = |problem: String| nn::Error::Shape {
+            owner: "VideoDecoder",
+            problem,
+        };
+        let clip = Canvas::clip(&self.config, layout.video.height, layout.video.width);
+        let tiles = Tiles::of(&self.config, &clip)
+            .map_err(|error| refuse(format!("the clip's tile grid: {error}")))?
+            .tiles(&self.config, &clip);
+        let (height, width) = (layout.video.height, layout.video.width);
+        let mut rows = Vec::new();
+        for tile in &tiles {
+            for frame in 0..layout.video.frames {
+                for row in tile.latent_rows.0..tile.latent_rows.1 {
+                    for column in tile.latent_columns.0..tile.latent_columns.1 {
+                        rows.push((frame * height + row) * width + column);
+                    }
+                }
+            }
+        }
+        Ok(Some(rows))
+    }
+
     fn layout_tables(&self, layout: &nn::capability::Layout) -> nn::Result<Vec<StateTable>> {
         // A layout whose extents contradict the checkpoint is a named error and not an empty list: a
         // runner that made a mistake hears which one, where an empty answer would have reached the

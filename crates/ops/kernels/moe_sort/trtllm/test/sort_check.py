@@ -81,6 +81,7 @@ class Call(ctypes.Structure):
         ("scales_dtype", ctypes.c_int64),
         ("error", ctypes.c_char * 512),
         ("live_tokens", ctypes.c_void_p),
+        ("permuted_to_token", ctypes.c_void_p),
     ]
 
 
@@ -153,6 +154,7 @@ def reference(ids, tokens, top, experts, local, offset, tile, live=None):
 
     expanded_to_permuted = [-1] * (tokens * top)
     permuted_to_expanded = [-1] * (len(tile_to_expert) * tile)
+    permuted_to_token = [-1] * (len(tile_to_expert) * tile)
     filled = [0] * local
     for token in range(tokens):
         for route in range(top):
@@ -166,12 +168,14 @@ def reference(ids, tokens, top, experts, local, offset, tile, live=None):
                 filled[expert] += 1
                 expanded_to_permuted[expanded] = row
                 permuted_to_expanded[row] = expanded
+                permuted_to_token[row] = token
 
     return {
         "tile_to_expert": tile_to_expert,
         "tile_to_limit": tile_to_limit,
         "expanded_to_permuted": expanded_to_permuted,
         "permuted_to_expanded": permuted_to_expanded,
+        "permuted_to_token": permuted_to_token,
         "total_padded_tokens": total_padded,
         "num_non_exiting_tiles": total_tiles,
     }
@@ -265,6 +269,7 @@ def main() -> int:
     permuted_to_expanded = torch.full(
         (permuted,), -1, dtype=torch.int32, device=device
     )
+    permuted_to_token = torch.full((permuted,), -7, dtype=torch.int32, device=device)
     total_padded_tokens = torch.zeros((1,), dtype=torch.int32, device=device)
     num_non_exiting_tiles = torch.zeros((1,), dtype=torch.int32, device=device)
 
@@ -283,6 +288,7 @@ def main() -> int:
     call.tile_to_limit = ctypes.c_void_p(tile_to_limit.data_ptr())
     call.expanded_to_permuted = ctypes.c_void_p(expanded_to_permuted.data_ptr())
     call.permuted_to_expanded = ctypes.c_void_p(permuted_to_expanded.data_ptr())
+    call.permuted_to_token = ctypes.c_void_p(permuted_to_token.data_ptr())
     call.total_padded_tokens = ctypes.c_void_p(total_padded_tokens.data_ptr())
     call.num_non_exiting_tiles = ctypes.c_void_p(
         num_non_exiting_tiles.data_ptr()
@@ -338,6 +344,7 @@ def main() -> int:
         ),
         ("expanded_to_permuted", expanded_to_permuted.flatten().cpu(), None),
         ("permuted_to_expanded", permuted_to_expanded.cpu(), padded),
+        ("permuted_to_token", permuted_to_token.cpu(), padded),
     ]:
         difference = compare(name, expected[name], actual, length)
         if difference is not None:

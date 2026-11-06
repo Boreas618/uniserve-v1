@@ -371,11 +371,12 @@ mod tests {
 
     #[tokio::test]
     async fn unsupported_repository_model_type_is_rejected() {
-        let (_directory, _tokenizer, config) = resolved_config("llama").await;
+        let (_directory, _tokenizer, config) = resolved_config("unsupported_architecture").await;
         let error = config.unwrap_err();
         assert!(matches!(
             error,
-            crate::model::assets::Error::UnsupportedModelType { actual } if actual == "llama"
+            crate::model::assets::Error::UnsupportedModelType { actual }
+                if actual == "unsupported_architecture"
         ));
     }
 

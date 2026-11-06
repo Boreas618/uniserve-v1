@@ -34,7 +34,10 @@ const END_OF_IMAGE: u32 = 1007;
 const START_OF_IMAGE: u32 = 1000;
 
 /// One CPU rank holding the language model and its patch encoder.
-fn engine() -> anyhow::Result<SchedulerHandle> {
+///
+/// `media_overstatement` is declared in every media artifact's report without
+/// being written, which states a rank's report of an extent it cannot store.
+fn engine(media_overstatement: u64) -> anyhow::Result<SchedulerHandle> {
     let components: BTreeMap<String, ComponentConfig> = ["model", "vision_encoder"]
         .into_iter()
         .map(|name| {
@@ -87,6 +90,7 @@ fn engine() -> anyhow::Result<SchedulerHandle> {
         info.media_components =
             BTreeMap::from([(ipc::MediaCall::VisionEncoding, VISION_ENCODER.to_owned())]);
     }
+    sim.overstate_published_media(media_overstatement);
     sim.place_components(components);
     let executor = engine::SimExecutor::new(sim);
     let rank = engine::Executor::info(&executor)
@@ -197,6 +201,9 @@ struct Outcome {
     fed_back: Vec<(u32, std::sync::Arc<engine::ImagePixels>, usize)>,
     completion_tokens: usize,
     image_count: usize,
+    /// Messages of the artifacts the engine refused to deliver, in arrival
+    /// order.
+    unavailable: Vec<String>,
 }
 
 /// Submit `request` and collect its events until it finishes.
@@ -238,6 +245,7 @@ fn run(engine: &SchedulerHandle, request: GenerationRequest) -> anyhow::Result<O
                         .push((image_id, feedback, outcome.generated.len()));
                 }
             }
+            Event::ArtifactUnavailable { message } => outcome.unavailable.push(message),
             Event::Rejected { message, .. } => {
                 anyhow::bail!("request {id:?} was rejected: {message}")
             }
@@ -270,7 +278,7 @@ fn image(seed: u64, steps: u16, text_scale: f32) -> ImageParams {
 
 #[test]
 fn generated_images_follow_their_seed_and_feed_back() -> anyhow::Result<()> {
-    let engine = engine()?;
+    let engine = engine(0)?;
     let result = (|| -> anyhow::Result<()> {
         // Guided generation evaluates the text-unconditional branch, whose
         // guidance prefix is prefilled into its own slot.
@@ -351,7 +359,7 @@ fn generated_images_follow_their_seed_and_feed_back() -> anyhow::Result<()> {
 
 #[test]
 fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
-    let engine = engine()?;
+    let engine = engine(0)?;
     let result = (|| -> anyhow::Result<()> {
         // A 32x32 image is a 2x2 patch grid: four feature tokens at one
         // temporal position.
@@ -453,7 +461,7 @@ fn a_continuation_feeds_its_carried_image_back_through_the_worker() -> anyhow::R
         request.sampling.logit_bias = vec![(START_OF_IMAGE, 100.0)];
         request
     };
-    let whole = engine()?;
+    let whole = engine(0)?;
     let uninterrupted = run(&whole, interleaved(21));
     whole.shutdown();
     let uninterrupted = uninterrupted?;
@@ -473,7 +481,7 @@ fn a_continuation_feeds_its_carried_image_back_through_the_worker() -> anyhow::R
         tokens: tokens as u32,
         image: engine::FeedbackImage::Pixels(values),
     }];
-    let resumed = engine()?;
+    let resumed = engine(0)?;
     let continued = run(&resumed, continuation);
     resumed.shutdown();
     let continued = continued?;
@@ -493,5 +501,87 @@ fn a_continuation_feeds_its_carried_image_back_through_the_worker() -> anyhow::R
     );
     assert_eq!(continued.completion_tokens, uninterrupted.completion_tokens);
     assert_eq!(continued.image_count, uninterrupted.image_count);
+    Ok(())
+}
+
+/// The engine owns the artifact a call publishes, and refuses one whose
+/// declared extent outruns its storage.
+///
+/// A rank states the payload of a completion by name and extent; the engine
+/// claims the object by that statement and keeps the mapping while the result
+/// waits. Here the simulator publishes the bytes an honest rank publishes and
+/// declares them truthfully, so the image is delivered intact with the
+/// published length; with one byte declared beyond the storage, the claim
+/// fails (`SharedMediaError::Short`) and the client is told the artifact is
+/// unavailable instead of receiving the first bytes the object holds.
+#[test]
+fn media_is_owned_by_the_engine_and_a_short_payload_fails_its_call() -> anyhow::Result<()> {
+    let honest = engine(0)?;
+    let result = (|| -> anyhow::Result<()> {
+        let delivered = run(
+            &honest,
+            request(
+                1,
+                vec![5, 6, 7],
+                MultimodalInputs::default(),
+                GenerationConstraint::GenOnly,
+                image(11, 2, 1.0),
+                false,
+            ),
+        )?;
+        assert_eq!(delivered.images.len(), 1, "no image was delivered");
+        assert!(
+            delivered.unavailable.is_empty(),
+            "an honest payload was refused: {:?}",
+            delivered.unavailable
+        );
+        // The claim maps the extent the report declared, so the delivered
+        // artifact is exactly the published payload: the simulator's PNG.
+        let (_, _, rgba) = pixels(&delivered.images[0])?;
+        assert_eq!(rgba.len(), 32 * 32 * 3, "the delivered artifact is whole");
+        Ok(())
+    })();
+    honest.shutdown();
+    result?;
+    assert!(!honest.is_dead(), "a delivered image killed the engine");
+
+    let short = engine(1)?;
+    let result = (|| -> anyhow::Result<()> {
+        let refused = run(
+            &short,
+            request(
+                2,
+                vec![5, 6, 7],
+                MultimodalInputs::default(),
+                GenerationConstraint::GenOnly,
+                image(11, 2, 1.0),
+                false,
+            ),
+        )?;
+        assert!(
+            refused.images.is_empty(),
+            "a payload declaring more than it stores was delivered"
+        );
+        assert_eq!(
+            refused.unavailable.len(),
+            1,
+            "the failed call was not reported once: {:?}",
+            refused.unavailable
+        );
+        assert!(
+            refused.unavailable[0].contains("fewer than its"),
+            "the report does not name the short storage: {}",
+            refused.unavailable[0]
+        );
+        assert!(
+            matches!(refused.reason, Some(FinishReason::Error)),
+            "a refused artifact did not fail the request: {:?}",
+            refused.reason
+        );
+        Ok(())
+    })();
+    short.shutdown();
+    result?;
+    assert!(!short.is_dead(), "a refused payload killed the engine");
     Ok(())
 }
