@@ -608,26 +608,6 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             .extent(0..rows * hidden_width)
             .reshape(ops::Shape::new(&[rows, hidden_width]));
         self.upload()?;
-        // The tower's residual stream and its merged rows, which the model writes into these views
-        // when the diagnosis asks for them. One block's stream is the only shape the model states.
-        let mut views = Vec::new();
-        if self.diag.enabled()
-            && let [grid] = prompt.grids.as_slice()
-        {
-            let patches = u64::from(grid[0]) * u64::from(grid[1]) * u64::from(grid[2]);
-            let merged = tables
-                .iter()
-                .find(|table| table.name == "vision_destinations")
-                .map_or(0, |table| table.shape.dim(0));
-            views = vec![
-                forward
-                    .arena()
-                    .tensor(self.shape.dtype, ops::Shape::new(&[patches, self.diag_tower_width()]))?,
-                forward
-                    .arena()
-                    .tensor(self.shape.dtype, ops::Shape::new(&[merged, hidden_width]))?,
-            ];
-        }
         self.model
             .encode(
                 &forward,
@@ -637,7 +617,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
                     images: &images,
                     layout: &layout,
                     state: &state,
-                    diagnostics: &views,
+                    diagnostics: &[],
                 },
                 EncoderOutputs { hidden },
             )
@@ -670,20 +650,9 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
                     .diag
                     .write(self.device, &stream, "encoder", table.name, *view);
             }
-            for (name, view) in ["vision_hidden", "vision_merged"].iter().zip(&views) {
-                let _ = self.diag.write(self.device, &stream, "encoder", name, *view);
-            }
         }
         drop(held);
         Ok(())
-    }
-
-    /// The tower's own width, which only the checkpoint states.
-    fn diag_tower_width(&self) -> u64 {
-        std::env::var("UNISERVE_DIAG_TOWER_WIDTH")
-            .ok()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(1152)
     }
 
     /// Walks the encode once for `bucket`, recording every operator launch's nodes into the
