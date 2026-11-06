@@ -152,6 +152,7 @@ constexpr int32_t kTypeConvolutionMode = 7;
 constexpr int32_t kTypeHeurMode = 8;
 constexpr int32_t kTypeNumericalNote = 11;
 constexpr int32_t kTypeBackendDescriptor = 15;
+constexpr int32_t kTypeInt32 = 23;
 
 // `CUDNN_DATA_FLOAT`: the compute type of every convolution here.
 constexpr int32_t kComputeFloat = 0;
@@ -468,10 +469,10 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
         cudaDeviceGetAttribute(&multiprocessors, cudaDevAttrMultiProcessorCount, ordinal) ==
             cudaSuccess &&
         multiprocessors > 0) {
-      int64_t device_id = ordinal;
+      int32_t device_id = ordinal;
       const bool made =
           library.backend_create(kDescriptorDeviceProp, &properties) == kSuccess &&
-          library.backend_set(properties, kAttrDevicePropDeviceId, kTypeInt64, 1, &device_id) ==
+          library.backend_set(properties, kAttrDevicePropDeviceId, kTypeInt32, 1, &device_id) ==
               kSuccess &&
           library.backend_finalize(properties) == kSuccess;
       if (!made) {
@@ -539,9 +540,9 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
               library.backend_set(asked, kAttrEngineHeurOperationGraph, kTypeBackendDescriptor, 1,
                                   &graph) == kSuccess;
       if (ready && multiprocessors > 0) {
-        int64_t target = multiprocessors;
+        int32_t target = multiprocessors;
         sm_counted = sm_counted ||
-                     library.backend_set(asked, kAttrEngineHeurSmCount, kTypeInt64, 1, &target) ==
+                     library.backend_set(asked, kAttrEngineHeurSmCount, kTypeInt32, 1, &target) ==
                          kSuccess;
       }
       if (ready && properties != nullptr) {
