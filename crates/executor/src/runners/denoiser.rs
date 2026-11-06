@@ -553,6 +553,8 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     /// A batch is one step, so this is filled by `submit` and consumed by the replay that follows;
     /// a second `submit` before a replay would be a second batch, which the executor does not do.
     pending: Vec<Pending>,
+    /// Whether this load's constants are written.
+    constants_filled: bool,
     /// The calls of the batch staged last, which its replay answers.
     calls: Vec<CallId>,
     /// The steps those calls' trajectories have completed once the replay ran: a call reports it,
@@ -618,6 +620,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             diag: Diag::from_env(),
             staged_step: None,
             pending: Vec::new(),
+            constants_filled: false,
             calls: Vec::new(),
             steps_completed: 0,
         })
@@ -1241,6 +1244,63 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
+    /// Fills the model's constants, once per load and ahead of every capture.
+    ///
+    /// They are values folded from the weights, such as an AdaLN cache, and every step reads them.
+    /// A model's region left unwritten is zeros, so its gates close and the stack passes its input
+    /// through unchanged, with nothing refusing.
+    fn fill_constants(&mut self, kernels: &Arc<ops::Generation>) -> Result<()> {
+        if self.constants_filled {
+            return Ok(());
+        }
+        if !self.model.constant_tables().is_empty() {
+            return Err(Error::Invalid(
+                "this model declares constant tables, and this runner holds no storage for them"
+                    .into(),
+            ));
+        }
+        let stream = self.stream.clone();
+        let base = self.pool()?.base(self.stream_id())?;
+        let reserved = self.pool()?.reserved();
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let forward = nn::Forward::new(&stream, kernels, &arena);
+        self.model
+            .prepare_constants(&forward, &[])
+            .map_err(Error::from)?;
+        self.constants_filled = true;
+        Ok(())
+    }
+
+    /// Writes the staged step's index into the `step` state table a replay reads.
+    ///
+    /// The graph selects its modulation and its solver coefficient on the device from this word, so
+    /// one capture serves every evaluation. The copy is stream-ordered, so a step queued behind a
+    /// running one changes nothing the running one reads.
+    fn write_step(&mut self, bucket: Bucket) -> Result<()> {
+        let layout = layout_of(bucket)?;
+        let tables = self.model.state_tables(&layout);
+        let Some(position) = tables.iter().position(|table| table.name == "step") else {
+            return Ok(());
+        };
+        let state = self.tables.views(
+            self.lifecycle.generation.number(),
+            &Self::key(bucket),
+            &tables,
+        )?;
+        let index = self.staged_step.unwrap_or(0).to_le_bytes();
+        // SAFETY: the destination is the four-byte table and the source four live bytes, staged by
+        // the driver before the call returns.
+        unsafe {
+            platform::memcpy_async(
+                state[position].ptr.address(),
+                index.as_ptr() as u64,
+                index.len(),
+                &self.stream,
+            )?;
+        }
+        Ok(())
+    }
+
     /// Runs the staged step operator by operator instead of replaying its graph.
     ///
     /// This is the diagnosis' own control: a step that is right here and wrong in a replay says the
@@ -1505,6 +1565,7 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 // below addresses, so the graph advances a trajectory rather than a warm capture's
                 // zeros (4.5, section 9).
                 self.first_step(*bucket, *generation)?;
+                self.write_step(*bucket)?;
                 let (served, captured) = self
                     .lifecycle
                     .graphs
@@ -1604,6 +1665,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
+        self.fill_constants(&kernels)?;
         let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
     }
