@@ -785,6 +785,13 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // belongs to the fold alone - copying it into `text` as well would be a second, mis-strided
         // copy of the same bytes (`text_width != source_width`, so the rows would not line up). A
         // model with no conditioner reads the encoder's rows themselves, so they land in `text`.
+        //
+        // The reference settles the direction: its `condition()` takes the encoder's features as the
+        // conditioner's **input** and its `text_condition` is written only by the conditioner's
+        // output, for every task. The two widths are therefore the only statement the interface makes
+        // about whether a conditioner runs (`Denoiser::text_width` answers `None` for no conditioner
+        // and for one that keeps the encoder's width alike), which is why the branch reads them
+        // rather than asking a second question.
         let folded = text_width != source_width;
         for row in &pending {
             let (request, index) = (row.request, row.index);
