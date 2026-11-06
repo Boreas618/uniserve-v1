@@ -1282,7 +1282,10 @@ pub(crate) enum HandedService {
         /// Each engine connection, by its identity, after the listener.
         engines: Vec<(u64, bool, HandedConnection)>,
         next_engine: u64,
-        /// Each member's connection, after the engines'.
+        /// Each client's connection, after the engines'.
+        #[serde(default)]
+        clients: Vec<HandedClient>,
+        /// Each member's connection, after the clients'.
         members: Vec<(u32, String, HandedConnection)>,
         /// The deployment's nodes (`proto::process::Node`, encoded).
         nodes: Vec<Vec<u8>>,
@@ -1323,6 +1326,19 @@ impl HandedConnection {
     }
 }
 
+/// A client of the process socket, its descriptor travelling apart. A client
+/// that reached `clients` greeted, so nothing of its hello is left to read.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+pub(crate) struct HandedClient {
+    /// Its key among the clients.
+    id: u64,
+    /// The owner its requests are answered for.
+    owner: u64,
+    /// The engine whose request link it is, when it is one.
+    requests_of: Option<u64>,
+    connection: HandedConnection,
+}
+
 /// The supervisor's processes and the node's claims, as handed over.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub(crate) struct HandedLocal {
@@ -1345,10 +1361,11 @@ impl LeaderService {
             nodes,
             engines,
             next_engine,
-            // A client of the process socket is a query in flight, not state:
-            // the successor serves its own, and a predecessor's client is
-            // closed with the predecessor's process.
-            clients: _,
+            // A client of the process socket goes on with the rest: a daemon's
+            // control connection is one, and the connection its engine's process
+            // lives under outlives a query.
+            clients,
+            // The successor numbers its clients on from those it adopts.
             next_client: _,
             // The link maps are derived from the connections that are handed
             // over: the successor's first look at a greeted peer files it.
@@ -1382,6 +1399,17 @@ impl LeaderService {
             handed_engines.push((id, engine.welcomed, HandedConnection::of(&handed)));
             descriptors.push(handed.descriptor);
         }
+        let mut handed_clients = Vec::with_capacity(clients.len());
+        for (id, client) in clients {
+            let handed = client.connection.hand_over();
+            handed_clients.push(HandedClient {
+                id,
+                owner: client.owner,
+                requests_of: client.requests_of,
+                connection: HandedConnection::of(&handed),
+            });
+            descriptors.push(handed.descriptor);
+        }
         let mut handed_members = Vec::with_capacity(members.len());
         for member in members {
             let handed = member.connection.hand_over();
@@ -1396,6 +1424,7 @@ impl LeaderService {
                 joins,
                 engines: handed_engines,
                 next_engine,
+                clients: handed_clients,
                 members: handed_members,
                 nodes: nodes.iter().map(prost::Message::encode_to_vec).collect(),
                 stops: stops
@@ -1445,6 +1474,7 @@ pub(crate) fn resume(
             joins,
             engines,
             next_engine,
+            clients,
             members,
             nodes,
             stops,
@@ -1473,6 +1503,24 @@ pub(crate) fn resume(
                     },
                 );
             }
+            let mut adopted_clients = HashMap::new();
+            let mut request_links = HashMap::new();
+            for client in clients {
+                if let Some(number) = client.requests_of {
+                    request_links.insert(number, client.id);
+                }
+                adopted_clients.insert(
+                    client.id,
+                    EngineConnection {
+                        connection: client.connection.resume(next()?)?,
+                        welcomed: true,
+                        process_of: None,
+                        requests_of: client.requests_of,
+                        owner: client.owner,
+                    },
+                );
+            }
+            let next_client = adopted_clients.keys().max().map_or(1, |client| client + 1);
             let mut adopted_members = Vec::with_capacity(members.len());
             for (node_rank, member_host, connection) in members {
                 adopted_members.push(Membership {
@@ -1501,6 +1549,7 @@ pub(crate) fn resume(
                 .collect::<anyhow::Result<HashMap<_, _>>>()?;
             tracing::info!(
                 engines = adopted_engines.len(),
+                clients = adopted_clients.len(),
                 members = adopted_members.len(),
                 "the service goes on from the previous daemon"
             );
@@ -1514,10 +1563,10 @@ pub(crate) fn resume(
                     nodes,
                     engines: adopted_engines,
                     next_engine,
-                    clients: HashMap::new(),
-                    next_client: 1,
+                    clients: adopted_clients,
+                    next_client,
                     process_links: HashMap::new(),
-                    request_links: HashMap::new(),
+                    request_links,
                     stops,
                     commands,
                     reports,

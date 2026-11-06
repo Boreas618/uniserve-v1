@@ -1173,8 +1173,15 @@ mod tests {
     /// for. A submit that waited for that acceptance while nothing stepped
     /// would be waiting for the permit the test sends only after it returns:
     /// a wait of the fixture's making, not the daemon's. The submission is
-    /// polled every grace interval and given a permit while it is still
+    /// polled every grace interval and offered a permit while it is still
     /// pending, so a submission the engine accepts at once is unchanged.
+    ///
+    /// One permit waits at a time, because the wait can be long and an engine
+    /// that executes nothing takes none: a simulated engine loads its policy
+    /// before it reads a submission, which lasts seconds in a debug build. A
+    /// permit for every interval of that wait would queue hundreds of batches,
+    /// and the paced engine would run the request to its end unpaced, with
+    /// nothing left for the test to preempt.
     async fn submit_stepped(
         pace: &engine::Pace,
         what: &str,
@@ -1192,7 +1199,7 @@ mod tests {
                         "{what} did not answer within {} s even while its engine stepped",
                         STALL.as_secs()
                     );
-                    pace.step();
+                    pace.offer();
                 }
             }
         }
