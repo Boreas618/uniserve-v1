@@ -413,6 +413,8 @@ pub struct MediaStage {
     /// The frames of each video unit of a request's timeline: the model's schedule, handed in as a
     /// function because it is the model's arithmetic and the executor holds no copy of it.
     units_of: fn(u32) -> Result<Vec<u32>>,
+    /// The video units of each request staged so far, which is the next unit's place.
+    units_staged: std::collections::HashMap<RequestKey, usize>,
     /// What `submit` staged, one entry per call of the batch it was handed, and what `serve`
     /// performs call by call.
     ///
@@ -458,6 +460,7 @@ impl MediaStage {
             lane,
             products: None,
             units_of,
+            units_staged: std::collections::HashMap::new(),
             pending: Vec::new(),
         }
     }
@@ -657,7 +660,7 @@ fn staged(
                     height,
                     width,
                 },
-                Some(Product::Video),
+                Some(Product::Video(index as u32)),
             ))
         }
         Variant::AudioEncode => Ok((Stage::Track, Some(Product::Track))),
@@ -701,8 +704,21 @@ impl Runner for MediaStage {
             computation,
             &requests,
             &|frames| (self.units_of)(frames),
-            &|request| self.output.units_appended(request),
+            &|request| self.units_staged.get(&request).copied().unwrap_or(0),
         )?;
+        // A unit's place is counted as it is staged: the encodes run on the media lane, so what has
+        // been appended lags what the next batch must read.
+        for staged_call in &staged_calls {
+            match staged_call.stage {
+                Stage::Unit { .. } => {
+                    *self.units_staged.entry(staged_call.request).or_insert(0) += 1;
+                }
+                Stage::Mux => {
+                    self.units_staged.remove(&staged_call.request);
+                }
+                _ => {}
+            }
+        }
         let mut prepared = Vec::with_capacity(staged_calls.len());
         let mut jobs = Vec::with_capacity(staged_calls.len());
         for (call, staged_call) in batch.calls.iter().copied().zip(staged_calls) {
@@ -951,7 +967,7 @@ mod tests {
         );
         assert!(staged_calls
             .iter()
-            .all(|staged_call| staged_call.product == Some(Product::Video)));
+            .all(|staged_call| matches!(staged_call.product, Some(Product::Video(_)))));
     }
 
     #[test]
@@ -974,7 +990,7 @@ mod tests {
                     height: 768,
                     width: 1344,
                 },
-                Some(Product::Video),
+                Some(Product::Video(0)),
             )
         );
         assert_eq!(
@@ -985,7 +1001,7 @@ mod tests {
                     height: 768,
                     width: 1344,
                 },
-                Some(Product::Video),
+                Some(Product::Video(1)),
             )
         );
 

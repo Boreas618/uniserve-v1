@@ -95,7 +95,10 @@ pub enum Product {
     /// own column, and a value another call must read has nowhere to be unless it is named. The name
     /// is `(request, kind)` like every other, so the encoder reads one request's frames by the
     /// identity the request was admitted under rather than by a position in a batch.
-    Video,
+    ///
+    /// **One product per unit of the timeline, which the number names.** A decode runs ahead of the
+    /// encodes that read it, so a later clip must not replace one nobody has read.
+    Video(u32),
     /// `[channels, samples]` the decoded audio track, in the same sense as [`Product::Video`].
     ///
     /// The audio decode runner publishes it and an audio encode reads it. It is a different product
@@ -116,7 +119,7 @@ impl Product {
             Self::Audio => "audio",
             Self::VideoLatents => "video latents",
             Self::AudioLatents => "audio latents",
-            Self::Video => "video",
+            Self::Video(_) => "video",
             Self::Track => "track",
         }
     }
@@ -689,7 +692,7 @@ mod tests {
             Product::Audio,
             Product::VideoLatents,
             Product::AudioLatents,
-            Product::Video,
+            Product::Video(0),
             Product::Track,
         ];
         let mut names: Vec<&'static str> = kinds.iter().map(|kind| kind.name()).collect();
