@@ -337,13 +337,16 @@ fn step_products(layout: &nn::capability::Layout) -> &'static [Product] {
     }
 }
 
-/// The rows and width of one request's conditioning in the columns: `(text_rows + condition_rows)`
-/// rows of `width` elements each.
+/// The rows of one request's conditioning and the encoder's width: `(text_rows + condition_rows)`
+/// rows, the encoder writing `width` elements in each.
 ///
 /// One statement for the two readers that need it - the view a step hands the model
-/// ([`DenoiserRunner::conditioning`]) and the copies that fill it from the store
-/// ([`DenoiserRunner::seed`]). Two statements of this arithmetic would be a step that reads a row
-/// the copies never filled, which is a plausible clip rather than an error.
+/// ([`DenoiserRunner::conditioning`]) and the rows [`DenoiserRunner::seed`] gives their bytes to.
+/// Two statements of this arithmetic would be a step that reads a row the copies never filled, which
+/// is a plausible clip rather than an error.
+///
+/// **`width` is `source`'s alone.** A conditioner may widen what the denoiser reads, so `text`'s
+/// width is the model's statement and the pair is resolved in [`conditioning_width`].
 fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (u64, u64) {
     let rows = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
     let width = u64::from(shape.width.max(1));
