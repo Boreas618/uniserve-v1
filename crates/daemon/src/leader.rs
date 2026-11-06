@@ -605,6 +605,13 @@ impl Leader {
                 .install_programs(commands, config, engines, world)
                 .await
                 .context("installing the epoch's programs in its main processes")?;
+            // A committed world's tensors are what the next world starts from: until it is
+            // published its storage is private to it, and a target of another world finds nothing.
+            let publishing = Arc::clone(&control);
+            tokio::task::spawn_blocking(move || publishing.publish_worlds(&[world], &mut None))
+                .await
+                .context("publishing the first world")?
+                .context("publishing the first world")?;
             // The epoch's programs serve, which is what the standbys were waiting to prepare from.
             for replica in leader.replicas() {
                 replica.prepare_standby();
@@ -1499,16 +1506,24 @@ impl Leader {
             .epochs()
             .program_update()
             .filter(|program| program.update.number == number);
-        if program.is_none() {
+        let Some(program) = program else {
             return Ok(false);
-        }
+        };
         let epochs = Arc::clone(&self.epochs());
-        tokio::task::spawn_blocking(move || epochs.commit_programs())
+        let committed = tokio::task::spawn_blocking(move || epochs.commit_programs())
             .await
             .map_err(|error| {
                 UpdateError::Failed(anyhow::anyhow!("committing the update: {error}"))
             })?
-            .map_err(UpdateError::Failed)
+            .map_err(UpdateError::Failed)?;
+        // The configuration is what the next apply starts from and what a successor takes over:
+        // one that kept the values before this update would undo it at the next change.
+        if committed {
+            for replica in self.replicas() {
+                *locked(&replica.config) = program.update.target.config.clone();
+            }
+        }
+        Ok(committed)
     }
 
     /// Returns every main process to the generation it served before update
@@ -1651,6 +1666,18 @@ impl Leader {
         // Servers select differs: the change applies to nothing, and the
         // world-level path answers it as unchanged.
         if next.programs == filled {
+            return Ok(None);
+        }
+        // What the configuration names is a part of what serves: the rest of an epoch's programs
+        // come from the store. A target that resolves to what the epoch runs changes nothing,
+        // whatever else the same apply changed.
+        if self
+            .epochs()
+            .serving()
+            .is_some_and(|(_, record)| {
+                record.kernels == next.programs.kernels && record.policy == next.programs.policy
+            })
+        {
             return Ok(None);
         }
         // The reverted-update refusal is the daemon's record's, checked when
@@ -2027,6 +2054,8 @@ impl Replica {
             epoch,
         } = target;
         let mut served = updates.epochs().served();
+        let serving_config = config.clone();
+        let publishing = Arc::clone(&control);
         tokio::spawn(async move {
             let sink = stats_sink(
             replica.model_name.clone(),
@@ -2091,6 +2120,9 @@ impl Replica {
             }
             spec.predecessor = None;
             let before = locked(&replica.served).replace(spec);
+            // The configuration is the one the target serves from here, as the spec is, and a
+            // revert puts both back: the next apply starts from it, and the operator reads it.
+            let config_before = std::mem::replace(&mut *locked(&replica.config), serving_config);
             // The previous client stays until the switch settles: it is what keeps the previous
             // epoch's process, which the switch drains next and serves again on a revert.
             let previous = replica.hold.client();
@@ -2106,8 +2138,19 @@ impl Replica {
                 .is_some_and(|(serving, _)| serving == epoch);
             if !committed && let Some(previous) = previous {
                 *locked(&replica.served) = before;
+                *locked(&replica.config) = config_before;
                 replica.hold.serve(previous);
                 warn!(engine, epoch, "the switch returned this replica to the previous epoch");
+            }
+            if committed {
+                // The committed target is what the next switch starts from.
+                let published = tokio::task::spawn_blocking(move || {
+                    publishing.publish_worlds(&[epoch], &mut None)
+                })
+                .await;
+                if !matches!(published, Ok(Ok(()))) {
+                    warn!(epoch, "publishing the committed epoch's world failed: {published:?}");
+                }
             }
         });
     }

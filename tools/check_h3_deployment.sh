@@ -30,7 +30,6 @@ clip=${4:-124}
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 fixture=$here/notes/programs/minimax-h3-keys.txt
-sparse_fixture=$here/notes/programs/minimax-h3-sparse-keys.txt
 gaps=$here/crates/models/minimax-h3/tools/walk_gaps.py
 manifests=$here/crates/models/minimax-h3/tools/check_encoder_manifests.py
 ladder=$here/crates/models/minimax-h3/tools/check_frames_ladder.py
@@ -74,8 +73,12 @@ PY
 )
 
 # 1. Is the file the rows of this tree?
+#    The file states the **video-sparse** deployment, whose rows are a superset of the dense one's, so
+#    it is compared with the generator that produces those rows. A second file for the dense set was a
+#    subset under another name, and a store built from it lacked the rows a sparse run launches.
 echo "== the list against the model's own enumeration"
-generator_question "$(basename "$fixture")" --generator "$root" --fixture "$fixture"
+generator_question "$(basename "$fixture")" --generator "$root" \
+    --generator-flag=--sparse --generator-flag=64,0.9 --fixture "$fixture"
 
 # 2. Does the file state what it holds?
 echo
@@ -98,14 +101,7 @@ echo "== the sparse list against its generator"
 # can reproduce each answer.
 sparse_producer=64,0.9
 sparse_programs=64,0.9,8192
-if [ -f "$sparse_fixture" ]; then
-    echo "   spellings: generator and recorder $sparse_producer, programs $sparse_programs"
-    generator_question "$(basename "$sparse_fixture")" --generator "$root" \
-        --generator-flag=--sparse --generator-flag=$sparse_producer \
-        --fixture "$sparse_fixture" || sparse_not_generated=1
-else
-    echo "   skipped: $sparse_fixture is absent"
-fi
+echo "   spellings: generator and recorder $sparse_producer, programs $sparse_programs"
 
 echo
 echo "== the list against its own header"
@@ -284,7 +280,7 @@ else
     }
 
     record_deployment "$fixture" "$scratch/recorded.dense" || true
-    record_deployment "$sparse_fixture" "$scratch/recorded.sparse" --sparse "$sparse_producer" || true
+    record_deployment "$fixture" "$scratch/recorded.sparse" --sparse "$sparse_producer" || true
 fi
 
 echo "== four walks: one per task, and a sparse one"
@@ -312,12 +308,9 @@ python3 "$gaps" --phantom --fixture "$fixture" \
 echo
 echo "== each walk's shapes against its own file"
 for walk in t2va fl2va ref2va sparse; do
-    # One file is one attention backend: the sparse walk's `vsa_*` and `sparse_attention`
-    # rows belong to the sparse file, and comparing them with the dense one would report
-    # seven gaps that are a deployment's, not a file's.
-    against=$fixture
-    [ "$walk" = sparse ] && against=$sparse_fixture
-    answer=$(python3 "$gaps" --by-shape --fixture "$against" --walk "$scratch/$walk.txt" | tail -1)
+    # One file holds one deployment's rows and it is the sparse one, whose set is a superset of the
+    # dense deployment's: every walk, the sparse one included, is checked against it.
+    answer=$(python3 "$gaps" --by-shape --fixture "$fixture" --walk "$scratch/$walk.txt" | tail -1)
     echo "   $walk: $answer"
     # A walk states one shape the file lacks at every element type when it is
     # the walk's own sample (a request-only quantity, not a deployment one); a

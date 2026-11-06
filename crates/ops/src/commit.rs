@@ -118,6 +118,13 @@ impl fmt::Display for CommitDescriptor {
 /// The arguments of `slot_commit`.
 ///
 /// The per-task columns are indexed by each row's task; the state tensors are indexed by its slot.
+///
+/// A sampled token is a row of `penalties`, so the operator installs only a token that is one: a
+/// value at or above the descriptor's `vocab` writes no next input column, no predicate and no
+/// penalty weight, and leaves the slot's token state as it was. A sampler can answer such a value
+/// (an `argmax` over a row with no numeric value answers the row's width), and installing it would
+/// hand the next step an id the embedding cannot address and land a count in the next slot's row.
+/// Whether the batch is served is the caller's decision, taken where the tokens are read back.
 #[derive(Clone, Copy)]
 pub struct CommitArgs {
     /// `[8, capacity]` i64: the step's commit rows, `stride` elements between columns.

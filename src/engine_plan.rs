@@ -1039,6 +1039,24 @@ impl EpochPlan {
                 // can express**: a distilled export serves the one task its contract states, and a
                 // partition carries one task's block set and condition capacity.
                 let task = served_task(&config.serving(), &self.checkpoint)?;
+                // **The prompt capacity is the deployment's, and the denoiser's packed prefix holds
+                // it.** A layout reserves one row per prompt token, so the text capacity a model is
+                // built with and the prompt capacities the deployment prepares buckets for are one
+                // number: the largest rung `video_config.text_capacities` states, which is the
+                // longest prompt the deployment admits. Built at any other number the model refuses
+                // every request past it at the packed prefix - at capture, minutes into a load, with
+                // the two figures in different components. The reference states the same rule: a
+                // request's text rows are its prompt rounded up to the attention unit's tile, and
+                // the layout's capacity is what the deployment prepared (`packing.py:557`,
+                // `denoiser.py:411`).
+                let longest = self.build.max_model_len.map(|length| length.get()).context(
+                    "a deployment of the media class states no `max_model_len`, and its prompt \
+                     capacities are checked against it",
+                )?;
+                let capacities = prompt_capacities(&self.build.video, longest)?;
+                let text_capacity = *capacities.last().context(
+                    "this deployment states no prompt capacity, so no layout could hold a prompt",
+                )?;
                 // **The postprocessor is placed here, though `serving` names only what holds
                 // weights.** Its arithmetic is the clip splice and it names no checkpoint
                 // directory, so it is not a component a task's weights place - but the decode
@@ -1052,6 +1070,9 @@ impl EpochPlan {
                     tensor_rank,
                     sequence_rank,
                 )?;
+                // The condition capacity is the task's (the block set is placed for it); the text
+                // capacity is the deployment's, from the ladder above.
+                let partition = partition.sized(text_capacity, partition.condition_rows);
                 let partition = partition.placing(
                     partition
                         .blocks
@@ -1065,6 +1086,22 @@ impl EpochPlan {
                 let canvases = deployment_canvases(&self.build.video)?;
                 let model =
                     minimax_h3::load(&opened, partition, Some(dtype), &canvases, &mut loader)?;
+                // **One number, checked where both halves meet.** The partition above takes the
+                // deployment's largest prompt capacity and the model's layouts hold it; a build that
+                // took one and not the other would refuse every longer prompt at the packed prefix,
+                // minutes into a load and in a component that never saw the deployment's number. The
+                // disagreement is named here instead, before any runner is bound.
+                if let Some(denoiser) = model.transformer() {
+                    let held = denoiser.rules().arrangement().text_rows;
+                    let largest = capacities.last().copied().unwrap_or(0);
+                    if capacities.iter().any(|capacity| *capacity > held) {
+                        bail!(
+                            "this deployment prepares prompts of up to {largest} tokens and the \
+                             denoiser's layout holds {held} text rows: the prompt capacity is one \
+                             number, stated by the deployment and held by the packing"
+                        );
+                    }
+                }
                 let served = Served::Media(Arc::new(model));
                 let (memory, info, graph) = self.open_memory(&served, storage)?;
                 Ok((served, memory, info, graph))

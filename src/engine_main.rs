@@ -130,6 +130,8 @@ pub(crate) struct Epoch {
     /// The host identity of the node this process runs on, which the daemon knows and which the
     /// Storage Server's claim states.
     pub host: String,
+    /// The world of the epoch this process succeeds, whose storages it maps until it is promoted.
+    pub predecessor_world: Option<u64>,
 }
 
 /// The options of `uniserve engine`: the launch file the daemon writes for this process (§2.3).
@@ -846,7 +848,13 @@ impl MainProcess {
         // A host tier is the build config's, and it needs prefix caching to have pages to keep.
         let host_kv_cache = build.kv_cache.host_tier && build.kv_cache.prefix_caching;
         let storage = claim(&mut process, launch, &epoch.host, host_kv_cache)?;
-        let client = Retained::connect(&storage, &launch.group, launch.rank, epoch.generation)
+        let client = Retained::connect(
+            &storage,
+            &launch.group,
+            launch.rank,
+            epoch.generation,
+            epoch.predecessor_world,
+        )
             .context("connecting to the Storage Server")?;
         // The client outlives every world of the epoch, and §2.5's park and wake reach its ledger
         // through the memory owners: kept here so the park does not have to hold the connect.
@@ -7094,6 +7102,7 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
     }
     Ok(Epoch {
         generation: 0,
+        predecessor_world: spec.predecessor.as_ref().map(|predecessor| predecessor.world),
         host: spec.host,
     })
 }

@@ -766,6 +766,20 @@ pub trait Denoiser {
         )))
     }
 
+    /// The width of [`Conditioning::text`]'s rows, when it is not the encoder's.
+    ///
+    /// `text` is what the denoiser reads and `source` is what the text encoder wrote, and a model
+    /// whose conditioner **widens** its input has two widths: H3's refiner projects the encoder's
+    /// 5120 columns into the stack's 5376, so a runner that sized both buffers from the encoder's
+    /// width hands the conditioner one too narrow for its own output - which no launch refuses until
+    /// the packed rows are gathered, one operator later, as `out is [rows, 5376], [rows, 5120]
+    /// expected`.
+    ///
+    /// `None` means one width: no conditioner, or a conditioner that keeps the encoder's.
+    fn text_width(&self) -> Option<u32> {
+        None
+    }
+
     /// Draw the initial noise of `out` from `seed`, addressed within `layout`.
     ///
     /// The layout is a parameter because the draw's element offsets are functions of the request's

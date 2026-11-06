@@ -151,6 +151,16 @@ struct Takeover {
     /// reopen them once the frontend serves.
     #[serde(default)]
     frontend_paused: bool,
+    /// The programs the serving epoch runs. A configuration names a part of
+    /// them and the store fills the rest, so the successor cannot derive them.
+    programs: Option<HandedPrograms>,
+}
+
+/// The programs of the epoch a takeover continues.
+#[derive(Debug, Serialize, Deserialize)]
+struct HandedPrograms {
+    kernels: Vec<(crate::epoch::KernelKey, program_server::program::Program)>,
+    policy: program_server::program::Program,
 }
 
 /// One replica's control connection and executing world. Descriptors follow
@@ -439,6 +449,10 @@ impl Restarter {
                     jobs: job_records,
                     then: then.map(|request| *request),
                     frontend_paused: leader.status().paused,
+                    programs: leader.epochs().serving().map(|(_, record)| HandedPrograms {
+                        kernels: record.kernels.into_iter().collect(),
+                        policy: record.policy,
+                    }),
                 })),
                 &borrowed,
             )?;
@@ -756,6 +770,7 @@ async fn prepared_successor(
         jobs,
         then,
         frontend_paused,
+        programs,
     } = *takeover;
     let mut descriptors = descriptors.into_iter();
     let mut next = || {
@@ -802,6 +817,11 @@ async fn prepared_successor(
     )
     .context("resuming the node's daemon service")?;
     let epoch_records = Arc::new(crate::epoch::Epochs::new());
+    // Every later update commands the same main processes through this daemon's
+    // channel, as the first daemon's did after its start.
+    if let Some(commands) = daemon.commands() {
+        epoch_records.supervise(commands);
+    }
     let (updates, awake) = daemon
         .updates(
             Arc::clone(&epoch_records),
@@ -855,7 +875,7 @@ async fn prepared_successor(
     );
     // The successor adopts the epoch that serves (§2.5, §7.4, §7.5).
     {
-        let (record, process) = adopted_epoch(adopted_world, handed.engine, &options);
+        let (record, process) = adopted_epoch(adopted_world, handed.engine, &options, programs);
         epoch_records.record(adopted_world, record);
         let mut processes = epoch_records.processes();
         processes.push(process);
@@ -876,7 +896,9 @@ async fn prepared_successor(
     first.adopt_unavailable(handed.unavailable);
     // §2.5 continues across the handoff: the successor adopts the engines and
     // then keeps a standby of its own, or the deployment would serve without one
-    // until the next restart.
+    // until the next restart. The epoch's programs serve already, so it prepares
+    // from them as soon as it parks.
+    first.prepare_standby();
     first.start_standby();
     for (index, (handed, options, served, observer, client)) in adopted.enumerate() {
         let replica = crate::leader::Replica::new(
@@ -892,6 +914,7 @@ async fn prepared_successor(
         replica.adopt_pause(handed.paused, handed.asleep, handed.sleep_paused);
         replica.adopt_unavailable(handed.unavailable);
         replica.monitor();
+        replica.prepare_standby();
         replica.start_standby();
         leader
             .replicas
@@ -1056,12 +1079,20 @@ fn adopted_epoch(
     world: u64,
     engine: u64,
     options: &crate::options::ServeConfig,
+    programs: Option<HandedPrograms>,
 ) -> (crate::epoch::EpochRecord, crate::epoch::ManagedProcess) {
     let deployment = crate::epoch::Deployment::of(options.clone());
+    let (kernels, policy) = match programs {
+        Some(programs) => (programs.kernels.into_iter().collect(), programs.policy),
+        None => (
+            deployment.programs.kernels.clone(),
+            deployment.programs.policy.clone(),
+        ),
+    };
     let record = crate::epoch::EpochRecord {
         build_config: deployment.build_config.clone(),
-        kernels: deployment.programs.kernels.clone(),
-        policy: deployment.programs.policy.clone(),
+        kernels,
+        policy,
         previous_kernels: std::collections::BTreeMap::new(),
         previous_policy: None,
         status: crate::epoch::Status::Serving,
@@ -1098,7 +1129,7 @@ mod tests {
     #[test]
     fn an_adopted_epoch_records_the_build_it_serves_and_the_generation_it_runs_at() {
         let options = crate::options::ServeConfig::default();
-        let (record, process) = adopted_epoch(7, 12, &options);
+        let (record, process) = adopted_epoch(7, 12, &options, None);
         assert_eq!(record.status, crate::epoch::Status::Serving);
         assert_eq!(record.world, 7);
         assert_eq!(
