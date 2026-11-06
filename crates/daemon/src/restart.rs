@@ -333,10 +333,13 @@ impl Restarter {
         // The successor serves with the daemon's options the change
         // states, over the configuration the engine serves.
         let options = config.unwrap_or_else(|| handoff[0].config.clone());
-        let address = |server: &crate::options::ServerOptions| {
-            (server.host.clone(), server.port, server.uds.clone())
+        // The listener binds the daemon's own address (`admin_config`): a
+        // change of it is the rebind this successor makes before the
+        // handover, and the previous daemon keeps serving if the bind fails.
+        let address = |admin: &crate::options::AdminOptions| {
+            (admin.host.clone(), admin.port, admin.uds.clone())
         };
-        let rebind = address(&options.server_config) != address(&handoff[0].config.server_config);
+        let rebind = address(&options.admin_config) != address(&handoff[0].config.admin_config);
         let config = crate::options::printed(&options)?;
         let processes = self
             .daemon
@@ -723,7 +726,7 @@ async fn prepared_successor(
     // refused bind leaves the previous daemon serving; the listener it hands
     // over then closes once the previous daemon stops accepting.
     let rebound = if prepare.rebind {
-        let listener = Listener::bind(&config.server_config)
+        let listener = Listener::bind(&config.admin_config)
             .await
             .context("binding the configuration's listening address")?;
         info!(address = %listener.local_addr()?, "listening on the configuration's address");
