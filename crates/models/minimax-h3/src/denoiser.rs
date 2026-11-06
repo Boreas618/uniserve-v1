@@ -4198,7 +4198,7 @@ mod tests {
         let packed = rule.segment_of(&layout).unwrap();
         assert_eq!(packed.extent.tile, 64);
         assert_eq!(packed.extent.text_rows, 128);
-        assert_eq!(packed.extent.condition_rows, 64);
+        assert_eq!(packed.extent.condition_rows, 0);
         assert_eq!(packed.extent.padded_tokens % 64, 0);
         assert_eq!(
             packed.video_variable_block_sizes.len() as u32,
@@ -4393,7 +4393,11 @@ mod tests {
         assert_eq!(packing.audio_rows, 2 * 178);
         assert_eq!(layout.audio.unwrap().frames, 178);
         assert_eq!(layout.text_rows, 128);
-        assert_eq!(layout.condition_rows, 64);
+        // A request without conditions carries no condition rows through the stack, and a request
+        // with conditions takes the deployment's capacity.
+        assert_eq!(layout.condition_rows, 0);
+        let (conditioned_layout, _) = rule.layout(&conditioned()).unwrap();
+        assert_eq!(conditioned_layout.condition_rows, 64);
     }
 
     /// A request carrying one keyframe, one clip reference with a soundtrack, and one audio
