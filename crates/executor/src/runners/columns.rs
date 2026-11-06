@@ -57,7 +57,14 @@ impl Column {
     }
 
     /// Copies the host side into the device column; the caller's graph reads it afterwards.
+    ///
+    /// A column whose device view is its own host storage has nothing to copy, and a copy of pinned
+    /// host memory onto itself is the driver's host copy, which waits for the stream: it held every
+    /// step's launch behind the step before it.
     pub(crate) fn upload(&self, stream: &platform::Stream) -> Result<()> {
+        if self.device.ptr.address() == self.host.address() {
+            return Ok(());
+        }
         // SAFETY: source and destination are this column's own host and device buffers, of the
         // same length, and the copy is stream-ordered before the graph that reads the device one.
         unsafe {
