@@ -332,18 +332,18 @@ fn generated_images_follow_their_seed_and_feed_back() -> anyhow::Result<()> {
         );
 
         // An image fed back through the latent encoder conditions the text
-        // that follows it; the stub's head ends that text.
-        let fed = run(
-            &engine,
-            request(
-                4,
-                vec![5, 6, 7],
-                MultimodalInputs::default(),
-                GenerationConstraint::Default,
-                image(7, 2, 1.0),
-                true,
-            ),
-        )?;
+        // that follows it. The simulator's text opens no image of itself, so
+        // the request's bias opens it.
+        let mut fed = request(
+            4,
+            vec![5, 6, 7],
+            MultimodalInputs::default(),
+            GenerationConstraint::Default,
+            image(7, 2, 1.0),
+            true,
+        );
+        fed.sampling.logit_bias = vec![(START_OF_IMAGE, 100.0)];
+        let fed = run(&engine, fed)?;
         assert_eq!(fed.images.len(), 1);
         assert!(
             !matches!(fed.reason, Some(FinishReason::Error)),
