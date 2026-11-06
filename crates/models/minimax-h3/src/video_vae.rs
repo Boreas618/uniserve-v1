@@ -2669,7 +2669,11 @@ pub(crate) mod tests {
             "the two crossings of the stream's type"
         );
         assert_eq!(count("tile_stitch"), 1, "the whole output path");
-        assert_eq!(count("copy_block"), 1, "the gather out of the trajectory");
+        assert_eq!(
+            count("copy_block"),
+            2,
+            "the gather out of the trajectory and the tail a clip leaves"
+        );
 
         // One attention whatever the clip: the sequences and their rows are launch values, so the
         // decoder's programs do not depend on the raster a request asks for.
