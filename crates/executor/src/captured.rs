@@ -141,6 +141,13 @@ impl Captured {
         // reported are not in the graph a replay launches.
         let launched = nodes.len() as u64;
         let template_nodes = template.nodes()?.len() as u64;
+        // What the graph holds beyond kernels is what a replay does on the host's side of the
+        // driver: a copy from host memory reads it again at every launch.
+        let mut kinds = std::collections::BTreeMap::<String, u64>::new();
+        for node in template.nodes()? {
+            *kinds.entry(format!("{:?}", node.kind()?)).or_default() += 1;
+        }
+        tracing::info!(nodes = template_nodes, ?kinds, "a captured graph's nodes");
         if template_nodes < launched {
             return Err(Error::Invariant(format!(
                 "the capture recorded {launched} launch(es) and its graph holds {template_nodes} \
