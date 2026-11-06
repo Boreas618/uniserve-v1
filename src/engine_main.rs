@@ -607,8 +607,19 @@ struct Served {
     /// client's pace, so the consumer can be further behind the producer than any
     /// window. The events the consumer reported consumed are dropped as they are
     /// reported.
-    kept: std::collections::VecDeque<(u64, proto::request::wire::Event)>,
+    kept: std::collections::VecDeque<KeptEvent>,
 }
+
+/// One journaled event: its position in the request's stream, the event, and the artifact bytes it
+/// travels with. A replay without the bytes would be an artifact event the daemon cannot read.
+type KeptEvent = (
+    u64,
+    proto::request::wire::Event,
+    Option<std::sync::Arc<dyn proto::request::ArtifactMedia>>,
+);
+
+/// The most artifact bytes one frame carries, so a frame's size does not grow with the clip.
+const ARTIFACT_PART: usize = 1 << 20;
 
 pub(crate) struct MainProcess {
     control: Control,
@@ -3860,7 +3871,7 @@ impl MainProcess {
                 // the journal.
                 served
                     .kept
-                    .retain(|(position, _)| *position > consumed.events);
+                    .retain(|(position, _, _)| *position > consumed.events);
                 return Ok(());
             }
             Some(proto::request::wire::command::Kind::Takeover(takeover)) => {
@@ -3893,7 +3904,7 @@ impl MainProcess {
                 // stream that skips tokens with nothing saying so. It is refused, naming the two
                 // positions and how far behind the consumer was, so the daemon ends the response
                 // instead of serving a body with a hole in it.
-                if let (Some((oldest, _)), true) = (kept.front(), sent > takeover.events) {
+                if let (Some((oldest, _, _)), true) = (kept.front(), sent > takeover.events) {
                     if takeover.events + 1 < *oldest {
                         let oldest = *oldest;
                         let behind = sent - takeover.events;
@@ -3927,13 +3938,13 @@ impl MainProcess {
                 }
                 let replay = replay_after(&kept, takeover.events);
                 self.streams[index].front = front;
-                for event in replay {
+                for (event, media) in replay {
                     tracing::debug!(
                         request = command.request,
                         front,
                         "replaying an event a taken-over request produced during the pause"
                     );
-                    self.send_event(front, proto::request::wire::from_engine::Kind::Event(event));
+                    self.send_stream_event(front, event, media);
                 }
                 tracing::info!(
                     request = command.request,
@@ -4324,6 +4335,56 @@ impl MainProcess {
         }
     }
 
+    /// Hands one event of a request's stream to its front, with the artifact bytes it travels with.
+    ///
+    /// A front on this host maps the shared-memory object, whose descriptor rides the event's own
+    /// frame. A front on another host, or bytes that no descriptor names, takes bounded parts ahead
+    /// of the event, and the daemon writes each part into the artifact's final host storage.
+    fn send_stream_event(
+        &mut self,
+        front: usize,
+        event: proto::request::wire::Event,
+        media: Option<std::sync::Arc<dyn proto::request::ArtifactMedia>>,
+    ) {
+        use proto::request::wire::{ArtifactPart, FromEngine, from_engine::Kind};
+
+        let Some(media) = media else {
+            self.send_event(front, Kind::Event(event));
+            return;
+        };
+        let Some(connection) = self.control.front_mut(front) else {
+            tracing::debug!(
+                front,
+                "a request's front is gone; its artifact is kept for a takeover"
+            );
+            return;
+        };
+        let frame = FromEngine {
+            kind: Some(Kind::Event(event)),
+        };
+        let descriptor = media
+            .descriptor()
+            .filter(|_| connection.peer_ip().is_none());
+        let sent = match descriptor {
+            Some(descriptor) => connection.send_with_descriptor(&frame, descriptor),
+            None => media
+                .bytes()
+                .chunks(ARTIFACT_PART)
+                .try_for_each(|data| {
+                    connection.send(&FromEngine {
+                        kind: Some(Kind::ArtifactPart(ArtifactPart {
+                            size: media.bytes().len() as u64,
+                            data: data.to_vec(),
+                        })),
+                    })
+                })
+                .and_then(|()| connection.send(&frame)),
+        };
+        if let Err(error) = sent {
+            tracing::warn!(%error, front, "sending a request's artifact failed");
+        }
+    }
+
     /// Ends one request with its refusal: a submission this process will not admit is answered with
     /// the event that says so, because the daemon has no other way to learn it (§2.3).
     fn reject(
@@ -4371,21 +4432,6 @@ impl MainProcess {
                                 | engine::Event::Migratable { .. }
                         );
                         let (wire, media) = event.to_wire(proto::request::RequestId(id));
-                        if media.is_some() {
-                            // An artifact's bytes travel beside its event (`ArtifactPart`), and this
-                            // process does not carry them: a daemon that reads this event waits for
-                            // bytes that never come. It is reachable only if a media request was
-                            // admitted, and the guard against that is the scheduler's - a device
-                            // with no media runner refuses the phase at admission. So this is the
-                            // alarm, not the guard: it fires when the admission rule has been
-                            // bypassed, and the event goes on because the outcome it states is the
-                            // request's own.
-                            tracing::error!(
-                                request = id,
-                                "a request produced media artifacts, which this process does not \
-                                 carry: the daemon will wait for bytes that never come"
-                            );
-                        }
                         // The position this event is written at, and the copy a takeover from an
                         // earlier position replays.
                         served.sent += 1;
@@ -4393,12 +4439,10 @@ impl MainProcess {
                             &mut served.kept,
                             served.sent,
                             wire.clone(),
+                            media.clone(),
                             HANDOVER_JOURNAL,
                         );
-                        self.send_event(
-                            served.front,
-                            proto::request::wire::from_engine::Kind::Event(wire),
-                        );
+                        self.send_stream_event(served.front, wire, media);
                         if terminal {
                             break;
                         }
@@ -4920,23 +4964,27 @@ const WORKER_ERA: &str = "this epoch has no worker of that kind: the command nam
 /// process goes on producing, and the successor resumes from what it last rendered. Without the
 /// replay those events are rendered nowhere and the response loses the tokens the pause covered.
 fn replay_after(
-    kept: &std::collections::VecDeque<(u64, proto::request::wire::Event)>,
+    kept: &std::collections::VecDeque<KeptEvent>,
     from: u64,
-) -> Vec<proto::request::wire::Event> {
+) -> Vec<(
+    proto::request::wire::Event,
+    Option<std::sync::Arc<dyn proto::request::ArtifactMedia>>,
+)> {
     kept.iter()
-        .filter(|(position, _)| *position > from)
-        .map(|(_, event)| event.clone())
+        .filter(|(position, _, _)| *position > from)
+        .map(|(_, event, media)| (event.clone(), media.clone()))
         .collect()
 }
 
 /// Journals one event at `position`, dropping the oldest past `bound`.
 fn keep_event(
-    kept: &mut std::collections::VecDeque<(u64, proto::request::wire::Event)>,
+    kept: &mut std::collections::VecDeque<KeptEvent>,
     position: u64,
     event: proto::request::wire::Event,
+    media: Option<std::sync::Arc<dyn proto::request::ArtifactMedia>>,
     bound: usize,
 ) {
-    kept.push_back((position, event));
+    kept.push_back((position, event, media));
     while kept.len() > bound {
         kept.pop_front();
     }
@@ -7163,7 +7211,7 @@ mod tests {
                 },
             )),
         };
-        let kept: std::collections::VecDeque<_> = (1..=4).map(|at| (at, event(9, "e"))).collect();
+        let kept: std::collections::VecDeque<_> = (1..=4).map(|at| (at, event(9, "e"), None)).collect();
 
         assert_eq!(replay_after(&kept, 0).len(), 4, "a takeover from the start");
         assert_eq!(
@@ -7198,7 +7246,7 @@ mod tests {
         let backlog = proto::request::EVENT_WINDOW as usize * 3;
         let mut kept = std::collections::VecDeque::new();
         for at in 1..=backlog as u64 {
-            keep_event(&mut kept, at, event(9, "e"), HANDOVER_JOURNAL);
+            keep_event(&mut kept, at, event(9, "e"), None, HANDOVER_JOURNAL);
         }
 
         assert!(
@@ -7228,7 +7276,7 @@ mod tests {
         let mut kept = std::collections::VecDeque::new();
         let positions = HANDOVER_JOURNAL as u64 + 10;
         for at in 1..=positions {
-            keep_event(&mut kept, at, event(9, "e"), HANDOVER_JOURNAL);
+            keep_event(&mut kept, at, event(9, "e"), None, HANDOVER_JOURNAL);
         }
 
         assert_eq!(
@@ -7237,7 +7285,7 @@ mod tests {
             "the journal keeps its own bound"
         );
         assert_eq!(
-            kept.front().map(|(position, _)| *position),
+            kept.front().map(|(position, _, _)| *position),
             Some(positions - HANDOVER_JOURNAL as u64 + 1),
             "the oldest event kept is the one at the bound"
         );
