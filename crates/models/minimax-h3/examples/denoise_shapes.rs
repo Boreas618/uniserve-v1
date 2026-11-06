@@ -257,8 +257,41 @@ fn run() -> Result<(), String> {
     }
     println!("  total {total} elements at {}", args.dtype);
 
+    // 5. The state tables the runner writes from this layout, with their values.
+    //
+    // `prepare_state` is the executor's per-request call and `write_state` is a host function, so
+    // this runs the same code the served walk runs before its first launch - and it is where
+    // `write_segment_state` refuses a table whose rows are not the packing's own.
+    let specs = layouts
+        .table_specs(&layout)
+        .map_err(|error| error.to_string())?;
+    let mut written: Vec<Vec<u8>> = Vec::with_capacity(specs.len());
+    for spec in &specs {
+        let elements = spec.shape.dims().iter().product::<u64>();
+        let width = spec.dtype.bytes().ok_or_else(|| {
+            format!("the state table `{}` is {}", spec.name, spec.dtype)
+        })?;
+        let bytes = usize::try_from(elements * width)
+            .map_err(|_| format!("the state table `{}` is larger than memory", spec.name))?;
+        written.push(vec![0u8; bytes]);
+    }
+    layouts
+        .write_state(&request, &layout, &mut written)
+        .map_err(|error| error.to_string())?;
+    println!("state tables  {} written", specs.len());
+    for (spec, bytes) in specs.iter().zip(&written) {
+        let non_zero = bytes.iter().filter(|byte| **byte != 0).count();
+        println!(
+            "  {:<20} {:<4} {:?}  {} byte(s), {non_zero} non-zero",
+            spec.name,
+            spec.dtype.to_string(),
+            spec.shape.dims(),
+            bytes.len()
+        );
+    }
+
     if disagreements.is_empty() {
-        println!("denoise shapes: {} statement(s) agree", plan.len() + 6);
+        println!("denoise shapes: {} statement(s) agree", plan.len() + 6 + specs.len());
         Ok(())
     } else {
         for disagreement in &disagreements {
