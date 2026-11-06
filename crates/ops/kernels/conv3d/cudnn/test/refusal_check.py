@@ -41,6 +41,7 @@ class Call(ctypes.Structure):
         ("groups", ctypes.c_int32),
         ("transposed", ctypes.c_int32),
         ("tf32", ctypes.c_int32),
+        ("channels_last", ctypes.c_int32),
         ("error", ctypes.c_char * 512),
     ]
 
