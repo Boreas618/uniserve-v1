@@ -253,6 +253,15 @@ pub struct WeightRequest {
     /// over the policy, and it is part of the retained key: two loaders of one checkpoint that read
     /// one tensor at two types retain two different weights.
     pub pinned: Option<DType>,
+    /// Whether this tensor must hold a value, asked by [`WeightRequest::nonzero`].
+    ///
+    /// A matrix that multiplies the hidden state is never all zero in a trained or a calibrated
+    /// checkpoint: the product would answer zeros for every activation, and whatever the loader
+    /// published from it reads as "this projection is broken" long after the loading boundary could
+    /// have said so. A norm's scale or a bias may legitimately be zero, so the check is asked for by
+    /// the request rather than applied to every weight, and it reads the region the caller asked for
+    /// - the bytes this load already holds, not a second pass over the tensor.
+    pub nonzero: bool,
 }
 
 impl WeightRequest {
@@ -269,6 +278,7 @@ impl WeightRequest {
             layout: WeightLayout::ROW_MAJOR,
             shape,
             pinned: None,
+            nonzero: false,
         }
     }
 
@@ -286,6 +296,7 @@ impl WeightRequest {
             layout: WeightLayout::ROW_MAJOR,
             shape,
             pinned: None,
+            nonzero: false,
         }
     }
 
@@ -302,7 +313,18 @@ impl WeightRequest {
             layout,
             shape,
             pinned: None,
+            nonzero: false,
         }
+    }
+
+    /// Ask that this tensor hold a value: an all-zero read is refused by name.
+    ///
+    /// The check is on the bytes this load reads - one rank's region of the tensor - so it also
+    /// catches a rank whose own block is zero while the rest of the tensor is not, and it costs no
+    /// second read of the shard.
+    pub fn nonzero(mut self) -> Self {
+        self.nonzero = true;
+        self
     }
 
     /// The same request read as `dtype`, whatever the loader's policy states.
@@ -983,6 +1005,16 @@ impl<'a> WeightLoader<'a> {
         }
 
         let bytes = self.source_bytes(&request.source, &key)?;
+        // The region's own bytes, before any conversion: one read, which this load was doing
+        // anyway, so the sentence costs no second pass over the shard.
+        if request.nonzero && bytes.iter().all(|byte| *byte == 0) {
+            return Err(Error::weight(
+                &request.tensor,
+                "every stored byte of the region is zero: the product would answer zeros for every \
+                 activation, so this tensor is missing its export"
+                    .to_owned(),
+            ));
+        }
         // The key carries the retained element type; the bytes still hold the checkpoint's, so the
         // conversion is decided by the source, not by the key.
         let bytes = if source_dtype != dtype {
@@ -1287,6 +1319,34 @@ impl<'a> WeightLoader<'a> {
                 &values_request.tensor,
                 format!("packed E2M1 values are U8 bytes, not {}", packed.dtype()),
             ));
+        }
+        // A calibrated export never packs an all-zero matrix: every E2M1 code would be zero, the
+        // product would answer zeros for every activation, and a cache filled from it would read as
+        // "this projection is broken" long after the loading boundary could have said so. One host
+        // read of a few megabytes per projection, at load only, buys that sentence.
+        if !self.is_shapes() {
+            let bytes = self.shards()?.read(&values_request.tensor)?;
+            if bytes.bytes.iter().all(|byte| *byte == 0) {
+                return Err(Error::weight(
+                    &values_request.tensor,
+                    "every packed E2M1 byte is zero: the product would answer zeros for every \
+                     activation, so this tensor's calibration did not run"
+                        .to_owned(),
+                ));
+            }
+            // The block scales are the second way a product answers zeros for every activation:
+            // an E4M3 scale of zero multiplies its whole block to zero whatever the codes are. One
+            // zero scale is legitimate (a block whose values are all zero); every scale zero is a
+            // calibration that did not run, and it is invisible in the values themselves.
+            let file_scales = self.shards()?.read(&scales.tensor)?;
+            if file_scales.bytes.iter().all(|byte| *byte == 0) {
+                return Err(Error::weight(
+                    &scales.tensor,
+                    "every block scale is zero: the product would answer zeros for every \
+                     activation whatever the codes hold, so this tensor's calibration did not run"
+                        .to_owned(),
+                ));
+            }
         }
         // The file's arrangement and the product's are two statements, and the permutation between
         // them happens here once: a kernel must never read a table under a claim it does not meet.
@@ -2346,6 +2406,105 @@ pub fn f32_to_half(value: f32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Write one shard of `tensors` - each `(name, dtype, shape, bytes)` - into `directory`.
+    ///
+    /// The header is composed from the format's own grammar here, rather than through the parser a
+    /// test is meant to exercise.
+    fn shard(directory: &std::path::Path, tensors: &[(&str, &str, &[usize], &[u8])]) {
+        let mut body = String::from("{");
+        let mut payload = Vec::new();
+        for (index, (name, dtype, shape, bytes)) in tensors.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            let start = payload.len();
+            payload.extend_from_slice(bytes);
+            let extents = shape
+                .iter()
+                .map(|extent| extent.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            body.push_str(&format!(
+                r#""{name}":{{"dtype":"{dtype}","shape":[{extents}],"data_offsets":[{start},{}]}}"#,
+                payload.len()
+            ));
+        }
+        body.push('}');
+        // The header length is a multiple of eight so the payload stays aligned, as every exporter
+        // writes it; JSON permits the spaces that padding needs.
+        let padded = body.len().div_ceil(8) * 8;
+        body.push_str(&" ".repeat(padded - body.len()));
+
+        let mut file = Vec::new();
+        file.extend_from_slice(&(body.len() as u64).to_le_bytes());
+        file.extend_from_slice(body.as_bytes());
+        file.extend_from_slice(&payload);
+        std::fs::write(directory.join("model.safetensors"), &file).expect("a shard");
+    }
+
+    /// A tensor whose every stored byte is zero is a missing export, not a value — when the request
+    /// asks for a value.
+    ///
+    /// The check is on the bytes the load already holds, so it costs no second read, and it is the
+    /// region the caller asked for rather than the whole tensor: a rank whose own block is zero is
+    /// refused even when the rest of the matrix holds values. A norm or a bias may be zero, which is
+    /// why the request asks rather than the loader deciding.
+    #[test]
+    fn a_region_of_zeros_is_refused_when_the_request_asks_for_a_value() {
+        let root = tempfile::tempdir().expect("a temp directory");
+        let zeros = [0u8; 8];
+        // Two BF16 elements each: one tensor holds nothing but zeros, the other holds a value.
+        let live = [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
+        shard(
+            root.path(),
+            &[
+                ("layers.0.attention.v_proj.weight", "BF16", &[2, 2], &zeros),
+                ("layers.0.attention.k_proj.weight", "BF16", &[2, 2], &live),
+            ],
+        );
+
+        let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
+        let mut store = HostStore::new();
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+
+        let zero =
+            WeightRequest::region("layers.0.attention.v_proj.weight", 0, Shape::new(&[2, 2]))
+                .nonzero();
+        let problem = loader
+            .load(&zero)
+            .expect_err("an all-zero projection is refused");
+        let text = problem.to_string();
+        assert!(
+            text.contains("v_proj.weight"),
+            "the refusal names the tensor: {text}"
+        );
+        assert!(
+            text.contains("every stored byte of the region is zero"),
+            "and what is wrong with it: {text}"
+        );
+
+        // Without the request's word the same bytes load: a zero norm's scale and a zero bias are
+        // values, and the loader does not decide which tensors must hold one.
+        let zero_but_allowed =
+            WeightRequest::region("layers.0.attention.v_proj.weight", 0, Shape::new(&[2, 2]));
+        loader
+            .load(&zero_but_allowed)
+            .expect("a zero tensor loads when nothing asks it to hold a value");
+
+        let live_request =
+            WeightRequest::region("layers.0.attention.k_proj.weight", 0, Shape::new(&[2, 2]))
+                .nonzero();
+        loader
+            .load(&live_request)
+            .expect("a tensor that holds a value passes");
+
+        // A shapes-only loader reads no bytes at all, so the walk of a model's programs states
+        // extents without a shard and has nothing to refuse.
+        WeightLoader::shapes(DType::BF16)
+            .load(&zero)
+            .expect("a shapes-only loader reads nothing");
+    }
 
     /// A shapes-only loader answers a weight request with the extents the caller asked for, at
     /// address zero, and reads nothing: no checkpoint, no shard, no device.

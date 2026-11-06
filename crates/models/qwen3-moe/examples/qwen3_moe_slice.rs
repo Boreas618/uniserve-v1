@@ -719,6 +719,19 @@ fn stage_weights(args: &Args) -> Result<()> {
             "plan(1 token): hidden {}, query {}, key/value {}, factors {}, workspace {} bytes",
             plan.hidden, plan.query, plan.key_value, plan.factors, plan.workspace,
         );
+        // Which representation each projection took, tensor by tensor: the loading boundary decides
+        // per tensor, a checkpoint can mix them, and a dense projection read from packed bytes
+        // answers zeros rather than refusing — which is a cache of zeros one stage later.
+        if let Some(encoded) = model.attention_encoded(0) {
+            let word = |packed: bool| if packed { "packed" } else { "dense" };
+            println!(
+                "layer 0 attention: q {} k {} v {} o {}",
+                word(encoded[0]),
+                word(encoded[1]),
+                word(encoded[2]),
+                word(encoded[3]),
+            );
+        }
         drop(model);
     }
     println!(
@@ -1271,13 +1284,19 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
         // cut, no reference, and the arena released between them exactly as the layer walk does.
         if args.cuts {
             let rows = tokens_usize(&batch);
-            let width = usize::try_from(plan.hidden).unwrap_or(0);
             for cut in [
                 Substage::Normalized,
+                Substage::Projected,
                 Substage::Attended,
                 Substage::GateIn,
                 Substage::MlpOut,
             ] {
+                // Each cut's tensor has its own width: the three projections answer at the
+                // key/value width, and every later cut at the hidden width.
+                let width = match cut {
+                    Substage::Projected => usize::try_from(plan.key_value).unwrap_or(0),
+                    _ => usize::try_from(plan.hidden).unwrap_or(0),
+                };
                 let name = cut.name();
                 let out = measure(Some(cut))?;
                 stream.synchronize()?;
@@ -2860,6 +2879,7 @@ fn rms(values: &[f32]) -> f64 {
 fn cut_hook(cut: Substage) -> &'static str {
     match cut {
         Substage::Normalized => "`input_layernorm`",
+        Substage::Projected => "`self_attn`'s three projections",
         Substage::Attended => "`self_attn`",
         Substage::GateIn => "`post_attention_layernorm`",
         Substage::MlpOut => "`mlp`",
@@ -2875,6 +2895,10 @@ fn cut_hook(cut: Substage) -> &'static str {
 fn cut_file(cut: Substage) -> &'static str {
     match cut {
         Substage::Normalized => "normalized",
+        // The reference hooks `self_attn`'s *output*, so it states no tensor for the three
+        // projections' raw answer: a directory that holds no `projected` file says exactly that,
+        // and the cut is still the one that separates a wrong product from a wrong cache write.
+        Substage::Projected => "projected",
         Substage::Attended => "attended",
         Substage::GateIn => "gate_in",
         Substage::MlpOut => "mlp",

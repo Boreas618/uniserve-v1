@@ -42,7 +42,16 @@ use std::path::{Path, PathBuf};
 /// One case's launch, as its recipe states it.
 #[derive(Debug)]
 pub struct Recipe {
+    /// The recipe file this was read from, absolute: the directory a relative `module` was resolved
+    /// against, and the directory a run's files are written under when it states none.
+    origin: PathBuf,
     /// The module directory: `module.cubin` (or `cubin`), `metadata.json`, and `baked.json`.
+    ///
+    /// Absolute, resolved against the recipe's own directory when the recipe states it relatively.
+    /// It is resolved at read time because the recipe path is the only thing that can say what a
+    /// relative `module` means: a reader that took the path again could be handed a different one -
+    /// a bare file name, whose parent is the empty path - and would then look for the module
+    /// relative to the process's working directory.
     pub module: PathBuf,
     /// The cubin's file name inside the module directory.
     pub cubin: String,
@@ -69,8 +78,19 @@ impl Recipe {
             .ok_or_else(|| format!("{}: a recipe names its module directory", path.display()))?;
         let entry = text_of(&value, "entry")
             .ok_or_else(|| format!("{}: a recipe names the entry to launch", path.display()))?;
+        let origin =
+            std::path::absolute(path).map_err(|error| format!("{}: {error}", path.display()))?;
+        let stated = PathBuf::from(module);
+        let module = match stated.is_absolute() {
+            true => stated,
+            false => origin
+                .parent()
+                .map(|parent| parent.join(&stated))
+                .unwrap_or(stated),
+        };
         Ok(Self {
-            module: PathBuf::from(module),
+            origin,
+            module,
             cubin: text_of(&value, "cubin")
                 .unwrap_or("module.cubin")
                 .to_owned(),
@@ -85,20 +105,19 @@ impl Recipe {
         })
     }
 
-    /// The module directory, resolved against the recipe's own directory when relative.
-    pub fn module_dir(&self, recipe: &Path) -> PathBuf {
-        if self.module.is_absolute() {
-            return self.module.clone();
-        }
-        match recipe.parent() {
-            Some(parent) => parent.join(&self.module),
-            None => self.module.clone(),
-        }
+    /// The module directory, absolute and resolved when this recipe was read.
+    pub fn module_dir(&self) -> PathBuf {
+        self.module.clone()
+    }
+
+    /// The recipe file this was read from.
+    pub fn origin(&self) -> &Path {
+        &self.origin
     }
 
     /// The directory a buffer's `dump` is written under when the run states none.
-    pub fn dump_dir(&self, recipe: &Path) -> PathBuf {
-        recipe
+    pub fn dump_dir(&self) -> PathBuf {
+        self.origin
             .parent()
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."))
@@ -635,7 +654,15 @@ fn width_of(kind: &str) -> usize {
 mod tests {
     use super::*;
 
-    fn plan_of(recipe: serde_json::Value, metadata: serde_json::Value) -> (Recipe, Metadata) {
+    /// A recipe and its module on disk, and the directory that holds them.
+    ///
+    /// The directory is returned because a `TempDir` deletes its files when it is dropped: a
+    /// caller that lets it fall here reads a recipe whose module no longer exists, and the baked
+    /// constants then read as an empty set rather than as a missing file.
+    fn plan_of(
+        recipe: serde_json::Value,
+        metadata: serde_json::Value,
+    ) -> (tempfile::TempDir, Recipe, Metadata) {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let recipe_path = directory.path().join("case.json");
         std::fs::write(&recipe_path, recipe.to_string()).expect("the recipe is written");
@@ -646,14 +673,57 @@ mod tests {
         std::fs::write(module.join("baked.json"), "{\"experts\": 128, \"top\": 8}")
             .expect("the baked constants are written");
         (
+            directory,
             Recipe::read(&recipe_path).expect("the recipe reads"),
             Metadata::read(&module).expect("the metadata reads"),
         )
     }
 
     #[test]
+    fn a_relative_module_resolves_against_the_recipes_own_directory() {
+        // The module a recipe names relatively is a directory beside the recipe. It is resolved
+        // when the recipe is read, and nowhere else: a reader that passed the path again could
+        // pass a bare file name, whose parent is the empty path, and the module would then be
+        // sought under the process's working directory. That is a directory, so the constants
+        // read as an empty set rather than as a missing file.
+        let (directory, recipe, _metadata) = plan_of(
+            serde_json::json!({"module": "module", "entry": "entry"}),
+            serde_json::json!({}),
+        );
+
+        assert_eq!(recipe.module_dir(), directory.path().join("module"));
+        assert!(recipe.module_dir().is_absolute());
+        assert_eq!(recipe.dump_dir(), directory.path());
+        let baked =
+            Baked::read(&recipe.module_dir()).expect("the constants beside the recipe read");
+        assert_eq!(baked.i32("experts"), Ok(128));
+    }
+
+    #[test]
+    fn an_absolute_module_is_taken_as_it_stands() {
+        let module = tempfile::tempdir().expect("a temporary module");
+        std::fs::write(module.path().join("metadata.json"), "{}").expect("the metadata is written");
+        let recipe_directory = tempfile::tempdir().expect("a temporary recipe directory");
+        let recipe_path = recipe_directory.path().join("case.json");
+        std::fs::write(
+            &recipe_path,
+            serde_json::json!({
+                "module": module.path().to_str().expect("a temporary path is text"),
+                "entry": "entry",
+            })
+            .to_string(),
+        )
+        .expect("the recipe is written");
+
+        let recipe = Recipe::read(&recipe_path).expect("the recipe reads");
+
+        assert_eq!(recipe.module_dir(), module.path());
+        assert_eq!(recipe.dump_dir(), recipe_directory.path());
+    }
+
+    #[test]
     fn a_baked_constant_reaches_the_word_the_recipe_names() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_topk_softmax",
@@ -663,8 +733,7 @@ mod tests {
             }),
             serde_json::json!({"num_warps": 4}),
         );
-        let baked = Baked::read(&recipe.module_dir(Path::new("case.json")))
-            .expect("the baked constants read");
+        let baked = Baked::read(&recipe.module_dir()).expect("the baked constants read");
         let launch = Launch::plan(&recipe, &metadata, &baked).expect("the launch plans");
         assert_eq!(launch.words[0].len(), 8);
         assert_eq!(launch.words[0].buffer(), Some("scores"));
@@ -675,7 +744,7 @@ mod tests {
 
     #[test]
     fn a_word_array_the_signature_does_not_describe_is_refused() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_topk_softmax",
@@ -687,8 +756,7 @@ mod tests {
                 "signature": {"scores": "*bf16", "rows": "i32", "wide": "constexpr"},
             }),
         );
-        let baked = Baked::read(&recipe.module_dir(Path::new("case.json")))
-            .expect("the baked constants read");
+        let baked = Baked::read(&recipe.module_dir()).expect("the baked constants read");
         let launch = Launch::plan(&recipe, &metadata, &baked).expect("the launch plans");
         let refused = launch.check_signature(&metadata);
         assert!(
@@ -699,7 +767,7 @@ mod tests {
 
     #[test]
     fn a_module_without_a_signature_is_launched_unchecked_and_says_so() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_topk_softmax",
@@ -707,8 +775,7 @@ mod tests {
             }),
             serde_json::json!({"num_warps": 4}),
         );
-        let baked = Baked::read(&recipe.module_dir(Path::new("case.json")))
-            .expect("the baked constants read");
+        let baked = Baked::read(&recipe.module_dir()).expect("the baked constants read");
         let launch = Launch::plan(&recipe, &metadata, &baked).expect("the launch plans");
         assert_eq!(
             launch.check_signature(&metadata),
@@ -719,7 +786,7 @@ mod tests {
 
     #[test]
     fn a_pointer_to_no_buffer_is_refused_before_anything_is_allocated() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_topk_softmax",
@@ -734,7 +801,7 @@ mod tests {
 
     #[test]
     fn a_structure_passed_by_value_is_one_word_of_its_own_bytes() {
-        let (recipe, metadata) = plan_of(
+        let (_directory, recipe, metadata) = plan_of(
             serde_json::json!({
                 "module": "module",
                 "entry": "uniserve_moe_sort",

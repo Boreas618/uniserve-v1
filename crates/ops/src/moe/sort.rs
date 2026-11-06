@@ -463,6 +463,7 @@ mod tests {
                 ("tile_tokens", layout.tile_tokens),
                 ("scales_dtype", layout.scales_dtype),
                 ("error", layout.error),
+                ("live_tokens", layout.live_tokens),
             ],
             layout.size,
         );
