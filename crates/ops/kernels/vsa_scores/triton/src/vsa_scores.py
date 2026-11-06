@@ -15,8 +15,9 @@ per-head means in — and the products accumulate in FP32, which is the operator
 standard bound for a ``width``-term contraction.
 
 A program is one block of ``QUERIES`` query tiles of one head: it holds their rows and walks the key
-tiles ``KEY_TILES`` at a time as one FP32 matrix step, without TF32, because the reference's product
-is FP32. A key row is read once per block of queries. The destination is the contiguous ``[heads, query tiles, key tiles]`` matrix
+tiles ``KEY_TILES`` at a time as one matrix step in three TF32 products, whose error at these widths
+matches FP32's against an FP64 product (2.8e-6 and 3.5e-6 at 544 tiles, 14 heads and width 128) at an
+eighth of the time of the FP32 step. A key row is read once per block of queries. The destination is the contiguous ``[heads, query tiles, key tiles]`` matrix
 the selection reads, which the operator requires and nothing else may be.
 """
 
@@ -77,7 +78,7 @@ def _vsa_scores_kernel(
             mask=live[:, None] & key_mask[None, :],
             other=0.0,
         ).to(tl.float32)
-        scores = tl.dot(query, values, input_precision="ieee") / root
+        scores = tl.dot(query, values, input_precision="tf32x3") / root
         tl.store(
             out_ptr + out_base[:, None] + keys[None, :],
             scores,
