@@ -21,8 +21,8 @@ use super::ServeConfig;
 /// Each flag and the configuration path it sets.
 pub const FLAG_PATHS: [(&str, &str); 15] = [
     ("MODEL", "model"),
-    ("--host", "server_config.host"),
-    ("--port", "server_config.port"),
+    ("--host", "admin_config.host"),
+    ("--port", "admin_config.port"),
     ("--served-model-name", "served_model_name"),
     ("--worker-groups", "worker_groups"),
     ("--tensor-parallel-size", "tensor_parallel_size"),
@@ -37,16 +37,27 @@ pub const FLAG_PATHS: [(&str, &str); 15] = [
     ("--worker-executable", "worker_config.executable"),
 ];
 
+/// Which process the `--host` and `--port` flags state the listening address
+/// of: the daemon's own server (`admin_config`) or the application's
+/// (`server_config`, which `uniserve frontend` serves).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Listen {
+    Daemon,
+    Frontend,
+}
+
 /// The serving command line.
 #[derive(Debug, Clone, Default, Args)]
 pub struct ServeArgs {
     /// Local model directory or Hugging Face repository (`model`).
     #[arg(value_name = "MODEL")]
     pub model: Option<String>,
-    /// TCP address the server listens on (`server_config.host`).
+    /// TCP address the server listens on (`admin_config.host` for `serve`,
+    /// `server_config.host` for `frontend`).
     #[arg(long)]
     pub host: Option<String>,
-    /// TCP port the server listens on (`server_config.port`).
+    /// TCP port the server listens on (`admin_config.port` for `serve`,
+    /// `server_config.port` for `frontend`).
     #[arg(long)]
     pub port: Option<u16>,
     /// The single model name the API serves (`served_model_name`).
@@ -180,6 +191,16 @@ impl ServeArgs {
     /// option or a value its option does not take; the message names the
     /// option's path.
     pub fn resolve(&self) -> anyhow::Result<(ServeConfig, Stated)> {
+        self.resolve_for(Listen::Daemon)
+    }
+
+    /// Resolves the configuration as [`resolve`](Self::resolve) does, with
+    /// `--host` and `--port` stating `listen`'s address.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`resolve`](Self::resolve) does.
+    pub fn resolve_for(&self, listen: Listen) -> anyhow::Result<(ServeConfig, Stated)> {
         let mut tree = match &self.config {
             Some(path) => std::fs::read_to_string(path)
                 .with_context(|| format!("reading --config {}", path.display()))?
@@ -187,7 +208,7 @@ impl ServeArgs {
                 .with_context(|| format!("parsing --config {}", path.display()))?,
             None => Table::new(),
         };
-        for (path, value) in self.flag_values() {
+        for (path, value) in self.flag_values(listen) {
             let path = path.split('.').map(str::to_owned).collect::<Vec<_>>();
             set(&mut tree, &path, value)?;
         }
@@ -198,16 +219,20 @@ impl ServeArgs {
     }
 
     /// The values the flags state, by configuration path.
-    fn flag_values(&self) -> Vec<(&'static str, Value)> {
+    fn flag_values(&self, listen: Listen) -> Vec<(&'static str, Value)> {
+        let (host_path, port_path) = match listen {
+            Listen::Daemon => ("admin_config.host", "admin_config.port"),
+            Listen::Frontend => ("server_config.host", "server_config.port"),
+        };
         let text = |value: &str| Value::String(value.to_owned());
         let path = |value: &PathBuf| Value::String(value.to_string_lossy().into_owned());
         let count = |value: u64| Value::Integer(i64::try_from(value).unwrap_or(i64::MAX));
 
         [
             ("model", self.model.as_deref().map(text)),
-            ("server_config.host", self.host.as_deref().map(text)),
+            (host_path, self.host.as_deref().map(text)),
             (
-                "server_config.port",
+                port_path,
                 self.port.map(|port| Value::Integer(i64::from(port))),
             ),
             (
@@ -629,8 +654,8 @@ mod tests {
             resolved(&["m", "--port", "9000", "--set", "video_config.max_seconds=5"]).unwrap();
         for path in [
             "model",
-            "server_config",
-            "server_config.port",
+            "admin_config",
+            "admin_config.port",
             "video_config.max_seconds",
         ] {
             assert!(stated.contains(path), "{path} was stated");
