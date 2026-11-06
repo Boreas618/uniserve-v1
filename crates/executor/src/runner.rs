@@ -154,6 +154,14 @@ pub trait Runner: Send {
     /// by name: discarding it would take away the graphs that answer batches.
     fn discard(&mut self, generation: u64) -> Result<()>;
 
+    /// States what this runner's stream needs of the device's graph range, from the model's plan.
+    ///
+    /// Called once the pools are attached and before any capture maps a range. A runner whose model
+    /// states no plan keeps the even share.
+    fn claim_arena(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+
     /// Gives the runner the device's graph pools, before its first capture.
     ///
     /// One pool set exists per device and every runner issuing on it books into the same one

@@ -135,15 +135,17 @@ pub struct DeviceMemory {
 /// [`Pools`] maps and unmaps exactly what these books say.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Ledger {
-    /// The bytes a stream's range reserves unless it stated more.
+    /// The bytes a stream's range reserves unless its runner claimed its own figure.
     reservation: u64,
-    /// The bytes every stream's range may reserve together: the device's graph storage.
-    storage: u64,
-    /// The ranges wider than `reservation`, as their runners stated them before their first use.
-    widened: BTreeMap<StreamId, u64>,
     /// The device bytes every mapping is booked against (4.1).
     budget: u64,
     streams: BTreeMap<StreamId, StreamBooks>,
+    /// What a runner stated its stream needs, from the model's own plan.
+    ///
+    /// The streams of one device differ by an order of magnitude: a denoiser's activations at a
+    /// served canvas are several times an audio decoder's, so an even division of the range starves
+    /// one and strands the rest. The range's total stays the design's figure.
+    claims: BTreeMap<StreamId, u64>,
 }
 
 /// One stream's books: what its plans need and what is mapped of them.
@@ -156,67 +158,31 @@ struct StreamBooks {
 
 impl Ledger {
     fn new(reservation: u64, budget: u64) -> Self {
-        Self::of(reservation, reservation, budget)
-    }
-
-    /// A ledger of `reservation` bytes a stream out of `storage` bytes of graph storage.
-    fn of(reservation: u64, storage: u64, budget: u64) -> Self {
         Self {
             reservation,
-            storage,
-            widened: BTreeMap::new(),
             budget,
             streams: BTreeMap::new(),
+            claims: BTreeMap::new(),
         }
     }
 
     /// The bytes `stream`'s range reserves.
-    fn range(&self, stream: StreamId) -> u64 {
-        self.widened
+    fn reservation_of(&self, stream: StreamId) -> u64 {
+        self.claims
             .get(&stream)
             .copied()
             .unwrap_or(self.reservation)
     }
 
-    /// Reserves `bytes` for `stream`'s range, when its even share is less.
-    ///
-    /// The range is what a captured graph addresses, so it is widened before its first use or not
-    /// at all, and the widening is taken from the streams that map no range: the even share counts
-    /// every stream, and a stream that captures nothing leaves its share unused. The ranges in use
-    /// stay inside the device's graph storage, which is what this refuses past.
-    fn widen(&mut self, stream: StreamId, bytes: u64) -> Result<()> {
-        if bytes <= self.range(stream) {
-            return Ok(());
-        }
-        if self.streams.contains_key(&stream) {
+    /// Records what `stream` needs, before its range is mapped.
+    fn claim(&mut self, stream: StreamId, bytes: u64) -> Result<()> {
+        if self.streams.contains_key(&stream) && bytes > self.reservation_of(stream) {
             return Err(Error::Invalid(format!(
-                "stream {stream:?} asked for a range of {bytes} bytes after its first use: a \
-                 captured graph addresses the {} bytes it holds, and a range does not move",
-                self.range(stream)
+                "stream {stream:?} claims {bytes} bytes and its range is already mapped at {}",
+                self.reservation_of(stream)
             )));
         }
-        let others: u64 = self
-            .streams
-            .keys()
-            .filter(|open| **open != stream)
-            .map(|open| self.range(*open))
-            .sum();
-        let wider: u64 = self
-            .widened
-            .iter()
-            .filter(|(held, _)| **held != stream && !self.streams.contains_key(held))
-            .map(|(_, bytes)| *bytes)
-            .sum();
-        if others + wider + bytes > self.storage {
-            return Err(Error::Invalid(format!(
-                "stream {stream:?} asked for a range of {bytes} bytes and the device's {} bytes of \
-                 graph storage hold {} bytes of other ranges: raise the device's graph share or \
-                 drop a layout from the deployment",
-                self.storage,
-                others + wider
-            )));
-        }
-        self.widened.insert(stream, bytes);
+        self.claims.insert(stream, bytes);
         Ok(())
     }
 
@@ -229,13 +195,12 @@ impl Ledger {
         let reserved = self
             .streams
             .keys()
-            .map(|open| self.range(*open))
-            .sum::<u64>()
-            .saturating_add(self.range(stream));
+            .map(|open| self.reservation_of(*open))
+            .fold(self.reservation_of(stream), u64::saturating_add);
         if reserved > self.budget {
             return Err(Error::Invalid(format!(
                 "a graph pool of {} bytes on stream {stream:?} would reserve {reserved} bytes of a {}-byte budget",
-                self.range(stream),
+                self.reservation_of(stream),
                 self.budget
             )));
         }
@@ -245,10 +210,10 @@ impl Ledger {
 
     /// Books `bucket`'s extent on `stream` and answers the bytes that must be mapped for it.
     fn note(&mut self, stream: StreamId, bucket: Bucket, bytes: u64) -> Result<u64> {
-        if bytes > self.range(stream) {
+        if bytes > self.reservation_of(stream) {
             return Err(Error::Invalid(format!(
                 "bucket {bucket} needs {bytes} bytes, the pool reserves {}",
-                self.range(stream)
+                self.reservation_of(stream)
             )));
         }
         let books = self
@@ -289,7 +254,11 @@ impl Ledger {
     fn metrics(&self) -> PoolMetrics {
         PoolMetrics {
             streams: self.streams.len(),
-            reserved: self.streams.keys().map(|stream| self.range(*stream)).sum(),
+            reserved: self
+                .streams
+                .keys()
+                .map(|open| self.reservation_of(*open))
+                .sum(),
             mapped: self.mapped(),
             budget: self.budget,
         }
@@ -459,7 +428,7 @@ impl Pools {
         }
         Ok(Self {
             allocator,
-            ledger: Ledger::of(graph / streams as u64, graph, totals.allowance()),
+            ledger: Ledger::new(graph / streams as u64, totals.allowance()),
             totals,
             pools: HashMap::new(),
             streams,
@@ -501,23 +470,19 @@ impl Pools {
         self.totals.allowance()
     }
 
-    /// The bytes a stream's range reserves unless its runner stated more ([`Self::widen`]).
+    /// The bytes a stream's range reserves unless its runner claimed its own figure.
     pub fn reserved(&self) -> u64 {
         self.ledger.reservation
     }
 
     /// The bytes `stream`'s range reserves.
-    pub fn range(&self, stream: StreamId) -> u64 {
-        self.ledger.range(stream)
+    pub fn reserved_on(&self, stream: StreamId) -> u64 {
+        self.ledger.reservation_of(stream)
     }
 
-    /// Reserves `bytes` for `stream`'s range, before its first use.
-    ///
-    /// The even share is what a runner gets when it states nothing. A runner whose model states a
-    /// plan past it states the plan here, and the range is taken from what the streams that map no
-    /// range leave of the device's graph storage.
-    pub fn widen(&mut self, stream: StreamId, bytes: u64) -> Result<()> {
-        self.ledger.widen(stream, bytes)
+    /// States what `stream` needs, from the model's own plan, before its range is mapped.
+    pub fn claim(&mut self, stream: StreamId, bytes: u64) -> Result<()> {
+        self.ledger.claim(stream, bytes)
     }
 
     /// The device's allocator, for the one other pool the executor carves from it.
@@ -598,7 +563,7 @@ impl Pools {
     /// remember: the addresses repeat. A zero extent is a bucket without activations.
     pub fn record(&mut self, stream: StreamId, bucket: Bucket, bytes: u64) -> Result<()> {
         self.ledger.note(stream, bucket, bytes)?;
-        let reservation = self.ledger.range(stream);
+        let reservation = self.ledger.reservation_of(stream);
         let pool = self.pool(stream)?;
         pool.plans.insert(bucket, Plan { bytes });
         // What a capture cost, as one line per bucket: the extent its walk reached inside the range.
@@ -734,7 +699,7 @@ impl Pools {
     fn pool(&mut self, stream: StreamId) -> Result<&mut Pool> {
         if !self.pools.contains_key(&stream) {
             self.ledger.open(stream)?;
-            let reservation = self.ledger.range(stream);
+            let reservation = self.ledger.reservation_of(stream);
             let bytes = usize::try_from(reservation)
                 .map_err(|_| Error::Resource("a stream's graph range is larger than memory"))?;
             let buffer = self.allocator.allocate(PoolKind::Graph, bytes)?;
@@ -775,6 +740,22 @@ impl std::fmt::Debug for Pools {
 mod tests {
     use super::*;
     use crate::plan::Variant;
+
+    /// A stream's own plan replaces the even share, and the budget counts what each stream reserves.
+    #[test]
+    fn a_stream_reserves_what_its_runner_claimed() {
+        let mut ledger = Ledger::new(100, 400);
+        ledger.claim(StreamId(1), 300).expect("a claim before the range maps");
+        assert_eq!(ledger.reservation_of(StreamId(1)), 300);
+        assert_eq!(ledger.reservation_of(StreamId(2)), 100);
+        ledger.open(StreamId(1)).expect("the claimed range fits");
+        ledger.open(StreamId(2)).expect("the even share fits beside it");
+        assert!(ledger.open(StreamId(3)).is_err(), "a third range passes the budget");
+        assert!(
+            ledger.claim(StreamId(1), 301).is_err(),
+            "a mapped range cannot grow"
+        );
+    }
 
     /// The device's three pool kinds share one allowance: two bookings under it pass, a third that
     /// would take their sum past it is refused, and the refusal books nothing, so a retry of a
@@ -840,26 +821,6 @@ mod tests {
         );
         // The refusal leaves the books as they were, so nothing is reserved twice.
         assert_eq!(ledger.metrics().streams, 1);
-    }
-
-    #[test]
-    fn a_stream_may_widen_past_its_share_while_the_ranges_in_use_fit_the_storage() {
-        // Three shares of 100 out of 300 bytes of storage, and a budget that holds them all.
-        let mut ledger = Ledger::of(100, 300, 1000);
-        ledger.open(StreamId(0)).expect("the first stream fits");
-        // The other two streams map nothing yet, so one may take their room...
-        ledger.widen(StreamId(1), 200).expect("200 beside 100");
-        assert_eq!(ledger.range(StreamId(1)), 200);
-        ledger.open(StreamId(1)).expect("the widened stream opens");
-        assert_eq!(ledger.note(StreamId(1), bucket(1), 150).expect("fits"), 150);
-        assert!(ledger.note(StreamId(1), bucket(2), 250).is_err());
-        // ...and a third range past what is left is refused, naming the storage.
-        assert!(ledger.widen(StreamId(2), 150).is_err());
-        // A range in use does not move: a captured graph addresses it.
-        assert!(ledger.widen(StreamId(0), 150).is_err());
-        // A stream that asks for less than its share keeps its share.
-        ledger.widen(StreamId(3), 50).expect("no widening");
-        assert_eq!(ledger.range(StreamId(3)), 100);
     }
 
     #[test]
