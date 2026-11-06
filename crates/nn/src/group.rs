@@ -14,7 +14,7 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use ops::platform::{DeviceRange, PlatformDevicePtr};
+use ops::platform::{CaptureStatus, DeviceRange, PlatformDevicePtr};
 use ops::{CollectiveType, Communicator, ReduceOp, Stream};
 
 use crate::error::{Error, Result};
@@ -76,7 +76,8 @@ impl Group {
                 dtype,
                 op,
             )
-            .map_err(Error::Platform)
+            .map_err(Error::Platform)?;
+        Self::settled(stream)
     }
 
     /// Gather `send` from every rank into `recv`, rank-major.
@@ -107,7 +108,8 @@ impl Group {
                 count,
                 dtype,
             )
-            .map_err(Error::Platform)
+            .map_err(Error::Platform)?;
+        Self::settled(stream)
     }
 
     /// Exchange equal blocks with every rank: block `j` of `send` goes to rank `j`, and block `j` of
@@ -136,13 +138,34 @@ impl Group {
                 elements / ranks.max(1),
                 dtype,
             )
-            .map_err(Error::Platform)
+            .map_err(Error::Platform)?;
+        Self::settled(stream)
     }
 
     /// Run `call` with the underlying communicator, for an operator whose collective is not one of
     /// the three above (an expert transport).
     pub fn with<R>(&self, call: impl FnOnce(&mut Communicator) -> Result<R>) -> Result<R> {
         call(&mut self.locked())
+    }
+
+    /// Waits for a collective issued outside a capture, so the walk goes on with none in flight.
+    ///
+    /// NCCL's kernel spins on its device until every member reaches the collective. The first
+    /// `cuKernelSetAttribute` of a kernel, which cuBLASLt issues inside a first `cublasLtMatmul` and
+    /// a native launch inside `cudaFuncSetAttribute`, takes a lock of the whole process and then
+    /// waits for its device to drain. Every rank of a host is a thread of one process, so a rank
+    /// that walked on past a collective and reached such a call holds that lock for a kernel that
+    /// needs its peers, while the peers queue on the lock in front of the same collective. The
+    /// warm walk of a bucket is where those first calls happen, and the walks of a group's ranks
+    /// are not in step, because a rank's rows of each modality are its own.
+    ///
+    /// A collective inside a capture runs in a replay, by which time every kernel is ready, so it
+    /// is not waited for.
+    fn settled(stream: &Stream) -> Result<()> {
+        if stream.capture_status().map_err(Error::Platform)? == CaptureStatus::None {
+            stream.synchronize().map_err(Error::Platform)?;
+        }
+        Ok(())
     }
 
     /// The communicator, for one call. A panic while it was held leaves nothing half-issued that

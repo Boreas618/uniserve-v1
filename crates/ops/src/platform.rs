@@ -30,7 +30,8 @@ pub use platform::DevicePtr as PlatformDevicePtr;
 pub use platform::Error as PlatformError;
 pub use platform::nccl::{Communicator, ReduceOp};
 pub use platform::{
-    Allocator, Buffer, Cluster, Device, DeviceRange, Function, FunctionAttribute, LaunchConfig,
+    Allocator, Buffer, CaptureStatus, Cluster, Device, DeviceRange, Function, FunctionAttribute,
+    LaunchConfig,
     Library, NativeLibrary, PoolKind, Stream,
 };
 
