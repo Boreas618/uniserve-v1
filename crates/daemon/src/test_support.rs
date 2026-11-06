@@ -362,10 +362,33 @@ pub(crate) async fn send(
         Ok(response) => response.unwrap(),
         Err(_) => panic!("{waited} answered nothing within {} s", STALL.as_secs()),
     };
-    let (parts, body) = response.into_parts();
-    let bytes = match tokio::time::timeout(STALL, axum::body::to_bytes(body, usize::MAX)).await {
-        Ok(bytes) => bytes.unwrap(),
-        Err(_) => panic!("{waited}'s body did not end within {} s", STALL.as_secs()),
+    // A response answered as one document carries its body beside the response, and a connection
+    // reads it from there: the status of a failure is the body's outcome, so it is read here too.
+    let document = response
+        .extensions()
+        .get::<crate::http::stream::HandedBody>()
+        .and_then(crate::http::stream::HandedBody::take)
+        .filter(|handed| handed.stream.head_held());
+    let (mut parts, body) = response.into_parts();
+    let bytes = if let Some(mut handed) = document {
+        use crate::http::stream::Opened;
+        let opened = tokio::time::timeout(STALL, handed.stream.opened()).await;
+        let opened = opened.unwrap_or_else(|_| {
+            panic!("{waited}'s document did not open within {} s", STALL.as_secs())
+        });
+        match opened {
+            Opened::Frame(frame) => frame.to_vec(),
+            Opened::Failed(error, frames) => {
+                parts.status = axum::response::IntoResponse::into_response(error).status();
+                frames.concat()
+            }
+            Opened::Ended => Vec::new(),
+        }
+    } else {
+        match tokio::time::timeout(STALL, axum::body::to_bytes(body, usize::MAX)).await {
+            Ok(bytes) => bytes.unwrap().to_vec(),
+            Err(_) => panic!("{waited}'s body did not end within {} s", STALL.as_secs()),
+        }
     };
     let json = if bytes.is_empty() {
         serde_json::Value::Null
