@@ -56,6 +56,10 @@ use crate::{Error, Result};
 /// The modulation columns one AdaLN row holds: six affine vectors of three tags each.
 const ADALN_COLUMNS: u64 = 18;
 
+/// The least rung of a deployment's condition ladder: the tiles of one keyframe of the released
+/// canvases, which is the smallest condition a request brings.
+const LEAST_CONDITION_RUNG: u32 = 1024;
+
 /// The row capacities and the sequence degree a deployment serves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Arrangement {
@@ -345,9 +349,10 @@ impl Layouts {
     /// The layout a request is laid out in, without packing it.
     ///
     /// The capability asks for a layout and cannot refuse one, so this snaps the request the way
-    /// [`Layouts::layout`] does and takes the deployment's prefix capacities. A request whose
-    /// packing is then refused is one the runner never asks for: the packing is the same function
-    /// of the same values, and the runner must lay the request out before it captures anything.
+    /// [`Layouts::layout`] does and takes the deployment's text capacity and the request's rung. A
+    /// request whose packing is then refused is one the runner never asks for: the packing is the
+    /// same function of the same values, and the runner must lay the request out before it captures
+    /// anything.
     pub fn cover(&self, request: &VideoRequest<'_>) -> Layout {
         let frames = frames_of(request);
         let canvas = canvas_of(request).unwrap_or(Canvas {
@@ -377,18 +382,44 @@ impl Layouts {
         }
     }
 
-    /// The condition rows `request`'s layout holds: the deployment's capacity for a request with
-    /// conditions, and none for a request without.
+    /// The condition rows `request`'s layout holds: the rung it states, the deployment's capacity
+    /// when it states none, and none for a request without conditions.
     ///
-    /// A deployment's capacity is sized for the widest task it serves, and a layout's rows are real
-    /// rows of every projection, every attention and every feed-forward of every step. A `t2va`
-    /// request at a capacity sized for `fl2va` carried 2048 empty rows through all of them.
+    /// A deployment's capacity is sized for the widest request it serves, and a layout's rows are
+    /// real rows of every projection, every attention and every feed-forward of every step. A
+    /// `t2va` request at a capacity sized for `fl2va` carried 2048 empty rows through all of them,
+    /// and an image reference at a capacity sized for a reference video carried 40000.
     fn condition_rows_of(&self, request: &VideoRequest) -> u32 {
         if request.task == nn::capability::VideoTask::TextToVideoAudio {
             0
         } else {
-            self.arrangement.condition_rows
+            request
+                .condition_rows
+                .unwrap_or(self.arrangement.condition_rows)
         }
+    }
+
+    /// The condition rows a layout of this deployment may hold, ascending and ending at its
+    /// capacity: one captured graph per rung and timeline, and a request rides the smallest rung
+    /// that holds its conditions.
+    ///
+    /// The rungs start at one keyframe and double, with a rung halfway between two doublings from
+    /// four keyframes up, where a request's empty rows start to cost more than their graphs. Each
+    /// is a whole number of capacity units, so a layout of any rung packs.
+    pub fn condition_ladder(&self) -> Vec<u32> {
+        let capacity = self.arrangement.condition_rows;
+        let unit = self.config.attention.capacity_rows();
+        let mut rungs = Vec::new();
+        let mut doubling = LEAST_CONDITION_RUNG;
+        while doubling < capacity {
+            rungs.push(round_up(doubling, unit));
+            if doubling >= 4 * LEAST_CONDITION_RUNG && doubling + doubling / 2 < capacity {
+                rungs.push(round_up(doubling + doubling / 2, unit));
+            }
+            doubling *= 2;
+        }
+        rungs.push(capacity);
+        rungs
     }
 
     /// The arrangement this rule serves.
@@ -398,8 +429,9 @@ impl Layouts {
 
     /// The layout a request is served in, with the packing of its row extents.
     ///
-    /// The canvas comes from the request's raster and the frames are snapped; the prefix capacities
-    /// are the deployment's, because a layout holds every prompt that fits it.
+    /// The canvas comes from the request's raster and the frames are snapped; the text capacity is
+    /// the deployment's, because a layout holds every prompt that fits it, and the condition rows
+    /// are the rung the request states.
     pub fn layout(&self, request: &VideoRequest) -> Result<(Layout, DensePacking)> {
         let frames = packing::align_num_frames(request.frames);
         let canvas = canvas_of(request)?;
@@ -2037,7 +2069,8 @@ impl<'a> Tables<'a> {
 ///
 /// A dense deployment's rows are the packing's padded token count and a sparse deployment's are the
 /// segment packing's, which rounds to whole tiles. Both come from the same functions the loader builds
-/// layouts from, so a plan and a forward cannot disagree about a row.
+/// layouts from, so a plan and a forward cannot disagree about a row. The capacities are the
+/// layout's own: a layout of a low rung is fewer rows than the deployment's bound.
 pub fn packed_rows(
     config: &DenoiserConfig,
     arrangement: &Arrangement,
@@ -2049,8 +2082,8 @@ pub fn packed_rows(
         crate::config::AttentionKind::Sparse { tile, .. } => Ok(packing::segment_packing(
             frames,
             &canvas,
-            arrangement.text_rows,
-            arrangement.condition_rows,
+            layout.text_rows,
+            layout.condition_rows,
             tile,
             tile,
         )?
@@ -2059,8 +2092,8 @@ pub fn packed_rows(
         crate::config::AttentionKind::Dense => Ok(packing::dense_packing(
             frames,
             &canvas,
-            arrangement.text_rows,
-            arrangement.condition_rows,
+            layout.text_rows,
+            layout.condition_rows,
             arrangement.shard,
         )?
         .padded_tokens),
@@ -2564,14 +2597,20 @@ impl Denoiser {
             .iter()
             .map(|piece| (piece.rows, piece.audio_rows))
             .collect();
-        // The layout's condition capacity, which is the arrangement's: `Layouts::cover` states it on
-        // every layout this deployment serves, so the writer and the packing's `prefix_index` read
-        // one number.
-        let (_, placements) = condition_placements(
-            text.shape.dim(0),
-            self.rules.arrangement().condition_rows,
-            &pieces,
-        )?;
+        // The layout's condition capacity is what the source holds past the text capacity and the
+        // zero row: a rung is the request's, and the source is sized by it, so the writer and the
+        // packing's `prefix_index` read one number.
+        let total = text.shape.dim(0);
+        let text_rows = u64::from(self.rules.arrangement().text_rows);
+        let reserved = total.checked_sub(text_rows + 1).ok_or_else(|| {
+            Error::config(format!(
+                "a {total}-row prefix source cannot hold {text_rows} text rows and the zero row"
+            ))
+        })?;
+        let reserved = u32::try_from(reserved).map_err(|_| {
+            Error::config(format!("{reserved} condition rows do not fit a row count"))
+        })?;
+        let (_, placements) = condition_placements(total, reserved, &pieces)?;
         let audio_channels = u64::from(self.config.transformer.audio_channels);
         // The trace's `clean` views are one per **visual** condition, in packed order, so the
         // counter advances on the visual pieces alone - an audio-only condition contributes none.
@@ -3934,6 +3973,7 @@ mod tests {
             text_tokens: 0,
             conditions: &[],
             vision_spans: &[],
+            condition_rows: None,
         }
     }
 
@@ -3943,6 +3983,55 @@ mod tests {
         let mut config = layouts().config;
         config.attention = AttentionKind::sparse(TILE, 0.8, None).unwrap();
         Layouts::new(config, layouts().arrangement).unwrap()
+    }
+
+    /// The ladder starts at one keyframe, doubles, gains a halfway rung from four keyframes up, and
+    /// ends at the capacity whatever it is; a capacity below the least rung is the only rung.
+    #[test]
+    fn the_condition_ladder_climbs_to_the_capacity() {
+        let ladder = |capacity| {
+            let mut rules = sparse_layouts();
+            rules.arrangement.condition_rows = capacity;
+            rules.condition_ladder()
+        };
+        assert_eq!(
+            ladder(49_152),
+            [1024, 2048, 4096, 6144, 8192, 12_288, 16_384, 24_576, 32_768, 49_152]
+        );
+        assert_eq!(
+            ladder(40_960),
+            [1024, 2048, 4096, 6144, 8192, 12_288, 16_384, 24_576, 32_768, 40_960]
+        );
+        assert_eq!(ladder(2048), [1024, 2048]);
+        assert_eq!(ladder(2112), [1024, 2048, 2112]);
+        assert_eq!(ladder(512), [512]);
+    }
+
+    /// A layout holds the rung its request states, its rows are that rung's, and a request that
+    /// states none holds the capacity. A request without conditions holds none at any rung.
+    #[test]
+    fn a_layout_holds_the_rung_of_its_request() {
+        let mut rules = sparse_layouts();
+        rules.arrangement.condition_rows = 2048;
+        let widest = rules.cover(&conditioned());
+        assert_eq!(widest.condition_rows, 2048);
+        let rung = rules.cover(&VideoRequest {
+            condition_rows: Some(1024),
+            ..conditioned()
+        });
+        assert_eq!(rung.condition_rows, 1024);
+        rules.segment_of(&rung).unwrap();
+        assert_eq!(
+            packed_rows(&rules.config, &rules.arrangement, &widest).unwrap()
+                - packed_rows(&rules.config, &rules.arrangement, &rung).unwrap(),
+            1024
+        );
+        let plain = rules.cover(&VideoRequest {
+            task: nn::capability::VideoTask::TextToVideoAudio,
+            condition_rows: Some(1024),
+            ..conditioned()
+        });
+        assert_eq!(plain.condition_rows, 0);
     }
 
     #[test]

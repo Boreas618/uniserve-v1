@@ -116,6 +116,7 @@ fn video_request(id: u64) -> DiffusionRequest {
             seed: 0,
             width: 1344,
             height: 768,
+            condition_rows: 0,
         },
         trajectory: Default::default(),
         encoder_inputs: None,

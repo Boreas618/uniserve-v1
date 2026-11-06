@@ -17,6 +17,9 @@ serde_json.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The request rules, which count a request's condition rows before the request reaches a rank: the
+# tests hold that count against this crate's packing.
+models = { path = "../rules" }
 # The slice harness (`examples/dit_layer.rs`) is the thing that owns runtime objects -- the device,
 # the allocator, the stream -- because a model may not. It sits in a dev-dependency so the library's
 # own dependency list stays `nn` and `ops`.

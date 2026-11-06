@@ -198,6 +198,7 @@ fn run() -> Result<(), String> {
         text_tokens: text_rows,
         conditions: &conditions,
         vision_spans: &[],
+        condition_rows: None,
     };
     let layout = layouts.cover(&request);
 

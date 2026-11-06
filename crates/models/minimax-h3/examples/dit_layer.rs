@@ -523,6 +523,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
         text_tokens: args.text_tokens,
         conditions: &[],
         vision_spans: &[],
+        condition_rows: None,
     };
     let (layout, packing) = layouts.layout(&request)?;
     let frames = packing::align_num_frames(request.frames);
@@ -1200,6 +1201,7 @@ fn stage_block(args: &Args) -> Result<()> {
         text_tokens: args.text_tokens,
         conditions: &[],
         vision_spans: &[],
+        condition_rows: None,
     };
     let (layout, packing) = layouts.layout(&request)?;
     let frames = packing::align_num_frames(request.frames);

@@ -329,9 +329,10 @@ pub enum Extent {
         height: u32,
         /// Prompt rows the layout must hold.
         text_rows: u32,
-        /// Whether the request carries conditions. A layout's condition rows are real rows of every
-        /// step, so a request without any is served by the layout that holds none.
-        conditioned: bool,
+        /// Condition rows the layout must hold, as the denoiser packs them. A layout's condition
+        /// rows are real rows of every step, so a request rides the smallest layout that holds its
+        /// own, and a request without any the layout that holds none.
+        condition_rows: u32,
     },
     /// One decoded clip's raster.
     Clip {
@@ -452,8 +453,8 @@ impl Bucket {
                     width,
                     height,
                     text_rows,
-                    conditioned,
-                } => self.serves_request(frames, width, height, text_rows, conditioned),
+                    condition_rows,
+                } => self.serves_request(frames, width, height, text_rows, condition_rows),
                 stated => self.extent == stated,
             }
     }
@@ -461,15 +462,15 @@ impl Bucket {
     /// Whether this bucket serves a request of `frames` frames at `width` by `height`.
     ///
     /// A clip's bucket is the canvas's whatever the timeline, a track's is the timeline's whatever
-    /// the canvas, and a step's is both, in a layout whose prompt rows hold the request's. An
-    /// encode's states neither.
+    /// the canvas, and a step's is both, in a layout whose prompt rows and condition rows hold the
+    /// request's. An encode's states neither.
     fn serves_request(
         &self,
         frames: u32,
         width: u32,
         height: u32,
         text_rows: u32,
-        conditioned: bool,
+        condition_rows: u32,
     ) -> bool {
         let same = |served: (u32, u32, u32)| served == (frames, width, height);
         match (self.variant, self.extent) {
@@ -485,7 +486,8 @@ impl Bucket {
             (_, Extent::Latents(layout)) => {
                 self.serves.is_none_or(same)
                     && layout.text_rows >= text_rows
-                    && (layout.condition_rows > 0) == conditioned
+                    && layout.condition_rows >= condition_rows
+                    && (layout.condition_rows > 0) == (condition_rows > 0)
             }
             _ => self.serves.is_none_or(same),
         }
@@ -879,7 +881,7 @@ mod tests {
                 width: 1344,
                 height: 768,
                 text_rows,
-                conditioned: false,
+                condition_rows: 0,
             },
         };
         assert_eq!(plan.select_media(&asked(124, 537)), Some(short));
@@ -889,7 +891,8 @@ mod tests {
     }
 
     /// A request without conditions finds the layout that holds none, and one with conditions the
-    /// layout that holds them, because a layout's condition rows are real rows of every step.
+    /// smallest layout that holds them, because a layout's condition rows are real rows of every
+    /// step. Conditions no layout holds find none.
     #[test]
     fn a_request_selects_the_layout_of_its_own_conditions() {
         let layout = |condition_rows: u32| nn::capability::Layout {
@@ -905,9 +908,10 @@ mod tests {
             condition_elements: 0,
         };
         let plain = Bucket::denoise(1, layout(0)).serving(124, 1344, 768);
-        let conditioned = Bucket::denoise(1, layout(2048)).serving(124, 1344, 768);
-        let plan = Buckets::new([conditioned, plain]);
-        let asked = |conditioned| Computation {
+        let low = Bucket::denoise(1, layout(2048)).serving(124, 1344, 768);
+        let high = Bucket::denoise(1, layout(8192)).serving(124, 1344, 768);
+        let plan = Buckets::new([high, low, plain]);
+        let asked = |condition_rows| Computation {
             call: ipc::MediaCall::Denoising,
             rows: 1,
             tokens: 0,
@@ -916,11 +920,15 @@ mod tests {
                 width: 1344,
                 height: 768,
                 text_rows: 537,
-                conditioned,
+                condition_rows,
             },
         };
-        assert_eq!(plan.select_media(&asked(false)), Some(plain));
-        assert_eq!(plan.select_media(&asked(true)), Some(conditioned));
+        assert_eq!(plan.select_media(&asked(0)), Some(plain));
+        assert_eq!(plan.select_media(&asked(1024)), Some(low));
+        assert_eq!(plan.select_media(&asked(2048)), Some(low));
+        assert_eq!(plan.select_media(&asked(2176)), Some(high));
+        assert_eq!(plan.select_media(&asked(8192)), Some(high));
+        assert_eq!(plan.select_media(&asked(8320)), None);
     }
 
     /// A host call's bucket serves its call whatever the batch holds, because it states no bound.

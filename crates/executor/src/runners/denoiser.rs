@@ -85,6 +85,9 @@ pub struct WarmRequest {
     pub conditions: Vec<nn::ConditionShape>,
     /// Per-image prompt spans, in request order.
     pub vision_spans: Vec<(u32, u32)>,
+    /// The condition rows this request's layout holds, as one rung of the deployment's ladder;
+    /// `None` is the deployment's whole capacity. A request of the bucket keeps the bucket's rung.
+    pub condition_rows: Option<u32>,
 }
 
 impl WarmRequest {
@@ -102,6 +105,7 @@ impl WarmRequest {
             text_tokens: self.text_tokens,
             conditions: &self.conditions,
             vision_spans: &self.vision_spans,
+            condition_rows: self.condition_rows,
         }
     }
 }
@@ -175,12 +179,14 @@ fn latent_bytes(latent: &LatentShape, dtype: DType) -> Result<u64> {
 /// A column's device address never moves, so a captured graph addresses it directly and every step
 /// rewrites its contents instead of allocating (4.5): the staging buffers here are the host side of
 /// that one buffer, and the offsets are the requests' own blocks.
+///
+/// **The conditioning columns are not here.** They are hundreds of megabytes, a capture only needs
+/// them to hold defined values, and a request writes every row of them it reads, so they are zeroed
+/// once, where they are allocated.
 #[derive(Default)]
 struct Staged {
     video: Vec<u8>,
     audio: Vec<u8>,
-    text: Vec<u8>,
-    source: Vec<u8>,
     step: Vec<u8>,
 }
 
@@ -251,20 +257,34 @@ struct DenoiseColumns {
 }
 
 impl DenoiseColumns {
-    fn new(device: DeviceId, shape: DenoiserShape, layout: &Layout, rows: u32) -> Result<Self> {
+    /// Columns that hold a request of any of `layouts`, `rows` requests to a batch.
+    ///
+    /// The extents are taken one by one rather than from a largest layout: the longest timeline and
+    /// the highest condition rung are two axes, and a bucket that is largest on one need not be on
+    /// the other.
+    fn new(device: DeviceId, shape: DenoiserShape, layouts: &[Layout], rows: u32) -> Result<Self> {
         let rows = u64::from(rows.max(1));
-        let video = numel(&layout.video)?;
-        let audio = match layout.audio {
-            Some(audio) => numel(&audio)?,
-            None => 1,
-        };
-        let width = prefix_rows(layout);
+        let (mut video, mut audio, mut width) = (0, 1, 0);
+        for layout in layouts {
+            video = video.max(numel(&layout.video)?);
+            if let Some(track) = layout.audio {
+                audio = audio.max(numel(&track)?);
+            }
+            width = width.max(prefix_rows(layout));
+        }
         let (source_width, text_width) = conditioning_width(&shape);
+        let mut text = Column::new(device, shape.stack, rows * width * text_width)?;
+        let mut source = Column::new(device, shape.stack, rows * width * source_width)?;
+        // SAFETY: the columns were allocated above and nothing reads them yet.
+        unsafe {
+            text.host.as_mut_slice().fill(0);
+            source.host.as_mut_slice().fill(0);
+        }
         Ok(Self {
             video: Column::new(device, shape.sample, rows * video)?,
             audio: Column::new(device, shape.sample, rows * audio)?,
-            text: Column::new(device, shape.stack, rows * width * text_width)?,
-            source: Column::new(device, shape.stack, rows * width * source_width)?,
+            text,
+            source,
             step: Column::new(device, DType::I64, 1)?,
             staged: Staged::default(),
             source_width,
@@ -272,8 +292,7 @@ impl DenoiseColumns {
         })
     }
 
-    /// Zeroes every column's host side for `bucket`'s layout, so a warm capture reads defined
-    /// values.
+    /// Zeroes the latents' host side for `bucket`'s layout, so a warm capture reads defined values.
     fn warm(&mut self, layout: &Layout, shape: DenoiserShape, rows: u32) -> Result<()> {
         let rows = u64::from(rows.max(1));
         Staged::zero(
@@ -285,18 +304,6 @@ impl DenoiseColumns {
             None => shape.sample.bytes().unwrap_or(1),
         };
         Staged::zero(&mut self.staged.audio, rows * audio)?;
-        let width = prefix_rows(layout);
-        let bytes = shape
-            .stack
-            .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", shape.stack)))?;
-        let text_bytes = rows * width * self.text_width * bytes;
-        Staged::zero(&mut self.staged.text, text_bytes)?;
-        // The conditioner folds these into `text`, so a warm capture must read defined features as
-        // well as defined rows: an uninitialised buffer would make the capture's output depend on
-        // whatever the allocator last held.
-        let source_bytes = rows * width * self.source_width * bytes;
-        Staged::zero(&mut self.staged.source, source_bytes)?;
         self.staged.step = vec![0u8; 8];
         Ok(())
     }
@@ -624,12 +631,16 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 warm: request,
             });
         }
-        let largest = buckets
+        let rows = buckets
             .iter()
-            .max_by_key(|plan| plan.bucket.rows)
+            .map(|plan| plan.bucket.rows)
+            .max()
             .ok_or_else(|| Error::Invalid("a denoiser runner derived no bucket".into()))?;
-        let layout = layout_of(largest.bucket)?;
-        let columns = DenoiseColumns::new(binding.device, shape, &layout, largest.bucket.rows)?;
+        let layouts = buckets
+            .iter()
+            .map(|plan| layout_of(plan.bucket))
+            .collect::<Result<Vec<_>>>()?;
+        let columns = DenoiseColumns::new(binding.device, shape, &layouts, rows)?;
         let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
         Ok(Self {
             id: binding.id,
@@ -663,10 +674,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         self
     }
 
-    /// The buckets this runner captures, largest first.
+    /// The buckets this runner captures, largest first: the longest timeline, and within it the
+    /// highest condition rung.
     fn capture_order(&self) -> Vec<Bucket> {
         let mut buckets: Vec<Bucket> = self.buckets.iter().map(|plan| plan.bucket).collect();
-        buckets.sort_by_key(|bucket| std::cmp::Reverse(bucket.rows));
+        buckets.sort_by_key(|bucket| std::cmp::Reverse(*bucket));
         buckets
     }
 
@@ -766,10 +778,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     fn key(bucket: Bucket) -> String {
         match bucket.extent {
             Extent::Latents(layout) => format!(
-                "denoise-{}-{}-{}-{}x{}x{}",
+                "denoise-{}-{}-{}-{}-{}x{}x{}",
                 layout.video.channels,
                 layout.video.frames,
-                layout.text_rows + layout.condition_rows,
+                layout.text_rows,
+                layout.condition_rows,
                 layout.video.height,
                 layout.video.width,
                 bucket.rows.max(1),
@@ -906,6 +919,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         if self.staged_step != Some(0) {
             return Ok(());
         }
+        self.zero_rows(bucket)?;
         let Some(products) = self.products.clone() else {
             return Ok(());
         };
@@ -922,6 +936,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // the shorter kind's copy land inside the wrong column's row (`conditioning_width`).
         let text_bytes = rows * text_width * element;
         let source_bytes = rows * source_width * element;
+        // What the conditioner reads of `source` is the text capacity: the rows past it are the
+        // conditions', which the encoders write into `text` and no launch reads here.
+        let folded_bytes = u64::from(layout.text_rows) * source_width * element;
         // **The encoder's rows go where the model consumes them next.** A conditioner that widens
         // reads `source` and writes `text` in place, so the product lands in `source` and `text`
         // belongs to the fold alone - copying it into `text` as well would be a second, mis-strided
@@ -938,10 +955,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         for row in &pending {
             let (request, index) = (row.request, row.index);
             let kind = Product::Text;
-            let (column, bytes) = if folded {
-                (&mut self.columns.source, source_bytes)
+            // `stride` is the row of the column and `bytes` what this copy fills of it.
+            let (column, stride, bytes) = if folded {
+                (&mut self.columns.source, source_bytes, folded_bytes)
             } else {
-                (&mut self.columns.text, text_bytes)
+                (&mut self.columns.text, text_bytes, text_bytes)
             };
             {
                 // **The copy is the store's, not this runner's.** A deployment can put the text
@@ -954,7 +972,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 };
                 let (copied, zeroed) = fills(request, kind, published.bytes, bytes)?;
                 let destination = TensorView::new(
-                    ops::DevicePtr::new(column.host.address() + u64::from(index) * bytes),
+                    ops::DevicePtr::new(column.host.address() + u64::from(index) * stride),
                     self.shape.stack,
                     Shape::new(&[copied / u64::from(element)]),
                 );
@@ -969,9 +987,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 // because that is the memory the captured graph reads: a column's device view is
                 // its pinned buffer's address (`columns.rs`), so these bytes are the graph's.
                 if zeroed > 0 {
-                    let start = usize::try_from(u64::from(index) * bytes + copied)
+                    let start = usize::try_from(u64::from(index) * stride + copied)
                         .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
-                    let end = usize::try_from(u64::from(index) * bytes + bytes)
+                    let end = usize::try_from(u64::from(index) * stride + bytes)
                         .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
                     // SAFETY: `start..end` is inside this column's row `index`, which the column
                     // was sized for, and no copy or launch writes it concurrently: the front copy
@@ -980,6 +998,34 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                         column.host.as_mut_slice()[start..end].fill(0);
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes the zero row of each pending request's prefix source.
+    ///
+    /// Every generated and padding row gathers it (`DensePacking::zero_row`), and it is the last row
+    /// of the layout's prefix, so it sits at another place in the column for each condition rung:
+    /// a request of a higher rung wrote a condition row where a lower rung reads its zeros. The
+    /// rest of a request's `text` is the refiner's and the encoders' to write, and no gather reads
+    /// a row they left.
+    fn zero_rows(&mut self, bucket: Bucket) -> Result<()> {
+        let layout = layout_of(bucket)?;
+        let (rows, _, text_width) = self.conditioning_row(&layout);
+        let element = u64::from(self.shape.stack.bytes().ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
+        })?);
+        let stride = rows * text_width * element;
+        let row = text_width * element;
+        for pending in &self.pending {
+            let start = usize::try_from(u64::from(pending.index) * stride + stride - row)
+                .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
+            let end = start + row as usize;
+            // SAFETY: the row lies inside this request's block of the column, and `upload_step`
+            // waited out the launches of the previous request, which are the column's only readers.
+            unsafe {
+                self.columns.text.host.as_mut_slice()[start..end].fill(0);
             }
         }
         Ok(())
@@ -1356,29 +1402,20 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let DenoiseColumns {
             video,
             audio,
-            text,
-            source,
             step,
             staged,
-            // The widths are the allocation's, read where it was made; this borrow moves bytes.
-            source_width: _,
-            text_width: _,
+            ..
         } = &mut self.columns;
         video.write(&staged.video)?;
         audio.write(&staged.audio)?;
-        text.write(&staged.text)?;
-        source.write(&staged.source)?;
         step.write(&staged.step)?;
         self.columns.video.upload(&stream)?;
         self.columns.audio.upload(&stream)?;
-        self.columns.text.upload(&stream)?;
-        self.columns.source.upload(&stream)?;
         self.columns.step.upload(&stream)?;
         Ok(())
     }
 
-    /// Copies the columns a **replay** writes from the host: the conditioning rows and the step's
-    /// index.
+    /// Copies the column a **replay** writes from the host: the step's index.
     ///
     /// **The trajectory is not one of them.** The captured graph advances the latents *in place* —
     /// that is the whole of a diffusion step — while the staged buffer holds a warm capture's zeros,
@@ -1388,26 +1425,14 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// (`first_step`), so the column never needs this path for its initial values.
     fn upload_step(&mut self) -> Result<()> {
         let stream = self.stream.clone();
-        let DenoiseColumns {
-            text,
-            source,
-            step,
-            staged,
-            ..
-        } = &mut self.columns;
         // The refined rows are the request's for its whole schedule: `first_step` folds them once,
-        // and every later step reads them where they are. Only a first step starts from zeros, and
-        // that write is the host's own, so the previous request's last launch is waited out first.
+        // and every later step reads them where they are. Only a first step writes the conditioning
+        // columns from the host (`seed`), so the previous request's last launch is waited out first.
         if self.staged_step == Some(0) {
             stream.synchronize()?;
-            text.write(&staged.text)?;
-            source.write(&staged.source)?;
         }
+        let DenoiseColumns { step, staged, .. } = &mut self.columns;
         step.write(&staged.step)?;
-        if self.staged_step == Some(0) {
-            self.columns.text.upload(&stream)?;
-            self.columns.source.upload(&stream)?;
-        }
         self.columns.step.upload(&stream)?;
         Ok(())
     }
@@ -2262,6 +2287,7 @@ mod product_tests {
             text_tokens: 1024,
             conditions: Vec::new(),
             vision_spans: Vec::new(),
+            condition_rows: None,
         };
         let conditioning = models::video::Conditioning {
             task: models::video::VideoTask::T2va,

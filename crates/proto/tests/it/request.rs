@@ -174,6 +174,7 @@ fn requests_come_back_from_their_messages_unchanged() {
                 seed: 3,
                 width: 64,
                 height: 32,
+                condition_rows: 7,
             },
             // A resumed request names its trajectory, the steps an engine
             // stored, the latent seed it continues with and where the pages

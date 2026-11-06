@@ -43,7 +43,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::{Canvas, VideoTask};
-use super::{ConditionMedia, ConditionVision, FrameClips, ImageFit, MediaLocator};
+use super::{ConditionMedia, ConditionPacking, ConditionVision, FrameClips, ImageFit, MediaLocator};
 use super::{ReferenceLimits, ServedCanvas, VideoCondition, VisionGrid};
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.
@@ -1147,6 +1147,29 @@ impl ConditionPlan {
         }
     }
 
+    /// Denoiser rows the condition takes in a layout of `packing`: its audio
+    /// rows in whole tiles, then a keyframe's or an image's rows in whole
+    /// tiles, or the tiles of a video's token grid. `canvas` is the generated
+    /// canvas, which a keyframe is fitted to.
+    pub fn packed_rows(&self, canvas: Canvas, packing: &ConditionPacking) -> u32 {
+        let tile = packing.tile_rows.max(1);
+        let visual = match &self.prepared {
+            Prepared::Keyframe(_) => rows_per_frame(canvas).div_ceil(tile),
+            Prepared::Image(size) => rows_per_frame(*size).div_ceil(tile),
+            Prepared::Video(clip) => [
+                clip.vae_clips.latent_frames(clip.vae_frames),
+                clip.canvas.height / CANVAS_MULTIPLE,
+                clip.canvas.width / CANVAS_MULTIPLE,
+            ]
+            .into_iter()
+            .zip(packing.video_tile)
+            .map(|(tokens, extent)| tokens.div_ceil(extent.max(1)))
+            .product(),
+            Prepared::Audio(_) => 0,
+        };
+        (self.audio_rows.div_ceil(tile) + visual).saturating_mul(tile)
+    }
+
     /// Describes the condition for the engine and the workers: its role, the
     /// published media at `source`, what the media reader decodes it into,
     /// what the conditioner reads of it, and the denoiser rows it encodes to,
@@ -1199,6 +1222,17 @@ pub struct RequestPlan {
 }
 
 impl RequestPlan {
+    /// Denoiser rows the request's conditions take in a layout of `packing`.
+    /// The request's layout holds them: what exceeds `packing.capacity` the
+    /// deployment does not serve, and within it they select the request's
+    /// graph.
+    pub fn condition_rows(&self, packing: &ConditionPacking) -> u32 {
+        self.conditions
+            .iter()
+            .map(|condition| condition.packed_rows(self.canvas, packing))
+            .fold(0, u32::saturating_add)
+    }
+
     /// The units each condition's reference image is encoded in when one
     /// latent encoding round covers `round_units` units, one entry per
     /// condition (other conditions' entries are unread).

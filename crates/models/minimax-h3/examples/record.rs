@@ -1064,6 +1064,7 @@ fn denoiser(request: &Request) -> Result<Vec<(String, String)>, String> {
         text_tokens: request.tokens,
         conditions: &[],
         vision_spans: &[],
+        condition_rows: None,
     };
     let (layout, packing) = rules.layout(&asked).map_err(|error| error.to_string())?;
 
@@ -1216,6 +1217,7 @@ fn conditioned(request: &Request) -> Result<Vec<(String, String)>, String> {
         text_tokens: request.tokens,
         conditions: &[],
         vision_spans: &[],
+        condition_rows: None,
     };
     let unit = network.attention.capacity_rows();
     let probe_rules = Layouts::new(

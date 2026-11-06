@@ -146,6 +146,7 @@ mod tests {
             text_tokens: 32,
             conditions: Vec::<ConditionShape>::new(),
             vision_spans: Vec::new(),
+            condition_rows: None,
         }
     }
 

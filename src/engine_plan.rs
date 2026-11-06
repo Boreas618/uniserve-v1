@@ -735,7 +735,12 @@ impl EpochPlan {
         // and a task the checkpoint does not serve gets no graph.
         let config = self.media_config()?;
         let tasks = self.media_tasks(&config)?;
-        let candidates = media_candidates(&tasks, &self.build.video, &capacities)?;
+        let denoiser = pipeline
+            .transformer()
+            .or(pipeline.transformer_ref())
+            .context("the checkpoint holds no transformer, so no denoising step could run")?;
+        let ladder = denoiser.rules().condition_ladder();
+        let candidates = media_candidates(&tasks, &self.build.video, &capacities, &ladder)?;
 
         // The buckets the deployment captures: an encode bucket per (rows, prompt capacity) and a
         // decode bucket per canvas. A denoiser derives its own from the candidates it walks, so the
@@ -771,10 +776,6 @@ impl EpochPlan {
             "the checkpoint holds no text encoder, so a media request's prompt could not be \
              encoded",
         )?;
-        let denoiser = pipeline
-            .transformer()
-            .or(pipeline.transformer_ref())
-            .context("the checkpoint holds no transformer, so no denoising step could run")?;
         // The encoder writes its hidden states in the deployment's effective type, which the daemon
         // resolved against the checkpoint before it wrote this build config (a `dtype` of `auto`
         // never reaches a main process as `auto`).
@@ -2104,6 +2105,7 @@ fn media_candidates(
     tasks: &[nn::VideoTask],
     video: &daemon::options::VideoOptions,
     capacities: &[u32],
+    ladder: &[u32],
 ) -> Result<Vec<executor::runners::denoiser::WarmRequest>> {
     use minimax_h3::config::{FPS, NAMED_CANVASES};
     let mut candidates = Vec::new();
@@ -2160,21 +2162,32 @@ fn media_candidates(
             // be a graph nothing fills.
             for task in tasks.iter().copied() {
                 let (first_frames, last_frames, references) = task_conditions(task);
+                // A layout's condition rows are real rows of every step, so a conditioned task
+                // captures one graph per rung of the ladder and a request rides the smallest that
+                // holds it. A task with no conditions holds none.
+                let rungs: Vec<Option<u32>> = if task == nn::VideoTask::TextToVideoAudio {
+                    vec![None]
+                } else {
+                    ladder.iter().copied().map(Some).collect()
+                };
                 for frames in timelines.iter().copied() {
                     for capacity in capacities {
-                        candidates.push(executor::runners::denoiser::WarmRequest {
-                            task,
-                            width: canvas.width,
-                            height: canvas.height,
-                            frames,
-                            fps: FPS,
-                            first_frames,
-                            last_frames,
-                            references,
-                            text_tokens: *capacity,
-                            conditions: Vec::new(),
-                            vision_spans: Vec::new(),
-                        });
+                        for rung in rungs.iter().copied() {
+                            candidates.push(executor::runners::denoiser::WarmRequest {
+                                task,
+                                width: canvas.width,
+                                height: canvas.height,
+                                frames,
+                                fps: FPS,
+                                first_frames,
+                                last_frames,
+                                references,
+                                text_tokens: *capacity,
+                                conditions: Vec::new(),
+                                vision_spans: Vec::new(),
+                                condition_rows: rung,
+                            });
+                        }
                     }
                 }
             }
@@ -2269,6 +2282,7 @@ fn denoiser_report(
         } else {
             ReferenceLimits::default()
         },
+        condition_packing: condition_packing(first),
     };
     report
         .validate()
@@ -2284,6 +2298,28 @@ fn denoiser_report(
         denoise_steps: steps,
         description: report.encode().context("encoding the denoiser's report")?,
     })
+}
+
+/// How `denoiser` packs a request's conditions and how many rows they may take: its tiles under
+/// sparse attention, and row for row under dense attention. A denoiser that places no condition
+/// encoder takes no condition at all.
+fn condition_packing(denoiser: &minimax_h3::denoiser::Denoiser) -> models::video::ConditionPacking {
+    let (tile_rows, shape) = match denoiser.config().attention {
+        minimax_h3::config::AttentionKind::Sparse { tile, .. } => (
+            tile,
+            minimax_h3::packing::tile_shape(tile).unwrap_or((1, 1, 1)),
+        ),
+        minimax_h3::config::AttentionKind::Dense => (1, (1, 1, 1)),
+    };
+    models::video::ConditionPacking {
+        capacity: if denoiser.places_encoders() {
+            denoiser.rules().arrangement().condition_rows
+        } else {
+            0
+        },
+        tile_rows,
+        video_tile: [shape.0, shape.1, shape.2],
+    }
 }
 
 /// The checkpoint's timeline rule. The fewest frames are one whole clip and the tail, and the tail's

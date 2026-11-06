@@ -292,7 +292,6 @@ mod tests {
             .to_owned(),
             prompt_token_ids: vec![1; 40],
             conditioning: b"{}".to_vec(),
-            conditions,
             priority: 0,
             sampling: DiffusionSamplingParams {
                 num_frames: 124,
@@ -300,7 +299,12 @@ mod tests {
                 seed: 42,
                 width: 1344,
                 height: 768,
+                condition_rows: conditions
+                    .iter()
+                    .map(|condition| condition.video_rows() as u32 + condition.audio_rows)
+                    .sum(),
             },
+            conditions,
             trajectory: Default::default(),
             encoder_inputs: None,
         }
