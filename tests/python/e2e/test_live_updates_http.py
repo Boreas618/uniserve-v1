@@ -1616,10 +1616,20 @@ def _restart_while_streaming(
     assert last["result"]["change"] == "epoch", last
     committed = _admin(both_url, "config/commit")
     assert committed.status_code == 200, committed.text
-    status = httpx.get(f"{both_url}/admin/config", timeout=10).json()
-    config = tomllib.loads(status["config"])
-    assert config["server_config"]["port"] == port, config
-    assert config["cuda_graph_config"]["decode_batch_sizes"] == [1, 2, 4, 8, 16]
+
+    def served_config() -> dict:
+        status = httpx.get(f"{both_url}/admin/config", timeout=10).json()
+        return tomllib.loads(status["config"])
+
+    # A commit may be asked while the target is still being promoted, and it is
+    # applied when the trial starts: the configuration moves once the target serves.
+    _wait_until(
+        lambda: served_config()["cuda_graph_config"]["decode_batch_sizes"]
+        == [1, 2, 4, 8, 16],
+        300,
+        "the switch's target never served its configuration",
+    )
+    assert served_config()["server_config"]["port"] == port
     reply = _chat(both_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     _wait_until(
