@@ -44,7 +44,7 @@ A `bf16` run under Triton's interpreter truncates its reference the way the inte
 truncates narrow stores: the value's own mantissa is truncated with no narrower type in
 between, because rounding to `f32` first can carry a value across a `bf16` boundary.
 
-**Two of the six are device-only, for two different tool gaps, and the script says so instead
+**Two of the eight are device-only, for two different tool gaps, and the script says so instead
 of reporting a pass it did not observe.**
 
 - `logits_shape` rounds with `libdevice.div_rn`, `mul_rn` and `sub_rn`. The interpreter does
@@ -55,15 +55,17 @@ of reporting a pass it did not observe.**
   Python bool and then hands `numpy.bool_ | ndarray` to a bitwise ufunc, which refuses:
   reproduced with a five-line kernel that does nothing else, so the gap is the interpreter's
   and not this operator's.
-- `top_k` maps the row onto order-preserving unsigned keys and complements them with `~` on a
-  `uint32`, which the interpreter turns into the Python integer `-1` and refuses
-  (`OverflowError('Python integer -1 out of bounds for uint32')`). A five-line kernel that
-  loads, bitcasts to `uint32` and complements reproduces it. `^ 0xFFFFFFFF` would not, so a
-  kernel written that way would run — the gap is in the tool, and whether the package should
-  spell it that way is its author's call, not the check's.
+
+Each kernel is launched through its real interface, which the operators do not share:
+`filter_candidates` and `inverse_cdf` take the candidate count as a launch value and walk their
+row in tiles of `BLOCK`; `argmax` walks a compiled width in tiles of `BLOCK`; `top_k` takes both
+counts as launch values, a scratch for its ordering passes, and a `TILE`. `top_k` writes FP32
+values whatever the row's element type, and `inverse_cdf` reads candidates in ascending id order,
+which is why a row is sorted before it is drawn from.
 """
 
 import argparse
+import os
 import pathlib
 import sys
 
@@ -103,6 +105,11 @@ TORCH_TYPES = {
 }
 
 #: The operators this script runs.
+#: The bins of one ordering pass, mirroring `ops::sampler::TOP_K_BINS`: a nibble of the key.
+TOP_K_BINS = 16
+#: The lanes one pass reads, as the descriptor names it (`ops::sampler::TopKDescriptor::tile`).
+TOP_K_TILE = 2048
+
 OPERATORS = (
     "logits_gather",
     "vocab_unpad",
@@ -150,7 +157,10 @@ def compare_exact(name, got, expected):
 
 def compare_relative(name, got, expected, relative, floor, deciding_bound):
     """Count the elements outside each bound and give the line that reports them."""
-    difference = (got - expected).abs()
+    # Equal values differ by nothing, and a masked token's `-inf` minus itself would say NaN.
+    difference = torch.where(
+        got == expected, torch.zeros_like(got), (got - expected).abs()
+    )
     declared_outside = (~(difference <= relative * expected.abs())).sum().item()
     scaled_outside = (
         (~(difference <= relative * expected.abs() + floor)).sum().item()
@@ -190,9 +200,16 @@ def run_logits_gather(case):
         rows = torch.arange(min(tokens, 4), dtype=torch.int32)
     out = torch.full((rows.numel(), columns), float("nan"), dtype=dtype)
 
-    kernels._logits_gather_kernel[
-        (math_ceil(rows.numel() * columns, case["block"]),)
-    ](hidden, rows, out, rows.numel(), columns, BLOCK=case["block"])
+    launch(
+        kernels._logits_gather_kernel,
+        (math_ceil(rows.numel() * columns, case["block"]),),
+        hidden,
+        rows,
+        out,
+        rows.numel(),
+        columns,
+        BLOCK=case["block"],
+    )
 
     expected = hidden.cpu()[rows.long()]
     failures, line = compare_exact("out", out.cpu(), expected)
@@ -218,7 +235,9 @@ def run_vocab_unpad(case):
         gathered[:, vocabulary:] = -7.0
     out = torch.full((rows, vocabulary), float("nan"), dtype=dtype)
 
-    kernels._vocab_unpad_kernel[(math_ceil(rows * vocabulary, case["block"]),)](
+    launch(
+        kernels._vocab_unpad_kernel,
+        (math_ceil(rows * vocabulary, case["block"]),),
         gathered,
         out,
         rows,
@@ -269,7 +288,9 @@ def run_logits_shape(case):
             extras[:, 1] = -1
     out = torch.full((rows, vocabulary), float("nan"), dtype=torch.float32)
 
-    kernels._logits_shape_kernel[(rows, math_ceil(vocabulary, block))](
+    launch(
+        kernels._logits_shape_kernel,
+        (rows, math_ceil(vocabulary, block)),
         logits,
         counts,
         slots,
@@ -354,8 +375,16 @@ def run_filter_candidates(case):
     valid = torch.full((rows,), -1, dtype=torch.int32)
     filtered = values.clone()
 
-    kernels._filter_candidates_kernel[(rows,)](
-        filtered, ids, parameters, valid, rows, WIDTH=width
+    launch(
+        kernels._filter_candidates_kernel,
+        (rows,),
+        filtered,
+        ids,
+        parameters,
+        valid,
+        rows,
+        width,
+        BLOCK=case["tile"],
     )
 
     exact = values.double()
@@ -390,7 +419,7 @@ def run_filter_candidates(case):
     )
     print(
         f"{'exact' if value_failures + flag_failures == 0 else 'FAIL'}: filter_candidates, "
-        f"{case['label']} — {rows} x {width}, top_k {case['top_k']:g}, top_p "
+        f"{case['label']} — {rows} x {width} in tiles of {case['tile']}, top_k {case['top_k']:g}, top_p "
         f"{case['top_p']:g}, min_p {case['min_p']:g}"
     )
     print(value_line)
@@ -441,18 +470,32 @@ def run_inverse_cdf(case):
     draws = torch.tensor(case["draws"][:rows], dtype=torch.float32)
     tokens = torch.full((rows,), -1, dtype=torch.int32)
 
-    kernels._inverse_cdf_kernel[(rows,)](
-        probabilities, ids, draws, tokens, rows, WIDTH=width
+    # The operator's contract: the candidates arrive in ascending id order. Sort the row here, so
+    # the buffer the kernel reads is the one its caller (`nn::Sampler`, after `candidate_order`)
+    # builds rather than a row it would have to sort itself.
+    order = torch.argsort(ids.long(), dim=1, stable=True)
+    ids = torch.gather(ids.long(), 1, order).to(torch.int32)
+    probabilities = torch.gather(probabilities, 1, order)
+
+    tile = case["tile"]
+    launch(
+        kernels._inverse_cdf_kernel,
+        (rows,),
+        probabilities,
+        ids,
+        draws,
+        tokens,
+        rows,
+        width,
+        BLOCK=tile,
     )
 
     failures = 0
     wanted = []
     for row in range(rows):
-        row_probabilities = probabilities[row].double()
         row_ids = ids[row].long()
-        order = torch.argsort(row_ids)
-        ordered_ids = row_ids[order]
-        ordered = row_probabilities[order]
+        ordered_ids = row_ids
+        ordered = probabilities[row].double()
         total = ordered.sum()
         cumulative = torch.cumsum(ordered, dim=0)
         # Strict, as the operator's rule reads: a zero-mass candidate is never drawn, and
@@ -471,7 +514,7 @@ def run_inverse_cdf(case):
     failures, line = compare_exact("tokens", tokens.cpu(), wanted)
     print(
         f"{'exact' if failures == 0 else 'FAIL'}: inverse_cdf, {case['label']} — "
-        f"{rows} x {width}, draws {case['draws'][:rows]}"
+        f"{rows} x {width} in tiles of {case['tile']}, draws {case['draws'][:rows]}"
     )
     print(line)
     return failures
@@ -494,7 +537,15 @@ def run_argmax(case):
     # The program walks one row in tiles of BLOCK, so a row wider than the tile exercises the
     # walk rather than a single load: the width this operator sees in service is 151936.
     block = 1024 if width > 1024 else width
-    kernels._argmax_kernel[(rows,)](values, out, rows, WIDTH=width, BLOCK=block)
+    launch(
+        kernels._argmax_kernel,
+        (rows,),
+        values,
+        out,
+        rows,
+        WIDTH=width,
+        BLOCK=block,
+    )
 
     exact = values.cpu()
     wanted = (
@@ -539,8 +590,14 @@ def run_logprob_gather(case):
             tokens[1] = columns - 1
     out = torch.full((rows,), float("nan"), dtype=torch.float32)
 
-    kernels._logprob_gather_kernel[(rows,)](
-        logprobabilities, tokens, out, rows, columns
+    launch(
+        kernels._logprob_gather_kernel,
+        (rows,),
+        logprobabilities,
+        tokens,
+        out,
+        rows,
+        columns,
     )
 
     expected = logprobabilities.cpu()[torch.arange(rows), tokens.long()]
@@ -572,11 +629,22 @@ def run_top_k(case):
         # A `-inf` tail, as `filter_candidates` leaves it: a dropped candidate is never kept
         # while a real one still is.
         logits[:, vocabulary // 2 :] = float("-inf")
-    values = torch.full((rows, width), float("nan"), dtype=dtype)
+    values = torch.full((rows, width), float("nan"), dtype=torch.float32)
     ids = torch.full((rows, width), -1, dtype=torch.int32)
+    # The ordering's scratch: two key planes, two id planes and the two nibble tables.
+    workspace = torch.zeros(rows, 4 * width + 2 * TOP_K_BINS, dtype=torch.int32)
 
-    kernels._top_k_kernel[(rows,)](
-        logits, values, ids, rows, vocabulary, width, WIDTH=width, STEP=2048
+    launch(
+        kernels._top_k_kernel,
+        (rows,),
+        logits,
+        values,
+        ids,
+        workspace,
+        rows,
+        vocabulary,
+        width,
+        TILE=case["tile"],
     )
 
     exact = logits.cpu().double()
@@ -598,6 +666,21 @@ def run_top_k(case):
             )
             id_failures = int((ids[row].cpu() != wanted_ids).sum())
         failures += value_failures + id_failures
+        # The destinations were filled with the operator's own sentinels, which no candidate can be:
+        # `nan` for a value and `-1` for an id. A row's width slots are the operator's whole output -
+        # it keeps the `width` largest and writes every one of them - so a sentinel that survives
+        # anywhere in the row is a slot nothing wrote, and it is a defect whether or not the narrower
+        # comparison above would have caught the value. This is the one reading the comparison cannot
+        # give: a hole and a candidate are both "not the reference value" but only one of them means
+        # the plane the sampler orders was left partly unwritten.
+        holes = int((ids[row] < 0).sum()) + int(torch.isnan(values[row]).sum())
+        if holes:
+            columns = (ids[row] < 0).nonzero().flatten().tolist()[:6]
+            print(
+                f"  row {row}: {holes} slots still hold the pre-fill "
+                f"(ids below 0 or values nan); first id columns {columns}"
+            )
+            failures += holes
         if value_failures or id_failures:
             print(
                 f"  row {row}: {value_failures} values and {id_failures} ids differ; "
@@ -621,6 +704,26 @@ RUNNERS = {
     "logprob_gather": run_logprob_gather,
     "top_k": run_top_k,
 }
+
+
+def launch(kernel, grid, *arguments, **constants):
+    """Run `kernel` over host tensors: in place on the interpreter, through the device otherwise.
+
+    The cases build their tensors on the host and read their results there, so a run on a device
+    copies each tensor over, launches, and copies each one back: Triton refuses a host pointer.
+    """
+    if os.environ.get("TRITON_INTERPRET") == "1":
+        kernel[grid](*arguments, **constants)
+        return
+    moved = [
+        argument.cuda() if isinstance(argument, torch.Tensor) else argument
+        for argument in arguments
+    ]
+    kernel[grid](*moved, **constants)
+    torch.cuda.synchronize()
+    for argument, copy in zip(arguments, moved):
+        if isinstance(argument, torch.Tensor):
+            argument.copy_(copy)
 
 
 def math_ceil(total, block):
@@ -680,6 +783,7 @@ def cases(operator, flags):
                 "label": "a top-k width of four, a nucleus of 0.9 and a min-p of 0.1",
                 "rows": 3,
                 "width": flags.width,
+                "tile": min(flags.width, 8192),
                 "top_k": 4.0,
                 "top_p": 0.9,
                 "min_p": 0.1,
@@ -688,9 +792,22 @@ def cases(operator, flags):
                 "seed": 1,
             },
             {
+                "label": "a row far wider than one tile, walked in five of them",
+                "rows": 2,
+                "width": 20480,
+                "tile": 4096,
+                "top_k": 0.0,
+                "top_p": 0.9,
+                "min_p": 0.05,
+                "tail_dropped": False,
+                "tie": False,
+                "seed": 4,
+            },
+            {
                 "label": "a dropped tail, which the thresholds must leave dropped",
                 "rows": 2,
                 "width": flags.width,
+                "tile": min(flags.width, 8192),
                 "top_k": 0.0,
                 "top_p": 0.95,
                 "min_p": 0.0,
@@ -702,6 +819,7 @@ def cases(operator, flags):
                 "label": "no width and no min-p, so only the nucleus removes anything",
                 "rows": 2,
                 "width": flags.width,
+                "tile": min(flags.width, 8192),
                 "top_k": 0.0,
                 "top_p": 0.5,
                 "min_p": -1.0,
@@ -713,6 +831,17 @@ def cases(operator, flags):
     if operator == "inverse_cdf":
         return [
             {
+                "label": "a row far wider than one tile, walked in ten of them",
+                "rows": 2,
+                "width": 20480,
+                "tile": 2048,
+                "draws": (0.0, 0.5),
+                "zero_mass": False,
+                "one_survivor": False,
+                "last_holds_mass": False,
+                "seed": 5,
+            },
+            {
                 "label": "the fixture's width, four draws across the mass",
                 "rows": 4,
                 "width": flags.width,
@@ -720,6 +849,7 @@ def cases(operator, flags):
                 "zero_mass": False,
                 "one_survivor": False,
                 "last_holds_mass": False,
+                "tile": min(flags.width, 8192),
                 "seed": 1,
             },
             {
@@ -730,6 +860,7 @@ def cases(operator, flags):
                 "zero_mass": True,
                 "one_survivor": False,
                 "last_holds_mass": False,
+                "tile": min(flags.width, 8192),
                 "seed": 2,
             },
             {
@@ -740,6 +871,7 @@ def cases(operator, flags):
                 "zero_mass": False,
                 "one_survivor": False,
                 "last_holds_mass": True,
+                "tile": min(flags.width, 8192),
                 "seed": 4,
             },
             {
@@ -750,6 +882,7 @@ def cases(operator, flags):
                 "zero_mass": False,
                 "one_survivor": True,
                 "last_holds_mass": False,
+                "tile": min(flags.width, 8192),
                 "seed": 3,
             },
         ]
@@ -764,6 +897,7 @@ def cases(operator, flags):
                 "ties": False,
                 "masked_tail": False,
                 "seed": 1,
+                "tile": TOP_K_TILE,
             },
             {
                 "label": "three tied logits, which must come out in ascending id order",
@@ -774,6 +908,34 @@ def cases(operator, flags):
                 "ties": True,
                 "masked_tail": False,
                 "seed": 2,
+                "tile": TOP_K_TILE,
+            },
+            {
+                # The same row at the deployment's default bound: the quota the equal keys hold is
+                # far smaller than the row, which is the case a rank computed per tile corrupts from
+                # the low slots up, and the case one module has to serve once the key names no width.
+                "label": "the deployment's default bound out of the same vocabulary",
+                "dtype": flags.dtype,
+                "rows": flags.rows,
+                "vocabulary": flags.vocabulary,
+                "width": 128,
+                "ties": False,
+                "masked_tail": False,
+                "seed": 4,
+                "tile": TOP_K_TILE,
+            },
+            {
+                # The boundary the field's removal makes representable: a row that keeps everything
+                # it has, so the quota is the row's width and every slot is written.
+                "label": "a row keeping its whole width",
+                "dtype": flags.dtype,
+                "rows": 2,
+                "vocabulary": 128,
+                "width": 128,
+                "ties": False,
+                "masked_tail": False,
+                "seed": 5,
+                "tile": TOP_K_TILE,
             },
             {
                 "label": "a masked -inf tail, which is never kept over a real candidate",
@@ -784,6 +946,7 @@ def cases(operator, flags):
                 "ties": False,
                 "masked_tail": True,
                 "seed": 3,
+                "tile": TOP_K_TILE,
             },
         ]
     if operator == "logprob_gather":
@@ -877,18 +1040,18 @@ def descriptor_key(operator, flags):
             f"_padded_{flags.padded}_block_{flags.block}_pdl_{pdl}"
         )
     if operator == "filter_candidates":
-        return f"width_{flags.width}_ids_i32_pdl_{pdl}"
+        return f"width_{flags.width}_tile_{min(flags.width, 8192)}_ids_i32_pdl_{pdl}"
     if operator == "inverse_cdf":
-        return f"width_{flags.width}_ids_i32_tokens_i32_pdl_{pdl}"
+        return (
+            f"width_{flags.width}_tile_{min(flags.width, 8192)}"
+            f"_ids_i32_tokens_i32_pdl_{pdl}"
+        )
     if operator == "argmax":
         return f"dtype_{flags.dtype}_width_{flags.width}_ids_i32_pdl_{pdl}"
     if operator == "logprob_gather":
         return f"columns_{flags.columns}_ids_i32_pdl_{pdl}"
     if operator == "top_k":
-        return (
-            f"dtype_{flags.dtype}_vocabulary_{flags.vocabulary}"
-            f"_width_{flags.top_width}_ids_i32_pdl_{pdl}"
-        )
+        return f"dtype_{flags.dtype}_tile_{TOP_K_TILE}_ids_i32_pdl_{pdl}"
     return (
         f"dtype_{flags.dtype}_vocabulary_{flags.vocabulary}_block_{flags.block}"
         f"_extras_{flags.extras}_divide_{flags.divide}_pdl_{pdl}"
@@ -942,19 +1105,11 @@ def main() -> int:
         )
         arguments.interpreter = True
     if arguments.interpreter:
-        import os
-
         os.environ["TRITON_INTERPRET"] = "1"
 
     if arguments.interpreter and arguments.op == "logits_shape":
         print(
             "skipped: needs a device — its kernel rounds with libdevice's div_rn, mul_rn and sub_rn, which the interpreter either cannot load (the CUDA module) or returns None from (the portable one)",
-            file=sys.stderr,
-        )
-        return 0
-    if arguments.interpreter and arguments.op == "top_k":
-        print(
-            "skipped: needs a device — its kernel complements a uint32 with `~`, which the interpreter turns into the Python integer -1 and refuses",
             file=sys.stderr,
         )
         return 0
