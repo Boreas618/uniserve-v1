@@ -830,7 +830,7 @@ fn expert_block(
                 &["up", "gate"],
                 vocabulary,
                 Nvfp4Names::vllm(),
-                nn::weights::ValueLayout::Shuffled {
+                nn::weights::ValueLayout::InterleavedShuffled {
                     epilogue_tile_m: 128,
                 },
                 WEIGHT_SCALE_LAYOUT,
