@@ -30,9 +30,8 @@ pub use platform::DevicePtr as PlatformDevicePtr;
 pub use platform::Error as PlatformError;
 pub use platform::nccl::{Communicator, ReduceOp};
 pub use platform::{
-    Allocator, Buffer, CaptureStatus, Cluster, Device, DeviceRange, Function, FunctionAttribute,
-    LaunchConfig,
-    Library, NativeLibrary, PoolKind, Stream,
+    Allocator, Buffer, CaptureStatus, Cluster, Device, DeviceRange, Event, EventFlags, Function,
+    FunctionAttribute, LaunchConfig, Library, NativeLibrary, PoolKind, Stream,
 };
 
 pub use crate::tensor::DevicePtr;

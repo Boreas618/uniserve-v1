@@ -51,6 +51,17 @@ impl UlyssesExchange {
         self.group(f)?.all_to_all(send, recv, f.stream()?)
     }
 
+    /// Starts [`Self::exchange`] beside the forward's stream, which goes on at once.
+    pub fn start(&self, f: &Forward, send: TensorView, recv: TensorView) -> Result<crate::Transfer> {
+        self.check_views(send, recv)?;
+        self.group(f)?.start_all_to_all(send, recv, f.stream()?)
+    }
+
+    /// Orders the forward's stream after `transfer`: what it received is readable from here on.
+    pub fn finish(&self, f: &Forward, transfer: crate::Transfer) -> Result<()> {
+        self.group(f)?.finish(transfer, f.stream()?)
+    }
+
     /// Gathers every member's `rows` into `out`, in member order: the whole sequence's rows.
     pub fn gather(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
         if out.numel() != rows.numel() * self.ranks {

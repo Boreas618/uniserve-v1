@@ -202,6 +202,46 @@ impl Sparse {
         scratch: &Scratch,
         out: TensorView,
     ) -> Result<()> {
+        self.attend(f, normalized, factors, sizes, segments, keep, scratch)?;
+        // The compression is folded into the fine rows, in place, and one binding names both the
+        // buffer the fold writes and the buffer the projection reads: `add_gated` modifies its first
+        // argument only, so folding into any other buffer would drop this branch without a shape
+        // ever saying so (`vsa/segments.py:461-478`).
+        let rows = scratch.query.shape.dim(0);
+        let shape = Shape::new(&[rows, u64::from(self.local_heads), u64::from(self.head_dim)]);
+        self.tiles.add_gated(
+            f,
+            scratch.fine.reshape(shape),
+            scratch.compressed,
+            scratch.gate.reshape(shape),
+        )?;
+        Ok(self.output.forward(f, scratch.fine, out)?)
+    }
+
+    /// Whether this layer's rows return from the other members' heads: the layer then runs as
+    /// [`Self::attend`], [`Self::deliver`] and [`Self::receive`] rather than [`Self::forward`].
+    pub fn exchanges(&self) -> bool {
+        self.exchange.is_some()
+    }
+
+    /// Attends this rank's heads of every row, up to the fine rows and the compression.
+    ///
+    /// In the exchange mode the four projections alternate with their transfers: each member's
+    /// heads of a projection travel while the next one multiplies, on the group's lane, so the two
+    /// staging buffers take turns, and a buffer is written again only after the transfer that read
+    /// it. The gate is read last, so its transfer is answered still running, and it travels beside
+    /// the attention.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend(
+        &self,
+        f: &Forward,
+        normalized: TensorView,
+        factors: Factors,
+        sizes: TensorView,
+        segments: TensorView,
+        keep: TensorView,
+        scratch: &Scratch,
+    ) -> Result<Option<nn::Transfer>> {
         // The sequence is whole here whatever this rank owns of it: the buffers below are the rows of
         // every member, in member order, for this rank's heads.
         let rows = scratch.query.shape.dim(0);
@@ -212,25 +252,41 @@ impl Sparse {
             )));
         }
         let exchange = self.exchange.as_ref();
-        let source = projected_rows(f, exchange, self.projection, normalized, scratch.gathered_rows)?;
-        self.query
-            .forward(f, exchange, source, scratch.staging, scratch.query)?;
-        self.key
-            .forward(f, exchange, source, scratch.staging, scratch.key)?;
-        self.value
-            .forward(f, exchange, source, scratch.staging, scratch.value)?;
-        self.gate
-            .forward(f, exchange, source, scratch.staging, scratch.gate)?;
+        let gate = match (exchange, self.projection) {
+            (Some(exchange), Projection::Exchange) => {
+                let (even, odd) = (scratch.staging, scratch.returned);
+                let query = self.query.start(f, exchange, normalized, even, scratch.query)?;
+                let key = self.key.start(f, exchange, normalized, odd, scratch.key)?;
+                exchange.finish(f, query)?;
+                let value = self.value.start(f, exchange, normalized, even, scratch.value)?;
+                exchange.finish(f, key)?;
+                let gate = self.gate.start(f, exchange, normalized, odd, scratch.gate)?;
+                exchange.finish(f, value)?;
+                Some(gate)
+            }
+            _ => {
+                let source =
+                    projected_rows(f, exchange, self.projection, normalized, scratch.gathered_rows)?;
+                self.query
+                    .forward(f, exchange, source, scratch.staging, scratch.query)?;
+                self.key
+                    .forward(f, exchange, source, scratch.staging, scratch.key)?;
+                self.value
+                    .forward(f, exchange, source, scratch.staging, scratch.value)?;
+                self.gate
+                    .forward(f, exchange, source, scratch.staging, scratch.gate)?;
+                None
+            }
+        };
 
         // The rows are `[tiles * tile_rows, heads, width]` for the preparation; the pooled views are
         // `[tiles, heads, width]` FP32 and stay tile-major, which is the order the reference's
         // permutation reads them in.
         let shape = Shape::new(&[rows, u64::from(self.local_heads), u64::from(self.head_dim)]);
-        let (query, key, value, gate) = (
+        let (query, key, value) = (
             scratch.query.reshape(shape),
             scratch.key.reshape(shape),
             scratch.value.reshape(shape),
-            scratch.gate.reshape(shape),
         );
         self.tiles.prepare(
             f,
@@ -287,22 +343,113 @@ impl Sparse {
             sizes,
             scratch.compressed,
         )?;
-        // The compression is folded into the fine rows, in place, and one binding names both the
-        // buffer the fold writes and the buffer the projection reads: `add_gated` modifies its first
-        // argument only, so folding into any other buffer would drop this branch without a shape
-        // ever saying so (`vsa/segments.py:461-478`).
-        self.tiles.add_gated(f, fine, scratch.compressed, gate)?;
-        // Each member's rows of the gated sum are a contiguous block of `fine`, so the buffer is
-        // already the exchange's send buffer and no composition into a payload is needed.
-        let attended = match exchange {
-            None => scratch.fine,
-            Some(exchange) => {
-                HeadsToRows::forward(f, exchange, scratch.fine, scratch.staging, scratch.merged)?;
-                scratch.merged
-            }
-        };
-        Ok(self.output.forward(f, attended, out)?)
+        Ok(gate)
     }
+
+    /// Composes this rank's attended heads and starts returning them to their rows' owners.
+    ///
+    /// Every interval of an owner's `own` rows is composed into its payload and started here, as
+    /// the reference's `token_chunks` does: the lane then carries them one after another, and
+    /// [`Self::receive`] takes up an interval while the later ones travel. `gate` is the transfer
+    /// [`Self::attend`] left running. An interval is whole row blocks of the composition, and one
+    /// member's rows are whole rows of a tile's share.
+    pub fn deliver(
+        &self,
+        f: &Forward,
+        gate: Option<nn::Transfer>,
+        scratch: &Scratch,
+        own: u64,
+    ) -> Result<Vec<Returning>> {
+        let exchange = self
+            .exchange
+            .as_ref()
+            .ok_or_else(|| Error::config("a layer of one rank returns no rows".to_owned()))?;
+        if let Some(gate) = gate {
+            exchange.finish(f, gate)?;
+        }
+        let members = exchange.ranks();
+        let heads = u64::from(self.local_heads);
+        let width = u64::from(self.head_dim);
+        let shape = Shape::new(&[members * own, heads, width]);
+        let (fine, gate) = (scratch.fine.reshape(shape), scratch.gate.reshape(shape));
+        let slots: Vec<u32> = (0..members as u32).collect();
+        let unit = (u64::from(self.tile_rows) / members).max(1);
+        let span = own.div_ceil(RETURN_INTERVALS).next_multiple_of(unit);
+        let mut returning = Vec::new();
+        let mut first = 0;
+        while first < own {
+            let count = span.min(own - first);
+            let block = Shape::new(&[members, count, heads, width]);
+            let at = first * members * heads * width;
+            let payload = scratch
+                .staging
+                .at(scratch.staging.offset_elements(at))
+                .reshape(block);
+            let landed = scratch
+                .returned
+                .at(scratch.returned.offset_elements(at))
+                .reshape(block);
+            self.tiles.compose(
+                f,
+                payload,
+                fine,
+                scratch.compressed,
+                gate,
+                own,
+                first,
+                count,
+                &slots,
+            )?;
+            returning.push(Returning {
+                first,
+                count,
+                landed,
+                transfer: exchange.start(f, payload, landed)?,
+            });
+            first += count;
+        }
+        Ok(returning)
+    }
+
+    /// Takes up one returning interval and projects it into `out`, its `[count, hidden]` rows.
+    pub fn receive(
+        &self,
+        f: &Forward,
+        interval: Returning,
+        scratch: &Scratch,
+        out: TensorView,
+    ) -> Result<()> {
+        let exchange = self
+            .exchange
+            .as_ref()
+            .ok_or_else(|| Error::config("a layer of one rank returns no rows".to_owned()))?;
+        exchange.finish(f, interval.transfer)?;
+        let every = u64::from(self.heads) * u64::from(self.head_dim);
+        let merged = scratch
+            .merged
+            .at(scratch.merged.offset_elements(interval.first * every))
+            .reshape(Shape::new(&[interval.count, every]));
+        HeadsToRows::merge(f, exchange.ranks(), interval.landed, merged)?;
+        Ok(self.output.forward(f, merged, out)?)
+    }
+}
+
+/// How many intervals an owner's rows return in.
+///
+/// The first interval's transfer is the part of the return nothing hides, and an interval's output
+/// projection and feed-forward take longer per row than its transfer.
+const RETURN_INTERVALS: u64 = 3;
+
+/// One interval of this rank's rows on its way back from the members that attended it.
+pub struct Returning {
+    /// The interval's first row, of this rank's rows.
+    pub first: u64,
+    /// The interval's rows.
+    pub count: u64,
+    /// Where the members' heads of those rows land, `[members, count, heads, width]`.
+    landed: TensorView,
+    /// The transfer that fills `landed`.
+    transfer: nn::Transfer,
 }
 
 /// The per-request device views a sparse stack's layers read.
@@ -337,6 +484,9 @@ pub struct Scratch {
     pub compressed: TensorView,
     /// The exchange's staging buffer, a member's block after another, for this rank's rows.
     pub staging: TensorView,
+    /// The staging buffer's twin: a projection's block while the one before it travels, and the
+    /// landing of the attended rows on their way back.
+    pub returned: TensorView,
     /// The attended rows of every head, as the output projection reads them.
     pub merged: TensorView,
     /// The whole sequence's normalized rows, in the gather mode.
@@ -362,12 +512,13 @@ impl Scratch {
         let arena = f.arena();
         // A layer that does not communicate reserves nothing for it: on one rank these views are
         // buffers the layer already holds, and the branches that read them do not run.
-        let (staging, merged) = match layer.exchange {
+        let (staging, returned, merged) = match layer.exchange {
             Some(_) => (
                 arena.tensor(dtype, Shape::new(&[own, every]))?,
                 arena.tensor(dtype, Shape::new(&[own, every]))?,
+                arena.tensor(dtype, Shape::new(&[own, every]))?,
             ),
-            None => (normalized, normalized),
+            None => (normalized, normalized, normalized),
         };
         let gathered_rows = match (&layer.exchange, layer.projection) {
             (Some(_), Projection::Gather) => {
@@ -377,6 +528,7 @@ impl Scratch {
         };
         Ok(Self {
             staging,
+            returned,
             merged,
             gathered_rows,
             query: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
