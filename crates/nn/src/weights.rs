@@ -68,21 +68,6 @@ pub struct Nvfp4Names {
     pub input_scale: &'static str,
 }
 
-/// The largest activation encoder factor a calibrated projection may state: `2^10 / 6`.
-///
-/// `nvfp4_quantize` normalizes a row by `token_scale = amax(row) · factor` and stores each block's
-/// scale as `e4m3(amax_b / (6 · token_scale))` (`crates/ops/kernels/nvfp4_quantize/triton/src/`
-/// `nvfp4_quantize.py`, `:166` and `:187`). The block whose `amax_b` is the row's own `amax`
-/// therefore stores `1 / (6 · factor)`. E4M3's smallest positive value is `2^-9` and the store
-/// rounds to nearest, so a scale below `2^-10` becomes zero — and the kernel then multiplies that
-/// block by zero (`:189`, `:194`): **every block of every row encodes as zeros, whatever the
-/// input.** `1 / (6 · factor) ≥ 2^-10` is `factor ≤ 2^10 / 6`, which is this bound.
-///
-/// It is a fact about the operand and not about a run: a projection whose factor is above it cannot
-/// encode one activation, so the loader refuses it by tensor name rather than publishing a weight
-/// that answers zeros.
-pub const MAXIMUM_ENCODER_FACTOR: f32 = 1024.0 / 6.0;
-
 impl Nvfp4Names {
     /// The vLLM/ModelOpt spelling: `weight`, `weight_scale`, `weight_scale_2`, `input_scale`.
     ///
@@ -1531,32 +1516,14 @@ impl<'a> WeightLoader<'a> {
         Ok(1.0 / self.tensor_scale(request)?)
     }
 
-    /// The activation encoder's factor for one calibrated projection, refused when it cannot encode.
+    /// The activation encoder's factor for one calibrated projection.
     ///
-    /// `nvfp4_quantize` normalizes a row by `token_scale = amax(row) · factor` and stores each
-    /// block's scale as `e4m3(amax_b / (6 · token_scale))`
-    /// (`crates/ops/kernels/nvfp4_quantize/triton/src/nvfp4_quantize.py`, `:166`, `:187`). The block
-    /// whose `amax_b` is the row's own `amax` therefore stores `1 / (6 · factor)`; E4M3's smallest
-    /// positive value is `2^-9`, the store rounds to nearest, so a factor above
-    /// [`MAXIMUM_ENCODER_FACTOR`] puts that scale below `2^-10` — and the kernel multiplies the block
-    /// by zero (`:189`, `:194`). Every block of every row then encodes as zeros whatever the input,
-    /// so the projection would answer zeros for every activation: a fact about the operand, not
-    /// about a run, refused here by tensor name.
+    /// Not bounded: a calibrated `input_scale` near `1e-3` is a normal calibration (its factor is
+    /// then about 724), so a ceiling here would refuse a healthy checkpoint. The encoder's block
+    /// scale is computed from the row it actually sees, which is why the bound does not belong to
+    /// the operand's scale.
     fn encoder_factor(&self, request: &WeightRequest) -> Result<f32> {
-        let scale = self.tensor_scale(request)?;
-        let factor = 1.0 / scale;
-        if factor > MAXIMUM_ENCODER_FACTOR {
-            return Err(Error::weight(
-                &request.tensor,
-                format!(
-                    "the calibrated activation scale is {scale} and the encoder's factor is its \
-                     reciprocal, {factor}, which is above {MAXIMUM_ENCODER_FACTOR}: every block \
-                     scale of the matrix would round to zero, so the projection would answer zeros \
-                     for every activation"
-                ),
-            ));
-        }
-        Ok(factor)
+        Ok(1.0 / self.tensor_scale(request)?)
     }
 
     /// One tensor's single positive scale, as the checkpoint states it.
