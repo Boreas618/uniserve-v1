@@ -21,12 +21,14 @@
 // `ids` is [tokens, top] i32 route ids (the router's experts, in the whole
 // vocabulary), `scales` is [tokens, top] route weights in `scales_dtype` —
 // accepted and not read by the sort, which writes indices alone. The outputs
-// are the tile metadata the grouped GEMMs read and the two permutation maps:
+// are the tile metadata the grouped GEMMs read and the three permutation maps:
 // `tile_to_expert`/`tile_to_limit` [max_tiles] — the expert of a tile and the
 // permuted row its live rows end at, counted from the routing's first permuted
 // row (TensorRT-LLM's `mPtrCtaIdxXyToMnLimit`), `expanded_to_permuted`
 // [tokens, top] (-1 for a route this rank does not hold),
-// `permuted_to_expanded` [max_permuted_rows], and the two scalars
+// `permuted_to_expanded` [max_permuted_rows], `permuted_to_token`
+// [max_permuted_rows] (the token row a permuted row gathers, -1 on a tile's
+// padding, TensorRT-LLM's `mPtrPermutedIdxToTokenIdx`), and the two scalars
 // `total_padded_tokens` (padded permuted rows) and `num_non_exiting_tiles`
 // (tiles that hold live rows).
 struct uniserve_moe_sort_call {
@@ -47,6 +49,7 @@ struct uniserve_moe_sort_call {
   int64_t scales_dtype;
   char error[512];
   int32_t const* live_tokens;
+  int32_t* permuted_to_token;
 };
 
 // The operator crate's `DType::as_i64()` numbering.
@@ -99,10 +102,12 @@ static_assert(offsetof(uniserve_moe_sort_call, scales_dtype) == 112,
               "the call's the scale type must sit where the operator's layout puts it");
 static_assert(offsetof(uniserve_moe_sort_call, error) == 120,
               "the call's the error message must sit where the operator's layout puts it");
-static_assert(sizeof(uniserve_moe_sort_call) == 640,
+static_assert(offsetof(uniserve_moe_sort_call, permuted_to_token) == 640,
+              "the call's the permutation map must sit where the operator's layout puts it");
+static_assert(sizeof(uniserve_moe_sort_call) == 648,
               "the call must be the size of the operator's layout");
 
-// Group the routes by local expert: fills the tile metadata and both
+// Group the routes by local expert: fills the tile metadata and the
 // permutation maps. Returns 0, or a nonzero status with a NUL-terminated
 // message in `call->error`.
 extern "C" int32_t uniserve_moe_sort(const uniserve_moe_sort_call* call, void* stream);
