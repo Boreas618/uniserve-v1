@@ -915,7 +915,10 @@ fn stage_decode(args: &Args) -> Result<()> {
     let raster = download(
         &stream,
         out,
-        usize::try_from(channels * frames * u64::from(height) * u64::from(width_px)).unwrap_or(0),
+        usize::try_from(
+            channels * frames * u64::from(height) * u64::from(width_px) * element_bytes,
+        )
+        .unwrap_or(0),
     )?;
     if raster.iter().all(|byte| *byte == 0) {
         return Err(Failure::message(
@@ -931,6 +934,7 @@ fn stage_decode(args: &Args) -> Result<()> {
         channels,
         frames,
         u64::from(height) * u64::from(width_px),
+        element_bytes,
     );
     write_h3t(
         &directory.join("latents.h3t"),
@@ -2879,15 +2883,17 @@ fn gather_tile(
     Ok(())
 }
 
-/// `[channels, frames, rows x columns]` to `[frames, rows x columns, channels]`, both float16.
-fn channels_last(bytes: &[u8], channels: u64, frames: u64, pixels: u64) -> Vec<u8> {
+/// `[channels, frames, rows x columns]` to `[frames, rows x columns, channels]`, elements of `width`
+/// bytes each.
+fn channels_last(bytes: &[u8], channels: u64, frames: u64, pixels: u64, width: u64) -> Vec<u8> {
     let mut out = vec![0_u8; bytes.len()];
+    let element = width as usize;
     for channel in 0..channels {
         for frame in 0..frames {
             for pixel in 0..pixels {
-                let source = (((channel * frames + frame) * pixels + pixel) * 2) as usize;
-                let target = (((frame * pixels + pixel) * channels + channel) * 2) as usize;
-                out[target..target + 2].copy_from_slice(&bytes[source..source + 2]);
+                let source = (((channel * frames + frame) * pixels + pixel) * width) as usize;
+                let target = (((frame * pixels + pixel) * channels + channel) * width) as usize;
+                out[target..target + element].copy_from_slice(&bytes[source..source + element]);
             }
         }
     }

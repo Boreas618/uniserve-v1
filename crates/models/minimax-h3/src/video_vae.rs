@@ -775,7 +775,8 @@ impl VideoDecoder {
             ));
         }
 
-        // The three placements into the token stream: every row-major gather is one program.
+        // The two placements into the token stream, the register rows and the zero row: every
+        // row-major gather is one program.
         programs.launch::<RowsOp>(&Rows::descriptor_of(dtype, rows::Mode::Replace, width));
 
         // The rotation's table once, then its application in every layer.
@@ -2684,7 +2685,7 @@ pub(crate) mod tests {
         // three projections and `proj_out` fold a bias, while `to_out`, the packed feed-forward
         // projection and `ff.net.2` carry none.
         assert_eq!(count("gemm"), 2);
-        assert_eq!(count("rows"), 1, "three placements, one program");
+        assert_eq!(count("rows"), 1, "two placements, one program");
         assert_eq!(count("rotary_factors"), 1);
         assert_eq!(count("qk_norm_rope"), 1);
         assert_eq!(count("rms_norm"), 1);
