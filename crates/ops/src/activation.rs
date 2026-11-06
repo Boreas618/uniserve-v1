@@ -210,6 +210,7 @@ impl Op for ActAndMul {
             let limit = i32::MAX as u64;
             for (name, value) in [
                 ("element count", elements),
+                ("widest span", widest),
                 ("gate row stride", descriptor.gate_stride),
                 ("value row stride", descriptor.value_stride),
             ] {
