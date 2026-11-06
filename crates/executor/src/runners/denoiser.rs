@@ -209,7 +209,7 @@ struct DenoiseColumns {
     /// The audio latents, in the same per-request blocks; one element when a bucket serves a task
     /// with no soundtrack, so the column is never empty.
     audio: Column,
-    /// `[requests x (text_rows + condition_rows) x width]` conditioning rows.
+    /// `[requests x (text_rows + condition_rows) x text_width]` conditioning rows.
     text: Column,
     /// `[requests x (text_rows + condition_rows) x width]` the text encoder's own features.
     ///
@@ -218,6 +218,16 @@ struct DenoiseColumns {
     /// shape and both are the runner's: the conditioner runs inside a captured forward, and a buffer
     /// it allocated would be a capture that allocates.
     source: Column,
+    /// The encoder's width: elements in one `source` row.
+    source_width: u64,
+    /// What the denoiser reads: elements in one `text` row.
+    ///
+    /// **Two widths, because a conditioner may widen.** H3's refiner projects the encoder's 5120
+    /// columns into the stack's 5376, so a runner that sized both buffers from the encoder's width
+    /// handed the conditioner one too narrow for its own output - and no launch refused until the
+    /// packed rows were gathered, as `out is [rows, 5376], [rows, 5120] expected`. The model states
+    /// the second width (`Denoiser::text_width`); `None` is one width.
+    text_width: u64,
     /// `[1]` `i64`: the step index the coefficients are selected by (`Conditioning::step`).
     step: Column,
     /// The host side of each column.
@@ -225,7 +235,13 @@ struct DenoiseColumns {
 }
 
 impl DenoiseColumns {
-    fn new(device: DeviceId, shape: DenoiserShape, layout: &Layout, rows: u32) -> Result<Self> {
+    fn new(
+        device: DeviceId,
+        shape: DenoiserShape,
+        layout: &Layout,
+        rows: u32,
+        stated_text_width: Option<u32>,
+    ) -> Result<Self> {
         let rows = u64::from(rows.max(1));
         let video = numel(&layout.video)?;
         let audio = match layout.audio {
@@ -233,14 +249,16 @@ impl DenoiseColumns {
             None => 1,
         };
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-        let text = width * u64::from(shape.width.max(1));
+        let (source_width, text_width) = conditioning_width(&shape, stated_text_width);
         Ok(Self {
             video: Column::new(device, shape.sample, rows * video)?,
             audio: Column::new(device, shape.sample, rows * audio)?,
-            text: Column::new(device, shape.stack, rows * text)?,
-            source: Column::new(device, shape.stack, rows * text)?,
+            text: Column::new(device, shape.stack, rows * width * text_width)?,
+            source: Column::new(device, shape.stack, rows * width * source_width)?,
             step: Column::new(device, DType::I64, 1)?,
             staged: Staged::default(),
+            source_width,
+            text_width,
         })
     }
 
@@ -258,16 +276,17 @@ impl DenoiseColumns {
         };
         Staged::zero(&mut self.staged.audio, rows * audio)?;
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-        let text = u64::from(shape.width.max(1));
         let bytes = shape
             .stack
             .bytes()
             .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", shape.stack)))?;
-        Staged::zero(&mut self.staged.text, rows * width * text * bytes)?;
+        let text_bytes = rows * width * self.text_width * bytes;
+        Staged::zero(&mut self.staged.text, text_bytes)?;
         // The conditioner folds these into `text`, so a warm capture must read defined features as
         // well as defined rows: an uninitialised buffer would make the capture's output depend on
         // whatever the allocator last held.
-        Staged::zero(&mut self.staged.source, rows * width * text * bytes)?;
+        let source_bytes = rows * width * self.source_width * bytes;
+        Staged::zero(&mut self.staged.source, source_bytes)?;
         self.staged.step = vec![0u8; 8];
         Ok(())
     }
@@ -329,6 +348,19 @@ fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (
     let rows = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
     let width = u64::from(shape.width.max(1));
     (rows, width)
+}
+
+/// The two widths one request's conditioning columns hold: `(source, text)`.
+///
+/// `source` is what the text encoder wrote, which [`DenoiserShape::width`] states; `text` is what
+/// the denoiser reads, which the model states when its conditioner widens the encoder's features
+/// (`Denoiser::text_width`) and which is the encoder's width when it does not. **One width for both
+/// is the defect this pair removes**: the conditioner's own output then does not fit the buffer it
+/// writes, and the refusal arrives one operator later, at the gather.
+fn conditioning_width(shape: &DenoiserShape, stated_text_width: Option<u32>) -> (u64, u64) {
+    let source = u64::from(shape.width.max(1));
+    let text = u64::from(stated_text_width.unwrap_or(shape.width).max(1));
+    (source, text)
 }
 
 /// How a product's bytes fill one row of a conditioning column: `(copied, zeroed)`.
@@ -484,7 +516,13 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             .max_by_key(|plan| plan.bucket.rows)
             .ok_or_else(|| Error::Invalid("a denoiser runner derived no bucket".into()))?;
         let layout = layout_of(largest.bucket)?;
-        let columns = DenoiseColumns::new(binding.device, shape, &layout, largest.bucket.rows)?;
+        let columns = DenoiseColumns::new(
+            binding.device,
+            shape,
+            &layout,
+            largest.bucket.rows,
+            model.text_width(),
+        )?;
         let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
         Ok(Self {
             id: binding.id,
@@ -666,6 +704,15 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     }
 
     /// The conditioning of request `index` of `bucket`, over the tables of its layout.
+    /// The rows and the two widths one request's conditioning occupies: `(rows, source, text)`.
+    ///
+    /// Read from the columns rather than recomputed, so the view a step hands the model and the row
+    /// size [`Self::seed`] fills are the ones the buffers were allocated for.
+    fn conditioning_row(&self, layout: &nn::capability::Layout) -> (u64, u64, u64) {
+        let (rows, _) = conditioning_row(&self.shape, layout);
+        (rows, self.columns.source_width, self.columns.text_width)
+    }
+
     fn conditioning<'a>(
         &self,
         bucket: Bucket,
@@ -674,15 +721,15 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         media: &'a [nn::capability::MediaInput],
     ) -> Result<Conditioning<'a>> {
         let layout = layout_of(bucket)?;
-        let (rows, width) = conditioning_row(&self.shape, &layout);
-        let view = self.columns.text.shaped(&[rows * width]);
+        let (rows, source_width, text_width) = self.conditioning_row(&layout);
+        let view = self.columns.text.shaped(&[rows * text_width]);
         let text = view
-            .at(view.offset_elements(u64::from(index) * rows * width))
-            .reshape(Shape::new(&[rows, width]));
-        let features = self.columns.source.shaped(&[rows * width]);
+            .at(view.offset_elements(u64::from(index) * rows * text_width))
+            .reshape(Shape::new(&[rows, text_width]));
+        let features = self.columns.source.shaped(&[rows * source_width]);
         let source = features
-            .at(features.offset_elements(u64::from(index) * rows * width))
-            .reshape(Shape::new(&[rows, width]));
+            .at(features.offset_elements(u64::from(index) * rows * source_width))
+            .reshape(Shape::new(&[rows, source_width]));
         Ok(Conditioning {
             text,
             source: Some(source),
@@ -726,11 +773,14 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let pending = self.pending.clone();
         let stream = self.stream.clone();
         let layout = layout_of(bucket)?;
-        let (rows, width) = conditioning_row(&self.shape, &layout);
+        let (rows, source_width, text_width) = self.conditioning_row(&layout);
         let element = u64::from(self.shape.stack.bytes().ok_or_else(|| {
             Error::Invalid(format!("{} has no whole-byte size", self.shape.stack))
         })?);
-        let bytes = rows * width * element;
+        // One row's size per kind: the two columns are two widths, so a single number would make
+        // the shorter kind's copy land inside the wrong column's row (`conditioning_width`).
+        let text_bytes = rows * text_width * element;
+        let source_bytes = rows * source_width * element;
         for row in &pending {
             let (request, index) = (row.request, row.index);
             for (kind, column) in [
@@ -742,6 +792,11 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 // and only the store holds both ends: it waits on the producer's write before this
                 // stream copies. A runner issuing its own `memcpy_async` from another device's
                 // region would be reading bytes no ordering protects.
+                let bytes = if matches!(kind, Product::Text) {
+                    text_bytes
+                } else {
+                    source_bytes
+                };
                 let Some(published) = products.product(request, kind)? else {
                     return Err(products::absent(request, kind));
                 };
@@ -982,6 +1037,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             source,
             step,
             staged,
+            // The widths are the allocation's, read where it was made; this borrow moves bytes.
+            source_width: _,
+            text_width: _,
         } = &mut self.columns;
         video.write(&staged.video)?;
         audio.write(&staged.audio)?;
@@ -1368,6 +1426,28 @@ mod tests {
             condition_rows: 0,
             condition_elements: 0,
         }
+    }
+
+    /// A widening conditioner gets a `text` column wider than its `source` one, by exactly the
+    /// width the model states - and a model that keeps the encoder's width gets one width.
+    ///
+    /// The stop this closes was `out is [19904, 5376], [19904, 5120] expected`. A gather cannot
+    /// change a row's width (`head::gather_rows` requires `[count, table width]`), so a runner that
+    /// sized both conditioning columns from the encoder's width handed the conditioner a buffer too
+    /// narrow for its own output, and the refusal arrived one operator later than the mistake. Both
+    /// models are asserted, so an implementation that always used one of the two numbers - either one
+    /// - fails here rather than at a gather.
+    #[test]
+    fn a_widening_conditioner_writes_into_a_text_column_of_its_own_width() {
+        let shape = DenoiserShape {
+            stack: DType::BF16,
+            sample: DType::F32,
+            width: 5120,
+        };
+        // H3's refiner projects the encoder's 5120 columns into the stack's 5376.
+        assert_eq!(conditioning_width(&shape, Some(5376)), (5120, 5376));
+        // A model with no conditioner, or one that keeps the encoder's width.
+        assert_eq!(conditioning_width(&shape, None), (5120, 5120));
     }
 
     /// A layout survives the bucket that carries it and the reader that unwraps it.
