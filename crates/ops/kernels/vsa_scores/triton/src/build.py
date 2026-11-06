@@ -39,8 +39,16 @@ def spec(fields, parameters, target):
             "WIDTH": "constexpr",
             "BLOCK": "constexpr",
             "KEY_TILES": "constexpr",
+            "QUERIES": "constexpr",
         },
-        "constexprs": {"WIDTH": int(fields["width"]), "BLOCK": block, "KEY_TILES": 16},
+        # `QUERIES` is the launch's grid divisor as well: `POOLED_QUERIES` in
+        # `crates/ops/src/segments.rs`.
+        "constexprs": {
+            "WIDTH": int(fields["width"]),
+            "BLOCK": block,
+            "KEY_TILES": 32,
+            "QUERIES": 16,
+        },
         "options": {
             "num_warps": warps_of(block),
             "launch_pdl": fields["pdl"] == "true",

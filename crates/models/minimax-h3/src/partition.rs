@@ -603,6 +603,38 @@ impl Partition {
         Ok(partition)
     }
 
+    /// The same partition, also serving `task` of the same network.
+    ///
+    /// A network serves several tasks with one set of weights: the condition encoders join when a
+    /// task conditions, and the capacity is the largest any of them asks for.
+    pub fn also_serving(self, config: &Config, task: VideoTask) -> Result<Self> {
+        let dit = |asked: VideoTask| {
+            TASK_DITS
+                .iter()
+                .find_map(|(served, dit)| (*served == asked).then_some(*dit))
+                .ok_or_else(|| Error::config(format!("no MiniMax-H3 deployment serves {asked:?}")))
+        };
+        let holds = |placed: crate::checkpoint::Dit| match placed {
+            crate::checkpoint::Dit::Base => self.blocks.contains(Component::Transformer),
+            crate::checkpoint::Dit::Reference => self.blocks.contains(Component::TransformerRef),
+        };
+        if !holds(dit(task)?) {
+            return Err(Error::config(format!(
+                "{task:?} runs on another network than this partition places"
+            )));
+        }
+        let mut blocks = self.blocks;
+        if matches!(
+            task,
+            VideoTask::FirstLastToVideoAudio | VideoTask::ReferenceToVideoAudio
+        ) {
+            blocks = blocks.with(Component::LatentEncoder);
+        }
+        let rows = self.condition_rows.max(condition_rows(config, task)?);
+        let text_rows = self.text_rows;
+        Ok(self.placing(blocks).sized(text_rows, rows))
+    }
+
     /// The same partition, placing `blocks`.
     ///
     /// A deployment that serves `ref2va` places [`Component::TransformerRef`] and drops

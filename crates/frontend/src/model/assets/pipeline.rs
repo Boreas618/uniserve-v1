@@ -94,6 +94,57 @@ async fn pinned_file(client: &HubClient, pin: &BaseRevision, filename: &str) -> 
     fetch_file(&client.api.repo(repo), &pin.to_string(), filename).await
 }
 
+/// The Hub cache's snapshot of the base revision the export at `root` pins, or
+/// `None` for a checkpoint that publishes no inference contract or pins no base.
+///
+/// A rank opens the export and this snapshot as one checkpoint: the export
+/// holds its own DiT, and the snapshot the directories it omits. Nothing is
+/// downloaded here, because a rank reads weights where they already are; a
+/// snapshot the cache lacks is refused by name.
+///
+/// # Errors
+///
+/// Returns [`Error::Invalid`] when the contract or its pin is malformed or the
+/// snapshot is not in the cache, and the errors of reading the contract.
+pub fn pinned_snapshot(root: &std::path::Path) -> Result<Option<PathBuf>> {
+    let path = root.join(INFERENCE_CONTRACT);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let content = std::fs::read_to_string(&path).map_err(|source| Error::Io {
+        path: path.clone(),
+        source,
+    })?;
+    let contract: Value =
+        serde_json::from_str(&content).map_err(|source| Error::Json { path, source })?;
+    let Some(pin) = contract.get("base_model_revision") else {
+        return Ok(None);
+    };
+    let pin = pin.as_str().ok_or_else(|| {
+        Error::invalid(format!(
+            "{} states a base_model_revision that is not a string",
+            root.display()
+        ))
+    })?;
+    let pin = BaseRevision::parse(pin)?;
+    let repo = Repo::with_revision(
+        pin.repository.clone(),
+        RepoType::Model,
+        pin.revision.clone(),
+    );
+    let snapshot = hf_hub::Cache::from_env()
+        .repo(repo)
+        .pointer_path(&pin.revision);
+    if !snapshot.is_dir() {
+        return Err(Error::invalid(format!(
+            "{} continues {pin}, and the Hub cache holds no snapshot of it at {}",
+            root.display(),
+            snapshot.display()
+        )));
+    }
+    Ok(Some(snapshot))
+}
+
 /// Reads the base revision a FastH3 export pins, or `None` for a checkpoint
 /// that publishes no inference contract or pins no base.
 async fn pinned_base(root: &ModelSource) -> Result<Option<BaseRevision>> {

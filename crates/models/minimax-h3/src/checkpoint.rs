@@ -435,25 +435,14 @@ impl Sidecars {
     ///
     /// A pipeline's components do not have to lie in one directory: an export that continues a base
     /// release holds its own DiT partition and schedulers, and the base holds the text encoder, the
-    /// processor and the VAEs, which the engine opens as one checkpoint. Each directory is
-    /// therefore read from the component that owns it - `<component>/config.json` from
-    /// `checkpoint.component(component)` - falling back to the pipeline's own root, which is where
-    /// a checkpoint that answers as one tree keeps everything.
+    /// processor and the VAEs, which the engine opens as one checkpoint. Each sidecar is therefore
+    /// read from the first root that holds it, the export's before the base's: a processor has no
+    /// shards, so no component of the checkpoint could answer for it.
     pub fn read_components(checkpoint: &nn::Checkpoint, layout: &Layout) -> Result<Self> {
-        let root = checkpoint.root();
-        let roots = |relative: &str| -> Vec<PathBuf> {
-            let mut roots = Vec::with_capacity(2);
-            if let Some((component, _)) = relative.split_once('/')
-                && let Ok(held) = checkpoint.component(component)
-            {
-                roots.push(held.root().to_path_buf());
-            }
-            roots.push(root.to_path_buf());
-            roots
-        };
+        let roots = checkpoint.roots();
         Self::read_through(
-            |relative| read_any(&roots(relative), relative),
-            |relative| optional_any(&roots(relative), relative),
+            |relative| read_any(roots, relative),
+            |relative| optional_any(roots, relative),
             layout,
         )
     }

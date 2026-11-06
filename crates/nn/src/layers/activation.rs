@@ -65,7 +65,9 @@ impl GatedActivation {
     ///
     /// The two row strides are launch values a walk reads from the scratch layout, and `elements` is
     /// the output's element count — the descriptor's `wide` form is a second program, so it is part of
-    /// the key and not a heuristic.
+    /// the key and not a heuristic. The form follows the widest span a launch addresses, the strided
+    /// inputs included: a packed projection's last row sits twice as far in as the output's, so an
+    /// output well inside 32 bits can still read past them.
     pub fn descriptor_of(
         dtype: DType,
         width: u64,
@@ -75,6 +77,8 @@ impl GatedActivation {
         elements: u64,
         stepwise: bool,
     ) -> Result<activation::ActAndMulDescriptor> {
+        let rows = elements.div_ceil(width.max(1));
+        let span = elements.max(rows.saturating_mul(gate_stride.max(value_stride)));
         Ok(activation::ActAndMulDescriptor {
             dtype,
             width: u32::try_from(width).map_err(|_| {
@@ -84,7 +88,7 @@ impl GatedActivation {
             activation,
             gate_stride,
             value_stride,
-            wide: elements >= u64::from(u32::MAX),
+            wide: span >= 1 << 31,
             pdl: PDL,
             stepwise,
         })
@@ -568,6 +572,27 @@ impl Silu {
 mod tests {
     use super::*;
     use ops::Shape;
+
+    /// The 64-bit form follows the packed input's span, which runs twice as far as the output's: with
+    /// 14336 channels the last row of 74899 is past `2**31` elements of input while the output is at
+    /// half of that. A 32-bit launch there wraps a row's offset and reads another row's memory.
+    #[test]
+    fn a_packed_projection_goes_wide_on_its_input_span() {
+        let width = 14_336u64;
+        let wide = |rows: u64| {
+            GatedActivation::packed_descriptor_of(
+                DType::BF16,
+                width,
+                Activation::Silu,
+                rows * width,
+                true,
+            )
+            .expect("the descriptor")
+            .wide
+        };
+        assert!(!wide(74_898), "74898 rows stay inside 32 bits");
+        assert!(wide(74_899), "74899 rows do not");
+    }
 
     /// The packed descriptor is the one a launch derives from the two halves of one packed projection:
     /// the halves keep the packed row stride, so each one's stride between rows is twice its width.
