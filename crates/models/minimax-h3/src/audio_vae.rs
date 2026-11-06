@@ -366,6 +366,7 @@ pub fn audio_arena(
         });
     };
     let mut length = u64::from(frames);
+    push("track".to_owned(), u64::from(config.latent_channels), length);
     push(
         "restored".to_owned(),
         u64::from(config.latent_channels),
@@ -785,6 +786,8 @@ pub struct BigVgan {
     post: AudioActivation,
     output: Conv1d,
     pcm: PcmInterleave,
+    /// Moves the track from the denoiser's rows into the decoder's channel-major layout.
+    track: nn::layers::CopyBlock,
 }
 
 /// One upsampling stage: a transposed convolution whose output is the sum of three anti-aliased blocks,
@@ -1023,7 +1026,46 @@ impl BigVgan {
             post,
             output,
             pcm: PcmInterleave::new(DType::F32)?,
+            track: nn::layers::CopyBlock::new(DType::F32)?,
         })
+    }
+
+    /// The denoiser's track in the layout [`Self::forward`] reads.
+    ///
+    /// The denoiser publishes its audio rows as they are: `[frames, 2 · latent_channels]` over the
+    /// bytes of `[2 · frames, latent_channels]`, the first stereo channel's rows before the second's.
+    /// The decoder's convolutions run along time, so each stereo channel's latent channels must
+    /// become the outer axis: this is the reference's `reshape(2, frames, channels).permute(0, 2, 1)`.
+    fn channel_major(&self, f: &Forward, track: TensorView) -> Result<TensorView> {
+        let channels = u64::from(self.config.latent_channels);
+        let stereo = u64::from(PCM_CHANNELS);
+        let shape = track.shape;
+        if shape.rank() != 2 || shape.dim(1) != stereo * channels {
+            return Err(Error::config(format!(
+                "{:?} is not a track of [frames, {}]",
+                shape.dims(),
+                stereo * channels
+            )));
+        }
+        let frames = shape.dim(0);
+        let major = self.buffer(f, self.config.latent_channels, frames)?;
+        // Four axes are what a block copy moves: `[stereo, channels, 1, frames]`.
+        let block = Shape::new(&[stereo, channels, 1, frames]);
+        let source = TensorView::with_strides(
+            track.offset_elements(0),
+            track.dtype,
+            block,
+            nn::Strides::new(&[frames * channels, 1, 1, channels]),
+        );
+        let strides = [channels * frames, frames, frames, 1].map(|stride| stride as i64);
+        let destination = TensorView::with_strides(
+            major.offset_elements(0),
+            major.dtype,
+            block,
+            nn::Strides::new(&[channels * frames, frames, frames, 1]),
+        );
+        self.track.forward(f, source, destination, &strides)?;
+        Ok(major)
     }
 
     /// Decode `latents [2, latent_channels, frames]` into interleaved PCM `[samples, 2]`.
@@ -1175,6 +1217,7 @@ impl BigVgan {
             false,
         ));
         programs.launch::<PcmInterleaveOp>(&PcmInterleave::descriptor_of(dtype)?);
+        programs.launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::descriptor_of(dtype));
 
         // The residual add at each stage's own buffers: `[PCM_CHANNELS, channels, length]` reshaped
         // to `[PCM_CHANNELS · channels, length]`, so its width is the length the stage's upsampling
@@ -1432,7 +1475,8 @@ impl Decoder for BigVgan {
                 problem: "the audio decoder writes no video raster".to_owned(),
             });
         }
-        self.forward(f, latents, audio)
+        self.channel_major(f, latents)
+            .and_then(|latents| self.forward(f, latents, audio))
             .map_err(|error| nn::Error::Shape {
                 owner: "BigVgan",
                 problem: format!("{error}"),
@@ -1830,7 +1874,7 @@ pub(crate) mod tests {
             "decoder_rates": [5, 5, 2, 2, 2, 2, 2],
             "decoder_kernel_sizes": [9, 9, 4, 4, 4, 4, 4],
             "num_attention_heads": 8,
-            "resblock_kernel_sizes": [3, 7, 11],
+            "resblock_kernel_sizes": [3, 7, 12],
             "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
             "sampling_rate": 32000,
             "latents_mean": vec![0.0; 32],
