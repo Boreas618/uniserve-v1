@@ -373,9 +373,9 @@ impl MediaColumns {
 /// A staged request is two buffers, in this order:
 ///
 /// - **0**, the conditioning blob, byte for byte as `DiffusionRequest::conditioning` holds it;
-/// - **1**, fifty-two bytes little-endian: `step: u32`, `steps: u32`, `seed: u64`, `width: u32`,
+/// - **1**, fifty-six bytes little-endian: `step: u32`, `steps: u32`, `seed: u64`, `width: u32`,
 ///   `height: u32`, `frames: u32`, then the identity - `engine_id: u64`, `request_id: u64`,
-///   `request_epoch: u64`.
+///   `request_epoch: u64` - and `handed: u32`.
 ///
 /// Little-endian and fixed width so that a worker and an engine of different architectures read one
 /// record, and so that a runner reads offsets rather than a parser.
@@ -407,6 +407,9 @@ pub struct StagedRequest {
     pub height: u32,
     /// The output frames after the model's alignment.
     pub frames: u32,
+    /// The encoded rounds this call hands over, which only a muxing call states: the final muxing
+    /// call hands none, and that is what makes it the one that finishes the artifact.
+    pub handed: u32,
 }
 
 impl StagedRequest {
@@ -422,6 +425,7 @@ impl StagedRequest {
         record.extend_from_slice(&self.request.engine_id.to_le_bytes());
         record.extend_from_slice(&self.request.request_id.0.to_le_bytes());
         record.extend_from_slice(&self.request.request_epoch.to_le_bytes());
+        record.extend_from_slice(&self.handed.to_le_bytes());
         vec![self.conditioning.clone(), record]
     }
 
@@ -440,8 +444,9 @@ impl StagedRequest {
             // refusal that prints it states a fact about the build rather than about what was
             // handed over. What the reader needs is which record this is and what arrived.
             return Err(Error::Invalid(format!(
-                "a media request's parameter record is step, steps, seed, width, height, frames and \
-                 the request's three identities; this one is {} bytes, which is not that shape",
+                "a media request's parameter record is step, steps, seed, width, height, frames, \
+                 the request's three identities and the rounds it hands over; this one is {} \
+                 bytes, which is not that shape",
                 record.len()
             )));
         }
@@ -469,13 +474,14 @@ impl StagedRequest {
             width: word(16),
             height: word(20),
             frames: word(24),
+            handed: word(52),
         })
     }
 }
 
 /// The width of a staged request's parameter record: `step`, `steps`, `seed`, `width`, `height` and
-/// `frames`, then the request's identity (`engine_id`, `request_id`, `request_epoch`).
-const PARAMETER_BYTES: usize = (4 + 4 + 8 + 4 + 4 + 4) + (8 + 8 + 8);
+/// `frames`, then the request's identity (`engine_id`, `request_id`, `request_epoch`), then `handed`.
+const PARAMETER_BYTES: usize = (4 + 4 + 8 + 4 + 4 + 4) + (8 + 8 + 8) + 4;
 
 impl BatchColumns {
     /// The number of rows (sequences) the columns describe.
@@ -1289,6 +1295,7 @@ mod media_tests {
             width: 768,
             height: 512,
             frames: 121,
+            handed: 0,
         };
         let row = staged.encode();
         assert_eq!(row.len(), 2, "a staged request is two buffers");
