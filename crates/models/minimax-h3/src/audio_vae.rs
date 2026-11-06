@@ -1857,6 +1857,7 @@ pub(crate) mod tests {
         assert_eq!(
             programs.len(),
             count("conv1d")
+                + count("copy_block")
                 + count("conv_transpose1d")
                 + count("pcm_interleave")
                 + count("audio_activation")
@@ -1874,7 +1875,7 @@ pub(crate) mod tests {
             "decoder_rates": [5, 5, 2, 2, 2, 2, 2],
             "decoder_kernel_sizes": [9, 9, 4, 4, 4, 4, 4],
             "num_attention_heads": 8,
-            "resblock_kernel_sizes": [3, 7, 12],
+            "resblock_kernel_sizes": [3, 7, 11],
             "resblock_dilation_sizes": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
             "sampling_rate": 32000,
             "latents_mean": vec![0.0; 32],
@@ -1912,7 +1913,7 @@ pub(crate) mod tests {
         // Three buffers before the stages (restore, project, input), six per stage (the upsampled signal,
         // the running sum and the four the stage's blocks share), and the post activation and the mono
         // signal.
-        assert_eq!(plan.len(), 3 + 6 * config.decoder_rates.len() + 2);
+        assert_eq!(plan.len(), 4 + 6 * config.decoder_rates.len() + 2);
         // The lengths follow the rates, so the last stage's buffers cover `frames · Π rates` samples.
         let longest = stages(&config)
             .expect("stages")
