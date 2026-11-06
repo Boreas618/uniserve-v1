@@ -911,6 +911,7 @@ mod tests {
     fn a_batch_of_two_requests_stages_both_at_their_own_entries() {
         let requests = [
             crate::batch::StagedRequest {
+                unit: 0,
                 request: ipc::RequestKey::new(1, ipc::RequestId(7), 0),
                 conditioning: Vec::new(),
                 step: 0,
@@ -922,6 +923,7 @@ mod tests {
                 handed: 0,
             },
             crate::batch::StagedRequest {
+                unit: 0,
                 request: ipc::RequestKey::new(1, ipc::RequestId(8), 0),
                 conditioning: Vec::new(),
                 step: 0,

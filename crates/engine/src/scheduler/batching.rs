@@ -904,7 +904,7 @@ impl Scheduler {
         let extent = bucket.extent;
         stated.extent = extent;
         let mut requests = Vec::with_capacity(batch.requests.len());
-        for (call, _) in &batch.requests {
+        for (call, placed) in &batch.requests {
             let Some(state) = self.running_media.get(&call.request_key.request_id) else {
                 tracing::debug!(
                     "a media batch is dropped: {:?} names a request this scheduler is not running",
@@ -922,6 +922,7 @@ impl Scheduler {
                 height: state.request.sampling.height,
                 frames: state.request.sampling.num_frames,
                 handed: u32::try_from(call.inputs.len()).unwrap_or(u32::MAX),
+                unit: placed.decode.as_ref().map_or(0, |range| range.cursor),
             });
         }
         batch.media = Some(executor::batch::MediaColumns::staged(stated, &requests));

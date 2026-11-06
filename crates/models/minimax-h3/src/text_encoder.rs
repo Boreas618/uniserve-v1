@@ -888,10 +888,14 @@ impl TextEncoder {
         let (first, stop) = rank.vocabulary;
         let rows = stop - first;
         let embedding = Embedding::new(
-            region(
+            // A rank's vocabulary rows start at its first id: read from the table's start, every
+            // rank past the first would hold the first shard's rows under its own ids.
+            sharded(
                 loader,
                 &format!("{PREFIX}.embed_tokens.weight"),
-                Shape::new(&[u64::from(rows), hidden]),
+                u64::from(first) * hidden,
+                u64::from(rows),
+                hidden,
             )
             .map_err(|error| {
                 Error::config(format!("the embedding shard {first}..{stop}: {error}"))

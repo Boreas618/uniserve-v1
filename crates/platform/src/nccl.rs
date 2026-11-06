@@ -253,7 +253,7 @@ impl Communicator {
         dtype: DataType,
     ) -> Result<()> {
         self.ready(stream, "ncclAllGather")?;
-        require_room(send.bytes(), ranks_bytes(count, dtype, self.size)?, "send")?;
+        require_room(send.bytes(), elements_bytes(count, dtype)?, "send")?;
         require_room(recv.bytes(), ranks_bytes(count, dtype, self.size)?, "recv")?;
         // NCCL launches on `stream`, which the driver accepts only with the
         // stream's context current on the calling thread; entering it here is

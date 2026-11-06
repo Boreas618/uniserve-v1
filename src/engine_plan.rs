@@ -360,8 +360,9 @@ impl EpochPlan {
         })
     }
 
-    /// Whether this rank serves the blocks that run on one rank of the group: the decoders and the
-    /// host stage. The sequence and tensor groups run on every rank; the rest run on the first.
+    /// Whether this rank serves the blocks that run on one rank of the group: the audio decoder and
+    /// the host stage. The sequence and tensor groups run on every rank, and the video decoder takes
+    /// a timeline's units in turn over every rank.
     pub(crate) fn serves_output(&self) -> bool {
         self.rank == 0
     }
@@ -795,14 +796,6 @@ impl EpochPlan {
             Arc::clone(generation),
         )?
         .in_group(self.rank, groups.sequence.clone());
-        // The group's own work ends here: a rank past the first holds the whole sample after every
-        // step and serves no output.
-        if !self.serves_output() {
-            return Ok(vec![
-                NamedRunner::new(RunnerId(0), Box::new(encoder)),
-                NamedRunner::new(RunnerId(1), Box::new(denoise)),
-            ]);
-        }
         let decoder = pipeline
             .video_decoder()
             .context("the checkpoint holds no video decoder, so no clip could be decoded")?;
@@ -827,6 +820,11 @@ impl EpochPlan {
             NamedRunner::new(RunnerId(1), Box::new(denoise)),
             NamedRunner::new(RunnerId(2), Box::new(decode)),
         ];
+        // A rank past the first holds the whole sample after every step and decodes its share of
+        // the timeline's clips; the track and the artifact are the first rank's.
+        if !self.serves_output() {
+            return Ok(runners);
+        }
         let audio_decoder = pipeline.audio_decoder().context(
             "the checkpoint holds no audio decoder, so no track could be decoded or encoded and \
              every response would be a clip with no sound",
@@ -1194,16 +1192,11 @@ impl EpochPlan {
                 // The condition capacity is the task's (the block set is placed for it); the text
                 // capacity is the deployment's, from the ladder above.
                 let partition = partition.sized(text_capacity, partition.condition_rows);
-                let partition = partition.placing(if self.serves_output() {
+                let partition = partition.placing(
                     partition
                         .blocks
-                        .with(minimax_h3::Component::VideoPostprocessor)
-                } else {
-                    partition
-                        .blocks
-                        .without(minimax_h3::Component::VideoDecoder)
-                        .without(minimax_h3::Component::AudioDecoder)
-                });
+                        .with(minimax_h3::Component::VideoPostprocessor),
+                );
                 let dtype = match self.build.dtype {
                     proto::request::ModelDtype::Float16 => DType::F16,
                     proto::request::ModelDtype::BFloat16 => DType::BF16,
@@ -1819,13 +1812,18 @@ fn targets(devices: &[DeviceId]) -> Result<Vec<Target>> {
     for device in devices {
         let handle = platform::Device::new(*device)
             .with_context(|| format!("opening device {}", device.0))?;
-        let (major, minor) = handle.architecture();
-        let target = Target::new(format!("sm_{major}{minor}a"));
+        let target = target_of(&handle);
         if !targets.contains(&target) {
             targets.push(target);
         }
     }
     Ok(targets)
+}
+
+/// The build target of `device`'s architecture.
+pub(crate) fn target_of(device: &platform::Device) -> Target {
+    let (major, minor) = device.architecture();
+    Target::new(format!("sm_{major}{minor}a"))
 }
 
 /// A seed for the runner's draws: the process's clock, so two runs differ.

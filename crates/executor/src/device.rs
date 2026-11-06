@@ -655,6 +655,18 @@ struct Device {
 impl Device {
     /// Serves the queue until it closes: one command at a time, in submission order.
     fn run(mut self, queue: &Arc<JobQueue>) {
+        // This thread drives one device, so that device's context is current for its whole life. A
+        // native module reads the device from the runtime (`cudaGetDevice`) to find its per-device
+        // handles, and with no context current the runtime answers device zero: every other device
+        // of the process would then launch through device zero's handle.
+        let context = platform::PrimaryContext::retain(self.device);
+        let _current = match &context {
+            Ok(context) => context.enter().map_err(|error| error.to_string()),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = &_current {
+            tracing::error!(device = self.device.0, %error, "the device's context is not current");
+        }
         // Deferred storage release gets its waiting commands through this queue (2.4).
         let events = Arc::clone(queue.events());
         let submitter = Arc::clone(queue);
@@ -743,10 +755,25 @@ impl Device {
         match &entry.command {
             Command::Batch(batch) => {
                 let runner = self.runner_of(phase_of(batch))?;
+                let started = Instant::now();
                 let jobs = self.runner_mut(runner)?.runner.submit(batch.clone())?;
+                let staged = started.elapsed();
                 // A batch's jobs are its replay and nothing else: serving it is one turn, because
                 // the mechanism waits on this submission to build the next step.
-                self.perform(&label, jobs_of(runner, jobs)).map(Step::Done)
+                let output = self.perform(&label, jobs_of(runner, jobs)).map(Step::Done);
+                // A media call is seconds of device work a few times per request, so one line each
+                // is the request's timeline; a token batch's would be the log.
+                if let Some(media) = &batch.media {
+                    tracing::info!(
+                        device = self.device.0,
+                        call = ?media.computation.call,
+                        batch = batch.id.0,
+                        staged_ms = staged.as_millis() as u64,
+                        total_ms = started.elapsed().as_millis() as u64,
+                        "a media batch was served"
+                    );
+                }
+                output
             }
             Command::Warmup => {
                 let mut jobs = Vec::new();

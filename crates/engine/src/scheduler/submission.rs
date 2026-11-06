@@ -870,6 +870,7 @@ mod tests {
             height: 768,
             frames: 121,
             handed: 0,
+            unit: 0,
         }
     }
 
