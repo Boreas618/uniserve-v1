@@ -1231,6 +1231,16 @@ impl Pace {
     pub fn step(&self) {
         let _ = self.0.send(());
     }
+
+    /// Lets the simulator execute one more batch unless it has not taken the
+    /// last permit yet. A simulator with nothing to execute leaves its permits
+    /// queued, and each queued permit later runs a batch no step of the test
+    /// asked for.
+    pub fn offer(&self) {
+        if self.0.is_empty() {
+            self.step();
+        }
+    }
 }
 
 /// One write a simulated request's call made to its context: the KV cache a
