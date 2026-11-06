@@ -884,11 +884,25 @@ impl Scheduler {
         let Ok(tokens) = u32::try_from(tokens) else {
             return;
         };
+        // The batch's requests share a bucket, so the first states the shape it is found by.
+        let extent = self
+            .running_media
+            .get(&first.request_key.request_id)
+            .map_or(executor::plan::Extent::None, |state| {
+                let sampling = &state.request.sampling;
+                executor::plan::Extent::Request {
+                    frames: sampling.num_frames,
+                    width: sampling.width,
+                    height: sampling.height,
+                    text_rows: u32::try_from(state.request.prompt_token_ids.len())
+                        .unwrap_or(u32::MAX),
+                }
+            });
         let mut stated = executor::plan::Computation {
             call: media_call,
             rows,
             tokens,
-            extent: executor::plan::Extent::None,
+            extent,
         };
         // The executor's answer is the authority on the extent: it is the bucket its own runner
         // planned the computation into, and a batch captured for one canvas serves no other.

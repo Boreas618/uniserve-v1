@@ -807,6 +807,7 @@ mod tests {
             rows,
             tokens: 1,
             extent: crate::plan::Extent::None,
+            serves: None,
         }
     }
 
