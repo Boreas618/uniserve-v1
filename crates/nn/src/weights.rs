@@ -68,6 +68,21 @@ pub struct Nvfp4Names {
     pub input_scale: &'static str,
 }
 
+/// The largest activation encoder factor a calibrated projection may state: `2^10 / 6`.
+///
+/// `nvfp4_quantize` normalizes a row by `token_scale = amax(row) · factor` and stores each block's
+/// scale as `e4m3(amax_b / (6 · token_scale))` (`crates/ops/kernels/nvfp4_quantize/triton/src/`
+/// `nvfp4_quantize.py`, `:166` and `:187`). The block whose `amax_b` is the row's own `amax`
+/// therefore stores `1 / (6 · factor)`. E4M3's smallest positive value is `2^-9` and the store
+/// rounds to nearest, so a scale below `2^-10` becomes zero — and the kernel then multiplies that
+/// block by zero (`:189`, `:194`): **every block of every row encodes as zeros, whatever the
+/// input.** `1 / (6 · factor) ≥ 2^-10` is `factor ≤ 2^10 / 6`, which is this bound.
+///
+/// It is a fact about the operand and not about a run: a projection whose factor is above it cannot
+/// encode one activation, so the loader refuses it by tensor name rather than publishing a weight
+/// that answers zeros.
+pub const MAXIMUM_ENCODER_FACTOR: f32 = 1024.0 / 6.0;
+
 impl Nvfp4Names {
     /// The vLLM/ModelOpt spelling: `weight`, `weight_scale`, `weight_scale_2`, `input_scale`.
     ///
@@ -1494,8 +1509,25 @@ impl<'a> WeightLoader<'a> {
     /// activation's `input_scale` — are one positive float each, and every kernel that consumes one
     /// takes the reciprocal. A zero, a negative or a non-finite scale is refused here rather than
     /// encoded at the wrong magnitude.
+    ///
+    /// The activation's reciprocal is the encoder's **factor**, and the factor has a ceiling the
+    /// encoder's own rounding step states: above [`MAXIMUM_ENCODER_FACTOR`] no row can encode, so
+    /// the projection would answer zeros for every activation.
     fn activation_reciprocal(&self, request: &WeightRequest) -> Result<f32> {
-        Ok(1.0 / self.tensor_scale(request)?)
+        let scale = self.tensor_scale(request)?;
+        let reciprocal = 1.0 / scale;
+        if reciprocal > MAXIMUM_ENCODER_FACTOR {
+            return Err(Error::weight(
+                &request.tensor,
+                format!(
+                    "the calibrated activation scale is {scale} and the encoder's factor is its \
+                     reciprocal, {reciprocal}, which is above {MAXIMUM_ENCODER_FACTOR}: every \
+                     block scale of the matrix would round to zero, so the projection would \
+                     answer zeros for every activation"
+                ),
+            ));
+        }
+        Ok(reciprocal)
     }
 
     /// One tensor's single positive scale, as the checkpoint states it.
