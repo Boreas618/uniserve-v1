@@ -17,11 +17,9 @@ true predicate runs the call as an ungated call does; the steps compare
 exactly, as the image executor's do, because a predicated call runs the
 same kernels on the same inputs and selects their result.
 
-A resumed request's latent preparation restores the trajectory stored at a
-step boundary from host pages of the host latent pool, with the copies the
-worker plans from the stored layout to the one the preparation declares
-(``latent_restore_copies``): the steps that follow compute exactly what the
-uninterrupted trajectory computed from that step.
+The predicated calls are the whole contract here: the restoring preparation
+and its copy plan retired with the worker library (``latent_restore_copies``),
+so no test states them any more.
 """
 
 from __future__ import annotations
@@ -33,7 +31,6 @@ from pathlib import Path
 import pytest
 import torch
 
-from uniserve import worker as library
 from uniserve.bindings.workspace import Scratch
 from uniserve.executor.video import VideoExecutor
 from uniserve.loading.rank import Description, Loaded
@@ -253,16 +250,11 @@ class Worker:
         latent: dict,
         reads: list[torch.Tensor],
         predicate: bool | None,
-        stored: list[torch.Tensor] = (),
-        restore=None,
     ) -> None:
         """Run one call of ``kind``, gated by a device predicate if given.
 
-        The worker appends a restoring preparation's stored pages after its
-        reads, and a predicated call's ``uint8 [1]`` predicate after the
-        batch's other tensors, naming its position in the call's entry. A
-        restoring preparation's ``restore`` gives its ``latent["restore"]``
-        from what the executor prepared, as the worker binds it.
+        A predicated call's ``uint8 [1]`` predicate is appended after the
+        batch's other tensors, naming its position in the call's entry.
         """
         entry = {
             "index": 0,
@@ -278,7 +270,7 @@ class Worker:
             "output_names": [],
             "latent": latent,
         }
-        tensors = [*reads, *stored]
+        tensors = list(reads)
         if predicate is not None:
             entry["predicate"] = len(tensors)
             tensors.append(
@@ -287,56 +279,10 @@ class Worker:
         step = {"calls": [entry]}
         step["prepared"] = self.executor.prepare(step)
         assert step["prepared"][0]["reads"] == list(range(len(reads)))
-        if restore is not None:
-            entry["latent"]["restore"] = restore(step["prepared"][0])
         self.executor.execute(step, tensors)
 
     def prepare_latents(self, slot, write, reads, predicate=None) -> None:
         self.run("latent_preparation", slot, {"write": write}, reads, predicate)
-
-    def restore(self, slot, write, reads, stored, predicate=None) -> None:
-        """Prepare ``slot`` from ``reads`` and restore ``stored``, the
-        slot's pages as the rank stored them (page-locked ``uint8
-        [page_bytes]`` pages of the host latent pool), into bank ``write``,
-        with the copies the worker plans from the stored layout, the one the
-        preparation declares, to itself: every page that holds samples
-        whole.
-        """  # noqa: D205
-        page_bytes = int(stored[0].numel())
-
-        def copies(prepared: dict) -> dict:
-            layout = {
-                "layout": prepared["latent_layout"],
-                "page_bytes": page_bytes,
-            }
-            request = {
-                "sources": [layout],
-                "target": layout,
-                "content": [0] * 32,
-            }
-            planned = json.loads(
-                str(
-                    library.library()["latent_restore_copies"](
-                        json.dumps(request)
-                    )
-                )
-            )
-            assert all(
-                (offset, length) == (0, page_bytes)
-                for _, _, offset, _, length in planned
-            )
-            return {
-                "pages": len(stored),
-                "copies": [
-                    [page, offset, at, length]
-                    for _, page, offset, at, length in planned
-                ],
-            }
-
-        latent = {"write": write}
-        self.run(
-            "latent_preparation", slot, latent, reads, predicate, stored, copies
-        )
 
     def denoise(self, slot, read, write, step, predicate=None) -> None:
         latent = {"read": read, "write": write, "step": step}
@@ -399,35 +345,3 @@ def test_false_predicates_leave_the_trajectory_as_it_was(worker, slot):
     # A true preparation writes the request's noise as an ungated one does.
     worker.prepare_latents(slot, 1, own, predicate=True)
     assert torch.equal(worker.bank(1, slot), noise)
-
-
-@pytest.mark.parametrize("slot", [1, 2], ids=["text_to_video", "first_frame"])
-@torch.inference_mode()
-def test_a_restored_trajectory_continues_as_the_uninterrupted_one(worker, slot):
-    own = [worker.features(5)]
-    if slot == 2:
-        own.append(worker.keyframe(6))
-
-    # The uninterrupted trajectory: the noise in bank 0, its first step in
-    # bank 1 and its second in bank 0.
-    worker.prepare_latents(slot, 0, own)
-    worker.denoise(slot, 0, 1, 0)
-    first = worker.bank(1, slot)
-    worker.denoise(slot, 1, 0, 1)
-    second = worker.bank(0, slot)
-    assert not torch.equal(second, first)
-
-    # The trajectory stored at its first step, as the host latent pool
-    # holds it: one page-locked page of bytes per page of the slot.
-    stored = [
-        page.reshape(-1).cpu().pin_memory().view(torch.uint8) for page in first
-    ]
-    # A skipped restoring preparation keeps the bank it would write.
-    worker.restore(slot, 0, own, stored, predicate=False)
-    assert torch.equal(worker.bank(0, slot), second)
-    # A restoring preparation leaves the stored step in the bank it
-    # initializes, from which the next step is the uninterrupted one.
-    worker.restore(slot, 0, own, stored)
-    assert torch.equal(worker.bank(0, slot), first)
-    worker.denoise(slot, 0, 1, 1)
-    assert torch.equal(worker.bank(1, slot), second)
