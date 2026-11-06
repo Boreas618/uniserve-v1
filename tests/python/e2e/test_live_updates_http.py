@@ -1534,7 +1534,9 @@ def _restart_while_streaming(
         120,
         "the replaced daemon did not exit",
     )
-    assert _runs(successor)
+    # The one-body restart replaced `successor` in turn, so the daemon that
+    # serves now is the last of them.
+    assert _runs(successors[-1])
     status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
     assert status["deployment"]["engine"] == "ready", status
     assert _pids(log, "Engine") == engines_before
