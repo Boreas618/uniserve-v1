@@ -149,10 +149,15 @@ pub struct DecoderRunner<M: Decoder + Send + Sync> {
     /// so one name covers a batch, and a later decode of the same request replaces it — which is
     /// what a reader that copied in time expects.
     staged_request: Option<ipc::RequestKey>,
-    /// The pinned host scratch a trajectory of another element type lands in, allocated the first
-    /// time one is staged and reused after: the denoiser accumulates in FP32 and this decoder reads
-    /// the checkpoint's type, so the crossing is one conversion per clip, on the host.
-    crossing: Option<platform::PinnedBuffer>,
+    /// The denoiser's trajectory, copied here from the store on this runner's stream, which is what
+    /// orders a clip's read after the producing step and works across devices. Sized to the first one
+    /// staged and grown after.
+    trajectory: Option<Column>,
+    /// The latent frame the clip staged last starts at, when its block is still to be gathered from
+    /// `trajectory`: the replay gathers it, on the stream that then reads it.
+    gather: Option<u32>,
+    /// The elements of the trajectory staged last.
+    trajectory_elements: u64,
     /// The request whose clip the raster column last held, so a decode of another can be refused
     /// while the first is unread ([`clip_is_releasable`]).
     published_for: Option<ipc::RequestKey>,
@@ -282,7 +287,9 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             raster_elements: 0,
             products: None,
             staged_request: None,
-            crossing: None,
+            trajectory: None,
+            gather: None,
+            trajectory_elements: 0,
             published_for: None,
             postprocessor,
             frames: None,
@@ -621,143 +628,87 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         self.stage_columns(bucket, Some(latents))
     }
 
-    /// Stages the clip the denoiser published for `request` into the column `bucket`'s graph reads.
+    /// Stages the trajectory the denoiser published for `request`, and notes the clip to gather.
     ///
-    /// The column is sized from the layout first - `prepare_layout`'s own clip - so the destination's
-    /// extent is the model's rather than a length this runner recomputes, and `copy_into` refuses a
-    /// product whose bytes disagree with it instead of copying a prefix. The copy is on this
-    /// runner's stream and the store orders it after the producing step's write, which is what makes
-    /// it correct when the denoiser ran on another stream or another device.
+    /// **Nothing here waits or crosses to the host.** The copy is on this runner's stream and the store
+    /// orders it after the producing step's write, which is what makes it correct when the denoiser ran
+    /// on another stream or another device; the replay then gathers the clip's rows on the same stream.
+    /// So staging the next clip costs the previous clip's decode nothing.
     fn stage_product(
         &mut self,
         bucket: Bucket,
         request: ipc::RequestKey,
         store: &dyn Products,
     ) -> Result<()> {
-        self.stage_columns(bucket, None)?;
-        let layout = self.layout(bucket)?;
+        self.size_raster(bucket)?;
+        self.fill(bucket)?;
         let Some(published) = store.product(request, Product::VideoLatents)? else {
             return Err(crate::runners::products::absent(
                 request,
                 Product::VideoLatents,
             ));
         };
-        // **The boundary's one conversion.** The denoiser accumulates in FP32 (`SAMPLE_DTYPE`) and
-        // this decoder reads the checkpoint's own type; the reference spans the two with
-        // `torch.autocast`, which design 9 replaced with declared per-layer precision, so exactly
-        // one conversion happens here - once per clip, on the host, not per step and not in a loop.
-        let source = self.trajectory_scratch(published)?;
-        if !store.copy_into(request, Product::VideoLatents, &source, &self.stream)? {
+        // The boundary converts nothing: the decoder states the type it reads its latents in, and a
+        // trajectory of another type would be a reinterpretation of its bytes.
+        if published.dtype != self.latent {
+            return Err(Error::Invalid(format!(
+                "the decoder reads its latents as {} and the denoiser published {}",
+                self.latent, published.dtype
+            )));
+        }
+        let element = published
+            .dtype
+            .bytes()
+            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", published.dtype)))?;
+        let elements = published.bytes / element;
+        if self
+            .trajectory
+            .as_ref()
+            .is_none_or(|column| column.device.numel() < elements)
+        {
+            self.trajectory = Some(Column::new(self.device, published.dtype, elements)?);
+        }
+        let column = self
+            .trajectory
+            .as_ref()
+            .ok_or_else(|| Error::Invariant("the trajectory column was just sized".into()))?;
+        let destination =
+            TensorView::new(column.device.ptr, published.dtype, Shape::new(&[elements]));
+        if !store.copy_into(request, Product::VideoLatents, &destination, &self.stream)? {
             return Err(crate::runners::products::absent(
                 request,
                 Product::VideoLatents,
             ));
         }
-        // The copy is ordered on this stream, so the host may read the bytes once the stream reaches
-        // it. This is the one place in the media seam that waits on the device rather than ordering
-        // more work after it, and it waits once per clip.
-        //
-        // **It waits on the decode stream, so it also waits for whatever that stream still holds** -
-        // and what it holds is one clip's launch, which is what the media path's one-in-flight
-        // admission rule guarantees is nothing. A deployment that ever admits two media requests at
-        // once makes this the place the second one queues, and the fix then is a stream of the
-        // runner's own for the crossing rather than a narrower wait.
-        self.stream.synchronize()?;
-        let crossing = self
-            .crossing
-            .as_ref()
-            .ok_or_else(|| Error::Invariant("the trajectory scratch was just staged".into()))?;
-        // SAFETY: the buffer is this runner's own pinned storage, sized for exactly the trajectory
-        // and written by the copy above, which the synchronize has completed; nothing else holds a
-        // reference to it while the conversion reads it.
-        let bytes = unsafe { crossing.as_slice() };
-        let converted = nn::weights::convert(
-            published.dtype,
-            self.latent,
-            bytes,
-            "the denoiser's trajectory",
-        )
-        .map_err(Error::from)?;
-        // The trajectory is `[channels, voxels]` of the whole timeline, and the block the model reads
-        // is `[rows, channels]` of one clip's window in its own row order, so this crossing also
-        // takes the window and lays it out.
         let clip = self.spliced.get(&request).copied().unwrap_or(0);
-        let first = self.model.clip_start(clip);
-        let block = self.block_of(&layout, &converted, first)?;
-        self.columns.latents.write(&block)?;
+        self.gather = Some(self.model.clip_start(clip));
+        self.trajectory_elements = elements;
+        self.staged = Some(bucket);
         Ok(())
     }
 
-    /// The clip window starting at latent frame `first` of `converted`, the timeline's
-    /// `[channels, voxels]` latents, as the model's `[rows, channels]` block.
-    fn block_of(&self, layout: &Layout, converted: &[u8], first: u32) -> Result<Vec<u8>> {
-        let video = layout.video;
-        let voxels = usize::try_from(
-            u64::from(video.frames) * u64::from(video.height) * u64::from(video.width),
-        )
-        .map_err(|_| Error::Invalid("a clip's latent extent overflows".into()))?;
-        let channels = video.channels as usize;
-        let element = usize::try_from(
-            self.latent
-                .bytes()
-                .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", self.latent)))?,
-        )
-        .map_err(|_| Error::Invalid("an element wider than memory".into()))?;
-        let plane = video.height as usize * video.width as usize;
-        let start = first as usize * plane;
-        let timeline = converted.len() / (channels * element);
-        if timeline * channels * element != converted.len() || start + voxels > timeline {
-            return Err(Error::Invalid(format!(
-                "a clip of {voxels} voxels from latent frame {first} of a {plane}-voxel raster is \
-                 past a trajectory of {} bytes in {channels} channels",
-                converted.len()
-            )));
-        }
-        let order = self.model.latent_rows(layout).map_err(Error::from)?;
-        let order: Vec<u32> = order.unwrap_or_else(|| (0..voxels as u32).collect());
-        let mut block = vec![0_u8; order.len() * channels * element];
-        for (row, voxel) in order.iter().enumerate() {
-            for channel in 0..channels {
-                let from = (channel * timeline + start + *voxel as usize) * element;
-                let to = (row * channels + channel) * element;
-                block[to..to + element].copy_from_slice(&converted[from..from + element]);
-            }
-        }
-        Ok(block)
-    }
-
-    /// The pinned host scratch a trajectory of another element type lands in, sized to it once.
-    ///
-    /// The conversion is a host conversion, so the product's bytes must come back to the host first -
-    /// and a product of another type cannot be copied into this runner's column at all, which the
-    /// store refuses by both types. Reusing one buffer keeps the crossing to one allocation per
-    /// runner rather than one per clip.
-    fn trajectory_scratch(
-        &mut self,
-        published: crate::runners::products::Published,
-    ) -> Result<TensorView> {
-        let element = published
-            .dtype
-            .bytes()
-            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", published.dtype)))?;
-        let bytes = usize::try_from(published.bytes)
-            .map_err(|_| Error::Invalid("a trajectory is larger than memory".into()))?;
-        if self
-            .crossing
+    /// Gathers the staged clip's block out of the trajectory, on the stream the replay runs on.
+    fn gather_replayed(&mut self, bucket: Bucket, generation: u64, first: u32) -> Result<()> {
+        let kernels = self.lifecycle.generation_named(generation)?;
+        let stream = self.stream.clone();
+        let base = self.pool()?.base(self.stream_id())?;
+        let reserved = self.pool()?.reserved();
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let forward = nn::Forward::new(&stream, &kernels, &arena);
+        let layout = self.layout(bucket)?;
+        let column = self
+            .trajectory
             .as_ref()
-            .is_none_or(|buffer| buffer.len() < bytes)
-        {
-            self.crossing = Some(platform::PinnedBuffer::new(self.device, bytes)?);
-        }
-        let buffer = self
-            .crossing
-            .as_ref()
-            .ok_or_else(|| Error::Invariant("the trajectory scratch was just allocated".into()))?;
-        Ok(TensorView::new(
-            ops::DevicePtr::new(buffer.address()),
-            published.dtype,
-            Shape::new(&[published.bytes / element]),
-        ))
+            .ok_or_else(|| Error::Invariant("a clip was staged with no trajectory".into()))?;
+        let trajectory = TensorView::new(
+            column.device.ptr,
+            self.latent,
+            Shape::new(&[self.trajectory_elements]),
+        );
+        let block = self.latents(&layout)?;
+        self.model
+            .gather_latents(&forward, &layout, trajectory, first, block)
+            .map_err(Error::from)
     }
 
     /// Stages `bucket` with no batch behind it, so a first capture has defined columns to read.
@@ -1291,7 +1242,10 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
                 bucket, generation, ..
             } => {
                 let stream = self.stream.clone();
-                self.upload()?;
+                match self.gather.take() {
+                    Some(first) => self.gather_replayed(*bucket, *generation, first)?,
+                    None => self.upload()?,
+                }
                 let (served, captured) = self
                     .lifecycle
                     .graphs

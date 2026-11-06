@@ -1032,6 +1032,26 @@ pub trait Decoder {
         self.element_type()
     }
 
+    /// Write the latent block of the clip starting at latent frame `first`, on the forward's stream.
+    ///
+    /// `trajectory` is the timeline's latents as a denoiser publishes them, `[channels, voxels]`, and
+    /// `block` is the buffer [`Self::decode`] reads, `[rows, channels]` in [`Self::latent_rows`]'
+    /// order. A decoder that reads a trajectory says how its rows lie in it; the runner stages the
+    /// trajectory and asks, so a clip never crosses to the host.
+    fn gather_latents(
+        &self,
+        f: &crate::Forward,
+        layout: &Layout,
+        trajectory: TensorView,
+        first: u32,
+        block: TensorView,
+    ) -> Result<()> {
+        let _ = (f, layout, trajectory, first, block);
+        Err(Error::Unsupported(
+            "this decoder reads no denoiser trajectory".to_owned(),
+        ))
+    }
+
     /// For each row of the latent block [`Self::decode`] reads, the clip's voxel it holds, counted
     /// frame by frame, row by row.
     ///
