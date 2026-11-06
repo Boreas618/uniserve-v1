@@ -262,6 +262,7 @@ pub(crate) fn video_request(id: u64, video_units: u32) -> Request {
             // The fixture decoder's raster (`video_worker`).
             width: 24,
             height: 16,
+            condition_rows: 0,
         },
         trajectory: Default::default(),
         encoder_inputs: None,

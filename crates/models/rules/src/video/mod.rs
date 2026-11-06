@@ -489,13 +489,33 @@ impl Conditioning {
     }
 }
 
+/// How a denoiser lays a request's conditions into its rows, and how many it
+/// holds.
+///
+/// A sparse denoiser attends whole tiles, so each condition's audio and each
+/// condition's pixels fill tiles of their own, and a reference video fills
+/// the tiles of its token grid, which its rows need not fill. A dense
+/// denoiser packs row for row: its tile is one row. What a request takes is
+/// therefore the denoiser's arithmetic and not its rows' sum, and it decides
+/// both whether the deployment serves the request and which of its graphs
+/// does ([`plan::RequestPlan::condition_rows`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ConditionPacking {
+    /// Rows one request's conditions may take: the deployment's capacity,
+    /// zero for a denoiser that takes none.
+    pub capacity: u32,
+    /// Rows of one tile.
+    pub tile_rows: u32,
+    /// Tokens of one video tile along time, height and width.
+    pub video_tile: [u32; 3],
+}
+
 /// What the video denoiser a deployment places serves, as the worker that
 /// denoises reports it to the frontend.
 ///
 /// The denoiser fixes its schedule, and with it every request's step count;
 /// the tasks, canvases and reference limits bound what a request may ask
-/// for. The worker that denoises a request admits its conditions into the
-/// condition capacity it provisioned. The engine carries it JSON-encoded
+/// for, and its condition packing what its conditions may take. The engine carries it JSON-encoded
 /// ([`Self::encode`]), so a frontend reads the report of workers of another
 /// build.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -525,6 +545,9 @@ pub struct DenoiserInfo {
     /// The references one request may carry and the largest short edge an
     /// image reference is encoded at; zeros for a denoiser that takes none.
     pub references: ReferenceLimits,
+    /// How the denoiser packs a request's conditions and how many rows they
+    /// may take.
+    pub condition_packing: ConditionPacking,
 }
 
 impl DenoiserInfo {
@@ -580,6 +603,12 @@ impl DenoiserInfo {
         }
         if self.audio_sample_rate == 0 {
             return Err("a video denoiser declares no audio sample rate");
+        }
+        let packing = self.condition_packing;
+        if packing.capacity > 0
+            && (packing.tile_rows == 0 || packing.video_tile.iter().any(|extent| *extent == 0))
+        {
+            return Err("a video denoiser takes conditions and declares no tile to pack them in");
         }
         if !self.frames.is_valid() {
             return Err("a video denoiser declares an empty frame rule");

@@ -417,6 +417,13 @@ pub struct VideoRequest<'a> {
     /// Those rows take the image's rotary coordinates rather than the text clock's, so a layout
     /// that placed them on the prompt's clock would be silently wrong rather than refusing.
     pub vision_spans: &'a [(u32, u32)],
+    /// The condition rows the request's layout holds, as one rung of the deployment's ladder;
+    /// `None` is the deployment's whole capacity.
+    ///
+    /// A layout's rows are real rows of every projection, attention and feed-forward of every step,
+    /// so the rung is what a step costs, and the conditions a request carries fill it from its
+    /// start. The caller chooses it, because a warm request carries no conditions to count.
+    pub condition_rows: Option<u32>,
 }
 
 /// One condition's raster, as a layout needs it.

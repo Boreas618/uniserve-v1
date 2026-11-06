@@ -359,9 +359,9 @@ SMALL_CAPACITY_OPTIONS = [
 
 
 def test_omniref_refuses_conditions_above_capacity(tmp_path: Path) -> None:
-    # Admission passes W4, whose every condition product fits its bound; the
-    # denoising ranks count its conditions in the denoiser's tiles and refuse
-    # it, and the deployment then serves its image-only form.
+    # Each of W4's condition products fits its bound, and the server counts
+    # its conditions in the denoiser's tiles and refuses it; the deployment
+    # then serves its image-only form.
     inputs = _inputs()
     export = _omniref()
     port = find_free_port()

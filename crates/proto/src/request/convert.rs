@@ -623,6 +623,7 @@ impl From<&DiffusionRequest> for wire::DiffusionRequest {
                 seed: sampling.seed,
                 width: sampling.width,
                 height: sampling.height,
+                condition_rows: sampling.condition_rows,
             }),
             trajectory: request.trajectory.id,
             denoised_steps: request.trajectory.denoised_steps,
@@ -683,6 +684,7 @@ impl TryFrom<wire::DiffusionRequest> for DiffusionRequest {
                 seed: sampling.seed,
                 width: sampling.width,
                 height: sampling.height,
+                condition_rows: sampling.condition_rows,
             },
             trajectory: Trajectory {
                 id: request.trajectory,

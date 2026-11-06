@@ -192,6 +192,7 @@ fn run() -> Result<(), String> {
             text_tokens: case.tokens,
             conditions: &[],
             vision_spans: &[],
+            condition_rows: None,
         };
         let (layout, packing) = rules.layout(&request).map_err(|error| error.to_string())?;
         let bound = rules.rows_bound().map_err(|error| error.to_string())?;

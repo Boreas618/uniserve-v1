@@ -34,6 +34,9 @@ pub struct DiffusionSamplingParams {
     pub width: u32,
     /// Output raster height in pixels: the request's canvas.
     pub height: u32,
+    /// Denoiser rows the request's conditions take, as the denoiser packs them; zero without
+    /// conditions. A denoising step's layout holds them, so this is what selects its graph.
+    pub condition_rows: u32,
 }
 
 /// The encoder that adds an image to a request's context.

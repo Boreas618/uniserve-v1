@@ -71,6 +71,7 @@ fn base_denoiser() -> DenoiserInfo {
             })
             .to_vec(),
         references: models::video::ReferenceLimits::default(),
+        condition_packing: models::video::ConditionPacking::default(),
     }
 }
 
@@ -463,6 +464,7 @@ async fn video_denoiser_handshake_bounds_requests_and_capabilities() {
             served(480, "16:9", 832, 480),
         ],
         references: models::video::ReferenceLimits::default(),
+        condition_packing: models::video::ConditionPacking::default(),
     };
     let model = InputProcessor::new(
         loaded.config().clone(),

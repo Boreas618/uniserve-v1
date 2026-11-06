@@ -323,6 +323,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
                 })
                 .to_vec(),
             references: models::video::ReferenceLimits::default(),
+            condition_packing: models::video::ConditionPacking::default(),
         },
         ProcessorConfig {
             patch_size: 16,

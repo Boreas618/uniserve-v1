@@ -608,6 +608,7 @@ fn plan(args: &Args) -> Result<(), String> {
         text_tokens: args.text_tokens,
         conditions: &conditions,
         vision_spans: &[],
+        condition_rows: None,
     };
     // The layout is the store's, not the case's: a program's key carries the bound the arrangement
     // states, so sizing it to this case would key attention differently from the store that serves it.
@@ -828,6 +829,7 @@ fn encode(args: &Args) -> Result<(), String> {
         text_tokens: args.text_tokens,
         conditions: &conditions,
         vision_spans: &[],
+        condition_rows: None,
     };
     // The layout is the store's, not the case's: a program's key carries the bound the arrangement
     // states, so sizing it to this case would key attention differently from the store that serves it.

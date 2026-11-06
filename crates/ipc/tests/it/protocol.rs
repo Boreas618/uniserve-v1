@@ -227,6 +227,7 @@ fn media_sampling() -> DiffusionSamplingParams {
         seed: 17,
         width: 1024,
         height: 768,
+        condition_rows: 0,
     }
 }
 

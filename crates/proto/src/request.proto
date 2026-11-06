@@ -973,6 +973,7 @@ message DiffusionSamplingParams {
   uint64 seed = 3;
   uint32 width = 4;
   uint32 height = 5;
+  uint32 condition_rows = 6;
 }
 
 // ------------------------------------------------------------------ events

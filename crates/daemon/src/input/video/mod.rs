@@ -22,15 +22,16 @@
 //!    aspect, frame rate, decoded frame count and soundtrack, and an audio
 //!    file's sample rate and decoded sample count, through `ffprobe`.
 //! 4. [`plan::plan_request`] resolves the canvas, the frame counts, how each
-//!    condition is prepared, the Qwen3-VL vision grids and the encoder units;
-//!    [`presentation::present`] tokenizes the conditioner's presentation with
-//!    the checkpoint's tokenizer and tags every token for the denoiser's AdaLN
-//!    modulation.
+//!    condition is prepared, the Qwen3-VL vision grids and the encoder units,
+//!    and the rows the conditions take as the denoiser packs them
+//!    ([`plan::RequestPlan::condition_rows`]), which the deployment's
+//!    condition capacity must hold; [`presentation::present`] tokenizes the
+//!    conditioner's presentation with the checkpoint's tokenizer and tags
+//!    every token for the denoiser's AdaLN modulation.
 //! 5. Each condition's media is published to shared memory for the worker's
 //!    media reader, and the request becomes one `DiffusionRequest`
-//!    describing every condition. The worker that denoises the request admits
-//!    its conditions into the condition capacity it provisioned, counting
-//!    their rows as its denoiser packs them.
+//!    describing every condition and stating the rows they take, by which
+//!    the engine finds the smallest graph that holds them.
 //!
 //! Stages 1 to 3 wait only on I/O and run on the async runtime; stages 4
 //! and 5 are CPU work, the planning, the tokenization and the copies into
@@ -55,10 +56,11 @@ use std::sync::Arc;
 use models::video::plan;
 use models::video::plan::{
     CANVAS_MAX_PIXELS, CANVAS_MULTIPLE, ConditionSpec, ConditionType, MAX_VIDEO_SECONDS,
-    MIN_VIDEO_SECONDS, PlanLimits, ProcessorConfig, ReferenceConfig, Role, Target, VideoInputError,
+    MIN_VIDEO_SECONDS, PlanLimits, ProcessorConfig, ReferenceConfig, RequestField, Role, Target,
+    VideoInputError,
 };
 use models::video::presentation;
-use models::video::{Canvas, Conditioning, DenoiserInfo, VideoTask};
+use models::video::{Canvas, ConditionPacking, Conditioning, DenoiserInfo, VideoTask};
 use proto::MediaSource;
 use proto::request::{ConditionExtent, DiffusionRequest};
 use proto::request::{DiffusionSamplingParams, RequestId, Trajectory};
@@ -194,6 +196,9 @@ struct Presenter {
     /// prompt is encoded, which reference images are banded to fill
     /// (`RequestPlan::image_bands`).
     latent_encoding_units: u32,
+    /// How the denoiser packs a request's conditions, and how many rows they
+    /// may take.
+    condition_packing: ConditionPacking,
     tokenizer: DynTokenizer,
 }
 
@@ -254,6 +259,7 @@ impl VideoService {
             reference_limits: denoiser.references,
             references,
         };
+        let condition_packing = denoiser.condition_packing;
         Ok(Self {
             denoiser,
             media: media.clone(),
@@ -263,6 +269,7 @@ impl VideoService {
                 limits,
                 vision,
                 latent_encoding_units: latent_encoding_units.max(1),
+                condition_packing,
                 tokenizer,
             }),
         })
@@ -487,6 +494,18 @@ impl Presenter {
             &self.vision,
             &self.limits,
         )?;
+        let condition_rows = plan.condition_rows(&self.condition_packing);
+        if condition_rows > self.condition_packing.capacity {
+            return Err(VideoInputError::invalid(
+                RequestField::Conditions,
+                format!(
+                    "the conditions take {condition_rows} denoiser rows, more than the {} this \
+                     deployment serves; serve with a larger video_config.max_condition_rows",
+                    self.condition_packing.capacity
+                ),
+            )
+            .into());
+        }
         let presentation = presentation::present(&*self.tokenizer, &plan, &fetched.prompt)?;
 
         let prompt_token_ids = presentation.token_ids;
@@ -561,6 +580,7 @@ impl Presenter {
                 seed: fetched.seed,
                 width: plan.canvas.width,
                 height: plan.canvas.height,
+                condition_rows,
             },
             // The migrator gives the request its trajectory's identity when
             // it first submits it.
@@ -711,6 +731,20 @@ mod tests {
     /// `latent_encoding_units` condition units in one round, on a deployment
     /// that sizes references as `references` states.
     fn encoding_service(latent_encoding_units: u32, references: ReferenceConfig) -> VideoService {
+        packing_service(latent_encoding_units, references, 79_104)
+    }
+
+    /// The same, holding `capacity` condition rows in 128-row tiles.
+    fn packing_service(
+        latent_encoding_units: u32,
+        references: ReferenceConfig,
+        capacity: u32,
+    ) -> VideoService {
+        let condition_packing = models::video::ConditionPacking {
+            capacity,
+            tile_rows: 128,
+            video_tile: [4, 4, 8],
+        };
         VideoService::new(
             DenoiserInfo {
                 tasks: ["t2va", "fl2va", "ref2va"].map(str::to_owned).to_vec(),
@@ -727,6 +761,7 @@ mod tests {
                 },
                 canvases: served_canvases(),
                 references: REFERENCE_LIMITS,
+                condition_packing,
             },
             vision(),
             15.0,
@@ -1017,11 +1052,11 @@ mod tests {
         assert_ne!(inputs[0].video_units, inputs[3].video_units);
     }
 
-    /// The daemon prepares a reference request whatever rows its conditions
-    /// take: the rank that denoises it counts them with the denoiser's own
-    /// size rule and refuses what its provisioned capacity cannot hold.
+    /// A request states the rows its conditions take as the denoiser packs
+    /// them, whole tiles here, and one past the deployment's capacity is
+    /// refused by name before any of it is published.
     #[tokio::test]
-    async fn the_daemon_leaves_condition_rows_to_the_denoising_rank() {
+    async fn a_requests_conditions_are_counted_in_the_denoisers_tiles() {
         let body = request(serde_json::json!({
             "model": "minimax_h3",
             "prompt": "a fox",
@@ -1031,6 +1066,18 @@ mod tests {
         }));
         let (request, _, _media) = service().process("rows", &body, 1 << 16).await.unwrap();
         assert_eq!(planned(&request).conditions[0].latent_units, [7296]);
+        assert_eq!(request.sampling.condition_rows, 7296);
+
+        let references = ReferenceConfig::released(&REFERENCE_LIMITS);
+        let narrow = packing_service(1, references, 7168);
+        let refused = narrow.process("rows", &body, 1 << 16).await.unwrap_err();
+        let message = refused.to_string();
+        assert!(
+            message.contains("7296")
+                && message.contains("7168")
+                && message.contains("video_config.max_condition_rows"),
+            "{message}"
+        );
     }
 
     /// A request that breaks a request-only rule is rejected before any of

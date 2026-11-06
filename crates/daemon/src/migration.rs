@@ -954,6 +954,7 @@ mod tests {
                 seed: 3,
                 width: 64,
                 height: 32,
+                condition_rows: 0,
             },
             trajectory: Trajectory {
                 id: 7,

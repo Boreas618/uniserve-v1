@@ -431,7 +431,8 @@ impl DiffusionRequest {
     /// Checks the request's own consistency.
     ///
     /// The prompt is nonempty and its token count fits in `u32`; the frame
-    /// and media-unit counts and the canvas are positive; and the task is
+    /// and media-unit counts and the canvas are positive; a request states
+    /// condition rows exactly when it carries conditions; and the task is
     /// named and the conditioning present.
     ///
     /// The engine's media admission rejects a failing request with
@@ -448,6 +449,11 @@ impl DiffusionRequest {
             || self.prompt_token_ids.len() > u32::MAX as usize
         {
             return Err(DiffusionRequestError::InvalidSampling);
+        }
+        if (self.sampling.condition_rows == 0) != self.conditions.is_empty() {
+            return Err(DiffusionRequestError::Conditions(
+                "a request states condition rows exactly when it carries conditions",
+            ));
         }
         if self.task.is_empty() || self.conditioning.is_empty() {
             return Err(DiffusionRequestError::Conditions(
