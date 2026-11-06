@@ -81,6 +81,7 @@ constexpr Status kSuccess = 0;
 
 // `cudnnBackendDescriptorType_t`.
 constexpr int32_t kDescriptorConvolution = 1;
+constexpr int32_t kDescriptorEngine = 2;
 constexpr int32_t kDescriptorEngineConfig = 3;
 constexpr int32_t kDescriptorEngineHeuristic = 4;
 constexpr int32_t kDescriptorExecutionPlan = 5;
@@ -120,6 +121,10 @@ constexpr int32_t kAttrOperationBwdDataW = 709;
 constexpr int32_t kAttrOperationBwdDataDx = 710;
 constexpr int32_t kAttrOperationBwdDataDy = 711;
 constexpr int32_t kAttrOperationGraphOps = 801;
+// `CUDNN_ATTR_OPERATIONGRAPH_HANDLE`: the device the graph is planned for. Without one the library
+// reads a blank device, every engine that checks its grid or architecture against it declines, and
+// a graph that a channels-last engine happens not to check is the only kind that finds a plan.
+constexpr int32_t kAttrOperationGraphHandle = 800;
 constexpr int32_t kAttrTensorDataType = 901;
 constexpr int32_t kAttrTensorDimensions = 902;
 constexpr int32_t kAttrTensorStrides = 903;
@@ -149,6 +154,7 @@ constexpr int32_t kTypeHeurMode = 8;
 constexpr int32_t kTypeNumericalNote = 11;
 constexpr int32_t kTypeBackendDescriptor = 15;
 constexpr int32_t kTypeInt32 = 23;
+constexpr int32_t kTypeHandle = 0;
 
 // `CUDNN_DATA_FLOAT`: the compute type of every convolution here.
 constexpr int32_t kComputeFloat = 0;
@@ -168,6 +174,8 @@ constexpr int64_t kMaxEngineConfigs = 32;
 // `CUDNN_NUMERICAL_NOTE_DOWN_CONVERT_INPUTS`: the engine narrows its inputs before
 // computing with them, which for FP32 inputs is TF32 and nothing else. It is the only
 // note that distinguishes a convolution that may use TF32 from one that may not.
+// A tensor-core engine reads FP32 inputs as TF32 whatever its other notes say.
+constexpr int32_t kNumericalNoteTensorCore = 0;
 constexpr int32_t kNumericalNoteDownConvertInputs = 1;
 // The notes one engine can carry, as `cudnnBackendGetAttribute` returns them.
 constexpr int64_t kMaxNumericalNotes = 16;
@@ -284,7 +292,7 @@ struct Plan {
 };
 
 /// The plan of a shape, from the process's cache or from cuDNN's heuristic.
-Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error,
+Plan plan_of(const uniserve_conv_call& call, const std::string& key, void* handle, char* error,
              int32_t* status) {
   static std::mutex mutex;
   static std::map<std::string, Plan> plans;
@@ -466,6 +474,7 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
   }
   void* graph = nullptr;
   built = built && make(kDescriptorOperationGraph, &graph) &&
+          set(graph, kAttrOperationGraphHandle, kTypeHandle, 1, &handle) &&
           set(graph, kAttrOperationGraphOps, kTypeBackendDescriptor, 1, &operation) &&
           finalize(graph, "the operation graph");
 
@@ -519,7 +528,14 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
       if (room > kMaxEngineConfigs * 64) {
         room = kMaxEngineConfigs * 64;
       }
+      // The results are written into descriptors the caller made: an array of null pointers is
+      // refused entry by entry, and the list then reads as empty.
       configs.assign(static_cast<size_t>(room), nullptr);
+      for (void*& config : configs) {
+        if (library.backend_create(kDescriptorEngineConfig, &config) != kSuccess) {
+          config = nullptr;
+        }
+      }
       int64_t count = 0;
       const bool answered =
           library.backend_get(heuristic, kAttrEngineHeurResults, kTypeBackendDescriptor, room,
@@ -535,17 +551,17 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
         configs.clear();
         return -1;
       }
-      if (count <= 0) {
-        // A query the library answered with nothing is the *empty list*, which is a different fact
-        // from a query it refused and is the one this mode's record has to tell apart.
-        configs.clear();
-        return 0;
-      }
       if (count > room) {
         count = room;
       }
-      configs.resize(static_cast<size_t>(count));
-      return count;
+      const size_t kept = count > 0 ? static_cast<size_t>(count) : 0;
+      for (size_t at = kept; at < configs.size(); ++at) {
+        if (configs[at] != nullptr) {
+          library.backend_destroy(configs[at]);
+        }
+      }
+      configs.resize(kept);
+      return count > 0 ? count : 0;
     };
     char tried[160] = {};
     const int32_t modes[3] = {kHeuristicModeA, kHeuristicModeB, kHeuristicModeFallback};
@@ -666,7 +682,8 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
       }
       *narrows = false;
       for (int64_t at = 0; at < notes_count && at < kMaxNumericalNotes; ++at) {
-        *narrows = *narrows || notes[at] == kNumericalNoteDownConvertInputs;
+        *narrows = *narrows || notes[at] == kNumericalNoteDownConvertInputs ||
+                   notes[at] == kNumericalNoteTensorCore;
       }
       return true;
     };
@@ -674,10 +691,15 @@ Plan plan_of(const uniserve_conv_call& call, const std::string& key, char* error
     bool hosted = false;
     bool named_narrows = false;
     for (int64_t at = 0; at < static_cast<int64_t>(configs.size()) && built; ++at) {
+      // As with the list, the engine is read into a descriptor made here.
       void* engine = nullptr;
+      if (library.backend_create(kDescriptorEngine, &engine) != kSuccess) {
+        continue;
+      }
+      int64_t engines = 0;
       if (library.backend_get(configs[at], kAttrEngineCfgEngine, kTypeBackendDescriptor, 1,
-                              nullptr, &engine) != kSuccess ||
-          engine == nullptr) {
+                              &engines, &engine) != kSuccess) {
+        library.backend_destroy(engine);
         continue;
       }
       bool narrows = false;
@@ -923,7 +945,7 @@ extern "C" int32_t UNISERVE_CONV_ENTRY(const uniserve_conv_call* call, void* str
     return refuse(error, "cudnnSetStream failed");
   }
 
-  const Plan plan = plan_of(*call, plan_key(*call, device), error, &status);
+  const Plan plan = plan_of(*call, plan_key(*call, device), handle, error, &status);
   if (plan.plan == nullptr) {
     return status != 0 ? status : refuse(error, "the convolution's plan could not be built");
   }
