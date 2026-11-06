@@ -260,6 +260,7 @@ impl Shape {
             tokens: self.tokens,
             variant: self.variant,
             extent: Extent::None,
+            serves: None,
         }
     }
 }
@@ -316,6 +317,19 @@ pub enum Extent {
     None,
     /// One denoising step's latent layout (`nn::capability::Layout`).
     Latents(nn::capability::Layout),
+    /// What a request asks for, which the mechanism states to find its bucket: the output frames and
+    /// the canvas. A layout's frame count is the request's own, because the video's extent sets the
+    /// sparse selection budget and the audio timeline, so a longer bucket is not a padded one.
+    Request {
+        /// Output frames after the model's alignment.
+        frames: u32,
+        /// Raster columns of a frame.
+        width: u32,
+        /// Raster rows of a frame.
+        height: u32,
+        /// Prompt rows the layout must hold.
+        text_rows: u32,
+    },
     /// One decoded clip's raster.
     Clip {
         /// Frames in the clip.
@@ -339,6 +353,9 @@ pub struct Bucket {
     pub tokens: u32,
     /// A media computation's extent, and [`Extent::None`] for the four causal-LM variants.
     pub extent: Extent,
+    /// The request this bucket serves as `(frames, width, height)`, when the extent alone does not
+    /// say: a layout states latents, and a request states output frames and a canvas.
+    pub serves: Option<(u32, u32, u32)>,
 }
 
 impl Bucket {
@@ -349,6 +366,7 @@ impl Bucket {
             rows,
             tokens: rows,
             extent: Extent::None,
+            serves: None,
         }
     }
 
@@ -363,6 +381,7 @@ impl Bucket {
             rows,
             tokens,
             extent: Extent::None,
+            serves: None,
         }
     }
 
@@ -376,6 +395,7 @@ impl Bucket {
             rows,
             tokens: 0,
             extent: Extent::Latents(layout),
+            serves: None,
         }
     }
 
@@ -390,6 +410,7 @@ impl Bucket {
             rows,
             tokens: 0,
             extent: Extent::Latents(layout),
+            serves: None,
         }
     }
 
@@ -421,7 +442,46 @@ impl Bucket {
         }
         self.rows >= computation.rows
             && self.tokens >= computation.tokens
-            && (computation.extent == Extent::None || self.extent == computation.extent)
+            && match computation.extent {
+                Extent::None => true,
+                Extent::Request {
+                    frames,
+                    width,
+                    height,
+                    text_rows,
+                } => self.serves_request(frames, width, height, text_rows),
+                stated => self.extent == stated,
+            }
+    }
+
+    /// Whether this bucket serves a request of `frames` frames at `width` by `height`.
+    ///
+    /// A clip's bucket is the canvas's whatever the timeline, a track's is the timeline's whatever
+    /// the canvas, and a step's is both, in a layout whose prompt rows hold the request's. An
+    /// encode's states neither.
+    fn serves_request(&self, frames: u32, width: u32, height: u32, text_rows: u32) -> bool {
+        let same = |served: (u32, u32, u32)| served == (frames, width, height);
+        match (self.variant, self.extent) {
+            (
+                Variant::Decode,
+                Extent::Clip {
+                    width: columns,
+                    height: rows,
+                    ..
+                },
+            ) => (columns, rows) == (width, height),
+            (Variant::AudioDecode, _) => self.serves.is_none_or(|served| served.0 == frames),
+            (_, Extent::Latents(layout)) => {
+                self.serves.is_none_or(same) && layout.text_rows >= text_rows
+            }
+            _ => self.serves.is_none_or(same),
+        }
+    }
+
+    /// The same bucket, stating the request it serves.
+    pub const fn serving(mut self, frames: u32, width: u32, height: u32) -> Self {
+        self.serves = Some((frames, width, height));
+        self
     }
 
     /// A host call's bucket: a computation no graph is captured for.
@@ -439,6 +499,7 @@ impl Bucket {
             rows: 1,
             tokens: 0,
             extent: Extent::None,
+            serves: None,
         }
     }
 
@@ -453,6 +514,7 @@ impl Bucket {
                 height,
                 width,
             },
+            serves: None,
         }
     }
 
@@ -499,6 +561,16 @@ impl fmt::Display for Bucket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.extent {
             Extent::None => self.shape().fmt(formatter),
+            Extent::Request {
+                frames,
+                width,
+                height,
+                ..
+            } => write!(
+                formatter,
+                "{}/{} rows/a request of {frames} frames at {width}x{height}",
+                self.variant, self.rows
+            ),
             Extent::Latents(layout) => write!(
                 formatter,
                 "{}/{} rows/{} latents {}x{}x{}{}",
@@ -765,6 +837,42 @@ impl Buckets {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A request finds the bucket of its own timeline, canvas and prompt, and never a longer one.
+    #[test]
+    fn a_request_selects_the_bucket_of_its_own_timeline() {
+        let layout = |frames: u32, text_rows: u32| nn::capability::Layout {
+            video: nn::capability::LatentShape {
+                channels: 24,
+                frames,
+                height: 48,
+                width: 84,
+            },
+            audio: None,
+            text_rows,
+            condition_rows: 0,
+            condition_elements: 0,
+        };
+        let short = Bucket::denoise(1, layout(37, 1024)).serving(124, 1344, 768);
+        let wide = Bucket::denoise(1, layout(37, 2048)).serving(124, 1344, 768);
+        let long = Bucket::denoise(1, layout(57, 1024)).serving(192, 1344, 768);
+        let plan = Buckets::new([short, wide, long]);
+        let asked = |frames, text_rows| Computation {
+            call: ipc::MediaCall::Denoising,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::Request {
+                frames,
+                width: 1344,
+                height: 768,
+                text_rows,
+            },
+        };
+        assert_eq!(plan.select_media(&asked(124, 537)), Some(short));
+        assert_eq!(plan.select_media(&asked(124, 1500)), Some(wide));
+        assert_eq!(plan.select_media(&asked(192, 537)), Some(long));
+        assert_eq!(plan.select_media(&asked(141, 537)), None);
+    }
 
     /// A host call's bucket serves its call whatever the batch holds, because it states no bound.
     ///

@@ -770,7 +770,11 @@ impl EpochPlan {
         // derived from them rather than named, so a rank that captures no denoise bucket states no
         // denoise phase.
         let denoise_set = Buckets::new(warm.iter().map(|candidate| {
-            executor::plan::Bucket::denoise(1, denoiser.layout(&candidate.view()))
+            executor::plan::Bucket::denoise(1, denoiser.layout(&candidate.view())).serving(
+                candidate.frames,
+                candidate.width,
+                candidate.height,
+            )
         }));
         // One audio decode bucket per distinct track those layouts carry. A `t2va` clip is a picture
         // **and** a soundtrack, so a deployment that captured clips alone would produce video with
@@ -791,7 +795,9 @@ impl EpochPlan {
                     continue;
                 }
                 seen.push((audio.frames, audio.channels));
-                buckets.push(executor::plan::Bucket::audio(1, layout));
+                let mut track = executor::plan::Bucket::audio(1, layout);
+                track.serves = bucket.serves;
+                buckets.push(track);
             }
             buckets
         };
@@ -2068,7 +2074,12 @@ fn media_candidates(
     // **The timeline rule is the checkpoint's** (`17 * n + 5`): a deployment states a duration, and
     // the frames it admits are the least legal timeline covering it. An unsnapped count captured a
     // layout the splice could not write and the decoder could not decode.
-    let frames = snap_frames(frames as u32)?;
+    let longest = snap_frames(frames as u32)?;
+    // A layout's frames are the request's own, because the video's extent sets the sparse selection
+    // budget and the audio timeline: every legal timeline a request may ask for is a bucket.
+    let shortest = snap_frames((models::video::plan::MIN_VIDEO_SECONDS * f64::from(FPS)).round() as u32)?;
+    let clip_frames = frame_clips()?.clip_frames;
+    let timelines: Vec<u32> = (shortest..=longest).step_by(clip_frames as usize).collect();
     for edge in &video.resolutions {
         let short_edge: u32 = edge
             .strip_suffix('p')
@@ -2105,20 +2116,22 @@ fn media_candidates(
             // be a graph nothing fills.
             for task in tasks.iter().copied() {
                 let (first_frames, last_frames, references) = task_conditions(task);
-                for capacity in capacities {
-                    candidates.push(executor::runners::denoiser::WarmRequest {
-                        task,
-                        width: canvas.width,
-                        height: canvas.height,
-                        frames,
-                        fps: FPS,
-                        first_frames,
-                        last_frames,
-                        references,
-                        text_tokens: *capacity,
-                        conditions: Vec::new(),
-                        vision_spans: Vec::new(),
-                    });
+                for frames in timelines.iter().copied() {
+                    for capacity in capacities {
+                        candidates.push(executor::runners::denoiser::WarmRequest {
+                            task,
+                            width: canvas.width,
+                            height: canvas.height,
+                            frames,
+                            fps: FPS,
+                            first_frames,
+                            last_frames,
+                            references,
+                            text_tokens: *capacity,
+                            conditions: Vec::new(),
+                            vision_spans: Vec::new(),
+                        });
+                    }
                 }
             }
         }
