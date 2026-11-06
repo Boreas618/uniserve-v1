@@ -530,14 +530,12 @@ impl Layouts {
             },
             // Axis-major, `[axes, rows]`: `nn::Rotary`'s sectioned rotation reads one coordinate
             // per axis per token and refuses a leading extent that is not the axis count. **The
-            // coordinates are integers** (`position_ids` in the reference is an `int64` table cut to
-            // its three axes), so the table is `i32` and the rotary's launch reads
-            // `positions_i32` - a table declared F32 is the same numbers in another type and the
-            // store has no such cell: `generation 1 has no kernel for rotary_factors
-            // descriptor dtype_f32_positions_f32_columns_48`.
+            // coordinates are real numbers**: the reference's `position_ids` is FP64, and the clock
+            // and the raster are rescaled (`ROPE_FRAME_RESCALE`, a column is `4/3`), so an integer
+            // table would truncate every generated row's place.
             StateTable {
                 name: "position_ids",
-                dtype: DType::I32,
+                dtype: DType::F32,
                 shape: Shape::new(&[3, rows]),
             },
             StateTable {
@@ -609,7 +607,7 @@ impl Layouts {
             },
             StateTable {
                 name: "position_ids",
-                dtype: DType::I32,
+                dtype: DType::F32,
                 shape: Shape::new(&[3, rows]),
             },
             StateTable {
@@ -724,11 +722,17 @@ impl Layouts {
             .map(|size| *size as i32)
             .collect();
         let audio: Vec<i32> = packing.audio_indices().map(|row| row as i32).collect();
-        let video: Vec<i32> = packing
+        // The table is read in raster order: the patch writes raster rows, the scatter puts row `r`
+        // at `table[r]`, and the gather before the head reads them back. So it holds the packed row
+        // of each raster row, which is what orders a sparse layout's video rows tile-major.
+        let mut video = vec![0_i32; packing.video_indices.len()];
+        for (packed, raster) in packing
             .video_indices
             .iter()
-            .map(|row| *row as i32)
-            .collect();
+            .zip(&packing.video_raster_indices)
+        {
+            video[*raster as usize] = *packed as i32;
+        }
         // The refiner's document: one prompt, so its queries are every padded row and its keys stop
         // at the prompt's last row. The prompt's row count is the media clock's own start.
         let refiner_q = integers(&[0, layout.text_rows as i32]);
@@ -1425,12 +1429,12 @@ fn gcd(left: u32, right: u32) -> u32 {
 /// The packing states one coordinate triple per row; `nn::Rotary`'s sectioned rotation indexes a
 /// table by `[axis, token]` and a row-major table would rotate each row by another row's angles.
 fn coordinates(points: &[[f64; 3]]) -> Vec<u8> {
-    // Axis-major int32, which is the table's declared type: a coordinate is an index, not a
-    // measured value, and the rotary reads one integer per axis per token.
+    // Axis-major FP32, which is the table's declared type: a coordinate is a place on a rescaled
+    // clock or raster, and the rotary reads one real number per axis per token.
     let mut bytes = Vec::with_capacity(points.len() * 3 * 4);
     for axis in 0..3 {
         for point in points {
-            bytes.extend_from_slice(&(point[axis] as i32).to_le_bytes());
+            bytes.extend_from_slice(&(point[axis] as f32).to_le_bytes());
         }
     }
     bytes

@@ -51,12 +51,12 @@ def spec(fields, parameters, target):
     # columns past the last section read the last axis.
     halves = [width // 2 for width in widths_of(fields, axes)]
     # The contiguous cut's thresholds: a column at or past threshold `a` reads
-    # axis `a` or later.
+    # axis `a` or later, so axis `a`'s threshold is the frequencies before it.
     cuts = []
     total = 0
     for half in halves:
-        total += half
         cuts.append(total)
+        total += half
 
     signature = {
         "positions": "*" + POSITIONS[fields["positions"]],

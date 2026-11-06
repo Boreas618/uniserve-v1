@@ -513,6 +513,11 @@ impl Projections {
         linear(&self.first)?.forward(f, embedding, hidden)?;
         nn::layers::Silu.forward(f, hidden, activated)?;
         linear(&self.second)?.forward(f, activated, time)?;
+        // The reference feeds the projections `silu(embedding)` (`weights.py`, `activated`): the
+        // pair's output is activated once more before any modulation reads it.
+        let activated_time = arena.tensor(time_type, time.shape)?;
+        nn::layers::Silu.forward(f, time, activated_time)?;
+        let time = activated_time;
         // The one crossing: the activation the timestep pair built, rounded into the type the
         // modulation projections read. `target <- 1 * source + 0 * target` is the reference's
         // `.to(weight.dtype)`, and the zero beta means the target is never read.
