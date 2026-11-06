@@ -49,7 +49,6 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use minimax_h3::AttentionKind;
 use minimax_h3::decoding::{ClipDecoder, arena_reservation, video_arena};
 use minimax_h3::video_vae::{Canvas, Tiles, VideoDecoder};
 use nn::capability::Decoder;
@@ -165,15 +164,8 @@ fn run() -> Result<(), String> {
         // knows the clip's latent extents.
         let spatial = config.spatial_compression();
         let raster = (clip_canvas.width * spatial, clip_canvas.height * spatial);
-        let decoder = VideoDecoder::load(
-            &config,
-            &[raster],
-            AttentionKind::Dense,
-            DType::F32,
-            input,
-            &mut loader,
-        )
-        .map_err(|error| error.to_string())?;
+        let decoder = VideoDecoder::load(&config, &[raster], DType::F32, input, &mut loader)
+            .map_err(|error| error.to_string())?;
 
         let scratch = decoder
             .scratch(&f, &canvas)
@@ -238,16 +230,9 @@ fn run() -> Result<(), String> {
     .to_string();
     let mut stitcher: Vec<(String, String)> = blends.clone();
     stitcher.push(("unpatchify_video".to_owned(), unpatchify));
-    // The stitch's third family: each seam's neighbour is copied into one contiguous block before the
-    // blend reads it, because `cross_fade` addresses its sources flat and a neighbour in a raster wider
-    // than the tile is not one contiguous block. One copy serves every seam of every canvas.
-    stitcher.push((
-        "copy_block".to_owned(),
-        nn::layers::CopyBlock::descriptor_of(DType::F32).to_string(),
-    ));
     stitcher.sort();
     println!(
-        "# the stitcher declares {} distinct blend row(s), one unpatchify and one copy",
+        "# the stitcher declares {} distinct blend row(s) and one unpatchify",
         blends.len()
     );
 
@@ -361,15 +346,8 @@ fn fit_arenas(
                 .map_err(|error| error.to_string())?;
             let spatial = config.spatial_compression();
             let raster = (clip_canvas.width * spatial, clip_canvas.height * spatial);
-            let decoder = VideoDecoder::load(
-                config,
-                &[raster],
-                AttentionKind::Dense,
-                dtype,
-                input,
-                &mut loader,
-            )
-            .map_err(|error| error.to_string())?;
+            let decoder = VideoDecoder::load(config, &[raster], dtype, input, &mut loader)
+                .map_err(|error| error.to_string())?;
             let plan =
                 video_arena(config, &clip_canvas, dtype).map_err(|error| error.to_string())?;
             let need = arena_reservation(&plan);

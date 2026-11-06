@@ -140,7 +140,7 @@ impl Track {
 /// plan in `notes/h3/decoders-interface.md` uses, so a mismatch is visible in one place - **and the order
 /// is the order the model reserves them in**, because the arena is one cursor: a buffer listed before
 /// another is also reserved before it, and anything the code reserves inside a loop is multiplied. The
-/// transformer's fourteen are reserved once per clip (`VideoDecoder::scratch`) and handed to every tile;
+/// transformer's thirteen are reserved once per clip (`VideoDecoder::scratch`) and handed to every tile;
 /// the token buffers are per tile, so their entry is the grid's sum.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Buffer {
@@ -267,7 +267,7 @@ pub fn video_arena(
     // One token buffer holds every tile, so its rows are the tiles' rows in grid order — summed,
     // because a tile at the canvas's edge can be narrower than the tile size.
     let rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
-    // **The transformer's fourteen buffers are one tile's, not the grid's sum.** The decoder's canvas is
+    // **The transformer's thirteen buffers are one tile's, not the grid's sum.** The decoder's canvas is
     // one tile (`VideoDecoder`) and `TileScratch` is reserved once per clip and reused by every tile, so
     // sizing them by the sum reserved the grid's worth of buffers for a decode that holds one tile's -
     // eight times the need on a 16-tile canvas. `decode` refuses a grid whose tiles differ in rows, so
@@ -279,17 +279,15 @@ pub fn video_arena(
         ))
     })?;
     let tile_rows = tile.canvas.rows();
-    let tile_voxels = tile.canvas.voxels();
-    // The clip's own raster, which the tiles are stitched into.
-    let raster = u64::from(frames) * u64::from(height) * u64::from(width_px);
     let channels = u64::from(crate::output::Rgb::CHANNELS);
     // **The order is the reservation order**: the clip-level buffers are reserved once, before the
-    // tile loop, and live across the whole clip; the transformer's fourteen are reserved there too, once
+    // tile loop, and live across the whole clip; the transformer's thirteen are reserved there too, once
     // (`VideoDecoder::scratch`), and reused by every tile - the arena never rewinds, so a per-tile
     // reservation would grow the clip's footprint by the tile count. The token buffers *are* per tile,
-    // because each tile's decode owns its own, and their sum is the `tokens` entry. The executor sizes
-    // the arena by the sum. There is no entry for the clip's blended raster: the blend's destination is
-    // the caller's `DecodedMedia.video`, which is the runner's buffer and not the arena's.
+    // because each tile's decode owns its own and its successors read it, and their sum is the `tokens`
+    // entry. The executor sizes the arena by the sum. There is no entry for the clip's raster: the
+    // stitch's destination is the caller's `DecodedMedia.video`, which is the runner's buffer and not
+    // the arena's.
     let patch = u64::from(config.out_channels)
         * u64::from(config.temporal_compression())
         * u64::from(config.spatial_compression())
@@ -302,12 +300,7 @@ pub fn video_arena(
     let element = crate::text_encoder::element_of(dtype);
     Ok(vec![
         Buffer {
-            name: "decoded".to_owned(),
-            element,
-            elements: raster * channels,
-        },
-        Buffer {
-            // The stitch's seam block: one tile's pixels, contiguous, which every blend copies its
+            // The stitch's seam block: one tile's pixels, contiguous, which every blend unpacks its
             // neighbour into. It is reserved with the clip's other buffers because one block serves
             // every seam, and the grid's tiles are all the same size.
             name: "seam".to_owned(),
@@ -326,11 +319,6 @@ pub fn video_arena(
             name: "stream".to_owned(),
             element,
             elements: tile_rows * columns,
-        },
-        Buffer {
-            name: "projected".to_owned(),
-            element,
-            elements: tile_voxels * columns,
         },
         Buffer {
             name: "cosine".to_owned(),
@@ -397,34 +385,24 @@ pub fn video_arena(
 
 /// The video decoder's tiled output path: one tile's tokens become its pixels in the clip's raster.
 ///
-/// The decoder decodes overlapping tiles one after another and blends each into the raster as it
-/// lands, which is the reference's stitch (`uniserve/nn/vae/tiled.py:46-81`): a tile is written where
-/// it belongs, then blended with the tile above it over the rows they share, then with the tile to
-/// its left over the columns they share. The first tile row and column have no predecessor, so they
-/// are written and nothing is blended.
+/// The decoder decodes overlapping tiles one after another and writes each into the raster as it lands,
+/// which is the reference's stitch (`uniserve/nn/vae/tiled.py`, `stitch_tiles`): a tile is written
+/// where it belongs, then blended with the tile above it over the rows they share, then with the tile
+/// to its left over the columns they share. The first tile row and column have no predecessor, so they
+/// are written and nothing is blended. A tile's trailing rows and columns are the reference's crop:
+/// they stay in the raster only until the next tile writes over them.
 ///
-/// Two rasters of `[channels, frames, rows, columns]` in the decoder's element type carry one clip
-/// while it is stitched. `plain` holds every tile as it was decoded and is never blended into;
-/// `blended` holds the result. The reference keeps its neighbours unmodified for a reason
-/// (`uniserve/nn/vae/tiled.py:51-56`): a tile's row blend reads the tile above, and that neighbour
-/// must be its *decoded* block rather than one already faded into its own predecessor, or the
-/// overlap where two seams cross is computed in a different order from the seams themselves. Writing
-/// each tile into both rasters costs one extra unpatchify launch per tile: every placement is a
-/// strided view of a raster, which the operators write through.
-///
-/// A **source** cannot be a strided view of either raster. A seam of a grid wider than one tile
-/// reads a block that is not contiguous in `[channels, frames, rows, columns]` order - the
-/// predecessor's last rows, laid out at the raster's width - and `cross_fade` addresses its sources
-/// flat, so a shifted view of a wider raster reads the wrong rows past the first. Each seam
-/// therefore copies its neighbour into one tile-shaped buffer first, `[channels, frames, tile rows,
-/// tile columns]` contiguous, and blends from that: one copy per seam, no operator signature change,
-/// and the blend's own key is untouched because only its destination ever carried strides.
+/// **A blend's neighbour is the tile as it was decoded, and only its tokens still hold that.** Tiles
+/// overlap, so no raster of the clip's size can hold them: a later tile's write replaces the band it
+/// shares with its predecessor, and that band is exactly what the next blend must read. The reference
+/// keeps every tile for this reason (`tiled.py`: "Neighbors remain unmodified so corner arithmetic
+/// follows the same order as edge arithmetic"), and so does this stitch: every tile's tokens stay in
+/// the arena for the whole clip, and a seam unpacks the neighbour's tokens into one tile-shaped block
+/// and blends from it. The block's only reader is the blend that follows on the same stream.
 pub struct ClipDecoder {
     unpatchify: UnpatchifyVideo,
     /// One blend layer for each overlap the tile grid has, by extent and axis.
     blends: Vec<(u32, u32, CrossFade)>,
-    /// The copy that makes a seam's neighbour contiguous for the blend's flat source addressing.
-    copy: nn::layers::CopyBlock,
     /// Pixels per latent position, the ratio a tile's latent origin scales by.
     ratio: u32,
     /// Elements of one token: `out_channels · temporal · spatial²`, the row width every tile's decode
@@ -476,7 +454,6 @@ impl ClipDecoder {
         Ok(Self {
             unpatchify,
             blends,
-            copy: nn::layers::CopyBlock::new(dtype)?,
             patch,
             ratio: spatial,
         })
@@ -498,40 +475,36 @@ impl ClipDecoder {
     /// Write one decoded tile into the clip's raster and blend it with its neighbours.
     ///
     /// `tokens` is what [`crate::video_vae::VideoDecoder::decode`] wrote for this tile,
-    /// `[rows, out_channels · temporal · spatial²]`, its voxel rows first; `dest` is the whole clip's
-    /// raster; `seam` is one tile-shaped contiguous buffer, reused by every blend of the clip, that a
-    /// neighbour is copied into before it is faded. The caller decodes the tiles in [`Tile`] order,
-    /// because a blend reads what the tile above and the tile to the left have already written.
+    /// `[rows, out_channels · temporal · spatial²]`, its voxel rows first; `above` and `left` are the
+    /// same for the tile above and the tile to the left, and each is present exactly when the tile
+    /// shares a seam on that side; `out` is the whole clip's raster; `seam` is one tile-shaped
+    /// contiguous buffer, reused by every blend of the clip, that a neighbour is unpacked into. The
+    /// caller writes the tiles in [`Tile`] order, because a later tile replaces the bands an earlier
+    /// one does not keep.
     pub fn write_tile(
         &self,
         f: &Forward,
         tile: &Tile,
         tokens: TensorView,
-        decoded: TensorView,
-        blended: TensorView,
+        above: Option<TensorView>,
+        left: Option<TensorView>,
+        out: TensorView,
         seam: TensorView,
     ) -> Result<()> {
-        for (name, raster) in [("decoded", decoded), ("blended", blended)] {
-            let shape = raster.shape;
-            if shape.rank() != 4 || shape.dim(0) != u64::from(self.unpatchify.channels()) {
-                return Err(Error::config(format!(
-                    "the {name} raster is {:?}, not [channels, frames, rows, columns]",
-                    shape.dims()
-                )));
-            }
+        let shape = out.shape;
+        if shape.rank() != 4 || shape.dim(0) != u64::from(self.unpatchify.channels()) {
+            return Err(Error::config(format!(
+                "the clip's raster is {:?}, not [channels, frames, rows, columns]",
+                shape.dims()
+            )));
         }
-        // The seam buffer is the shape every blend's source has, contiguous: a copy writes it, and the
-        // blend reads it flat, which is the addressing its program has.
+        // The blend's source is the block the neighbour was unpacked into, so its shape is the tile's.
+        let ratio = u64::from(self.ratio);
         let (tile_rows, tile_columns) = (
-            u64::from(tile.canvas.height) * u64::from(self.ratio),
-            u64::from(tile.canvas.width) * u64::from(self.ratio),
+            u64::from(tile.canvas.height) * ratio,
+            u64::from(tile.canvas.width) * ratio,
         );
-        let seam_shape = Shape::new(&[
-            decoded.shape.dim(0),
-            decoded.shape.dim(1),
-            tile_rows,
-            tile_columns,
-        ]);
+        let seam_shape = Shape::new(&[shape.dim(0), shape.dim(1), tile_rows, tile_columns]);
         let packed = [
             seam_shape.dim(1) * tile_rows * tile_columns,
             tile_rows * tile_columns,
@@ -543,16 +516,44 @@ impl ClipDecoder {
                 "the seam buffer is {seam:?}, not {seam_shape:?} contiguous"
             )));
         }
-        let ratio = u64::from(self.ratio);
-        let first_row = u64::from(tile.latent_rows.0) * ratio;
-        let first_column = u64::from(tile.latent_columns.0) * ratio;
-        let plain = self.placement(decoded, tile, first_row, first_column, 0, 0)?;
-        let view = self.placement(blended, tile, first_row, first_column, 0, 0)?;
-        // The operator's declared input is the token **grid** - `frames x height x width` rows - while a
-        // tile's buffer carries the grid plus the decoder's register and tail rows, which the decode
-        // writes and this operator never reads. So the launch states the rows it reads: `ops`' own
-        // check wants that shape exactly (`Unpatchify::check`), and the layer admits spare rows only
-        // because a view past the grid is legal to hand it - not because it should be handed one.
+        let view = self.placement(
+            out,
+            tile,
+            u64::from(tile.latent_rows.0) * ratio,
+            u64::from(tile.latent_columns.0) * ratio,
+        )?;
+        self.unpatchify.forward(f, self.grid(tile, tokens)?, view)?;
+        // Each blend reads the neighbour's last `extent` positions along its axis and this tile's first
+        // `extent`, and the column blend reads what the row blend wrote, which is the reference's order.
+        for (extent, axis, neighbour, side) in [
+            (tile.above, 2, above, "above"),
+            (tile.left, 3, left, "to the left of"),
+        ] {
+            if extent == 0 {
+                continue;
+            }
+            let neighbour = neighbour.ok_or_else(|| {
+                Error::config(format!(
+                    "tile ({}, {}) shares a {extent}-pixel seam and no tokens were given for the \
+                     tile {side} it",
+                    tile.row, tile.column
+                ))
+            })?;
+            self.unpatchify
+                .forward(f, self.grid(tile, neighbour)?, seam)?;
+            self.blend(extent, axis)?
+                .forward(f, Some(seam), view, view)?;
+        }
+        Ok(())
+    }
+
+    /// The rows of a tile's token buffer the unpatchify reads.
+    ///
+    /// The operator's declared input is the token **grid** - `frames x height x width` rows - while a
+    /// tile's buffer carries the grid plus the decoder's register and tail rows, which the decode writes
+    /// and this operator never reads. So the launch states the rows it reads: `ops`' own check wants
+    /// that shape exactly (`Unpatchify::check`). A neighbour of a uniform grid has the same grid.
+    fn grid(&self, tile: &Tile, tokens: TensorView) -> Result<TensorView> {
         let voxels = tile.canvas.voxels();
         if tokens.shape.rank() != 2 || tokens.shape.dim(0) < voxels {
             return Err(Error::config(format!(
@@ -560,87 +561,23 @@ impl ClipDecoder {
                 tokens.shape.dims()
             )));
         }
-        let grid = TensorView::new(
+        Ok(TensorView::new(
             tokens.offset_elements(0),
             tokens.dtype,
             Shape::new(&[voxels, tokens.shape.dim(1)]),
-        );
-        self.unpatchify.forward(f, grid, plain)?;
-        self.unpatchify.forward(f, grid, view)?;
-        // A blend reads its neighbour's **last** `extent` positions along the axis and writes the
-        // current tile's first `extent`. The predecessor's last positions are the seam itself, which
-        // still holds the predecessor's pixels in the raster, so the neighbour's view starts one
-        // tile-extent minus one overlap before the tile - not one overlap before it, which would read
-        // the tile's own pixels from a band further down. That view is strided wherever the raster is
-        // wider than the tile, and `cross_fade` addresses its sources flat, so the view is copied into
-        // the contiguous seam buffer first: the copy reads the raster through the view's strides, the
-        // blend reads the buffer flat, and both are the addressing their programs have.
-        let mut destination_strides = [0_i64; ops::copy_block::RANK];
-        for (axis, stride) in packed.iter().enumerate() {
-            destination_strides[axis] = i64::try_from(*stride)
-                .map_err(|_| Error::config("a seam block is larger than i64 strides".to_owned()))?;
-        }
-        let contiguous = TensorView::with_strides(
-            seam.offset_elements(0),
-            seam.dtype,
-            seam_shape,
-            nn::Strides::new(&packed),
-        );
-        let (body_rows, body_columns) = (
-            u64::from(tile.canvas.height) * ratio,
-            u64::from(tile.canvas.width) * ratio,
-        );
-        if tile.above != 0 {
-            let previous = self.placement(
-                decoded,
-                tile,
-                first_row,
-                first_column,
-                u32::try_from(body_rows).unwrap_or(u32::MAX) - tile.above,
-                0,
-            )?;
-            self.copy
-                .forward(f, previous, contiguous, &destination_strides)?;
-            self.blend(tile.above, 2)?
-                .forward(f, Some(contiguous), view, view)?;
-        }
-        if tile.left != 0 {
-            let previous = self.placement(
-                decoded,
-                tile,
-                first_row,
-                first_column,
-                0,
-                u32::try_from(body_columns).unwrap_or(u32::MAX) - tile.left,
-            )?;
-            self.copy
-                .forward(f, previous, contiguous, &destination_strides)?;
-            self.blend(tile.left, 3)?
-                .forward(f, Some(contiguous), view, view)?;
-        }
-        Ok(())
+        ))
     }
 
-    /// A view of `dest` holding one tile's pixel block, shifted back by `up` rows and `left` columns.
-    ///
-    /// The shift reads the region a blend's predecessor occupies, which the tile grid has already
-    /// written; the view keeps the raster's own strides, so the operator writes through them.
+    /// A view of `dest` holding one tile's pixel block, which keeps the raster's own strides, so the
+    /// operators write through them.
     fn placement(
         &self,
         dest: TensorView,
         tile: &Tile,
         first_row: u64,
         first_column: u64,
-        up: u32,
-        left: u32,
     ) -> Result<TensorView> {
         let ratio = u64::from(self.ratio);
-        let rows = first_row
-            .checked_sub(u64::from(up))
-            .ok_or_else(|| Error::config("a blend starts above the raster".to_owned()))?;
-        let columns = first_column
-            .checked_sub(u64::from(left))
-            .ok_or_else(|| Error::config("a blend starts left of the raster".to_owned()))?;
         let shape = Shape::new(&[
             dest.shape.dim(0),
             // The raster's own frames: every tile spans them all, so the placement reads the extent
@@ -650,7 +587,7 @@ impl ClipDecoder {
             u64::from(tile.canvas.width) * ratio,
         ]);
         Ok(TensorView::with_strides(
-            dest.element(&[0, 0, rows, columns]),
+            dest.element(&[0, 0, first_row, first_column]),
             dest.dtype,
             shape,
             dest.strides,
@@ -664,10 +601,8 @@ impl ClipDecoder {
     /// `[3, rows]` table, and `out` the clip's raster `[channels, frames, rows, columns]` in the
     /// decoder's element type, which the tiles are stitched into. Every tile view is the model's own:
     /// the rows are cumulative over the tiles' voxel counts, and the token buffer is reserved here, in
-    /// the arena, one tile at a time.
-    ///
-    /// The tiles are decoded one after another because a seam blend reads what the tile above and the
-    /// tile to its left have already written.
+    /// the arena, one tile at a time, and kept for the clip: a seam blend reads the tile above and the
+    /// tile to the left as they were decoded.
     pub fn decode_clip(
         &self,
         f: &Forward,
@@ -753,12 +688,7 @@ impl ClipDecoder {
                         .join(", ")
                 ))
             })?;
-        // The clip-level buffers, reserved once: `decoded` holds every tile as it was decoded and is read
-        // as an unmodified neighbour, and `out` - the caller's raster - takes the stitch, which is why the
-        // plan lists no third raster. `scratch` is the transformer's fourteen, reserved here so that every
-        // tile of the clip shares them.
-        let decoded = f.arena().tensor(out.dtype, out.shape)?;
-        // The seam buffer: one tile-shaped contiguous block every blend copies its neighbour into. A
+        // The seam buffer: one tile-shaped contiguous block every blend unpacks its neighbour into. A
         // tile's extents are the same across a grid, so one buffer serves every seam of the clip and
         // the blends of a tile are ordered on the stream that wrote it.
         let first = tiles.first().ok_or_else(|| {
@@ -773,13 +703,17 @@ impl ClipDecoder {
                 u64::from(first.canvas.width) * u64::from(self.ratio),
             ]),
         )?;
-        // The transformer's fourteen buffers, reserved **once per clip** and reused by every tile: the
+        // The transformer's thirteen buffers, reserved **once per clip** and reused by every tile: the
         // arena never rewinds, so a per-tile reservation would grow the clip's footprint by the tile
         // count while the plan states them once.
         let scratch = decoder.scratch(f, &canvas)?;
         let patch = self.patch;
+        // A tile's neighbours are the previous tile and the tile one grid row back, because `tiles` is
+        // row-major.
+        let columns = tiles.iter().filter(|tile| tile.row == first.row).count();
+        let mut decoded: Vec<TensorView> = Vec::with_capacity(tiles.len());
         let mut start = 0_u64;
-        for tile in tiles {
+        for (index, tile) in tiles.iter().enumerate() {
             let tile_rows = crate::video_vae::Canvas::rows(&tile.canvas);
             let tile_voxels = tile.canvas.voxels();
             let latent = TensorView::new(
@@ -788,12 +722,15 @@ impl ClipDecoder {
                 Shape::new(&[tile_voxels, latents.shape.dim(1)]),
             );
             // One tile's token buffer: the plan's `tokens` is the whole clip's, and the reservations
-            // of the tiles sum to it because each is reused only by its own tile's decode.
+            // of the tiles sum to it because each lives until the clip's last seam has read it.
             let tokens = f
                 .arena()
                 .tensor(out.dtype, Shape::new(&[tile_rows, patch]))?;
             decoder.decode(f, &canvas, latent, positions, tokens, &scratch)?;
-            self.write_tile(f, tile, tokens, decoded, out, seam)?;
+            let above = index.checked_sub(columns).map(|tile| decoded[tile]);
+            let left = (tile.column > 0).then(|| decoded[index - 1]);
+            self.write_tile(f, tile, tokens, above, left, out, seam)?;
+            decoded.push(tokens);
             start += tile_voxels;
         }
         Ok(())
@@ -1175,9 +1112,8 @@ mod tests {
         // **The transformer's buffers are one tile's, and the tokens are every tile's.** `decode`
         // reserves `TileScratch` once per clip and reuses it for every tile, while each tile reserves
         // its own token buffer inside the loop and the arena never rewinds. A plan that sized the
-        // fourteen by the grid summed two different lifetimes into one number.
+        // thirteen by the grid summed two different lifetimes into one number.
         let tile_rows: u64 = grid[0].canvas.rows();
-        let tile_voxels: u64 = grid[0].canvas.voxels();
         let all_rows: u64 = grid.iter().map(|tile| tile.canvas.rows()).sum();
         let all_voxels: u64 = grid.iter().map(|tile| tile.canvas.voxels()).sum();
         let buffer = |name: &str| {
@@ -1198,7 +1134,7 @@ mod tests {
             * u64::from(config.spatial_compression());
         assert_eq!(buffer("tokens").elements, all_rows * patch);
         // The seam block: one tile's pixels at the raster's frame count, contiguous - the buffer every
-        // blend copies its neighbour into, reserved once because every tile of a grid is the same size.
+        // blend unpacks its neighbour into, reserved once because every tile of a grid is the same size.
         assert_eq!(
             buffer("seam").elements,
             u64::from(grid[0].canvas.height)
@@ -1209,7 +1145,6 @@ mod tests {
                 * 3
         );
         assert_eq!(buffer("stream").elements, tile_rows * columns);
-        assert_eq!(buffer("projected").elements, tile_voxels * columns);
         assert_eq!(buffer("gate_up").elements, tile_rows * 2 * columns * 4);
         assert_eq!(buffer("gated").elements, tile_rows * columns * 4);
         assert!(
@@ -1238,10 +1173,10 @@ mod tests {
         // follow.
         let clip_level: Vec<&str> = arena
             .iter()
-            .take(3)
+            .take(2)
             .map(|buffer| buffer.name.as_str())
             .collect();
-        assert_eq!(clip_level, ["decoded", "seam", "tokens"]);
+        assert_eq!(clip_level, ["seam", "tokens"]);
         // Every buffer is named once and no buffer is empty.
         let mut names: Vec<&str> = arena.iter().map(|buffer| buffer.name.as_str()).collect();
         let count = names.len();
@@ -1252,7 +1187,7 @@ mod tests {
     }
 
     #[test]
-    fn a_tiles_placement_is_a_view_of_the_raster_and_its_blends_read_the_neighbour() {
+    fn a_tiles_placement_is_a_view_of_the_raster_and_every_seam_has_a_blend() {
         // The served canvas's output width: the raster the tiles are placed into.
         const WIDTH: u32 = 1344;
         // 768x1344 pixels: 48x84 latent positions, so the checkpoint's 256-pixel tiles and 64-pixel
@@ -1283,45 +1218,18 @@ mod tests {
             let first_row = u64::from(tile.latent_rows.0) * ratio;
             let first_column = u64::from(tile.latent_columns.0) * ratio;
             let view = clip
-                .placement(dest, tile, first_row, first_column, 0, 0)
+                .placement(dest, tile, first_row, first_column)
                 .expect("the placement");
             // The block is the tile's canvas in pixels, and it sits where the seam table says.
             assert_eq!(view.shape.dims(), &[3, u64::from(frames), 256, 256]);
             let origin = (first_row * u64::from(WIDTH) + first_column) * 2;
             assert_eq!(view.ptr.address(), 0x1000 + origin);
             if tile.above != 0 {
-                // The neighbour is the predecessor's own block: its last `above` rows are the seam,
-                // which sits where this tile starts, so the block begins `256 - above` rows above it.
-                let up = 256 - tile.above;
-                let previous = clip
-                    .placement(dest, tile, first_row, first_column, up, 0)
-                    .expect("the row neighbour");
-                assert_eq!(
-                    previous.ptr.address(),
-                    0x1000 + origin - u64::from(up) * u64::from(WIDTH) * 2
-                );
-                // Its last `above` rows are this tile's first `above` rows - the seam itself.
-                assert_eq!(
-                    previous.ptr.address() + u64::from(256 - tile.above) * u64::from(WIDTH) * 2,
-                    0x1000 + origin
-                );
                 assert!(clip.blend(tile.above, 2).is_ok());
                 above_widths.push(tile.above);
                 above_seams += 1;
             }
             if tile.left != 0 {
-                let left = 256 - tile.left;
-                let previous = clip
-                    .placement(dest, tile, first_row, first_column, 0, left)
-                    .expect("the column neighbour");
-                assert_eq!(
-                    previous.ptr.address(),
-                    0x1000 + origin - u64::from(left) * 2
-                );
-                assert_eq!(
-                    previous.ptr.address() + u64::from(256 - tile.left) * 2,
-                    0x1000 + origin
-                );
                 assert!(clip.blend(tile.left, 3).is_ok());
                 left_widths.push(tile.left);
                 left_seams += 1;
@@ -1357,13 +1265,13 @@ mod tests {
         }
     }
 
-    /// A seam's neighbour is not one contiguous block of a raster wider than the tile, and
-    /// `cross_fade` addresses its sources flat: the stitch copies the neighbour into one contiguous
-    /// tile-shaped buffer and blends from that. The buffer's contract is enforced where it is used,
-    /// because a packed view of the raster passed in its place would blend the wrong rows and read as a
-    /// different picture rather than a failure.
+    /// A seam's neighbour is the tile as it was decoded, which only its tokens still hold: the stitch
+    /// unpacks them into one contiguous tile-shaped block and blends from that. Handing it a view of
+    /// the raster instead would blend pixels a later tile already replaced and read as a different
+    /// picture rather than a failure, so the block's contract is enforced where it is used, and a seam
+    /// with no neighbour's tokens is refused.
     #[test]
-    fn a_seam_blends_from_one_contiguous_block_and_refuses_a_view_of_the_raster() {
+    fn a_seam_blends_a_neighbours_tokens_through_one_contiguous_block() {
         let config = crate::video_vae::tests::video_config();
         // Two tiles across, one down: 28 latent columns at 16 pixels each is 448, which is two
         // 256-pixel tiles sharing a 64-pixel seam, so the clip has a left blend and no row blend.
@@ -1379,23 +1287,21 @@ mod tests {
         // is a rounding error against the budget the plan states.
         let arena = nn::forward::Arena::new(ops::DevicePtr::new(0), 1 << 40);
         let f = Forward::recording(&arena);
-        let decoded = f
+        let raster = f
             .arena()
             .tensor(DType::F16, Shape::new(&[3, frames, rows, columns]))
-            .expect("the decoded raster");
-        let blended = f
-            .arena()
-            .tensor(DType::F16, Shape::new(&[3, frames, rows, columns]))
-            .expect("the blended raster");
-        let tokens = f
-            .arena()
-            .tensor(
-                DType::F16,
-                Shape::new(&[Canvas::rows(&tiles[1].canvas), 3 * 4 * 16 * 16]),
-            )
-            .expect("the tile's tokens");
+            .expect("the clip's raster");
+        let tokens = |tile: &Tile| {
+            f.arena()
+                .tensor(
+                    DType::F16,
+                    Shape::new(&[Canvas::rows(&tile.canvas), 3 * 4 * 16 * 16]),
+                )
+                .expect("the tile's tokens")
+        };
+        let (previous, tokens) = (tokens(&tiles[0]), tokens(&tiles[1]));
         let clip = ClipDecoder::new(&config, DType::F16).expect("the output path");
-        // A contiguous 256x256 block: the shape the copy writes.
+        // A contiguous 256x256 block: the shape the neighbour is unpacked into.
         let packed = [frames * 256 * 256, 256 * 256, 256, 1];
         let seam = f
             .arena()
@@ -1404,22 +1310,44 @@ mod tests {
         assert_eq!(seam.strides, nn::Strides::new(&packed));
         // The raster itself is what a caller might pass by mistake: same shape, the raster's strides.
         let wrong = TensorView::with_strides(
-            decoded.offset_elements(0),
+            raster.offset_elements(0),
             DType::F16,
             Shape::new(&[3, frames, 256, 256]),
-            decoded.strides,
+            raster.strides,
         );
         let error = clip
-            .write_tile(&f, &tiles[1], tokens, decoded, blended, wrong)
+            .write_tile(&f, &tiles[1], tokens, None, Some(previous), raster, wrong)
             .expect_err("a strided seam is not the block the blend reads");
         let message = format!("{error}");
         assert!(
             message.contains("seam buffer"),
             "the refusal names the buffer it wants: {message}"
         );
-        // With the contiguous block the same tile is written: the refusal was the buffer, nothing else.
-        clip.write_tile(&f, &tiles[1], tokens, decoded, blended, seam)
-            .expect("a contiguous seam writes the tile");
+        let error = clip
+            .write_tile(&f, &tiles[1], tokens, None, None, raster, seam)
+            .expect_err("a seam with no neighbour has nothing to fade against");
+        assert!(
+            format!("{error}").contains("no tokens were given"),
+            "the refusal names the missing neighbour: {error}"
+        );
+        // With the contiguous block and the neighbour's tokens the same tile is written: the refusals
+        // were those two, nothing else. The tile is unpacked into the raster, the neighbour into the
+        // block, and one blend reads the block.
+        struct Launches(Vec<&'static str>);
+        impl ops::capture::Sink for Launches {
+            fn launched(&mut self, operator: &'static str, _key: &str) {
+                self.0.push(operator);
+            }
+        }
+        let mut launches = Launches(Vec::new());
+        ops::capture::set_sink(Some(&mut launches));
+        let written = clip.write_tile(&f, &tiles[1], tokens, None, Some(previous), raster, seam);
+        ops::capture::set_sink(None);
+        written.expect("a contiguous seam writes the tile");
+        assert_eq!(
+            launches.0,
+            ["unpatchify_video", "unpatchify_video", "cross_fade"]
+        );
     }
     /// Every seam the default canvases produce is in the blend table.
     ///
