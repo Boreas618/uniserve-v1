@@ -302,6 +302,9 @@ struct Assembly {
     appended: usize,
     /// The framed units that arrived before their turn, by place.
     waiting: std::collections::BTreeMap<usize, Vec<u8>>,
+    /// The encoded track, when it arrived before the first unit opened the assembly: the two encode
+    /// beside each other, and only a unit knows the raster the assembly is opened at.
+    track: Option<Vec<u8>>,
 }
 
 impl Output {
@@ -375,6 +378,12 @@ impl Output {
                     self.rates.audio_rate,
                     units,
                 )?;
+                let track = crate::lock(&self.assemblies)
+                    .get_mut(&request_id(request))
+                    .and_then(|assembly| assembly.track.take());
+                if let Some(track) = track {
+                    self.media.set_audio(request_id(request), track)?;
+                }
             }
         }
         let decoded = unit_frames as usize * height as usize * width as usize * 3;
@@ -429,7 +438,20 @@ impl Output {
         let track = self
             .media
             .encode_audio(&pcm, samples, self.rates.audio_rate)?;
-        self.media.set_audio(request_id(request), track)?;
+        // The lock orders this against a unit opening the assembly: a track that finds none waits for
+        // the unit, and the unit that opens it finds the track.
+        let opened = self
+            .opened
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if opened.contains(&request_id(request)) {
+            self.media.set_audio(request_id(request), track)?;
+        } else {
+            crate::lock(&self.assemblies)
+                .entry(request_id(request))
+                .or_default()
+                .track = Some(track);
+        }
         Ok(())
     }
 
@@ -1364,6 +1386,37 @@ mod tests {
             mp4.len() < unit_bytes,
             "a compressed artifact is smaller than the frames it was made from"
         );
+    }
+
+    /// A track that arrives before the first unit waits for the unit that opens the assembly: the
+    /// two encode beside each other on different ranks.
+    #[test]
+    fn a_track_that_arrives_first_joins_the_assembly_its_units_open() {
+        let output = Output::from_env(Rates {
+            frame_rate: 24,
+            audio_rate: 32_000,
+        })
+        .expect("the runtime provides libx264 and aac");
+        let request = RequestKey::new(0, ipc::RequestId(8), 0);
+        let units = [17_u32, 22];
+        let (height, width) = (16_u32, 16_u32);
+        let samples = media::codec::audio_samples(
+            units.iter().map(|&frames| frames as usize).sum::<usize>(),
+            24,
+            32_000,
+        );
+        let pcm = vec![0_u8; samples * 2 * size_of::<i16>()];
+        output
+            .encode_track(request, &pcm, samples)
+            .expect("a track encodes before any unit");
+        for (index, frames) in units.iter().copied().enumerate() {
+            let pixels = vec![0x40_u8; frames as usize * height as usize * width as usize * 3];
+            output
+                .encode_clip(request, &units, index, (frames, height, width), &pixels)
+                .expect("a unit encodes");
+        }
+        let mp4 = output.finish(request).expect("the assembly ends");
+        assert_eq!(&mp4[4..8], b"ftyp", "an MP4 begins with its file type box");
     }
 
     /// A clip that is not `frames * height * width * 3` bytes is refused before an encoder sees it.
