@@ -384,8 +384,7 @@ impl Layouts {
     /// rows of every projection, every attention and every feed-forward of every step. A `t2va`
     /// request at a capacity sized for `fl2va` carried 2048 empty rows through all of them.
     fn condition_rows_of(&self, request: &VideoRequest) -> u32 {
-        let anchors = request.first_frames + request.last_frames + request.references;
-        if anchors == 0 && request.conditions.is_empty() {
+        if request.task == nn::capability::VideoTask::TextToVideoAudio {
             0
         } else {
             self.arrangement.condition_rows
