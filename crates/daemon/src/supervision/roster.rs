@@ -847,6 +847,18 @@ mod tests {
                 },
             ))
             .unwrap();
+        // The process parked before it served, which is the report that binds
+        // its connection to the launch: `Drained` names no launch generation,
+        // so a process drains under the binding it already has.
+        service
+            .reports
+            .send((
+                5,
+                Report {
+                    kind: Some(report::Kind::Parked(process::Parked { generation: 7 })),
+                },
+            ))
+            .unwrap();
         service
             .reports
             .send((
