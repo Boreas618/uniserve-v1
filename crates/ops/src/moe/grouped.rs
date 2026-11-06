@@ -679,8 +679,8 @@ pub struct GatherGemmNvfp4Args {
     pub weights: TensorView,
     /// `[experts, ...]` the block scales in the descriptor's layout, one per sixteen elements.
     pub scales: TensorView,
-    /// `[2, experts]` f32, contiguous: the reciprocals of each expert's tensor scales, one **per
-    /// projection** in the fused reading order — row 0 is the value half (up), row 1 the gate half. A
+    /// `[2, experts]` f32, contiguous: each expert's tensor scales, one **per projection** in the
+    /// fused reading order — row 0 is the value half (up), row 1 the gate half. A
     /// checkpoint carries two separate per-expert scalar tables, and the product's kernel reads each
     /// as its own array of `experts` floats, so the two halves are two *rows* here and not an
     /// interleaved `[experts, 2]`: an interleaved table cannot be handed to a reader that indexes

@@ -770,8 +770,8 @@ pub struct QuantizedStack {
     /// Every expert of a stack agrees on it, and it is published unchanged: a model puts
     /// [`Self::scales`]`.dtype()` in the product's descriptor and nothing converts.
     pub scales: Weight,
-    /// `[projections, experts]` f32, row-major, in the stack's own projection order: the reciprocal
-    /// of each expert's **per-projection** checkpoint tensor scale.
+    /// `[projections, experts]` f32, row-major, in the stack's own projection order: each expert's
+    /// **per-projection** checkpoint tensor scale, which is the factor the product multiplies by.
     ///
     /// One packed table per projection rather than one row per expert, because that is what the
     /// batched-GEMM entry takes: it reads each projection's table as `experts` consecutive floats. A
@@ -2692,7 +2692,9 @@ mod tests {
     #[test]
     fn a_bf16_conversion_rounds_like_the_hardware() {
         // A value whose low half is zero keeps exactly its top sixteen bits.
-        for value in [0.0_f32, 1.0, -1.0, 2.0, 0.5, 1.0e-30, 3.0e38] {
+        let tiny = f32::from_bits(0x0c00_0000);
+        let large = f32::from_bits(0x7f7f_0000);
+        for value in [0.0_f32, 1.0, -1.0, 2.0, 0.5, tiny, large] {
             assert_eq!(
                 f32_to_bf16(value),
                 (value.to_bits() >> 16) as u16,
