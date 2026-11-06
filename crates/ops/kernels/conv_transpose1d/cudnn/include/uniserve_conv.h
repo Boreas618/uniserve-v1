@@ -35,8 +35,8 @@ struct uniserve_conv_call {
   // not FP32 may not set it, and is refused if it does.
   int32_t tf32;
   // 0 for channels-first (NCDHW, the default), 1 for channels-last (NDHWC). The shapes in this
-  // call are logical [n, c, d, h, w] either way: only the strides the entry derives change, and a
-  // package with no channels-last path refuses 1 by name rather than reading it as 0.
+  // call are logical [n, c, d, h, w] either way: only the strides the entry derives for the input and
+  // the output change, and the filter stays packed. All three operators take either order.
   int32_t channels_last;
   char error[512];
 };

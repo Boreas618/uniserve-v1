@@ -210,6 +210,39 @@ fn a_native_module_may_name_a_file_its_build_writes_its_entries_into() {
     );
 }
 
+/// What a Triton compile writes beside its cubin: the kernel's symbol, in Triton's own field.
+const METADATA: &str = "{\"name\": \"kernel\"}\n";
+
+/// The manifest names its metadata file and the package holds a file by that name.
+fn assert_names_its_metadata(manifest: &Manifest, package: &std::path::Path) {
+    let name = manifest
+        .module
+        .metadata_name("any_descriptor")
+        .expect("a Triton cubin module names its metadata file");
+    assert!(
+        package.join(&name).is_file(),
+        "the package names {name} and does not hold it"
+    );
+}
+
+/// A Triton program's kernel symbol and parameters are in the metadata its compile writes, so a
+/// package that does not name that file serves an image the main process cannot find the kernel of.
+#[test]
+fn a_triton_cubin_module_must_name_its_metadata_file() {
+    let text = REASONABLE.replace("metadata = \"metadata.json\"\n", "");
+    let root = package(
+        &text,
+        &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
+    );
+    let refused = Manifest::load(root.path()).expect_err("the rule refuses the manifest");
+    assert!(
+        refused
+            .to_string()
+            .contains("a Triton cubin module must name its metadata file"),
+        "the refusal was {refused}"
+    );
+}
+
 #[test]
 fn a_cubin_module_may_not_name_an_entries_file() {
     let text = REASONABLE.replace(
@@ -479,6 +512,7 @@ fn a_package_may_declare_one_descriptor_table_per_key_shape() {
     let package = directory.path();
     std::fs::create_dir_all(package.join("src")).unwrap();
     std::fs::write(package.join("src/build.py"), "print('built')\n").unwrap();
+    std::fs::write(package.join("metadata.json"), METADATA).unwrap();
     std::fs::write(
         package.join("package.toml"),
         r#"op = "qk_norm_rope"
@@ -491,6 +525,7 @@ packages = []
 
 [module]
 form = "cubin"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
@@ -511,6 +546,7 @@ dimensions = { dtype = ["bf16"], head_dim = ["128"], q_heads = ["56"], rotation 
     .unwrap();
 
     let manifest = program_server::manifest::Manifest::load(package).expect("the package loads");
+    assert_names_its_metadata(&manifest, package);
     assert_eq!(
         manifest.descriptors().len(),
         2,
@@ -534,6 +570,7 @@ fn a_package_may_still_declare_one_descriptor_table() {
     let package = directory.path();
     std::fs::create_dir_all(package.join("src")).unwrap();
     std::fs::write(package.join("src/build.py"), "print('built')\n").unwrap();
+    std::fs::write(package.join("metadata.json"), METADATA).unwrap();
     std::fs::write(
         package.join("package.toml"),
         r#"op = "bias_add"
@@ -546,6 +583,7 @@ packages = []
 
 [module]
 form = "cubin"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
@@ -563,6 +601,7 @@ dimensions = { dtype = ["bf16"], channels = ["512"] }
     .unwrap();
 
     let manifest = program_server::manifest::Manifest::load(package).expect("the package loads");
+    assert_names_its_metadata(&manifest, package);
     assert_eq!(manifest.descriptors().len(), 1);
     assert!(manifest.covers("dtype_bf16_channels_512"));
     assert!(!manifest.covers("dtype_bf16_channels_256"));
