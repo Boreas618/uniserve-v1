@@ -671,14 +671,21 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         // capture that has to be thrown away.** The pool is the runtime's policy (a share of the
         // device per stream); the model states what one evaluation reserves. A share below the plan
         // is a refusal naming both numbers, and it is asked before anything is filled.
-        let offered = self.pool()?.reserved();
         let plans = self.buckets.clone();
+        let mut needed = 0;
         for plan in &plans {
-            floor::checked(
-                plan.bucket,
-                self.model.arena_bytes(&plan.warm.view()),
-                offered,
-            )?;
+            needed = needed.max(
+                floor::checked(
+                    plan.bucket,
+                    self.model.arena_bytes(&plan.warm.view()),
+                    u64::MAX,
+                )?
+                .unwrap_or(0),
+            );
+        }
+        if needed > 0 {
+            let stream = self.stream_id();
+            self.pool()?.claim(stream, needed)?;
         }
         for bucket in self.capture_order() {
             self.fill(bucket)?;
@@ -965,7 +972,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         self.fill(bucket)?;
         self.state_of_request(bucket)?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, &kernels, &arena);
         let layout = layout_of(bucket)?;
@@ -1230,8 +1237,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             ..
         } = &mut self.columns;
         // The refined rows are the request's for its whole schedule: `first_step` folds them once,
-        // and every later step reads them where they are. Only a first step starts from zeros.
+        // and every later step reads them where they are. Only a first step starts from zeros, and
+        // that write is the host's own, so the previous request's last launch is waited out first.
         if self.staged_step == Some(0) {
+            stream.synchronize()?;
             text.write(&staged.text)?;
             source.write(&staged.source)?;
         }
@@ -1261,7 +1270,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         }
         let stream = self.stream.clone();
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, kernels, &arena);
         self.model
@@ -1309,7 +1318,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, &kernels, &arena);
         let layout = layout_of(bucket)?;
@@ -1345,7 +1354,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload()?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, generation, &arena);
         let layout = layout_of(bucket)?;

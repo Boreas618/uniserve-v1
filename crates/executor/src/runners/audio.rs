@@ -240,10 +240,17 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
                 "the audio decoder runner loaded before its device's pools were attached",
             ));
         }
-        let offered = self.pool()?.reserved();
+        let mut needed = 0;
         for bucket in self.capture_order() {
             let layout = self.layout(bucket)?;
-            super::floor::checked(bucket, self.model.arena_bytes(&layout), offered)?;
+            needed = needed.max(
+                super::floor::checked(bucket, self.model.arena_bytes(&layout), u64::MAX)?
+                    .unwrap_or(0),
+            );
+        }
+        if needed > 0 {
+            let stream = self.stream_id();
+            self.pool()?.claim(stream, needed)?;
         }
         Ok(())
     }
@@ -364,7 +371,7 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload()?;
         let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
+        let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, generation, &arena);
         let audio = self.audio(bucket)?;
