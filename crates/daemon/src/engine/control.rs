@@ -772,9 +772,9 @@ impl EngineControl {
             return Ok(connection);
         }
         let deadline = Instant::now() + CONNECT_TIMEOUT;
-        // Whether the handed-over control connection has been seen to close: it is the
-        // predecessor's own client to the process socket, and a successor serves its own,
-        // so its end is the predecessor leaving and not the engine. Stated once.
+        // Whether the handed-over control connection has been seen to close: the service
+        // goes on with its accepted side, so an end here is a predecessor that left without
+        // handing it over, and not the engine. Stated once.
         let mut control_closed = false;
         loop {
             match self.requests.try_accept() {
@@ -806,11 +806,10 @@ impl EngineControl {
             {
                 match still_serving(control) {
                     Ok(true) => {}
-                    // The handover's own connection: the predecessor's accepted side of its
-                    // process socket closes with its service, so this end reads closed at the
-                    // first look. Which peer ended is the whole content of the failure, and this
-                    // one is the predecessor - the engine may be serving perfectly well, and the
-                    // dial below is what says so.
+                    // The handover's own connection, whose accepted side was not handed over:
+                    // this end reads closed at the first look. Which peer ended is the whole
+                    // content of the failure, and this one is the predecessor - the engine may
+                    // be serving perfectly well, and the dial below is what says so.
                     Ok(false) => {
                         control_closed = true;
                         tracing::info!(
@@ -1804,9 +1803,10 @@ mod tests {
         );
     }
 
-    /// A handover's own control connection closes with the predecessor's service, and
-    /// that is the predecessor leaving, not an engine exit: the successor waits for the
-    /// engine's own dial instead of refusing the adoption (§7.5.1 step 2).
+    /// A handed-over control connection whose accepted side is gone closed with the
+    /// predecessor's service, and that is the predecessor leaving, not an engine exit:
+    /// the successor waits for the engine's own dial instead of refusing the adoption
+    /// (§7.5.1 step 2).
     #[test]
     fn a_closed_control_connection_is_not_an_engine_exit() {
         let directory = tempfile::tempdir().unwrap();
