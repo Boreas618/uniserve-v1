@@ -591,6 +591,75 @@ pub struct MediaInput {
     pub noise: Option<TensorView>,
 }
 
+/// One piece of a request's conditions, as the packed conditioning holds it.
+///
+/// A request states its conditions in its own order; the model packs them in another (keyframes
+/// first), and only the model knows how many rows each takes and where its draw sits in the
+/// request's noise stream. So the runner asks for this list and builds its [`MediaInput`]s in this
+/// order, rather than deriving either fact beside the packing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConditionPiece {
+    /// The condition's place in the request, which is how the raw media is addressed.
+    pub condition: u32,
+    /// Where the piece anchors.
+    pub role: MediaRole,
+    /// The packed rows of its visual condition; zero without pixels.
+    pub rows: u32,
+    /// The packed rows of its soundtrack; zero without one.
+    pub audio_rows: u32,
+    /// The extents of its [`MediaInput::pixels`], `None` for a piece with no pixels.
+    pub pixels: Option<[u64; 5]>,
+    /// The extents of its [`MediaInput::audio`], `None` for a piece with no soundtrack.
+    pub track: Option<[u64; 3]>,
+    /// The shape of its anchoring draw, `None` for a piece with no pixels: an audio reference is
+    /// conditioned at its posterior's mean and draws nothing.
+    pub draw: Option<LatentShape>,
+    /// The first element of the draw in the request's noise stream.
+    pub draw_offset: u64,
+}
+
+/// How a model's encoders read the media a request's conditions decode to, on the host.
+///
+/// The media reader decodes bytes into RGB frames and stereo PCM, which are the media's own forms.
+/// What an encoder reads is the model's arithmetic: its channel order and normalisation, its patch
+/// rows, the padding of a track. The executor owns the decoding and the buffers and asks the model
+/// for these conversions, so no model constant reaches it.
+pub trait MediaFormat: Send + Sync {
+    /// Writes `[frames, height, width, 3]` RGB bytes as `out`, the pixels
+    /// [`MediaInput::pixels`] carries: `3 * frames * height * width` elements.
+    fn condition_pixels(
+        &self,
+        rgb: &[u8],
+        frames: u32,
+        height: u32,
+        width: u32,
+        out: &mut [f32],
+    ) -> Result<()>;
+
+    /// The element type of a vision tower's patch rows.
+    fn patch_dtype(&self) -> DType;
+
+    /// The elements of one patch row.
+    fn patch_width(&self) -> u32;
+
+    /// The pixels one patch spans along each side of a frame.
+    ///
+    /// The frames [`Self::patches`] reads are resized to `grid` times this.
+    fn patch_side(&self) -> u32;
+
+    /// Writes `[frames, 3, height, width]` planar RGB bytes, already at the grid's raster, as `out`:
+    /// the `grid[0] * grid[1] * grid[2]` patch rows [`ImageInput::pixels`] carries, in
+    /// [`Self::patch_dtype`].
+    fn patches(&self, planes: &[u8], frames: u32, grid: [u32; 3], out: &mut [u8]) -> Result<()>;
+
+    /// The samples an encoder reads of a track of `samples` samples, padding included.
+    fn track_samples(&self, samples: u64) -> Result<u64>;
+
+    /// Writes `[samples, 2]` interleaved stereo as `out`, the view [`MediaInput::audio`] carries:
+    /// `2 * self.track_samples(samples)` elements.
+    fn track(&self, pcm: &[f32], samples: u64, out: &mut [f32]) -> Result<()>;
+}
+
 /// What a denoiser conditions on at a step.
 ///
 /// The rows of every view follow the order the layout reserves: the encoded text first, then the
@@ -787,6 +856,38 @@ pub trait Denoiser {
     /// layout-to-offsets map would hold mutable request state, and the seed addressing is a pure
     /// function of `(seed, layout, element index)`.
     fn draw_noise(&self, f: &Forward, seed: Seed, layout: Layout, out: Latents) -> Result<()>;
+
+    /// The pieces of `request`'s conditions, in the order [`Conditioning::media`] holds them.
+    ///
+    /// A request with no conditions has none. A model that takes conditions states them here, and
+    /// one that takes none refuses a request that carries some, by name, rather than answering an
+    /// empty list that would condition the clip on nothing.
+    fn condition_pieces(&self, request: &VideoRequest<'_>) -> Result<Vec<ConditionPiece>> {
+        if request.conditions.is_empty() {
+            return Ok(Vec::new());
+        }
+        Err(Error::Unsupported(format!(
+            "a denoiser that takes no conditions, asked for {}",
+            request.conditions.len()
+        )))
+    }
+
+    /// Draw `piece`'s anchoring noise into `out`, at its place in the request's stream.
+    ///
+    /// The conditions' draws lead the stream [`Self::draw_noise`] continues, so one seed names both.
+    fn draw_condition_noise(
+        &self,
+        f: &Forward,
+        seed: Seed,
+        piece: &ConditionPiece,
+        out: TensorView,
+    ) -> Result<()> {
+        let _ = (f, seed, out);
+        Err(Error::Unsupported(format!(
+            "a denoiser that draws no condition noise, asked for condition {}",
+            piece.condition
+        )))
+    }
 
     /// Fold `cond` into the latents the schedule starts from.
     fn prepare_latents<'a>(&self, f: &Forward, cond: Conditioning<'a>, out: Latents) -> Result<()>;
