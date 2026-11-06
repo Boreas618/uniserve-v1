@@ -62,6 +62,20 @@ pub trait WeightStorage: Send + Sync {
         bytes: &[u8],
         allocation: usize,
     ) -> Result<Backing>;
+
+    /// `bytes` in a region of `allocation` bytes that kernels may write, held by this process.
+    ///
+    /// A store with no read-only mapping answers what [`Self::store`] does. The key is not
+    /// retained: the launch that fills the region runs in every load.
+    fn writable(
+        &self,
+        device: platform::DeviceId,
+        key: &[u8; 32],
+        bytes: &[u8],
+        allocation: usize,
+    ) -> Result<Backing> {
+        self.store(device, key, bytes, allocation)
+    }
 }
 
 /// A shared storage, as two owners of one rank's client use it: the store itself and whatever else
@@ -69,6 +83,16 @@ pub trait WeightStorage: Send + Sync {
 impl<S: WeightStorage + ?Sized> WeightStorage for std::sync::Arc<S> {
     fn fetch(&self, device: platform::DeviceId, key: &[u8; 32]) -> Result<Option<Backing>> {
         (**self).fetch(device, key)
+    }
+
+    fn writable(
+        &self,
+        device: platform::DeviceId,
+        key: &[u8; 32],
+        bytes: &[u8],
+        allocation: usize,
+    ) -> Result<Backing> {
+        (**self).writable(device, key, bytes, allocation)
     }
 
     fn granularity(&self, device: platform::DeviceId) -> Result<usize> {
@@ -285,6 +309,21 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         self.mapped.insert(storage_key, backing);
         self.published += 1;
         Ok(backing)
+    }
+
+    fn writable(
+        &mut self,
+        key: &WeightKey,
+        _dtype: DType,
+        _shape: Shape,
+        bytes: &[u8],
+    ) -> nn::Result<Backing> {
+        let allocation = self
+            .allocation_length(bytes.len())
+            .map_err(|error| nn::Error::Unsupported(format!("sizing table {key}: {error}")))?;
+        self.storage
+            .writable(self.device, &retained_key(key), bytes, allocation)
+            .map_err(|error| nn::Error::Unsupported(format!("allocating table {key}: {error}")))
     }
 }
 

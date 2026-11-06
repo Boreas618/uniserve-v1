@@ -243,6 +243,8 @@ struct State {
     /// answers the mapping it already holds rather than mapping the region
     /// twice.
     weights: BTreeMap<(i32, Key), Arc<Storage>>,
+    /// The tables a model writes after its load, which live as long as this process.
+    tables: Vec<Arc<Storage>>,
     /// A standby worker's exclusive storages, until it is promoted; `None`
     /// for a worker that takes write access at once.
     standby: Option<Standby>,
@@ -331,6 +333,7 @@ impl Retained {
                 written: BTreeSet::new(),
                 used: BTreeSet::new(),
                 weights: BTreeMap::new(),
+                tables: Vec::new(),
                 standby: launch.standby.then(Standby::default),
                 inherited: Vec::new(),
             }),
@@ -1066,6 +1069,32 @@ impl crate::memory::weights::WeightStorage for Retained {
     /// so a second store of the same key republishes rather than failing.
     fn granularity(&self, device: DeviceId) -> Result<usize> {
         Ok(platform::HandleType::Descriptor.granularity(device)?)
+    }
+
+    /// A table a model writes after its load, in device memory of this process alone.
+    fn writable(
+        &self,
+        device: DeviceId,
+        _key: &[u8; 32],
+        bytes: &[u8],
+        allocation: usize,
+    ) -> Result<nn::Backing> {
+        let storage = Storage::retained_device(device, allocation)?;
+        let stream = platform::Stream::new(device)?;
+        // SAFETY: the storage holds `allocation` writable device bytes and the source slice is at
+        // most that long; the copy is synchronized before the region is handed out.
+        unsafe {
+            platform::memcpy_async(
+                storage.address(),
+                bytes.as_ptr() as u64,
+                bytes.len(),
+                &stream,
+            )?;
+        }
+        stream.synchronize()?;
+        let backing = nn::Backing::new(ops::DevicePtr::new(storage.address()), bytes.len() as u64);
+        lock(&self.state).tables.push(storage);
+        Ok(backing)
     }
 
     fn store(

@@ -472,6 +472,21 @@ pub trait RetainedWeights {
         shape: Shape,
         bytes: &[u8],
     ) -> Result<Backing>;
+
+    /// A region the model writes after the load, holding `bytes` until it does.
+    ///
+    /// A published region is read-only on the device, so a table a model folds from its weights
+    /// cannot live in one: the first launch that writes it faults. A store whose regions a kernel
+    /// may write answers one of those, which is what this default does.
+    fn writable(
+        &mut self,
+        key: &WeightKey,
+        dtype: DType,
+        shape: Shape,
+        bytes: &[u8],
+    ) -> Result<Backing> {
+        self.publish(key, dtype, shape, bytes)
+    }
 }
 
 /// A retained store in host memory: a model loaded, and asked for what it would launch, with no
@@ -1951,6 +1966,33 @@ impl<'a> WeightLoader<'a> {
         bytes: &[u8],
         producer: &'static str,
     ) -> Result<Weight> {
+        self.computed(name, dtype, shape, bytes, producer, false)
+    }
+
+    /// A table the model writes once after the load, holding `bytes` until then.
+    ///
+    /// It is a [`Self::constant`] that stays writable on the device, and it is this process's own:
+    /// no later load reads it back, because the launch that fills it runs in every load.
+    pub fn writable_constant(
+        &mut self,
+        name: &str,
+        dtype: DType,
+        shape: Shape,
+        bytes: &[u8],
+        producer: &'static str,
+    ) -> Result<Weight> {
+        self.computed(name, dtype, shape, bytes, producer, true)
+    }
+
+    fn computed(
+        &mut self,
+        name: &str,
+        dtype: DType,
+        shape: Shape,
+        bytes: &[u8],
+        producer: &'static str,
+        writable: bool,
+    ) -> Result<Weight> {
         let element = dtype.bytes().ok_or_else(|| {
             Error::weight(name, format!("{dtype} has no whole-byte element size"))
         })?;
@@ -1988,9 +2030,13 @@ impl<'a> WeightLoader<'a> {
             },
             provenance: Some(Provenance::computed(producer, bytes)),
         };
-        let backing = match self.retention()?.retained(&key)? {
-            Some(backing) => backing,
-            None => self.retention()?.publish(&key, dtype, shape, bytes)?,
+        let backing = if writable {
+            self.retention()?.writable(&key, dtype, shape, bytes)?
+        } else {
+            match self.retention()?.retained(&key)? {
+                Some(backing) => backing,
+                None => self.retention()?.publish(&key, dtype, shape, bytes)?,
+            }
         };
         Ok(Weight {
             view: backing.view(dtype, shape)?,
