@@ -38,6 +38,14 @@ const START_OF_IMAGE: u32 = 1000;
 /// `media_overstatement` is declared in every media artifact's report without
 /// being written, which states a rank's report of an extent it cannot store.
 fn engine(media_overstatement: u64) -> anyhow::Result<SchedulerHandle> {
+    logged_engine(media_overstatement).map(|(engine, _)| engine)
+}
+
+/// [`engine`], with the log of what each request's calls write into its
+/// context.
+fn logged_engine(
+    media_overstatement: u64,
+) -> anyhow::Result<(SchedulerHandle, engine::ContextLog)> {
     let components: BTreeMap<String, ComponentConfig> = ["model", "vision_encoder"]
         .into_iter()
         .map(|name| {
@@ -92,6 +100,7 @@ fn engine(media_overstatement: u64) -> anyhow::Result<SchedulerHandle> {
     }
     sim.overstate_published_media(media_overstatement);
     sim.place_components(components);
+    let context = sim.context_log();
     let executor = engine::SimExecutor::new(sim);
     let rank = engine::Executor::info(&executor)
         .runtime_info()
@@ -99,7 +108,7 @@ fn engine(media_overstatement: u64) -> anyhow::Result<SchedulerHandle> {
     let handle = SchedulerHandle::with_executor(config, Box::new(executor))
         .expect("the simulated executor serves");
     crate::support::install_policy_on(&handle, engine::BatchCapacity::of(&rank));
-    Ok(handle)
+    Ok((handle, context))
 }
 
 /// A base64 PNG of `side` x `side` pixels of one color.
@@ -357,9 +366,22 @@ fn generated_images_follow_their_seed_and_feed_back() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// What request `id`'s calls wrote of its prompt: its four tokens and its
+/// image's block, before the tokens it generated.
+fn prompt_context(context: &engine::ContextLog, id: u64) -> Vec<engine::ContextWrite> {
+    context.admissions(RequestId(id)).remove(0)[..5].to_vec()
+}
+
+/// The first `length` tokens the simulator generates for request `id`.
+fn simulated_text(id: u64, length: usize) -> Vec<u32> {
+    (0..length)
+        .map(|index| engine::sim_text_token(RequestId(id), index))
+        .collect()
+}
+
 #[test]
 fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
-    let engine = engine(0)?;
+    let (engine, context) = logged_engine(0)?;
     let result = (|| -> anyhow::Result<()> {
         // A 32x32 image is a 2x2 patch grid: four feature tokens at one
         // temporal position.
@@ -407,8 +429,19 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
                 "understanding failed"
             );
         }
-        // The cached feature conditions the prompt as the encoded one did.
-        assert_eq!(red.tokens, cached.tokens);
+        // The cached feature conditions the prompt as the encoded one did. The
+        // simulator's text follows the request's identity, and these are two
+        // requests, so what they share is their prompt's context, the same
+        // tokens and image block at the same positions, and each generates its
+        // text from its first token.
+        let encoded = prompt_context(&context, 11);
+        assert!(
+            encoded.contains(&engine::ContextWrite::InputBlock { position: 2 }),
+            "the prompt holds its image: {encoded:?}"
+        );
+        assert_eq!(encoded, prompt_context(&context, 12));
+        assert_eq!(red.tokens, simulated_text(11, red.tokens.len()));
+        assert_eq!(cached.tokens, simulated_text(12, red.tokens.len()));
 
         // A scored image prompt scores its text: every token but the first,
         // the one after the image predicted from the image's last logits.
@@ -427,7 +460,8 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
             "scored understanding failed"
         );
         assert_eq!(scored.prompt_scores, 3);
-        assert_eq!(scored.tokens, red.tokens);
+        assert_eq!(prompt_context(&context, 13), encoded);
+        assert_eq!(scored.tokens, simulated_text(13, red.tokens.len()));
         Ok(())
     })();
     engine.shutdown();
