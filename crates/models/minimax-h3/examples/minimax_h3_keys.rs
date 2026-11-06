@@ -315,6 +315,12 @@ fn main() {
     // derived from. A walk that had only the flag could not state the bound its tile derives, and it
     // stated the dense one - which the recorder refuses.
     let mut commit: Option<String> = None;
+    // The prompt capacity the deployment prepares. **It is the deployment's number and it moves the
+    // key set**: a packed prefix holds one row per prompt token, so the bound - and with it every
+    // attention row's `max_kv_len` - follows from the capacity the engine prepares buckets for
+    // (`video_config.text_capacities`, 1024 by default). A store cut at the release's 128 serves a
+    // deployment that states 128 and no other.
+    let mut text_tokens: Option<u32> = None;
     let mut sparse = false;
     let mut sparse_deployment: Option<minimax_h3::config::AttentionKind> = None;
     while let Some(flag) = arguments.next() {
@@ -337,6 +343,15 @@ fn main() {
                 }
             }
             "--derived" => derived = true,
+            "--text-tokens" => {
+                let stated = value(&mut arguments, "--text-tokens");
+                text_tokens = Some(
+                    stated
+                        .trim()
+                        .parse::<u32>()
+                        .unwrap_or_else(|_| panic!("--text-tokens is not a row count: {}", stated)),
+                );
+            }
             // **The sequence and tensor degrees are key axes, not deployment decorations.** A sparse
             // attention's program takes the heads one exchange rank attends (`Partition::denoiser_heads`,
             // `heads / ulysses`), so a checkpoint served at Ulysses 4 launches `heads_14` where a single
@@ -487,6 +502,10 @@ fn main() {
         .unwrap_or_else(|error| {
             panic!("the deployment's serving partition is not statable: {error}")
         });
+        let partition = match text_tokens {
+            Some(capacity) => partition.sized(capacity, partition.condition_rows),
+            None => partition,
+        };
         let Some(dies) = config.denoisers.values().next() else {
             panic!("the checkpoint states no DiT, so its arrangement is not statable")
         };
@@ -528,7 +547,7 @@ fn main() {
         0,
     )
     .unwrap_or_else(|error| panic!("the deployment's serving partition is not statable: {error}"));
-    let bound = deployment_bound(&config, sparse_deployment);
+    let bound = deployment_bound(&config, sparse_deployment, text_tokens);
     let mut lines: Vec<(String, String)> = Vec::new();
     for deployment in DEPLOYMENTS {
         lines.extend(rows(deployment, bound, sparse));
@@ -922,6 +941,7 @@ fn header(
 fn deployment_bound(
     config: &minimax_h3::config::Config,
     sparse: Option<minimax_h3::config::AttentionKind>,
+    text_tokens: Option<u32>,
 ) -> u32 {
     let mut bound = 0u32;
     for (task, dit) in minimax_h3::checkpoint::TASK_DITS {
@@ -940,6 +960,10 @@ fn deployment_bound(
             0,
             0,
         )
+        .map(|partition| match text_tokens {
+            Some(capacity) => partition.sized(capacity, partition.condition_rows),
+            None => partition,
+        })
         .and_then(|partition| partition.arrangement(&network))
         .and_then(|arrangement| minimax_h3::denoiser::Layouts::new(network, arrangement))
         .and_then(|rules| rules.rows_bound())
