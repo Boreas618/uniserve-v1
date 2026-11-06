@@ -600,6 +600,85 @@ fn the_block_scales_must_have_the_layout_s_shape() {
     assert!(store.published.is_empty());
 }
 
+/// The encoder's factor is the calibrated activation scale's reciprocal, and it has a ceiling that
+/// the encoder's own rounding step states: a factor above `2^10 / 6` makes the row's own block
+/// scale fall below E4M3's half-subnormal, so every block encodes as zeros and the projection
+/// answers zeros for every activation. A factor inside the ceiling is published as the encoder's
+/// operand, which is the reciprocal and not the checkpoint's number.
+#[test]
+fn an_activation_scale_whose_reciprocal_cannot_encode_is_refused() {
+    let values: Vec<u8> = (0..128).map(|byte| byte as u8).collect();
+    let scales: Vec<u8> = (0..16).map(|byte| 0x30 + byte).collect();
+    let request = WeightRequest::region("w_input_scale", 0, Shape::new(&[1]));
+    let quantize = |directory: &std::path::Path, scale: f32| {
+        shard_typed(
+            directory,
+            "model.safetensors",
+            &[
+                ("w", DType::U8, vec![4, 32], values.clone()),
+                ("w_scale", DType::U8, vec![4, 4], scales.clone()),
+                (
+                    "w_input_scale",
+                    DType::F32,
+                    vec![1],
+                    scale.to_le_bytes().to_vec(),
+                ),
+            ],
+        );
+    };
+
+    // `1 / 0.001 = 1000`, well above `2^10 / 6 = 170.67`: no block of any row survives.
+    let too_small = tempfile::tempdir().unwrap();
+    quantize(too_small.path(), 0.001);
+    let checkpoint = Checkpoint::open(too_small.path()).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let error = loader
+        .nvfp4(
+            &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
+            &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            Some(&request),
+            Nvfp4Names::vllm(),
+            ops::fp4::ScaleLayout::Linear,
+            ops::fp4::ScaleLayout::Linear,
+            0.25,
+        )
+        .expect_err("a calibration whose factor cannot encode");
+    let text = format!("{error}");
+    assert!(text.contains("w_input_scale"), "{text}");
+    assert!(
+        text.contains("170.6"),
+        "the bound is not in the sentence: {text}"
+    );
+    assert!(store.published.is_empty(), "nothing is published for it");
+
+    // `1 / 0.1 = 10`, inside the ceiling: the same checkpoint shape loads, and what is published
+    // beside the weights is the reciprocal the encoder is handed.
+    let encodable = tempfile::tempdir().unwrap();
+    quantize(encodable.path(), 0.1);
+    let checkpoint = Checkpoint::open(encodable.path()).unwrap();
+    let mut store = Recording::default();
+    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let quantized = loader
+        .nvfp4(
+            &WeightRequest::region("w", 0, Shape::new(&[4, 32])),
+            &WeightRequest::region("w_scale", 0, Shape::new(&[4, 4])),
+            Some(&request),
+            Nvfp4Names::vllm(),
+            ops::fp4::ScaleLayout::Linear,
+            ops::fp4::ScaleLayout::Linear,
+            0.25,
+        )
+        .unwrap();
+    let published = quantized
+        .input_scale
+        .expect("a calibrated projection publishes one");
+    assert_eq!(published.dtype(), DType::F32);
+    // Values, then the block scales, then the encoder's operand — which is the reciprocal.
+    assert_eq!(store.published.len(), 3);
+    assert_eq!(store.published[2].1, 10.0_f32.to_le_bytes().to_vec());
+}
+
 /// An expert stack is its experts' encoded tensors concatenated in the operator's reading order —
 /// expert-major, up before gate — and its tensor scales become one reciprocal per expert **and
 /// projection**, because the checkpoint gives each expert's up and gate their own `weight_scale_2`.
