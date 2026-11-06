@@ -844,13 +844,19 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// Issues each pending row's first step: the model's own draw and fold, on the replay's arena
-    /// and stream, before the captured graph launches.
+    /// Issues each pending row's first step: the model's own draw, its conditioner and its fold, on
+    /// the replay's arena and stream, before the captured graph launches.
     ///
     /// A trajectory's value at step zero is not a step: it is `Denoiser::draw_noise` (Philox
     /// addressed by the request's seed and the element's index, section 9) followed by
     /// `Denoiser::prepare_latents` (the schedule's start over that draw), and both take a
-    /// `Forward` because their operators reserve scratch in an arena.
+    /// `Forward` because their operators reserve scratch in an arena. `Denoiser::prepare_conditioning`
+    /// runs between them: the encoder's rows are raw until it refines them, and the fold reads
+    /// `cond.text`, so refining after the fold would start the schedule from unrefined rows.
+    ///
+    /// **None of the three is in the captured graph.** Each runs once per request, and a graph
+    /// replays once per step; `prepare_conditioning` writes `text` in place, so a refinement inside
+    /// the graph would compound over the schedule.
     ///
     /// The replay's arena is the one its captured graph addresses: `Pool::base` is the stream's
     /// range and `Pool::begin` answers only whether a bucket is planning or replaying, so the same
@@ -883,6 +889,12 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             let latents = self.latents(bucket, row.index)?;
             let cond = self.conditioning(bucket, row.index, &state, &media)?;
             self.model.draw_noise(&forward, row.seed, layout, latents)?;
+            // **The conditioner, once per request and outside the graph.** `text` holds the encoder's
+            // rows as `seed` copied them; this folds `source` into it in place, so every replay of the
+            // bucket reads rows refined for its own request. It is not a graph node because a graph
+            // replays once per *step* while this runs once per *request* - a refinement inside the
+            // captured graph would compound over the schedule, and `text` is written in place.
+            self.model.prepare_conditioning(&forward, cond)?;
             self.model.prepare_latents(&forward, cond, latents)?;
         }
         Ok(())
