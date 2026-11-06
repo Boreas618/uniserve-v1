@@ -684,6 +684,8 @@ impl EpochPlan {
                 stack: dtype,
                 sample: minimax_h3::denoiser::SAMPLE_DTYPE,
                 width: hidden,
+                text_width: nn::capability::Denoiser::text_width(denoiser.as_ref())
+                    .unwrap_or(hidden),
             },
             Arc::clone(generation),
         )?;

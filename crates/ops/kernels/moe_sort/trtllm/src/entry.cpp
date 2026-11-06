@@ -29,8 +29,9 @@ int32_t launch(const uniserve_moe_sort_call* call, void* stream) {
   }
   if (call->ids == nullptr || call->tile_to_expert == nullptr || call->tile_to_limit == nullptr ||
       call->expanded_to_permuted == nullptr || call->permuted_to_expanded == nullptr ||
-      call->total_padded_tokens == nullptr || call->num_non_exiting_tiles == nullptr) {
-    return refuse(call, "moe_sort needs the router's ids and all six metadata buffers");
+      call->permuted_to_token == nullptr || call->total_padded_tokens == nullptr ||
+      call->num_non_exiting_tiles == nullptr) {
+    return refuse(call, "moe_sort needs the router's ids and all seven metadata buffers");
   }
   // The sort writes indices alone, but the weights it is handed must still be
   // the route weights the descriptor names: a call whose scales are another
