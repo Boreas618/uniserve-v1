@@ -798,13 +798,14 @@ pub trait Denoiser {
     /// no host read, no synchronization, no allocation. `cond.source` is the buffer the conditioner
     /// reads; `cond.text` is written in place over its own rows.
     ///
-    /// The default does nothing: a model whose text encoder's features are everything its denoiser
-    /// reads has no conditioner. A model that has one overrides this, and leaves
-    /// [`Self::denoise`] reading `cond.text` alone.
-    fn prepare_conditioning(&self, f: &Forward, cond: Conditioning<'_>) -> Result<()> {
-        let _ = (f, cond);
-        Ok(())
-    }
+    /// Prepares what the denoiser reads from a request's conditioning, in place.
+    ///
+    /// Required, not defaulted: a model whose text encoder's features are everything its denoiser
+    /// reads has no conditioner and says so with an explicit `Ok(())`, while a model that has one
+    /// must write it here. A no-op default would make forgetting the call — or forgetting the
+    /// override — succeed silently, and a model whose conditioning is prepared nowhere generates a
+    /// plausible clip from zeros; the absence of this method's work is not observable in the output.
+    fn prepare_conditioning(&self, f: &Forward, cond: Conditioning<'_>) -> Result<()>;
 
     /// One denoising step: update `latents` in place with the model's velocity.
     fn denoise<'a>(

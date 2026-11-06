@@ -258,6 +258,13 @@ impl Nvfp4Linear {
     /// the loading boundary publishes beside the weights as [`QuantizedWeight::input_scale`]; a
     /// weight-only export has none and **cannot serve this layer**, which is refused here by name
     /// rather than encoded at an invented magnitude.
+    ///
+    /// A present scale is *not* validated here, and a zero one is the way a product answers zeros
+    /// with every weight correct: the encoder computes `token_scale = amax(row) × global_scale`,
+    /// floors it at `1e-30`, saturates the codes to their largest magnitude, and the decode
+    /// multiplies them back by `1e-30` — so a zero `input_scale` is the same class of defect as an
+    /// all-zero packed matrix, one factor up. The value is device memory by the time this layer is
+    /// constructed, so the refusal belongs where the bytes are read: the loading boundary.
     pub fn new(
         weight: &QuantizedWeight,
         bias: Option<Weight>,
