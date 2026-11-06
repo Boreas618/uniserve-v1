@@ -636,7 +636,7 @@ mod tests {
                 message.contains("`quantization_config` is retired"),
                 "{args:?}: {message}"
             );
-            assert!(message.contains("`quantization.mode=...`"), "{args:?}: {message}");
+            assert!(message.contains("`--set quantization.mode=...`"), "{args:?}: {message}");
         }
         let error = resolve_text("[quantization_config]\nmode = \"performance\"\n", &[])
             .expect_err("the retired name is refused in a configuration file too");

@@ -768,10 +768,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{body}");
         let session = &body["result"];
         assert_eq!(session["state"], json!("running"), "{body}");
-        // The simulated worker has no device: it runs no collector.
+        // The simulated executor has no device: it runs no collector.
         assert_eq!(
             session["workers"][0]["collectors"]["timeline"],
-            json!("unavailable: the simulated worker has no device")
+            json!("unavailable: the simulated executor has no device")
         );
         assert_eq!(session["collectors"], json!([]));
 
