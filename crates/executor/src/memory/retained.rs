@@ -218,6 +218,8 @@ pub struct Retained {
     /// The world the worker belongs to, which creates its exclusive
     /// storages.
     world: u64,
+    /// The world whose exclusive storages this worker keys: its own, or a standby's predecessor's.
+    storage_world: u64,
     state: Mutex<State>,
 }
 
@@ -298,6 +300,7 @@ impl Retained {
         group: &str,
         rank: u32,
         generation: u64,
+        predecessor_world: Option<u64>,
     ) -> Result<Arc<Self>> {
         let scope = Scope {
             deployment: launch.deployment.clone(),
@@ -317,6 +320,11 @@ impl Retained {
         Ok(Arc::new(Self {
             scope,
             world: launch.world,
+            // A standby maps what its predecessor holds, and an epoch switch's target serves
+            // another world than the one those storages were created in.
+            storage_world: predecessor_world
+                .filter(|_| launch.standby)
+                .unwrap_or(launch.world),
             state: Mutex::new(State {
                 client,
                 gpus: BTreeMap::new(),
@@ -333,7 +341,7 @@ impl Retained {
     /// its scope, world, name, layout and GPU. It covers its shape only, so
     /// a restart of the world reuses the storage whatever else changed.
     pub(crate) fn exclusive_key(&self, spec: &ExclusiveSpec<'_>, gpu: &[u8; 16]) -> Key {
-        self.storage_key(spec.name, spec.bytes, gpu, self.world)
+        self.storage_key(spec.name, spec.bytes, gpu, self.storage_world)
     }
 
     /// The key of one part of a segmented storage, as the exclusive storage

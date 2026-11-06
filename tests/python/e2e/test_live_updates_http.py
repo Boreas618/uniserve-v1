@@ -102,7 +102,7 @@ OPTIONS = (
 )
 # A change of the options that only a new world executes: graphs of other
 # decode batch sizes.
-CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
+CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 8]"
 # The deployment's host KV cache on the host, in GiB.
 HOST_GIB = 8
 PROMPT = (
@@ -1024,8 +1024,10 @@ def test_a_serving_deployment_answers_its_admin_api(
         )
         streaming.start()
         _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
-        in_place = _apply(base_url, "max_running_requests=4")
-        assert in_place["change"] == "in_place", in_place
+        update = _apply(base_url, "scheduler_config.max_batch=4")
+        assert update["change"] == "program", update
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
         before_update = len(read)
         report = _change_world(base_url, CHANGE)
         print(f"world change pause: {report['pause_seconds']:.3f} s")
@@ -1561,8 +1563,13 @@ def _restart_while_streaming(
     )
     reply = _chat(base_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
-    update = _apply(base_url, "max_running_requests=8")
-    assert update["change"] == "in_place", update
+    # A scheduling limit is a parameter of the policy program, so it reaches the
+    # serving epoch as a program update; `max_running_requests` is build config
+    # and would switch the epoch.
+    update = _apply(base_url, "scheduler_config.max_batch=4")
+    assert update["change"] == "program", update
+    committed = _admin(base_url, "config/commit")
+    assert committed.status_code == 200, committed.text
 
     # A change of the listening address restarts the daemon on it: the new
     # address serves, and the old one closes once the replaced daemon exits.
@@ -1609,10 +1616,20 @@ def _restart_while_streaming(
     assert last["result"]["change"] == "epoch", last
     committed = _admin(both_url, "config/commit")
     assert committed.status_code == 200, committed.text
-    status = httpx.get(f"{both_url}/admin/config", timeout=10).json()
-    config = tomllib.loads(status["config"])
-    assert config["server_config"]["port"] == port, config
-    assert config["cuda_graph_config"]["decode_batch_sizes"] == [1, 2, 4, 8, 16]
+
+    def served_config() -> dict:
+        status = httpx.get(f"{both_url}/admin/config", timeout=10).json()
+        return tomllib.loads(status["config"])
+
+    # A commit may be asked while the target is still being promoted, and it is
+    # applied when the trial starts: the configuration moves once the target serves.
+    _wait_until(
+        lambda: served_config()["cuda_graph_config"]["decode_batch_sizes"]
+        == [1, 2, 8],
+        300,
+        "the switch's target never served its configuration",
+    )
+    assert served_config()["server_config"]["port"] == port
     reply = _chat(both_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     _wait_until(

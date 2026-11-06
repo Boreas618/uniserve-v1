@@ -1528,6 +1528,17 @@ impl nn::capability::Denoiser for Denoiser {
         schedule_for(&self.config, &self.schedule, task).map_err(flattened)
     }
 
+    /// The stack's width: the refiner projects the encoder's `text_dim` columns into it.
+    ///
+    /// H3's text encoder writes 5120-column features (`transformer.text_dim`) and every packed row
+    /// the denoiser reads is `hidden_size` wide - the `context_embedder` the refiner's input layer
+    /// is, `conditioning.py:195`. So `Conditioning::text` and `Conditioning::source` are two widths
+    /// and the runner sizes each from its owner: the encoder's features stay 5120 wide, and the rows
+    /// the denoiser reads are 5376.
+    fn text_width(&self) -> Option<u32> {
+        Some(self.config.transformer.hidden_size)
+    }
+
     fn draw_noise(
         &self,
         f: &Forward,
