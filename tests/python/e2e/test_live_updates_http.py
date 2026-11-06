@@ -1024,8 +1024,10 @@ def test_a_serving_deployment_answers_its_admin_api(
         )
         streaming.start()
         _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
-        in_place = _apply(base_url, "max_running_requests=4")
-        assert in_place["change"] == "in_place", in_place
+        update = _apply(base_url, "scheduler_config.max_batch=4")
+        assert update["change"] == "program", update
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
         before_update = len(read)
         report = _change_world(base_url, CHANGE)
         print(f"world change pause: {report['pause_seconds']:.3f} s")
@@ -1561,8 +1563,13 @@ def _restart_while_streaming(
     )
     reply = _chat(base_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
-    update = _apply(base_url, "max_running_requests=8")
-    assert update["change"] == "in_place", update
+    # A scheduling limit is a parameter of the policy program, so it reaches the
+    # serving epoch as a program update; `max_running_requests` is build config
+    # and would switch the epoch.
+    update = _apply(base_url, "scheduler_config.max_batch=4")
+    assert update["change"] == "program", update
+    committed = _admin(base_url, "config/commit")
+    assert committed.status_code == 200, committed.text
 
     # A change of the listening address restarts the daemon on it: the new
     # address serves, and the old one closes once the replaced daemon exits.
