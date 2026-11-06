@@ -597,7 +597,11 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         let base = self.pool()?.base(self.stream_id())?;
         let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let forward = nn::Forward::new(&stream, &kernels, &arena);
+        let group = self.group.clone();
+        let forward = crate::runners::denoiser::grouped(
+            nn::Forward::new(&stream, &kernels, &arena),
+            group.as_deref(),
+        );
         let rows = u64::from(tokens);
         let hidden_width = u64::from(self.shape.hidden.max(1));
         let batch = TokenBatch {

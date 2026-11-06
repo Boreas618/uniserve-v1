@@ -396,7 +396,12 @@ impl RankProducts {
     /// The store that holds `kind` for this rank.
     fn store(&self, kind: Product) -> &Held {
         match kind {
-            Product::Video(_) | Product::Track | Product::Tail(_) => &self.group.shared,
+            Product::Video(_)
+            | Product::Track
+            | Product::Tail(_)
+            | Product::ConditionPixels
+            | Product::ConditionSamples
+            | Product::VisionPixels => &self.group.shared,
             _ => &self.group.ranks[self.rank],
         }
     }
@@ -424,6 +429,22 @@ impl Products for RankProducts {
         stream: StreamId,
     ) -> Result<Option<TensorView>> {
         self.store(kind).borrow(request, kind, device, stream)
+    }
+
+    fn ordered(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        stream: &platform::Stream,
+    ) -> Result<Option<TensorView>> {
+        match kind {
+            // The media reader's regions are pinned host storage, which every rank's device reads
+            // in place: the first rank published them, and the rest order after its write.
+            Product::ConditionPixels | Product::ConditionSamples | Product::VisionPixels => {
+                self.group.shared.ordered_from_host(request, kind, stream)
+            }
+            _ => self.store(kind).ordered(request, kind, stream),
+        }
     }
 
     fn holds(&self, request: RequestKey, kind: Product) -> bool {
@@ -530,6 +551,27 @@ impl Default for Held {
 }
 
 impl Held {
+    /// The view of a product held in pinned host storage, for a reader on any device, ordered after
+    /// its write on `stream`.
+    ///
+    /// [`Products::ordered`] refuses a reader on another device because a device's storage does not
+    /// cross; host storage does, which only a caller that knows the region's kind can say.
+    fn ordered_from_host(
+        &self,
+        request: RequestKey,
+        kind: Product,
+        stream: &platform::Stream,
+    ) -> Result<Option<TensorView>> {
+        let placed = crate::lock(&self.entries).get(&(request, kind)).cloned();
+        let Some(placed) = placed else {
+            return Ok(None);
+        };
+        if let Some(written) = placed.written.as_ref() {
+            stream.wait_event(written)?;
+        }
+        Ok(Some(placed.view))
+    }
+
     /// An empty store.
     pub fn new() -> Self {
         Self {
@@ -887,6 +929,51 @@ mod tests {
 
     /// The shape a request's own runner has: it writes the trajectory and reads it back on one
     /// stream, and that must be the plain answer rather than a refusal.
+    /// Each rank of a group holds its own conditioning under the one name every rank publishes,
+    /// what a rank makes for another is one region for the whole group, and one reader's `forget`
+    /// ends the request on every rank.
+    #[test]
+    fn a_groups_ranks_keep_their_own_rows_and_share_what_crosses_them() {
+        let group = GroupProducts::new(2);
+        let (first, second) = (
+            RankProducts::new(Arc::clone(&group), 0),
+            RankProducts::new(Arc::clone(&group), 1),
+        );
+        let publish = |store: &RankProducts, kind, address, device: i32| {
+            store
+                .publish(
+                    request(1),
+                    kind,
+                    DeviceId(device),
+                    StreamId(1),
+                    None,
+                    &view(address, 8),
+                )
+                .expect("a publish");
+        };
+        publish(&first, Product::Text, 0x1000, 0);
+        publish(&second, Product::Text, 0x2000, 1);
+        let read = |store: &RankProducts, device: i32| {
+            store
+                .borrow(request(1), Product::Text, DeviceId(device), StreamId(1))
+                .expect("a read")
+                .expect("the rank's own rows")
+                .ptr
+                .address()
+        };
+        assert_eq!(read(&first, 0), 0x1000);
+        assert_eq!(read(&second, 1), 0x2000);
+
+        publish(&second, Product::Video(3), 0x3000, 1);
+        publish(&second, Product::Tail(3), 0x4000, 1);
+        assert!(first.holds(request(1), Product::Video(3)));
+        assert!(first.holds(request(1), Product::Tail(3)));
+
+        assert_eq!(first.forget(request(1)), 4);
+        assert!(!second.holds(request(1), Product::Text));
+        assert!(!second.holds(request(1), Product::Video(3)));
+    }
+
     #[test]
     fn a_product_written_and_read_on_one_stream_is_returned() {
         let store = Held::new();
