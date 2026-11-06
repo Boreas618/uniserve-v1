@@ -185,13 +185,13 @@ impl Plan {
 
     /// The bytes one encode call of this plan reserves in the arena.
     pub fn bytes(&self, config: &TextEncoderConfig, dtype: nn::DType) -> Result<u64> {
-        let mut bytes = Buffers::bytes(self, dtype)?;
-        for &patches in &self.images {
-            bytes = bytes
-                .checked_add(Buffers::tower_bytes(&config.vision, patches, dtype)?)
-                .ok_or_else(|| Error::config("an encoder plan larger than a u64".to_owned()))?;
-        }
-        Ok(bytes)
+        let bytes = Buffers::bytes(self, dtype)?;
+        let Some(&patches) = self.images.iter().max() else {
+            return Ok(bytes);
+        };
+        bytes
+            .checked_add(Buffers::tower_bytes(&config.vision, patches, dtype)?)
+            .ok_or_else(|| Error::config("an encoder plan larger than a u64".to_owned()))
     }
 }
 
@@ -1171,6 +1171,10 @@ impl TextEncoder {
             ];
             let image_tables =
                 ImageTables::new(&self.config.vision, image, patches, time, &tables)?;
+            // A block's tower buffers are dead once its features are written, and the next block's
+            // launches follow on the stream, so each block reuses the bytes of the one before it: a
+            // request of several enlarged images took more than the arena holds.
+            let block = f.arena().mark();
             let mut tower = self.tower.buffers(f.arena(), patches)?;
             if let Some(stream) = vision_hidden {
                 tower = tower.with_stream(stream).map_err(|error| {
@@ -1196,6 +1200,7 @@ impl TextEncoder {
                     deepstack: &deepstack[deepstack.len() - self.tower.deepstack_features()..],
                 },
             )?;
+            f.arena().release(block);
             offset += rows;
             patch_offset += u64::from(patches);
             length_offset += u64::from(time) + 1;
@@ -1282,8 +1287,9 @@ impl TextEncoder {
     /// The arena one encode of `layout` reserves, buffer by buffer.
     ///
     /// This is the same sum [`Plan::bytes`] returns, decomposed by name: the prompt's buffers once
-    /// (the stack reuses one set across all its layers), then one set per image the layout carries,
-    /// because the tower runs once per image. A deployment row reads the sum of these entries, and
+    /// (the stack reuses one set across all its layers), then the tower's set of the largest block,
+    /// because the tower runs once per block and each reuses the bytes of the one before it. A
+    /// deployment row reads the sum of these entries, and
     /// the equality with `Plan::bytes` is what the module's test holds it to - the arena is what
     /// every served request reserves before the denoiser runs, so a plan that disagreed with the
     /// arithmetic would be a reservation nobody could check.
@@ -1295,7 +1301,8 @@ impl TextEncoder {
             .collect::<Vec<_>>();
         let plan = self.plan(layout.tokens, &grids)?;
         let mut buffers = Buffers::plan(&plan, self.dtype);
-        for (index, &patches) in plan.images.iter().enumerate() {
+        let largest = plan.images.iter().enumerate().max_by_key(|(_, patches)| **patches);
+        if let Some((index, &patches)) = largest {
             for buffer in Buffers::tower_plan(&self.config.vision, patches, self.dtype) {
                 buffers.push(Buffer {
                     name: format!("image{index}.{}", buffer.name),
