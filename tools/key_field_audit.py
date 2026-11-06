@@ -27,14 +27,13 @@ import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
 #: The row sets to audit. H3's dense rows come from `minimax-h3-keys.txt`, which the deployment's own
-#: generator writes and `key_coverage`/`build_store` certify; the file it replaced held the same rows
-#: under a second name, and one deployment with two names is the second statement of one truth this
-#: lane keeps removing. The sparse rows have no certified file yet, so they are audited where they
-#: stand.
+#: generator writes and `key_coverage`/`build_store` certify. The H3 file is **one** deployment's
+#: rows and states the video-sparse one, whose rows are a superset of the dense deployment's: a second
+#: file for the dense set was a second name for a subset, and a store built from the dense file lacked
+#: the rows a sparse run launches.
 FIXTURES = (
     HERE.parent / 'notes/programs/qwen3-moe-keys.txt',
     HERE.parent / 'notes/programs/minimax-h3-keys.txt',
-    HERE.parent / 'notes/programs/minimax-h3-sparse-keys.txt',
 )
 
 #: Fields an extent is likely to be named by, most specific first.
