@@ -609,8 +609,9 @@ impl InProcess {
         // own stated parameters. A batch that states both would be served twice over, and one that
         // states neither cannot be served at all.
         if let Some(media) = batch.media.clone() {
+            // A text encoding is the one media computation that reads token columns: its prompt.
             anyhow::ensure!(
-                batch.columns.is_none(),
+                batch.columns.is_none() || media.computation.call == ipc::MediaCall::TextEncoding,
                 "batch {} states token columns and media columns: one batch is one computation",
                 batch.id
             );
