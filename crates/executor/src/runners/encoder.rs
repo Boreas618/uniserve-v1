@@ -31,7 +31,7 @@ use crate::batch::{Batch, BatchOutput, Job, Jobs};
 use crate::plan::{Bucket, Buckets, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, encode_i32};
-use crate::runners::lifecycle::{Lifecycle, walk_capture};
+use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
@@ -312,7 +312,8 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             phase: PhaseKind::Prefill,
             page_size: 0,
             num_tokens: bucket.tokens,
-            max_kv_len: 0,
+            // A row attends over its own tokens, and a bucket holds no more than its tokens.
+            max_kv_len: bucket.tokens,
             draft_lens: None,
         })
     }
@@ -381,6 +382,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         self.columns.seq_lens.write(&buffer)?;
         encode_i32(&mut buffer, &vec![0i32; rows + 1]);
         self.columns.query_offsets.write(&buffer)?;
+        encode_i32(&mut buffer, &vec![0i32; rows]);
         self.columns.logits_rows.write(&buffer)?;
         self.staged = Some(bucket);
         // A warm capture serves no request, so its launch publishes nothing: a row left here would
@@ -614,7 +616,8 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
-        self.lifecycle.attach_pools(pools);
+        self.lifecycle.attach_pools(Arc::clone(&pools));
+        self.pools = Some(pools);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
@@ -692,7 +695,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
+        let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
     }
 

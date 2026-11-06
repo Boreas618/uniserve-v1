@@ -102,7 +102,7 @@ OPTIONS = (
 )
 # A change of the options that only a new world executes: graphs of other
 # decode batch sizes.
-CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
+CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 8]"
 # The deployment's host KV cache on the host, in GiB.
 HOST_GIB = 8
 PROMPT = (
@@ -675,9 +675,10 @@ def _stream_count(
     reasons: list[str] | None = None,
     prompt: str = PROMPT,
     errors: list[BaseException] | None = None,
+    arrivals: list[float] | None = None,
 ) -> None:
-    """Streams the count, appending each content delta to `read` and each
-    finish reason to `reasons`.
+    """Streams the count, appending each content delta to `read`, the moment
+    it arrived to `arrivals`, and each finish reason to `reasons`.
 
     Runs on a thread, where an exception would otherwise be printed to a log
     the test's failure does not carry and read exactly like a stream that
@@ -685,7 +686,7 @@ def _stream_count(
     count of zero. `errors` keeps what went wrong so the failure states it.
     """  # noqa: D205
     try:
-        _stream_count_body(base_url, model, read, reasons, prompt)
+        _stream_count_body(base_url, model, read, reasons, prompt, arrivals)
     except BaseException as error:  # noqa: BLE001 - reported, never swallowed
         if errors is not None:
             errors.append(error)
@@ -701,6 +702,7 @@ def _stream_count_body(
     read: list[str],
     reasons: list[str] | None,
     prompt: str,
+    arrivals: list[float] | None = None,
 ) -> None:
     with httpx.stream(
         "POST",
@@ -725,6 +727,8 @@ def _stream_count_body(
                     content = (choice.get("delta") or {}).get("content")
                     if content:
                         read.append(content)
+                        if arrivals is not None:
+                            arrivals.append(time.monotonic())
                     if reasons is not None and choice.get("finish_reason"):
                         reasons.append(choice["finish_reason"])
 
@@ -1020,8 +1024,10 @@ def test_a_serving_deployment_answers_its_admin_api(
         )
         streaming.start()
         _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
-        in_place = _apply(base_url, "max_running_requests=4")
-        assert in_place["change"] == "in_place", in_place
+        update = _apply(base_url, "scheduler_config.max_batch=4")
+        assert update["change"] == "program", update
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
         before_update = len(read)
         report = _change_world(base_url, CHANGE)
         print(f"world change pause: {report['pause_seconds']:.3f} s")
@@ -1464,7 +1470,9 @@ def _restart_while_streaming(
         assert numbers == list(range(1, len(numbers) + 1)), (
             f"stream {index} broke: {''.join(read)[:400]}"
         )
-        assert len(numbers) > before_restart[index], (
+        # `before_restart` counts frames, and a frame need not hold a number.
+        before = re.findall(r"\d+", "".join(read[: before_restart[index]]))
+        assert len(numbers) > len(before), (
             f"stream {index} carried no number after the restart"
         )
         assert numbers and numbers[-1] >= last // 2, (
@@ -1528,20 +1536,16 @@ def _restart_while_streaming(
         120,
         "the replaced daemon did not exit",
     )
-    assert _runs(successor)
+    # The one-body restart replaced `successor` in turn, so the daemon that
+    # serves now is the last of them.
+    assert _runs(successors[-1])
     status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
     assert status["deployment"]["engine"] == "ready", status
     assert _pids(log, "Engine") == engines_before
     lines = _log_lines(log)
     assert any("the engine attached" in line for line in lines)
-    # The workers read the checkpoint once, when the deployment started.
-    assert (
-        sum(
-            "uniserve.loading.rank: loaded numerical model" in line
-            for line in lines
-        )
-        == 1
-    )
+    # The main process read the checkpoint once, when the deployment started.
+    assert sum("the epoch's retained weights" in line for line in lines) == 1
     events = httpx.get(f"{base_url}/admin/events?after=0", timeout=10).json()
     messages = [event["message"] for event in events["events"]]
     assert any("after a hot restart" in message for message in messages), (
@@ -1559,8 +1563,13 @@ def _restart_while_streaming(
     )
     reply = _chat(base_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
-    update = _apply(base_url, "max_running_requests=8")
-    assert update["change"] == "in_place", update
+    # A scheduling limit is a parameter of the policy program, so it reaches the
+    # serving epoch as a program update; `max_running_requests` is build config
+    # and would switch the epoch.
+    update = _apply(base_url, "scheduler_config.max_batch=4")
+    assert update["change"] == "program", update
+    committed = _admin(base_url, "config/commit")
+    assert committed.status_code == 200, committed.text
 
     # A change of the listening address restarts the daemon on it: the new
     # address serves, and the old one closes once the replaced daemon exits.
@@ -1607,10 +1616,20 @@ def _restart_while_streaming(
     assert last["result"]["change"] == "epoch", last
     committed = _admin(both_url, "config/commit")
     assert committed.status_code == 200, committed.text
-    status = httpx.get(f"{both_url}/admin/config", timeout=10).json()
-    config = tomllib.loads(status["config"])
-    assert config["server_config"]["port"] == port, config
-    assert config["cuda_graph_config"]["decode_batch_sizes"] == [1, 2, 4, 8, 16]
+
+    def served_config() -> dict:
+        status = httpx.get(f"{both_url}/admin/config", timeout=10).json()
+        return tomllib.loads(status["config"])
+
+    # A commit may be asked while the target is still being promoted, and it is
+    # applied when the trial starts: the configuration moves once the target serves.
+    _wait_until(
+        lambda: served_config()["cuda_graph_config"]["decode_batch_sizes"]
+        == [1, 2, 8],
+        300,
+        "the switch's target never served its configuration",
+    )
+    assert served_config()["server_config"]["port"] == port
     reply = _chat(both_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     _wait_until(
@@ -2484,6 +2503,7 @@ def _lose_the_serving_engine(
     read: list[str] = []
     done = threading.Event()
     errors: list[BaseException] = []
+    arrivals: list[float] = []
     reasons: list[str] = []
     streaming = threading.Thread(
         target=_stream_count,
@@ -2492,6 +2512,7 @@ def _lose_the_serving_engine(
             "reasons": reasons,
             "prompt": RECOVERY_PROMPT,
             "errors": errors,
+            "arrivals": arrivals,
         },
     )
     streaming.start()
@@ -2517,9 +2538,19 @@ def _lose_the_serving_engine(
         f"the response in flight did not continue within "
         f"{RECOVERY_BOUND_S:.0f} s of the engine {killed} ending",
     )
-    recovery_s = resumed[0] - started
 
     streaming.join(timeout=1800)
+    # What the client lived through: the longest silence of the stream from the
+    # last token before the loss on. The arrival of each token is its own
+    # reading, so this is exact to the token; a poll of the count would round up
+    # to its interval, and tokens already on their way would read as a recovery.
+    last_before = [moment for moment in arrivals if moment < started][-1:]
+    after = [moment for moment in arrivals if moment >= started]
+    spans = last_before + after
+    recovery_s = max(
+        (later - earlier for earlier, later in zip(spans, spans[1:])),
+        default=resumed[0] - started,
+    )
     # The measurement is taken before the tokens are judged: a run whose served
     # path is broken still states how long the recovery took, which is the one
     # number this case exists to record.

@@ -28,7 +28,7 @@
 //! Two model calls fill it, in either order, because they write disjoint rows and neither reads the
 //! other's: the text encoder's own features and the zero row are the encoder stage's, and then
 //! [`Denoiser::encode_conditions`] projects each condition's own rows into the condition rows, and
-//! [`Denoiser::prepare_conditioning`] refines the prompt's rows in place. The condition projection
+//! `Denoiser::prepare_conditioning` refines the prompt's rows in place. The condition projection
 //! needs the request's declared condition shapes and therefore the stage that holds the request;
 //! the refinement needs only the buffer, which is why it is the denoiser's own per-request hook.
 //!
@@ -36,8 +36,8 @@
 //!
 //! Everything a request changes arrives as device tables the executor allocates: the rotary
 //! coordinates, the modulation tags, the timestep groups, the prefix index of every packed row, the
-//! AdaLN row each row reads, and the step index. [`Layouts::prepare_state`] writes their host bytes
-//! in the order [`Layouts::state_tables`] names them; nothing of a request reaches a capture as a
+//! AdaLN row each row reads, and the step index. `Layouts::prepare_state` writes their host bytes
+//! in the order `Layouts::state_tables` names them; nothing of a request reaches a capture as a
 //! host value, and no table is uploaded from inside a forward.
 
 use nn::capability::{ConditionRole, LatentShape, Layout, StateTable, VideoRequest};
@@ -476,7 +476,7 @@ impl Layouts {
         Ok(packing)
     }
 
-    /// The tables one request of `layout` needs, in the order [`Layouts::prepare_state`] fills them.
+    /// The tables one request of `layout` needs, in the order `Layouts::prepare_state` fills them.
     ///
     /// Sorted by name, so the order is a property of the layout alone and two requests of one shape
     /// share one set. Every table is one the forward reads; none is a host value the executor would
@@ -787,7 +787,7 @@ impl Layouts {
         Ok(())
     }
 
-    /// Write one request's tables, in [`Layouts::state_tables`]' order.
+    /// Write one request's tables, in `Layouts::state_tables`' order.
     ///
     /// The bytes are host bytes in each table's own element type: the executor uploads them once
     /// per request, before the capture it will replay. `text_tokens` is the prompt's row count,
@@ -1108,8 +1108,8 @@ fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
 /// The segments a request's conditions pack into, in packed order.
 ///
 /// A runner hands one raster, one soundtrack and one draw per segment and reads back the row counts
-/// the packing reserved - it does not re-derive them, because those rows are the same arithmetic as
-/// [`condition_placements`] and a second statement of them is what makes a dropped condition
+/// the packing reserved - it does not re-derive them, because those rows are the same arithmetic the
+/// packer's own placements compute and a second statement of them is what makes a dropped condition
 /// invisible. Each segment carries its kind, its request index, its anchor (a keyframe's), its
 /// pixels' raster when it has any, and its audio frames.
 ///
@@ -1470,6 +1470,33 @@ fn flattened(error: Error) -> nn::Error {
 ///
 /// Every method delegates to the inherent one, so the model's own API stays the one the tests and
 /// the runner's documentation read.
+/// The denoising steps a denoiser of `config` runs for `task`, from the checkpoint's own schedule.
+///
+/// The task is a key: a checkpoint states the tasks it serves, and one it does not state is refused
+/// by name rather than answered with another task's ladder. Every H3 task shares one grid today,
+/// which is exactly why a wrong key would go unnoticed - the numbers would be right for a task the
+/// deployment's own contract denies.
+///
+/// The video and audio ladders advance on one step counter ([`Schedule::num_steps`] refuses a grid
+/// whose two disagree), so the video ladder is the request's ladder rather than one of two.
+///
+/// Public because it is arithmetic over a config and a schedule and nothing else: a host test cannot
+/// build a [`Denoiser`], and this is the half of the trait's answer that can be wrong while every
+/// number is right.
+pub fn schedule_for(
+    config: &DenoiserConfig,
+    schedule: &Schedule,
+    task: nn::capability::VideoTask,
+) -> Result<Vec<nn::Step>> {
+    if !config.tasks.contains(&task) {
+        return Err(Error::config(format!(
+            "this checkpoint serves {:?} and not {task:?}",
+            config.tasks
+        )));
+    }
+    schedule.steps(Modality::Video)
+}
+
 impl nn::capability::Denoiser for Denoiser {
     fn layout(&self, request: &VideoRequest<'_>) -> Layout {
         self.rules.cover(request)
@@ -1485,6 +1512,31 @@ impl nn::capability::Denoiser for Denoiser {
         let layout = self.layout(request);
         let plan = self.denoise_arena(&layout).map_err(flattened)?;
         Ok(crate::decoding::arena_reservation(&plan))
+    }
+
+    /// The denoising steps this checkpoint runs for `task`.
+    ///
+    /// Both modalities advance on one step counter - [`Schedule::num_steps`] refuses a grid whose two
+    /// ladders disagree, and the solver refuses a step a modality does not have - so the video ladder
+    /// **is** the request's ladder, not one of two.
+    ///
+    /// `task` is a key and not a position. Every H3 task shares this checkpoint's grid, which is
+    /// exactly why a wrong key would go unnoticed: a runner that took the first schedule would run
+    /// the right numbers for a task the checkpoint does not serve, and the deployment would serve a
+    /// task its own contract denies.
+    fn schedule(&self, task: nn::capability::VideoTask) -> nn::Result<Vec<nn::Step>> {
+        schedule_for(&self.config, &self.schedule, task).map_err(flattened)
+    }
+
+    /// The stack's width: the refiner projects the encoder's `text_dim` columns into it.
+    ///
+    /// H3's text encoder writes 5120-column features (`transformer.text_dim`) and every packed row
+    /// the denoiser reads is `hidden_size` wide - the `context_embedder` the refiner's input layer
+    /// is, `conditioning.py:195`. So `Conditioning::text` and `Conditioning::source` are two widths
+    /// and the runner sizes each from its owner: the encoder's features stay 5120 wide, and the rows
+    /// the denoiser reads are 5376.
+    fn text_width(&self) -> Option<u32> {
+        Some(self.config.transformer.hidden_size)
     }
 
     fn draw_noise(
@@ -2615,7 +2667,7 @@ impl Denoiser {
     ///
     /// The model allocates nothing: `out`, the latents and the draws are the runner's views, and
     /// the one scratch row buffer a visual condition needs comes from the forward pass's arena.
-    /// [`Denoiser::prepare_conditioning`] with the conditioned path's diagnostic views.
+    /// `Denoiser::prepare_conditioning` with the conditioned path's diagnostic views.
     ///
     /// **The served arm is this one with no trace**, so a page a harness writes through it is the
     /// arithmetic a request runs, launch for launch. A trace is the design's numeric diagnosis
@@ -2643,7 +2695,13 @@ impl Denoiser {
         if !cond.media.is_empty() {
             self.encode_media(f, cond.media, cond.text, trace)?;
         }
-        self.refine_conditioning(f, source, cond.text, cond.state, trace.and_then(|t| t.refined))
+        self.refine_conditioning(
+            f,
+            source,
+            cond.text,
+            cond.state,
+            trace.and_then(|t| t.refined),
+        )
     }
 
     pub fn encode_conditions(
@@ -3461,6 +3519,65 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn the_traits_schedule_is_the_checkpoints_ladder_keyed_by_task() {
+        let config = DenoiserConfig {
+            transformer: transformer(),
+            schedule: ScheduleSpec::uniform(
+                4,
+                Shifts {
+                    video: 12.0,
+                    audio: 3.0,
+                },
+            )
+            .expect("a uniform grid"),
+            attention: AttentionKind::DENSE,
+            tasks: vec![nn::capability::VideoTask::TextToVideoAudio],
+            canvases: None,
+            clip: crate::encoding::Clip {
+                frames: 17,
+                latents: 5,
+                token_drop: 3,
+            },
+        };
+        let schedule = Schedule::new(&config.schedule).expect("the checkpoint's schedule");
+        let count = schedule.num_steps().expect("an aligned grid");
+        let steps = schedule_for(
+            &config,
+            &schedule,
+            nn::capability::VideoTask::TextToVideoAudio,
+        )
+        .expect("the task this checkpoint serves");
+
+        // The ladders are the schedule's own, walked once: one step per pair of sigma points, indexed
+        // from zero, ending at the clean endpoint. A runner that rebuilt them from the spec would be
+        // a second statement of a grid only the checkpoint owns.
+        assert_eq!(steps.len() as u32, count);
+        assert_eq!(steps[0].index, 0);
+        assert_eq!(steps[0].count, count);
+        assert_eq!(steps.last().expect("steps").sigma_next, 0.0);
+        assert!(
+            steps
+                .windows(2)
+                .all(|pair| pair[0].sigma_next == pair[1].sigma
+                    && pair[1].index == pair[0].index + 1),
+            "{steps:?}"
+        );
+        assert_eq!(steps, schedule.steps(Modality::Video).expect("a ladder"));
+
+        // A task the checkpoint does not state is refused by name, and the refusal lists what it
+        // does serve: every H3 task shares one grid, so the numbers alone cannot tell a wrong key.
+        let error = schedule_for(
+            &config,
+            &schedule,
+            nn::capability::VideoTask::ReferenceToVideoAudio,
+        )
+        .expect_err("a task this checkpoint does not serve");
+        let message = error.to_string();
+        assert!(message.contains("ReferenceToVideoAudio"), "{message}");
+        assert!(message.contains("TextToVideoAudio"), "{message}");
     }
 
     fn request(frames: u32, width: u32, height: u32) -> VideoRequest<'static> {

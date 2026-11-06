@@ -288,8 +288,10 @@ pub fn channels_last_strides(shape: Shape) -> Strides {
 /// Whether `out` is stored channels-last: exactly the channels-last order and not the contiguous
 /// one.
 ///
-/// A frame whose channels are one wide has both orders as its strides, and it is contiguous: the
-/// compiled variant a launch selects must not depend on an axis that carries no order.
+/// The view's vector decides. A frame one channel wide has two different vectors for one memory
+/// order — the row-major one still steps the channel axis a whole frame — and the launch stores
+/// through whichever vector it was handed, so reading the extent instead of the vector would let one
+/// buffer run two ways in one deployment.
 pub fn is_channels_last(out: &TensorView) -> bool {
     out.strides == channels_last_strides(out.shape) && out.strides != Strides::row_major(out.shape)
 }
@@ -943,15 +945,21 @@ mod tests {
     fn the_order_of_a_frame_is_read_off_its_strides() {
         assert!(!is_channels_last(&channel_first()));
         assert!(is_channels_last(&channels_last()));
-        // A frame one channel wide has both orders as its strides, so it must read as contiguous:
-        // a variant chosen by an axis that carries no order would key on nothing.
-        let single = view(&[1, 1, 3, 2, 5], &[30, 1, 10, 5, 1]);
-        assert_eq!(single.strides, Strides::row_major(single.shape));
-        assert!(!is_channels_last(&single));
+        // A frame one channel wide is the interesting case: both orders describe the same memory,
+        // because the channel axis holds nothing to reorder, yet the two stride vectors differ -
+        // the row-major one still steps the channel axis a whole frame. The vector decides, so the
+        // layout a caller builds is the layout that runs; guessing from the extent instead would
+        // let one buffer be two keys.
+        let single_first = view(&[1, 1, 3, 2, 5], &[30, 30, 10, 5, 1]);
+        let single_last = view(&[1, 1, 3, 2, 5], &[30, 1, 10, 5, 1]);
+        assert_eq!(single_first.strides, Strides::row_major(single_first.shape));
         assert_eq!(
-            channels_last_strides(single.shape),
-            Strides::row_major(single.shape)
+            single_last.strides,
+            channels_last_strides(single_last.shape)
         );
+        assert_ne!(single_first.strides, single_last.strides);
+        assert!(!is_channels_last(&single_first));
+        assert!(is_channels_last(&single_last));
     }
 
     #[test]

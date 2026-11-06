@@ -80,6 +80,10 @@ struct InProcess {
     generation: u64,
     /// Completed reports, in the order the devices finished them.
     ready: crossbeam_channel::Receiver<Result<BatchReport, ExecutorError>>,
+    /// The sending end of `nudged`, which `Submissions::waker` hands out.
+    nudge: crossbeam_channel::Sender<()>,
+    /// Ends a park that no result would end (`Submissions::waker`).
+    nudged: crossbeam_channel::Receiver<()>,
     /// Submissions still to be waited on, handed to the waiting thread.
     queue: crossbeam_channel::Sender<Pending>,
     /// Shadow submissions in flight (7.3 step 2).
@@ -147,6 +151,8 @@ impl Submissions {
         );
         let (queue, pending) = crossbeam_channel::unbounded::<Pending>();
         let (reports, ready) = crossbeam_channel::unbounded();
+        // One slot: a nudge that finds one waiting has nothing to add.
+        let (nudge, nudged) = crossbeam_channel::bounded(1);
         std::thread::Builder::new()
             .name("sched-in-process-wait".into())
             .spawn(move || {
@@ -168,10 +174,32 @@ impl Submissions {
                 info,
                 generation: 0,
                 ready,
+                nudge,
+                nudged,
                 queue,
                 shadows: Vec::new(),
             })),
         })
+    }
+
+    /// What ends this scheduler's park when something other than a batch's
+    /// result arrives: a command, or a reader that freed room in an event
+    /// channel.
+    ///
+    /// The in-process arm parks on its results, so without this a command to an
+    /// idle scheduler waits out the park's whole liveness bound: a request
+    /// admitted that much later, and every stage of an update that much slower.
+    /// The worker-process arm's executor carries its own wake.
+    pub fn waker(&self) -> crate::CommandWaker {
+        match &self.path {
+            Path::MainProcess(_) => crate::CommandWaker::noop(),
+            Path::InProcess(arm) => {
+                let nudge = arm.nudge.clone();
+                crate::CommandWaker::new(move || {
+                    let _ = nudge.try_send(());
+                })
+            }
+        }
     }
 
     /// States the generation this step's batches serve on (4.2, 7.3).
@@ -521,12 +549,25 @@ impl InProcess {
     }
 
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, ExecutorError> {
-        match self.ready.recv_timeout(timeout) {
-            Ok(report) => report.map(Some),
-            Err(crossbeam_channel::RecvTimeoutError::Timeout) => Ok(None),
-            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => Err(anyhow::anyhow!(
-                "the in-process waiting thread has gone while batches were outstanding"
-            )),
+        let gone = || {
+            anyhow::anyhow!("the in-process waiting thread has gone while batches were outstanding")
+        };
+        // A poll that does not wait takes a result if one is there, and leaves a
+        // nudge for the park that follows, which is the one it is meant to end.
+        if timeout.is_zero() {
+            return match self.ready.try_recv() {
+                Ok(report) => report.map(Some),
+                Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => Err(gone()),
+            };
+        }
+        crossbeam_channel::select! {
+            recv(self.ready) -> report => match report {
+                Ok(report) => report.map(Some),
+                Err(_) => Err(gone()),
+            },
+            recv(self.nudged) -> _ => Ok(None),
+            default(timeout) => Ok(None),
         }
     }
 

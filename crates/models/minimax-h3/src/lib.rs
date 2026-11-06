@@ -29,7 +29,7 @@
 //!
 //! ## The model
 //!
-//! [`load`] composes the blocks the checkpoint holds into `nn::Model`; `uniserve engine` is the one
+//! [`load`](fn@crate::load) composes the blocks the checkpoint holds into `nn::Model`; `uniserve engine` is the one
 //! place a model class is named, and it hands the model to the executor, which serves each block by
 //! the capability it implements.
 

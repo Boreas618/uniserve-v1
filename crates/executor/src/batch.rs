@@ -1201,7 +1201,11 @@ mod media_tests {
         assert_eq!(denoise.bytes(), 64);
         denoise.check().expect("one request, its canvas stated");
 
-        let unstated = MediaColumns {
+        // A mux reads what the encodes already wrote, so no canvas sizes it: a **host** call
+        // states `Extent::None` and is accepted, which is what separates it from the device
+        // computation whose extent is asserted below. The case that used to sit here made muxing
+        // the example of a call no variant states, and that stopped being true when it gained one.
+        let muxed = MediaColumns {
             computation: Computation {
                 call: ipc::MediaCall::Muxing,
                 rows: 1,
@@ -1210,10 +1214,10 @@ mod media_tests {
             },
             inputs: vec![Vec::new()],
         };
-        assert!(
-            unstated.check().is_err(),
-            "a call no variant states is refused"
-        );
+        muxed
+            .check()
+            .expect("a host call is sized by the request's own products, not a canvas");
+        assert_eq!(muxed.bytes(), 0, "a mux stages no extent of its own");
 
         let wrong_rows = MediaColumns {
             inputs: vec![Vec::new(), Vec::new()],

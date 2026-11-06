@@ -58,6 +58,9 @@ pub enum Ready {
     /// A frame from an attached daemon is buffered: the hot restart successor
     /// whose request socket this engine connected to (`Attach`, §7.5.1 step 2).
     Attached(usize),
+    /// The process interface has something to read: the daemon's commands
+    /// arrive there, on a socket of their own.
+    Process,
     /// A peer main process connected: [`Control::accept`] takes it.
     PeerConnecting,
     /// A peer has a frame buffered; read it with [`Control::peer_mut`].
@@ -84,6 +87,8 @@ pub struct Control {
     listener: Option<Listener>,
     peers: BTreeMap<u32, Channel>,
     waker: Waker,
+    /// The process interface's descriptor, while it is open.
+    process: Option<std::os::fd::RawFd>,
 }
 
 impl Control {
@@ -111,6 +116,7 @@ impl Control {
             listener,
             peers: BTreeMap::new(),
             waker,
+            process: None,
         })
     }
 
@@ -118,6 +124,13 @@ impl Control {
     /// process.
     pub fn wake(&self) -> Wake {
         self.waker.wake()
+    }
+
+    /// States the process interface's descriptor, or `None` once it closed: a
+    /// closed socket stays readable, and polling it would never let a wait end
+    /// at its deadline.
+    pub fn watch_process(&mut self, process: Option<std::os::fd::RawFd>) {
+        self.process = process;
     }
 
     /// Waits for the next thing to serve, and not later than `deadline`.
@@ -134,6 +147,14 @@ impl Control {
             fd: self.daemon.descriptor(),
             events: libc::POLLIN,
             revents: 0,
+        });
+        let process_index = self.process.map(|process| {
+            descriptors.push(libc::pollfd {
+                fd: process,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            descriptors.len() - 1
         });
         let attached_start = descriptors.len();
         // The front each attached descriptor belongs to: a detached entry keeps
@@ -192,6 +213,9 @@ impl Control {
         let mut events = Vec::new();
         if descriptors[0].revents != 0 {
             events.push(Ready::Daemon);
+        }
+        if process_index.is_some_and(|index| descriptors[index].revents != 0) {
+            events.push(Ready::Process);
         }
         // An attached front reports its index, which is its place among the
         // fronts the process has ever had, not among the live ones.
@@ -449,6 +473,7 @@ mod tests {
             listener: Some(Listener::bind(&[address]).expect("a peer listener")),
             peers: BTreeMap::new(),
             waker: Waker::new().expect("a control wake"),
+            process: None,
         }
     }
 
@@ -536,6 +561,9 @@ mod tests {
         refusal: String,
         frame: Option<proto::request::wire::ToEngine>,
     ) -> std::thread::JoinHandle<(proto::request::wire::Hello, proto::request::wire::State)> {
+        // Whether the daemon refuses this engine, kept beside the welcome it is sent in: the
+        // fixture's own branch below asks the same question, and the welcome consumes the string.
+        let refuses = !refusal.is_empty();
         std::thread::spawn(move || {
             let mut connection = loop {
                 match listener.try_accept() {
@@ -557,15 +585,22 @@ mod tests {
                     spec: None,
                 })
                 .expect("answering the hello");
-            let reported: Option<proto::request::wire::FromEngine> = connection
-                .recv(Duration::from_secs(10))
-                .expect("reading the state");
-            let state: proto::request::wire::State = reported
-                .and_then(|message| match message.kind {
-                    Some(proto::request::wire::from_engine::Kind::State(state)) => Some(state),
-                    _ => None,
-                })
-                .expect("the engine stated what it serves");
+            // A refused engine states nothing: the refusal is the whole answer and the engine
+            // closes the connection after reading it, which is the correct behaviour and the
+            // reason this fixture must not wait for a state frame it will never receive.
+            let state: proto::request::wire::State = if !refuses {
+                let reported: Option<proto::request::wire::FromEngine> = connection
+                    .recv(Duration::from_secs(10))
+                    .expect("reading the state");
+                reported
+                    .and_then(|message| match message.kind {
+                        Some(proto::request::wire::from_engine::Kind::State(state)) => Some(state),
+                        _ => None,
+                    })
+                    .expect("the engine stated what it serves")
+            } else {
+                proto::request::wire::State::default()
+            };
             if let Some(frame) = frame {
                 connection.send(&frame).expect("sending a frame");
             }

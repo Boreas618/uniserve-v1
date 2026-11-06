@@ -124,7 +124,9 @@ use crate::RejectionKind;
 use crate::allocation::{
     BufferPool, BufferSpan, LatentPages, LatentPool, PrefixCacheManager, RequestPool, RequestSlot,
 };
-use crate::handle::{Command, EVENT_BUFFER_CAPACITY, EventSendError, EventTx, Submission};
+use crate::handle::{
+    Command, CommandWaker, EVENT_BUFFER_CAPACITY, EventSendError, EventTx, Submission,
+};
 use crate::kv_cache::{BlockPool, BlockTable, CacheAllocation, PrefixCacheCoordinator};
 use crate::{
     ArtifactEvent, DiffusionRequest, Event, FinishReason, GenerationRequest,
@@ -541,6 +543,10 @@ pub struct Scheduler {
     /// rather than on startup. It is a `watch` because the waiters outlive the
     /// stage that sets it and never need the value to change back.
     serving: tokio::sync::watch::Sender<bool>,
+    /// Tells the thread that reads this scheduler's output that there is some:
+    /// its events and its answers wait for that thread, so a step that produced
+    /// them says so rather than leaving them to its next periodic pass.
+    progress: CommandWaker,
     /// The stage §7.3 asked for and the answer to give once it is applied: a
     /// stage changes the serving policy, so it waits for a boundary where no
     /// batch and no submission is in flight.

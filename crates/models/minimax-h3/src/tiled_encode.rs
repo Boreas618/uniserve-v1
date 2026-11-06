@@ -129,7 +129,7 @@ pub struct Scene<'a> {
     pub blended: TensorView,
 }
 
-/// The stitcher's ring and hand-off: the buffers [`Scene::encode`] takes after the encoder's set.
+/// The stitcher's ring and hand-off: the buffers `Scene::encode` takes after the encoder's set.
 ///
 /// Two decoded rows of a two-row ring, one block per tile column, and one more block that a tile whose
 /// fade is both ways hands to its second blend - `2 * columns + 1` blocks in all, in the order
@@ -149,11 +149,7 @@ pub fn stitch_arena(
 ) -> Result<Vec<crate::decoding::Buffer>> {
     // The raster's channel extent, `2 * latent_channels`: the encoder writes a mean and a deviation
     // per latent channel and the clip's plan splits them.
-    let block = 2
-        * u64::from(config.latent_channels)
-        * latent_frames
-        * tile_rows
-        * tile_columns;
+    let block = 2 * u64::from(config.latent_channels) * latent_frames * tile_rows * tile_columns;
     let mut plan = Vec::with_capacity(2 * columns + 1);
     for ring in 0..2 {
         for column in 0..columns {
@@ -576,9 +572,17 @@ mod tests {
         let config = crate::video_vae::tests::video_config();
         let plan = stitch_arena(&config, 3, 2, 16, 16).expect("the stitcher's plan");
         let block = 2 * u64::from(config.latent_channels) * 2 * 16 * 16;
-        assert_eq!(plan.len(), 2 * 3 + 1, "two ring rows of three columns, and the hand-off");
+        assert_eq!(
+            plan.len(),
+            2 * 3 + 1,
+            "two ring rows of three columns, and the hand-off"
+        );
         for buffer in &plan {
-            assert_eq!(buffer.elements, block, "{} holds {block} elements", buffer.name);
+            assert_eq!(
+                buffer.elements, block,
+                "{} holds {block} elements",
+                buffer.name
+            );
             assert_eq!(buffer.element, "f32");
         }
         let names: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();

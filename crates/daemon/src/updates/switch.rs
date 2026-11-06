@@ -142,6 +142,12 @@ pub(crate) trait Roster {
     fn stop(&mut self, host: &str, group: &str, generation: Option<u64>);
     /// Commands the main process of `generation` on `host`.
     fn command(&mut self, host: &str, generation: u64, command: process::Command);
+    /// Makes the process of `generation` on `host` commandable: the epoch the switch leaves was
+    /// started by the daemon's engine control, so this roster holds no row of it, and a `Drain` to
+    /// a process it does not know would reach nothing.
+    fn adopt(&mut self, host: &str, group: &str, rank: u32, generation: u64) {
+        let _ = (host, group, rank, generation);
+    }
     /// Commands the frontend to serve `epoch` from `requests`.
     fn serve(&mut self, epoch: u64, requests: &str);
     /// Returns the previous epoch at `host` to serving.
@@ -187,6 +193,10 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
 
     fn command(&mut self, host: &str, generation: u64, command: process::Command) {
         (**self).command(host, generation, command)
+    }
+
+    fn adopt(&mut self, host: &str, group: &str, rank: u32, generation: u64) {
+        (**self).adopt(host, group, rank, generation)
     }
 
     fn serve(&mut self, epoch: u64, requests: &str) {
@@ -308,6 +318,8 @@ pub(crate) struct Switch {
     /// Where the switchover began and how long its pause took: from its first
     /// promote to the last drained epoch.
     switchover_started: Option<Instant>,
+    /// The operator committed before the trial began (`Switch::commit`).
+    commit_asked: bool,
     pause: Option<Duration>,
     /// Whether a serving main process of the previous epoch exited during the
     /// switch, which hands the failure domain to the standby promotion
@@ -369,6 +381,7 @@ impl Switch {
             target_dead: BTreeSet::new(),
             failure: None,
             switchover_started: None,
+            commit_asked: false,
             pause: None,
             promotion_due: false,
         }
@@ -438,6 +451,9 @@ impl Switch {
     /// Starts the precopy: every node starts the target's main process, then
     /// claims the target world's storage before the child maps it.
     pub(crate) fn start(&mut self, roster: &mut impl Roster) {
+        for node in &self.nodes {
+            roster.adopt(&node.host, &self.group, node.rank, self.previous_generation);
+        }
         for node in &self.nodes {
             let spawn = Spawn {
                 host: node.host.clone(),
@@ -562,9 +578,19 @@ impl Switch {
 
     /// The operator commits: the target serves from now on and the previous
     /// epoch is dropped and retired.
+    ///
+    /// The operator may ask before the trial has begun: the answer to an apply
+    /// comes once the target serves, while the drain that starts the trial is
+    /// still in flight. The commit is kept and applied when the trial starts, so
+    /// an answered commit is never one that did nothing.
     pub(crate) fn commit(&mut self, roster: &mut impl Roster) {
-        if self.phase != Phase::Probation {
-            return;
+        match self.phase {
+            Phase::Preparing | Phase::Promoting | Phase::Serving => {
+                self.commit_asked = true;
+                return;
+            }
+            Phase::Probation => {}
+            Phase::Committing | Phase::Reverting | Phase::Purged | Phase::Abandoned => return,
         }
         self.phase = Phase::Committing;
         let generation = self.target_generation();
@@ -1054,6 +1080,9 @@ impl Switch {
                 self.record.status = Status::Probation;
                 self.epochs.record(self.target, self.record.clone());
                 self.phase = Phase::Probation;
+                if std::mem::take(&mut self.commit_asked) {
+                    self.commit(roster);
+                }
             }
             Phase::Committing if hosts.is_subset(&self.committed) => {
                 self.record.status = Status::Serving;
@@ -2328,6 +2357,30 @@ mod tests {
         assert_eq!(switch.phase(), Phase::Probation);
         assert!(roster.stops.is_empty());
         assert!(switch.failure().is_none());
+    }
+
+    /// The answer to an apply comes once the target serves, so an operator's
+    /// commit can arrive while the drain that starts the trial is in flight. It
+    /// is kept for the trial: a commit that was answered and did nothing would
+    /// leave the previous epoch's process running for good.
+    #[test]
+    fn a_commit_before_the_trial_applies_when_the_trial_starts() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        prepared(&mut roster, &mut switch);
+        switch.promoted(&mut roster, "n0", 6);
+        switch.promoted(&mut roster, "n1", 6);
+        assert_eq!(switch.phase(), Phase::Serving);
+        roster.commands.clear();
+
+        switch.commit(&mut roster);
+        assert_eq!(switch.phase(), Phase::Serving, "the drain has not finished");
+        assert!(roster.commands.is_empty(), "nothing is commanded yet");
+
+        switch.drained(&mut roster, "n0", 11);
+        switch.drained(&mut roster, "n1", 11);
+        assert_eq!(switch.phase(), Phase::Committing);
+        assert_eq!(roster.commands.len(), 2, "a commit per node");
     }
 
     /// A commit records the target as serving once it acknowledges, stops the

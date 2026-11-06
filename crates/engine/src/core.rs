@@ -1202,6 +1202,20 @@ impl SchedulerHandle {
     /// request rows than `max_running_requests` running requests need, or when
     /// the scheduler's thread cannot be started.
     pub fn over_batches(config: EngineConfig, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
+        Self::over_batches_telling(config, batches, CommandWaker::noop())
+    }
+
+    /// [`Self::over_batches`], with `progress` told whenever a step produced
+    /// events or an answer: what the thread reading them waits on.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::over_batches`] does.
+    pub fn over_batches_telling(
+        config: EngineConfig,
+        batches: Arc<dyn Batches>,
+        progress: CommandWaker,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             config.data_parallel_size == 1,
             "one handle is one scheduler thread, but the config states {} ranks: start one \
@@ -1213,19 +1227,18 @@ impl SchedulerHandle {
         let runtime = info.runtime_info()?;
         Self::check_rows(&runtime, config.max_running_requests)?;
         let tokens = config.control_tokens();
+        let submissions = crate::scheduler::submissions_over(Arc::clone(&batches))?;
+        let waker = submissions.waker();
         let scheduler = Scheduler::new(
-            crate::scheduler::submissions_over(Arc::clone(&batches))?,
+            submissions,
             tokens,
             Self::scheduler_config(&config),
             config.worker_process.dtype,
             config.generation_limits.clone(),
         )?;
-        let scheduler = Self::configured(scheduler, &config)?;
-        let mut handle = Self::spawn(
-            scheduler,
-            config.worker_process.model.clone(),
-            CommandWaker::noop(),
-        )?;
+        let mut scheduler = Self::configured(scheduler, &config)?;
+        scheduler.set_progress(progress);
+        let mut handle = Self::spawn(scheduler, config.worker_process.model.clone(), waker)?;
         handle.batches = Some(batches);
         // The serving path's warm-up is the serving path's: it runs once the
         // epoch's first policy serves, on a thread of its own, and startup does
@@ -1832,9 +1845,12 @@ impl SchedulerHandle {
         &self,
         ranks: Vec<scheduling::guest::view::RankView>,
     ) -> Option<crate::scheduler::TrialState> {
+        // A scheduler answers at its next command boundary, and one whose executor has no wake
+        // reaches it when its park ends, which is `IDLE_LIVENESS_POLL` away at most.
+        const POLICY_STATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
         self.commands
             .policy_state(ranks)
-            .recv_timeout(std::time::Duration::from_millis(200))
+            .recv_timeout(POLICY_STATE_WAIT)
             .ok()
             .flatten()
     }
