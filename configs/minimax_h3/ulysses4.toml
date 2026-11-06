@@ -1,8 +1,9 @@
 # FastH3 on four GPUs of one host: a Ulysses4 denoiser and a TP4 text encoder.
 #
-# The denoiser's projection is `gather`, the protocol's default: each rank gathers every member's
-# rows and projects its own heads with its share of the weights. At these four ranks it moves less
-# than `exchange`, which projects a rank's rows for all heads and sends each member its shard.
+# The denoiser's projection is `exchange`: each rank projects its own rows for all heads with
+# whole weights and sends each member that member's head shard, which is what the port does
+# (`attention_sparse`'s three scatters and one gather) and what its unsliced weight requests
+# imply. The protocol's default is `gather`, so the mode is stated here rather than assumed.
 
 [[worker_groups]]
 id = "model"
@@ -10,7 +11,7 @@ ranks = ["cuda:0-3"]
 queue_depth = 6
 
 [worker_groups.components.transformer]
-sequence_parallel = { kind = "ulysses", ulysses_degree = 4, projection = "gather" }
+sequence_parallel = { kind = "ulysses", ulysses_degree = 4, projection = "exchange" }
 
 [worker_groups.components.text_encoder]
 tensor_parallel_size = 4

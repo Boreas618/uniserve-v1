@@ -50,7 +50,7 @@ architectures = ["sm_100a", "sm_100f"]
 # alignment (16 bytes = 8 BF16 elements), so 72 is served by the standard kernel rather than by a
 # padded last tile this package would have to mask itself. `kv_heads` 16 with `q_heads` 16 is the
 # equal-heads case that its grouped-query path degenerates to (`num_head % num_head_kv == 0`).
-dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "72"], q_heads = ["56", "28", "32", "24", "16", "64"], kv_heads = ["56", "28", "16", "4", "8", "2", "32", "64"], mask = ["causal", "dense"], window = ["false"] }
+dimensions = { dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "72"], q_heads = ["56", "28", "14", "32", "24", "16", "64"], kv_heads = ["56", "28", "14", "16", "4", "8", "2", "32", "64"], mask = ["causal", "dense"], window = ["false"] }
 
 [parameters]
 # The representative problem the vendor's configuration is chosen for: the batch and
