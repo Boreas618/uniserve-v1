@@ -1436,6 +1436,11 @@ impl EventStream {
             Event::TextToken { .. } => self.text_tokens += 1,
             Event::TextTokens { ids } => self.text_tokens += ids.len(),
             event if event.is_terminal() => {
+                // The terminal event is one the consumer took, and the engine
+                // counts it in the position a takeover replays from: a stream
+                // that reported one short of it would leave the engine holding
+                // the request for an event nobody is behind.
+                self.consumed += 1;
                 self.finish();
                 return;
             }
@@ -1449,8 +1454,21 @@ impl EventStream {
         // command failed: a consumer's position is the connection's
         // bookkeeping`. Events already queued when a stream ended still reach
         // `observe`, so the gate is here and not in the caller.
-        if self.open
-            && self.consumed - self.reported >= EVENT_WINDOW / 2
+        if self.open && self.consumed - self.reported >= EVENT_WINDOW / 2 {
+            self.report_consumed();
+        }
+    }
+
+    /// Reports the position the consumer has reached, when it moved since the
+    /// last report.
+    ///
+    /// The window's turnover is the ordinary reason to report; the end of the
+    /// stream is the other one. A short request never turns the window over, and
+    /// an engine that keeps a request until its consumer has taken every event —
+    /// the forwarder whose join holds an epoch's shutdown, and a takeover's
+    /// replay — would wait for a report that only a long request ever sends.
+    fn report_consumed(&mut self) {
+        if self.consumed > self.reported
             && let Some(shared) = &self.shared
         {
             shared.command(
@@ -1509,6 +1527,7 @@ impl EventStream {
     /// Ends the stream's request on its side and runs its callback once.
     fn finish(&mut self) {
         self.open = false;
+        self.report_consumed();
         if let Some(on_finish) = self.on_finish.take() {
             on_finish();
         }
@@ -1516,9 +1535,15 @@ impl EventStream {
 }
 
 impl Drop for EventStream {
-    /// Cancels a request that has not ended and runs a callback that has not
-    /// run.
+    /// Reports the position the consumer reached, cancels a request that has not
+    /// ended, and runs a callback that has not run.
+    ///
+    /// The report goes out on the way out even though the request is about to be
+    /// cancelled: the engine's forwarder holds a request until its consumer has
+    /// taken what it sent, and a dropped stream is exactly the case where the
+    /// last position would otherwise never be stated.
     fn drop(&mut self) {
+        self.report_consumed();
         self.cancel();
         if let Some(on_finish) = self.on_finish.take() {
             on_finish();
