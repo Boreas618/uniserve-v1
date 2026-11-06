@@ -47,6 +47,9 @@ use crate::runners::products::{Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
 
+/// The channels of a decoded raster: red, green and blue, whatever the latents carry.
+const RASTER_CHANNELS: u32 = 3;
+
 /// The columns one clip's decode is staged into, sized for the largest canvas the runner serves.
 ///
 /// A decoder's buckets differ by canvas, and its columns are sized by the largest of them: the clip
@@ -401,7 +404,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             )));
         };
         let layout = self.layout(bucket)?;
-        let elements = u64::from(layout.video.channels)
+        let elements = u64::from(RASTER_CHANNELS)
             .checked_mul(u64::from(frames))
             .and_then(|elements| elements.checked_mul(u64::from(height)))
             .and_then(|elements| elements.checked_mul(u64::from(width)))
@@ -693,7 +696,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             self.columns.raster.device.ptr,
             self.dtype,
             Shape::new(&[
-                u64::from(layout.video.channels),
+                u64::from(RASTER_CHANNELS),
                 u64::from(frames),
                 u64::from(height),
                 u64::from(width),
@@ -846,7 +849,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 "bucket {bucket} is not a decode bucket and a clip was spliced"
             )));
         };
-        let channels = layout.video.channels;
+        let channels = RASTER_CHANNELS;
         self.size_tail(channels, height, width, splice.overlap)?;
         let previous = match self.tail.as_ref() {
             Some(tail) if splice.overlap > 0 => Some(TensorView::new(
