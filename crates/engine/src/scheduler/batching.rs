@@ -853,41 +853,34 @@ impl Scheduler {
             );
             return;
         };
-        // The per-request record is a denoising step's: the request's conditioning and the step,
-        // seed and canvas a draw is addressed by. **The artifact's three host calls state that same
-        // record and nothing more** - an encode of a video unit works at the request's canvas and
-        // frame count, an encode of its track reads the window the audio decoder published, and the
-        // mux reads what the two encodes wrote - so a batch of one of them is stamped here like a
-        // denoising step's.
+        // Every media call states the same record: the request's conditioning and the step, seed,
+        // canvas and frame count a call of its request is addressed by. A denoising step reads all
+        // of it; a decode reads the request and its frames, and the track's decoder the request; the
+        // host calls work at the request's canvas and frame count. What a call reads beyond the
+        // record is a product, which its runner takes from the store under the request's name.
         //
-        // The other families stage buffers this mechanism cannot state: a decode reads the clip's
-        // latents and the tables the model's `layout_tables` names, and a conditioning encode reads
-        // the tokens its call carries. A batch of one of those is refused here by name rather than
-        // stamped with a record shaped for another family (a decoder reads `inputs[0]` as a clip's
-        // latents, and two buffers for it would be a refusal about counts rather than about the
-        // fact that nobody stated them).
-        let host = matches!(
-            media_call,
-            ipc::MediaCall::VideoEncoding
-                | ipc::MediaCall::AudioEncoding
-                | ipc::MediaCall::Muxing
-        );
-        if media_call != ipc::MediaCall::Denoising && !host {
-            tracing::debug!(
-                "a media batch is dropped: a {:?} batch's per-request buffers are the model's own \
-                 and the mechanism states no spelling for them yet",
-                media_call
-            );
-            return;
-        }
+        // A text encoding also reads its prompt, as the token columns an encoder stages.
+        let prompts = if media_call == ipc::MediaCall::TextEncoding {
+            let Some(columns) = self.prompt_columns(batch) else {
+                return;
+            };
+            Some(columns)
+        } else {
+            None
+        };
         let Ok(rows) = u32::try_from(batch.requests.len()) else {
             return;
         };
-        let tokens = batch
-            .requests
-            .iter()
-            .map(|(call, _)| call.input_token_ids.len())
-            .sum::<usize>();
+        let tokens = prompts.as_ref().map_or_else(
+            || {
+                batch
+                    .requests
+                    .iter()
+                    .map(|(call, _)| call.input_token_ids.len())
+                    .sum::<usize>()
+            },
+            |columns| columns.input_ids.len(),
+        );
         let Ok(tokens) = u32::try_from(tokens) else {
             return;
         };
@@ -931,6 +924,30 @@ impl Scheduler {
             });
         }
         batch.media = Some(executor::batch::MediaColumns::staged(stated, &requests));
+        batch.columns = prompts;
+    }
+
+    /// The token columns of a text encoding batch: each request's prompt, packed, one row per request.
+    ///
+    /// `None` when the batch names a request this scheduler is not running, which the caller has
+    /// the same answer for as for any other media batch it cannot state.
+    fn prompt_columns(&self, batch: &ExecutionBatch) -> Option<executor::batch::BatchColumns> {
+        let mut columns = executor::batch::BatchColumns::default();
+        columns.rows.query_offsets.push(0);
+        for (call, _) in &batch.requests {
+            let state = self.running_media.get(&call.request_key.request_id)?;
+            let prompt = &state.request.prompt_token_ids;
+            let length = i32::try_from(prompt.len()).ok()?;
+            columns
+                .input_ids
+                .extend(prompt.iter().map(|id| *id as i32));
+            columns.rows.positions.extend(0..length);
+            columns.rows.seq_lens.push(length);
+            let end = i32::try_from(columns.input_ids.len()).ok()?;
+            columns.rows.query_offsets.push(end);
+            columns.rows.logits_rows.push(end - 1);
+        }
+        Some(columns)
     }
 
     /// Determines the next call kind without mutating request or resource state.

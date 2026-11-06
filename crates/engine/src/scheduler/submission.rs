@@ -660,9 +660,10 @@ impl InProcess {
                     tokens: computation.tokens,
                     variant,
                 },
-                // A media computation reads none of the token columns, so its batch carries none:
-                // the fields the kernels read are the model's own, staged inside the runner.
-                columns: executor::batch::BatchColumns::default(),
+                // A text encoding reads its prompt as token columns. Every other media computation
+                // reads none, so its batch carries none: the fields its kernels read are the
+                // model's own, staged inside the runner.
+                columns: batch.columns.clone().unwrap_or_default(),
                 generation,
                 cache_units: Vec::new(),
                 block_tables: Vec::new(),
