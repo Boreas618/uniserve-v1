@@ -1230,8 +1230,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             ..
         } = &mut self.columns;
         // The refined rows are the request's for its whole schedule: `first_step` folds them once,
-        // and every later step reads them where they are. Only a first step starts from zeros.
+        // and every later step reads them where they are. Only a first step starts from zeros, and
+        // that write is the host's own, so the previous request's last launch is waited out first.
         if self.staged_step == Some(0) {
+            stream.synchronize()?;
             text.write(&staged.text)?;
             source.write(&staged.source)?;
         }
