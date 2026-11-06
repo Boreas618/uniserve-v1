@@ -872,7 +872,7 @@ impl Replica {
         // The daemon orchestrates what changes in its own options: a hot
         // restart applies them first, and its successor applies the change
         // again, which then leaves the daemon's options as they are.
-        if daemon_changes && !in_place {
+        if daemon_changes {
             return Ok(Applied::Daemon {
                 config: Box::new(crate::options::with_daemon_options(&current, &target)),
                 executable: None,
@@ -914,15 +914,10 @@ impl Replica {
                 serde_json::json!({ "in_place": ["the fence probes"] }),
             ));
         }
-        // Scheduling alone, within the batch the serving engine's workers
-        // were started for, changes in place at the schedulers' next step.
+        // A scheduling limit is a parameter of the policy program, so the program layer above has
+        // moved the schedulers to it (§7.7) or found they run it already. What is left is the
+        // record of it here: the spec the next apply compares with.
         if in_place {
-            let scheduling = target_spec.scheduling.clone().unwrap_or_default();
-            running
-                .configure(scheduling)
-                .await
-                .map_err(|error| anyhow::anyhow!("the engine did not take the limits: {error}"))?;
-            info!("the engine took the new scheduling limits in place");
             let mut spec = served;
             spec.scheduling = target_spec.scheduling;
             *locked(&self.served) = Some(spec);
