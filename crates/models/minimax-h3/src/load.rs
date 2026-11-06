@@ -946,7 +946,6 @@ pub fn load(
                 let decoder = Arc::new(crate::video_vae::VideoDecoder::load(
                     &config.video_vae,
                     canvases,
-                    attention,
                     dtype,
                     input,
                     &mut shards,
