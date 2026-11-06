@@ -87,6 +87,9 @@ pub enum Stage {
     /// multiplication), so a second computation here would be a different number waiting to
     /// disagree by one at the end of a request.
     Track,
+    /// A muxing call that hands over encoded rounds. Each unit joined the assembly when its encode
+    /// ran, so nothing is left to do and the call is answered as it arrives.
+    Hand,
     /// The end of the request's assembly: the MP4's bytes are the stage's answer.
     Mux,
 }
@@ -154,7 +157,7 @@ impl HostAction for MediaWork {
                 Ok(None)
             }
             Stage::Mux => Ok(Some(self.output.finish(self.request)?)),
-            Stage::Open => Ok(None),
+            Stage::Open | Stage::Hand => Ok(None),
         };
         if outcome.is_err() {
             // A stage that fails ends its request short of an artifact, so the assembly this
@@ -599,6 +602,7 @@ fn stage_batch(
             (request.width, request.height),
             &units,
             appended(request.request),
+            request.handed,
         )?;
         staged_calls.push(StagedCall {
             request: request.request,
@@ -633,6 +637,7 @@ fn staged(
     canvas: (u32, u32),
     units: &[u32],
     index: usize,
+    handed: u32,
 ) -> Result<(Stage, Option<Product>)> {
     let variant = computation.variant().ok_or_else(|| {
         crate::Error::Invalid(format!(
@@ -664,6 +669,7 @@ fn staged(
             ))
         }
         Variant::AudioEncode => Ok((Stage::Track, Some(Product::Track))),
+        Variant::Mux if handed > 0 => Ok((Stage::Hand, None)),
         Variant::Mux => Ok((Stage::Mux, None)),
         Variant::LatentPrepare => Ok((Stage::Open, None)),
         other => Err(crate::Error::Invalid(format!(
@@ -913,6 +919,7 @@ mod tests {
                 width: 1344,
                 height: 768,
                 frames: 56,
+                handed: 0,
             },
             crate::batch::StagedRequest {
                 request: ipc::RequestKey::new(1, ipc::RequestId(8), 0),
@@ -923,6 +930,7 @@ mod tests {
                 width: 768,
                 height: 768,
                 frames: 39,
+                handed: 0,
             },
         ];
         let video = crate::plan::Computation {
@@ -983,7 +991,7 @@ mod tests {
         // The first unit of the timeline is the first entry of the schedule, at the request's own
         // canvas: the batch states no extent, and nothing about the raster is re-derived here.
         assert_eq!(
-            staged(video, (1344, 768), &units, 0).expect("a video encode"),
+            staged(video, (1344, 768), &units, 0, 0).expect("a video encode"),
             (
                 Stage::Unit {
                     frames: 17,
@@ -994,7 +1002,7 @@ mod tests {
             )
         );
         assert_eq!(
-            staged(video, (1344, 768), &units, 1).expect("the timeline's second unit"),
+            staged(video, (1344, 768), &units, 1, 0).expect("the timeline's second unit"),
             (
                 Stage::Unit {
                     frames: 22,
@@ -1005,12 +1013,26 @@ mod tests {
             )
         );
 
+        // Only the muxing call that hands over nothing finishes the artifact.
+        let mux = crate::plan::Computation {
+            call: ipc::MediaCall::Muxing,
+            ..video
+        };
+        assert_eq!(
+            staged(mux, (1344, 768), &units, 0, 2).expect("a round handed over"),
+            (Stage::Hand, None)
+        );
+        assert_eq!(
+            staged(mux, (1344, 768), &units, 0, 0).expect("the final call"),
+            (Stage::Mux, None)
+        );
+
         let audio = crate::plan::Computation {
             call: ipc::MediaCall::AudioEncoding,
             ..video
         };
         assert_eq!(
-            staged(audio, (1344, 768), &units, 0).expect("an audio encode"),
+            staged(audio, (1344, 768), &units, 0, 0).expect("an audio encode"),
             (Stage::Track, Some(Product::Track))
         );
 
@@ -1019,7 +1041,7 @@ mod tests {
             ..audio
         };
         assert_eq!(
-            staged(mux, (1344, 768), &units, 0).expect("a mux"),
+            staged(mux, (1344, 768), &units, 0, 0).expect("a mux"),
             (Stage::Mux, None)
         );
 
@@ -1027,7 +1049,7 @@ mod tests {
         // encodes running as one is an assembly the muxer would refuse much later.
         let message = format!(
             "{}",
-            staged(video, (1344, 768), &units, 2).expect_err("no third unit")
+            staged(video, (1344, 768), &units, 2, 0).expect_err("no third unit")
         );
         assert!(
             message.contains("2 unit(s)"),
@@ -1041,7 +1063,7 @@ mod tests {
         };
         let message = format!(
             "{}",
-            staged(denoise, (1344, 768), &units, 0).expect_err("a denoise")
+            staged(denoise, (1344, 768), &units, 0, 0).expect_err("a denoise")
         );
         assert!(
             message.contains("three calls"),
