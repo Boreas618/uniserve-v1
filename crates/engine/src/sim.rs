@@ -1593,6 +1593,31 @@ impl SimEngine {
                 let visual_state =
                     !call.vision_inputs.is_empty() || call.latent_feature_input.is_some();
                 let samples_token = call.token_output.is_some();
+                // A call that extends the prompt scores its tokens when the
+                // request asks, as a rank does: every token but the prompt's
+                // first, which no position predicts.
+                let extends_prompt = work == CallKind::Forward(ForwardMode::Prefill)
+                    && call.latent_feature_input.is_none()
+                    && call.completion_output.is_none();
+                if extends_prompt
+                    && request
+                        .sampling()
+                        .is_some_and(SamplingParams::prompt_logprobs_requested)
+                {
+                    let scored = usize::from(call.coordinates.logical_position == 0);
+                    record.prompt_logprobs = call
+                        .input_token_ids
+                        .iter()
+                        .skip(scored)
+                        .map(|&token_id| {
+                            vec![TokenLogprob {
+                                token_id,
+                                logprob: sim_candidate_logprob(call.request_key.request_id, token_id),
+                                rank: 1,
+                            }]
+                        })
+                        .collect();
+                }
                 if visual_state {
                     request.positions_from_model = true;
                     request.cache_visible_len = request
