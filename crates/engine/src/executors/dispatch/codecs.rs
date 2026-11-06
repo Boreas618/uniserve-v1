@@ -60,7 +60,7 @@ pub(crate) fn video_unit_codecs(
             let coverage = encoder_config.ranks.len() * per_encoder;
             if coverage < round_units {
                 refusals.push(format!(
-                    "worker {encoder_worker} encodes {coverage} units per round and worker \
+                    "executor {encoder_worker} encodes {coverage} units per round and executor \
                      {decoder_worker} decodes {round_units}"
                 ));
                 continue;
@@ -78,9 +78,9 @@ pub(crate) fn video_unit_codecs(
                     .map_or("<unplaced>", String::as_str);
                 (decoding_host != encoding_host).then(|| {
                     format!(
-                        "media unit {position} is decoded by rank {decoding_rank} of worker \
+                        "media unit {position} is decoded by rank {decoding_rank} of executor \
                          {decoder_worker} on host {decoding_host} and would be encoded by rank \
-                         {encoding_rank} of worker {encoder_worker} on host {encoding_host}"
+                         {encoding_rank} of executor {encoder_worker} on host {encoding_host}"
                     )
                 })
             });
@@ -93,7 +93,7 @@ pub(crate) fn video_unit_codecs(
         }
         anyhow::ensure!(
             !admissible.is_empty(),
-            "no video codec keeps the media units of worker {decoder_worker} on their host, \
+            "no video codec keeps the media units of executor {decoder_worker} on their host, \
              where their encoder reads them through shared storage: {}",
             refusals.join("; ")
         );
