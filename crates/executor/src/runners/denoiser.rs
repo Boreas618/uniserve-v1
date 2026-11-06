@@ -130,6 +130,13 @@ pub struct DenoiserShape {
     /// denoiser reads, and the model states that width itself (`Denoiser::text_width`), so the pair
     /// is resolved in [`conditioning_width`] rather than read from here twice.
     pub width: u32,
+    /// The width of the rows the denoiser reads (`nn::Denoiser::text_width`), which `text` is sized
+    /// by while `source`, holding what the encoder wrote, is sized by [`Self::width`].
+    ///
+    /// **The shape is where the model's statement lives, not the runner.** The planning boundary asks
+    /// the model once (`src/engine_plan.rs`) and puts the answer here, so a runner never asks the model
+    /// a second time and two statements of one width cannot drift.
+    pub text_width: u32,
 }
 
 /// The elements of one latent's block.
@@ -243,13 +250,7 @@ struct DenoiseColumns {
 }
 
 impl DenoiseColumns {
-    fn new(
-        device: DeviceId,
-        shape: DenoiserShape,
-        layout: &Layout,
-        rows: u32,
-        stated_text_width: Option<u32>,
-    ) -> Result<Self> {
+    fn new(device: DeviceId, shape: DenoiserShape, layout: &Layout, rows: u32) -> Result<Self> {
         let rows = u64::from(rows.max(1));
         let video = numel(&layout.video)?;
         let audio = match layout.audio {
@@ -257,7 +258,7 @@ impl DenoiseColumns {
             None => 1,
         };
         let width = (u64::from(layout.text_rows) + u64::from(layout.condition_rows)).max(1);
-        let (source_width, text_width) = conditioning_width(&shape, stated_text_width);
+        let (source_width, text_width) = conditioning_width(&shape);
         Ok(Self {
             video: Column::new(device, shape.sample, rows * video)?,
             audio: Column::new(device, shape.sample, rows * audio)?,
@@ -364,13 +365,13 @@ fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (
 /// The two widths one request's conditioning columns hold: `(source, text)`.
 ///
 /// `source` is what the text encoder wrote, which [`DenoiserShape::width`] states; `text` is what
-/// the denoiser reads, which the model states when its conditioner widens the encoder's features
-/// (`Denoiser::text_width`) and which is the encoder's width when it does not. **One width for both
+/// the denoiser reads, which [`DenoiserShape::text_width`] states - the planning boundary asked the
+/// model once and equal to the encoder's width when the model has no conditioner. **One width for both
 /// is the defect this pair removes**: the conditioner's own output then does not fit the buffer it
 /// writes, and the refusal arrives one operator later, at the gather.
-fn conditioning_width(shape: &DenoiserShape, stated_text_width: Option<u32>) -> (u64, u64) {
+fn conditioning_width(shape: &DenoiserShape) -> (u64, u64) {
     let source = u64::from(shape.width.max(1));
-    let text = u64::from(stated_text_width.unwrap_or(shape.width).max(1));
+    let text = u64::from(shape.text_width.max(1));
     (source, text)
 }
 
@@ -527,13 +528,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             .max_by_key(|plan| plan.bucket.rows)
             .ok_or_else(|| Error::Invalid("a denoiser runner derived no bucket".into()))?;
         let layout = layout_of(largest.bucket)?;
-        let columns = DenoiseColumns::new(
-            binding.device,
-            shape,
-            &layout,
-            largest.bucket.rows,
-            model.text_width(),
-        )?;
+        let columns = DenoiseColumns::new(binding.device, shape, &layout, largest.bucket.rows)?;
         let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
         Ok(Self {
             id: binding.id,
@@ -1467,15 +1462,20 @@ mod tests {
     /// - fails here rather than at a gather.
     #[test]
     fn a_widening_conditioner_writes_into_a_text_column_of_its_own_width() {
-        let shape = DenoiserShape {
+        // H3's refiner projects the encoder's 5120 columns into the stack's 5376.
+        let widened = DenoiserShape {
             stack: DType::BF16,
             sample: DType::F32,
             width: 5120,
+            text_width: 5376,
         };
-        // H3's refiner projects the encoder's 5120 columns into the stack's 5376.
-        assert_eq!(conditioning_width(&shape, Some(5376)), (5120, 5376));
+        assert_eq!(conditioning_width(&widened), (5120, 5376));
         // A model with no conditioner, or one that keeps the encoder's width.
-        assert_eq!(conditioning_width(&shape, None), (5120, 5120));
+        let kept = DenoiserShape {
+            text_width: 5120,
+            ..widened
+        };
+        assert_eq!(conditioning_width(&kept), (5120, 5120));
     }
 
     /// A layout survives the bucket that carries it and the reader that unwraps it.
