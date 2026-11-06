@@ -1244,6 +1244,7 @@ dependencies = [
  "libc",
  "libloading",
  "media",
+ "models",
  "nn",
  "nvtx",
  "ops",

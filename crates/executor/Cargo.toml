@@ -17,6 +17,7 @@ indexmap.workspace = true
 ipc.workspace = true
 libc.workspace = true
 libloading.workspace = true
+models.workspace = true
 nvtx.workspace = true
 nn.workspace = true
 ops.workspace = true

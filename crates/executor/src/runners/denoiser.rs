@@ -426,7 +426,7 @@ fn missing_product(
 /// The request and its row are what the store is seeded and published by; the seed is what the
 /// first step's draw is addressed by, and it is kept here because the draw is issued by the
 /// replay rather than by the `submit` that read it.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct Pending {
     /// The request this row belongs to.
     request: ipc::RequestKey,
@@ -434,6 +434,83 @@ struct Pending {
     index: u32,
     /// The request's noise seed: the draw is addressed by it and the element's index.
     seed: nn::capability::Seed,
+    /// The request as its first step reads it: its own prompt length and its own conditions.
+    stated: Arc<WarmRequest>,
+}
+
+/// The request a staged row states, within the bucket `warm` plans.
+///
+/// A graph is captured for a bucket's capacity, and a request's state tables say how much of that
+/// capacity it fills: the refiner's keys stop at its prompt, and every packed row takes its place on
+/// the rotary clock from that length. So the task, the canvas and the frames stay the plan's, and
+/// everything the request itself states replaces the plan's figures.
+fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest> {
+    use models::video::{ConditionRole, Conditioning};
+
+    let decoded = Conditioning::decode(conditioning).map_err(|error| {
+        Error::Invalid(format!("a media request's conditioning does not decode: {error}"))
+    })?;
+    let count = |role: ConditionRole| {
+        decoded
+            .conditions
+            .iter()
+            .filter(|condition| condition.role == role)
+            .count() as u32
+    };
+    let conditions = decoded
+        .conditions
+        .iter()
+        .map(|condition| {
+            let (frames, height, width) = condition
+                .media
+                .pixels()
+                .map_or((0, 0, 0), |(frames, canvas)| {
+                    (frames, canvas.height, canvas.width)
+                });
+            nn::ConditionShape {
+                role: match condition.role {
+                    ConditionRole::FirstFrame => nn::ConditionRole::FirstFrame,
+                    ConditionRole::LastFrame => nn::ConditionRole::LastFrame,
+                    ConditionRole::Reference => nn::ConditionRole::Reference,
+                },
+                frames,
+                height,
+                width,
+                audio_samples: condition
+                    .media
+                    .audio()
+                    .map_or(0, |clip| u32::try_from(clip.samples).unwrap_or(u32::MAX)),
+            }
+        })
+        .collect();
+    Ok(WarmRequest {
+        first_frames: count(ConditionRole::FirstFrame),
+        last_frames: count(ConditionRole::LastFrame),
+        references: count(ConditionRole::Reference),
+        text_tokens: u32::try_from(decoded.text_tags.len())
+            .map_err(|_| Error::Invalid("a prompt of more tokens than a u32 counts".into()))?,
+        conditions,
+        vision_spans: vision_spans(&decoded.text_tags),
+        ..warm.clone()
+    })
+}
+
+/// The prompt rows each vision block occupies, as `(first row, rows)`: the runs tagged zero.
+fn vision_spans(tags: &[u8]) -> Vec<(u32, u32)> {
+    let mut spans = Vec::new();
+    let mut first = None;
+    for (row, tag) in tags.iter().copied().chain(std::iter::once(1)).enumerate() {
+        match (tag, first) {
+            (0, None) => first = Some(row as u32),
+            (0, Some(_)) => {}
+            (_, Some(start)) => {
+                spans.push((start, row as u32 - start));
+                first = None;
+            }
+            (_, None) => {}
+        }
+    }
+    spans
 }
 
 /// One bucket and the request it was derived from.
@@ -878,6 +955,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
         self.fill(bucket)?;
+        self.state_of_request(bucket)?;
         let base = self.pool()?.base(self.stream_id())?;
         let reserved = self.pool()?.reserved();
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
@@ -909,6 +987,36 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             self.model.prepare_latents(&forward, cond, latents)?;
         }
         Ok(())
+    }
+
+    /// Writes the pending request's own state tables over the ones the capture read.
+    ///
+    /// A bucket's tables are one set, so a bucket serves one request at a time.
+    fn state_of_request(&mut self, bucket: Bucket) -> Result<()> {
+        let [row] = self.pending.as_slice() else {
+            return Err(Error::Invalid(format!(
+                "a first step of {} requests reached bucket {bucket}, whose state tables hold one",
+                self.pending.len()
+            )));
+        };
+        let layout = layout_of(bucket)?;
+        let tables = self.model.state_tables(&layout);
+        if tables.is_empty() {
+            return Ok(());
+        }
+        let stated = Arc::clone(&row.stated);
+        let model = Arc::clone(&self.model);
+        self.tables.rewrite(
+            &self.stream,
+            self.lifecycle.generation.number(),
+            &Self::key(bucket),
+            &tables,
+            |host| {
+                model
+                    .prepare_state(&stated.view(), &layout, host)
+                    .map_err(Error::from)
+            },
+        )
     }
 
     /// Writes one named tensor of the block-by-block diagnosis, when a directory is named.
@@ -1233,6 +1341,10 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 request: stated_request.request,
                 index,
                 seed: nn::capability::Seed(stated_request.seed),
+                stated: Arc::new(self::stated_request(
+                    &self.plan_of(bucket)?.warm,
+                    &stated_request.conditioning,
+                )?),
             });
             // Every row of one batch is the same step of the same schedule: a batch is one step
             // (`Variant::Denoise`), so a row that names another step describes another batch.
@@ -1834,6 +1946,46 @@ mod product_tests {
             STEP_PRODUCTS.first().copied(),
             "an empty store is refused for the first kind the step reads, not for the last"
         );
+    }
+
+    /// A staged row's own prompt replaces the capacity the plan captured, and the plan keeps the
+    /// canvas: the refiner's keys and the rotary clock stop at the prompt the request presents.
+    #[test]
+    fn a_staged_request_states_its_own_prompt_length_within_the_plan() {
+        let warm = WarmRequest {
+            task: nn::VideoTask::T2va,
+            width: 768,
+            height: 768,
+            frames: 107,
+            fps: 24,
+            first_frames: 0,
+            last_frames: 0,
+            references: 0,
+            text_tokens: 1024,
+            conditions: Vec::new(),
+            vision_spans: Vec::new(),
+        };
+        let conditioning = models::video::Conditioning {
+            task: models::video::VideoTask::T2va,
+            text_tags: vec![1; 9],
+            conditions: Vec::new(),
+        };
+        let stated = stated_request(&warm, &conditioning.encode().expect("a conditioning encodes"))
+            .expect("a t2va conditioning states a request");
+        assert_eq!(stated.text_tokens, 9);
+        assert_eq!((stated.width, stated.height, stated.frames), (768, 768, 107));
+        assert!(stated.conditions.is_empty());
+        assert!(
+            stated_request(&warm, b"not a conditioning").is_err(),
+            "a blob that does not decode is refused, because the capture's capacity is no request"
+        );
+    }
+
+    /// A vision block is one run of zero tags, wherever it ends.
+    #[test]
+    fn a_vision_span_is_a_run_of_zero_tags() {
+        assert_eq!(vision_spans(&[1, 0, 0, 1, 0]), vec![(1, 2), (4, 1)]);
+        assert!(vision_spans(&[1, 1]).is_empty());
     }
 
     /// A task whose request carries no condition element reads no source rows, so a store holding
