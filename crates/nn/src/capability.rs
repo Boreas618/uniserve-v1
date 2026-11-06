@@ -933,6 +933,16 @@ pub trait Decoder {
         Ok(None)
     }
 
+    /// The latent frame `clip`, counted from the timeline's first clip, starts at.
+    ///
+    /// A clip reads a window of the trajectory, and clips overlap by the frames the next one also
+    /// reads, so where a window starts is the decoder's arithmetic. A timeline of one clip starts at
+    /// zero.
+    fn clip_start(&self, clip: u32) -> u32 {
+        let _ = clip;
+        0
+    }
+
     /// The latent layout one clip's raster decodes from.
     ///
     /// [`Clip`] is the runtime's own extent - frames, rows and columns of the decoded raster - and

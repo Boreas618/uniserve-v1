@@ -615,15 +615,19 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             "the denoiser's trajectory",
         )
         .map_err(Error::from)?;
-        // The trajectory is `[channels, voxels]`, and the block the model reads is `[rows, channels]`
-        // in its own row order, so this crossing also lays the clip out for it.
-        let block = self.block_of(&layout, &converted)?;
+        // The trajectory is `[channels, voxels]` of the whole timeline, and the block the model reads
+        // is `[rows, channels]` of one clip's window in its own row order, so this crossing also
+        // takes the window and lays it out.
+        let clip = self.spliced.get(&request).copied().unwrap_or(0);
+        let first = self.model.clip_start(clip);
+        let block = self.block_of(&layout, &converted, first)?;
         self.columns.latents.write(&block)?;
         Ok(())
     }
 
-    /// `converted`, the clip's `[channels, voxels]` latents, as the model's `[rows, channels]` block.
-    fn block_of(&self, layout: &Layout, converted: &[u8]) -> Result<Vec<u8>> {
+    /// The clip window starting at latent frame `first` of `converted`, the timeline's
+    /// `[channels, voxels]` latents, as the model's `[rows, channels]` block.
+    fn block_of(&self, layout: &Layout, converted: &[u8], first: u32) -> Result<Vec<u8>> {
         let video = layout.video;
         let voxels = usize::try_from(
             u64::from(video.frames) * u64::from(video.height) * u64::from(video.width),
@@ -634,11 +638,13 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             Error::Invalid(format!("{} has no whole-byte size", self.dtype))
         })?)
         .map_err(|_| Error::Invalid("an element wider than memory".into()))?;
-        if converted.len() != channels * voxels * element {
+        let plane = video.height as usize * video.width as usize;
+        let start = first as usize * plane;
+        let timeline = converted.len() / (channels * element);
+        if timeline * channels * element != converted.len() || start + voxels > timeline {
             return Err(Error::Invalid(format!(
-                "a clip of {channels} channels and {voxels} voxels is {} bytes, and the trajectory \
-                 holds {}",
-                channels * voxels * element,
+                "a clip of {voxels} voxels from latent frame {first} of a {plane}-voxel raster is \
+                 past a trajectory of {} bytes in {channels} channels",
                 converted.len()
             )));
         }
@@ -647,7 +653,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let mut block = vec![0_u8; order.len() * channels * element];
         for (row, voxel) in order.iter().enumerate() {
             for channel in 0..channels {
-                let from = (channel * voxels + *voxel as usize) * element;
+                let from = (channel * timeline + start + *voxel as usize) * element;
                 let to = (row * channels + channel) * element;
                 block[to..to + element].copy_from_slice(&converted[from..from + element]);
             }
