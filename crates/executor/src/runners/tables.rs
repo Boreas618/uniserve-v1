@@ -177,6 +177,54 @@ impl Tables {
         Ok(())
     }
 
+    /// Writes one request's bytes over `layout`'s `tables`, at the addresses a graph captured.
+    ///
+    /// The tables are allocated once per layout, and a replay reads them where they are, so a
+    /// request's own tables replace the bytes and never the allocation. The copy is stream-ordered
+    /// before the launch that reads them, and a pageable source is staged before the call returns.
+    pub(crate) fn rewrite(
+        &self,
+        stream: &platform::Stream,
+        generation: u64,
+        layout: &str,
+        tables: &[StateTable],
+        fill: impl FnOnce(&mut [Vec<u8>]) -> Result<()>,
+    ) -> Result<()> {
+        let mut host: Vec<Vec<u8>> = Vec::with_capacity(tables.len());
+        for table in tables {
+            let bytes = Self::plan_bytes(std::slice::from_ref(table))?;
+            host.push(vec![
+                0u8;
+                usize::try_from(bytes).map_err(|_| {
+                    Error::Invalid("a state table is larger than memory".into())
+                })?
+            ]);
+        }
+        fill(&mut host)?;
+        for (table, bytes) in tables.iter().zip(&host) {
+            let held = self
+                .entries
+                .get(&(generation, layout.to_owned(), table.name))
+                .ok_or_else(|| {
+                    Error::Invalid(format!(
+                        "table {} of layout {layout} is not allocated",
+                        table.name
+                    ))
+                })?;
+            // SAFETY: the source is this table's host bytes, the destination is the allocation the
+            // table was filled into, and both lengths are the table's planned size.
+            unsafe {
+                platform::memcpy_async(
+                    held.view.ptr.address(),
+                    bytes.as_ptr() as u64,
+                    bytes.len(),
+                    stream,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// The views of `layout`'s `tables`, in the model's order.
     pub(crate) fn views(
         &self,
