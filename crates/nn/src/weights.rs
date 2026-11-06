@@ -1436,7 +1436,8 @@ impl<'a> WeightLoader<'a> {
                     "calibration's activation scale",
                     names.input_scale,
                 )?;
-                let reciprocal = self.activation_reciprocal(request)?;
+                // This value *is* the encoder's factor, so it is the one place the ceiling applies.
+                let reciprocal = self.encoder_factor(request)?;
                 let shape = Shape::new(&[1]);
                 let bytes = reciprocal.to_le_bytes();
                 // The activation's reciprocal is computed from one file: the suffix names the
@@ -1510,24 +1511,41 @@ impl<'a> WeightLoader<'a> {
     /// takes the reciprocal. A zero, a negative or a non-finite scale is refused here rather than
     /// encoded at the wrong magnitude.
     ///
-    /// The activation's reciprocal is the encoder's **factor**, and the factor has a ceiling the
-    /// encoder's own rounding step states: above [`MAXIMUM_ENCODER_FACTOR`] no row can encode, so
-    /// the projection would answer zeros for every activation.
+    /// The reciprocal is answered as the checkpoint states it. Whether it can encode is
+    /// [`Self::encoder_factor`]'s question, and only an operand that *is* the encoder's factor is
+    /// asked it: an expert stack publishes its experts' activation scales as the checkpoint's own
+    /// data and no operand multiplies a value by them, so bounding those would refuse a checkpoint
+    /// over a number nothing reads.
     fn activation_reciprocal(&self, request: &WeightRequest) -> Result<f32> {
+        Ok(1.0 / self.tensor_scale(request)?)
+    }
+
+    /// The activation encoder's factor for one calibrated projection, refused when it cannot encode.
+    ///
+    /// `nvfp4_quantize` normalizes a row by `token_scale = amax(row) · factor` and stores each
+    /// block's scale as `e4m3(amax_b / (6 · token_scale))`
+    /// (`crates/ops/kernels/nvfp4_quantize/triton/src/nvfp4_quantize.py`, `:166`, `:187`). The block
+    /// whose `amax_b` is the row's own `amax` therefore stores `1 / (6 · factor)`; E4M3's smallest
+    /// positive value is `2^-9`, the store rounds to nearest, so a factor above
+    /// [`MAXIMUM_ENCODER_FACTOR`] puts that scale below `2^-10` — and the kernel multiplies the block
+    /// by zero (`:189`, `:194`). Every block of every row then encodes as zeros whatever the input,
+    /// so the projection would answer zeros for every activation: a fact about the operand, not
+    /// about a run, refused here by tensor name.
+    fn encoder_factor(&self, request: &WeightRequest) -> Result<f32> {
         let scale = self.tensor_scale(request)?;
-        let reciprocal = 1.0 / scale;
-        if reciprocal > MAXIMUM_ENCODER_FACTOR {
+        let factor = 1.0 / scale;
+        if factor > MAXIMUM_ENCODER_FACTOR {
             return Err(Error::weight(
                 &request.tensor,
                 format!(
                     "the calibrated activation scale is {scale} and the encoder's factor is its \
-                     reciprocal, {reciprocal}, which is above {MAXIMUM_ENCODER_FACTOR}: every \
-                     block scale of the matrix would round to zero, so the projection would \
-                     answer zeros for every activation"
+                     reciprocal, {factor}, which is above {MAXIMUM_ENCODER_FACTOR}: every block \
+                     scale of the matrix would round to zero, so the projection would answer zeros \
+                     for every activation"
                 ),
             ));
         }
-        Ok(reciprocal)
+        Ok(factor)
     }
 
     /// One tensor's single positive scale, as the checkpoint states it.
