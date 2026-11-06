@@ -111,7 +111,7 @@ def reference(
         grouped = rows.shape[0] // keys.shape[0]
         keys = keys.repeat_interleave(grouped, dim=0)
         values = values.repeat_interleave(grouped, dim=0)
-        logits = torch.einsum("thd,hkd->thk", rows, keys) * scale
+        logits = torch.einsum("htd,hkd->htk", rows, keys) * scale
         queries = torch.arange(q_end - q_start, device=query.device)
         keyed = torch.arange(k_end - k_start, device=query.device)
         hidden = torch.zeros(
@@ -128,7 +128,7 @@ def reference(
             logits.masked_fill(hidden[None, :, :], float("-inf")), dim=-1
         )
         out[q_start:q_end] = torch.einsum(
-            "thk,hkd->thd", weights, values
+            "htk,hkd->htd", weights, values
         ).transpose(0, 1)
     return out
 
