@@ -125,6 +125,10 @@ pub struct DenoiserShape {
     pub sample: DType,
     /// The width of the encoded conditioning rows: the text encoder's hidden width, which a layout
     /// counts rows of and states no width for.
+    ///
+    /// **This is `source`'s width, not necessarily `text`'s.** A conditioner may widen what the
+    /// denoiser reads, and the model states that width itself (`Denoiser::text_width`), so the pair
+    /// is resolved in [`conditioning_width`] rather than read from here twice.
     pub width: u32,
 }
 
