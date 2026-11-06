@@ -588,7 +588,8 @@ impl EpochPlan {
         // The checkpoint's own statement of what it serves, read once: the candidates are per task,
         // and a task the checkpoint does not serve gets no graph.
         let config = self.media_config()?;
-        let candidates = media_candidates(&config, &self.build.video, &capacities)?;
+        let tasks = self.media_tasks(&config)?;
+        let candidates = media_candidates(&tasks, &self.build.video, &capacities)?;
 
         // The buckets the deployment captures: an encode bucket per (rows, prompt capacity) and a
         // decode bucket per canvas. A denoiser derives its own from the candidates it walks, so the
@@ -974,6 +975,12 @@ impl EpochPlan {
     /// The media class's parallel shape is the deployment's, and the page states it beside the
     /// component it splits; the same reader the launcher used answers it here, so a rank and the
     /// engine that started it cannot disagree about the group's degrees.
+    /// The tasks this deployment serves: those of the checkpoint's network the page places.
+    fn media_tasks(&self, config: &minimax_h3::Config) -> Result<Vec<nn::VideoTask>> {
+        let groups = self.deployment_groups()?;
+        served_tasks(&config.serving(), groups.as_deref(), &self.checkpoint)
+    }
+
     fn deployment_groups(&self) -> Result<Option<Vec<engine::ExecutorGroupConfig>>> {
         let Some(path) = self.build.worker_groups.as_ref() else {
             return Ok(None);
@@ -1059,10 +1066,8 @@ impl EpochPlan {
                 // condition capacity, so two tasks are two partitions and one deployment holds one.
                 // A construction stating their union would serve both; the model offers none, and
                 // this does not invent one.
-                // **What a deployment of this checkpoint serves, not everything its architecture
-                // can express**: a distilled export serves the one task its contract states, and a
-                // partition carries one task's block set and condition capacity.
-                let task = served_task(&config.serving(), &self.checkpoint)?;
+                // The tasks of the network the deployment page places: a checkpoint may hold two.
+                let tasks = self.media_tasks(&config)?;
                 // **The prompt capacity is the deployment's, and the denoiser's packed prefix holds
                 // it.** A layout reserves one row per prompt token, so the text capacity a model is
                 // built with and the prompt capacities the deployment prepares buckets for are one
@@ -1086,14 +1091,17 @@ impl EpochPlan {
                 // directory, so it is not a component a task's weights place - but the decode
                 // runner takes it as the video decoder's second entry point, and a rank that held
                 // the decoder without it would publish a timeline's first clip and say nothing.
-                let partition = minimax_h3::Partition::serving(
+                let mut partition = minimax_h3::Partition::serving(
                     &config,
-                    task,
+                    tasks[0],
                     ulysses,
                     tensor_parallel,
                     tensor_rank,
                     sequence_rank,
                 )?;
+                for task in &tasks[1..] {
+                    partition = partition.also_serving(&config, *task)?;
+                }
                 // The text capacity is the deployment's, from the ladder above, and so is the
                 // condition capacity when it states one: the rows a request's references take
                 // follow their rasters, which the task's own default cannot know.
@@ -1332,7 +1340,7 @@ impl EpochPlan {
             info.video_denoiser = Some(denoiser_report(
                 pipeline,
                 &self.build.video,
-                &config.serving(),
+                &self.media_tasks(&config)?,
             )?);
         }
         Ok((memory, info, graph))
@@ -1930,7 +1938,7 @@ fn snap_frames(frames: u32) -> Result<u32> {
 /// serves, and the frames are the deployment's longest clip at the model's frame rate - the model
 /// snaps them to a legal count itself, which is why the request states the plain figure.
 fn media_candidates(
-    config: &minimax_h3::Config,
+    tasks: &[nn::VideoTask],
     video: &daemon::options::VideoOptions,
     capacities: &[u32],
 ) -> Result<Vec<executor::runners::denoiser::WarmRequest>> {
@@ -1982,7 +1990,7 @@ fn media_candidates(
             // serves (`Config::tasks`), the daemon refuses a request of any other task against that
             // statement, and a candidate stated here for a task the checkpoint does not serve would
             // be a graph nothing fills.
-            for task in config.tasks() {
+            for task in tasks.iter().copied() {
                 let (first_frames, last_frames, references) = task_conditions(task);
                 for capacity in capacities {
                     candidates.push(executor::runners::denoiser::WarmRequest {
@@ -2222,33 +2230,55 @@ pub(crate) struct Placement {
     load_options: qwen3_moe::LoadOptions,
 }
 
-/// The one task this deployment serves, from the checkpoint's own statement.
+/// The tasks this deployment serves: those the checkpoint states, on the network the page places.
 ///
-/// A partition carries one task's block set and one task's condition capacity: the condition encoders
-/// are placed for the conditioned tasks and the capacity is [`minimax_h3::partition::condition_rows`]
-/// of the task, so two tasks are two partitions and one deployment holds one. The checkpoint states
-/// which it serves (`Config::tasks`, read from the export's own record), and a checkpoint that states
-/// several is refused here naming them, rather than served with one task's arrangement for another
-/// task's request.
-fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTask> {
-    match tasks {
-        [] => bail!(
+/// A release holds two networks, `transformer` and `transformer_ref`, and a deployment runs one: the
+/// page's component says which, and that network's tasks are the deployment's. A deployment with no
+/// page has no such statement, so it serves what the checkpoint states when that is one network's.
+fn served_tasks(
+    stated: &[nn::VideoTask],
+    groups: Option<&[engine::ExecutorGroupConfig]>,
+    checkpoint: &Path,
+) -> Result<Vec<nn::VideoTask>> {
+    if stated.is_empty() {
+        bail!(
             "the checkpoint {} states no task, so no denoiser partition can be sized for one",
             checkpoint.display()
-        ),
-        [task] => Ok(*task),
-        several => bail!(
-            "the checkpoint states {} tasks ({}) and one partition serves one task's block set and \
-             condition capacity: a deployment serving several needs a construction that states their \
-             union",
-            several.len(),
-            several
-                .iter()
-                .map(|task| format!("{task:?}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
+        );
     }
+    let reference = |task: &nn::VideoTask| *task == nn::VideoTask::ReferenceToVideoAudio;
+    let Some(groups) = groups else {
+        if stated.iter().all(reference) || !stated.iter().any(reference) {
+            return Ok(stated.to_vec());
+        }
+        bail!(
+            "the checkpoint {} holds two networks and this deployment states no page to place one",
+            checkpoint.display()
+        );
+    };
+    let places = |name: &str| {
+        groups
+            .iter()
+            .any(|group| group.components.contains_key(name))
+    };
+    let served: Vec<nn::VideoTask> = stated
+        .iter()
+        .copied()
+        .filter(|task| {
+            if reference(task) {
+                places(REFERENCE_DENOISER_COMPONENT)
+            } else {
+                places(DENOISER_COMPONENT)
+            }
+        })
+        .collect();
+    if served.is_empty() {
+        bail!(
+            "the checkpoint {} states {stated:?} and the deployment places no network of them",
+            checkpoint.display()
+        );
+    }
+    Ok(served)
 }
 
 /// This rank's sequence split, and its place in it, as the deployment page states them.
@@ -2269,6 +2299,9 @@ fn served_task(tasks: &[nn::VideoTask], checkpoint: &Path) -> Result<nn::VideoTa
 /// It is the page's key (`[worker_groups.components.transformer]`), and it is what tells one engine's
 /// group from another's when the name the launch states is the daemon's process group.
 const DENOISER_COMPONENT: &str = "transformer";
+
+/// The page's name for the denoiser of the reference tasks.
+const REFERENCE_DENOISER_COMPONENT: &str = "transformer_ref";
 
 /// The reference denoiser's node in the page: an OmniRef deployment names it instead.
 const REFERENCE_COMPONENT: &str = "transformer_ref";
@@ -2722,34 +2755,31 @@ mod tests {
         );
     }
 
-    /// One partition serves one task, and the checkpoint's own statement decides which.
-    ///
-    /// The condition encoders are placed for the conditioned tasks and the condition capacity is that
-    /// task's, so a second task is a second partition. A checkpoint that states several is refused
-    /// naming them, rather than served with one task's arrangement for another task's request.
+    /// A checkpoint with no page serves what it states when that is one network's, and a checkpoint
+    /// that states no task serves nothing.
     #[test]
-    fn the_served_task_is_the_one_the_checkpoint_states() {
+    fn the_served_tasks_are_those_of_the_checkpoints_one_network() {
         let checkpoint = Path::new("/models/fasth3");
-        let one = served_task(&[nn::VideoTask::TextToVideoAudio], checkpoint)
-            .expect("a checkpoint that states one task serves it");
-        assert_eq!(one, nn::VideoTask::TextToVideoAudio);
-        let none = served_task(&[], checkpoint).expect_err("no task is no partition");
+        let tasks = [
+            nn::VideoTask::TextToVideoAudio,
+            nn::VideoTask::FirstLastToVideoAudio,
+        ];
+        assert_eq!(
+            served_tasks(&tasks, None, checkpoint).expect("one network's tasks"),
+            tasks.to_vec()
+        );
+        let none = served_tasks(&[], None, checkpoint).expect_err("no task is no partition");
         assert!(
             format!("{none:#}").contains("states no task"),
             "the refusal says the checkpoint states none: {none:#}"
         );
-        let several = served_task(
-            &[
-                nn::VideoTask::TextToVideoAudio,
-                nn::VideoTask::FirstLastToVideoAudio,
-            ],
-            checkpoint,
-        )
-        .expect_err("two tasks are two partitions");
-        let sentence = format!("{several:#}");
+        let both = [
+            nn::VideoTask::TextToVideoAudio,
+            nn::VideoTask::ReferenceToVideoAudio,
+        ];
         assert!(
-            sentence.contains("TextToVideoAudio") && sentence.contains("FirstLastToVideoAudio"),
-            "the refusal names the tasks: {sentence}"
+            served_tasks(&both, None, checkpoint).is_err(),
+            "two networks need a page to choose between them"
         );
     }
 

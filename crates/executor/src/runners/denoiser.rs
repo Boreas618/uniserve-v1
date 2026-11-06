@@ -493,6 +493,11 @@ fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest
         })
         .collect();
     Ok(WarmRequest {
+        task: match decoded.task {
+            models::video::VideoTask::T2va => nn::VideoTask::TextToVideoAudio,
+            models::video::VideoTask::Fl2va => nn::VideoTask::FirstLastToVideoAudio,
+            models::video::VideoTask::Ref2va => nn::VideoTask::ReferenceToVideoAudio,
+        },
         first_frames: count(ConditionRole::FirstFrame),
         last_frames: count(ConditionRole::LastFrame),
         references: count(ConditionRole::Reference),
