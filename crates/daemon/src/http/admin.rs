@@ -589,9 +589,9 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
                     .restart(executable, Some(*config), then, &leader, &admin, &jobs)
                     .await
                     .map(|pid| {
-                        // The successor changes the world in an operation of
+                        // The successor changes the epoch in an operation of
                         // its own (`GET /admin/status`).
-                        json!({ "change": "daemon", "pid": pid, "then": world.then_some("world") })
+                        json!({ "change": "daemon", "pid": pid, "then": world.then_some("epoch") })
                     })
                     .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))
             }
