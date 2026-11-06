@@ -1164,6 +1164,19 @@ impl CommandSender {
         "the scheduler took no command: its thread has ended".to_owned()
     }
 
+    /// Asks this scheduler what it holds cached (§8's groups, for a standby's start).
+    ///
+    /// # Caller obligation: the scheduler must be able to reach a boundary
+    ///
+    /// A scheduler answers a command of this kind at its next batch boundary, and a scheduler
+    /// holding paused or parked requests never reaches one. A caller that has quiesced the
+    /// scheduler - a park, a drain, a handover's pause - must not ask it: the answer is not late,
+    /// it is never coming, and a caller that waits for it stalls until its own bound expires and
+    /// reports a scheduler that is not there.
+    ///
+    /// The obligation is on the receiver rather than on the asker because the asker cannot see
+    /// whether a boundary is reachable: `service.rs`'s route and this process's announce both ask
+    /// without owning the scheduler's state, and the state is the scheduler's own.
     pub fn describe_cache(
         &self,
     ) -> crossbeam_channel::Receiver<Result<Vec<crate::scheduler::GroupCache>, String>> {

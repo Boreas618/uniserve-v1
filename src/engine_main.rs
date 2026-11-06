@@ -130,6 +130,8 @@ pub(crate) struct Epoch {
     /// The host identity of the node this process runs on, which the daemon knows and which the
     /// Storage Server's claim states.
     pub host: String,
+    /// The world of the epoch this process succeeds, whose storages it maps until it is promoted.
+    pub predecessor_world: Option<u64>,
 }
 
 /// The options of `uniserve engine`: the launch file the daemon writes for this process (§2.3).
@@ -557,15 +559,23 @@ pub(crate) fn run(
 /// each executor thread owns its runners and streams, each scheduler thread its
 /// mechanism. The fields below are the handles those threads were handed and the
 /// owners that must outlive them.
-/// How many of a request's events this process keeps for a takeover while a handover is open.
+/// How many of a request's events this process keeps for a takeover to replay.
 ///
-/// The ordinary bound is `EVENT_WINDOW`: what a consumer can be behind by, since the same figure
-/// gates the credit this process waits on. A handover is the one case where that reasoning does
-/// not hold - a predecessor's consumer stops reading at the pause while this process goes on
-/// producing - so the gap a successor's position names grows with the pause. The journal is
-/// widened for it and stays bounded: a takeover whose position is older than what is kept is
-/// refused by name rather than served as a stream with a hole in it.
-pub(crate) const HANDOVER_JOURNAL: usize = proto::request::EVENT_WINDOW as usize * 256;
+/// The event window is the credit a consumer reports in, not the distance it can be behind by:
+/// this process writes every event as it is produced, the daemon files them without bound, and the
+/// body writes them to a socket the client drains at its own speed, so at a fast decode a response
+/// that stops reading is tens of events behind. The pause is that case at its sharpest - a
+/// predecessor's consumer stops at the pause while this process goes on producing - and it begins
+/// before this process has an attached front to tell it so, so the wide bound is the ordinary one
+/// and pruning on a consumer's report is what keeps the journal small in service.
+///
+/// **It is a memory budget, not a protocol bound.** An event is a token or a scheduling fact,
+/// about 100 bytes with its wire form: 4096 of them is roughly 400 KB for one request, so a
+/// deployment whose every stream stalls at the bound spends about 50 MB at 128 streams. Raising it
+/// buys a longer stall before a takeover is refused; it does not change what the refusal means. A
+/// takeover whose position is older than what is kept is refused by name rather than served as a
+/// stream with a hole in it.
+pub(crate) const HANDOVER_JOURNAL: usize = 4096;
 
 /// One admitted request and the connection its events belong to.
 ///
@@ -588,10 +598,15 @@ struct Served {
     /// Events written to a front so far, which is the position a takeover
     /// names and the consumer reports.
     sent: u64,
-    /// The events not yet reported as consumed, by their position, at most
-    /// `EVENT_WINDOW` of them: an older event than that is beyond what any
-    /// consumer can be behind by, since the same bound gates the credit this
-    /// process waits on.
+    /// The events written to a front that a takeover from an earlier position
+    /// has to replay, by their position.
+    ///
+    /// Bounded by [`HANDOVER_JOURNAL`], not by the event window the consumer's
+    /// credit names: this process hands every event to the daemon as it is
+    /// produced and the daemon files them into a channel it drains at the
+    /// client's pace, so the consumer can be further behind the producer than any
+    /// window. The events the consumer reported consumed are dropped as they are
+    /// reported.
     kept: std::collections::VecDeque<(u64, proto::request::wire::Event)>,
 }
 
@@ -759,6 +774,8 @@ pub(crate) struct MainProcess {
     /// which adopts it, so a resumed epoch reuses the pages it still holds instead of reading them
     /// again.
     parked: Option<Vec<engine::ParkedCache>>,
+    /// A drain in progress: its schedulers park on the passes that follow (`advance_drain`).
+    draining: Option<Draining>,
     /// The frontend's admission gate, the `/admin/pause_generation` of §2.3: submissions are
     /// refused while it is held, and no request in flight is ended by it.
     paused: bool,
@@ -821,6 +838,9 @@ impl MainProcess {
         // the reports of §7.3, and every command of the program layer - travels on this one.
         let mut process =
             ProcessInterface::connect(&launch.processes, &launch.deployment, launch.engine)?;
+        // Every command of the program layer arrives on this socket, and a stage waits for the
+        // command before it: the control thread sleeps on it as it does on the request socket.
+        control.watch_process(Some(process.connection.descriptor()));
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
@@ -828,7 +848,13 @@ impl MainProcess {
         // A host tier is the build config's, and it needs prefix caching to have pages to keep.
         let host_kv_cache = build.kv_cache.host_tier && build.kv_cache.prefix_caching;
         let storage = claim(&mut process, launch, &epoch.host, host_kv_cache)?;
-        let client = Retained::connect(&storage, &launch.group, launch.rank, epoch.generation)
+        let client = Retained::connect(
+            &storage,
+            &launch.group,
+            launch.rank,
+            epoch.generation,
+            epoch.predecessor_world,
+        )
             .context("connecting to the Storage Server")?;
         // The client outlives every world of the epoch, and §2.5's park and wake reach its ledger
         // through the memory owners: kept here so the park does not have to hold the connect.
@@ -925,7 +951,15 @@ impl MainProcess {
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = schedulers(&plan, launch, &memory, &model, &executors, &inventory)?;
+        let schedulers = schedulers(
+            &plan,
+            launch,
+            &memory,
+            &model,
+            &executors,
+            &inventory,
+            control.wake(),
+        )?;
 
         let stats_reporters = (0..schedulers.len())
             .map(|_| engine::SchedulerStatsReporter::default())
@@ -984,6 +1018,7 @@ impl MainProcess {
             standby: launch.standby,
             promoted: false,
             parked: None,
+            draining: None,
             paused: false,
             rollback: launch.rollback_s.map(Duration::from_secs),
             released: std::collections::BTreeSet::new(),
@@ -1161,6 +1196,13 @@ impl MainProcess {
             {
                 due = due.min(Instant::now() + PROBATION_POLL);
             }
+            // A transition moves one stage a pass, and what ends a stage is a device, a Program
+            // Server or a scheduler rather than a socket. Passes run back to back while one is in
+            // flight, so each stage costs what its work costs: a recovery is made of these stages,
+            // and a client's stream stands still for all of them.
+            if self.precopy.is_some() || !self.warming.is_empty() || self.draining.is_some() {
+                due = due.min(Instant::now() + TRANSITION_POLL);
+            }
             let deadline = Some(stall.map_or(due, |stall| stall.min(due)));
             // One metrics report a second, and a final one on the way out
             // (§7.3: the daemon exports the engine's counters as metrics).
@@ -1186,7 +1228,8 @@ impl MainProcess {
                             return Ok(Some(failure));
                         }
                     }
-                    Ready::Woken | Ready::Idle => {}
+                    // What these announce is read by the pass below, whatever woke it.
+                    Ready::Process | Ready::Woken | Ready::Idle => {}
                 }
             }
 
@@ -1207,6 +1250,7 @@ impl MainProcess {
             // successor holds the deployment: this process is still serving it, and ending here
             // would leave the successor with a front into nothing (§7.5.1).
             if self.process.closed() {
+                self.control.watch_process(None);
                 let serving = self.control.live_attached();
                 if serving == 0 {
                     self.stopping = true;
@@ -1224,6 +1268,7 @@ impl MainProcess {
             // its builds or its devices (§7.3 step 2).
             self.note_waits();
             self.advance_precopy()?;
+            self.advance_drain()?;
             if let Some(failure) = self.advance_warmup()? {
                 return Ok(Some(failure));
             }
@@ -2039,7 +2084,7 @@ impl MainProcess {
                 continue;
             };
             return Ok(Some((
-                program_server::program::ProgramSlot { op, phase: None },
+                program_server::program::ProgramSlot { op, phase: None, part: None },
                 Program {
                     backend: backend.clone(),
                     revision: *revision,
@@ -2056,7 +2101,7 @@ impl MainProcess {
         // holds, which reads as a store defect and is not one.
         match declared_program(&self.listing()?.packages, operator) {
             Some((op, backend, revision)) => Ok(Some((
-                program_server::program::ProgramSlot { op, phase: None },
+                program_server::program::ProgramSlot { op, phase: None, part: None },
                 Program {
                     backend,
                     revision,
@@ -2152,6 +2197,17 @@ impl MainProcess {
                 keys = declared;
             }
             keys.append(&mut known);
+            // A slot of a divided operator holds its own package's descriptors alone: a generation
+            // that launched the operator states all of them.
+            if slot.part.is_some() {
+                if listing.is_none() {
+                    listing = Some(self.listing().map_err(invalid)?);
+                }
+                if let Some(store) = listing.as_ref() {
+                    let built = built_keys(store, &slot.op, program, &self.targets);
+                    keys.retain(|key| built.contains(key));
+                }
+            }
             keys.sort_unstable();
             keys.dedup();
             let group = groups
@@ -2651,8 +2707,10 @@ impl MainProcess {
                     // that never answers is not a device that never answered, and the previous
                     // message said the device either way. The policy is the narrower of the two, so
                     // it is asked first.
-                    let policy =
-                        matches!(poll_answers(&mut precopy.policies), Some(StageFailure::Pending));
+                    let policy = matches!(
+                        poll_answers(&mut precopy.policies),
+                        Some(StageFailure::Pending)
+                    );
                     let cause = if policy {
                         "a scheduler's policy build never answered"
                     } else {
@@ -3220,10 +3278,53 @@ impl MainProcess {
         // drained epoch reaches none, so what the precopy built is given back now rather than left
         // prepared for a boundary that cannot come.
         self.drop_prepared("the epoch drained before its switchover")?;
-        self.park_schedulers("draining the epoch")?;
+        // A scheduler parks once its requests have ended, and a request ends only when the daemon
+        // acknowledges it through this thread, so the answers are polled from the serve pass:
+        // waiting here would hold the acknowledgement the park is waiting for.
+        self.draining = Some(Draining {
+            epoch,
+            answers: self.schedulers.iter().map(|scheduler| scheduler.park(false)).collect(),
+            parked: Vec::with_capacity(self.schedulers.len()),
+            since: Instant::now(),
+        });
+        self.advance_drain()
+    }
+
+    /// Takes the answers of a drain in progress, and states `Drained` when every scheduler parked.
+    fn advance_drain(&mut self) -> Result<()> {
+        let bound = self.watchdog.stall_bound();
+        let Some(mut draining) = self.draining.take() else {
+            return Ok(());
+        };
+        while let Some(answer) = draining.answers.first() {
+            match answer.try_recv() {
+                Ok(Ok(cache)) => {
+                    draining.parked.push(cache);
+                    draining.answers.remove(0);
+                }
+                Ok(Err(reason)) => bail!("draining the epoch: a scheduler did not park: {reason}"),
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    if draining.since.elapsed() > bound {
+                        bail!("draining the epoch: a scheduler did not park within {bound:?}");
+                    }
+                    self.draining = Some(draining);
+                    return Ok(());
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    bail!("draining the epoch: a scheduler is gone");
+                }
+            }
+        }
+        self.parked = Some(draining.parked);
+        self.serving = false;
+        // A drain ends the epoch this process was serving, so admission owed to a warmup of it is
+        // owed to nothing: the `Serve` that names the epoch again opens the next one.
+        self.admission_owed = false;
         self.send_report(proto::process::Report {
             kind: Some(proto::process::report::Kind::Drained(
-                proto::process::Drained { epoch },
+                proto::process::Drained {
+                    epoch: draining.epoch,
+                },
             )),
         });
         Ok(())
@@ -3318,13 +3419,11 @@ impl MainProcess {
         if let Some(reason) = promote_refusal(self.standby, held) {
             tracing::warn!(%reason, "a promotion this process cannot serve is refused");
             self.send_report(proto::process::Report {
-                kind: Some(proto::process::report::Kind::Fault(
-                    proto::process::Fault {
-                        kind: "promote".to_owned(),
-                        reason: reason.clone(),
-                        device: 0,
-                    },
-                )),
+                kind: Some(proto::process::report::Kind::Fault(proto::process::Fault {
+                    kind: "promote".to_owned(),
+                    reason: reason.clone(),
+                    device: 0,
+                })),
             });
             bail!("{reason}");
         }
@@ -3543,6 +3642,7 @@ impl MainProcess {
             self.serving = true;
             return Ok(());
         };
+        let bound = self.watchdog.stall_bound();
         for (scheduler, cache) in self.schedulers.iter().zip(parked) {
             // A resumed epoch recomputes from the tokens the frontend resubmits rather than lending
             // from a predecessor: it is the same world, and the requests it ended at the drain are
@@ -3550,6 +3650,13 @@ impl MainProcess {
             scheduler
                 .promote(cache, true, false)
                 .context("resuming a scheduler")?;
+            // The promotion states the cache; it is the resume that ends the park. A scheduler left
+            // parked takes requests into its queue and admits none of them.
+            match scheduler.resume(true).recv_timeout(bound) {
+                Ok(Ok(())) => {}
+                Ok(Err(reason)) => bail!("resuming a scheduler: {reason}"),
+                Err(error) => bail!("resuming a scheduler: no answer within {bound:?}: {error}"),
+            }
         }
         self.serving = true;
         Ok(())
@@ -4250,7 +4357,6 @@ impl MainProcess {
         // Whether a handover is open, read once for the pass: a second front that has attached and
         // not yet taken its requests over. The journal's bound is wider while it is, because a
         // predecessor's consumer stops reading at the pause while this process keeps producing.
-        let handover_open = self.control.attached_fronts() > 0;
         let mut running = Vec::with_capacity(streams.len());
         for mut served in streams {
             let id = served.request;
@@ -4283,26 +4389,12 @@ impl MainProcess {
                         // The position this event is written at, and the copy a takeover from an
                         // earlier position replays.
                         served.sent += 1;
-                        served.kept.push_back((served.sent, wire.clone()));
-                        // The journal's bound is `EVENT_WINDOW` events - what a consumer can be
-                        // behind by, since the same figure gates the credit this process waits on
-                        // - EXCEPT while a handover is open. A predecessor's consumer stops
-                        // reading at the pause and this process keeps producing, so the gap a
-                        // successor's position names grows with the pause and not with the
-                        // consumer. A journal trimmed to the ordinary bound therefore drops the
-                        // events in the middle of the pause, and the replay that follows hands the
-                        // successor a stream with a hole in it. The wider bound is the pause's,
-                        // and it is still a bound: a handover that produces more than this many
-                        // events of one request is refused at the takeover by name rather than
-                        // served with a gap.
-                        let bound = if handover_open {
-                            HANDOVER_JOURNAL
-                        } else {
-                            proto::request::EVENT_WINDOW as usize
-                        };
-                        while served.kept.len() > bound {
-                            served.kept.pop_front();
-                        }
+                        keep_event(
+                            &mut served.kept,
+                            served.sent,
+                            wire.clone(),
+                            HANDOVER_JOURNAL,
+                        );
                         self.send_event(
                             served.front,
                             proto::request::wire::from_engine::Kind::Event(wire),
@@ -4769,6 +4861,18 @@ fn poll_answers(
     None
 }
 
+/// A drain whose schedulers have not all parked yet.
+struct Draining {
+    /// The epoch `Drained` names.
+    epoch: u64,
+    /// The schedulers still to answer, in order.
+    answers: Vec<crossbeam_channel::Receiver<std::result::Result<engine::ParkedCache, String>>>,
+    /// What the ones that answered parked with, in the schedulers' order.
+    parked: Vec<engine::ParkedCache>,
+    /// When the drain began, which the stall bound is measured from.
+    since: Instant,
+}
+
 /// Logs one scheduler's answer to a policy step when it comes, off the control thread.
 ///
 /// A scheduler answers at its next batch boundary, and it reaches that boundary only while the
@@ -4823,6 +4927,19 @@ fn replay_after(
         .filter(|(position, _)| *position > from)
         .map(|(_, event)| event.clone())
         .collect()
+}
+
+/// Journals one event at `position`, dropping the oldest past `bound`.
+fn keep_event(
+    kept: &mut std::collections::VecDeque<(u64, proto::request::wire::Event)>,
+    position: u64,
+    event: proto::request::wire::Event,
+    bound: usize,
+) {
+    kept.push_back((position, event));
+    while kept.len() > bound {
+        kept.pop_front();
+    }
 }
 
 /// What the engine answers a command whose owner is the epoch layer: the same operation exists,
@@ -4917,6 +5034,9 @@ const METRICS_EVERY: Duration = Duration::from_secs(1);
 /// expiry, and the control thread asks it at least this often. A rollback window is stated in whole
 /// seconds, so the poll costs a wake per tenth of a second for the length of the window.
 const PROBATION_POLL: Duration = Duration::from_millis(100);
+
+/// How long a serve pass sleeps while a precopy, a warmup or a drain is in flight.
+const TRANSITION_POLL: Duration = Duration::from_millis(1);
 
 /// How often a device that is busy delays the question asked of the policy slots: a probe that finds
 /// a device running proves nothing about whether a policy serves, so it is asked again after this.
@@ -5911,7 +6031,9 @@ fn updated_programs(named: &Programs, serving: &Programs) -> Programs {
                 .iter()
                 .filter(|(held, _)| {
                     held.op == slot.op
-                        && (held.phase == slot.phase || held.phase.is_none() || slot.phase.is_none())
+                        && (held.phase == slot.phase
+                            || held.phase.is_none()
+                            || slot.phase.is_none())
                 })
                 .any(|(_, held)| {
                     held.backend != program.backend || held.revision != program.revision
@@ -6338,6 +6460,13 @@ fn switchover_answer(warming: usize, generation: u64) -> SwitchoverAnswer {
 }
 
 fn answer_commit(update: &mut executor::hot_update::HotUpdate, generation: u64) -> ProgramStatus {
+    // An epoch switch commits its target, whose programs were committed when the daemon handed them
+    // over: the generation it names already serves with nothing on trial, so the answer is that.
+    if update.current() == generation
+        && matches!(update.phase(), executor::hot_update::Phase::Serving)
+    {
+        return ProgramStatus::Committed { generation };
+    }
     match update.commit(generation) {
         Ok(()) => ProgramStatus::Committed { generation },
         Err(error) => {
@@ -6536,12 +6665,30 @@ fn operator_slots(
     let slot = |phase: Option<PhaseKind>| ProgramSlot {
         op: op.to_owned(),
         phase,
+        part: None,
     };
     let (claims, refusal) = split_claims(holders);
     if refusal.is_none() && claims.len() > 1 {
         return claims
             .into_iter()
             .map(|(phase, index)| (slot(Some(phase)), holders[index].0.clone()))
+            .collect();
+    }
+    // Packages whose built keys share none divide the operator by descriptor - a bf16 module and an
+    // f32 one, whose keys state no phase - so each holds a slot of its own: one program would serve
+    // its own keys and refuse the other's at the first capture that launches them.
+    if divides_descriptors(holders) {
+        return holders
+            .iter()
+            .map(|(program, _)| {
+                (
+                    ProgramSlot {
+                        part: Some(program.backend.clone()),
+                        ..slot(None)
+                    },
+                    program.clone(),
+                )
+            })
             .collect();
     }
     // The fallback is right - a wrong split would have a package asked for a key it cannot build -
@@ -6565,6 +6712,19 @@ fn operator_slots(
         Some(program) => vec![(slot(None), program.clone())],
         None => Vec::new(),
     }
+}
+
+/// Whether every package built keys of its own, none of them shared: then each one's descriptors are
+/// its alone, and the generation needs them all.
+fn divides_descriptors(holders: &[(Program, Vec<String>)]) -> bool {
+    if holders.len() < 2 || holders.iter().any(|(_, keys)| keys.is_empty()) {
+        return false;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    holders
+        .iter()
+        .flat_map(|(_, keys)| keys)
+        .all(|key| seen.insert(key))
 }
 
 /// The phases an operator's packages claim, and - when they cannot be split across them - why.
@@ -6714,6 +6874,7 @@ fn resolve_slots(
                     ProgramSlot {
                         op: op.clone(),
                         phase: *phase,
+                        part: None,
                     },
                     program.clone(),
                 );
@@ -6859,6 +7020,7 @@ fn schedulers(
     model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
     rank: &ipc::MainProcessInfo,
+    control: ipc::Wake,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -6895,7 +7057,10 @@ fn schedulers(
         executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
             .stating(vec![inventory]),
     );
-    let handle = engine::SchedulerHandle::over_batches(config, batches)?;
+    // The control thread forwards what a scheduler produced, so it sleeps until a step says there
+    // is something: a request's tokens reach the daemon when they exist, not at the next pass.
+    let progress = engine::CommandWaker::new(move || control.wake());
+    let handle = engine::SchedulerHandle::over_batches_telling(config, batches, progress)?;
     Ok(vec![handle])
 }
 
@@ -6937,6 +7102,7 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
     }
     Ok(Epoch {
         generation: 0,
+        predecessor_world: spec.predecessor.as_ref().map(|predecessor| predecessor.world),
         host: spec.host,
     })
 }
@@ -7005,6 +7171,77 @@ mod tests {
         );
     }
 
+    /// A takeover replays a backlog wider than the consumer's event window.
+    ///
+    /// The window is the credit a consumer reports in, not the distance it can
+    /// be behind by: the daemon files this process's events without bound and
+    /// writes them at the client's pace, so at a fast decode the body of a
+    /// response that pauses is tens of events behind what was produced. A
+    /// journal capped at the window drops the oldest of those and the handover
+    /// loses exactly them.
+    #[test]
+    fn a_takeover_replays_a_backlog_wider_than_the_event_window() {
+        let event = |request: u64, message: &str| proto::request::wire::Event {
+            request,
+            kind: Some(proto::request::wire::event::Kind::Error(
+                proto::request::wire::Failed {
+                    message: message.to_owned(),
+                },
+            )),
+        };
+        let backlog = proto::request::EVENT_WINDOW as usize * 3;
+        let mut kept = std::collections::VecDeque::new();
+        for at in 1..=backlog as u64 {
+            keep_event(&mut kept, at, event(9, "e"), HANDOVER_JOURNAL);
+        }
+
+        assert!(
+            kept.len() > proto::request::EVENT_WINDOW as usize,
+            "the journal holds the whole backlog: {} of {backlog}",
+            kept.len()
+        );
+        assert_eq!(
+            replay_after(&kept, 1).len(),
+            backlog - 1,
+            "a takeover from the first event replays the backlog whole"
+        );
+    }
+
+    /// The journal drops its oldest only past its bound, and what it holds
+    /// is replayable from any position inside it.
+    #[test]
+    fn the_journal_is_bounded_by_its_own_bound_and_not_by_the_window() {
+        let event = |request: u64, message: &str| proto::request::wire::Event {
+            request,
+            kind: Some(proto::request::wire::event::Kind::Error(
+                proto::request::wire::Failed {
+                    message: message.to_owned(),
+                },
+            )),
+        };
+        let mut kept = std::collections::VecDeque::new();
+        let positions = HANDOVER_JOURNAL as u64 + 10;
+        for at in 1..=positions {
+            keep_event(&mut kept, at, event(9, "e"), HANDOVER_JOURNAL);
+        }
+
+        assert_eq!(
+            kept.len(),
+            HANDOVER_JOURNAL,
+            "the journal keeps its own bound"
+        );
+        assert_eq!(
+            kept.front().map(|(position, _)| *position),
+            Some(positions - HANDOVER_JOURNAL as u64 + 1),
+            "the oldest event kept is the one at the bound"
+        );
+        assert_eq!(
+            replay_after(&kept, 0).len(),
+            HANDOVER_JOURNAL,
+            "a takeover from before the journal replays all of it"
+        );
+    }
+
     /// An epoch's first precopy has no serving generation, so no operator has an old kernel to pair
     /// a shadowed step against: the changed set is empty and the precopy finishes without asking
     /// for a step an idle epoch never runs.
@@ -7015,6 +7252,7 @@ mod tests {
             program_server::program::ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "fa4".to_owned(),
@@ -7037,6 +7275,7 @@ mod tests {
         let slot = |op: &str| program_server::program::ProgramSlot {
             op: op.to_owned(),
             phase: None,
+            part: None,
         };
         let program = |backend: &str, revision: u32| Program {
             backend: backend.to_owned(),
@@ -7291,6 +7530,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "trtllm".to_owned(),
@@ -7329,6 +7569,7 @@ mod tests {
                 .get(&ProgramSlot {
                     op: "paged_attention".to_owned(),
                     phase: Some(PhaseKind::Prefill),
+                    part: None,
                 })
                 .map(|program| program.backend.as_str()),
             Some("fa4"),
@@ -7337,6 +7578,7 @@ mod tests {
         let decode_slot = ProgramSlot {
             op: "paged_attention".to_owned(),
             phase: Some(PhaseKind::Decode),
+            part: None,
         };
         let Some(decode_program) = programs.get(&decode_slot).cloned() else {
             panic!("the decode phase bound no program");
@@ -7364,6 +7606,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "fa4".to_owned(),
@@ -7397,6 +7640,7 @@ mod tests {
         let slot = ProgramSlot {
             op: "paged_attention".to_owned(),
             phase: None,
+            part: None,
         };
         assert_eq!(
             programs.get(&slot).map(|program| program.backend.as_str()),
@@ -7500,6 +7744,7 @@ mod tests {
         let slot = |phase: Option<PhaseKind>| ProgramSlot {
             op: "paged_attention".to_owned(),
             phase,
+            part: None,
         };
         // What serves: one package filling both phases.
         let mut serving = Programs::new();
@@ -7534,6 +7779,7 @@ mod tests {
         let slot = |op: &str, phase: Option<PhaseKind>| ProgramSlot {
             op: op.to_owned(),
             phase,
+            part: None,
         };
 
         let mut group: (Vec<ProgramRequest>, Vec<Descriptors>) = (Vec::new(), Vec::new());
@@ -7843,6 +8089,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "trtllm".to_owned(),
@@ -7906,6 +8153,7 @@ mod tests {
             ProgramSlot {
                 op: "paged_attention".to_owned(),
                 phase: None,
+                part: None,
             },
             Program {
                 backend: "trtllm".to_owned(),
@@ -7986,6 +8234,19 @@ mod tests {
             )
             .expect("the revert lands");
         update
+    }
+
+    /// An epoch switch's commit reaches a target whose programs were committed at their handover:
+    /// the generation it names serves with nothing on trial, so it is answered as committed. A
+    /// refusal here left the switch waiting for an acknowledgement, and the previous epoch's process
+    /// running, for good.
+    #[test]
+    fn a_commit_of_the_generation_that_serves_is_committed() {
+        let mut update = update_on_probation_then_reverted();
+        match answer_commit(&mut update, 1) {
+            ProgramStatus::Committed { generation } => assert_eq!(generation, 1),
+            other => panic!("a commit of what serves answered {other:?}"),
+        }
     }
 
     /// A commit that races the revert is answered with the state that holds, and the process keeps

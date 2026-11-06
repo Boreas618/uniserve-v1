@@ -1085,7 +1085,7 @@ impl PolicySlot {
         match self.pending.take() {
             None | Some(Stage::Commit) => Ok(None),
             Some(Stage::Switchover) => {
-                self.switch_over();
+                self.switch_over(state)?;
                 Ok(None)
             }
             Some(Stage::Revert) => {
@@ -1099,24 +1099,35 @@ impl PolicySlot {
         }
     }
 
-    /// §7.3 step 3: the prepared instance becomes the serving one, and the
-    /// module it replaces is kept to revert to.
+    /// §7.3 step 3: the prepared module serves from this boundary, instantiated
+    /// on `state`, and the module it replaces is kept to revert to.
+    ///
+    /// The precopy proved the module on the state of its own moment, and the
+    /// instance it left has seen no event since: under traffic the pages and
+    /// requests moved on while the update ran its shadow step. So the module is
+    /// instantiated again here, as a revert instantiates the previous one, and
+    /// the instance and the mechanism start from the same state.
     ///
     /// A switchover without a prepared candidate leaves the serving policy in
     /// place: the daemon's precopy failed and the update is discarded.
-    fn switch_over(&mut self) {
+    fn switch_over(&mut self, state: &TrialState) -> Result<(), PolicyError> {
         let Some(candidate) = self.candidate.take() else {
             tracing::warn!("a policy switchover arrived without a policy prepared by a precopy");
-            return;
+            return Ok(());
         };
+        let init = init_of(&candidate.program, state);
+        let instance = candidate
+            .module
+            .instantiate(&init.state, &init.parameters, &self.ceilings)?;
         let replaced_program = std::mem::replace(&mut self.program, candidate.program);
         let replaced_module = std::mem::replace(&mut self.module, candidate.module);
-        let replaced = std::mem::replace(&mut self.instance, candidate.instance);
-        self.state = candidate.state;
+        let replaced = std::mem::replace(&mut self.instance, instance);
+        self.state = init.state;
         self.cost.replace(&replaced);
         // §7.3 step 5: the replaced module stays until the next precopy, which
         // replaces it; committing therefore keeps it, and a revert finds it.
         self.previous = Some((replaced_program, replaced_module));
+        Ok(())
     }
 
     /// §7.3 step 4: the previous policy is instantiated on `state` and becomes
