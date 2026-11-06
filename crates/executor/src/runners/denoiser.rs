@@ -1657,12 +1657,13 @@ mod tests {
 #[cfg(test)]
 mod product_tests {
     use super::*;
-    use std::sync::Mutex;
 
     /// A product store that answers for exactly the kinds it was given.
+    ///
+    /// It records nothing about how a caller asks: whether a kind is present is the store's
+    /// answer, and how many questions a step put to it is not a fact about the deployment.
     struct Store {
         held: Vec<Product>,
-        asked: Mutex<Vec<Product>>,
     }
 
     impl Products for Store {
@@ -1712,7 +1713,6 @@ mod product_tests {
             _device: platform::DeviceId,
             _stream: StreamId,
         ) -> Result<Option<TensorView>> {
-            self.asked.lock().unwrap().push(kind);
             Ok(self
                 .held
                 .contains(&kind)
@@ -1764,7 +1764,6 @@ mod product_tests {
     fn the_first_absent_kind_is_the_one_a_step_refuses() {
         let store = Store {
             held: vec![Product::Text],
-            asked: Mutex::new(Vec::new()),
         };
         let missing =
             missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
@@ -1780,20 +1779,24 @@ mod product_tests {
         );
     }
 
-    /// A store holding every kind a step reads has nothing missing, and it is asked in one pass.
+    /// A store holding every kind a step reads has nothing missing, and a store holding none names
+    /// the first kind the step would have read.
     #[test]
     fn a_store_holding_every_kind_leaves_nothing_missing() {
-        let store = Store {
+        let full = Store {
             held: CONDITIONED_STEP_PRODUCTS.to_vec(),
-            asked: Mutex::new(Vec::new()),
         };
         let missing =
-            missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
+            missing_product(&full, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
         assert_eq!(missing, None);
+
+        let empty = Store { held: Vec::new() };
+        let missing =
+            missing_product(&empty, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
         assert_eq!(
-            store.asked.lock().unwrap().len(),
-            CONDITIONED_STEP_PRODUCTS.len(),
-            "each kind is asked once"
+            missing,
+            CONDITIONED_STEP_PRODUCTS.first().copied(),
+            "an empty store is refused for the first kind the step reads, not for the last"
         );
     }
 
@@ -1825,7 +1828,6 @@ mod product_tests {
 
         let store = Store {
             held: vec![Product::Text],
-            asked: Mutex::new(Vec::new()),
         };
         let missing =
             missing_product(&store, request(), CONDITIONED_STEP_PRODUCTS).expect("a store answers");
