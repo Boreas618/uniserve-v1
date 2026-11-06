@@ -400,8 +400,11 @@ impl Pools {
     /// Reserves the device's graph pool and divides it among `streams` ranges.
     ///
     /// `bytes` is the device's whole graph storage (`capacity::graph_storage_budget_bytes`) and
-    /// each stream gets `bytes / streams` of it: a captured graph addresses fixed buffers, so a
-    /// stream's range must not move while its graphs live, and two streams' work runs at once.
+    /// a stream that states nothing gets `bytes / streams` of it: a captured graph addresses fixed
+    /// buffers, so a stream's range must not move while its graphs live, and two streams' work runs
+    /// at once. A stream that claims what its model's plan needs holds that instead (`claim`), and
+    /// the claims of one device may sum past `bytes`, so the addresses reach the whole allowance:
+    /// they cost nothing, and the mappings are what the allowance books and refuses.
     /// `budget` is the device budget the pool is booked against, kept apart from the reservation so
     /// a report of one cannot pass the other's invariant by construction.
     pub fn new(
@@ -414,7 +417,7 @@ impl Pools {
     ) -> Result<Self> {
         let streams = streams.max(1);
         let mut allocator = allocator;
-        let size = usize::try_from(graph)
+        let size = usize::try_from(graph.max(totals.allowance()))
             .map_err(|_| Error::Resource("the graph storage is larger than memory"))?;
         allocator.reserve(PoolKind::Graph, size)?;
         // The other two kinds in the same book (4.1): a pool whose figure is zero is not reserved,
