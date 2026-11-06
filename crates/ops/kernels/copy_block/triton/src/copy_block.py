@@ -61,6 +61,23 @@ def _copy_block_kernel(
     e3 = e3.to(tl.int64)
     program = tl.program_id(0).to(tl.int64)
 
+    # A wide block's rows are unit-stride and aligned on both sides, which the module states, so the
+    # compiler moves whole vectors, and nothing below this branch is compiled into its module: the
+    # general path's four 64-bit divisions a lane are what kept a copy at a quarter of the memory's
+    # speed through the registers they hold.
+    if WIDE:
+        blocks = (e3 + BLOCK - 1) // BLOCK
+        row = program // blocks
+        lanes = (program % blocks) * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
+        inside = lanes < e3
+        c2 = row % e2
+        rest = row // e2
+        c1 = rest % e1
+        c0 = rest // e1
+        value = tl.load(source_ptr + (c0 * s0 + c1 * s1 + c2 * s2) + lanes, mask=inside, other=0)
+        tl.store(out_ptr + (c0 * d0 + c1 * d1 + c2 * d2) + lanes, value, mask=inside)
+        return
+
     # A last axis at least one block wide is walked a row at a time: the three leading coordinates
     # are one scalar decomposition per program, where the general path below divides four times per
     # lane in 64 bits, which is what a copy of a wide block spends its time on.
@@ -75,14 +92,8 @@ def _copy_block_kernel(
         c0 = rest // e1
         source_row = c0 * s0 + c1 * s1 + c2 * s2
         out_row = c0 * d0 + c1 * d1 + c2 * d2
-        # A wide block's rows are unit-stride and aligned on both sides, which the module states, so
-        # the compiler moves whole vectors instead of one element a lane.
-        if WIDE:
-            value = tl.load(source_ptr + source_row + lanes, mask=inside, other=0)
-            tl.store(out_ptr + out_row + lanes, value, mask=inside)
-        else:
-            value = tl.load(source_ptr + source_row + lanes * s3, mask=inside, other=0)
-            tl.store(out_ptr + out_row + lanes * d3, value, mask=inside)
+        value = tl.load(source_ptr + source_row + lanes * s3, mask=inside, other=0)
+        tl.store(out_ptr + out_row + lanes * d3, value, mask=inside)
         return
 
     index = program * BLOCK + tl.arange(0, BLOCK).to(tl.int64)
