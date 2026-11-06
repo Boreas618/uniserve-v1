@@ -49,7 +49,7 @@ use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::diag::Diag;
 use crate::runners::floor;
-use crate::runners::lifecycle::{Lifecycle, walk_capture};
+use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{self, Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
@@ -1222,7 +1222,8 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
-        self.lifecycle.attach_pools(pools);
+        self.lifecycle.attach_pools(Arc::clone(&pools));
+        self.pools = Some(pools);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
@@ -1325,7 +1326,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
+        let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
     }
 

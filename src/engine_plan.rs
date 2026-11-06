@@ -346,6 +346,7 @@ impl EpochPlan {
         device: DeviceId,
         resident: u64,
         snapshot: u64,
+        streams: usize,
     ) -> Result<GraphStorage> {
         let handle = platform::Device::new(device)
             .with_context(|| format!("opening device {}", device.0))?;
@@ -406,12 +407,20 @@ impl EpochPlan {
         Ok(GraphStorage {
             bytes,
             budget,
-            // Two ranges, because two streams walk this device's graphs: the serving generation's
-            // runner and the preparation's beside it - `graph.bytes` is already `pool * 2` for
-            // exactly that reason, and `Pools::pool` allocates ONE stream's share of it whole.
-            // With one range the first walk takes the reservation entire and the preparation's
-            // range has nothing to take, which is an update that cannot map its own capture.
-            streams: 2,
+            // The range is divided among the streams that will map it, and `streams` is that
+            // count: one per runner the device serves plus one for a preparation, which walks its
+            // own generation on a stream of its own. `bytes` above is the design's figure for the
+            // device - one graph pool, two while a preparation is alive - so a stream's share is
+            // `bytes / streams` and a device that serves more runners takes a smaller share each.
+            // The figure is NOT scaled by the runner count: 10% of the device is the budget for a
+            // device's graphs, and a media rank with five runners may not claim 50%.
+            //
+            // A count short of the streams that actually map is not a tuning error: the first
+            // streams take the range whole and the next one is refused at `Pools::pool` with
+            // "cannot give out N more", which reads as an allocator fault rather than a plan.
+            // `Executor::spawn` therefore refuses a device whose runners outnumber the streams the
+            // range was divided for, by name, before any capture.
+            streams,
             scratch,
             // The shadow region alone, which the paired forward's twins allocate; `scratch` keeps
             // the reservation that also holds the state group's snapshot (7.3, 4.5).
@@ -820,6 +829,29 @@ impl EpochPlan {
         &self.targets
     }
 
+    /// The streams `device` maps graphs on: one per runner it serves, plus one for a preparation.
+    ///
+    /// The count is the number of `NamedRunner`s [`EpochPlan::runners`] builds for this class, and
+    /// the two are checked against each other where the runners exist: `Executor::spawn` refuses a
+    /// device whose runners outnumber the streams its graph range was divided for, naming both
+    /// figures. That refusal is what keeps this constant honest - a runner added without the count
+    /// following it stops at the spawn instead of at a capture nobody can read.
+    ///
+    /// A preparation walks its own generation on a stream of its own, so it takes one more range
+    /// than the serving generation does, whether or not an update is in flight when the process
+    /// starts: a range that appeared only at the first precopy would be mapped after the model and
+    /// the cache, and the device would have nothing left to give it.
+    fn streams_on(served: &Served) -> usize {
+        let serving = match served {
+            // The text class serves one causal-language runner (4.3).
+            Served::Text(_) => 1,
+            // The media class serves its encoder, its denoise step, its decoder, its audio
+            // decoder and its host stage: five runners, one stream each.
+            Served::Media(_) => 5,
+        };
+        serving + 1
+    }
+
     /// The runners `device` serves: one per block of the loaded model (§4.3).
     ///
     /// The model's class was resolved once, when it was loaded and its resident memory opened
@@ -1003,7 +1035,28 @@ impl EpochPlan {
                 // condition capacity, so two tasks are two partitions and one deployment holds one.
                 // A construction stating their union would serve both; the model offers none, and
                 // this does not invent one.
-                let task = served_task(&config.tasks(), &self.checkpoint)?;
+                // **What a deployment of this checkpoint serves, not everything its architecture
+                // can express**: a distilled export serves the one task its contract states, and a
+                // partition carries one task's block set and condition capacity.
+                let task = served_task(&config.serving(), &self.checkpoint)?;
+                // **The prompt capacity is the deployment's, and the denoiser's packed prefix holds
+                // it.** A layout reserves one row per prompt token, so the text capacity a model is
+                // built with and the prompt capacities the deployment prepares buckets for are one
+                // number: the largest rung `video_config.text_capacities` states, which is the
+                // longest prompt the deployment admits. Built at any other number the model refuses
+                // every request past it at the packed prefix - at capture, minutes into a load, with
+                // the two figures in different components. The reference states the same rule: a
+                // request's text rows are its prompt rounded up to the attention unit's tile, and
+                // the layout's capacity is what the deployment prepared (`packing.py:557`,
+                // `denoiser.py:411`).
+                let longest = self.build.max_model_len.map(|length| length.get()).context(
+                    "a deployment of the media class states no `max_model_len`, and its prompt \
+                     capacities are checked against it",
+                )?;
+                let capacities = prompt_capacities(&self.build.video, longest)?;
+                let text_capacity = *capacities.last().context(
+                    "this deployment states no prompt capacity, so no layout could hold a prompt",
+                )?;
                 // **The postprocessor is placed here, though `serving` names only what holds
                 // weights.** Its arithmetic is the clip splice and it names no checkpoint
                 // directory, so it is not a component a task's weights place - but the decode
@@ -1017,6 +1070,9 @@ impl EpochPlan {
                     tensor_rank,
                     sequence_rank,
                 )?;
+                // The condition capacity is the task's (the block set is placed for it); the text
+                // capacity is the deployment's, from the ladder above.
+                let partition = partition.sized(text_capacity, partition.condition_rows);
                 let partition = partition.placing(
                     partition
                         .blocks
@@ -1030,6 +1086,22 @@ impl EpochPlan {
                 let canvases = deployment_canvases(&self.build.video)?;
                 let model =
                     minimax_h3::load(&opened, partition, Some(dtype), &canvases, &mut loader)?;
+                // **One number, checked where both halves meet.** The partition above takes the
+                // deployment's largest prompt capacity and the model's layouts hold it; a build that
+                // took one and not the other would refuse every longer prompt at the packed prefix,
+                // minutes into a load and in a component that never saw the deployment's number. The
+                // disagreement is named here instead, before any runner is bound.
+                if let Some(denoiser) = model.transformer() {
+                    let held = denoiser.rules().arrangement().text_rows;
+                    let largest = capacities.last().copied().unwrap_or(0);
+                    if capacities.iter().any(|capacity| *capacity > held) {
+                        bail!(
+                            "this deployment prepares prompts of up to {largest} tokens and the \
+                             denoiser's layout holds {held} text rows: the prompt capacity is one \
+                             number, stated by the deployment and held by the packing"
+                        );
+                    }
+                }
                 let served = Served::Media(Arc::new(model));
                 let (memory, info, graph) = self.open_memory(&served, storage)?;
                 Ok((served, memory, info, graph))
@@ -1160,10 +1232,19 @@ impl EpochPlan {
         // booked against. A plan that fitted no cache (a rank that serves none) states zero.
         let resident = match (&planned.plan.cache, planned.plan.info.prefix_cache.as_ref()) {
             (Some(cache), Some(info)) => u64::from(info.num_units) * cache.unit_bytes,
+            // A media rank keeps no cache, and its resident pool holds the tables its model
+            // declares per layout. The reservation is addresses and not storage: a table books the
+            // allowance as it maps, so the range is what the device has left to give.
+            _ if matches!(served, Served::Media(_)) => {
+                platform::Device::new(device)
+                    .with_context(|| format!("opening device {}", device.0))?
+                    .memory_info()?
+                    .free
+            }
             _ => 0,
         };
         let snapshot = planned.state_snapshot_bytes();
-        let graph = self.graph(device, resident, snapshot)?;
+        let graph = self.graph(device, resident, snapshot, Self::streams_on(served))?;
         let pools = executor::device::Executor::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;
@@ -1194,7 +1275,12 @@ impl EpochPlan {
         // which the frontend plans a request against and no capacity figure implies.
         let mut info = planned.plan.info.clone();
         if let Served::Media(pipeline) = served {
-            info.video_denoiser = Some(denoiser_report(pipeline, &self.build.video)?);
+            let config = minimax_h3::Config::read(&self.checkpoint, None)?;
+            info.video_denoiser = Some(denoiser_report(
+                pipeline,
+                &self.build.video,
+                &config.serving(),
+            )?);
         }
         Ok((memory, info, graph))
     }
@@ -1806,11 +1892,13 @@ fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32
 
 /// What the placed denoisers serve, as the frontend plans a request against it.
 ///
-/// The tasks, the schedule and the shifts are the checkpoint's. The frame rule is the clip rule, the
+/// The tasks are the ones the checkpoint states it serves, which a distilled student narrows from
+/// what its network could run. The schedule and the shifts are its too. The frame rule is the clip rule, the
 /// rates are the model's output clock, and the canvases are the ones this deployment prepares.
 fn denoiser_report(
     pipeline: &minimax_h3::load::MinimaxH3,
     video: &daemon::options::VideoOptions,
+    checkpoint_tasks: &[nn::VideoTask],
 ) -> Result<ipc::VideoDenoiserInfo> {
     use minimax_h3::{AUDIO_SAMPLE_RATE, CLIP_FRAMES, CLIP_LATENTS, FPS};
     use models::video::{
@@ -1829,9 +1917,7 @@ fn denoiser_report(
             VideoTask::Fl2va => nn::VideoTask::FirstLastToVideoAudio,
             VideoTask::Ref2va => nn::VideoTask::ReferenceToVideoAudio,
         };
-        denoisers
-            .iter()
-            .any(|denoiser| denoiser.config().tasks.contains(&named))
+        checkpoint_tasks.contains(&named)
     };
     let tasks: Vec<VideoTask> = VideoTask::ALL.into_iter().filter(|task| served(*task)).collect();
     let steps = first.schedule().num_steps()?;

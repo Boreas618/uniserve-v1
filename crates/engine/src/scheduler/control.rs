@@ -82,6 +82,11 @@ pub(super) struct ShadowPass {
     /// One of the step's batches was submitted as a shadow: the step that owns
     /// the answer has begun, and ends before the answer is sent.
     pub(super) shadowed: bool,
+    /// The shapes this pass has compared. A shape is compared once (§7.3 step
+    /// 2): a pass that shadowed every batch of a shape would keep a slow
+    /// comparison in flight for as long as traffic lasts, and it would neither
+    /// settle nor leave the device to the requests it serves.
+    pub(super) shapes: std::collections::HashSet<executor::plan::Shape>,
     /// Where the ask's answer goes, in the shape every stage's answer takes.
     pub(super) answer: StageAnswer,
 }
@@ -510,6 +515,7 @@ impl Scheduler {
         self.shadow_pass = Some(ShadowPass {
             generation,
             shadowed: false,
+            shapes: std::collections::HashSet::new(),
             answer,
         });
     }
@@ -517,16 +523,27 @@ impl Scheduler {
     /// The world generation the following step's batches also run in shadow
     /// for, if an update asked (§7.3 step 2). The step reads it before it
     /// submits, since it names the kernels the shadow pass compares against.
-    pub(super) fn shadow_generation(&self) -> Option<u64> {
-        self.shadow_pass.as_ref().map(|pass| pass.generation)
+    pub(super) fn shadow_generation(&self, batch: &ExecutionBatch) -> Option<u64> {
+        let pass = self.shadow_pass.as_ref()?;
+        let shape = batch
+            .columns
+            .as_ref()
+            .map(crate::scheduler::batching::columns::batch_shape);
+        // A media batch states no token shape: its computation is compared once.
+        let compared = match &shape {
+            Some(shape) => pass.shapes.contains(shape),
+            None => pass.shadowed,
+        };
+        (!compared).then_some(pass.generation)
     }
 
     /// Records that a batch of this step was submitted as a shadow pass: the
     /// ask is answered when the step ends, so an answer never claims a pass
     /// that has not run.
-    pub(super) fn note_shadowed(&mut self) {
+    pub(super) fn note_shadowed(&mut self, shape: Option<executor::plan::Shape>) {
         if let Some(pass) = self.shadow_pass.as_mut() {
             pass.shadowed = true;
+            pass.shapes.extend(shape);
         }
     }
 
@@ -715,10 +732,23 @@ impl Scheduler {
     /// Applies the stage asked for, when the scheduler is at a boundary: no
     /// batch and no submission is in flight, so the policy that decided them is
     /// no longer needed by anything (§7.3 steps 3 to 6).
+    /// Whether a policy stage waits for this boundary: one that names a later step is not due yet.
+    pub(super) fn policy_stage_due(&self) -> bool {
+        matches!(&self.policy_stage, Some((_, _, at)) if at.is_none_or(|at| self.step >= at))
+    }
+
     pub(super) fn apply_policy_stage(&mut self) {
         let ready = self.inflight.pending_batches.is_empty()
             && self.inflight.pending_submissions.is_empty();
         if !ready {
+            if self.policy_stage.is_some() {
+                tracing::debug!(
+                    batches = self.inflight.pending_batches.len(),
+                    submissions = self.inflight.pending_submissions.len(),
+                    step = self.step,
+                    "a policy stage waits for a boundary with nothing in flight"
+                );
+            }
             return;
         }
         // A command that names the step its expert group agreed applies at that
@@ -750,6 +780,7 @@ impl Scheduler {
         let Some((stage, answer, _at)) = self.policy_stage.take() else {
             return;
         };
+        tracing::info!(stage = stage_name(stage), step = self.step, "a policy stage applies");
         let state = views::trial_state(self, self.step, self.recorder.recorded());
         // The step the stage applied at: the boundary this scheduler reached,
         // where the policy it replaced had decided its last batch. The ranks of
@@ -776,6 +807,7 @@ impl Scheduler {
                 Err(reason)
             }
         };
+        tracing::info!(ok = applied.is_ok(), "a policy stage answered");
         if let Some(answer) = answer {
             answer.send(applied);
         }
@@ -812,6 +844,9 @@ impl Scheduler {
         }
         policy.request(stage);
         let applied = policy.boundary(state).map_err(|error| error.to_string());
+        if applied.is_ok() && matches!(stage, Stage::Switchover | Stage::Revert) {
+            self.seed_from_policy();
+        }
         if serves {
             // A policy instance serves from this boundary on (§7.3 step 3).
             self.note_policy_serves();

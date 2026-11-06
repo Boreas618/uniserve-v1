@@ -42,7 +42,7 @@ use crate::batch::{Batch, BatchOutput, Job, Jobs};
 use crate::plan::{Bucket, Buckets, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
-use crate::runners::lifecycle::{Lifecycle, walk_capture};
+use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
 use crate::runners::products::{Product, Products};
 use crate::runners::tables::Tables;
 use crate::{Error, Result};
@@ -1099,7 +1099,8 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
-        self.lifecycle.attach_pools(pools);
+        self.lifecycle.attach_pools(Arc::clone(&pools));
+        self.pools = Some(pools);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
@@ -1179,7 +1180,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
+        let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
     }
 

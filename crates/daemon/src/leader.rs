@@ -605,6 +605,17 @@ impl Leader {
                 .install_programs(commands, config, engines, world)
                 .await
                 .context("installing the epoch's programs in its main processes")?;
+            // A committed world's tensors are what the next world starts from: until it is
+            // published its storage is private to it, and a target of another world finds nothing.
+            let publishing = Arc::clone(&control);
+            tokio::task::spawn_blocking(move || publishing.publish_worlds(&[world], &mut None))
+                .await
+                .context("publishing the first world")?
+                .context("publishing the first world")?;
+            // The epoch's programs serve, which is what the standbys were waiting to prepare from.
+            for replica in leader.replicas() {
+                replica.prepare_standby();
+            }
         }
         Ok(leader)
     }
@@ -1495,16 +1506,24 @@ impl Leader {
             .epochs()
             .program_update()
             .filter(|program| program.update.number == number);
-        if program.is_none() {
+        let Some(program) = program else {
             return Ok(false);
-        }
+        };
         let epochs = Arc::clone(&self.epochs());
-        tokio::task::spawn_blocking(move || epochs.commit_programs())
+        let committed = tokio::task::spawn_blocking(move || epochs.commit_programs())
             .await
             .map_err(|error| {
                 UpdateError::Failed(anyhow::anyhow!("committing the update: {error}"))
             })?
-            .map_err(UpdateError::Failed)
+            .map_err(UpdateError::Failed)?;
+        // The configuration is what the next apply starts from and what a successor takes over:
+        // one that kept the values before this update would undo it at the next change.
+        if committed {
+            for replica in self.replicas() {
+                *locked(&replica.config) = program.update.target.config.clone();
+            }
+        }
+        Ok(committed)
     }
 
     /// Returns every main process to the generation it served before update
@@ -1647,6 +1666,18 @@ impl Leader {
         // Servers select differs: the change applies to nothing, and the
         // world-level path answers it as unchanged.
         if next.programs == filled {
+            return Ok(None);
+        }
+        // What the configuration names is a part of what serves: the rest of an epoch's programs
+        // come from the store. A target that resolves to what the epoch runs changes nothing,
+        // whatever else the same apply changed.
+        if self
+            .epochs()
+            .serving()
+            .is_some_and(|(_, record)| {
+                record.kernels == next.programs.kernels && record.policy == next.programs.policy
+            })
+        {
             return Ok(None);
         }
         // The reverted-update refusal is the daemon's record's, checked when
@@ -1932,6 +1963,9 @@ pub(crate) struct Replica {
     /// both start a process, since a second engine of the same scope is a
     /// whole copy of its device storage.
     standby_starting: tokio::sync::Mutex<()>,
+    /// Whether the epoch's programs serve here, which is what a standby is
+    /// prepared from.
+    programs_serve: std::sync::atomic::AtomicBool,
     /// Whether this daemon handed the engine to a successor (§7.5.1): the
     /// successor owns its life then, and a watch that sees its client go away
     /// must not relaunch it.
@@ -1971,6 +2005,7 @@ impl Replica {
             manifests: std::sync::Mutex::new(storage::manifest::Planner::default()),
             standby: std::sync::Mutex::new(None),
             standby_starting: tokio::sync::Mutex::new(()),
+            programs_serve: std::sync::atomic::AtomicBool::new(false),
             handed_over: AtomicBool::new(false),
         });
         hold.serve(client);
@@ -2019,6 +2054,8 @@ impl Replica {
             epoch,
         } = target;
         let mut served = updates.epochs().served();
+        let serving_config = config.clone();
+        let publishing = Arc::clone(&control);
         tokio::spawn(async move {
             let sink = stats_sink(
             replica.model_name.clone(),
@@ -2082,10 +2119,39 @@ impl Replica {
                 }
             }
             spec.predecessor = None;
-            *locked(&replica.served) = Some(spec);
+            let before = locked(&replica.served).replace(spec);
+            // The configuration is the one the target serves from here, as the spec is, and a
+            // revert puts both back: the next apply starts from it, and the operator reads it.
+            let config_before = std::mem::replace(&mut *locked(&replica.config), serving_config);
+            // The previous client stays until the switch settles: it is what keeps the previous
+            // epoch's process, which the switch drains next and serves again on a revert.
+            let previous = replica.hold.client();
             replica.hold.serve(Arc::clone(&client));
             tokio::spawn(watch_engine(Arc::clone(&replica), Arc::downgrade(&client)));
             info!(engine, epoch, "the switch's target serves this replica");
+            while !updates.settled() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            let committed = updates
+                .epochs()
+                .serving()
+                .is_some_and(|(serving, _)| serving == epoch);
+            if !committed && let Some(previous) = previous {
+                *locked(&replica.served) = before;
+                *locked(&replica.config) = config_before;
+                replica.hold.serve(previous);
+                warn!(engine, epoch, "the switch returned this replica to the previous epoch");
+            }
+            if committed {
+                // The committed target is what the next switch starts from.
+                let published = tokio::task::spawn_blocking(move || {
+                    publishing.publish_worlds(&[epoch], &mut None)
+                })
+                .await;
+                if !matches!(published, Ok(Ok(()))) {
+                    warn!(epoch, "publishing the committed epoch's world failed: {published:?}");
+                }
+            }
         });
     }
 
@@ -2171,9 +2237,87 @@ pub(crate) struct Standby {
     /// The launch generation the standby was started under, from the epoch
     /// layer's one allocator.
     pub(crate) generation: u64,
+    /// Whether it holds the epoch's programs and has captured its graphs, so a
+    /// promotion is the promotion alone (§2.5).
+    prepared: bool,
 }
 
 impl Replica {
+    /// Prepares the parked standby in the background, once the epoch's programs
+    /// serve: the caller is what makes them serve.
+    pub(crate) fn prepare_standby(self: &Arc<Self>) {
+        self.programs_serve.store(true, Ordering::SeqCst);
+        let replica = Arc::clone(self);
+        tokio::spawn(async move {
+            let _starting = replica.standby_starting.lock().await;
+            replica.prepare_parked_standby().await;
+        });
+    }
+
+    /// Hands the parked standby the epoch's programs (§2.5): it captures its
+    /// graphs on its own warmup scratch, and the graphs wait at their addresses
+    /// for a promotion that then has nothing left to build.
+    ///
+    /// A standby the epoch's programs have not reached is kept: the promotion
+    /// hands them over itself, later than it should, and still serves. The
+    /// caller holds `standby_starting`, so a promotion never meets a handover
+    /// half done.
+    async fn prepare_parked_standby(self: &Arc<Self>) {
+        if !self.programs_serve.load(Ordering::SeqCst) {
+            return;
+        }
+        let parked = locked(&self.standby)
+            .as_ref()
+            .filter(|standby| !standby.prepared)
+            .map(|standby| (Arc::clone(&standby.client), standby.generation));
+        let Some((client, generation)) = parked else {
+            return;
+        };
+        match self.hand_programs(&client).await {
+            Ok(()) => {
+                if let Some(standby) = locked(&self.standby)
+                    .as_mut()
+                    .filter(|standby| standby.generation == generation)
+                {
+                    standby.prepared = true;
+                }
+                info!(generation, "the standby captured its graphs and stands by");
+            }
+            Err(reason) => warn!(
+                generation,
+                "the standby did not take the epoch's programs while parked: {reason}; a \
+                 promotion hands them over itself"
+            ),
+        }
+    }
+
+    /// Gives `client`'s process the programs the epoch serves.
+    async fn hand_programs(self: &Arc<Self>, client: &Arc<EngineClient>) -> Result<(), String> {
+        let Some(epochs) = self
+            .registry
+            .upgrade()
+            .and_then(|registry| registry.updates.upgrade())
+            .map(|driver| Arc::clone(driver.epochs()))
+        else {
+            return Ok(());
+        };
+        let config = locked(&self.config).clone();
+        let host = config.host_identity.clone();
+        let engine = client
+            .engine()
+            .ok_or_else(|| "the standby states no engine number".to_owned())?;
+        let handed = tokio::task::spawn_blocking(move || epochs.hand_to(&host, engine, &config));
+        match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
+            Ok(Ok(Ok(()))) => Ok(()),
+            Ok(Ok(Err(failure))) => Err(format!("{}: {}", failure.kind, failure.reason)),
+            Ok(Err(error)) => Err(format!("the handover did not complete: {error}")),
+            Err(_) => Err(format!(
+                "it answered nothing within {} s",
+                SWITCH_TIMEOUT.as_secs()
+            )),
+        }
+    }
+
     /// Starts the standby in the background, if this replica serves and has
     /// none. Errors are logged: a replica without a standby still serves, and a
     /// loss then relaunches ([`Replica::recover`]) instead of promoting.
@@ -2330,7 +2474,12 @@ impl Replica {
             generation,
             "the standby is prepared beside the serving engine"
         );
-        *locked(&self.standby) = Some(Standby { client, generation });
+        *locked(&self.standby) = Some(Standby {
+            client,
+            generation,
+            prepared: false,
+        });
+        self.prepare_parked_standby().await;
         Ok(())
     }
 
@@ -2342,53 +2491,26 @@ impl Replica {
     /// under the serving engine's world. A standby that cannot be promoted is
     /// dropped, and the caller's loss path relaunches the engine instead.
     pub(crate) async fn promote_standby(self: &Arc<Self>) -> Option<Arc<EngineClient>> {
+        // A standby being started or prepared is waited for: it is closer to serving than a
+        // process this replica has yet to launch.
+        let starting = self.standby_starting.lock().await;
         let standby = locked(&self.standby).take()?;
         self.hold.hold();
-        // The epoch's programs first, then the promotion: a standby parks
-        // before any `Precopy` names a generation, so it holds none of the
-        // epoch's programs when it is promoted (§2.5, §7.5). A promotion that
-        // named it serving with no programs would answer 503 to every request
-        // — the same silence a relaunched process produced — so the daemon
-        // hands them over before it moves the frontend, and the engine's own
-        // refusal of a programless promotion is a guard rather than the only
-        // defence.
-        if let Some(epochs) = self
-            .registry
-            .upgrade()
-            .and_then(|registry| registry.updates.upgrade())
-            .map(|driver| Arc::clone(driver.epochs()))
+        // A standby prepares while it parks (`prepare_parked_standby`), and one that is lost to
+        // before its programs reached it takes them here. A promotion that named it serving with
+        // no programs would answer 503 to every request, so the daemon hands them over before it
+        // moves the frontend, and the engine's own refusal of a programless promotion is a guard
+        // rather than the only defence.
+        if !standby.prepared
+            && let Err(reason) = self.hand_programs(&standby.client).await
         {
-            let config = locked(&self.config).clone();
-            let host = config.host_identity.clone();
-            let Some(engine) = standby.client.engine() else {
-                warn!(
-                    generation = standby.generation,
-                    "the standby states no engine number; the engine is relaunched"
-                );
-                return None;
-            };
-            let handing = Arc::clone(&epochs);
-            let handed =
-                tokio::task::spawn_blocking(move || handing.hand_to(&host, engine, &config));
-            let took = match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
-                Ok(joined) => match joined {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(failure)) => Err(format!("{}: {}", failure.kind, failure.reason)),
-                    Err(error) => Err(format!("the handover did not complete: {error}")),
-                },
-                Err(_) => Err(format!(
-                    "it answered nothing within {} s",
-                    SWITCH_TIMEOUT.as_secs()
-                )),
-            };
-            if let Err(reason) = took {
-                warn!(
-                    generation = standby.generation,
-                    "the standby did not take the epoch's programs: {reason}; the engine is relaunched"
-                );
-                return None;
-            }
+            warn!(
+                generation = standby.generation,
+                "the standby did not take the epoch's programs: {reason}; the engine is relaunched"
+            );
+            return None;
         }
+        drop(starting);
         match standby.client.promote(Vec::new(), false, true).await {
             Ok(()) => {
                 self.hold.serve(Arc::clone(&standby.client));
