@@ -200,24 +200,13 @@ fn launch_refuses_a_worker_of_another_build() -> anyhow::Result<()> {
 }
 
 
+/// A rank placed on another host is started by that host's daemon, which
+/// joined the leader; with no daemon there, the launch fails naming the host
+/// whose ranks cannot start rather than waiting for them or starting them in
+/// the wrong place. What a placement computes is asserted without a launch
+/// (`core::tests::a_placement_shares_ranks_across_the_named_hosts`).
 #[test]
-fn placement_binds_ranks_to_the_engine_host_by_name() {
-    let named = ExecutorGroupConfig::placed(
-        &["compute-0".to_owned()],
-        "cpu",
-        WORLD_SIZE,
-        2,
-        ExecutorGroupConfig::single_component("model", WORLD_SIZE),
-    );
-    assert!(
-        named.ranks.iter().all(|rank| rank.host == "compute-0"),
-        "the placement shorthand must place ranks on the host it is given"
-    );
-
-    // A rank placed on another host is started by that host's daemon, which
-    // joined the leader. No daemon runs on that host here, so the launch
-    // fails naming the host whose ranks cannot start rather than waiting for
-    // them or starting them in the wrong place.
+fn a_launch_names_the_host_whose_daemon_is_absent() {
     let spawned = ExecutorGroup::spawn(ExecutorProcessArgs {
         executable: worker_executable(),
         daemon: crate::support::daemon(),
@@ -231,7 +220,7 @@ fn placement_binds_ranks_to_the_engine_host_by_name() {
             ExecutorGroupConfig::single_component("model", WORLD_SIZE),
         )
         .ranks,
-        components: named.components.clone(),
+        components: ExecutorGroupConfig::single_component("model", WORLD_SIZE),
         stub: true,
         ..ExecutorProcessArgs::default()
     });

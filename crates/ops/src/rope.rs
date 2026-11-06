@@ -79,7 +79,7 @@ pub struct FactorsDescriptor {
 
 /// The most position axes a sectioned rotation reads.
 ///
-/// Qwen2.5-VL's M-RoPE cuts the head into three (time, height, width); a fourth is room for a
+/// The M-RoPE layout cuts the head into three (time, height, width); a fourth is room for a
 /// model that adds a modality axis, and the kernels' per-column search is a scan over four entries.
 pub const MAX_AXES: usize = 4;
 
