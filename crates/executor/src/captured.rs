@@ -147,7 +147,21 @@ impl Captured {
         for node in template.nodes()? {
             *kinds.entry(format!("{:?}", node.kind()?)).or_default() += 1;
         }
-        tracing::info!(nodes = template_nodes, ?kinds, "a captured graph's nodes");
+        let mut operators = std::collections::BTreeMap::<&str, (u64, u64)>::new();
+        for (operator, _, launch) in &nodes {
+            let entry = operators.entry(operator).or_default();
+            entry.0 += 1;
+            entry.1 += launch.len() as u64;
+        }
+        let mut heaviest: Vec<_> = operators.into_iter().collect();
+        heaviest.sort_by_key(|(_, (_, nodes))| std::cmp::Reverse(*nodes));
+        heaviest.truncate(8);
+        tracing::info!(
+            nodes = template_nodes,
+            ?kinds,
+            ?heaviest,
+            "a captured graph's nodes, and its heaviest operators as (launches, nodes)"
+        );
         if template_nodes < launched {
             return Err(Error::Invariant(format!(
                 "the capture recorded {launched} launch(es) and its graph holds {template_nodes} \
