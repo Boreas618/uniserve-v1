@@ -303,13 +303,42 @@ impl JobQueue {
         }
     }
 
+    /// The next command, if one is pending now and `wanted` accepts it.
+    pub(crate) fn next_if(&self, wanted: impl FnOnce(&Entry) -> bool) -> Option<Entry> {
+        let mut state = lock(&self.state);
+        if state.closed || !state.pending.front().is_some_and(wanted) {
+            return None;
+        }
+        let entry = state.pending.pop_front()?;
+        state.current = Some(Current {
+            submission: entry.submission_id,
+            kind: entry.kind,
+            batch: entry.batch,
+            started: std::time::Instant::now(),
+        });
+        Some(entry)
+    }
+
+    /// Whether a command is pending.
+    pub(crate) fn has_pending(&self) -> bool {
+        !lock(&self.state).pending.is_empty()
+    }
+
     /// Reports that `entry` ended with `result`, and completes the submission that waited on it.
     ///
     /// A serving command hands over the step's output; every other command's output is empty.
     pub(crate) fn complete(&self, entry: Entry, result: Result<BatchOutput>, detail: Option<String>) {
         {
+            // The command in hand may already be the next one: a replay lands while the replay
+            // launched behind it is the command the watchdog watches.
             let mut state = lock(&self.state);
-            state.current = None;
+            if state
+                .current
+                .as_ref()
+                .is_none_or(|current| current.batch == entry.batch)
+            {
+                state.current = None;
+            }
         }
         if entry.kind == JobKind::After {
             // The command's only work was its wait, which completing it establishes.

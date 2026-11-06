@@ -263,6 +263,8 @@ impl Executor {
             shadow_attached: false,
             activity: Arc::clone(&activity),
             sticky: None,
+            waits: true,
+            pending_landing: None,
         };
         let thread_queue = Arc::clone(&queue);
         let thread = std::thread::Builder::new()
@@ -624,7 +626,35 @@ pub enum Probe {
 }
 
 /// The device thread's state: the runners, the streams only it issues to, and the queue.
+/// How often a device thread looks at a replay in flight while it waits for the next command.
+const LANDING_POLL: Duration = Duration::from_micros(100);
+
+/// A replay on its stream, and what is reported when it lands.
+struct PendingLanding {
+    /// Recorded behind the replay.
+    landed: platform::Event,
+    /// When its command was taken up.
+    started: Instant,
+    /// How long staging its batch took, in milliseconds.
+    staged_ms: u64,
+    /// The media call it serves.
+    call: ipc::MediaCall,
+    /// The batch it serves.
+    batch: u64,
+}
+
+/// A command whose replay is running, with the answer its submission gets when it lands.
+struct Launched {
+    entry: crate::job::Entry,
+    output: BatchOutput,
+    pending: PendingLanding,
+}
+
 struct Device {
+    /// Whether a job's device work is waited for before the job answers.
+    waits: bool,
+    /// The replay the command just served left running.
+    pending_landing: Option<PendingLanding>,
     device: DeviceId,
     runners: Vec<NamedRunner>,
     queue: Arc<JobQueue>,
@@ -673,7 +703,23 @@ impl Device {
         events.set_submitter(Some(Box::new(move |device, events| {
             submitter.after(device, events)
         })));
-        while let Some(entry) = queue.next(None) {
+        let mut launched: Option<Launched> = None;
+        loop {
+            let entry = match &launched {
+                Some(in_flight) => match self.beside(queue, in_flight) {
+                    Some(entry) => Some(entry),
+                    None => {
+                        if let Some(landing) = launched.take() {
+                            self.land(queue, landing);
+                        }
+                        continue;
+                    }
+                },
+                None => queue.next(None),
+            };
+            let Some(entry) = entry else {
+                break;
+            };
             if let Some(sticky) = &self.sticky {
                 // The context is unusable: the command is not issued, and its submission fails
                 // with the sticky error rather than with a launch error that would hide it.
@@ -685,11 +731,26 @@ impl Device {
                 continue;
             }
             let result = self.serve(&entry);
+            // A replay that was in flight lands now, with the one behind it already on the stream.
+            if let Some(landing) = launched.take() {
+                self.land(queue, landing);
+            }
             if matches!(result, Ok(Step::Requeued)) {
                 // The entry put the rest of its command at the tail; its submission waits for the
                 // last step, so nothing completes here.
                 continue;
             }
+            let result = match (result, self.pending_landing.take()) {
+                (Ok(Step::Done(output)), Some(pending)) => {
+                    launched = Some(Launched {
+                        entry,
+                        output,
+                        pending,
+                    });
+                    continue;
+                }
+                (result, _) => result,
+            };
             // What was in hand, read **after** the command: `perform` is what writes it, and it is
             // taken when a command completes, so a string read before the command is the one the
             // previous command left - empty. Reading it before the command therefore wrapped no
@@ -734,7 +795,63 @@ impl Device {
             }
             queue.complete(entry, result, detail);
         }
+        if let Some(landing) = launched.take() {
+            self.land(queue, landing);
+        }
         events.set_submitter(None);
+    }
+
+    /// The next command to serve beside the replay in flight, or `None` once the replay should land
+    /// first: it has finished, or the command next in line needs the device to itself.
+    fn beside(&self, queue: &JobQueue, in_flight: &Launched) -> Option<crate::job::Entry> {
+        loop {
+            if let Some(entry) = queue.next_if(|entry| self.overlaps(entry)) {
+                return Some(entry);
+            }
+            if queue.has_pending() || !matches!(in_flight.pending.landed.query(), Ok(false)) {
+                return None;
+            }
+            std::thread::sleep(LANDING_POLL);
+        }
+    }
+
+    /// Whether `entry` is a batch whose replay may be launched behind one in flight.
+    fn overlaps(&self, entry: &crate::job::Entry) -> bool {
+        let Command::Batch(batch) = &entry.command else {
+            return false;
+        };
+        self.runner_of(phase_of(batch))
+            .and_then(|runner| self.runner_ref(runner))
+            .is_ok_and(|named| named.runner.overlaps_replays())
+    }
+
+    /// Waits for a launched replay and answers its submission.
+    fn land(&mut self, queue: &JobQueue, launched: Launched) {
+        let Launched {
+            entry,
+            output,
+            pending,
+        } = launched;
+        let result = pending
+            .landed
+            .synchronize()
+            .map(|()| output)
+            .map_err(Error::from);
+        tracing::info!(
+            device = self.device.0,
+            call = ?pending.call,
+            batch = pending.batch,
+            staged_ms = pending.staged_ms,
+            total_ms = pending.started.elapsed().as_millis() as u64,
+            "a media batch was served"
+        );
+        if let Err(error) = &result {
+            tracing::warn!(%error, device = self.device.0, "a device command failed");
+            if let Ok(Some(sticky)) = self.probe_sticky() {
+                self.sticky = Some(sticky);
+            }
+        }
+        queue.complete(entry, result, None);
     }
 
     /// Reads this device's context for a sticky error, the check the stall rule ends in (2.4).
@@ -759,8 +876,33 @@ impl Device {
                 let jobs = self.runner_mut(runner)?.runner.submit(batch.clone())?;
                 let staged = started.elapsed();
                 // A batch's jobs are its replay and nothing else: serving it is one turn, because
-                // the mechanism waits on this submission to build the next step.
+                // the mechanism waits on this submission to build the next step. A runner whose
+                // replays overlap leaves its stream running: launching a graph costs the device
+                // milliseconds of idle, and the next step's launch fits behind this step's work.
+                let named = self.runner_mut(runner)?;
+                let overlapping = named.runner.overlaps_replays();
+                let stream = named.runner.stream().cloned();
+                self.waits = !overlapping;
                 let output = self.perform(&label, jobs_of(runner, jobs)).map(Step::Done);
+                self.waits = true;
+                if overlapping && output.is_ok() {
+                    let (Some(stream), Some(media)) = (stream, &batch.media) else {
+                        return Err(Error::Invariant(
+                            "a runner whose replays overlap serves a media batch on a stream"
+                                .into(),
+                        ));
+                    };
+                    let landed = platform::Event::new(platform::EventFlags::default());
+                    landed.record(&stream)?;
+                    self.pending_landing = Some(PendingLanding {
+                        landed,
+                        started,
+                        staged_ms: staged.as_millis() as u64,
+                        call: media.computation.call,
+                        batch: batch.id.0,
+                    });
+                    return output;
+                }
                 // A media call is seconds of device work a few times per request, so one line each
                 // is the request's timeline; a token batch's would be the log.
                 if let Some(media) = &batch.media {
@@ -986,7 +1128,12 @@ impl Device {
                 Ok(named) => named.runner.serve(&job),
                 Err(error) => Err(error),
             }
-            .and_then(|produced| self.synchronize().map(|()| produced));
+            .and_then(|produced| {
+                if self.waits {
+                    self.synchronize()?;
+                }
+                Ok(produced)
+            });
             if let Some(bucket) = walked {
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 match &outcome {
@@ -1065,6 +1212,14 @@ impl Device {
             .ok_or_else(|| {
                 Error::Invariant(format!("no runner of this device serves phase {}", phase.0))
             })
+    }
+
+    /// The runner with `id`, to read.
+    fn runner_ref(&self, id: RunnerId) -> Result<&NamedRunner> {
+        self.runners
+            .iter()
+            .find(|named| named.id == id)
+            .ok_or_else(|| Error::Invariant(format!("the device has no runner {}", id.0)))
     }
 
     /// The runner with `id`.
