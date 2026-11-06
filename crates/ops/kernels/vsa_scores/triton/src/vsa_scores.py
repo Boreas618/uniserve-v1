@@ -4,15 +4,15 @@ VSA pools each tile's per-head means, contracts them per head, and ranks the res
 tiles the sparse attention reads:
 
 ```text
-pooled_query [heads, query tiles, width] · pooled_key [heads, key tiles, width]
-scores[head, i, j] = Σ_w pooled_query[head, i, w] · pooled_key[head, j, w]
+pooled_query [query tiles, heads, width] · pooled_key [key tiles, heads, width]
+scores[head, i, j] = Σ_w pooled_query[i, head, w] · pooled_key[j, head, w] / sqrt(width)
 ```
 
-There is no scale and no softmax: the caller applies both afterwards — the selection only compares,
-and the attention scales its own products — so a program writes the raw sum of products and nothing
-else. Both operands are FP32 — the type ``vsa_prepare_tiles`` pools a tile's per-head means in —
-and the products accumulate in FP32, which is the operator's tolerance: the standard bound for a
-``width``-term contraction.
+The operands are in the layout ``vsa_prepare_tiles`` writes, a tile first. The scale is the
+reference's: the selection only compares, but the compression's softmax reads these same scores.
+There is no softmax here. Both operands are FP32 — the type ``vsa_prepare_tiles`` pools a tile's
+per-head means in — and the products accumulate in FP32, which is the operator's tolerance: the
+standard bound for a ``width``-term contraction.
 
 A program is one (head, query tile): it holds the query row in registers and walks the key tiles a
 tile of them at a time, so every key row is read once per query tile and the scores of a row are
@@ -55,9 +55,11 @@ def _vsa_scores_kernel(
     key_tiles = key_tiles.to(tl.int64)
 
     # The query row stays in registers: [BLOCK] FP32.
+    heads = tl.num_programs(1).to(tl.int64)
     query = tl.load(
-        query_ptr + (head * query_tiles + tile) * WIDTH + lanes, mask=live, other=0.0
+        query_ptr + (tile * heads + head) * WIDTH + lanes, mask=live, other=0.0
     ).to(tl.float32)
+    root = tl.sqrt(tl.full((KEY_TILES,), WIDTH, tl.float32))
 
     # One step contracts KEY_TILES key tiles: [KEY_TILES, BLOCK] loads against the query row.
     step = tl.arange(0, KEY_TILES).to(tl.int64)
@@ -66,9 +68,9 @@ def _vsa_scores_kernel(
         keys = start + step
         key_mask = keys < key_tiles
         values = tl.load(
-            key_ptr + (head * key_tiles + keys)[:, None] * WIDTH + lanes[None, :],
+            key_ptr + (keys * heads + head)[:, None] * WIDTH + lanes[None, :],
             mask=key_mask[:, None] & live[None, :],
             other=0.0,
         ).to(tl.float32)
-        scores = tl.sum(values * query[None, :], axis=1)
+        scores = tl.sum(values * query[None, :], axis=1) / root
         tl.store(out_ptr + out_base + keys, scores, mask=key_mask)
