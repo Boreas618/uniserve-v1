@@ -86,7 +86,7 @@ uniserve-eval = { path = "uniserve_eval", editable = true }
 # reaches a page the allocator returned faults the device front end (Xid 31)
 # and leaves the context unusable. CUPTI 13.4.92 records kernels, copies and
 # fills on the CUDA 13.0 driver without it. Records keep the field offsets the
-# worker decodes (`crates/cuda/src/cupti/records.rs`).
+# reader decodes (`crates/platform/src/cupti/records.rs`).
 override-dependencies = [
     "nvidia-nccl-cu13==2.30.4; sys_platform == 'linux'",
     "nvidia-cuda-cupti==13.4.92; sys_platform == 'linux'",
@@ -103,15 +103,14 @@ include = ["uniserve", "uniserve.*"]
 # Grouped-expert providers read this fixed tactic catalog at preparation.
 uniserve = ["backends/moe/tactics.json"]
 
-# Rust worker runtime. It is a TVM-FFI library rather than a Python extension
-# module: the `uniserve` executable's `worker` command loads it and calls its
-# entry, and Python loads the same file with `tvm_ffi.load_module`. Serving
-# runs these native targets, so they build with Cargo's release profile even
-# for an editable install, where setuptools-rust would otherwise choose a
-# debug build.
 # The one executable of every UniServe process, installed onto PATH as
-# `uniserve`: `serve` (a node's daemon), `engine` (the engine process), `worker`
-# (one worker, in this environment) and `storage` (a host's Storage Server).
+# `uniserve`: `serve` (a node's daemon), `frontend` (the deployment's
+# application process), `engine` (the engine process), `storage` (a host's
+# Storage Server) and `rules` (the model-family request rules a plan asks
+# for), plus the `program-server` entry a Program Server starts with. It is a
+# binary rather than a Python extension module, and serving runs it, so it
+# builds with Cargo's release profile even for an editable install, where
+# setuptools-rust would otherwise choose a debug build.
 [[tool.setuptools-rust.bins]]
 target = "uniserve"
 path = "Cargo.toml"

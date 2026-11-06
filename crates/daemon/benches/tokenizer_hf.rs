@@ -11,7 +11,7 @@ use criterion::{Criterion, Throughput, black_box};
 use daemon::tokenizer::HuggingFaceTokenizer;
 use hf_hub::api::sync::ApiBuilder;
 
-const MODEL_ID: &str = "Qwen/Qwen3.5-0.8B";
+const MODEL_ID: &str = "Qwen/Qwen3-30B-A3B";
 const SAMPLE_TEXT: &str =
     "<|im_start|>user\nSummarize this request.\n<|im_end|>\n<|im_start|>assistant\n";
 
