@@ -43,7 +43,7 @@ use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
-use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
+use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
 use crate::plan::{Bucket, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
@@ -478,6 +478,9 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     pending: Vec<Pending>,
     /// The calls of the batch staged last, which its replay answers.
     calls: Vec<CallId>,
+    /// The steps those calls' trajectories have completed once the replay ran: a call reports it,
+    /// and that report is what moves the request to its next step.
+    steps_completed: u32,
 }
 
 impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
@@ -539,6 +542,7 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             staged_step: None,
             pending: Vec::new(),
             calls: Vec::new(),
+            steps_completed: 0,
         })
     }
 
@@ -1246,6 +1250,7 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
         let step = step.ok_or_else(|| Error::Invalid("a denoise batch of no request".into()))?;
         self.stage_step(&step)?;
         self.calls.clone_from(&batch.calls);
+        self.steps_completed = step.index + 1;
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
             bucket,
@@ -1375,7 +1380,17 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 // reads them through its own products: the stream's order is what makes them
                 // readable, and the wait is the executor's on the runner's stream.
                 Ok(BatchOutput {
-                    calls: answered(&mut self.calls),
+                    calls: self
+                        .calls
+                        .drain(..)
+                        .map(|call| {
+                            let state = RowState {
+                                step_index: self.steps_completed,
+                                ..RowState::default()
+                            };
+                            CallOutput::completed(call, Vec::new(), state)
+                        })
+                        .collect(),
                     timing: TimingCounters {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()
