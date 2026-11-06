@@ -272,13 +272,13 @@ impl Conv {
                 args.out.shape.dim(1) / u64::from(descriptor.geometry.groups),
             ),
         };
-        let kernel = descriptor.geometry.kernel;
+        let taps = descriptor.geometry.kernel;
         let filter = [
             first,
             second,
-            u64::from(kernel[0]),
-            u64::from(kernel[1]),
-            u64::from(kernel[2]),
+            u64::from(taps[0]),
+            u64::from(taps[1]),
+            u64::from(taps[2]),
         ];
         args.weight
             .require_shape(operator, Shape::new(&filter[..rank + 2]))?;
