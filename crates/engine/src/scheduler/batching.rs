@@ -915,7 +915,7 @@ impl Scheduler {
             requests.push(executor::batch::StagedRequest {
                 request: call.request_key,
                 conditioning: state.request.conditioning.clone(),
-                step: state.denoising.completed(),
+                step: self.step_of(call.request_key.request_id, call.call_id, state),
                 steps: state.denoising.steps(),
                 seed: state.request.sampling.seed,
                 width: state.request.sampling.width,
@@ -925,6 +925,24 @@ impl Scheduler {
         }
         batch.media = Some(executor::batch::MediaColumns::staged(stated, &requests));
         batch.columns = prompts;
+    }
+
+    /// The step a request's call covers: the steps its trajectory has completed and the denoising
+    /// calls submitted before this one.
+    ///
+    /// A request's steps are scheduled ahead of their results, so what has completed is behind what
+    /// a call in the pipeline runs: two calls stating the completed count would run one step twice.
+    fn step_of(&self, id: RequestId, call_id: CallId, state: &MediaFlowState) -> u32 {
+        let ahead = self
+            .inflight
+            .pending_calls
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .take_while(|pending| pending.call.call_id != call_id)
+            .filter(|pending| pending.call.kind == CallKind::Media(ipc::MediaCall::Denoising))
+            .count();
+        state.denoising.completed() + ahead as u32
     }
 
     /// The token columns of a text encoding batch: each request's prompt, packed, one row per request.
