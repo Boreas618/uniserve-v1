@@ -25,6 +25,7 @@ version = "3.7.1"
 
 [module]
 form = "cubin"
+metadata = "metadata.json"
 
 [source]
 kind = "triton"
@@ -42,6 +43,7 @@ fn package(directory: &Path) -> std::path::PathBuf {
     std::fs::write(directory.join("package.toml"), MANIFEST).unwrap();
     std::fs::write(directory.join("src/rms.py"), b"# the kernel\n").unwrap();
     std::fs::write(directory.join("src/compile.py"), b"# the driver\n").unwrap();
+    std::fs::write(directory.join("metadata.json"), b"{\"name\": \"rms_norm\"}\n").unwrap();
     directory.to_path_buf()
 }
 
