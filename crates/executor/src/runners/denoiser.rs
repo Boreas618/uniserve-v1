@@ -901,10 +901,21 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             // because a graph replays once per *step* while this runs once per *request* - a
             // refinement inside the captured graph would compound over the schedule, and `text` is
             // written in place.
+            if let Some(source) = cond.source {
+                self.dump("conditioner", "source", source);
+            }
             self.model.prepare_conditioning(&forward, cond)?;
+            self.dump("conditioner", "text", cond.text);
             self.model.prepare_latents(&forward, cond, latents)?;
         }
         Ok(())
+    }
+
+    /// Writes one named tensor of the block-by-block diagnosis, when a directory is named.
+    fn dump(&self, block: &str, name: &str, view: TensorView) {
+        if self.diag.enabled() {
+            let _ = self.diag.write(self.device, &self.stream, block, name, view);
+        }
     }
 
     /// Publishes each pending row's trajectory as this runner's columns hold it.
