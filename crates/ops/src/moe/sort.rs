@@ -94,6 +94,10 @@ pub struct SortArgs {
     pub expanded_to_permuted: TensorView,
     /// `[max_permuted_rows]` i32: expanded route of each permuted row.
     pub permuted_to_expanded: TensorView,
+    /// `[max_permuted_rows]` i32: the token row each permuted row gathers, and `-1` on a tile's
+    /// padding. It is the expanded route over `top`, written beside it, because a product that
+    /// gathers its own rows indexes the token-major activations and takes no `top` to divide by.
+    pub permuted_to_token: TensorView,
     /// `[1]` i32: padded **permuted** rows the GEMMs must cover.
     ///
     /// This is the tail of an expert's last tile, and it is not the same subject as a token row a batch
@@ -155,11 +159,12 @@ pub struct Call {
     pub scales_dtype: i64,
     pub error: [u8; 512],
     pub live_tokens: *const i32,
+    pub permuted_to_token: *mut i32,
 }
 
 /// The size and field offsets the package's header must mirror, in bytes.
 pub const SORT_CALL_LAYOUT: CallLayout = CallLayout {
-    size: 640,
+    size: 648,
     ids: 0,
     scales: 8,
     tile_to_expert: 16,
@@ -177,6 +182,7 @@ pub const SORT_CALL_LAYOUT: CallLayout = CallLayout {
     scales_dtype: 112,
     error: 120,
     live_tokens: 632,
+    permuted_to_token: 640,
 };
 
 /// The layout of [`Call`], for the header's mirror and its test.
@@ -200,6 +206,7 @@ pub struct CallLayout {
     pub scales_dtype: usize,
     pub error: usize,
     pub live_tokens: usize,
+    pub permuted_to_token: usize,
 }
 
 const _: () = assert!(
@@ -217,6 +224,10 @@ const _: () = assert!(
 const _: () = assert!(
     std::mem::offset_of!(Call, live_tokens) == SORT_CALL_LAYOUT.live_tokens,
     "the moe_sort call structure's live count moved without its header"
+);
+const _: () = assert!(
+    std::mem::offset_of!(Call, permuted_to_token) == SORT_CALL_LAYOUT.permuted_to_token,
+    "the moe_sort call structure's token map moved without its header"
 );
 const _: () = assert!(
     std::mem::offset_of!(Call, error) == SORT_CALL_LAYOUT.error,
@@ -287,6 +298,8 @@ impl Op for MoeSort {
         super::require_i32_vector(Self::NAME, &args.expanded_to_permuted)?;
         args.permuted_to_expanded
             .require_shape(Self::NAME, Shape::new(&[permuted]))?;
+        args.permuted_to_token
+            .require_shape(Self::NAME, Shape::new(&[permuted]))?;
         args.total_padded_tokens
             .require_shape(Self::NAME, Shape::new(&[1]))?;
         args.num_non_exiting_tiles
@@ -298,6 +311,7 @@ impl Op for MoeSort {
         for view in [
             &args.expanded_to_permuted,
             &args.permuted_to_expanded,
+            &args.permuted_to_token,
             &args.total_padded_tokens,
             &args.num_non_exiting_tiles,
         ] {
@@ -338,6 +352,7 @@ impl Op for MoeSort {
             live_tokens: args.live_tokens.map_or(std::ptr::null(), |view| {
                 address(view.ptr) as usize as *const i32
             }),
+            permuted_to_token: address(args.permuted_to_token.ptr) as usize as *mut i32,
         };
         // SAFETY: `Call` is the call structure this package's entry declares, and its layout is
         // pinned by the assertions above and by the test below.
@@ -351,6 +366,7 @@ impl Op for MoeSort {
             tile_to_limit: twins.shadow_of(args.tile_to_limit),
             expanded_to_permuted: twins.shadow_of(args.expanded_to_permuted),
             permuted_to_expanded: twins.shadow_of(args.permuted_to_expanded),
+            permuted_to_token: twins.shadow_of(args.permuted_to_token),
             total_padded_tokens: twins.shadow_of(args.total_padded_tokens),
             num_non_exiting_tiles: twins.shadow_of(args.num_non_exiting_tiles),
             ..args
@@ -464,6 +480,7 @@ mod tests {
                 ("scales_dtype", layout.scales_dtype),
                 ("error", layout.error),
                 ("live_tokens", layout.live_tokens),
+                ("permuted_to_token", layout.permuted_to_token),
             ],
             layout.size,
         );
