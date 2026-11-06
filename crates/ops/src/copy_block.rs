@@ -41,6 +41,9 @@ pub const COPY: u32 = 1024;
 /// The rank of every block this operator moves.
 pub const RANK: usize = 4;
 
+/// What a wide copy's module states of its launch words: each is a multiple of this.
+const WIDE_ALIGNMENT: u64 = 16;
+
 /// One compilation of `copy_block`.
 ///
 /// The two element types are in the key even though a copy moves bits between views of one type: a
@@ -52,6 +55,9 @@ pub struct Descriptor {
     pub source: DType,
     /// Element type of the destination view.
     pub out: DType,
+    /// Whether the block's rows are unit-stride and aligned on both sides, which compiles the copy
+    /// to whole vectors. The launch refuses a block that is not.
+    pub wide: bool,
 }
 
 impl fmt::Display for Descriptor {
@@ -59,6 +65,7 @@ impl fmt::Display for Descriptor {
         Key::new()
             .field("source", self.source)
             .field("out", self.out)
+            .field("wide", self.wide)
             .finish(formatter)
     }
 }
@@ -167,6 +174,28 @@ impl Op for CopyBlock {
         ];
         check_strides(Self::NAME, &source_strides, &extents)?;
         check_strides(Self::NAME, args.out_strides, &extents)?;
+        if descriptor.wide {
+            let aligned = |value: u64| value.is_multiple_of(WIDE_ALIGNMENT);
+            let leading = source_strides[..RANK - 1]
+                .iter()
+                .chain(&args.out_strides[..RANK - 1])
+                .all(|stride| aligned(*stride as u64));
+            if source_strides[RANK - 1] != 1
+                || args.out_strides[RANK - 1] != 1
+                || !leading
+                || !aligned(extents[RANK - 1])
+                || !aligned(args.source.ptr.address())
+                || !aligned(args.out.ptr.address())
+            {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "a wide copy moves unit-stride rows of whole {WIDE_ALIGNMENT}-element runs \
+                         between {WIDE_ALIGNMENT}-byte addresses"
+                    ),
+                ));
+            }
+        }
 
         let mut arguments = Arguments::new();
         arguments.view(args.source).view(args.out);
@@ -234,20 +263,26 @@ mod tests {
         let plain = Descriptor {
             source: DType::BF16,
             out: DType::BF16,
+            wide: false,
         };
-        assert_eq!(crate::descriptor::key(&plain), "source_bf16_out_bf16");
+        assert_eq!(
+            crate::descriptor::key(&plain),
+            "source_bf16_out_bf16_wide_false"
+        );
         assert_ne!(
             crate::descriptor::key(&plain),
             crate::descriptor::key(&Descriptor {
                 source: DType::F32,
-                out: DType::F32
+                out: DType::F32,
+                wide: false,
             })
         );
         assert_ne!(
             crate::descriptor::key(&plain),
             crate::descriptor::key(&Descriptor {
                 source: DType::BF16,
-                out: DType::F32
+                out: DType::F32,
+                wide: false,
             })
         );
     }

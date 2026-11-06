@@ -29,8 +29,8 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
-# `source_bf16_out_bf16`.
+# `source_bf16_out_bf16_wide_false`.
 [kernel.descriptors]
-dimensions = { source = ["bf16", "f16", "f32"], out = ["bf16", "f16", "f32"] }
+dimensions = { source = ["bf16", "f16", "f32"], out = ["bf16", "f16", "f32"], wide = ["false", "true"] }
 
 [parameters]

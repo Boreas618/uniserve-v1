@@ -1466,6 +1466,7 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
             ops::copy_block::Descriptor {
                 source: dtype,
                 out: dtype,
+                wide: false,
             }
             .to_string(),
         );

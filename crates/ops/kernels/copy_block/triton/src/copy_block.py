@@ -45,6 +45,7 @@ def _copy_block_kernel(
     block,
     pdl,
     BLOCK: tl.constexpr,
+    WIDE: tl.constexpr,
 ):
     """One element a lane, addressed through both sides' strides.
 
@@ -74,8 +75,14 @@ def _copy_block_kernel(
         c0 = rest // e1
         source_row = c0 * s0 + c1 * s1 + c2 * s2
         out_row = c0 * d0 + c1 * d1 + c2 * d2
-        value = tl.load(source_ptr + source_row + lanes * s3, mask=inside, other=0)
-        tl.store(out_ptr + out_row + lanes * d3, value, mask=inside)
+        # A wide block's rows are unit-stride and aligned on both sides, which the module states, so
+        # the compiler moves whole vectors instead of one element a lane.
+        if WIDE:
+            value = tl.load(source_ptr + source_row + lanes, mask=inside, other=0)
+            tl.store(out_ptr + out_row + lanes, value, mask=inside)
+        else:
+            value = tl.load(source_ptr + source_row + lanes * s3, mask=inside, other=0)
+            tl.store(out_ptr + out_row + lanes * d3, value, mask=inside)
         return
 
     index = program * BLOCK + tl.arange(0, BLOCK).to(tl.int64)

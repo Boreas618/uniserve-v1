@@ -21,6 +21,7 @@ def spec(fields, parameters, target):
     """The compilation of one copy_block descriptor."""
     source = DTYPES[fields["source"]]
     out = DTYPES[fields["out"]]
+    wide = fields["wide"] == "true"
     return {
         "kernel": kernels._copy_block_kernel,
         "signature": {
@@ -42,11 +43,16 @@ def spec(fields, parameters, target):
             "block": "u32",
             "pdl": "i32",
             "BLOCK": "constexpr",
+            "WIDE": "constexpr",
         },
         # The block is the operator's own constant; the descriptor does not carry it, so the key is
         # the two element types and a change of block is a change of this file.
-        "constexprs": {"BLOCK": 1024},
+        "constexprs": {"BLOCK": 1024, "WIDE": wide},
         "options": {"num_warps": 4, "launch_pdl": False},
+        # A wide copy's launch refuses anything else: `Op::launch` checks the same words.
+        "aligned": ["source_ptr", "out_ptr", "e3", "s0", "s1", "s2", "d0", "d1", "d2"]
+        if wide
+        else [],
     }
 
 

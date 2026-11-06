@@ -45,7 +45,34 @@ impl CopyBlock {
         copy_block::Descriptor {
             source: dtype,
             out: dtype,
+            wide: false,
         }
+    }
+
+    /// The descriptor of a copy whose rows are unit-stride and aligned on both sides.
+    pub fn wide_descriptor_of(dtype: ops::DType) -> copy_block::Descriptor {
+        copy_block::Descriptor {
+            wide: true,
+            ..Self::descriptor_of(dtype)
+        }
+    }
+
+    /// [`Self::forward`] for a block whose rows are unit-stride and aligned on both sides.
+    pub fn forward_wide(
+        &self,
+        f: &Forward,
+        source: TensorView,
+        destination: TensorView,
+        destination_strides: &[i64; RANK],
+    ) -> Result<()> {
+        f.operate::<CopyBlockOp>(
+            &Self::wide_descriptor_of(self.dtype),
+            copy_block::Args {
+                source,
+                out: destination,
+                out_strides: destination_strides,
+            },
+        )
     }
 
     pub fn forward(
