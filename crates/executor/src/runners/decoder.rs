@@ -1236,7 +1236,7 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
         let generation = self.lifecycle.generation.number();
         let mut jobs = Vec::new();
         for bucket in self.capture_order() {
-            if self.lifecycle.graphs.captured(bucket, generation).is_none() {
+            if self.lifecycle.graphs.captured_for(bucket, generation).is_none() {
                 jobs.push(Job::Capture {
                     runner: self.id,
                     bucket,
@@ -1643,6 +1643,8 @@ mod tests {
     /// compute, and the shape whose refusal is a fact about the batch rather than about a runner.
     fn no_computation() -> Batch {
         Batch {
+            page_loads: Vec::new(),
+            page_offloads: Vec::new(),
             id: crate::batch::BatchId(1),
             phase: ipc::PhaseId(0),
             calls: Vec::new(),
