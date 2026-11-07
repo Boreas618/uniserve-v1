@@ -100,11 +100,9 @@ impl Scheduler {
                 });
                 return;
             }
-            // A lost group is replaced before its loss is reported, by its
-            // standby, or later by its failure domain's relaunch, and its
-            // requests wait for it meanwhile. Keep independent workers
-            // usable, but an expert-only group cannot serve requests once
-            // every model worker has closed.
+            // A lost group may be replaced, and its requests wait for it
+            // meanwhile. Keep independent groups usable, but an expert-only
+            // group cannot serve requests once every model group has closed.
             if !self
                 .executor
                 .info()
@@ -383,7 +381,7 @@ impl Scheduler {
         // its generated tokens leaves as migratable once its in-flight calls
         // drain, after every token it generated, unless the worker refused it
         // or it already finishes; the daemon submits it again, and it waits
-        // for the relaunched workers. Any other token request emits an error
+        // for the group's replacement. Any other token request emits an error
         // unless an error finish is already pending, and defers an error
         // finish until its in-flight calls drain.
         let engine_id = self.engine_id;

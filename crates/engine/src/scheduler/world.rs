@@ -23,12 +23,10 @@
 //!   prefixes, and allocates the lent ones as its own.
 //! - **Resume** (the parked world, at a rollback): it admits and executes
 //!   again, with the index it parked with, and allocates the units it lent
-//!   once the world on trial writes none of them any more (its processes
-//!   are gone).
-//! - **Commit** (the successor, once the predecessor is gone): its workers
-//!   take the segments they mapped read-only (`uniserve.take_cache`), its
-//!   pool allocates the inherited units, and its worker groups relaunch on
-//!   a loss and keep their standbys from then on.
+//!   once the world on trial writes none of them any more.
+//! - **Commit** (the successor, once the predecessor is gone): its executors
+//!   take the segments they mapped read-only (`uniserve.take_cache`), and its
+//!   pool allocates the inherited units.
 //!
 //! Until its commit a successor is on trial: a worker fault or non-finite
 //! logits fail it as a whole rather than being repaired, and its requests
@@ -495,10 +493,9 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Commits a successor scheduler: its workers take the predecessor's
-    /// segments they mapped read-only, its pool allocates their units, and
-    /// its worker groups relaunch on a loss from then on. Returns what each
-    /// worker reported.
+    /// Commits a successor scheduler: its executors take the predecessor's
+    /// segments they mapped read-only, and its pool allocates their units.
+    /// Returns what each executor reported.
     pub(super) fn commit(&mut self) -> Result<Vec<String>, String> {
         let closing = std::mem::replace(&mut self.closing, true);
         while !(self.inflight.pending_batches.is_empty()

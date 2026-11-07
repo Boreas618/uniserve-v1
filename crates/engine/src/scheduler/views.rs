@@ -756,8 +756,8 @@ fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u3
             u32::try_from(state.req.readout.len()).unwrap_or(u32::MAX)
         }
         // A canvas step spends a whole canvas of a step's token budget, the
-        // same bound the deployment's launch was checked against: it denoises
-        // text tokens on the worker's canvas, not an image of the request's
+        // same bound the deployment was checked against: it denoises text
+        // tokens on the executor's canvas, not an image of the request's
         // latent raster, so it is charged neither the image's latent units nor
         // its guidance branches.
         Some(CallKind::Forward(ForwardMode::TokenDenoising))
@@ -1296,8 +1296,8 @@ pub(crate) fn call(
     (!candidates.is_empty()).then(|| (call_view(request, kind), candidates))
 }
 
-/// One entry per worker the world reports, in the order `ExecutorGroup::spawn_all`
-/// returned them — the same length and order as the control thread's
+/// One entry per pool the world reports, in the order it states them — the
+/// same length and order as the control thread's
 /// `routing.slots`, so an index into this list and an index into that one name
 /// the same rank. The two are built on different threads and carry different
 /// fields (a rank's in-flight count and liveness exist only on the control

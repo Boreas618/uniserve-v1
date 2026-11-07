@@ -1,20 +1,20 @@
-//! Scheduling, KV cache management, executor execution and request control.
+//! Scheduling, KV cache management and request control of a node's main
+//! process (`uniserve engine`).
 //!
-//! The crate is the engine process (`uniserve engine`): it serves the request
-//! interface to the leader's daemon (`service`) and drives the executor
-//! processes.
-//! A deployment runs one scheduler per DP rank: `SchedulerHandle` (`core`)
-//! launches the executor processes, or takes a supplied executor, and runs the
-//! `Scheduler` (`scheduler`) on a thread of its own. Frontends submit and
-//! control requests through the handle and receive each request's events on
-//! its `EventRx` (`handle`). On its thread, the `Scheduler` admits requests,
-//! assigns cache pages (`kv_cache`) and other executor storage (`allocation`),
-//! and submits calls through the `Executor` trait (`executor`);
-//! `Dispatcher` (`executor`) splits each batch into per-executor submissions
-//! to the executor processes.
+//! A deployment runs one scheduler per DP rank: a main process builds a
+//! `SchedulerHandle` (`core`) over the devices it holds and runs the
+//! `Scheduler` (`scheduler`) on a thread of its own. The process's control
+//! thread submits and controls requests through the handle and receives each
+//! request's events on its `EventRx` (`handle`). On its thread, the
+//! `Scheduler` admits requests, assigns cache pages (`kv_cache`) and other
+//! storage (`allocation`), and submits batches through `Submissions`
+//! (`scheduler`) to the executor crate's `Batches`.
 //!
 //! The `testing` feature additionally exports `SimExecutor`, `SimEngine`, and
-//! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests.
+//! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests,
+//! which plugs in through the `Executor` trait, and `serve_requests`
+//! (`service`), which serves the request interface over simulated schedulers
+//! for the daemon's tests.
 
 /// Scheduler-owned allocation of executor storage; only its `OutOfStorage`
 /// error is public.
@@ -27,34 +27,33 @@ mod executor;
 mod handle;
 mod host_tier;
 mod kv_cache;
-pub mod launches;
-mod process_link;
 mod scheduler;
+#[cfg(feature = "testing")]
 mod service;
 #[cfg(feature = "testing")]
 mod sim;
 mod spec;
 mod trajectories;
 mod warmup;
-mod executors;
 
 pub use crate::core::{
     EngineConfig, RankFacts, SchedulerHandle, ExecutorGroupConfig, ExecutorGroupRole, ExecutorRank,
 };
 pub use crate::deployment::Deployment;
+#[cfg(feature = "testing")]
+pub use crate::executor::{BatchResult, CallResult, Executor};
 pub use crate::executor::{
-    BatchResult, CallResult, CommandOutcome, ComponentConfig, ComponentDistribution,
-    ExecutionBatch, Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError, PageOffloads,
+    CommandOutcome, CommandResult, ComponentConfig, ComponentDistribution, ExecutionBatch,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, PageOffloads,
     ParallelConfig, PoolPlacement, RankBuffer, RankEncoderPools, RequestPlacement,
     SequenceParallel, TransferBackend, TransferConfig, TransferConfigError, TransferEdge,
-    ExecuteError, ExecutorFailure, ExecutorGroupId, ExecutorResult,
+    ExecuteError, ExecutorFailure, ExecutorGroupId,
 };
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
     EventSendError, EventTx, HookBarrier, PolicyPrograms, PolicySlotHandle, RankBudgets,
     StageApplied, StreamCancelCause, Submission, SubmitError, Successor, Wake, WeightsInFlight,
 };
-pub use crate::process_link::ProcessLink;
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
 pub use crate::kv_cache::{HostCacheSize, IndexedPage};
@@ -73,7 +72,8 @@ pub use crate::scheduler::{
     SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
     PhaseKind, Validators, WorkerStats, arrival_view, ceilings_of, phase_id,
 };
-pub use crate::service::{EpochPolicy, continuation_slot, run_engine, serve_requests};
+#[cfg(feature = "testing")]
+pub use crate::service::{EpochPolicy, serve_requests};
 // The simulated engine is test support: `mod sim` is built only with the
 // `testing` feature, so its surface is exported only with it. A production
 // build that exported these would not compile - the module they come from is
@@ -82,10 +82,6 @@ pub use crate::service::{EpochPolicy, continuation_slot, run_engine, serve_reque
 pub use crate::sim::{
     BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,
     sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
-};
-pub use crate::executors::{
-    BatchSubmitError, CallReaders, ExpertParallelPlacement, Dispatcher, ExecutorGroup,
-    ExecutorProcessArgs,
 };
 pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo, VideoTaskInfo};
 /// Serializable scheduler, cache, and executor performance snapshots.

@@ -1,10 +1,10 @@
 //! GPU-free executor for scheduler and frontend behavior.
 //!
 //! [`SimExecutor`] implements the `Executor` trait the scheduler drives, over
-//! a background thread that runs a [`SimEngine`]. It consumes the same typed
-//! admissions, lifecycle commands, and calls as `Dispatcher`, bounds the
-//! batches in flight by a queue depth, and tracks admitted requests and live
-//! products for `command_has_capacity`.
+//! a background thread that runs a [`SimEngine`]. It consumes the scheduler's
+//! typed admissions, lifecycle commands, and calls, bounds the batches in
+//! flight by a queue depth, and tracks admitted requests and live products for
+//! `command_has_capacity`.
 //!
 //! [`SimEngine`] keeps the per-request progress an executor tracks:
 //! positions, cache extent, denoising step, and predicate values. It enforces
@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use crate::CommandWaker;
 use crate::executor::{
-    BatchResult, ComponentConfig, ExecutionBatch, Executor, ExecutorInfo, ExecutorSubmitError,
-    PoolPlacement, ExecutorFailure, ExecutorGroupId, logical_result,
+    BatchResult, CallResult, CommandOutcome, CommandResult, ComponentConfig, ExecutionBatch,
+    Executor, ExecutorFailure, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, PoolPlacement,
 };
 use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
@@ -37,17 +37,85 @@ use ipc::{
 use ipc::{ImageParams, RequestId, SamplingParams, TokenLogprob};
 
 const DEFAULT_TEXT_LEN: usize = 8;
+/// The scheduler-facing result of one whole batch: its completions, each with
+/// its media claimed, and one `Applied` receipt per lifecycle command, numbered
+/// with `Start` admissions skipped.
+///
+/// A completion's media is claimed before anything else reads it, and a failure
+/// to claim it belongs to the call: the batch's other results stay usable.
+fn batch_result(report: ipc::BatchOutput, commands: &[ipc::BatchCommand]) -> BatchResult {
+    let results = report
+        .completions
+        .into_iter()
+        .map(|mut output| {
+            let media = output
+                .media_output
+                .take()
+                .map(|media| {
+                    let ipc::ArtifactHandle::PosixShm { name } = media.handle;
+                    // SAFETY: export transfers immutable storage after the writer closes.
+                    // The mapping owns the bytes even if this result is rejected downstream.
+                    unsafe { ipc::SharedMedia::open(&name, media.bytes) }.map(Arc::new)
+                })
+                .transpose();
+            CallResult { output, media }
+        })
+        .collect();
+    BatchResult {
+        batch_id: report.batch_id,
+        results,
+        command_results: commands
+            .iter()
+            .filter(|command| !matches!(command, ipc::BatchCommand::Start { .. }))
+            .enumerate()
+            .map(|(index, command)| CommandResult {
+                command_index: index as u32,
+                request_key: command.request_key(),
+                outcome: CommandOutcome::Applied,
+            })
+            .collect(),
+        done: true,
+        worker_exec_us: report.worker_exec_us.into_iter().collect(),
+        forward_stats: report.forward_stats.into_iter().collect(),
+    }
+}
+
+/// The failure a stall report amounts to, naming the forward the job belongs
+/// to and the calls it held.
+fn stall_failure(stall: &ipc::Stall) -> anyhow::Error {
+    let calls = stall
+        .calls
+        .iter()
+        .map(|call| format!("{}/{:?}", call.request_key.request_id.0, call.call_id))
+        .collect::<Vec<_>>();
+    let forward = match stall.batch_id {
+        Some(batch_id) => format!(
+            "a job of batch {batch_id} ({}, method {}, calls [{}])",
+            stall.route.as_deref().unwrap_or("no calls"),
+            stall.method.as_deref().unwrap_or("none"),
+            calls.join(", "),
+        ),
+        None => format!(
+            "a job of no batch (method {})",
+            stall.method.as_deref().unwrap_or("none")
+        ),
+    };
+    anyhow::anyhow!(
+        "the builder thread stalled: it has performed {forward} for {:.1} s without completing it",
+        Duration::from_millis(stall.running_ms).as_secs_f64()
+    )
+}
+
 /// Default EOS id the simulator samples after `text_len` tokens.
 /// `EngineConfig::sim` configures the same id so the scheduler finishes
 /// simulated requests.
 const FAKE_EOS_TOKEN: u32 = 151_645;
 const SYNTH_VOCAB_SIZE: usize = FAKE_EOS_TOKEN as usize + 1;
-/// The longest sequence the simulated pool was launched for: the model's
-/// context length, which a real rank reads from its launch arguments'
-/// `max_model_len` and which the attention descriptor bounds every row by.
+/// The longest sequence the simulated pool serves: the model's context length,
+/// which the attention descriptor bounds every row by.
 ///
-/// A world states it as the pool's own launch fact, so the mechanism shapes a
-/// KV view from a number the pool declares and not from a guess: batches are
+/// A world states it as the pool's own fact, so the mechanism shapes a KV view
+/// from a number the pool declares and not from a guess: batches are
 /// refused when it is zero, exactly as a deployment that never states its
 /// model's length is refused.
 const SIM_MAX_MODEL_LEN: u32 = 32_768;
@@ -62,22 +130,20 @@ enum Job {
 }
 
 /// Runs the deterministic model simulator on a bounded asynchronous executor seam.
-/// Reports a simulated deployment's executor group lost, the way a dead launch
-/// does: the group closes, and the executor answers its next poll with the
-/// loss instead of a result.
+/// Reports a simulated deployment's executor group lost: the group closes, and
+/// the executor answers its next poll with the loss instead of a result.
 ///
-/// A real launch that cannot be replaced closes its group, and the scheduler
-/// stops when every model group is closed. Without this a simulated executor's
-/// executors never die, so no in-process case could state what happens when they
-/// all do.
+/// The scheduler stops when every model group is closed. Without this a
+/// simulated executor's executors never die, so no case could state what
+/// happens when they all do.
 #[derive(Clone, Default)]
 pub struct SimLoss {
     /// The group reported lost: it stays lost for the executor's lifetime, so
     /// it reports not ready after the report has been answered.
     group: Arc<Mutex<Option<ExecutorGroupId>>>,
-    /// Whether the lost group is closed as well as lost: a launch that cannot
-    /// be replaced closes its group, while one whose replacement is starting
-    /// is not ready but not closed.
+    /// Whether the lost group is closed as well as lost: a group that cannot
+    /// be replaced closes, while one whose replacement is starting is not
+    /// ready but not closed.
     closed: Arc<Mutex<bool>>,
     /// The report the executor's next poll answers with, taken once: the
     /// group, why it failed, and the requests whose work is gone.
@@ -124,8 +190,8 @@ impl SimLoss {
 
     /// Reports `group` failed by the stall `stall` names, as a rank whose
     /// builder thread stayed inside one job reports it: the executor's next
-    /// poll answers with the same failure a launch reports, naming the forward
-    /// the job belongs to and the requests whose calls it held.
+    /// poll answers with that failure, naming the forward the job belongs to
+    /// and the requests whose calls it held.
     ///
     /// # Panics
     ///
@@ -154,7 +220,7 @@ impl SimLoss {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *pending = Some((
                 group,
-                crate::executors::stall_failure(stall).to_string(),
+                stall_failure(stall).to_string(),
                 requests,
             ));
         }
@@ -289,7 +355,7 @@ pub enum BatchEvent {
 
 impl SimExecutor {
     /// Starts an asynchronous simulator that admits as many batches in
-    /// flight as the pool's launched queue depth.
+    /// flight as the pool's queue depth.
     ///
     /// # Panics
     ///
@@ -323,14 +389,7 @@ impl SimExecutor {
                         Job::Batch(batch) => {
                             let commands = batch.commands.clone();
                             let result = engine.execute(batch).map(|report| {
-                                (
-                                    logical_result(
-                                        crate::executor::ExecutorResult::receive(report),
-                                        true,
-                                        &commands,
-                                    ),
-                                    commands,
-                                )
+                                (batch_result(report, &commands), commands)
                             });
                             if results_tx.send(result).is_err() {
                                 break;
@@ -352,9 +411,9 @@ impl SimExecutor {
                         .iter()
                         .map(|group| (group.clone(), placement.clone()))
                         .collect(),
-                    // The pool's own launch fact, as `Dispatcher` reads it
-                    // from the ranks' launch arguments: the mechanism shapes a
-                    // KV view to it, and refuses to shape one without it.
+                    // The pool's own fact, as an inventory states it: the
+                    // mechanism shapes a KV view to it, and refuses to shape
+                    // one without it.
                     max_model_len,
                     rank_latents: if latent_pools.is_empty() {
                         BTreeMap::new()
@@ -488,9 +547,9 @@ impl SimExecutor {
         self.loss.clone()
     }
 
-    /// The failure a result's failed calls amount to, as `Dispatcher`
-    /// reports it: their requests, the buffers those calls would have
-    /// produced, and the reason of each request the simulated model refused.
+    /// The failure a result's failed calls amount to: their requests, the
+    /// buffers those calls would have produced, and the reason of each request
+    /// the simulated model refused.
     /// `None` when every call of the result succeeded.
     fn call_failure(&self, result: &BatchResult) -> Option<ExecutorFailure> {
         let failed = || {
@@ -693,7 +752,7 @@ impl Executor for SimExecutor {
                 continue;
             }
             // Receipts number lifecycle commands with `Start` admissions
-            // skipped, as `logical_result` assigns them.
+            // skipped, as `batch_result` assigns them.
             let command = commands
                 .iter()
                 .filter(|command| !matches!(command, ipc::BatchCommand::Start { .. }))
@@ -1150,14 +1209,12 @@ impl SimSpeculation {
 
 pub struct SimEngine {
     info: MainProcessInfo,
-    /// What the simulated pool is launched with: its queue depth and its
-    /// components' placement, which `SimExecutor` states to the scheduler as
-    /// the engine's own launch, as `Dispatcher` does.
+    /// How the simulated pool is placed: its queue depth and its components'
+    /// placement, which `SimExecutor` states to the scheduler.
     placement: PoolPlacement,
-    /// The longest sequence the simulated pool was launched for: the model's
-    /// context length, which a real rank reads from its launch arguments
-    /// (`ExecutorProcessArgs::max_model_len`) and `SimExecutor` states to the
-    /// scheduler as `ExecutorInfo::max_model_len`.
+    /// The longest sequence the simulated pool serves: the model's context
+    /// length, which `SimExecutor` states to the scheduler as
+    /// `ExecutorInfo::max_model_len`.
     ///
     /// The mechanism bounds every attention row by it, so a pool that states
     /// none is refused rather than shaped to a bound nobody gave.
@@ -1172,8 +1229,7 @@ pub struct SimEngine {
     /// Readout candidate whose log-probability is reported as NaN, as a
     /// executor with a numerical defect reports it.
     non_finite_candidate: Option<u32>,
-    /// Block-diffusion sampling the simulated executor is launched with, as a
-    /// rank's launch configuration states it.
+    /// Block-diffusion sampling the simulated executor runs under.
     canvas_sampling: Option<ipc::CanvasSampling>,
     /// How the simulated executor speculates, when it runs a drafter.
     speculation: Option<SimSpeculation>,
@@ -1186,8 +1242,8 @@ pub struct SimEngine {
     /// The executor groups the simulated deployment runs: one named `sim` unless
     /// a test names more.
     ///
-    /// A deployment's groups are separate launches that serve different
-    /// components and fail independently, so a statement about one group
+    /// A deployment's groups serve different components and fail
+    /// independently, so a statement about one group
     /// failing while another serves needs more than one here.
     groups: Vec<ExecutorGroupId>,
     /// Releases for batches that skip a predicated call: such a batch returns
@@ -1343,8 +1399,8 @@ impl SimEngine {
     pub fn new() -> Self {
         // Unset fields, including the prefix cache, come from
         // `MainProcessInfo::default`. One latent page is the reserved sentinel
-        // page that `latent_capacity_units` excludes. The pool is launched
-        // with a queue depth of one and no placed components.
+        // page that `latent_capacity_units` excludes. The pool starts with a
+        // queue depth of one and no placed components.
         let info = MainProcessInfo {
             supported_calls: CallKind::ALL.to_vec(),
             latent_page_units: 64,
@@ -1388,7 +1444,7 @@ impl SimEngine {
         }
     }
 
-    /// The longest sequence this simulated pool was launched for: the number
+    /// The longest sequence this simulated pool serves: the number
     /// `SimExecutor` states as `ExecutorInfo::max_model_len`.
     pub const fn max_model_len(&self) -> u32 {
         self.max_model_len
@@ -2002,8 +2058,7 @@ impl SimEngine {
         }
     }
 
-    /// Sets the unresolved-batch capacity the pool is launched with, clamped
-    /// to at least one.
+    /// Sets the pool's unresolved-batch capacity, clamped to at least one.
     pub fn set_queue_depth(&mut self, depth: u32) {
         self.placement.queue_depth = (depth as usize).max(1);
     }
@@ -2020,8 +2075,8 @@ impl SimEngine {
             .collect();
     }
 
-    /// Places the pool's components, as a launch places an executor group's,
-    /// and launches the pool with the ranks they span.
+    /// Places the pool's components, as a deployment places an executor
+    /// group's, and gives the pool the ranks they span.
     pub fn place_components(&mut self, components: BTreeMap<String, ComponentConfig>) {
         self.placement.ranks = components
             .values()
@@ -2759,8 +2814,8 @@ mod tests {
         Bounds, CallId, DType, ForwardBatch, GenerationParams, RequestKey, ShapeBound, TensorRef,
     };
 
-    /// The pool states the longest sequence it was launched for, and
-    /// `SimExecutor` hands that number to the mechanism: a batch is shaped to
+    /// The pool states the longest sequence it serves, and `SimExecutor`
+    /// hands that number to the mechanism: a batch is shaped to
     /// a bound the pool declared, and a pool that declares none hands over a
     /// zero the mechanism refuses rather than a guessed bound.
     #[test]

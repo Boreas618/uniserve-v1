@@ -1,25 +1,24 @@
 //! The mechanism's one door to execution.
 //!
 //! The step submits a batch, waits for results, and asks what the pool can do;
-//! it does not know whether the batch goes to worker processes over the ipc
-//! channel or to the in-process device executor (design §2.4). This module is
-//! the door: every path of the mechanism that executes something comes through
-//! it, and the two arms differ only in what they ask.
+//! it does not know what runs the batch (design §2.4). This module is the door:
+//! every path of the mechanism that executes something comes through it.
 //!
-//! The worker-process arm speaks the ipc protocol. The in-process arm is
-//! `executor::Batches` (2.4, 4.4): the mechanism's own completion type is filled
-//! from `executor::batch::BatchOutput` there, and nothing of the wire is
-//! involved. The in-process path is `notes/sched/splice.md`'s splice: it lands
-//! first as a constructor (`over_batches`) that the main process may choose, and
-//! the worker-process arm goes when it serves a token end to end.
+//! A serving scheduler's door is `executor::Batches` (2.4, 4.4): the mechanism's
+//! own completion type is filled from `executor::batch::BatchOutput` there, and
+//! nothing of the wire is involved. A test supplies a simulated executor through
+//! the `Executor` trait instead; that arm is built only with the `testing`
+//! feature, so a serving build holds the first alone.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ExecutorGroupId;
+#[cfg(feature = "testing")]
+use crate::executor::Executor;
 use crate::executor::ExecutionBatch;
-use crate::executor::{Executor, ExecutorError, ExecutorInfo, ExecutorSubmitError};
+use crate::executor::{ExecutorError, ExecutorInfo, ExecutorSubmitError};
 use crate::scheduler::completion::BatchReport;
 use executor::batch::{
     Batch as DeviceBatch, BatchId as DeviceBatchId, Batches, CallId as DeviceCallId, Submission,
@@ -32,9 +31,9 @@ use ipc::BatchCommand;
 ///
 /// The step places calls on every path — a planned call, a media call, a
 /// request's first call, a prefill target — and none of that submits anything.
-/// Stating it as this trait is what lets one placement serve the worker-process
-/// executor and the in-process one: what differs between them is who answers,
-/// not what the step asks.
+/// Stating it as this trait is what lets one placement serve the in-process
+/// executor and a simulated one: what differs between them is who answers, not
+/// what the step asks.
 pub(super) trait World {
     /// The pools, their ranks and their capabilities.
     fn info(&self) -> &ExecutorInfo;
@@ -49,20 +48,19 @@ const REPORT_POLL: std::time::Duration = std::time::Duration::from_micros(50);
 /// What the mechanism executes through.
 ///
 /// Public because a scheduler is built with one: `Scheduler::new` takes a
-/// `Submissions`, and a deployment outside this crate chooses the arm it runs
-/// on — `new` over a launched executor, `over_batches` over its own devices.
+/// `Submissions`, made with `over_batches` over a process's own devices, or
+/// with `new` over a simulated executor.
 pub struct Submissions {
     path: Path,
 }
 
 /// Which executor serves this scheduler's batches.
 enum Path {
-    /// A main process's executors, over the ipc protocol.
-    MainProcess(Box<dyn Executor>),
+    /// An executor a test supplies.
+    #[cfg(feature = "testing")]
+    Supplied(Box<dyn Executor>),
     /// The device executor of this process (2.4). Boxed: the arm holds the
-    /// batch path, the waiting thread's two channels and the shadows, and a
-    /// scheduler built on the main-process path should not carry that much
-    /// unused room.
+    /// batch path, the waiting thread's two channels and the shadows.
     InProcess(Box<InProcess>),
 }
 
@@ -122,10 +120,16 @@ struct Pending {
     calls: Vec<(ipc::RequestKey, ipc::CallId)>,
 }
 
+#[cfg_attr(
+    not(feature = "testing"),
+    allow(unused_variables, reason = "the arms that read them are a supplied executor's")
+)]
 impl Submissions {
+    /// The mechanism over an executor a test supplies.
+    #[cfg(feature = "testing")]
     pub fn new(executor: Box<dyn Executor>) -> Self {
         Self {
-            path: Path::MainProcess(executor),
+            path: Path::Supplied(executor),
         }
     }
 
@@ -215,10 +219,10 @@ impl Submissions {
     /// The in-process arm parks on its results, so without this a command to an
     /// idle scheduler waits out the park's whole liveness bound: a request
     /// admitted that much later, and every stage of an update that much slower.
-    /// The worker-process arm's executor carries its own wake.
     pub fn waker(&self) -> crate::CommandWaker {
         match &self.path {
-            Path::MainProcess(_) => crate::CommandWaker::noop(),
+            #[cfg(feature = "testing")]
+            Path::Supplied(_) => crate::CommandWaker::noop(),
             Path::InProcess(arm) => {
                 let nudge = arm.nudge.clone();
                 crate::CommandWaker::new(move || {
@@ -233,23 +237,27 @@ impl Submissions {
     /// The scheduler calls this once per step, before it dispatches anything:
     /// every batch of one step runs on one world's kernels.
     pub(super) fn set_generation(&mut self, generation: u64) {
-        if let Path::InProcess(arm) = &mut self.path {
-            arm.generation = generation;
+        match &mut self.path {
+            #[cfg(feature = "testing")]
+            Path::Supplied(_) => {}
+            Path::InProcess(arm) => arm.generation = generation,
         }
     }
 
     /// The pool's capabilities: its workers, components, pools, and limits.
     pub(super) fn info(&self) -> &ExecutorInfo {
         match &self.path {
-            Path::MainProcess(executor) => executor.info(),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.info(),
             Path::InProcess(arm) => &arm.info,
         }
     }
 
-    /// Whether every worker of `worker` is ready to accept execution.
+    /// Whether every rank of the pool `worker` is ready to accept execution.
     pub(super) fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
         match &self.path {
-            Path::MainProcess(executor) => executor.is_ready(worker),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.is_ready(worker),
             // The arm serves the pools its inventory states and no others.
             Path::InProcess(arm) => arm.info.workers.iter().any(|(id, _)| id == worker),
         }
@@ -258,7 +266,8 @@ impl Submissions {
     /// Whether `worker` executes nothing further.
     pub(super) fn is_closed(&self, worker: &ExecutorGroupId) -> bool {
         match &self.path {
-            Path::MainProcess(executor) => executor.is_closed(worker),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.is_closed(worker),
             // A device of this process is closed when the process ends.
             Path::InProcess(_) => false,
         }
@@ -267,17 +276,19 @@ impl Submissions {
     /// Whether `worker` has an unclaimed destination submission slot.
     pub(super) fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
         match &self.path {
-            Path::MainProcess(executor) => executor.has_capacity(worker),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.has_capacity(worker),
             // `Batches::submit` queues on the device's own stream and never
             // refuses for capacity, so a stated pool always has room here.
             Path::InProcess(arm) => arm.info.workers.iter().any(|(id, _)| id == worker),
         }
     }
 
-    /// Whether `command` can be handed to a worker now.
+    /// Whether `command` can be handed to the pool now.
     pub(super) fn command_has_capacity(&self, command: &BatchCommand) -> bool {
         match &self.path {
-            Path::MainProcess(executor) => executor.command_has_capacity(command),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.command_has_capacity(command),
             // A lifecycle command travels inside the batch it belongs to.
             Path::InProcess(_) => true,
         }
@@ -286,7 +297,8 @@ impl Submissions {
     /// Submits one logical batch without blocking for capacity.
     pub(super) fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.submit(batch),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.submit(batch),
             Path::InProcess(arm) => arm.submit(batch),
         }
     }
@@ -297,27 +309,25 @@ impl Submissions {
     /// kernels were captured for and only the executor's own plan knows it: a bucket planned for
     /// one canvas serves no other, and deriving the extent in the mechanism would be a second
     /// statement of the runner's plan. `None` is the answer for a computation no device of this
-    /// rank serves, and for the worker-process arm, which serves media on its workers rather than
-    /// through the mechanism's own batch assembly.
+    /// rank serves, and for a supplied executor, which serves media without the mechanism's own
+    /// batch assembly.
     pub(super) fn media(
         &self,
         phase: ipc::PhaseId,
         computation: &executor::plan::Computation,
     ) -> Option<executor::plan::Bucket> {
         match &self.path {
-            Path::MainProcess(_) => None,
+            #[cfg(feature = "testing")]
+            Path::Supplied(_) => None,
             Path::InProcess(arm) => arm.batches.media(phase, computation).ok().flatten(),
         }
     }
 
-    /// Runs `batch`'s paired forwards without serving them (7.3 step 2).
+    /// Whether this door serves the devices of this process.
     ///
-    /// Whether a shadow batch can be submitted through this door.
-    ///
-    /// The in-process arm shadows its own devices; the worker processes shadow
-    /// on their workers, not through the mechanism's submit point, so a
-    /// worker-world epoch refuses the update's ask at command time rather than
-    /// accepting one nothing will run (7.3 step 2).
+    /// Only those shadow a batch: a scheduler over a supplied executor refuses
+    /// the update's ask at command time rather than accepting one nothing will
+    /// run (7.3 step 2).
     pub(super) fn serves_in_process(&self) -> bool {
         matches!(self.path, Path::InProcess(_))
     }
@@ -336,8 +346,9 @@ impl Submissions {
         generation: u64,
     ) -> Result<(), ExecutorSubmitError> {
         match &mut self.path {
-            Path::MainProcess(_) => Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
-                "a worker-process executor shadows a world on its workers, not through this door"
+            #[cfg(feature = "testing")]
+            Path::Supplied(_) => Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
+                "a supplied executor shadows nothing: only this process's devices do"
             ))),
             Path::InProcess(arm) => arm.shadow(batch, generation),
         }
@@ -345,12 +356,13 @@ impl Submissions {
 
     /// The state of the shadow submissions of the pass in flight (7.3 step 2).
     ///
-    /// The worker-process path shadows a world on its workers and submits no
-    /// shadow batch here, so a pass waiting on this arm cannot exist: `shadow`
-    /// refuses it at submission, and the pass is answered with that refusal.
+    /// A supplied executor submits no shadow batch, so a pass waiting on that
+    /// arm cannot exist: `shadow` refuses it at submission, and the pass is
+    /// answered with that refusal.
     pub(super) fn shadow_status(&mut self) -> ShadowStatus {
         match &mut self.path {
-            Path::MainProcess(_) => ShadowStatus::Settled,
+            #[cfg(feature = "testing")]
+            Path::Supplied(_) => ShadowStatus::Settled,
             Path::InProcess(arm) => arm.shadow_status(),
         }
     }
@@ -359,15 +371,17 @@ impl Submissions {
     /// mechanism's own completion type.
     pub(super) fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => Ok(executor.poll(timeout)?.map(BatchReport::from_wire)),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => Ok(executor.poll(timeout)?.map(BatchReport::from_wire)),
             Path::InProcess(arm) => arm.poll(timeout),
         }
     }
 
-    /// Closes the pool and its physical workers.
+    /// Closes the pool.
     pub(super) fn close(&mut self) -> Result<(), ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.close(),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.close(),
             // The devices of this process are its own: nothing outlives the call.
             Path::InProcess(_) => Ok(()),
         }
@@ -376,7 +390,8 @@ impl Submissions {
     /// The nodes that hold the deployment's storage.
     pub(super) fn storage_nodes(&self) -> BTreeMap<String, String> {
         match &self.path {
-            Path::MainProcess(executor) => executor.storage_nodes(),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.storage_nodes(),
             // This process's devices hold no deployment storage of their own;
             // the engine's host KV path is served by the storage server it
             // reaches itself.
@@ -384,27 +399,29 @@ impl Submissions {
         }
     }
 
-    /// Maps the host KV cache's page pools on every worker's ranks, each
+    /// Maps the host KV cache's page pools on every rank of the pool, each
     /// holding `tokens` tokens of every cache group.
     pub(super) fn map_host_cache(
         &mut self,
         tokens: u64,
     ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.map_host_cache(tokens),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.map_host_cache(tokens),
             // No rank of this process maps a host page pool, so the mechanism
             // plans no host KV write rather than one nothing answers.
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
 
-    /// Commits the pool's world: every worker takes the predecessor world's
-    /// storage it mapped read-only.
+    /// Commits the pool's world: it takes the predecessor world's storage it
+    /// mapped read-only.
     pub(super) fn commit(&mut self) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.commit(),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.commit(),
             // The world this process serves is the executor's own, committed
-            // when it was spawned; there is no worker to tell.
+            // when it was spawned.
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -412,7 +429,8 @@ impl Submissions {
     /// Publishes this world's immutable pages after its commit decision.
     pub(super) fn publish_world(&mut self) -> Result<(), ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.publish_world(),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.publish_world(),
             Path::InProcess(_) => Ok(()),
         }
     }
@@ -420,7 +438,8 @@ impl Submissions {
     /// Ends the storage of every world of `worlds` on the pool's nodes.
     pub(super) fn retire(&mut self, worlds: &[u64]) -> Result<(), ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.retire(worlds),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.retire(worlds),
             Path::InProcess(_) => Ok(()),
         }
     }
@@ -433,7 +452,8 @@ impl Submissions {
         cache_keys: &[Vec<u8>],
     ) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.keep_weights(worlds, to_host, cache_keys),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.keep_weights(worlds, to_host, cache_keys),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -441,7 +461,8 @@ impl Submissions {
     /// Halves, or restores when not `halve`, the deployment's link budgets.
     pub(super) fn throttle(&mut self, halve: bool) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.throttle(halve),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.throttle(halve),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -449,28 +470,31 @@ impl Submissions {
     /// The storage ledgers of the pool's nodes.
     pub(super) fn ledgers(&mut self) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.ledgers(),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.ledgers(),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
 
-    /// Runs the worker hook `name` on every worker while none runs a batch.
+    /// Runs the executor hook `name` on every rank while none runs a batch.
     pub(super) fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.hook(name, payload),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.hook(name, payload),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
 
-    /// Runs the worker hook `name`, answering each worker group with its
-    /// ranks' results.
+    /// Runs the executor hook `name`, answering each group with its ranks'
+    /// results.
     pub(super) fn hook_groups(
         &mut self,
         name: &str,
         payload: &str,
     ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.hook_groups(name, payload),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.hook_groups(name, payload),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -481,7 +505,8 @@ impl Submissions {
         order: &BTreeMap<String, Vec<u32>>,
     ) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
-            Path::MainProcess(executor) => executor.commit_experts(order),
+            #[cfg(feature = "testing")]
+            Path::Supplied(executor) => executor.commit_experts(order),
             // The expert allocation of a world this process serves is its own
             // setup's (7.6), applied where the world is built.
             Path::InProcess(_) => Ok(Vec::new()),
@@ -609,7 +634,7 @@ impl InProcess {
     /// it is checked against the columns before the batch leaves.
     ///
     /// The batch's lifecycle commands do not travel: `executor::Batch` has no
-    /// field for them, because the resources a worker-side command retires —
+    /// field for them, because the resources such a command retires —
     /// a request's row, its buffers, its pages — belong to this process's
     /// executor once it holds the columns. A batch that completes reports no
     /// command as failed, which the mechanism reads as its commands having

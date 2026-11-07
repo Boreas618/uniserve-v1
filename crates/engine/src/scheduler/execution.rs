@@ -39,7 +39,7 @@ mod projection;
 mod results;
 
 use super::*;
-use ipc::{BufferId, MediaCall};
+use ipc::BufferId;
 use scheduling::PolicyError;
 use scheduling::guest::{Plan, Room};
 
@@ -105,8 +105,8 @@ impl Scheduler {
             // requests they name once it is submitted: batches reach a rank in
             // submission order, so no later `Start` can name a row before the
             // worker has seen its close.
-            // The in-process arm has no worker process to tell: the rows and
-            // buffers a lifecycle command closes are this scheduler's own
+            // The in-process arm has nothing to tell: the rows and buffers a
+            // lifecycle command closes are this scheduler's own
             // pools, so the command is answered here, where it would have been
             // submitted. Its `Finish` and `Free` have nothing left to reach.
             if batch.requests.is_empty() && self.executor.serves_in_process() {
@@ -1207,22 +1207,6 @@ impl Scheduler {
             shape_bound: ShapeBound::default(),
         })
     }
-}
-
-/// The calls that read the products of an image generation call, or `None`
-/// for a call whose readers are the destinations of its transfer edges.
-///
-/// Image generation chains its state calls on one denoising component: text
-/// features feed latent preparation, which feeds the denoising steps.
-/// `ExecutorGroup::consumer_slots` reads this for a media call whose placement
-/// names no readers; a video request's calls name theirs from the request's
-/// graph (`plan_media_call`).
-pub(crate) fn generation_consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCall]> {
-    Some(match media_call {
-        MediaCall::TextEncoding => &[MediaCall::LatentPreparation],
-        MediaCall::LatentPreparation | MediaCall::Denoising => &[MediaCall::Denoising],
-        _ => return None,
-    })
 }
 
 impl Scheduler {

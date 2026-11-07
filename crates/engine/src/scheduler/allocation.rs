@@ -246,9 +246,9 @@ pub(super) struct MediaTensorAllocation {
     pub(super) shape_bound: ShapeBound,
 }
 
-/// Independent scheduler address spaces for one physical media ExecutorGroup.
-/// Replicas intentionally reuse row numbers and byte offsets in their own
-/// processes; the worker identity keeps those physical addresses distinct.
+/// Independent scheduler address spaces for one physical media group.
+/// Replicas intentionally reuse row numbers and byte offsets; the group
+/// identity keeps those physical addresses distinct.
 ///
 /// Request rows are one address space for the group. Each rank has its own
 /// buffer pool, holding only the results of the components it executes and of
@@ -266,11 +266,11 @@ impl MediaStorage {
     /// Builds the address spaces of a group whose ranks back `rank_bytes`.
     ///
     /// A rank backs a component's results when it is one of the component's
-    /// ranks in `components`, the placement the engine launched the group
-    /// with, or one of a reading component's, where readers follow the video
+    /// ranks in `components`, the group's placement, or one of a reading
+    /// component's, where readers follow the video
     /// graph's persistent product edges (`MediaCall::readers`) through the
-    /// deployment's `routing`; the worker sizes each rank's pool by the same
-    /// rule. A group launched with no components backs every result on every
+    /// deployment's `routing`; the executor sizes each rank's pool by the same
+    /// rule. A group placed with no components backs every result on every
     /// rank.
     pub(super) fn new(
         request_slots: usize,

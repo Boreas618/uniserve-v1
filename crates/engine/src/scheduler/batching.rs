@@ -719,8 +719,8 @@ impl Scheduler {
             block_size,
             units_per_page,
         };
-        // The attention descriptor's static bound: the executor states it
-        // from the launch, since a KV view's shape must not move per batch.
+        // The attention descriptor's static bound: the executor states it once,
+        // since a KV view's shape must not move per batch.
         let max_kv_len = self.executor.info().max_model_len;
         if max_kv_len == 0 {
             tracing::debug!(

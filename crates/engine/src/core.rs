@@ -5,13 +5,13 @@
 //! scheduler's thread and is the front door request producers submit and
 //! control requests through.
 //!
-//! [`ExecutorGroupConfig`] is the static deployment description: each ExecutorGroup has
+//! [`ExecutorGroupConfig`] is the static deployment description: each group has
 //! an ordered list of physical [`ExecutorRank`]s and named components whose
-//! `ranks` index into that list. [`EngineConfig`] adds scheduler budgets,
-//! transfer bindings, and rank launch defaults. `SchedulerHandle::start_all`
-//! turns that configuration into launched executor processes and one scheduler
-//! per DP rank; `SchedulerHandle::with_executor` accepts an executor built
-//! elsewhere, such as the CPU simulation backend.
+//! `ranks` index into that list. [`EngineConfig`] adds the scheduler's budgets
+//! and the facts of what it serves. A main process builds one scheduler per
+//! rank it holds with `SchedulerHandle::over_batches_telling`, over the
+//! devices of its own process; `SchedulerHandle::with_executor` takes the CPU
+//! simulation backend instead.
 
 use ipc::DEFAULT_COMPONENT;
 use ipc::MediaCall;
@@ -22,19 +22,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::executor::{Executor, TransferConfig, ExecutorGroupId};
-// The executor crate's device-side submission path, named here rather than
-// through this process's executor-process executor.
+#[cfg(feature = "testing")]
+use crate::executor::Executor;
+use crate::executor::ExecutorGroupId;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::{
-    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_RUNNING_REQUESTS,
+    DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS,
 };
-use crate::scheduler::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
+use crate::scheduler::guidance_prefix_rows;
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats};
-use crate::executors::{Dispatcher, ExecutorGroup, ExecutorProcessArgs};
 use crate::{CommandWaker, GenerationLimits, Request};
 use anyhow::Context as _;
 use executor::batch::Batches;
@@ -51,9 +49,6 @@ pub struct ExecutorRank {
     /// the rank.
     pub host: String,
     /// Device string, such as `cuda:0` for a GPU rank or `cpu` for a CPU executor.
-    /// On the edges `TransferConfig::with_worker_defaults` derives, device
-    /// products use CUDA VMM only between distinct ranks whose devices both
-    /// start with `cuda:`.
     pub device: String,
 }
 
@@ -95,17 +90,13 @@ pub struct ExecutorGroupConfig {
     pub ranks: Vec<ExecutorRank>,
     /// Components keyed by name, each listing indices into `ranks`.
     pub components: BTreeMap<String, ComponentConfig>,
-    /// Maximum number of physical runs in flight per rank, launched as
-    /// `ExecutorProcessArgs::queue_depth`.
+    /// Maximum number of physical runs in flight per rank.
     pub queue_depth: usize,
-    /// Per-rank share of device storage available to this executor process for
-    /// static allocations (weights and KV cache).
+    /// Per-rank share of device storage available to this group for static
+    /// allocations (weights and KV cache), instead of the deployment-wide
+    /// `--mem-fraction-static`.
     ///
-    /// When set, `SchedulerHandle::start_all` launches the group's ranks with it as
-    /// `ExecutorProcessArgs::mem_fraction_static` instead of the engine-wide
-    /// default, which `--mem-fraction-static` sets.
-    ///
-    /// Distinct ExecutorGroups may share one physical GPU. Their configured
+    /// Distinct groups may share one physical GPU. Their configured
     /// shares must leave enough aggregate headroom for the device runtime;
     /// validation checks each group alone, never the sum across groups, and
     /// accepts the range [`ExecutorGroupConfig::validate_mem_fraction_static`] states.
@@ -113,7 +104,7 @@ pub struct ExecutorGroupConfig {
 }
 
 impl ExecutorGroupConfig {
-    /// Validates one ExecutorGroup in isolation.
+    /// Validates one group in isolation.
     ///
     /// Fails when the identity is not a valid `ExecutorGroupId`, `queue_depth` is
     /// zero, `validate_mem_fraction_static` refuses a set `mem_fraction_static`, or
@@ -137,15 +128,11 @@ impl ExecutorGroupConfig {
         Ok(())
     }
 
-    /// Checks a per-process static storage fraction: a group's
-    /// `mem_fraction_static` or the engine-wide
-    /// `ExecutorProcessArgs::mem_fraction_static` default.
+    /// Checks a group's static storage fraction, `mem_fraction_static`.
     ///
     /// Each rank grants itself this share of every device's total storage,
-    /// less what its process already holds and never more than the device
-    /// has free, so any finite value in (0, 1] is meaningful, 1 granting the
-    /// whole device. The executor refuses any other value at startup; checking
-    /// here refuses it before a rank is launched.
+    /// less what it already holds and never more than the device has free, so
+    /// any finite value in (0, 1] is meaningful, 1 granting the whole device.
     pub fn validate_mem_fraction_static(fraction: f64) -> anyhow::Result<()> {
         anyhow::ensure!(
             fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
@@ -164,9 +151,6 @@ impl ExecutorGroupConfig {
     /// A component without a distribution must have a parallel world size
     /// equal to its rank count; one with a distribution must have world size
     /// one.
-    ///
-    /// `ExecutorGroup::spawn_all` calls this again for each group before
-    /// starting its ranks.
     pub fn validate_members(
         ranks: &[ExecutorRank],
         components: &BTreeMap<String, ComponentConfig>,
@@ -196,9 +180,9 @@ impl ExecutorGroupConfig {
         Ok(())
     }
 
-    /// Validates unique ExecutorGroup identities and every local placement.
+    /// Validates unique group identities and every local placement.
     ///
-    /// Component names may repeat across ExecutorGroups. Repeated names are
+    /// Component names may repeat across groups. Repeated names are
     /// replicas of the same numerical component; the scheduler binds each
     /// request to one of them and keeps that affinity for the request lifetime.
     ///
@@ -209,7 +193,7 @@ impl ExecutorGroupConfig {
         let mut ids = BTreeSet::new();
         for worker in workers {
             worker.validate()?;
-            anyhow::ensure!(ids.insert(&worker.id), "ExecutorGroup identity is repeated");
+            anyhow::ensure!(ids.insert(&worker.id), "executor group identity is repeated");
         }
         // A request prefilled on a prefill group decodes on a decode group,
         // which holds the same text model and nothing else.
@@ -355,8 +339,7 @@ pub struct EngineConfig {
     pub max_batch: usize,
     /// Maximum number of tokens scheduled in one engine step.
     pub max_num_batched_tokens: usize,
-    /// Maximum number of concurrently running requests. `SchedulerHandle::start_all`
-    /// sizes every executor's request pool from it.
+    /// Maximum number of concurrently running requests.
     pub max_running_requests: usize,
     /// Most requests, waiting or finished with undelivered events, the
     /// scheduler holds before it rejects a submission as overloaded; `None`
@@ -382,19 +365,10 @@ pub struct EngineConfig {
     /// How large the world's host KV cache is (`kv_cache_config.host_ratio`
     /// and `host_gib`).
     pub host_cache: crate::kv_cache::HostCacheSize,
-    /// Waiting queue policy for admitting/scheduling requests.
     /// Static computation components and physical rank membership.
     pub worker_groups: Vec<ExecutorGroupConfig>,
-    /// Per-edge data-plane transfer backend selection (`placement_config.transfer`), e.g.
-    /// `encoder->prefill=posix_shm,prefill->decode=cuda_vmm`. Participating executor
-    /// ranks receive the selected transport. Before process launch,
-    /// `SchedulerHandle::start_all` binds a default for every ordered rank pair, within
-    /// and across ExecutorGroups, that no configured edge covers, derived from
-    /// rank host/device coordinates.
-    pub transfer: TransferConfig,
     /// Number of schedulers `worker_groups` forms, as equal consecutive
-    /// blocks of model groups ([`SchedulerHandle::start_all`]). One means the
-    /// groups form one scheduler.
+    /// blocks of model groups. One means the groups form one scheduler.
     pub data_parallel_size: usize,
     /// Whether the schedulers shard the model's routed experts, and how
     /// they exchange tokens: each scheduler's group is then one executor,
@@ -402,41 +376,40 @@ pub struct EngineConfig {
     /// others at those layers, while attention and every other layer stay
     /// data-parallel. `None` keeps every expert on every scheduler.
     pub expert_parallel: Option<ExpertExchange>,
-    /// Rank launch defaults refined by each ExecutorGroup configuration.
-    ///
-    /// Every constructor also reads the model identifier (`model`) and
-    /// `model_dtype` from here.
-    pub worker_process: ExecutorProcessArgs,
+    /// Model identifier or local model path.
+    pub model: String,
+    /// Numeric data type of the model's parameters and activations.
+    pub dtype: crate::ModelDtype,
+    /// The deployment the schedulers serve, which their storage scopes name:
+    /// the served model name.
+    pub deployment: String,
+    /// This process's own host identity.
+    pub host: String,
+    /// Whether the schedulers copy cache pages through the host KV cache
+    /// (`kv_cache_config.host_tier`).
+    pub host_kv_cache: bool,
+    /// Whether the host KV cache keeps committed pages in the KV storage
+    /// (`kv_cache_config.mooncake`).
+    pub kv_storage: bool,
+    /// Block-diffusion sampling of every canvas the deployment generates;
+    /// `None` when the served model generates no canvases.
+    pub canvas_sampling: Option<ipc::CanvasSampling>,
+    /// The most draft tokens a call proposes with the model's drafter; zero
+    /// when the deployment does not speculate.
+    pub draft_tokens: u32,
     /// Beginning-of-sequence token identifier.
     pub bos: u32,
     /// Token identifiers that terminate generation.
     pub eos: Vec<u32>,
     /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
-    /// The world the engine executes (`EngineSpec::world`): its executors'
-    /// storage is keyed and retained under it.
+    /// The world the engine executes (`EngineSpec::world`): its storage is
+    /// keyed and retained under it.
     pub world: u64,
-    /// The KV cache of each executor group of the predecessor world, by group
-    /// identity; `None` for an engine that succeeds none. The engine's
-    /// groups map those segments read-only, import the predecessor's prefix
-    /// cache index when promoted ([`SchedulerHandle::promote`]), and run on
-    /// trial until the commit ([`SchedulerHandle::commit`]): a lost group
-    /// fails the engine instead of being relaunched, and none keeps a
-    /// standby.
-    pub predecessor: Option<BTreeMap<String, ipc::PredecessorCache>>,
-    /// Prepare cache-transfer targets with writable warmup storage while
-    /// reserving the remaining pool's virtual addresses.
-    pub stage_cache: bool,
-    /// Existing Host cache keys retained for this world's trial rollback.
-    pub cache_keys: Vec<[u8; 32]>,
-    /// The KV cache segments each executor group's planes were made of, by
-    /// group identity, which an engine replacing a lost one of the world
-    /// takes as its own; empty to lay the planes out afresh.
-    pub segments: BTreeMap<String, ipc::CacheTable>,
-    /// The weights each executor group receives from the world the engine
-    /// succeeds, by group identity, as the daemon planned a change of the
-    /// parallel configuration; empty for groups that bind or load theirs.
-    pub received_weights: BTreeMap<String, ipc::ReceivedWeights>,
+    /// Whether the schedulers start on trial, as a successor world's do: they
+    /// serve once promoted ([`SchedulerHandle::promote`]), and until the commit
+    /// ([`SchedulerHandle::commit`]) a fatal failure ends the world.
+    pub trial: bool,
 }
 
 /// The launch-file and build-config facts a main process holds about the ranks
@@ -523,10 +496,9 @@ impl EngineConfig {
     /// its ranks, from the facts it holds ([`RankFacts`]).
     ///
     /// Everything not stated there is derived here: the KV cache's host size,
-    /// the page boundaries, the batch and token budgets the executors are
-    /// launched with, the transfer edges between the group's ranks, and the
-    /// capture catalog's bounds. A fact the derivation needs and the facts do
-    /// not state fails with the fact's name and its source.
+    /// the page boundaries and the capture catalog's bounds. A fact the
+    /// derivation needs and the facts do not state fails with the fact's name
+    /// and its source.
     pub fn of(facts: &RankFacts) -> anyhow::Result<Self> {
         let model = fact(&facts.model, "model", "launch file")?.clone();
         let dtype = *fact(&facts.dtype, "dtype", "launch file")?;
@@ -568,48 +540,20 @@ impl EngineConfig {
             .zip(devices)
             .map(|(host, device)| ExecutorRank { host, device })
             .collect();
-        let components = ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, world_size);
+        let host = ranks
+            .get(rank)
+            .map(|rank| rank.host.clone())
+            .unwrap_or_default();
         let group_config = ExecutorGroupConfig {
-            id: ExecutorGroupId(group.clone()),
+            id: ExecutorGroupId(group),
             role: crate::ExecutorGroupRole::Model,
-            ranks: ranks.clone(),
-            components: components.clone(),
-            // In process the ranks are the executor's own jobs: nothing is
-            // launched, and no run is queued.
+            ranks,
+            components: ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, world_size),
+            // The ranks are the executor's own jobs: no run is queued.
             queue_depth: 1,
             mem_fraction_static: None,
         };
         group_config.validate()?;
-        let worker_groups = vec![group_config];
-        let transfer = TransferConfig::default().with_worker_defaults(&worker_groups)?;
-
-        let worker_process = ExecutorProcessArgs {
-            model: model.clone(),
-            dtype,
-            ranks: ranks.clone(),
-            host: ranks
-                .get(rank)
-                .map(|rank| rank.host.clone())
-                .unwrap_or_default(),
-            role: crate::ExecutorGroupRole::Model,
-            components,
-            peers: facts.peers.clone().unwrap_or_default(),
-            watchdog_timeout: facts
-                .watchdog_timeout
-                .unwrap_or_else(|| ExecutorProcessArgs::default().watchdog_timeout),
-            queue_depth: 1,
-            block_size: facts.block_size,
-            kv_cache_dtype: facts.kv_cache_dtype,
-            max_batch_calls: u32::try_from(max_batch)
-                .context("`max_batch` exceeds the executor field width")?,
-            max_batch_tokens: u32::try_from(max_num_batched_tokens)
-                .context("`max_num_batched_tokens` exceeds the executor field width")?,
-            max_request_pool_size: u32::try_from(max_running_requests)
-                .context("`max_running_requests` exceeds the executor field width")?,
-            max_model_len: facts.max_model_len.unwrap_or(0),
-            world,
-            ..ExecutorProcessArgs::default()
-        };
 
         Ok(Self {
             generation_limits: fact(
@@ -628,11 +572,19 @@ impl EngineConfig {
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             host_cache: facts.host_cache.clone().unwrap_or_default(),
-            worker_groups,
-            transfer,
+            worker_groups: vec![group_config],
             data_parallel_size: 1,
             expert_parallel: None,
-            worker_process,
+            model,
+            dtype,
+            // A main process that names no deployment serves one of its own,
+            // so two of them never contest one storage scope.
+            deployment: unnamed_deployment(),
+            host,
+            host_kv_cache: false,
+            kv_storage: false,
+            canvas_sampling: None,
+            draft_tokens: 0,
             bos: *fact(&facts.bos, "bos token", "model's tokenizer")?,
             eos: fact(&facts.eos, "eos tokens", "model's tokenizer")?.clone(),
             end_of_image: *fact(
@@ -641,39 +593,22 @@ impl EngineConfig {
                 "model's own configuration",
             )?,
             world,
-            predecessor: None,
-            stage_cache: false,
-            cache_keys: Vec::new(),
-            segments: BTreeMap::new(),
-            received_weights: BTreeMap::new(),
+            trial: false,
         })
     }
+}
+
+/// A storage scope no other deployment names.
+pub(crate) fn unnamed_deployment() -> String {
+    format!("deployment-{}", uuid::Uuid::new_v4().simple())
 }
 
 impl EngineConfig {
     /// Builds a minimal configuration for the CPU simulation backend.
     ///
-    /// Pair this with [`SchedulerHandle::with_executor`]:
-    /// [`SchedulerHandle::start_all`] cannot build a `Sim` backend because it
-    /// has no spawnable executor process.
+    /// Pair this with [`SchedulerHandle::with_executor`].
     #[cfg(feature = "testing")]
     pub fn sim(model: impl Into<String>) -> Self {
-        let worker_process = ExecutorProcessArgs {
-            model: model.into(),
-            ranks: ExecutorGroupConfig::placed(
-                &["localhost".to_owned()],
-                "cpu",
-                1,
-                2,
-                ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, 1),
-            )
-            .ranks,
-            block_size: Some(64),
-            queue_depth: 2,
-            max_batch_calls: DEFAULT_MAX_BATCH as u32,
-            max_batch_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS as u32,
-            ..ExecutorProcessArgs::default()
-        };
         Self {
             generation_limits: crate::sim::SimEngine::generation_limits(),
             max_batch: DEFAULT_MAX_BATCH,
@@ -693,21 +628,23 @@ impl EngineConfig {
                 2,
                 ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, 1),
             )],
-            transfer: TransferConfig::default(),
             data_parallel_size: 1,
             expert_parallel: None,
-            worker_process,
+            model: model.into(),
+            dtype: crate::ModelDtype::BFloat16,
+            deployment: unnamed_deployment(),
+            host: "localhost".to_owned(),
+            host_kv_cache: false,
+            kv_storage: false,
+            canvas_sampling: None,
+            draft_tokens: 0,
             bos: 0,
             // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
             // scheduler must recognize it to finish a sim request.
             eos: vec![151645],
             end_of_image: 0,
             world: 0,
-            predecessor: None,
-            stage_cache: false,
-            cache_keys: Vec::new(),
-            segments: BTreeMap::new(),
-            received_weights: BTreeMap::new(),
+            trial: false,
         }
     }
 
@@ -756,9 +693,8 @@ pub struct SchedulerHandle {
     /// Whether the scheduler started on trial, as a successor world's do;
     /// its commit ends the trial.
     trial: bool,
-    /// The device-side submission path of the executor's own crate, when this
-    /// handle was started with one (`SchedulerHandle::start`). A handle built
-    /// over the executor-process executor has none; the shadow pass and the
+    /// The device-side submission path of the executor's own crate. A handle
+    /// built over a simulated executor has none; the shadow pass and the
     /// in-process submission both need it.
     batches: Option<Arc<dyn Batches>>,
     /// Request ids, shared with the warm-up's view of this scheduler.
@@ -773,444 +709,32 @@ pub struct SchedulerHandle {
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
-/// Every executor group's launch arguments ([`SchedulerHandle::group_arguments`]),
-/// and what the schedulers are assembled from.
-pub(crate) struct GroupArguments {
-    /// The model groups', scheduler by scheduler, then the expert groups'.
-    pub(crate) arguments: Vec<ExecutorProcessArgs>,
-    /// The model groups each scheduler holds.
-    pub(crate) per_core: usize,
-    /// Each scheduler's resolved transfer edges.
-    transfers: Vec<TransferConfig>,
-    max_running_requests: usize,
-    model_workers: Vec<ExecutorGroupConfig>,
-    expert_workers: Vec<ExecutorGroupConfig>,
-}
-
 impl SchedulerHandle {
-    /// The launch arguments of every executor group `config` places: the
-    /// model groups, scheduler by scheduler, then the dedicated expert
-    /// groups, each with its scheduler's transfer edges, its place in the
-    /// expert union and the world's per-group values (see
-    /// [`SchedulerHandle::start_all`] for what is refused).
-    pub(crate) fn group_arguments(config: &EngineConfig) -> anyhow::Result<GroupArguments> {
-        let size = config.data_parallel_size;
-        ExecutorGroupConfig::validate_all(&config.worker_groups)?;
-        let (model_workers, expert_workers): (Vec<_>, Vec<_>) = config
-            .worker_groups
-            .iter()
-            .cloned()
-            .partition(|worker| worker.role.serves_requests());
-        anyhow::ensure!(
-            size > 0 && !model_workers.is_empty() && model_workers.len().is_multiple_of(size),
-            "{} executor groups do not form {size} equal schedulers",
-            model_workers.len()
-        );
-        let per_core = model_workers.len() / size;
-        let core_groups: Vec<&[ExecutorGroupConfig]> = model_workers.chunks(per_core).collect();
-        for core_group in &core_groups[1..] {
-            for (group, first) in core_group.iter().zip(core_groups[0]) {
-                anyhow::ensure!(
-                    group.ranks.len() == first.ranks.len()
-                        && group.components == first.components
-                        && group.queue_depth == first.queue_depth
-                        && group.mem_fraction_static == first.mem_fraction_static,
-                    "schedulers must place the same groups: worker group {} \
-                     differs from worker group {}",
-                    group.id,
-                    first.id
-                );
-            }
-        }
-
-        let disaggregated = !expert_workers.is_empty();
-        // Experts sharded with one scheduler divide over its tensor-parallel
-        // ranks instead of an expert union across schedulers.
-        let tensor_experts = config.expert_parallel.is_some() && !disaggregated && size == 1;
-        anyhow::ensure!(
-            config.worker_process.expert_microbatches >= 1
-                && (config.worker_process.expert_microbatches == 1 || disaggregated),
-            "expert microbatches must number at least one and require disaggregated placement \
-             when greater than one"
-        );
-        if disaggregated {
-            anyhow::ensure!(
-                matches!(
-                    config.expert_parallel,
-                    Some(ExpertExchange::DeepEp | ExpertExchange::MegaMoe)
-                ) && core_groups.iter().all(|core_group| core_group.len() == 1),
-                "disaggregated experts require deepep or megamoe and one model group per scheduler"
-            );
-        } else if tensor_experts {
-            // The ranks of one tensor-parallel group hold every token of
-            // their scheduler, so no exchange moves tokens: each runs its
-            // share of the experts over all of them and the group sums the
-            // outputs, as it sums the shards of tensor-parallel experts.
-            anyhow::ensure!(
-                config.expert_parallel == Some(ExpertExchange::AllToAll)
-                    && core_groups[0].len() == 1
-                    && core_groups[0][0].ranks.len() > 1,
-                "expert parallelism within one scheduler requires a single worker group of two \
-                 or more tensor-parallel ranks, which exchange no tokens: the exchange applies \
-                 across schedulers"
-            );
-        } else {
-            anyhow::ensure!(
-                config.expert_parallel.is_none()
-                    || (config.expert_parallel != Some(ExpertExchange::DeepEp)
-                        && size > 1
-                        && core_groups.iter().all(|core_group| {
-                            core_group.len() == 1 && core_group[0].ranks.len() == 1
-                        })),
-                "colocated expert parallelism across schedulers requires one one-worker group \
-                 per scheduler; deepep requires dedicated expert workers"
-            );
-        }
-        let attention_ranks = if disaggregated {
-            model_workers
-                .iter()
-                .map(|worker| worker.ranks.len())
-                .sum::<usize>()
-        } else {
-            0
-        };
-        let expert_world_size = if disaggregated {
-            attention_ranks
-                + expert_workers
-                    .iter()
-                    .map(|worker| worker.ranks.len())
-                    .sum::<usize>()
-        } else {
-            size
-        };
-
-        // Each scheduler resolves its transfer edges over its own groups.
-        // The edges `with_worker_defaults` adds only name the core's groups,
-        // so checking the configured ones covers every edge.
-        let mut transfers = Vec::with_capacity(size);
-        let mut assigned = 0;
-        for core_group in &core_groups {
-            let members = core_group
-                .iter()
-                .map(|worker| worker.id.clone())
-                .collect::<BTreeSet<_>>();
-            let edges = config
-                .transfer
-                .edges
-                .iter()
-                .filter(|edge| members.contains(&edge.source_worker))
-                .cloned()
-                .collect::<Vec<_>>();
-            for edge in &edges {
-                anyhow::ensure!(
-                    members.contains(&edge.destination_worker),
-                    "transfer edge {} -> {} leaves its source's scheduler",
-                    edge.source_worker,
-                    edge.destination_worker
-                );
-            }
-            assigned += edges.len();
-            transfers.push(
-                TransferConfig {
-                    edges,
-                    ..config.transfer.clone()
-                }
-                .with_worker_defaults(core_group)?,
-            );
-        }
-        anyhow::ensure!(
-            assigned == config.transfer.edges.len(),
-            "transfer edge names an unconfigured executor"
-        );
-
-        // Every group holds a request row for each running request the
-        // scheduler may keep resident, plus the rows a runtime keeps outside
-        // that limit. Only the loaded capabilities decide that reserve
-        // (`guidance_prefix_rows`), so the launch sizes for the largest one.
-        let max_running_requests = config.max_running_requests.max(1);
-        let max_request_pool_size = u32::try_from(max_running_requests + MAX_GUIDANCE_PREFIX_ROWS)
-            .context("max_running_requests exceeds the executor request-pool field")?;
-
-        // Each group launches from the shared defaults with its own identity,
-        // placement, components, queue depth, and mem_fraction_static, plus its
-        // scheduler's resolved transfer edges and the components of every
-        // group of its scheduler (`peers`), from which the group resolves
-        // the ranks, possibly in other groups, that read its products.
-        let mut arguments = Vec::with_capacity(config.worker_groups.len());
-        let mut union_rank = 0;
-        for (core_group, transfer) in core_groups.iter().zip(&transfers) {
-            let peers = core_group
-                .iter()
-                .map(|worker| (worker.id.to_string(), worker.components.clone()))
-                .collect::<BTreeMap<_, _>>();
-            for worker in *core_group {
-                arguments.push(ExecutorProcessArgs {
-                    worker_id: worker.id.to_string(),
-                    role: worker.role,
-                    ranks: worker.ranks.clone(),
-                    components: worker.components.clone(),
-                    peers: peers.clone(),
-                    queue_depth: worker.queue_depth,
-                    max_request_pool_size,
-                    mem_fraction_static: worker
-                        .mem_fraction_static
-                        .unwrap_or(config.worker_process.mem_fraction_static),
-                    transfer: transfer.clone(),
-                    expert_parallel: config.expert_parallel.filter(|_| !tensor_experts).map(
-                        |exchange| crate::executors::ExpertParallelPlacement {
-                            rank: union_rank as u32,
-                            size: expert_world_size as u32,
-                            attention_ranks: attention_ranks as u32,
-                            address: None,
-                            exchange,
-                        },
-                    ),
-                    tensor_experts,
-                    ..config.worker_process.clone()
-                });
-                union_rank += worker.ranks.len();
-            }
-        }
-        for worker in &expert_workers {
-            arguments.push(ExecutorProcessArgs {
-                worker_id: worker.id.to_string(),
-                role: worker.role,
-                ranks: worker.ranks.clone(),
-                components: worker.components.clone(),
-                peers: BTreeMap::new(),
-                queue_depth: worker.queue_depth,
-                max_request_pool_size,
-                mem_fraction_static: worker
-                    .mem_fraction_static
-                    .unwrap_or(config.worker_process.mem_fraction_static),
-                transfer: transfers[0].clone(),
-                expert_parallel: config.expert_parallel.map(|exchange| {
-                    crate::executors::ExpertParallelPlacement {
-                        rank: union_rank as u32,
-                        size: expert_world_size as u32,
-                        attention_ranks: attention_ranks as u32,
-                        address: None,
-                        exchange,
-                    }
-                }),
-                ..config.worker_process.clone()
-            });
-            union_rank += worker.ranks.len();
-        }
-
-        // Every rank belongs to the engine's world; a successor's ranks map
-        // the KV cache of their group's predecessor read-only.
-        for args in &mut arguments {
-            args.world = config.world;
-            args.stage_cache = config.stage_cache;
-            args.cache_keys = config.cache_keys.clone();
-            args.predecessor = config
-                .predecessor
-                .as_ref()
-                .and_then(|groups| groups.get(&args.worker_id))
-                .cloned();
-            args.segments = config.segments.get(&args.worker_id).cloned();
-            args.received_weights = config.received_weights.get(&args.worker_id).cloned();
-        }
-
-        Ok(GroupArguments {
-            arguments,
-            per_core,
-            transfers,
-            max_running_requests,
-            model_workers,
-            expert_workers,
-        })
-    }
-
-    /// Launches the deployment's executors and runs one scheduler per DP rank,
-    /// `config.data_parallel_size` of them, each over its own copy of the
-    /// deployment's model executor groups.
+    /// [`Self::over_batches_telling`] with nothing told of a step's progress.
     ///
-    /// `config.worker_groups` lists the schedulers' model groups as equal
-    /// consecutive blocks. Each scheduler gets its own thread, executor,
-    /// cache pool, prefix cache and request rows over its own groups, the
-    /// way SGLang runs one scheduler per data-parallel rank behind its
-    /// `DataParallelController` and vLLM one engine core per data-parallel
-    /// rank. Every group of every scheduler launches through one
-    /// `ExecutorGroup::spawn_all`, so the schedulers load their models at the
-    /// same time and one daemon per node serves all of them.
+    /// # Errors
     ///
-    /// Schedulers exchange no products: every configured transfer edge must
-    /// stay inside one scheduler, and each binds its default edges over its
-    /// own groups only.
-    ///
-    /// Fails when the size is zero or does not divide the groups, when the
-    /// schedulers' groups are not the same deployment on different ranks
-    /// (group count, rank counts, components, queue depth and
-    /// mem_fraction_static must match position by position), when a
-    /// configured edge crosses schedulers or names an unconfigured executor
-    /// group, when the executors of a token runtime hold too few request rows
-    /// for `max_running_requests` running requests, or when a group cannot
-    /// be launched, a scheduler cannot be built or its warmup fails.
-    /// Starts one scheduler thread — the rank `config` names — over the
-    /// device-side submission path `batches` states, and returns its handle.
-    ///
-    /// One handle is one scheduler thread, so `config` names one rank's executor
-    /// groups: a data-parallel config's ranks start together with
-    /// [`Self::start_all`]. The mechanism still plans from its executor group's
-    /// capabilities and completes from its reports; `batches` is the executor
-    /// crate's own submission path, which the shadow pass of §7.3 step 2 and,
-    /// once the splice lands, the step's own submissions go through.
-    pub fn start(config: EngineConfig, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            config.data_parallel_size == 1,
-            "one handle is one scheduler thread, but the config states {} ranks: start a \
-             data-parallel config with start_all",
-            config.data_parallel_size
-        );
-        let GroupArguments {
-            arguments,
-            per_core,
-            transfers,
-            max_running_requests,
-            model_workers,
-            expert_workers,
-        } = Self::group_arguments(&config)?;
-        anyhow::ensure!(
-            model_workers.len() == per_core,
-            "the config holds {} model groups against {per_core} per scheduler, so it is several \
-             ranks': one handle takes one rank's groups",
-            model_workers.len()
-        );
-        let transfer = transfers
-            .into_iter()
-            .next()
-            .context("the config states no transfer edges")?;
-        // `spawn_all` returns groups in argument order, which pairs each with
-        // its identity: the rank's model groups, then its expert groups.
-        let launched = ExecutorGroup::spawn_all(arguments)?;
-        let workers = model_workers
-            .iter()
-            .chain(&expert_workers)
-            .map(|worker| worker.id.clone())
-            .zip(launched)
-            .collect::<Vec<_>>();
-        let mut placement = model_workers;
-        placement.extend(expert_workers);
-        let core_config = EngineConfig {
-            worker_groups: placement,
-            transfer,
-            data_parallel_size: 1,
-            expert_parallel: None,
-            ..config
-        };
-        let mut handle = Self::launch(&core_config, max_running_requests, workers)?;
-        handle.batches = Some(batches);
-        if core_config.predecessor.is_none() {
-            handle
-                .publish_world()
-                .recv()
-                .context("the scheduler stopped before publication")?
-                .map_err(anyhow::Error::msg)?;
-        }
-        Ok(handle)
-    }
-
-    pub fn start_all(config: EngineConfig) -> anyhow::Result<Vec<Self>> {
-        let GroupArguments {
-            arguments,
-            per_core,
-            transfers,
-            max_running_requests,
-            model_workers,
-            expert_workers,
-        } = Self::group_arguments(&config)?;
-        let core_groups: Vec<&[ExecutorGroupConfig]> = model_workers.chunks(per_core).collect();
-
-        // `spawn_all` returns groups in argument order, which pairs each group
-        // with its identity and, block by block, with its scheduler.
-        let launched = ExecutorGroup::spawn_all(arguments)?;
-        let mut groups = model_workers
-            .iter()
-            .chain(&expert_workers)
-            .map(|worker| worker.id.clone())
-            .zip(launched)
-            .collect::<Vec<_>>();
-        // Shared expert groups have one lifecycle owner. They advertise no
-        // request capabilities, so they never become a scheduler's own.
-        let mut shared = groups.split_off(model_workers.len());
-        let mut groups = groups.into_iter();
-        let mut cores = Vec::with_capacity(config.data_parallel_size);
-        for (index, (core_group, transfer)) in core_groups.iter().zip(transfers).enumerate() {
-            let mut workers = groups.by_ref().take(core_group.len()).collect::<Vec<_>>();
-            if index == 0 {
-                workers.append(&mut shared);
-            }
-            let mut placement = core_group.to_vec();
-            if index == 0 {
-                placement.extend(expert_workers.iter().cloned());
-            }
-            let core_config = EngineConfig {
-                worker_groups: placement,
-                transfer,
-                data_parallel_size: 1,
-                expert_parallel: None,
-                ..config.clone()
-            };
-            cores.push(Self::launch(&core_config, max_running_requests, workers)?);
-        }
-        if config.predecessor.is_none() {
-            cores[0]
-                .publish_world()
-                .recv()
-                .context("the scheduler stopped before publication")?
-                .map_err(anyhow::Error::msg)?;
-        }
-        Ok(cores)
-    }
-
-    /// Starts one rank's executors and the scheduler that commands them.
-    ///
-    /// `config` names that rank's groups alone; its transfer edges are the ones
-    /// `config.transfer` states.
-    fn launch(
-        config: &EngineConfig,
-        max_running_requests: usize,
-        workers: Vec<(ExecutorGroupId, ExecutorGroup)>,
-    ) -> anyhow::Result<Self> {
-        let executor = Dispatcher::try_new(workers, config.transfer.clone())?;
-        let info = executor.info().runtime_info()?;
-        Self::check_rows(&info, max_running_requests)?;
-        let waker = executor.command_waker();
-        let scheduler = Self::assemble(config.clone(), Box::new(executor), waker)?;
-        // The serving path's warm-up is the serving path's: a scheduler with no
-        // policy forms no batch, so it can only run once the epoch's first
-        // policy serves. It is recorded here, on a thread of its own, and
-        // startup — and the daemon's readiness contract — does not wait for it.
-        crate::warmup::after_serving(&scheduler, config);
-        Ok(scheduler)
+    /// Fails as [`Self::over_batches_telling`] does.
+    #[cfg(feature = "testing")]
+    pub fn over_batches(config: EngineConfig, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
+        Self::over_batches_telling(config, batches, CommandWaker::noop())
     }
 
     /// Starts one scheduler thread over the executor crate's batch path — the
-    /// in-process submission path of §2.4 — and returns its handle.
+    /// in-process submission path of §2.4 — and returns its handle, with
+    /// `progress` told whenever a step produced events or an answer: what the
+    /// thread reading them waits on.
     ///
-    /// No executor group is launched: the pool's capabilities come from what the
-    /// executor reports (`Batches::inventory`), the batches go to `batches`
-    /// itself, and the threads, the command channel and the handle's surface are
-    /// exactly what [`Self::start`] gives. The scheduler decides nothing until a
-    /// policy serves it: the daemon's first `Precopy` and `Switchover` install
-    /// one (§7.3), and until then a step forms no batch.
+    /// The pool's capabilities come from what the executor reports
+    /// (`Batches::inventory`), and the batches go to `batches` itself. The
+    /// scheduler decides nothing until a policy serves it: the daemon's first
+    /// `Precopy` and `Switchover` install one (§7.3), and until then a step
+    /// forms no batch.
     ///
     /// Fails when the config names more than one rank, when the executor reports
     /// no pool or pools that disagree about a component, when a pool serves fewer
     /// request rows than `max_running_requests` running requests need, or when
     /// the scheduler's thread cannot be started.
-    pub fn over_batches(config: EngineConfig, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
-        Self::over_batches_telling(config, batches, CommandWaker::noop())
-    }
-
-    /// [`Self::over_batches`], with `progress` told whenever a step produced
-    /// events or an answer: what the thread reading them waits on.
-    ///
-    /// # Errors
-    ///
-    /// Fails as [`Self::over_batches`] does.
     pub fn over_batches_telling(
         config: EngineConfig,
         batches: Arc<dyn Batches>,
@@ -1233,12 +757,12 @@ impl SchedulerHandle {
             submissions,
             tokens,
             Self::scheduler_config(&config),
-            config.worker_process.dtype,
+            config.dtype,
             config.generation_limits.clone(),
         )?;
         let mut scheduler = Self::configured(scheduler, &config)?;
         scheduler.set_progress(progress);
-        let mut handle = Self::spawn(scheduler, config.worker_process.model.clone(), waker)?;
+        let mut handle = Self::spawn(scheduler, config.model.clone(), waker)?;
         handle.batches = Some(batches);
         // The serving path's warm-up is the serving path's: it runs once the
         // epoch's first policy serves, on a thread of its own, and startup does
@@ -1247,12 +771,11 @@ impl SchedulerHandle {
         Ok(handle)
     }
 
-    /// Runs a scheduler over an executor supplied by a higher composition
-    /// layer, such as the CPU simulation backend.
+    /// Runs a scheduler over a simulated executor.
     ///
     /// The command waker is a no-op, so a command does not interrupt the
-    /// scheduler's idle park. Neither `config.worker_groups` nor
-    /// `config.transfer` is read.
+    /// scheduler's idle park. `config.worker_groups` is not read.
+    #[cfg(feature = "testing")]
     pub fn with_executor(
         config: EngineConfig,
         executor: Box<dyn Executor>,
@@ -1295,8 +818,8 @@ impl SchedulerHandle {
                 "the config names the pool {}, which the executor does not serve",
                 group.id.0
             );
-            // `from_inventory` states every pool's launched rank count; an
-            // executor that reports none places the pool on one rank.
+            // `from_inventory` states every pool's rank count; an executor
+            // that reports none places the pool on one rank.
             let served = info
                 .placements
                 .get(&group.id)
@@ -1320,29 +843,14 @@ impl SchedulerHandle {
             max_running_requests: config.max_running_requests.max(1),
             max_queued_requests: config.max_queued_requests,
             chunked_prefill_size: config.chunked_prefill_size.max(1),
-            canvas: config.worker_process.canvas_sampling,
-            draft_tokens: config.worker_process.draft_tokens as usize,
+            canvas: config.canvas_sampling,
+            draft_tokens: config.draft_tokens as usize,
             graph_tiers: config.graph_tiers.clone(),
         }
     }
 
-    /// The handle a main process that holds its own devices serves from: the
-    /// configuration its launch file's facts state, over the executor's own
-    /// batch path (§2.4, §7.3).
-    ///
-    /// The three steps are the boot's whole shape and are stated here once so
-    /// that a call site cannot take two of them and forget the third:
-    /// [`EngineConfig::of`] derives the configuration from the facts — refusing
-    /// by name and source any fact it needs and the launch file does not state —
-    /// and [`Self::over_batches`] builds the scheduler over `batches`, whose
-    /// inventory is where the executor states the pools it serves. No executor
-    /// group is launched: the ranks are `batches`' own.
-    pub fn boot(facts: &RankFacts, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
-        let config = EngineConfig::of(facts)?;
-        Self::over_batches(config, batches)
-    }
-
     /// Builds the scheduler `config` states over `executor` and runs it.
+    #[cfg(feature = "testing")]
     fn assemble(
         config: EngineConfig,
         executor: Box<dyn Executor>,
@@ -1353,11 +861,11 @@ impl SchedulerHandle {
             crate::scheduler::submissions(executor),
             tokens,
             Self::scheduler_config(&config),
-            config.worker_process.dtype,
+            config.dtype,
             config.generation_limits.clone(),
         )?;
         let scheduler = Self::configured(scheduler, &config)?;
-        Self::spawn(scheduler, config.worker_process.model.clone(), waker)
+        Self::spawn(scheduler, config.model.clone(), waker)
     }
 
     /// Applies `config`'s per-world settings to a freshly built scheduler: its
@@ -1367,7 +875,7 @@ impl SchedulerHandle {
         scheduler.set_world(config.world);
         scheduler.set_prefix_reuse(config.prefix_cache);
         scheduler.set_state_interval(config.state_interval);
-        scheduler.set_trial(config.predecessor.is_some());
+        scheduler.set_trial(config.trial);
         scheduler.set_prefill_groups(
             config
                 .worker_groups
@@ -1375,15 +883,15 @@ impl SchedulerHandle {
                 .filter(|group| group.role == ExecutorGroupRole::Prefill)
                 .map(|group| group.id.clone()),
         );
-        if config.prefix_cache && config.worker_process.host_kv_cache {
+        if config.prefix_cache && config.host_kv_cache {
             scheduler
                 .enable_kv_offload(
-                    &config.worker_process.deployment,
+                    &config.deployment,
                     config.world,
-                    &config.worker_process.host,
+                    &config.host,
                     config.boundary_interval,
                     config.host_cache,
-                    config.worker_process.kv_storage.is_some(),
+                    config.kv_storage,
                 )
                 .context("sizing the world's host KV cache")?;
         }
@@ -1392,17 +900,17 @@ impl SchedulerHandle {
         // stored there.
         scheduler.enable_trajectory_store(
             &storage::socket::default_socket(),
-            &config.worker_process.deployment,
+            &config.deployment,
             config.world,
-            &config.worker_process.host,
+            &config.host,
         );
         // Ranks executing video encoders that map host encoder pools report
         // them: a request's encoder outputs are stored and found there.
         scheduler.enable_encoder_store(
             &storage::socket::default_socket(),
-            &config.worker_process.deployment,
+            &config.deployment,
             config.world,
-            &config.worker_process.host,
+            &config.host,
         );
         Ok(scheduler)
     }
@@ -1497,22 +1005,6 @@ impl SchedulerHandle {
             .store(generation, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// The generation serving now.
-    pub fn serving_generation(&self) -> u64 {
-        self.generation.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Blocks until a policy instance actually serves this scheduler, or the
-    /// scheduler stops first (§7.3).
-    ///
-    /// Before the epoch's first switchover the mechanism decides nothing, so a
-    /// scheduler with no policy forms no batch; whatever must run under a
-    /// policy — the serving path's warm-up, above all — waits here instead of at
-    /// startup.
-    pub fn wait_serving(&self) {
-        crate::warmup::wait_serving(self.serving.clone());
-    }
-
     /// The scheduler's serving signal, for a thread that waits on it without
     /// holding the handle ([`crate::warmup::after_serving`]).
     pub fn serving(&self) -> tokio::sync::watch::Receiver<bool> {
@@ -1579,7 +1071,7 @@ impl SchedulerHandle {
 
     /// One of the epoch's engine commands, as this scheduler applies it (§7.3):
     /// a stage is answered when it applies; the commands that belong to the
-    /// engine process or to the process holding the Program Server are answered
+    /// main process or to the process holding the Program Server are answered
     /// with that reason.
     pub fn engine_command(
         &self,
@@ -1913,9 +1405,8 @@ impl SchedulerHandle {
     }
 
     /// Commits the scheduler's world, which succeeded another: its executors
-    /// take the predecessor's storage they mapped read-only, and its groups
-    /// relaunch on a loss from then on. The receiver gets what each executor
-    /// reported.
+    /// take the predecessor's storage they mapped read-only. The receiver gets
+    /// what each executor reported.
     pub fn commit(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         self.commands.commit()
     }
@@ -2045,13 +1536,11 @@ mod tests {
             max_running_requests: Some(24),
             max_batch: Some(32),
             max_num_batched_tokens: Some(4096),
-            block_size: Some(128),
             graph_tiers: Some(vec![16, 32]),
             bos: Some(1),
             eos: Some(vec![2, 3]),
             end_of_image: Some(4),
             generation_limits: Some(GenerationLimits::default()),
-            max_model_len: Some(32768),
             ..RankFacts::default()
         }
     }
@@ -2078,16 +1567,14 @@ mod tests {
         assert_eq!(group.ranks[0].host, "node-a");
         assert_eq!(group.ranks[0].device, "cuda:0");
         assert_eq!(config.data_parallel_size, 1);
-        // Derived: the build configuration's prefill chunk, the platform's
-        // prefix cache, and no predecessor.
+        // Derived: the build configuration's prefill chunk and the platform's
+        // prefix cache.
         assert_eq!(
             config.chunked_prefill_size,
             crate::scheduler::DEFAULT_CHUNKED_PREFILL_SIZE
         );
         assert!(config.prefix_cache);
-        assert!(config.predecessor.is_none());
-        assert_eq!(config.worker_process.model, "Qwen/Qwen3-30B-A3B");
-        assert_eq!(config.worker_process.max_model_len, 32768);
+        assert_eq!(config.model, "Qwen/Qwen3-30B-A3B");
         Ok(())
     }
 
@@ -2205,10 +1692,9 @@ mod tests {
     #[test]
     fn the_shorthand_blocks_ranks_across_the_hosts_it_is_given() {
         // Eight devices over two four-device hosts, the engine's host first as
-        // the CLI lists them. `ExecutorGroup` refuses a muxer off the engine's
-        // host, so a deployment that places its muxer on rank zero needs the
-        // lowest ranks on the first host, and each host must number its own
-        // devices from zero.
+        // the CLI lists them. A deployment that places its muxer on rank zero
+        // needs the lowest ranks on the first host, and each host must number
+        // its own devices from zero.
         let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
         let worker = ExecutorGroupConfig::placed(&hosts, "cuda", 8, 2, mixed_components(8));
 
@@ -2307,62 +1793,6 @@ mod tests {
         );
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].id.to_string(), "model");
-    }
-
-    /// Schedulers must place the same deployment on different ranks, and
-    /// the size must divide the groups; both are refused before any executor
-    /// launches.
-    #[test]
-    fn engine_cores_refuse_unequal_deployments() {
-        let hosts = ["localhost".to_owned()];
-        let mut config = EngineConfig {
-            worker_groups: ExecutorGroupConfig::data_parallel(
-                &hosts,
-                "cpu",
-                2,
-                1,
-                2,
-                ExecutorGroupConfig::single_component("model", 1),
-            ),
-            data_parallel_size: 3,
-            ..EngineConfig::sim("sim-model")
-        };
-        assert!(SchedulerHandle::start_all(config.clone()).is_err());
-
-        config.data_parallel_size = 2;
-        config.worker_groups[1].queue_depth = 3;
-        let error = SchedulerHandle::start_all(config)
-            .err()
-            .expect("unequal schedulers are refused");
-        assert!(error.to_string().contains("schedulers must place"));
-    }
-
-    /// Experts shard across two or more schedulers of one one-rank executor
-    /// each, or across the tensor-parallel ranks of one scheduler's single
-    /// group; a one-rank scheduler, and schedulers of multi-rank groups,
-    /// are refused before an executor launches.
-    #[test]
-    fn expert_parallelism_needs_several_ranks_in_one_arrangement() {
-        let hosts = ["localhost".to_owned()];
-        for (cores, ranks) in [(1, 1), (2, 2)] {
-            let config = EngineConfig {
-                worker_groups: ExecutorGroupConfig::data_parallel(
-                    &hosts,
-                    "cpu",
-                    cores,
-                    ranks,
-                    2,
-                    ExecutorGroupConfig::single_component("model", ranks),
-                ),
-                data_parallel_size: cores,
-                expert_parallel: Some(ExpertExchange::AllToAll),
-                ..EngineConfig::sim("sim-model")
-            };
-            let error = SchedulerHandle::start_all(config)
-                .err()
-                .expect("the placement is refused");
-            assert!(error.to_string().contains("expert parallelism"), "{error}");
-        }
     }
 
     #[test]

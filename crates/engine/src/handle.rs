@@ -31,8 +31,8 @@ use crate::lock;
 ///
 /// Callers run `wake` on their own thread: the command sender right after it
 /// enqueues a command, and `EventRx` after it consumes an output event and
-/// frees channel capacity. The engine's implementations (the `WakeSignal`
-/// socket write and the simulator's progress channel send) do not block.
+/// frees channel capacity. The engine's implementations (the in-process
+/// path's nudge and the simulator's progress channel send) do not block.
 pub trait Wake: Send + Sync {
     /// Signals the waiting engine owner.
     fn wake(&self);
@@ -176,74 +176,6 @@ impl std::fmt::Debug for CommandWaker {
 /// Events a closing sender hands to its receiver, shared by the two ends of
 /// one request's event channel.
 type Handoff = Arc<Mutex<VecDeque<Event>>>;
-
-/// Pollable command ingress whose lifetime is independent of Executor membership.
-///
-/// A nonblocking Unix socket pair: the `CommandWaker` from [`Self::waker`]
-/// owns the write end and writes a byte per wake (a full socket already holds
-/// a pending notification), and the owner polls [`Self::descriptor`] for
-/// readability and consumes the bytes with [`Self::drain`]. `Dispatcher`
-/// owns one beside its executor groups and polls it with their progress
-/// descriptors.
-pub(crate) struct WakeSignal {
-    reader: std::os::unix::net::UnixStream,
-    waker: CommandWaker,
-}
-
-impl WakeSignal {
-    pub(crate) fn new() -> std::io::Result<Self> {
-        use std::io::Write as _;
-
-        let (reader, writer) = std::os::unix::net::UnixStream::pair()?;
-        reader.set_nonblocking(true)?;
-        writer.set_nonblocking(true)?;
-        let waker = CommandWaker::new(move || {
-            loop {
-                match (&writer).write(&[1]) {
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    // A full socket already has a pending notification. A closed
-                    // reader means its control owner has stopped accepting work.
-                    _ => break,
-                }
-            }
-        });
-        Ok(Self { reader, waker })
-    }
-
-    pub(crate) fn waker(&self) -> CommandWaker {
-        self.waker.clone()
-    }
-
-    /// Raw read-end descriptor for `poll`; valid while this value lives.
-    pub(crate) fn descriptor(&self) -> i32 {
-        use std::os::fd::AsRawFd as _;
-        self.reader.as_raw_fd()
-    }
-
-    /// Consumes latched notifications before the owner considers parking again.
-    ///
-    /// Returns whether at least one notification was pending. Reads until the
-    /// socket is empty or its write end has closed, so any number of wakes
-    /// coalesce into one `true`. Read errors other than `WouldBlock` and
-    /// `Interrupted` propagate.
-    pub(crate) fn drain(&mut self) -> std::io::Result<bool> {
-        use std::io::Read as _;
-
-        let mut received = false;
-        let mut bytes = [0_u8; 256];
-        loop {
-            match self.reader.read(&mut bytes) {
-                Ok(0) => return Ok(received),
-                Ok(_) => received = true,
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    return Ok(received);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            }
-        }
-    }
-}
 
 /// Maximum number of generation events buffered for one request consumer.
 ///
@@ -1277,7 +1209,7 @@ impl CommandSender {
 
     /// The epoch's engine command as this scheduler applies it (§7.3): the
     /// stages are answered when they apply, and every other command is answered
-    /// with why it belongs to the engine process rather than to one scheduler.
+    /// with why it belongs to the main process rather than to one scheduler.
     pub fn engine_command(
         &self,
         command: proto::process::Command,
