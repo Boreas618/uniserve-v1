@@ -1045,7 +1045,7 @@ impl Scheduler {
     /// This step's room.
     ///
     /// `views.rs` builds every fact but one: the captured graph tiers, which
-    /// the build config states (the spec's `cuda_graphs`).
+    /// the build config states (the deployment's `cuda_graph_config`).
     fn room(&self) -> Room {
         let mut facts = views::room_facts(self, self.step);
         facts.graph_tiers = self.config.graph_tiers.clone();

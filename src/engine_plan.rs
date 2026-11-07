@@ -389,7 +389,7 @@ impl EpochPlan {
         let targets = targets(&devices)?;
         Ok(Self {
             build: build.clone(),
-            checkpoint: launch.model.clone(),
+            checkpoint: PathBuf::from(&launch.engine_config.model.model),
             devices,
             program_server: PathBuf::from(&launch.program_server),
             targets,

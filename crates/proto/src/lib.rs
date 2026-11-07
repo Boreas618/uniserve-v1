@@ -53,7 +53,11 @@ pub mod handoff {
 /// from `request::EngineSpec`: those values are the programs' arguments
 /// (`specs/worker.md` §5.1, §7.7), and the engine spec no longer carries a
 /// second copy of them.
-pub const PROTOCOL_MAJOR: u32 = 2;
+///
+/// Major 3 removes the engine spec: what an engine process starts from is in
+/// its launch file (`config::EngineArgs`), and the welcome no longer carries
+/// it, so an engine of an earlier major would find no host identity there.
+pub const PROTOCOL_MAJOR: u32 = 3;
 
 /// The interfaces' minor version: the additions this build knows. Minor 1
 /// adds the leader's answer of the nodes it knows now (`NodesQuery`). Minor 2

@@ -3,9 +3,9 @@
 //!
 //! The engine takes the file's contents as its whole description: one flag,
 //! no second account of what the process is or which build it serves. The
-//! daemon therefore owns both files the process reads — the epoch's build
-//! config, written once per epoch, and this process's launch — and writes each
-//! one atomically: a temporary file beside the target, synced, then renamed.
+//! file carries the epoch's engine configuration inline, so the process reads
+//! nothing else the daemon wrote, and the daemon writes it atomically: a
+//! temporary file beside the target, synced, then renamed.
 //! The child reads it in its first instruction, so nothing may be observable
 //! half-written.
 //!
@@ -27,12 +27,6 @@ pub(crate) fn launch_path(directory: &Path, engine: u64) -> PathBuf {
     directory.join(format!("launch-{engine}.json"))
 }
 
-/// The path of one epoch's build config, which every process of that epoch
-/// reads.
-pub(crate) fn engine_config_path(directory: &Path, world: u64) -> PathBuf {
-    directory.join(format!("engine-config-{world}.json"))
-}
-
 /// Writes `launch` for the process `engine` and answers the path it was
 /// written to.
 ///
@@ -42,27 +36,6 @@ pub(crate) fn engine_config_path(directory: &Path, world: u64) -> PathBuf {
 pub(crate) fn write(directory: &Path, engine: u64, launch: &EngineArgs) -> io::Result<PathBuf> {
     let path = launch_path(directory, engine);
     let bytes = serde_json::to_vec_pretty(launch)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    write_atomically(&path, &bytes)?;
-    Ok(path)
-}
-
-/// Writes `config` as the epoch's build config and answers the path it was
-/// written to.
-///
-/// Two engines of one epoch read the same bytes, so the file is named for the
-/// epoch's world rather than for a process.
-///
-/// # Errors
-///
-/// Fails when the directory or the file cannot be written.
-pub(crate) fn write_engine_config(
-    directory: &Path,
-    world: u64,
-    config: &proto::config::EngineConfig,
-) -> io::Result<PathBuf> {
-    let path = engine_config_path(directory, world);
-    let bytes = serde_json::to_vec_pretty(config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     write_atomically(&path, &bytes)?;
     Ok(path)
@@ -109,10 +82,38 @@ mod tests {
     use super::*;
     use crate::options::ServerArgs;
 
+    /// The launch of a standby (engine 7) of world 12 beside the process of world 11 it succeeds,
+    /// with a rebalanced expert order.
     fn launch() -> EngineArgs {
+        use proto::request::wire::{CacheSegment, CacheSegments, ExpertOrder, Predecessor};
         EngineArgs {
-            engine_config: PathBuf::from("/run/uniserve/engine-config-12.json"),
-            model: PathBuf::from("/models/qwen3"),
+            engine_config: ServerArgs::default()
+                .engine_config()
+                .expect("the configuration resolves"),
+            world: 12,
+            predecessor: Some(Predecessor {
+                world: 11,
+                segments: vec![CacheSegments {
+                    worker_group: "engine".to_owned(),
+                    segments: vec![CacheSegment {
+                        world: 11,
+                        ordinal: 0,
+                        units: 64,
+                    }],
+                    held: 1,
+                    units: 64,
+                    scratch: 0,
+                }],
+            }),
+            expert_order: [(
+                "model.layers.0.mlp".to_owned(),
+                ExpertOrder {
+                    experts: vec![1, 0],
+                },
+            )]
+            .into_iter()
+            .collect(),
+            host: "rank-0".to_owned(),
             requests: "unix:/run/uniserve/requests.sock".to_owned(),
             processes: "unix:/run/uniserve/processes.sock".to_owned(),
             engine: 7,
@@ -120,15 +121,12 @@ mod tests {
             devices: vec![0, 1],
             group: "engine".to_owned(),
             rank: 0,
-            deployment: "qwen3".to_owned(),
-            world: 12,
             scheduler_node: true,
             peers: Vec::new(),
             watchdog_timeout_s: None,
             rollback_s: None,
             queue_depth: 4,
             world_size: 1,
-            standby: false,
         }
     }
 
@@ -145,7 +143,8 @@ mod tests {
         directory
     }
 
-    /// The launch file states exactly the engine's fields, and the engine reads
+    /// The launch file states exactly the engine's fields, the epoch's engine
+    /// configuration and the handover state among them, and the engine reads
     /// it back as the one type both sides use (`proto::config::EngineArgs`).
     /// A key a newer daemon adds is read past rather than refused, so an
     /// engine of an older build still starts from it.
@@ -163,7 +162,10 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected = [
             "engine_config",
-            "model",
+            "world",
+            "predecessor",
+            "expert_order",
+            "host",
             "requests",
             "processes",
             "engine",
@@ -171,15 +173,12 @@ mod tests {
             "devices",
             "group",
             "rank",
-            "deployment",
-            "world",
             "scheduler_node",
             "peers",
             "watchdog_timeout_s",
             "rollback_s",
             "queue_depth",
             "world_size",
-            "standby",
         ]
         .into_iter()
         .map(str::to_owned)
@@ -190,7 +189,12 @@ mod tests {
         assert_eq!(value["devices"], json!([0, 1]));
         assert_eq!(value["queue_depth"], json!(4));
         assert_eq!(value["world_size"], json!(1));
-        assert_eq!(value["standby"], json!(false));
+        assert_eq!(value["predecessor"]["world"], json!(11));
+        assert_eq!(
+            value["expert_order"]["model.layers.0.mlp"]["experts"],
+            json!([1, 0])
+        );
+        assert!(value["engine_config"].is_object());
 
         // The engine reads back what the writer wrote.
         let read: EngineArgs = serde_json::from_str(&text).expect("the launch file reads back");
@@ -201,29 +205,6 @@ mod tests {
         extra["generation"] = json!(7);
         let read: EngineArgs = serde_json::from_value(extra).expect("an unknown key is read past");
         assert_eq!(read, launch());
-        let _ = std::fs::remove_dir_all(&directory);
-    }
-
-    /// The build config is one file per epoch, its bytes the epoch's, and it
-    /// is written whole.
-    #[test]
-    fn the_engine_config_is_written_once_per_epoch() {
-        let directory = scratch("build");
-        let config = ServerArgs::default()
-            .engine_config()
-            .expect("the configuration resolves");
-        let path = write_engine_config(&directory, 12, &config).expect("the engine config");
-        assert_eq!(
-            path.file_name().and_then(|name| name.to_str()),
-            Some("engine-config-12.json")
-        );
-        let read: proto::config::EngineConfig =
-            serde_json::from_slice(&std::fs::read(&path).expect("the file")).expect("its JSON");
-        assert_eq!(read, config);
-
-        // A second engine of the same epoch finds the same file, unchanged.
-        let again = write_engine_config(&directory, 12, &config).expect("the same file");
-        assert_eq!(again, path);
         let _ = std::fs::remove_dir_all(&directory);
     }
 

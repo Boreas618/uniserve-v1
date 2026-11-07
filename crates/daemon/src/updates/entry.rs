@@ -22,8 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use anyhow::Context as _;
-use proto::request::wire;
+use proto::config::EngineConfig;
 use tracing::info;
 
 use crate::engine::client::EngineState;
@@ -94,65 +93,41 @@ const LEDGER_READ: Duration = Duration::from_secs(10);
 /// start, the probed components and whether PC sampling was enabled before
 /// the capture (`profiling_config.graph_pc_sampling`), and takes a new
 /// world.
-fn switches_probes_only(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
+fn switches_probes_only(served: &EngineConfig, target: &EngineConfig) -> bool {
     let mut switched = comparable(served);
-    if let (Some(served), Some(target)) = (switched.profiling.as_mut(), target.profiling.as_ref()) {
-        served.fence_probes = target.fence_probes;
-        served.fence_probes_off.clone_from(&target.fence_probes_off);
-    }
+    switched.profiling.fence_probes = target.profiling.fence_probes;
+    switched
+        .profiling
+        .fence_probes_off
+        .clone_from(&target.profiling.fence_probes_off);
     switched == comparable(target)
 }
 
-/// The parts of `spec` a configuration states: without the world's identity,
-/// the layout of its cache, the worlds it retires as it starts and the
-/// weights it receives, which the world's history sets.
-fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
-    let mut comparable = wire::EngineSpec {
-        world: 0,
-        predecessor: None,
-        segments: Vec::new(),
-        retire: Vec::new(),
-        received_weights: Vec::new(),
-        expert_order: Default::default(),
-        stage_cache: false,
-        cache_keys: Vec::new(),
-        ..spec.clone()
-    };
-    // The file path is diagnostic; the resolved contents define the ranks.
-    if let Some(ranks) = comparable.rank_layout.as_mut() {
-        ranks.worker_groups.clear();
-    }
+/// The parts of `config` a replica compares: all of it but what the program
+/// layer owns (§7.7), the program backends, the scheduling policy, the expert
+/// exchange and the speculative cost figures. A change reaches a replica only
+/// once the program layer has answered for those.
+fn comparable(config: &EngineConfig) -> EngineConfig {
+    let mut comparable = config.clone();
+    comparable.attention_backend = String::new();
+    comparable.prefill_attention_backend = None;
+    comparable.decode_attention_backend = None;
+    comparable.moe_runner_backend = None;
+    comparable.scheduler.policy = proto::config::SchedulerConfig::default().policy;
+    comparable.moe.exchange = proto::config::MoeConfig::default().exchange;
+    comparable.speculative.expected_speedup = None;
+    comparable.speculative.refill_token_cost = None;
     comparable
 }
 
-fn devices(
-    spec: &wire::EngineSpec,
-) -> anyhow::Result<std::collections::BTreeSet<(String, String)>> {
-    Ok(engine::EngineConfig::from_spec(spec)?
-        .worker_groups
-        .into_iter()
-        .flat_map(|group| group.ranks.into_iter().map(|rank| (rank.host, rank.device)))
-        .collect())
-}
-
 /// Keeps an existing replica's assigned devices when an update changes its
-/// execution options without requesting a different set of ranks.
-#[expect(
-    clippy::unwrap_used,
-    reason = "EngineConfig::from_spec requires the ranks before this mutation"
-)]
-fn retain_devices(served: &wire::EngineSpec, target: &mut wire::EngineSpec) -> anyhow::Result<()> {
-    if served
-        .rank_layout
-        .as_ref()
-        .is_some_and(|ranks| ranks.worker_groups_content.is_empty())
-    {
-        return Ok(());
-    }
-    let source = engine::EngineConfig::from_spec(served)?;
-    let mut destination = engine::EngineConfig::from_spec(target)?;
-    for group in &mut destination.worker_groups {
-        if let Some(before) = source
+/// execution options without requesting a different set of ranks: each
+/// group of `target` that `served` places with as many ranks keeps the
+/// served group's ranks.
+fn retain_devices(served: &EngineConfig, target: &mut EngineConfig) {
+    for group in &mut target.parallel.worker_groups {
+        if let Some(before) = served
+            .parallel
             .worker_groups
             .iter()
             .find(|before| before.id == group.id)
@@ -161,174 +136,16 @@ fn retain_devices(served: &wire::EngineSpec, target: &mut wire::EngineSpec) -> a
             group.ranks.clone_from(&before.ranks);
         }
     }
-    target.rank_layout.as_mut().unwrap().worker_groups_content =
-        proto::config::WorkerGroupConfig::to_file(&destination.worker_groups)?;
-    Ok(())
-}
-
-/// Assigns each distinct requested GPU once. Several numerical worker
-/// groups sharing a GPU keep that relationship in the successor.
-#[expect(
-    clippy::unwrap_used,
-    reason = "EngineConfig::from_spec requires the ranks before this mutation"
-)]
-fn assign_devices(
-    target: &mut wire::EngineSpec,
-    mut available: BTreeMap<String, Vec<u32>>,
-    explicit: bool,
-) -> anyhow::Result<()> {
-    let mut config = engine::EngineConfig::from_spec(target)?;
-    let mut assigned = BTreeMap::<(String, String), String>::new();
-    for group in &mut config.worker_groups {
-        for rank in &mut group.ranks {
-            let key = (rank.host.clone(), rank.device.clone());
-            if let Some(device) = assigned.get(&key) {
-                rank.device.clone_from(device);
-                continue;
-            }
-            let free = available
-                .get_mut(&rank.host)
-                .with_context(|| format!("no GPU inventory for host {}", rank.host))?;
-            let index = if explicit {
-                let device = rank
-                    .device
-                    .strip_prefix("cuda:")
-                    .context("a replica rank must name a CUDA device")?
-                    .parse::<u32>()?;
-                free.iter().position(|candidate| *candidate == device)
-                    .with_context(|| format!("host {} device {} is occupied; the replica successor needs disjoint GPUs", rank.host, rank.device))?
-            } else {
-                anyhow::ensure!(
-                    !free.is_empty(),
-                    "host {} has insufficient free GPUs for the replica successor",
-                    rank.host
-                );
-                0
-            };
-            let device = format!("cuda:{}", free.remove(index));
-            assigned.insert(key, device.clone());
-            rank.device = device;
-        }
-    }
-    target.rank_layout.as_mut().unwrap().worker_groups_content =
-        proto::config::WorkerGroupConfig::to_file(&config.worker_groups)?;
-    Ok(())
-}
-
-/// Whether `target` states another parallel configuration than `served`:
-/// other ranks, devices or hosts (a deployment file by its content), another
-/// device of a generation tower
-/// (the worker mesh), another division of the routed experts, or another
-/// page size of the KV cache. Each GPU of the successor then holds other
-/// regions of the logical tensors: its weights are keyed by those regions,
-/// so a chunk of the same key on its GPU is mapped and the rest
-/// redistributed, and its KV cache is laid out for its own heads and
-/// pages, so it maps none of the serving world's segments and the requests
-/// in flight compute their state again.
-fn parallel_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
-    let ranks = |spec: &wire::EngineSpec| {
-        spec.rank_layout.as_ref().map(|rank_layout| {
-            (
-                rank_layout.worker_groups_content.clone(),
-                rank_layout.tensor_parallel_size,
-                rank_layout.data_parallel_size,
-                rank_layout.device.clone(),
-                rank_layout.devices.clone(),
-                rank_layout.worker_hosts.clone(),
-            )
-        })
-    };
-    let mesh = |spec: &wire::EngineSpec| spec.workers.as_ref().map(|workers| workers.mesh.clone());
-    let pages = |spec: &wire::EngineSpec| spec.kv_cache.as_ref().map(|cache| cache.block_size);
-    served.host != target.host
-        || ranks(served) != ranks(target)
-        || mesh(served) != mesh(target)
-        || pages(served) != pages(target)
-        || served.experts != target.experts
 }
 
 /// Changes outside a successor's current process-control contract. Rank
 /// resources and numerical layouts are planned by the target world.
-fn differing(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'static str> {
+fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> {
     let mut parts = Vec::new();
-    let mut differs = |name: &'static str, same: bool| {
-        if !same {
-            parts.push(name);
-        }
-    };
-    differs("the deployment", served.deployment == target.deployment);
-    parts
-}
-
-/// The parts of the engine spec a world change changes that key the
-/// weights by what they are loaded from (`reloads`): the model's files, the
-/// dtype, the quantization, the load format and the weight source. The
-/// successor loads the weights of other keys from the model's files and
-/// maps those whose keys stay.
-fn reloads(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'static str> {
-    let mut parts = Vec::new();
-    if served.model != target.model {
-        parts.push("the model");
-    }
-    if let (Some(old), Some(new)) = (&served.workers, &target.workers) {
-        for (name, same) in [
-            ("the dtype", old.dtype == new.dtype),
-            ("the quantization", old.quantization == new.quantization),
-            ("the load format", old.load_format == new.load_format),
-            ("the weight source", old.weights == new.weights),
-        ] {
-            if !same {
-                parts.push(name);
-            }
-        }
+    if served.deployment != target.deployment {
+        parts.push("the deployment");
     }
     parts
-}
-
-/// The encoding of a world's KV cache: its configured dtype, else the
-/// compute dtype each layer's cache follows, with the quantization that may
-/// scale it.
-fn kv_encoding(spec: &wire::EngineSpec) -> (String, String, String) {
-    let configured = spec
-        .kv_cache
-        .as_ref()
-        .map(|kv| kv.dtype.clone())
-        .unwrap_or_default();
-    let (compute, quantization) = spec
-        .workers
-        .as_ref()
-        .map_or_else(Default::default, |workers| {
-            (workers.dtype.clone(), workers.quantization.clone())
-        });
-    (configured, compute, quantization)
-}
-
-/// Whether the successor's KV cache is encoded otherwise than the serving
-/// world's, which it then cannot read: a class-丙 change of
-/// `specs/online-operations.md` §4.6 without a conversion, so the requests
-/// in flight compute their state again and the successor maps none of the
-/// serving world's segments.
-fn kv_encoding_changes(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
-    kv_encoding(served) != kv_encoding(target)
-}
-
-/// Changes that need the target ranks' capacity plan even when their
-/// numerical tensor regions stay on the same devices. A different quota,
-/// queue, cache or media configuration must not inherit a budget measured
-/// for the serving world's resources.
-fn resource_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
-    served.rank_layout != target.rank_layout
-        || served.transfer != target.transfer
-        || served.kv_cache != target.kv_cache
-        || served.video != target.video
-}
-
-/// A successor with another capacity lays out its own segments. Importing
-/// the source's full segments could exceed a smaller target capacity;
-/// warming copies only the accepted prefixes into the target's own pool.
-fn cache_capacity_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
-    let tokens = |spec: &wire::EngineSpec| spec.kv_cache.as_ref().and_then(|kv| kv.max_tokens);
-    tokens(served) != tokens(target)
 }
 
 impl Leader {
@@ -555,18 +372,13 @@ impl Leader {
             .unwrap_or(previous_epoch)
             .max(previous_epoch)
             + 1;
-        // The epoch's own build config is written once, and the launch file
-        // every process of it reads names that path (§2.3). The world is the
-        // epoch's identity, which the switch claims.
-        control
-            .write_engine_config(target_epoch, &next.engine)
-            .map_err(UpdateError::Failed)?;
-        // The target's spec is resolved as a deployment's start resolves it: the options state the
-        // scheduler and the rank layout, and the model's files complete what they determine.
-        let mut spec = Leader::prepare(&target, &crate::options::Stated::from_paths(Vec::new()))
+        // The target's engine configuration is resolved as a deployment's start resolves it: the
+        // options state the scheduler and the rank layout, and the model's files complete what they
+        // determine. Its launch file carries it whole (§2.3).
+        let engine = Leader::prepare(&target, &crate::options::Stated::from_paths(Vec::new()))
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?
-            .spec;
+            .engine;
         // Other model files serve the deployment's requests only when they are processed as the
         // serving ones are: the same tokenizer, templates, generation defaults and model facts.
         if current.model() != target.model() {
@@ -574,7 +386,7 @@ impl Leader {
                 .await
                 .map_err(UpdateError::Refused)?;
             let served = locked(&replicas[0].served).clone();
-            if served.is_some_and(|served| served.model_facts != spec.model_facts) {
+            if served.is_some_and(|served| served.engine_config.model.facts != engine.model.facts) {
                 return Err(UpdateError::Refused(format!(
                     "the model at {} has other generation limits, control tokens or context \
                      length than the served model, which change how requests are processed: \
@@ -583,7 +395,8 @@ impl Leader {
                 )));
             }
         }
-        spec.world = target_epoch;
+        let mut args = proto::config::EngineArgs::new(engine);
+        args.world = target_epoch;
         // §7.4 step 1: the target's main processes start as the serving
         // process's standby — they map the predecessor's cache read-only and
         // park — so the storage of an epoch has one writer while both run.
@@ -591,16 +404,16 @@ impl Leader {
         // engine can state; without them the child would map nothing and the
         // launch would be a serving process's, claiming the same scopes
         // writably. The engine states as well the world that created them, which
-        // is what they are keyed by, and not the target's own `spec.world`: the
+        // is what they are keyed by, and not the target's own `args.world`: the
         // successor reads one world while it serves the next, an epoch that took
         // storage over keys it as its creator did, and one relaunched created
         // its own.
-        spec.predecessor = Some(serving_client.describe_cache().await.map_err(|reason| {
+        args.predecessor = Some(serving_client.describe_cache().await.map_err(|reason| {
             UpdateError::Refused(format!(
                 "the serving epoch named no cache segments for its standby: {reason}"
             ))
         })?);
-        let joining = (!dry_run).then(|| spec.clone());
+        let joining = (!dry_run).then(|| args.clone());
         let change = crate::updates::epoch::EpochChange {
             previous: previous_epoch,
             target: target_epoch,
@@ -608,7 +421,7 @@ impl Leader {
             update: crate::epoch::Update::new(target_epoch, next.clone()),
             group: group.to_owned(),
             start: control
-                .epoch_start(&spec, spawn_generation)
+                .epoch_start(&args, spawn_generation)
                 .map_err(UpdateError::Failed)?,
             previous_world: serving.world,
             previous_generation,
@@ -624,13 +437,13 @@ impl Leader {
             self.end_profiles("world change").await;
         }
         let applied = self.updates.apply(&previous, &next, change, dry_run);
-        if let (Ok(_), Some(spec)) = (&applied, joining) {
+        if let (Ok(_), Some(args)) = (&applied, joining) {
             self.updates.await_programs(&target.host_identity);
             replicas[0].follow_switch(
                 Arc::clone(control),
                 Arc::clone(&self.updates),
                 crate::leader::SwitchTarget {
-                    spec,
+                    args,
                     config: target.clone(),
                     programs,
                     servers,
@@ -867,23 +680,17 @@ impl Replica {
             return Ok(Applied::Unchanged);
         }
         let served = locked(&self.served).clone().ok_or(UpdateError::NoEngine)?;
-        // The target's engine spec is resolved as a deployment's start
-        // resolves it: from the options, completed by what the model's files
-        // determine.
+        // The target's engine configuration is resolved as a deployment's
+        // start resolves it: from the options, completed by what the model's
+        // files determine, and divided into the deployment's replicas.
         let prepared = Leader::prepare(&target, &stated)
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-        let prepared_specs = engine::EngineConfig::replica_specs(&prepared.spec)
+        let replicas = crate::leader::replica_configs(&prepared.engine)
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-        let prepared_spec = prepared_specs.get(self.ordinal).cloned().ok_or_else(|| {
+        let mut target_engine = replicas.get(self.ordinal).cloned().ok_or_else(|| {
             UpdateError::Refused("the target changes the replica group".to_owned())
         })?;
-        let mut target_spec = wire::EngineSpec {
-            world: 0,
-            predecessor: None,
-            segments: Vec::new(),
-            ..prepared_spec
-        };
         let explicit_devices = target.worker_groups.is_some()
             || (stated.contains("device_config.device") && target.device_config.device != "cuda")
             || !target.device_config.devices.is_empty();
@@ -891,31 +698,31 @@ impl Replica {
             && target.tensor_parallel_size == current.tensor_parallel_size
             && target.data_parallel_size == current.data_parallel_size
             && target.device_config.worker_hosts == current.device_config.worker_hosts
-            && target_spec.host == served.host
+            && target_engine.parallel.engine_host == served.engine_config.parallel.engine_host
         {
-            retain_devices(&served, &mut target_spec)
-                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+            retain_devices(&served.engine_config, &mut target_engine);
         }
         let running = self.hold().client().ok_or(UpdateError::NoEngine)?;
         let daemon_changes = crate::options::daemon_options_differ(&current, &target);
         let in_place = crate::leader::configurable(
-            &comparable(&served),
-            &comparable(&target_spec),
+            &comparable(&served.engine_config),
+            &comparable(&target_engine),
             running.info().capacity.as_ref(),
         );
         // A successor serving other model files processes requests as the
         // daemon does only with the same tokenizer, templates, generation
         // defaults and model facts.
-        if served.model != target_spec.model {
-            crate::leader::same_processing(&served.model, &target_spec.model)
+        let served_model = &served.engine_config.model;
+        if served_model.model != target_engine.model.model {
+            crate::leader::same_processing(&served_model.model, &target_engine.model.model)
                 .await
                 .map_err(UpdateError::Refused)?;
-            if served.model_facts != target_spec.model_facts {
+            if served_model.facts != target_engine.model.facts {
                 return Err(UpdateError::Refused(format!(
                     "the model at {} has other generation limits, control tokens or context \
                      length than the served model, which change how requests are processed: \
                      deploy it instead",
-                    target_spec.model
+                    target_engine.model.model
                 )));
             }
         }
@@ -925,7 +732,7 @@ impl Replica {
             return Ok(Applied::Planned(serde_json::json!({
                 "daemon": daemon_changes,
                 "scheduling": in_place,
-                "fence_probes": switches_probes_only(&served, &target_spec),
+                "fence_probes": switches_probes_only(&served.engine_config, &target_engine),
             })));
         }
         // The daemon orchestrates what changes in its own options: a hot
@@ -941,16 +748,9 @@ impl Replica {
         // The fence probes' switch alone changes in place: every worker
         // writes its device switch at the engine's next step boundary, and
         // the graphs that captured the probes stay.
-        if switches_probes_only(&served, &target_spec) {
-            let enabled = target_spec
-                .profiling
-                .as_ref()
-                .is_some_and(|profiling| profiling.fence_probes);
-            let off = target_spec
-                .profiling
-                .as_ref()
-                .map(|profiling| profiling.fence_probes_off.clone())
-                .unwrap_or_default();
+        if switches_probes_only(&served.engine_config, &target_engine) {
+            let enabled = target_engine.profiling.fence_probes;
+            let off = target_engine.profiling.fence_probes_off.clone();
             running
                 .hook(
                     "uniserve.fence_switch",
@@ -965,9 +765,9 @@ impl Replica {
                 ?off,
                 "the workers switched the fence probes in place"
             );
-            let mut spec = served;
-            spec.profiling = target_spec.profiling;
-            *locked(&self.served) = Some(spec);
+            let mut args = served;
+            args.engine_config = target_engine;
+            *locked(&self.served) = Some(args);
             *locked(&self.config) = target;
             return Ok(Applied::InPlace(
                 serde_json::json!({ "in_place": ["the fence probes"] }),
@@ -975,11 +775,11 @@ impl Replica {
         }
         // A scheduling limit is a parameter of the policy program, so the program layer above has
         // moved the schedulers to it (§7.7) or found they run it already. What is left is the
-        // record of it here: the spec the next apply compares with.
+        // record of it here: the arguments the next apply compares with.
         if in_place {
-            let mut spec = served;
-            spec.scheduling = target_spec.scheduling;
-            *locked(&self.served) = Some(spec);
+            let mut args = served;
+            args.engine_config = target_engine;
+            *locked(&self.served) = Some(args);
             *locked(&self.config) = target;
             return Ok(Applied::InPlace(
                 serde_json::json!({ "in_place": ["the scheduling limits"] }),
@@ -997,7 +797,7 @@ impl Replica {
         Err(UpdateError::Refused(format!(
             "the change fits no layer: it would have needed a successor engine ({}) and the \
              epoch layer starts one main process from the build config",
-            differing(&served, &target_spec).join(", ")
+            differing(&served.engine_config, &target_engine).join(", ")
         )))
     }
 }
@@ -1006,70 +806,64 @@ impl Replica {
 mod tests {
     use super::*;
 
-    /// A change of the scheduling alone, within the batch the workers were
-    /// started for, is in place for a world that a change started, whose
-    /// spec carries its identity and its cache's layout.
+    /// The default deployment's engine configuration.
+    fn config() -> EngineConfig {
+        crate::options::ServerArgs::default()
+            .engine_config()
+            .expect("the configuration resolves")
+    }
+
+    /// The fence probes' switch, and a component's probes switched off, change in place; the
+    /// probed components and PC sampling shape the captured graphs and take a new world.
     #[test]
     fn only_the_fence_probes_switch_changes_profiling_in_place() {
-        let spec = |profiling: wire::Profiling| wire::EngineSpec {
-            profiling: Some(profiling),
-            ..wire::EngineSpec::default()
+        let profiled = |profiling: proto::config::ProfilingConfig| EngineConfig {
+            profiling,
+            ..config()
         };
-        let served = spec(wire::Profiling {
+        let served = profiled(proto::config::ProfilingConfig {
             fence_probes: true,
             fence_components: vec!["*.Transformer".to_owned()],
             fence_probes_off: Vec::new(),
             graph_pc_sampling: false,
         });
-        let switched = spec(wire::Profiling {
+        let switched = profiled(proto::config::ProfilingConfig {
             fence_probes: false,
-            ..served.profiling.clone().unwrap()
+            ..served.profiling.clone()
         });
         assert!(switches_probes_only(&served, &switched));
         // A component's probes switch off in place too.
-        let thinned = spec(wire::Profiling {
+        let thinned = profiled(proto::config::ProfilingConfig {
             fence_probes_off: vec!["*.Attention".to_owned()],
-            ..served.profiling.clone().unwrap()
+            ..served.profiling.clone()
         });
         assert!(switches_probes_only(&served, &thinned));
         for world in [
-            wire::Profiling {
+            proto::config::ProfilingConfig {
                 graph_pc_sampling: true,
-                ..served.profiling.clone().unwrap()
+                ..served.profiling.clone()
             },
-            wire::Profiling {
+            proto::config::ProfilingConfig {
                 fence_components: vec!["*.TransformerLayer".to_owned()],
-                ..served.profiling.clone().unwrap()
+                ..served.profiling.clone()
             },
         ] {
-            assert!(!switches_probes_only(&served, &spec(world)));
+            assert!(!switches_probes_only(&served, &profiled(world)));
         }
     }
 
+    /// A change of the scheduling limits alone, within the batch the workers were started for, is
+    /// in place, and a value the program layer owns does not stand in its way: the program layer
+    /// answered for it before the change reached the replica.
     #[test]
-    fn a_scheduling_change_of_a_successor_world_is_in_place() {
-        let scheduling = |running: u32| wire::Scheduling {
-            max_running_requests: running,
-            max_batch: 8,
-            ..Default::default()
-        };
-        let served = wire::EngineSpec {
-            model: "a".into(),
-            world: 3,
-            segments: vec![wire::CacheSegments {
-                worker_group: "model".into(),
-                ..Default::default()
-            }],
-            scheduling: Some(scheduling(8)),
-            ..Default::default()
-        };
-        let target = wire::EngineSpec {
-            world: 0,
-            segments: Vec::new(),
-            scheduling: Some(scheduling(4)),
-            ..served.clone()
-        };
-        let capacity = wire::BatchCapacity {
+    fn a_scheduling_change_is_in_place_beside_what_the_program_layer_owns() {
+        let mut served = config();
+        served.scheduler.max_batch = std::num::NonZeroUsize::new(8).unwrap();
+        served.max_running_requests = std::num::NonZeroUsize::new(8).unwrap();
+        let mut target = served.clone();
+        target.max_running_requests = std::num::NonZeroUsize::new(4).unwrap();
+        target.attention_backend = "trtllm".to_owned();
+        let capacity = proto::request::wire::BatchCapacity {
             max_batch: 8,
             max_num_batched_tokens: 8192,
             max_running_requests: 8,
@@ -1077,6 +871,11 @@ mod tests {
         assert!(crate::leader::configurable(
             &comparable(&served),
             &comparable(&target),
+            Some(&capacity)
+        ));
+        assert!(!crate::leader::configurable(
+            &served,
+            &target,
             Some(&capacity)
         ));
     }
@@ -1087,7 +886,7 @@ mod tests {
     fn a_resolved_deployment_keeps_its_ranks_when_the_file_changes() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("deployment.toml");
-        let spec = |ranks: &str| {
+        let resolve = |ranks: &str| {
             std::fs::write(
                 &path,
                 format!(
@@ -1096,20 +895,18 @@ mod tests {
                 ),
             )
             .unwrap();
-            let config = crate::options::ServerArgs {
+            crate::options::ServerArgs {
                 worker_groups: Some(path.clone()),
                 ..Default::default()
-            };
-            let mut resolved = config.engine_spec().unwrap();
-            resolved.model_facts = Some(wire::ModelFacts::default());
-            resolved
+            }
+            .engine_config()
+            .unwrap()
         };
-        let served = spec(r#"["rank-0/cuda:0", "rank-0/cuda:1"]"#);
-        let moved = spec(r#"["rank-1/cuda:0", "rank-1/cuda:1"]"#);
+        let served = resolve(r#"["rank-0/cuda:0", "rank-0/cuda:1"]"#);
+        let moved = resolve(r#"["rank-1/cuda:0", "rank-1/cuda:1"]"#);
         std::fs::remove_file(path).unwrap();
         for (resolved, host) in [(served, "rank-0"), (moved, "rank-1")] {
-            let engine = engine::EngineConfig::from_spec(&resolved).unwrap();
-            let ranks = &engine.worker_groups[0].ranks;
+            let ranks = &resolved.parallel.worker_groups[0].ranks;
             assert_eq!(ranks.len(), 2);
             assert!(ranks.iter().all(|rank| rank.host == host));
             assert_eq!(ranks[0].device, "cuda:0");

@@ -20,7 +20,6 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use proto::request::wire;
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
@@ -155,16 +154,8 @@ impl RemoteHold {
             let world = attachment.world;
             let engine = attachment.engine;
             let attached = tokio::task::spawn_blocking(move || {
-                let client = control.adopt(
-                    engine,
-                    engine + 1,
-                    wire::EngineSpec {
-                        world,
-                        ..Default::default()
-                    },
-                    None,
-                    Box::new(|_, _, _| {}),
-                )?;
+                let client =
+                    control.adopt(engine, engine + 1, world, None, Box::new(|_, _, _| {}))?;
                 client.number_requests_from(first);
                 Ok::<_, anyhow::Error>(client)
             })

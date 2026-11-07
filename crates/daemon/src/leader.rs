@@ -137,8 +137,8 @@ pub enum Task {
 
 /// What a replica needs to follow an epoch switch onto its target (§7.4).
 pub(crate) struct SwitchTarget {
-    /// The spec the target is welcomed with.
-    pub(crate) spec: wire::EngineSpec,
+    /// The arguments the target's process started with.
+    pub(crate) args: proto::config::EngineArgs,
     /// The configuration the target serves.
     pub(crate) config: ServerArgs,
     /// The programs the target takes before it is promoted.
@@ -181,13 +181,68 @@ pub(crate) fn outcomes() -> (u64, u64) {
     )
 }
 
+/// The engine configuration of each data-parallel replica of `config`: independent replicas each
+/// run their own engine process on their own worker groups, while schedulers whose expert-parallel
+/// groups exchange experts stay in one.
+///
+/// # Errors
+///
+/// Fails when the worker groups do not form equal replicas, when the transfer edges do not parse,
+/// or when a transfer edge connects two replicas.
+pub(crate) fn replica_configs(
+    config: &proto::config::EngineConfig,
+) -> anyhow::Result<Vec<proto::config::EngineConfig>> {
+    let count = config.parallel.data_parallel_size.get();
+    if count == 1 || config.moe.expert_parallel {
+        return Ok(vec![config.clone()]);
+    }
+    let groups = &config.parallel.worker_groups;
+    anyhow::ensure!(
+        !groups.is_empty() && groups.len().is_multiple_of(count),
+        "the worker groups must form {count} equal independent replicas"
+    );
+    let transfers = config
+        .device
+        .transfer
+        .as_deref()
+        .unwrap_or_default()
+        .parse::<engine::TransferConfig>()
+        .context("invalid `device_config.transfer`")?;
+    groups
+        .chunks(groups.len() / count)
+        .map(|groups| {
+            let contains =
+                |id: &proto::config::WorkerGroupId| groups.iter().any(|group| &group.id == id);
+            let mut local = engine::TransferConfig::default();
+            for edge in &transfers.edges {
+                let source = contains(&edge.source_worker);
+                let destination = contains(&edge.destination_worker);
+                anyhow::ensure!(
+                    source == destination,
+                    "a transfer edge connects independent replicas: {} -> {}",
+                    edge.source_worker,
+                    edge.destination_worker
+                );
+                if source {
+                    local.edges.push(edge.clone());
+                }
+            }
+            let mut replica = config.clone();
+            replica.parallel.data_parallel_size = std::num::NonZeroUsize::MIN;
+            replica.parallel.worker_groups = groups.to_vec();
+            replica.device.transfer = (!local.edges.is_empty()).then(|| local.to_string());
+            Ok(replica)
+        })
+        .collect()
+}
+
 /// What a leader prepares before it has an engine (`Leader::prepare`).
 pub(crate) struct Prepared {
     model_config: ModelConfig,
     tokenizer: crate::tokenizer::DynTokenizer,
     renderer: LoadedRenderer,
-    /// The spec of the engine that serves the model.
-    pub(crate) spec: wire::EngineSpec,
+    /// The deployment's engine configuration, with the facts the model's files determine.
+    pub(crate) engine: proto::config::EngineConfig,
     max_model_len: u32,
 }
 
@@ -518,8 +573,8 @@ impl Leader {
     ///
     /// Fails when the model assets cannot be resolved, when an option of
     /// another model family was stated ([`Stated::refuse_foreign_options`]),
-    /// when the options do not form an engine spec
-    /// ([`ServerArgs::engine_spec`]), when the engine process fails to
+    /// when the options do not resolve into an engine configuration
+    /// ([`ServerArgs::engine_config`]), when the engine process fails to
     /// start, or when the model cannot be bound to the capabilities its
     /// workers report.
     pub async fn start(
@@ -530,7 +585,7 @@ impl Leader {
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(config, stated).await?;
-        info!(rank_layout = ?prepared.spec.rank_layout, "starting the engine process");
+        info!(parallel = ?prepared.engine.parallel, "starting the engine process");
         let control = Arc::new(EngineControl::new(
             &config.request_socket(),
             daemon,
@@ -538,20 +593,18 @@ impl Leader {
             config.served_model_name().to_owned(),
             config.program_server.clone(),
         )?);
-        let specs = engine::EngineConfig::replica_specs(&prepared.spec)?;
-        // The epoch's build config: every main process of it reads these bytes.
-        let build = config.engine_config()?;
+        let replicas = replica_configs(&prepared.engine)?;
         let clients =
-            futures::future::join_all(specs.into_iter().enumerate().map(|(index, mut spec)| {
+            futures::future::join_all(replicas.into_iter().enumerate().map(|(index, replica)| {
                 let model = config.model().to_owned();
                 let starting = Arc::clone(&control);
-                let build = build.clone();
                 tokio::task::spawn_blocking(move || {
                     let observer = Arc::new(crate::observe::Observer::default());
                     let sink = stats_sink(model, Arc::clone(&observer), index);
-                    let client = starting.start(spec.clone(), &build, sink)?;
-                    spec.world = client.world();
-                    Ok::<_, anyhow::Error>((client, spec, observer))
+                    let mut args = proto::config::EngineArgs::new(replica);
+                    let client = starting.start(args.clone(), sink)?;
+                    args.world = client.world();
+                    Ok::<_, anyhow::Error>((client, args, observer))
                 })
             }))
             .await
@@ -569,7 +622,7 @@ impl Leader {
         let mut clients = clients.into_iter();
         let (client, served, observer) = clients
             .next()
-            .context("the engine spec starts no replicas")?;
+            .context("the engine configuration starts no replicas")?;
         let leader = Self::finish(
             config,
             prepared,
@@ -817,8 +870,8 @@ impl Leader {
     }
 
     /// What a leader prepares before it has an engine: the model's files
-    /// and the spec of the engine that serves it, as [`Leader::start`]
-    /// describes.
+    /// and the engine configuration of the engine that serves it, as
+    /// [`Leader::start`] describes.
     ///
     /// # Errors
     ///
@@ -838,10 +891,10 @@ impl Leader {
 
         // The options state the scheduler and the rank layout; the loaded model
         // completes what it determines.
-        let mut spec = config.engine_spec()?;
+        let mut engine = config.engine_config()?;
         let control_tokens = special_token_ids(&model_config);
-        spec.model_facts = Some(wire::ModelFacts {
-            limits: Some((&model_config.generation_limits(config.dtype)).into()),
+        engine.model.facts = Some(proto::config::ModelFacts {
+            limits: model_config.generation_limits(config.dtype),
             bos: control_tokens.bos,
             eos: control_tokens.eos,
             end_of_image: control_tokens.end_of_image,
@@ -856,24 +909,22 @@ impl Leader {
         // the configured resolutions and aspect ratios, refusing a pair it
         // does not generate, and report them back as the only canvases
         // requests may target. Other models prepare none.
-        if !matches!(model_config.parameters, ModelParameters::MiniMaxH3)
-            && let Some(video) = spec.video.as_mut()
-        {
-            video.resolutions.clear();
-            video.aspect_ratios.clear();
+        if !matches!(model_config.parameters, ModelParameters::MiniMaxH3) {
+            engine.video.resolutions.clear();
+            engine.video.aspect_ratios.clear();
         }
 
         Ok(Prepared {
             model_config,
             tokenizer,
             renderer,
-            spec,
+            engine,
             max_model_len,
         })
     }
 
     /// The leader of `prepared`'s model over the engine `client` serves,
-    /// which `control` started (or adopted) with the spec `served`.
+    /// which `control` started (or adopted) with the arguments `served`.
     ///
     /// # Errors
     ///
@@ -884,7 +935,7 @@ impl Leader {
         prepared: Prepared,
         control: Arc<EngineControl>,
         client: EngineClient,
-        served: wire::EngineSpec,
+        served: proto::config::EngineArgs,
         observer: Arc<crate::observe::Observer>,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
@@ -892,7 +943,7 @@ impl Leader {
             model_config,
             tokenizer,
             renderer,
-            spec: _,
+            engine: _,
             max_model_len: _,
         } = prepared;
         let model_name = config.model().to_owned();
@@ -1653,7 +1704,7 @@ impl Leader {
             return Ok(None);
         }
         // From here only the programs can differ. The descriptors a
-        // `prepare` builds modules for come from the epoch's engine spec,
+        // `prepare` builds modules for come from the epoch's engine configuration,
         // which this decision does not resolve: the main process resolves
         // the modules it needs when it loads them (`resolve`), so the
         // selection and the revisions are what this call is for.
@@ -1819,7 +1870,7 @@ pub(crate) struct EngineHandoff {
     pub(crate) client: Arc<EngineClient>,
     pub(crate) engine: u64,
     pub(crate) next_engine: u64,
-    pub(crate) served: wire::EngineSpec,
+    pub(crate) served: proto::config::EngineArgs,
     pub(crate) config: ServerArgs,
     /// New requests wait (`Leader::pause`).
     pub(crate) paused: bool,
@@ -1909,36 +1960,46 @@ pub enum UpdateError {
     Failed(#[from] anyhow::Error),
 }
 
-/// Whether `updated` differs from `served` in its scheduling alone, within
+/// Whether `updated` differs from `served` in its scheduling limits alone, within
 /// `capacity`, the batch the running engine's workers were started for: at
 /// most as many calls and tokens a step and running requests. The
 /// schedulers take such limits in place; any other change starts a standby
 /// engine.
 pub(crate) fn configurable(
-    served: &wire::EngineSpec,
-    updated: &wire::EngineSpec,
+    served: &proto::config::EngineConfig,
+    updated: &proto::config::EngineConfig,
     capacity: Option<&wire::BatchCapacity>,
 ) -> bool {
-    let (Some(new), Some(capacity)) = (updated.scheduling.as_ref(), capacity) else {
+    let Some(capacity) = capacity else {
         return false;
     };
-    let same_otherwise = wire::EngineSpec {
-        scheduling: served.scheduling.clone(),
-        ..updated.clone()
-    } == *served;
-    // A step's tokens left to the engine's default stay as they were.
-    let tokens = match new.max_num_batched_tokens {
-        Some(tokens) => u64::from(tokens) <= capacity.max_num_batched_tokens,
-        None => served
-            .scheduling
-            .as_ref()
-            .is_some_and(|served| served.max_num_batched_tokens.is_none()),
+    let limits = |config: &proto::config::EngineConfig| {
+        (
+            config.scheduler.max_batch,
+            config.scheduler.max_queued_requests,
+            config.scheduler.chunked_prefill_size,
+            config.max_num_batched_tokens,
+            config.max_running_requests,
+        )
     };
-    same_otherwise
-        && served.scheduling.as_ref() != Some(new)
+    let mut same_otherwise = updated.clone();
+    same_otherwise.scheduler = served.scheduler.clone();
+    same_otherwise.max_num_batched_tokens = served.max_num_batched_tokens;
+    same_otherwise.max_running_requests = served.max_running_requests;
+    // A step's tokens left to the engine's default stay as they were.
+    let tokens = match updated.max_num_batched_tokens {
+        Some(tokens) => u64::try_from(tokens.get())
+            .is_ok_and(|tokens| tokens <= capacity.max_num_batched_tokens),
+        None => served.max_num_batched_tokens.is_none(),
+    };
+    let within = |value: std::num::NonZeroUsize, bound: u32| {
+        u32::try_from(value.get()).is_ok_and(|value| value <= bound)
+    };
+    same_otherwise == *served
+        && limits(served) != limits(updated)
         && tokens
-        && (capacity.max_batch == 0 || new.max_batch <= capacity.max_batch)
-        && new.max_running_requests <= capacity.max_running_requests
+        && (capacity.max_batch == 0 || within(updated.scheduler.max_batch, capacity.max_batch))
+        && within(updated.max_running_requests, capacity.max_running_requests)
 }
 
 /// Whether the daemon processes requests for the checkpoint at `path` as
@@ -2056,12 +2117,12 @@ pub(crate) struct Replica {
     /// What starts the leader's engine processes; unset for an engine run
     /// elsewhere.
     pub(crate) control: std::sync::OnceLock<Arc<EngineControl>>,
-    /// The spec the serving engine serves with: the one it was started with
-    /// and the scheduling it took in place since, which a relaunch and the
+    /// The arguments the serving engine serves with: the ones it was started
+    /// with and the scheduling it took in place since, which a relaunch and the
     /// next update start from; unset with `control`.
-    pub(crate) served: std::sync::Mutex<Option<wire::EngineSpec>>,
-    /// The options the serving engine's spec was made from, which an update
-    /// overrides.
+    pub(crate) served: std::sync::Mutex<Option<proto::config::EngineArgs>>,
+    /// The options the serving engine's configuration was resolved from, which
+    /// an update overrides.
     pub(crate) config: std::sync::Mutex<ServerArgs>,
     /// The model their statistics are labelled with.
     pub(crate) model_name: String,
@@ -2179,7 +2240,7 @@ impl Replica {
     ) {
         let replica = Arc::clone(self);
         let SwitchTarget {
-            mut spec,
+            mut args,
             config,
             programs,
             servers,
@@ -2220,10 +2281,9 @@ impl Replica {
                 Arc::clone(&replica.observer),
                 replica.ordinal,
             );
-            let welcomed = spec.clone();
+            let world = args.world;
             let joined =
-                tokio::task::spawn_blocking(move || control.join_target(engine, welcomed, sink))
-                    .await;
+                tokio::task::spawn_blocking(move || control.join_target(engine, world, sink)).await;
             let client = match joined {
                 Ok(Ok(client)) => Arc::new(client),
                 Ok(Err(error)) => {
@@ -2240,11 +2300,11 @@ impl Replica {
             let host = config.host_identity.clone();
             let handing = Arc::clone(updates.epochs());
             let pinning = Arc::clone(&updates);
-            let target_page = spec
+            let target_page = args
+                .engine_config
                 .kv_cache
-                .as_ref()
-                .and_then(|kv| kv.block_size)
-                .unwrap_or(0);
+                .block_size
+                .map_or(0, std::num::NonZeroU32::get);
             let mut source = None;
             let handed = tokio::task::spawn_blocking(move || {
                 // The update names backends, and a revision is the Program Server's to select.
@@ -2326,10 +2386,10 @@ impl Replica {
             while updates.phase() == Some(crate::updates::switch::Phase::Serving) {
                 tokio::time::sleep(DRAIN_POLL).await;
             }
-            spec.predecessor = None;
-            let world = spec.world;
-            let before = locked(&replica.served).replace(spec);
-            // The configuration is the one the target serves from here, as the spec is, and a
+            args.predecessor = None;
+            let world = args.world;
+            let before = locked(&replica.served).replace(args);
+            // The configuration is the one the target serves from here, as its arguments are, and a
             // revert puts both back: the next apply starts from it, and the operator reads it.
             let config_before = std::mem::replace(&mut *locked(&replica.config), serving_config);
             // The previous client stays until the switch settles: it is what keeps the previous
@@ -2497,7 +2557,7 @@ impl Replica {
         self: &Arc<Self>,
         control: &Arc<EngineControl>,
         updates: &Arc<crate::updates::driver::Driver>,
-        spec: Option<wire::EngineSpec>,
+        args: Option<proto::config::EngineArgs>,
         config: &ServerArgs,
     ) -> anyhow::Result<Arc<EngineClient>> {
         let host = config.host_identity.clone();
@@ -2505,7 +2565,7 @@ impl Replica {
             .epochs()
             .next_generation(crate::engine::control::ENGINE_GROUP, 0);
         let started = self
-            .start_previous(control, updates, spec, config, generation)
+            .start_previous(control, updates, args, config, generation)
             .await;
         // Whether or not it serves, the switch has nothing left to wait for.
         updates.relaunched(&host, generation);
@@ -2517,20 +2577,19 @@ impl Replica {
         self: &Arc<Self>,
         control: &Arc<EngineControl>,
         updates: &Arc<crate::updates::driver::Driver>,
-        spec: Option<wire::EngineSpec>,
+        args: Option<proto::config::EngineArgs>,
         config: &ServerArgs,
         generation: u64,
     ) -> anyhow::Result<Arc<EngineClient>> {
-        let spec = spec.context("the replica has no served spec")?;
+        let args = args.context("the replica has no served arguments")?;
         let sink = stats_sink(
             self.model_name.clone(),
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let build = config.engine_config()?;
         let starting = Arc::clone(control);
         let client = Arc::new(
-            tokio::task::spawn_blocking(move || starting.start_at(spec, generation, &build, sink))
+            tokio::task::spawn_blocking(move || starting.start_at(args, generation, sink))
                 .await??,
         );
         reload_adapters(self, &client).await;
@@ -2570,19 +2629,17 @@ impl Replica {
                 .get()
                 .context("the replica has no engine control")?,
         );
-        let spec = locked(&self.served)
+        let args = locked(&self.served)
             .clone()
-            .context("the replica has no served spec")?;
+            .context("the replica has no served arguments")?;
         self.hold.hold();
         let sink = stats_sink(
             self.model_name.clone(),
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let build = locked(&self.config).engine_config()?;
-        let client = Arc::new(
-            tokio::task::spawn_blocking(move || control.start(spec, &build, sink)).await??,
-        );
+        let client =
+            Arc::new(tokio::task::spawn_blocking(move || control.start(args, sink)).await??);
         reload_adapters(self, &client).await;
         // The epoch's programs, before this process serves: a relaunched main
         // process starts with none, and the epoch they belong to was installed
@@ -2774,7 +2831,7 @@ impl Replica {
         let Some((_, record)) = driver.epochs().serving() else {
             return true;
         };
-        let Some(served) = locked(&self.served).as_ref().map(|spec| spec.world) else {
+        let Some(served) = locked(&self.served).as_ref().map(|args| args.world) else {
             return true;
         };
         record.world == served
@@ -2849,7 +2906,7 @@ impl Replica {
                 None => {}
             }
         }
-        let Some(mut spec) = locked(&self.served).clone() else {
+        let Some(mut args) = locked(&self.served).clone() else {
             return Ok(());
         };
         let Some(driver) = self
@@ -2881,16 +2938,14 @@ impl Replica {
                 return Ok(());
             }
         };
-        spec.predecessor = Some(predecessor);
-        let build = locked(&self.config).engine_config()?;
+        args.predecessor = Some(predecessor);
         let sink = stats_sink(
             self.model_name.clone(),
             Arc::clone(&self.observer),
             self.ordinal,
         );
         let client = Arc::new(
-            tokio::task::spawn_blocking(move || control.start_at(spec, generation, &build, sink))
-                .await??,
+            tokio::task::spawn_blocking(move || control.start_at(args, generation, sink)).await??,
         );
         info!(
             generation,
@@ -3013,8 +3068,8 @@ impl Replica {
     }
 
     /// What a hot restart hands the successor of this leader's engine: its
-    /// client, its identity and the next engine identity, the spec it
-    /// serves and the options it was made from.
+    /// client, its identity and the next engine identity, the arguments it
+    /// serves with and the options they were resolved from.
     ///
     /// # Errors
     ///
@@ -3090,10 +3145,13 @@ impl Replica {
             asleep: self.asleep.load(Ordering::Acquire),
             replacing: self.replacing.try_lock().is_err(),
             in_flight: hold.client().map_or(0, |client| client.in_flight()),
-            executable: locked(&self.served)
-                .as_ref()
-                .and_then(|spec| spec.workers.as_ref())
-                .map(|workers| workers.executable.clone()),
+            executable: locked(&self.served).as_ref().map(|args| {
+                args.engine_config
+                    .worker
+                    .executable
+                    .to_string_lossy()
+                    .into_owned()
+            }),
         }
     }
 
@@ -3230,8 +3288,8 @@ impl Replica {
                 .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
             let facts = locked(&self.served)
                 .as_ref()
-                .map(|spec| spec.model_facts.clone());
-            if facts.is_some_and(|facts| facts != prepared.spec.model_facts) {
+                .map(|args| args.engine_config.model.facts.clone());
+            if facts.is_some_and(|facts| facts != prepared.engine.model.facts) {
                 return Err(UpdateError::Refused(format!(
                     "the checkpoint at {model_path} has other model facts (generation limits, \
                      special tokens or context length) than the served model: deploy it instead"
@@ -3248,13 +3306,14 @@ impl Replica {
         let results = results.map_err(|error| {
             UpdateError::Failed(anyhow::anyhow!("the weights were not updated: {error}"))
         })?;
-        if let Some(spec) = locked(&self.served).as_mut() {
+        if let Some(args) = locked(&self.served).as_mut() {
             if !streamed {
-                spec.model = model_path.to_owned();
+                args.engine_config.model.model = model_path.to_owned();
             }
-            if let Some(workers) = spec.workers.as_mut() {
-                workers.weights = config.load_config.weights.clone().unwrap_or_default();
-            }
+            args.engine_config
+                .load
+                .weights
+                .clone_from(&config.load_config.weights);
         }
         *locked(&self.config) = config;
         // A parked standby mapped the weights this update replaced, and a promotion would serve
@@ -4002,26 +4061,23 @@ mod tests {
         use super::configurable;
         use proto::request::wire;
 
-        let scheduling = |batch, tokens: Option<u32>, running| wire::Scheduling {
-            max_batch: batch,
-            max_num_batched_tokens: tokens,
-            max_running_requests: running,
-            ..Default::default()
+        let base = crate::options::ServerArgs::default()
+            .engine_config()
+            .expect("the configuration resolves");
+        let config = |batch: usize, tokens: Option<usize>, running: usize| {
+            let mut config = base.clone();
+            config.scheduler.max_batch = std::num::NonZeroUsize::new(batch).unwrap();
+            config.max_num_batched_tokens = tokens.and_then(std::num::NonZeroUsize::new);
+            config.max_running_requests = std::num::NonZeroUsize::new(running).unwrap();
+            config
         };
-        let spec = |scheduling| wire::EngineSpec {
-            scheduling: Some(scheduling),
-            ..Default::default()
-        };
-        let served = spec(scheduling(128, None, 128));
+        let served = config(128, None, 128);
         let capacity = wire::BatchCapacity {
             max_batch: 128,
             max_num_batched_tokens: 8192,
             max_running_requests: 128,
         };
-        let within = [
-            spec(scheduling(64, Some(4096), 64)),
-            spec(scheduling(128, Some(8192), 128)),
-        ];
+        let within = [config(64, Some(4096), 64), config(128, Some(8192), 128)];
         for updated in &within {
             assert!(
                 configurable(&served, updated, Some(&capacity)),
@@ -4029,15 +4085,15 @@ mod tests {
             );
             assert!(!configurable(&served, updated, None), "{updated:?}");
         }
+        let mut captured_otherwise = within[0].clone();
+        captured_otherwise.cuda_graph.decode_batch_sizes =
+            Some(vec![std::num::NonZeroU32::new(8).unwrap()]);
         let beyond = [
-            spec(scheduling(256, None, 128)),
-            spec(scheduling(128, Some(16384), 128)),
-            spec(scheduling(128, None, 256)),
+            config(256, None, 128),
+            config(128, Some(16384), 128),
+            config(128, None, 256),
             served.clone(),
-            wire::EngineSpec {
-                cuda_graphs: Some(wire::CudaGraphs::default()),
-                ..within[0].clone()
-            },
+            captured_otherwise,
         ];
         for updated in &beyond {
             assert!(
@@ -4045,14 +4101,66 @@ mod tests {
                 "{updated:?}"
             );
         }
-        // A step's tokens the served spec states cannot return to the
+        // A step's tokens the served configuration states cannot return to the
         // engine's default in place.
-        let stated = spec(scheduling(128, Some(4096), 128));
+        let stated = config(128, Some(4096), 128);
         assert!(!configurable(
             &stated,
-            &spec(scheduling(128, None, 128)),
+            &config(128, None, 128),
             Some(&capacity)
         ));
+    }
+
+    /// The engine configuration of a deployment of `data` schedulers of `tensor` ranks each,
+    /// whose experts the schedulers exchange when `experts` holds.
+    fn deployment(tensor: usize, data: usize, experts: bool) -> proto::config::EngineConfig {
+        let mut options = crate::options::ServerArgs::default();
+        options.tensor_parallel_size = std::num::NonZeroUsize::new(tensor).unwrap();
+        options.data_parallel_size = std::num::NonZeroUsize::new(data).unwrap();
+        options.moe_config.expert_parallel = experts;
+        options.engine_config().expect("the configuration resolves")
+    }
+
+    /// Independent data-parallel replicas each take their own scheduler's ranks, on the devices
+    /// the deployment assigned them, and every other part of the configuration as it is.
+    #[test]
+    fn independent_replicas_keep_their_assigned_tensor_parallel_ranks() {
+        let config = deployment(2, 2, false);
+        let replicas = super::replica_configs(&config).unwrap();
+        let devices: Vec<Vec<String>> = replicas
+            .iter()
+            .map(|replica| {
+                replica
+                    .parallel
+                    .worker_groups
+                    .iter()
+                    .flat_map(|group| group.ranks.iter().map(|rank| rank.device.clone()))
+                    .collect()
+            })
+            .collect();
+        assert_eq!(
+            devices,
+            vec![vec!["cuda:0", "cuda:1"], vec!["cuda:2", "cuda:3"]]
+        );
+        assert!(replicas.iter().all(|replica| {
+            replica.parallel.data_parallel_size.get() == 1 && replica.scheduler == config.scheduler
+        }));
+    }
+
+    /// Schedulers that exchange experts communicate, so they stay in one replica.
+    #[test]
+    fn communicating_expert_ranks_stay_in_one_replica() {
+        let replicas = super::replica_configs(&deployment(1, 4, true)).unwrap();
+        assert_eq!(replicas.len(), 1);
+        assert_eq!(
+            replicas[0]
+                .parallel
+                .worker_groups
+                .iter()
+                .map(|group| group.ranks.len())
+                .sum::<usize>(),
+            4
+        );
     }
 
     /// A standby exists only where the deployment reserved room for one and the

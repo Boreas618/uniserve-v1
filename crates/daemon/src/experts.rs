@@ -102,11 +102,14 @@ async fn rebalance(
     // Daemon handoff and engine replacement share the locks held above.
     let committed = decided.expert_order.clone();
     *locked(&replica.served) = Some(decided);
-    client.commit_experts(committed).await.map_err(|error| {
-        UpdateError::Failed(anyhow::anyhow!(
-            "expert publication failed; engine recovery will load the committed order: {error}"
-        ))
-    })?;
+    client
+        .commit_experts(committed.into_iter().collect())
+        .await
+        .map_err(|error| {
+            UpdateError::Failed(anyhow::anyhow!(
+                "expert publication failed; engine recovery will load the committed order: {error}"
+            ))
+        })?;
     client
         .resize_cache(wire::CacheChange::Grow)
         .await

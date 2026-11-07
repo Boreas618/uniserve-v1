@@ -12,7 +12,7 @@
 //!    with (`Prepared`).
 //! 2. The daemon stops its service thread between two rounds and sends what
 //!    the thread served, its HTTP listener and the connection its engine's
-//!    process lives under, with the spec the engine serves, the admin's log
+//!    process lives under, with the arguments the engine serves with, the admin's log
 //!    and the video jobs (`Takeover`), and commands the engine to attach to
 //!    the successor's request socket (`EngineCommand::Attach`).
 //! 3. The successor goes on with the service, adopts the engine once it
@@ -39,8 +39,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Context as _;
-use prost::Message as _;
-use proto::request::wire;
 use proto::{Connection, Handed};
 use serde::{Deserialize, Serialize};
 use storage::transport::Connection as Channel;
@@ -172,7 +170,8 @@ struct ReplicaHandoff {
     control: Option<(bool, Vec<u8>)>,
     engine: u64,
     next_engine: u64,
-    served: Vec<u8>,
+    /// The arguments the replica's engine process serves with.
+    served: proto::config::EngineArgs,
     first_request: u64,
     config: String,
     paused: bool,
@@ -397,7 +396,7 @@ impl Restarter {
                 control,
                 engine: replica.engine,
                 next_engine: replica.next_engine,
-                served: replica.served.encode_to_vec(),
+                served: replica.served.clone(),
                 first_request: replica.client.next_request_id() + (1 << 32),
                 config: crate::options::printed(&replica.config)?,
                 paused: replica.paused,
@@ -850,13 +849,13 @@ async fn prepared_successor(
             .map(|(index, (replica, connection))| {
                 let (options, _) = crate::options::resolve_text(&replica.config, &[])?;
                 let options = crate::options::with_daemon_options(&options, &daemon_options);
-                let served = wire::EngineSpec::decode(replica.served.as_slice())?;
+                let served = replica.served.clone();
                 let observer = Arc::new(crate::observe::Observer::default());
                 let sink = stats_sink(options.model().to_owned(), Arc::clone(&observer), index);
                 let client = adopting.adopt(
                     replica.engine,
                     replica.next_engine,
-                    served.clone(),
+                    served.world,
                     connection,
                     sink,
                 )?;

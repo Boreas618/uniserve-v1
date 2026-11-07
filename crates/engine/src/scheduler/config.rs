@@ -37,15 +37,15 @@ pub struct SchedulerConfig {
     /// under this sampling; without it the runtime serves readouts only.
     pub canvas: Option<ipc::CanvasSampling>,
     /// The most draft tokens a verification carries per request
-    /// (`EngineSpec::speculation`); zero when the deployment does not
+    /// (`speculative_config.num_draft_tokens`); zero when the deployment does not
     /// speculate.
     pub draft_tokens: usize,
-    /// The captured graph sizes the deployment states, in tokens (the spec's
-    /// `cuda_graphs` decode batch sizes and prefill token sizes), ascending and
+    /// The captured graph sizes the deployment states, in tokens (its
+    /// `cuda_graph_config` decode batch sizes and prefill token sizes), ascending and
     /// without duplicates: `Room.graph_tiers`, the bound a plan's batch must
     /// fit.
     ///
-    /// Empty when the spec states none, and on a reconfigure, which carries no
+    /// Empty when the deployment states none, and on a reconfigure, which carries no
     /// graph catalog: an executor then runs its own captured catalog or
     /// eagerly, and the tier bound is honest but vacuous.
     pub graph_tiers: Vec<u32>,

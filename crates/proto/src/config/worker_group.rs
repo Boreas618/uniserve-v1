@@ -637,6 +637,100 @@ mod tests {
         }
     }
 
+    /// The command-line shorthand's groups for `tensor` tensor-parallel ranks per scheduler and
+    /// `data` schedulers on this host, on the devices `devices` orders.
+    fn shorthand(
+        tensor: usize,
+        data: usize,
+        devices: &[u32],
+    ) -> anyhow::Result<Vec<WorkerGroupConfig>> {
+        let device = crate::config::DeviceConfig {
+            devices: devices.to_vec(),
+            ..crate::config::DeviceConfig::default()
+        };
+        WorkerGroupConfig::shorthand("localhost", &device, tensor, data)
+    }
+
+    /// The devices of `groups`, group by group in rank order.
+    fn devices(groups: &[WorkerGroupConfig]) -> Vec<(String, Vec<String>)> {
+        groups
+            .iter()
+            .map(|group| {
+                (
+                    group.id.to_string(),
+                    group.ranks.iter().map(|rank| rank.device.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The shorthand puts its ranks, in rank order, on the devices
+    /// `device_config.devices` names.
+    #[test]
+    fn the_shorthand_puts_ranks_on_the_devices_their_order_names() {
+        let ordered = shorthand(4, 1, &[0, 2, 1, 3]).unwrap();
+        assert_eq!(
+            devices(&ordered),
+            [(
+                "model".to_owned(),
+                vec![
+                    "cuda:0".to_owned(),
+                    "cuda:2".to_owned(),
+                    "cuda:1".to_owned(),
+                    "cuda:3".to_owned(),
+                ],
+            )]
+        );
+
+        // Without an order each host's ranks number its devices from zero.
+        let numbered = shorthand(4, 1, &[]).unwrap();
+        assert_eq!(
+            devices(&numbered),
+            [(
+                "model".to_owned(),
+                vec![
+                    "cuda:0".to_owned(),
+                    "cuda:1".to_owned(),
+                    "cuda:2".to_owned(),
+                    "cuda:3".to_owned(),
+                ],
+            )]
+        );
+    }
+
+    /// The order runs across the schedulers' groups: the devices name each scheduler's rank in
+    /// turn.
+    #[test]
+    fn a_device_order_runs_across_the_schedulers_groups() {
+        let groups = shorthand(1, 2, &[1, 0]).unwrap();
+        assert_eq!(
+            devices(&groups),
+            [
+                ("model-0".to_owned(), vec!["cuda:1".to_owned()]),
+                ("model-1".to_owned(), vec!["cuda:0".to_owned()]),
+            ]
+        );
+    }
+
+    /// An order that does not name one CUDA device per rank, or puts two ranks of a host on one
+    /// device, is refused naming the option, and so is an order of devices that are not CUDA's.
+    #[test]
+    fn a_device_order_of_another_length_or_a_repeated_device_is_refused() {
+        for order in [&[0, 1, 2][..], &[0, 1, 1, 2]] {
+            let error = shorthand(4, 1, order).expect_err("the order must be refused");
+            assert!(
+                format!("{error:#}").contains("device_config.devices"),
+                "{error:#}"
+            );
+        }
+        let cpu = crate::config::DeviceConfig {
+            device: "cpu".into(),
+            devices: vec![0, 1],
+            ..crate::config::DeviceConfig::default()
+        };
+        assert!(WorkerGroupConfig::shorthand("localhost", &cpu, 2, 1).is_err());
+    }
+
     /// Replicas take equal consecutive blocks of the stated ranks and are
     /// named by their index; blocks without ranks span each replica.
     #[test]

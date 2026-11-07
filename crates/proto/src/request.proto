@@ -40,8 +40,9 @@ message Welcome {
   string build = 3;
   // Why the engine is refused; empty when it is accepted.
   string refusal = 4;
-  // What the engine is to serve and how.
-  EngineSpec spec = 5;
+  // Field 5 carried the engine spec, which the launch file carries now.
+  reserved 5;
+  reserved "spec";
 }
 
 // What travels from the engine process after the welcome.
@@ -414,6 +415,26 @@ message Configure {
   // Matches the `Configured` answer.
   uint64 id = 1;
   Scheduling scheduling = 2;
+}
+
+// The limits a `Configure` sets on every scheduler.
+message Scheduling {
+  // The mechanism's limits: what the engine's schedulers admit and how they
+  // assemble a step. The scheduling policy's own name and parameters are its
+  // program's (§5.1, §7.7), not this message's.
+  uint32 max_batch = 2;
+  // Absent for the engine's default.
+  optional uint32 max_num_batched_tokens = 3;
+  uint32 max_running_requests = 4;
+  // Absent for an unbounded waiting queue.
+  optional uint64 max_queued_requests = 5;
+  // Absent for the engine's default.
+  optional uint32 chunked_prefill_size = 6;
+  // Field 1 named the scheduling policy's backend, fields 7 and 8 its
+  // draft-cache refill parameters: all three are the policy program's
+  // (§7.7).
+  reserved 1, 7, 8;
+  reserved "policy", "expected_speedup", "refill_token_cost";
 }
 
 // The answer to a `Configure`.
@@ -1129,112 +1150,14 @@ message GenerationLimits {
   uint32 encoder_cache_entries = 15;
 }
 
-// ---------------------------------------------------------------- the spec
+// ---------------------------------------------------------------- handover
 
-// What an engine serves and how: the deployment's serving options that
-// concern the engine, under the names the serving options give them, and
-// what the daemon resolved from the model. A value an option table names by
-// a word (a policy, a backend, an element type) travels as that word.
-message EngineSpec {
-  // The deployment: its served model name, under which the Storage Servers
-  // keep its claims and pages.
-  string deployment = 1;
-  // The model: a local directory or a Hugging Face repository.
-  string model = 2;
-  // The host identity of the leader, where the engine process runs.
-  string host = 3;
-  RankLayout rank_layout = 4;
-  reserved 5;
-  // Product transport per worker edge (`device_config.transfer`); empty
-  // for the defaults.
-  string transfer = 6;
-  Scheduling scheduling = 7;
-  KvCache kv_cache = 8;
-  Workers workers = 9;
-  CudaGraphs cuda_graphs = 10;
-  // Field 11 carried the FlashInfer provider's table, which is the attention
-  // program's arguments (§5.1, §7.7).
-  reserved 11;
-  reserved "flashinfer";
-  Video video = 12;
-  Experts experts = 13;
-  ModelFacts model_facts = 14;
-  reserved 15;
-  reserved "standby";
-  // The world the engine executes: the daemon's identity of the processes
-  // that execute one configuration of the deployment, which keys the storage
-  // they create. An engine relaunched after a loss keeps its world.
-  uint64 world = 16;
-  // Present for an engine that succeeds the serving one on the same
-  // devices: it prepares beside it, mapping what it shares read-only, and
-  // serves once promoted.
-  Predecessor predecessor = 17;
-  // The KV cache segments each worker group's planes are made of, which an
-  // engine that replaces a lost one of its world (or restarts it at a
-  // rollback) takes as its own; empty to lay the planes out afresh.
-  repeated CacheSegments segments = 18;
-  // Worlds of the deployment whose storage ends on every node before this
-  // engine's workers start: the world on trial a rollback discards, whose
-  // storage the previous world, started again on its kept weights, needs.
-  repeated uint64 retire = 19;
-  // Speculative decoding with the model's drafter (`speculative_config`);
-  // absent for a deployment that does not speculate. A world that
-  // speculates keeps the drafter's draft cache in its pool, so any change
-  // of it is a world change.
-  Speculation speculation = 20;
-  // The always-on profiling of the workers (`profiling_config`); absent for
-  // none.
-  Profiling profiling = 21;
-  // The weights each worker group receives from the world the engine
-  // succeeds, as the daemon planned a change of the parallel configuration;
-  // empty for an engine whose groups bind or load their weights.
-  repeated ReceivedWeights received_weights = 22;
-  // Runtime expert distribution; shape-changing updates start another world.
-  map<string, ExpertOrder> expert_order = 23;
-  // Prepare a cache-transfer target with writable warmup storage and a
-  // reserved virtual pool whose remaining segments are populated on demand.
-  bool stage_cache = 24;
-  // Existing Host cache keys retained by this world for a trial rollback.
-  repeated bytes cache_keys = 25;
-}
+// What an engine process takes over from the one it succeeds on the same
+// devices, which the daemon states in its launch file.
 
 // Logical expert IDs in global physical-slot order for one numerical layer.
 message ExpertOrder {
   repeated uint32 experts = 1;
-}
-
-// The weights one worker group receives from retained predecessor worlds.
-message ReceivedWeights {
-  string worker_group = 1;
-  // Predecessor worlds whose retained weights supply the copy plan.
-  repeated uint64 worlds = 2;
-  // Serialized storage::manifest::weights::Transfer chosen by the daemon.
-  bytes manifest = 3;
-}
-
-// Speculative decoding with the model's drafter.
-message Speculation {
-  // The most draft tokens one verification carries per request; at least
-  // one.
-  uint32 num_draft_tokens = 1;
-}
-
-// The workers' always-on profiling.
-message Profiling {
-  // Whether the fence probes record: the device switch every probe reads.
-  bool fence_probes = 1;
-  // The components whose module instances carry fence probes in the graphs
-  // the workers capture, as name patterns (`*` matches any run).
-  repeated string fence_components = 2;
-  // Whether every worker enables CUPTI's PC sampling, stopped, before it
-  // captures its CUDA graphs and keeps it enabled for its life, so that a
-  // session's PC samples of graph kernels are attributed; sessions of PM
-  // sampling, range metrics and whole-graph timelines are then refused.
-  bool graph_pc_sampling = 3;
-  // The probed components whose probes are off while the switch is on, as
-  // name patterns (`*` matches any run): a component's probes cost more
-  // than the always-on budget. Switched in place, as `fence_probes` is.
-  repeated string fence_probes_off = 4;
 }
 
 // What an engine that succeeds another maps of it.
@@ -1245,195 +1168,4 @@ message Predecessor {
   // Each worker group's KV cache segments the predecessor holds, which the
   // successor's ranks map read-only behind segments of their own.
   repeated CacheSegments segments = 2;
-}
-
-// Where the ranks run: a deployment file, or the shorthand.
-message RankLayout {
-  // A deployment file (`worker_groups`), placed on `EngineSpec.host`; empty
-  // for the shorthand.
-  string worker_groups = 1;
-  uint32 tensor_parallel_size = 2;
-  uint32 data_parallel_size = 3;
-  string device = 4;
-  uint32 queue_depth = 5;
-  // Hosts after the leader the shorthand spreads ranks across.
-  repeated string worker_hosts = 6;
-  double mem_fraction_static = 7;
-  // Deployment TOML read by the leader when it resolved the configuration.
-  // The engine launches these contents even if the file changes afterwards.
-  // Empty for the shorthand.
-  string worker_groups_content = 8;
-  // Each rank's CUDA device index on its host, in rank order
-  // (`device_config.devices`); empty numbers each host's ranks from
-  // zero.
-  repeated uint32 devices = 9;
-}
-
-message Scheduling {
-  // The mechanism's limits: what the engine's schedulers admit and how they
-  // assemble a step. The scheduling policy's own name and parameters are its
-  // program's (§5.1, §7.7), not this message's.
-  uint32 max_batch = 2;
-  // Absent for the engine's default.
-  optional uint32 max_num_batched_tokens = 3;
-  uint32 max_running_requests = 4;
-  // Absent for an unbounded waiting queue.
-  optional uint64 max_queued_requests = 5;
-  // Absent for the engine's default.
-  optional uint32 chunked_prefill_size = 6;
-  // Field 1 named the scheduling policy's backend, fields 7 and 8 its
-  // draft-cache refill parameters: all three are the policy program's
-  // (§7.7).
-  reserved 1, 7, 8;
-  reserved "policy", "expected_speedup", "refill_token_cost";
-}
-
-message KvCache {
-  optional uint64 max_tokens = 1;
-  optional uint32 block_size = 2;
-  // Empty for each layer's compute type.
-  string dtype = 3;
-  bool prefix_caching = 4;
-  bool host_tier = 5;
-  // Absent when the deployment keeps no KV storage.
-  Mooncake mooncake = 6;
-  // The pages of the largest block size between the aligned boundaries a
-  // long prompt offloads its sliding windows before; absent for the
-  // engine's default.
-  optional uint32 boundary_interval = 7;
-  reserved 8;
-  // The host KV cache's token count over the device KV cache's, the same on
-  // every rank of a world; absent for the engine's default (2.0).
-  optional double host_ratio = 9;
-  // The bytes of the deployment's host KV cache on each host, over the
-  // ranks there, in place of `host_ratio`; absent to size it by the ratio.
-  optional uint64 host_bytes = 10;
-  // The decoded tokens between two checkpoints of a request's state kept
-  // per request slot; absent for the engine's default.
-  optional uint32 state_interval = 11;
-}
-
-message Mooncake {
-  string master = 1;
-  string metadata_server = 2;
-  string protocol = 3;
-  string device = 4;
-  uint64 segment_bytes = 5;
-  // Empty for the loader's search path.
-  string library = 6;
-}
-
-message Workers {
-  string executable = 1;
-  uint64 watchdog_timeout_ms = 2;
-  // Empty when unset.
-  string mesh = 3;
-  // Field 4 was a torch process-group backend override. Nothing names a
-  // process-group backend in a configuration that builds no torch process
-  // group, so the number and the name stay reserved rather than being reused
-  // by a later field of a different meaning.
-  reserved 4;
-  reserved "distributed_backend";
-  bool standby = 5;
-  string attention_backend = 6;
-  string dtype = 7;
-  // The precision policy, a JSON object.
-  string quantization = 8;
-  string load_format = 9;
-  // Empty when unset.
-  string download_dir = 10;
-  optional uint32 load_threads = 11;
-  // `auto`, `resident` or `suspended`; empty for `auto`.
-  string standby_storage = 12;
-  // A plugin's weight source (`scheme://...`) that streams the checkpoint's
-  // tensors in place of its files, as an in-place weight update from it
-  // left them; empty to read the files.
-  string weights = 13;
-  // The tensor- and expert-parallel degrees retained weight storage is
-  // chunked for; empty for every degree up to the GPUs a worker sees.
-  repeated uint32 parallel_degrees = 14;
-}
-
-message CudaGraphs {
-  // `auto`, `full` or `off`: a worker group runs every call with CUDA
-  // graphs, or every call eagerly.
-  string policy = 1;
-  // Prefill and image denoising always capture under graphs.
-  reserved 2, 3;
-  // Image denoising captures the row buckets its executor derives.
-  reserved 6;
-  reserved "flow_batch_sizes";
-  // Each list is absent for the worker's catalog.
-  Sizes decode_batch_sizes = 4;
-  Sizes prefill_token_sizes = 5;
-  Shapes flow_shapes = 7;
-}
-
-message Sizes {
-  repeated uint32 values = 1;
-}
-
-message Shapes {
-  repeated Shape shapes = 1;
-}
-
-message Shape {
-  uint32 height = 1;
-  uint32 width = 2;
-}
-
-// The FlashInfer provider's table is the attention program's arguments
-// (`specs/worker.md` §5.1, §7.7): the engine spec carries no second copy of it.
-// The name stays, with every field it had, so a peer of another build cannot
-// read an old meaning into a reused number.
-message FlashInfer {
-  reserved 1 to 7;
-  reserved "workspace_size", "use_tensor_core", "decode_backend",
-      "prefill_backend", "decode_split_tile_size", "prefill_split_tile_size",
-      "split_kv";
-}
-
-message Video {
-  double max_seconds = 1;
-  double min_seconds = 2;
-  repeated string resolutions = 3;
-  repeated string aspect_ratios = 4;
-  // Absent for the default capacities.
-  Sizes text_capacities = 5;
-  optional uint32 max_condition_rows = 6;
-  string ffmpeg = 7;
-}
-
-message Experts {
-  bool expert_parallel = 1;
-  // `alltoall`, `megamoe`, `deepep` or `dwdp`.
-  string exchange = 2;
-  uint32 microbatches = 3;
-}
-
-// What the daemon resolved from the model's checkpoint.
-message ModelFacts {
-  // The model's generation requirements, which the engine intersects with
-  // its workers' capacities.
-  GenerationLimits limits = 1;
-  uint32 bos = 2;
-  // Every end-of-sequence token, the primary one first.
-  repeated uint32 eos = 3;
-  uint32 end_of_image = 4;
-  uint32 max_model_len = 5;
-  // A block-diffusion model's canvas sampling; absent for other models.
-  CanvasSampling canvas_sampling = 6;
-  // Whether a prompt's prefill returns outputs, which only conditioning
-  // prefills of block-diffusion models do not.
-  bool prefill_outputs = 7;
-}
-
-message CanvasSampling {
-  uint32 canvas_length = 1;
-  uint32 max_steps = 2;
-  float entropy_bound = 3;
-  float t_min = 4;
-  float t_max = 5;
-  float confidence_threshold = 6;
-  uint32 stability_threshold = 7;
 }

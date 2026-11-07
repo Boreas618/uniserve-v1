@@ -1504,8 +1504,12 @@ mod tests {
             executable: "/opt/uniserve".to_owned(),
             build: Some("2.0.0+new".to_owned()),
             launch: proto::config::EngineArgs {
-                engine_config: "/run/engine-config-11.json".into(),
-                model: "/models/qwen3".into(),
+                engine_config: crate::options::ServerArgs::default()
+                    .engine_config()
+                    .expect("the configuration resolves"),
+                predecessor: None,
+                expert_order: Default::default(),
+                host: "rank-0".to_owned(),
                 requests: "unix:/run/requests.sock".to_owned(),
                 processes: "unix:/run/processes.sock".to_owned(),
                 engine: 7,
@@ -1513,7 +1517,6 @@ mod tests {
                 devices: vec![0],
                 group: "engine".to_owned(),
                 rank: 0,
-                deployment: "qwen3".to_owned(),
                 world: 11,
                 scheduler_node: true,
                 peers: Vec::new(),
@@ -1521,7 +1524,6 @@ mod tests {
                 rollback_s: None,
                 queue_depth: 4,
                 world_size: 1,
-                standby: false,
             },
             environment: HashMap::new(),
         }
