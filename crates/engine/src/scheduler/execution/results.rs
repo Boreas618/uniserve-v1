@@ -684,9 +684,11 @@ impl Scheduler {
         // `command_index` counts. A failed `Finish` or `Free` keeps its
         // physical ownership and is queued again.
         let mut measured = None;
+        let mut batch_tokens = 0;
         let worker_us = if batch_complete {
             let pending = owned.remove();
             measured = pending.measured;
+            batch_tokens = pending.tokens;
             for (index, command) in pending.commands.into_iter().enumerate() {
                 let failed = report.command_results.iter().any(|result| {
                     result.command_index == index as u32
@@ -731,6 +733,10 @@ impl Scheduler {
                 .timing
                 .batch_timing_count
                 .fetch_add(1, Ordering::Relaxed);
+            self.stats
+                .timing
+                .batch_tokens_total
+                .fetch_add(batch_tokens, Ordering::Relaxed);
         }
 
         for stats in &forward_stats {

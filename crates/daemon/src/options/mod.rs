@@ -1021,8 +1021,8 @@ pub const DEFAULT_FENCE_COMPONENTS: [&str; 1] = ["*.Transformer"];
 /// How the deployment moves to a new configuration in another world
 /// (`update_config`, `PUT /admin/config`): what of the previous world its
 /// trial keeps for a rollback, when the trial rolls back by itself, and how
-/// long the serving world's requests hold the cache a successor needs. A
-/// value an update states in its own assignments governs that update alone.
+/// the transfers and the warming yield to the serving world. A value an
+/// update states in its own assignments governs that update alone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateOptions {
@@ -1032,11 +1032,6 @@ pub struct UpdateOptions {
     /// the engine process's exit, a stalled job and non-finite logits always
     /// roll back; these thresholds, which have no default, add the rest.
     pub rollback: RollbackOptions,
-    /// How long the serving world's requests that hold the KV cache's tail a
-    /// successor needs run on before they are recomputed; unset to let them
-    /// run to their end.
-    #[serde(with = "values::optional_duration")]
-    pub preempt_after: Option<Duration>,
     /// How much longer than before the change a serving scheduler's step
     /// may take while the successor prepares, as a fraction (`0.1` for
     /// 10%), past which the leader halves the byte budgets of the links the
@@ -1044,13 +1039,9 @@ pub struct UpdateOptions {
     /// within it. Steps are compared within their batch-size range. The
     /// default is the value measured on GB200 (`docs/configuration.md`).
     pub transfer_slowdown: f64,
-    /// Whether the serving world runs its forwards eagerly while the
-    /// successor prepares, giving its CUDA graph storage to the successor's
-    /// captures: the serving world steps slower meanwhile, and replays its
-    /// graphs again if it serves on or resumes.
-    pub eager_prepare: bool,
-    /// Maximum accepted tokens not yet warmed per request before promotion;
-    /// unset uses the largest source or target cache page.
+    /// The most tokens a request in flight may have computed past the pages
+    /// the host KV cache holds of it at the switchover; unset uses the largest
+    /// source or target cache page.
     pub cache_tail_tokens: Option<std::num::NonZeroU32>,
     /// Source prefill tokens per scheduling step after the first warming
     /// round; unset uses the largest source or target cache page.
@@ -1068,9 +1059,7 @@ impl Default for UpdateOptions {
         Self {
             previous_world: PreviousWorld::Parked,
             rollback: RollbackOptions::default(),
-            preempt_after: None,
             transfer_slowdown: TRANSFER_SLOWDOWN,
-            eager_prepare: false,
             cache_tail_tokens: None,
             cache_prefill_tokens: None,
         }

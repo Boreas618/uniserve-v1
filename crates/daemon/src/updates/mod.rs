@@ -30,6 +30,8 @@ pub(crate) mod driver;
 pub(crate) mod entry;
 pub(crate) mod epoch;
 pub(crate) mod switch;
+pub(crate) mod trial;
+pub(crate) mod warming;
 
 /// The update a change would collide with (§7.2: one update at a time): the
 /// switch a driver runs, or the program update on probation, whose epoch
