@@ -1,12 +1,9 @@
-//! Rust-owned allocations and the typed views Python receives as torch
-//! tensors.
+//! Rust-owned allocations and their typed views.
 //!
 //! Runtime storage (cache planes, graph inputs and outputs, workspaces, staging)
 //! is allocated here. A [`Storage`] owns one allocation; a [`StorageView`]
 //! is a typed, strided window into it that retains the allocation, the way a
-//! torch tensor views a torch storage. Python receives a view as one torch tensor, made once from
-//! the view's DLPack export and passed by every call that takes the view
-//! ([`StorageView::handle`]). Dropping the last Rust and Python reference
+//! torch tensor views a torch storage. Dropping the last reference
 //! releases the storage through `cuda`'s reclaimer, which never
 //! waits for device work: owners must retire all device accesses to an
 //! allocation before dropping it.
@@ -914,10 +911,7 @@ impl Backing for Storage {
 /// `offset` is in bytes; `shape` and `strides` are in elements. Construction
 /// checks that the window lies inside its allocation.
 ///
-/// A view and its clones are one tensor to Python: they share the torch
-/// tensor the view is wrapped as (`Self::handle`). A view derived from it
-/// (a prefix, a row, a region, a reshape) is another tensor, wrapped on its
-/// own; narrowing an axis to its whole extent returns the view itself.
+/// Narrowing an axis to its whole extent returns the view itself.
 #[derive(Clone)]
 pub struct StorageView {
     storage: Arc<dyn Backing>,

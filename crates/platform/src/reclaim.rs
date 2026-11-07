@@ -6,9 +6,8 @@
 //! `cuMemFreeHost`) is queued to one process-wide reclaimer thread instead,
 //! because:
 //!
-//! - the last reference may drop inside a DLPack deleter while the Python GIL
-//!   is held, and `cuMemFree`/`cuMemFreeHost` may synchronize the device,
-//!   which can wait on a host function that needs the GIL;
+//! - `cuMemFree`/`cuMemFreeHost` may synchronize the device, which a thread
+//!   that drops a last reference must not wait for;
 //! - a free issued from a thread that is capturing a CUDA graph in global
 //!   mode would invalidate the capture. The reclaimer thread runs in relaxed
 //!   capture mode, so its calls never interact with other threads' captures.

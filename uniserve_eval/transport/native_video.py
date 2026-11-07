@@ -28,6 +28,7 @@ from urllib.parse import quote, urljoin
 
 import aiohttp
 
+from .. import video_rules
 from ..types import RequestRecord, TaskRequest
 
 # Response headers in which a synchronous video route reports its timings.
@@ -163,8 +164,6 @@ def _vllm_omni_request(
         # One offset per video, in the videos' order.
         extra["start_time_seconds"] = starts
 
-    from uniserve.models.minimax_h3 import packing
-
     shape = request.video_shape
     assert shape is not None
     fields = {
@@ -173,7 +172,7 @@ def _vllm_omni_request(
         "height": shape.height,
         "aspect_ratio": payload["target"]["aspect_ratio"],
         # The model's output frame rate.
-        "fps": packing.FPS,
+        "fps": video_rules.FPS,
         "num_inference_steps": int(payload["num_inference_steps"]) - 1,
         "guidance_scale": 1.0,
         "flow_shift": float(payload["flow_shift"]),
@@ -209,8 +208,6 @@ def _fastvideo_request(
     them. References name local files by path in its typed reference
     fields; it has no keyframe or start-offset fields.
     """
-    from uniserve.models.minimax_h3 import packing
-
     points = int(payload["num_inference_steps"])
     shape = request.video_shape
     assert shape is not None
@@ -218,7 +215,7 @@ def _fastvideo_request(
         **common,
         "size": f"{shape.width}x{shape.height}",
         # The model's output frame rate.
-        "fps": packing.FPS,
+        "fps": video_rules.FPS,
         "num_inference_steps": (
             points - 1 if request.video_parallel_decoding else points
         ),

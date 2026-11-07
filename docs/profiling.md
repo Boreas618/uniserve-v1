@@ -4,7 +4,7 @@ A serving deployment profiles itself without restarting a process or pausing ser
 
 ## CUPTI in a worker
 
-A worker loads the CUPTI library that sits beside the CUDA runtime it loaded, which is the `nvidia-cuda-cupti` package of its Python environment; the CUDA 13.0 toolkit's own CUPTI (2025.3.0) stalls a worker that replays CUDA graphs while kernels are recorded. CUPTI accepts one subscriber per process, so the worker subscribes once, before it loads its model, and the counters and every session collector enable the callbacks and activity records they need on that subscription and release them when they stop. A worker whose process a profiler already subscribed, such as Nsight Systems tracing CUDA, logs that CUPTI is not subscribed: it reports neither counter, and a session reports every CUPTI collector unavailable on it; the fence probes do not use CUPTI and stay on. The CUPTI library stays loaded in the process: removing it (`cuptiFinalize`) after it recorded a serving worker's activity leaves the device work the worker submits afterwards waiting forever.
+A worker loads the CUPTI library that sits beside the CUDA runtime it loaded, so a runtime taken from the `nvidia-cuda-cupti` package of the project environment brings that package's CUPTI; the CUDA 13.0 toolkit's own CUPTI (2025.3.0) stalls a worker that replays CUDA graphs while kernels are recorded. CUPTI accepts one subscriber per process, so the worker subscribes once, before it loads its model, and the counters and every session collector enable the callbacks and activity records they need on that subscription and release them when they stop. A worker whose process a profiler already subscribed, such as Nsight Systems tracing CUDA, logs that CUPTI is not subscribed: it reports neither counter, and a session reports every CUPTI collector unavailable on it; the fence probes do not use CUPTI and stay on. The CUPTI library stays loaded in the process: removing it (`cuptiFinalize`) after it recorded a serving worker's activity leaves the device work the worker submits afterwards waiting forever.
 
 CUDA graph executables are instantiated in their current CUPTI tracing mode: whole-graph records (`CUPTI_ACTIVITY_KIND_GRAPH_TRACE`) or node records. When a timeline changes this mode, the worker replaces each affected executable before its next replay, using the retained source graph. This preserves captured tensors, allocator pools and random-number state without recapturing computation or synchronizing the device. A worker subscribed to CUPTI replaces its executables the same way after it unmaps or maps again storage its graphs address (a sleep and wake, an epoch change's eager preparation or cache shrink or growth, an adopted or taken predecessor cache, a committed expert redistribution): with `nvidia-cuda-cupti` 13.0.85 and driver 580.82.07 on GB200, an executable CUPTI instrumented by node before such a remapping faults inside CUPTI in `cuGraphLaunch` at its next launch, while one instantiated after it replays correctly. Executables instantiated for whole-graph tracing must not run in node mode: with `nvidia-cuda-cupti` 13.0.85 on GB200, that combination retains timestamp slots until CUPTI exhausts its profiling buffers.
 
@@ -123,17 +123,17 @@ Every time is in nanoseconds of one of two clocks: CUPTI's (about `CLOCK_REALTIM
 
 ## Capture and inspect a CUDA timeline with Nsight Systems
 
-Set `UNISERVE_NVTX=1` before starting the worker to start its ranges on. The native executor emits synchronous ranges named `uniserve.worker.admit`, `prepare`, `inputs`, `execute`, `retire`, `poll`, `result` and `close`, with the batch ID as a numeric payload. Shared resource reclamation uses `uniserve.worker.reap` without a batch payload. Startup phases emit `uniserve.worker.describe`, `load`, `plan`, `bind`, `warmup` and `capture` without a payload. Python numerical ranges, such as `uniserve.collective` launches, remain nested within those stages. Native ranges use the NVIDIA NVTX SDK directly and issue no Python callbacks or CUDA operations. Nsight Systems holds CUPTI's subscription in the processes it traces, so their sessions run no CUPTI collector.
+Set `UNISERVE_NVTX=1` before starting the worker to start its ranges on. The native executor emits synchronous ranges named `uniserve.worker.admit`, `prepare`, `inputs`, `execute`, `retire`, `poll`, `result` and `close`, with the batch ID as a numeric payload. Shared resource reclamation uses `uniserve.worker.reap` without a batch payload. Startup phases emit `uniserve.worker.describe`, `load`, `plan`, `bind`, `warmup` and `capture` without a payload. Native ranges use the NVIDIA NVTX SDK directly and issue no CUDA operations. Nsight Systems holds CUPTI's subscription in the processes it traces, so their sessions run no CUPTI collector.
 
-Capture a representative workload with Nsight Systems. `CAPTURE` is an output prefix and `WORKLOAD` is the caller's Python entry point; select both explicitly. For serving, replace the Python command with the normal `uniserve serve` command and run the fixed workload against it.
+Capture a representative workload with Nsight Systems. `CAPTURE` is an output prefix; run the fixed workload against the server the command starts.
 
 ```bash
 UNISERVE_NVTX=1 nsys profile \
-  --trace=cuda,nvtx,python-gil --cuda-trace-all-apis=true \
+  --trace=cuda,nvtx --cuda-trace-all-apis=true \
   --cuda-graph-trace=graph --sample=process-tree \
-  --cudabacktrace=sync:0,storage:0 --python-backtrace=cuda \
+  --cudabacktrace=sync:0,storage:0 \
   --export=sqlite --output="$CAPTURE" \
-  .venv/bin/python "$WORKLOAD"
+  uniserve serve "$MODEL"
 
 .venv/bin/python -m uniserve_eval.sanitizer trace "$CAPTURE.sqlite"
 .venv/bin/python -m uniserve_eval.sanitizer trace "$CAPTURE.sqlite" --json
@@ -157,21 +157,19 @@ CUDA Graph execution does not itself need the GIL once submitted. Python prepara
 
 Coverage counts describe recorded activities. A missing activity, missing stack or unmatched scope is a coverage gap. No hints does not mean no unnecessary synchronization. GPU graph-level capture does not expose every graph node; Python metadata accesses and dependency relationships between independent batches are not inferred from CUDA timing. Use Nsight's timeline and native reports for GPU gaps, utilization and stream dependencies.
 
-For bounded worker capture, the existing `UNISERVE_TORCH_PROFILER_DIR`, `UNISERVE_PROFILE_START_STEP`, `UNISERVE_PROFILE_STEPS` and `UNISERVE_CUDA_PROFILER` settings can drive `--capture-range=cudaProfilerApi`. This window brackets numerical execution steps: the first batch's earlier preparation and the last batch's later completion may lie outside it. Capture the whole workload when those phases are under investigation. Stacks and detailed tracing add overhead; keep capture duration proportionate to the question.
-
 CUDA's [synchronization semantics](https://docs.nvidia.com/cuda/cuda-runtime-api/api-sync-behavior.html) depend on operation and memory kind. Nsight's [analysis guide](https://docs.nvidia.com/nsight-systems/AnalysisGuide/index.html) describes the export and built-in reports. The sanitizer's rules are advisory interpretations of those activities.
 
 ## Inspect Python/native call edges
 
-Standard cProfile captures some Python/native calls and callbacks. Select the native function names to inspect; the analyzer matches builtin labels, with no assumptions about installation paths.
+A Python client of the server, such as the evaluator, can be read the same way: standard cProfile captures some Python/native calls and callbacks. Select the native function names to inspect; the analyzer matches builtin labels, with no assumptions about installation paths.
 
 ```bash
-.venv/bin/python -m cProfile -o "$CALLS" "$WORKLOAD"
+.venv/bin/python -m cProfile -o "$CALLS" "$CLIENT"
 .venv/bin/python -m uniserve_eval.sanitizer calls "$CALLS" \
   --native "$NATIVE"
 ```
 
-`NATIVE` is a substring of the builtin's cProfile label, such as `torch._C`; repeat `--native` to select more. cProfile does not record TVM-FFI function calls, so the calls between the worker runtime and its Python numerical functions never appear in this report. Read those crossings from the `uniserve.worker.*` ranges of the CUDA timeline.
+`NATIVE` is a substring of the builtin's cProfile label, such as `torch._C`; repeat `--native` to select more.
 
 The report shows repeated edges in both directions, call counts and inclusive time. Use it to locate repeated metadata conversion or per-row callbacks for further investigation. A repeated batch numerical call is expected. Inclusive time includes the callee's work and must not be summed or interpreted as FFI overhead.
 

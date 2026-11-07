@@ -3,13 +3,11 @@
 //! One executable runs every UniServe process, each as a command: `serve` (a
 //! node's daemon, and on the leader the application), `frontend` (the
 //! deployment's application process), `engine` (a node's main process for one
-//! epoch), `storage` (a host's Storage Server), `program-server` (a host's
-//! Program Server) and `executor` (one executor of the Python runtime the daemon
-//! still starts). The binary's own options, its log levels, are global; each
+//! epoch), `storage` (a host's Storage Server) and `program-server` (a host's
+//! Program Server). The binary's own options, its log levels, are global; each
 //! command declares its own. `serve` and `frontend` take the serving command
 //! line (`daemon::options::ServeArgs`), which resolves one configuration from
-//! a `--config` file, a few flags and `--set` assignments. `executor` hands its
-//! arguments to the executor library unparsed.
+//! a `--config` file, a few flags and `--set` assignments.
 
 use std::ffi::OsString;
 
@@ -23,7 +21,7 @@ use crate::storage::StorageArgs;
 #[derive(Debug, Parser)]
 #[command(
     name = "uniserve",
-    about = "UniServe OpenAI-compatible server: Rust engine + scheduler, Python forwards only."
+    about = "UniServe OpenAI-compatible server."
 )]
 pub(crate) struct Cli {
     #[command(flatten)]

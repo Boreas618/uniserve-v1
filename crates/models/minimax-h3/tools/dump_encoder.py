@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Dump the text encoder's own output for one request, from today's implementation.
+"""Dump the text encoder's own output for one request, from the reference implementation.
+
+**This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
+repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
+checkout of the last tree that held the package and that tree's interpreter, with the tree on the
+path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+
+    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
+        /workspace/uniserve-v1/.venv/bin/python <this file> ...
 
 The reference half of the encoder stage's comparison. The candidate's half is
 `crates/models/minimax-h3/examples/encoder.rs`, which writes its prompt's hidden rows for the same
 case; this reads the candidate's case and writes the reference's rows for it, so the comparison is
 about arithmetic rather than about which side built the prompt.
 
-    .venv/bin/python crates/models/minimax-h3/tools/dump_encoder.py --probe prompt_hidden \
+    python crates/models/minimax-h3/tools/dump_encoder.py --probe prompt_hidden \
         --stack artifacts/h3-stage4/text_encoder --checkpoint /opt/uv/models/MiniMax-H3 \
         --out artifacts/h3-stage4-ref --device cuda
 

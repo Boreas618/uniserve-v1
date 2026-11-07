@@ -21,13 +21,13 @@ curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolcha
 
 export CUDA_HOME=/usr/local/cuda
 export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$CUDA_HOME/bin:$PATH"
-export MAX_JOBS=2
 
 uv sync --locked --python /usr/bin/python3.12 --extra gpu
+uv sync --locked --python /usr/bin/python3.12 --project crates/program-server/python
 source .venv/bin/activate
 ```
 
-The sync installs the locked GPU providers (FlashInfer, FlashAttention-4, the CuTe and CUTLASS DSLs) and builds the `uniserve` executable, the worker runtime library (`uniserve._worker`) and UniServe's native kernels. The kernels compile for the visible GPUs, or for the architectures `TORCH_CUDA_ARCH_LIST` names, with `MAX_JOBS` parallel jobs; a later sync recompiles them when their sources change.
+The first sync builds the `uniserve` executable and installs the NCCL and CUPTI libraries serving loads. The second creates the Program Server's own environment, the locked compilers of the kernel programs (Triton, the CuTe DSL, FlashInfer and FlashAttention-4); the Program Server compiles a kernel the first time a deployment asks for it, for the target GPU, with that environment and the host's CUDA toolkit.
 
 ## Checkpoints
 
@@ -261,15 +261,13 @@ Denoiser attention stays BF16. `components` overrides parts of a mode by the nam
 
 ## Further guides
 
-- [Python library](library.md): loading and generating with the same numerical modules.
 - [Evaluation](evaluation.md): the published measurements and fixed workloads.
 
 ## Troubleshooting
 
 | Symptom | Remedy |
 | --- | --- |
-| `uniserve._worker` load or protocol error | Run the `uv sync` above again and use the resulting `uniserve`. |
-| CUDA or sparse-attention compile error during `uv sync` | Check CUDA 13 `nvcc`, `CUDA_HOME`, the C++ build tools, and a `TORCH_CUDA_ARCH_LIST` naming the target GPUs when none is visible. |
+| A kernel program's compile error in the Program Server's log | Check CUDA 13 `nvcc`, `CUDA_HOME` and the C++ build tools, and run the Program Server's `uv sync` above again. |
 | `unsupported FastH3 checkpoint` | Use a checkpoint from the table above; the message names the `fastvideo_inference.json` field it cannot serve. |
 | `checkpoint format 'modelopt_nvfp4' owns its numerical configuration` | Drop `quantization` for a packed NVFP4 checkpoint. |
 | `nvfp4 conversion requires an SM100-class CUDA device` | Use `quality` or FP8 overrides on Hopper. |
