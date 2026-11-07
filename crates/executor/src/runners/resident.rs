@@ -594,6 +594,29 @@ impl KvProvider for ResidentCache {
         self.gather(group, slots, stream)
     }
 
+    fn table_source(&self, group: usize, rows: u32) -> Result<Option<(TensorView, TensorView)>> {
+        let table = self
+            .tables
+            .get(group)
+            .ok_or_else(|| Error::Invalid(format!("the cache has no attention group {group}")))?;
+        let (pooled, pool_rows, width) = {
+            let cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            cache.unit_tables()
+        };
+        let base = pooled.address() + group as u64 * u64::from(pool_rows) * u64::from(width) * 4;
+        Ok(Some((
+            TensorView::new(
+                DevicePtr::new(base),
+                DType::I32,
+                Shape::new(&[u64::from(pool_rows), u64::from(width)]),
+            ),
+            table.view_rows(rows),
+        )))
+    }
+
     fn block_table_view(&self, group: usize, slots: &[i32]) -> Result<TensorView> {
         let table = self
             .tables
