@@ -543,6 +543,7 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()
                     },
+                    forward_stats: None,
                 })
             }
             Job::Capture {

@@ -3100,6 +3100,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 copy_us: 0,
                 host_us: host_start.elapsed().as_micros() as u64,
             },
+            forward_stats: None,
         })
     }
 
@@ -4639,8 +4640,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // Under the dump, every layer's attended output is read at its own launch: the buffer is
         // reused by the next layer, so any later reading is the last layer's whichever name it has.
         let probe = AttentionOutputs::default();
+        let probes = crate::profiling::fences::capturing(&stream);
         let mut forward = Forward::new(&stream, generation, &arena)
-            .with_live_tokens(self.columns.live_tokens.device);
+            .with_live_tokens(self.columns.live_tokens.device)
+            .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence));
         // Never inside a recording: the probe copies and synchronises per layer, and a synchronise
         // inside a capture is refused by the driver - which is a measurement that breaks what it
         // measures, and one that no line of its own would ever explain.

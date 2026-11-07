@@ -109,6 +109,12 @@ pub(crate) enum Command {
     /// them (7.6). It is a queue item because the queue's order is what makes "no job reads the
     /// weights" true at the moment their mappings change.
     Rebind(Arc<dyn Fn() -> Result<()> + Send + Sync>),
+    /// Change the rank's profiling session (`docs/profiling.md`), at a batch boundary: a session's
+    /// collectors begin and end between two forwards, and only this thread knows where that is.
+    Profile {
+        change: crate::profiling::session::Change,
+        answer: crossbeam_channel::Sender<Result<serde_json::Value>>,
+    },
     /// Wait for the events deferred storage release hangs on.
     After(Vec<Arc<platform::Event>>),
 }
@@ -139,6 +145,7 @@ impl Command {
             Self::SuspendGraphs => "suspending the graph pools".to_owned(),
             Self::RestoreGraphs => "restoring the graph pools".to_owned(),
             Self::Rebind(_) => "putting new weights at the rank's addresses".to_owned(),
+            Self::Profile { .. } => "changing the rank's profiling session".to_owned(),
             Self::After(_) => "waiting for deferred storage work".to_owned(),
         }
     }

@@ -666,9 +666,25 @@ impl Leader {
             .iter()
             .filter_map(|replica| replica.hold().client())
             .find(|client| matches!(client.state(), EngineState::Ready | EngineState::Parked));
+        // Each node's daemon reads its ledgers over its claim; an engine this daemon did not launch
+        // (a simulated one) answers for itself.
+        let control = replicas
+            .iter()
+            .find_map(|replica| replica.control.get().cloned());
         let ledgers = match client {
             Some(client) => {
-                match tokio::time::timeout(LEDGER_READ, client.describe_storage()).await {
+                let read = async {
+                    match control {
+                        Some(control) => {
+                            tokio::task::spawn_blocking(move || control.storage_reports())
+                                .await
+                                .map_err(|error| error.to_string())?
+                                .map_err(|error| format!("{error:#}"))
+                        }
+                        None => client.describe_storage().await,
+                    }
+                };
+                match tokio::time::timeout(LEDGER_READ, read).await {
                     Ok(Ok(nodes)) => serde_json::Value::Array(
                         nodes
                             .iter()

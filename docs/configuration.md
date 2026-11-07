@@ -156,7 +156,7 @@ Three backend-name fields the split names already exist in the code and are read
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `max_tokens` | Sized from storage | Capacity in tokens |
+| `max_tokens` | Sized from storage: what `mem_fraction_static` of the device leaves once the weights, the graph pools and the process's allowance are counted | Capacity in tokens |
 | `block_size` | Largest supported up to 64 | Tokens per page of the cache group with the widest token rows, a power of two |
 | `dtype` | Each layer's compute type | `bfloat16`, `float16`, `float32` or `float8_e4m3fn` |
 | `prefix_caching` | `true` | Reuse and retain cached prompt prefixes across requests |

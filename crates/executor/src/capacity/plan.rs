@@ -356,6 +356,12 @@ pub struct RankFacts<'a> {
     pub max_request_pool_size: usize,
     /// The model's longest request.
     pub max_model_len: usize,
+    /// The tokens the deployment fixed the cache at (`kv_cache_config.max_tokens`), or `None` to
+    /// size it from storage.
+    pub max_total_tokens: Option<usize>,
+    /// The planes a standby adopts: the cache of the world it stands by for, which it maps and did
+    /// not size. `None` for a rank that lays its planes out itself.
+    pub segments: Option<ipc::CacheTable>,
     /// Fraction of the device's storage the epoch may hold.
     pub mem_fraction_static: f64,
     /// The paged key/value geometry this rank keeps, or `None` for a rank that keeps no paged
@@ -659,6 +665,12 @@ pub fn plan_media(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> R
     plan(facts, report, group, None)
 }
 
+/// What a rank's process maps after its plan and beside its pools: the modules a precopy loads and
+/// the workspaces of the native libraries they call. A rank measured 2.26 GB of it serving
+/// Qwen3-30B-A3B over twelve graphs; a cache sized from storage leaves it this room, because the
+/// ledger refuses a rank whose process does not fit beside its cache.
+const PROCESS_ALLOWANCE: u64 = 4 << 30;
+
 /// The one planner both entry points share: what differs between them is only the cache fitted.
 fn plan(
     facts: &RankFacts<'_>,
@@ -693,18 +705,38 @@ fn plan(
         }
         Device::Cpu => (0, 0),
     };
+    // A cache sized from storage takes what the deployment's quota leaves: the device's share less
+    // what is mapped by now, which is the weights and the process, and less what the process has yet
+    // to map. Nothing else bounds it, so the fraction binds here or nowhere.
+    let grant = match (facts.device, &cache) {
+        (Device::Cuda(index), Some(_)) => {
+            let storage = index.memory_info()?;
+            let held = storage.total.saturating_sub(storage.free);
+            let quota = crate::capacity::device::quota(storage.total, facts.mem_fraction_static);
+            let grant = quota
+                .saturating_sub(held.saturating_add(PROCESS_ALLOWANCE))
+                .min(storage.free);
+            Some(usize::try_from(grant).unwrap_or(usize::MAX))
+        }
+        _ => None,
+    };
     let request = CapacityRequest {
         device: facts.device,
         block_size: facts.block_size.map(|size| size as usize),
-        pool_storage_bytes: None,
+        pool_storage_bytes: grant,
         pool_storage_full_bytes: None,
         mem_fraction_static: facts.mem_fraction_static,
         max_batch_calls: facts.max_batch_calls,
         max_batch_tokens: facts.max_batch_tokens,
-        max_total_tokens: Some(facts.max_model_len),
+        // A rank without a paged cache plans its request's whole footprint, whose bound is the
+        // longest request.
+        max_total_tokens: match &cache {
+            Some(_) => facts.max_total_tokens,
+            None => Some(facts.max_model_len),
+        },
         max_request_pool_size: facts.max_request_pool_size,
         encoder_cache_entries: 0,
-        segments: None,
+        segments: facts.segments.clone(),
         stage_cache: false,
         predecessor: None,
         world: facts.world,
@@ -1308,6 +1340,8 @@ mod tests {
             max_batch_tokens: 2048,
             max_request_pool_size: 8,
             max_model_len: 4096,
+            max_total_tokens: Some(4096),
+            segments: None,
             mem_fraction_static: 0.5,
             cache,
             kv_dtype: ipc::PrefixCacheDtype::BFloat16,
