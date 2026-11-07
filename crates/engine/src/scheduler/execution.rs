@@ -628,6 +628,12 @@ impl Scheduler {
             .iter()
             .filter_map(|page| views::unit_of(*page))
             .collect();
+        // A page the host was offered as it was published has nothing left to move. A policy names
+        // the same idle pages step after step, and taking one again pins it out of the free queue
+        // until the host answers, so requests that need units would wait behind cached pages.
+        let units = self.storage.cache().map_or(units.clone(), |cache| {
+            cache.block_pool.without_host_key(&units)
+        });
         if !units.is_empty() {
             let moved = self.offload_units(&units);
             if moved < units.len() {
@@ -980,27 +986,43 @@ impl Scheduler {
     /// itself and by the log line above it.
     fn starvation_report(&self, live: &mechanism::Live<'_>, now: scheduling::guest::Nanos) -> String {
         let mut text = format!(
-            "{} resident, {} queued, {} in flight, {} waiting to be submitted",
+            "{} resident, {} queued, {} in flight, {} waiting to be submitted, {} of {} cache \
+             units free",
             self.running.len() + self.running_media.len(),
             self.waiting.len() + self.waiting_media.len(),
             self.inflight.pending_batches.len(),
             self.inflight.pending_submissions.len(),
+            self.storage.free_units(),
+            self.storage.capacity_units(),
         );
         for (id, since) in self.watchdog.advancing() {
             let age_ms = now.0.saturating_sub(since.0) / 1_000_000;
             let guest = scheduling::guest::RequestId(id.0);
             match live.requests.get(&guest) {
-                Some(view) => text.push_str(&format!(
-                    "; request {} is {:?}{} and last advanced {} ms ago",
-                    id.0,
-                    view.state,
-                    if view.waiting_transfer {
-                        ", waiting for a transfer"
-                    } else {
-                        ""
-                    },
-                    age_ms,
-                )),
+                Some(view) => {
+                    text.push_str(&format!(
+                        "; request {} is {:?}{} and last advanced {} ms ago",
+                        id.0,
+                        view.state,
+                        if view.waiting_transfer {
+                            ", waiting for a transfer"
+                        } else {
+                            ""
+                        },
+                        age_ms,
+                    ));
+                    if let Some(state) = self.running.get(&RequestId(id.0)) {
+                        text.push_str(&format!(
+                            ", {} of its {} prompt tokens computed in {} units",
+                            state.num_computed_prompt_tokens,
+                            state.req.prompt_token_ids.len(),
+                            state.block_tables().map_or(0, |tables| tables
+                                .iter()
+                                .map(BlockTable::held_units)
+                                .sum::<usize>()),
+                        ));
+                    }
+                }
                 None => text.push_str(&format!(
                     "; request {} is not in the live set and last advanced {} ms ago",
                     id.0, age_ms,

@@ -103,6 +103,26 @@ pub enum Variant {
 }
 
 impl Variant {
+    /// The call kind this variant serves, as a profiling session's `stages` and the fence probes'
+    /// histograms name it (`ipc::CallKind`).
+    pub const fn stage(self) -> &'static str {
+        match self {
+            Self::DecodeGreedy | Self::DecodeSampled => "decode",
+            Self::PrefillWrite | Self::PrefillOutput | Self::PrefillGreedy => "prefill",
+            Self::Encode => "text_encoding",
+            Self::Denoise => "denoising",
+            Self::Decode => "video_decoding",
+            Self::AudioDecode => "audio_decoding",
+            Self::VideoEncode => "video_encoding",
+            Self::AudioEncode => "audio_encoding",
+            Self::Mux => "muxing",
+            Self::LatentPrepare => "latent_preparation",
+            Self::MediaRead => "media_reading",
+            Self::ConditionEncode => "condition_encoding",
+            Self::ExpertJoin => "expert_join",
+        }
+    }
+
     /// The variant's name, as a capture report prints it.
     pub const fn name(self) -> &'static str {
         match self {

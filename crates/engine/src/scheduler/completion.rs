@@ -301,9 +301,8 @@ impl BatchReport {
             // batch's calls together, never a part of one.
             done: true,
             timing: output.timing,
-            // Device-side forward statistics are an executor's readout, not a
-            // rank's own (`crate::executors`); a process reports none here.
-            forward_stats: Vec::new(),
+            // What the rank's counters, probes and profiling session accumulated.
+            forward_stats: output.forward_stats.into_iter().collect(),
         })
     }
 }
@@ -351,6 +350,7 @@ mod tests {
                 device_us: 11,
                 ..TimingCounters::default()
             },
+            forward_stats: None,
         })
     }
 

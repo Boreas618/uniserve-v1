@@ -1569,12 +1569,23 @@ impl Scheduler {
 
                 // Hit pages that are currently unreferenced count as free
                 // until acquisition takes them, so they are subtracted from
-                // the free units.
+                // the free units. A resident keeps what it holds until it ends
+                // and is never preempted, and a host hit holds the units of all
+                // its pages from its admission, so the head's whole prompt fits
+                // beside what the residents' prompts still take: requests that
+                // hold every unit with none for their tails would wait for one
+                // another until the watchdog fails them.
+                let head_units = cache
+                    .coordinator
+                    .units_after_prefix(cached_tokens, n)
+                    .min(cache.coordinator.min_units_for_prompt(n, chunk_limit))
+                    .max(first_chunk_units);
                 let capacity_available = self
                     .storage
                     .free_units()
                     .saturating_sub(prefix_hit.cached_free_units)
-                    >= first_chunk_units;
+                    .saturating_sub(self.units_residents_still_need(chunk_limit))
+                    >= head_units;
                 if capacity_available {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
@@ -1601,6 +1612,33 @@ impl Scheduler {
             // capacity to free.
             break;
         }
+    }
+
+    /// The units the residents still take to compute their whole prompts in chunks of `chunk`.
+    fn units_residents_still_need(&self, chunk: usize) -> usize {
+        let Some(cache) = self.storage.cache() else {
+            return 0;
+        };
+        self.running
+            .values()
+            .filter(|state| {
+                (state.num_computed_prompt_tokens as usize) < state.req.prompt_token_ids.len()
+            })
+            .filter_map(|state| {
+                let held: usize = state
+                    .block_tables()?
+                    .iter()
+                    .map(BlockTable::held_units)
+                    .sum();
+                let prompt = state.req.prompt_token_ids.len();
+                Some(
+                    cache
+                        .coordinator
+                        .min_units_for_prompt(prompt, chunk)
+                        .saturating_sub(held),
+                )
+            })
+            .sum()
     }
 
     /// Probes the prefix cache on the configured prefill owner.

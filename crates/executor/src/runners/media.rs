@@ -1045,6 +1045,7 @@ impl MediaStage {
             return Ok(BatchOutput {
                 calls: vec![CallOutput::completed(call, Vec::new(), RowState::default())],
                 timing: ipc::TimingCounters::default(),
+                forward_stats: None,
             });
         }
         let regions = prepared
@@ -1109,6 +1110,7 @@ impl MediaStage {
                 host_us: started.elapsed().as_micros() as u64,
                 ..Default::default()
             },
+            forward_stats: None,
         })
     }
 }

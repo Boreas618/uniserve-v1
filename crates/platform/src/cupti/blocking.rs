@@ -229,13 +229,13 @@ mod tests {
         let stream = Stream::new(DeviceId(0))?;
         let scope = Watched::enter();
         let watch = BlockingWatch::start()?;
-        drop(StreamActivity::start([("device", &stream)])?);
+        drop(StreamActivity::start([("device", &stream)], false)?);
         drop(watch);
         stream.synchronize()?;
         assert_eq!(scope.blocking_calls(), 0);
 
         let watch = BlockingWatch::start()?;
-        let recording = StreamActivity::start([("device", &stream)])?;
+        let recording = StreamActivity::start([("device", &stream)], false)?;
         let bytes = 256 << 20;
         let storage = DeviceAllocation::linear(DeviceId(0), bytes)?;
         // SAFETY: the allocation holds `bytes` and outlives the fill, which

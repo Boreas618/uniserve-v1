@@ -95,6 +95,16 @@ pub(crate) enum Command {
         /// How many segments to map, or `None` for every one the storage holds for this rank.
         limit: Option<u32>,
     },
+    /// Map the host KV cache's page pools on this device's caches, `tokens` tokens of each cache
+    /// group: `pools` receives what the rank reports of them. It runs on this device's thread
+    /// because the copy stream the pages then move on belongs to the cache this thread drives.
+    MapHostCache {
+        tokens: u64,
+        keys: crate::batch::HostCacheKeys,
+        pools: Arc<std::sync::Mutex<Vec<ipc::PagePoolInfo>>>,
+    },
+    /// Copy published pages to the host KV cache, with no batch to carry them.
+    CopyPages(Vec<ipc::PageCopy>),
     /// Give the cache's segments from `from` on back to the Storage Server (7.6). The scheduler
     /// withdrew their units and waited for every request that held one.
     ReleaseCache {
@@ -109,6 +119,12 @@ pub(crate) enum Command {
     /// them (7.6). It is a queue item because the queue's order is what makes "no job reads the
     /// weights" true at the moment their mappings change.
     Rebind(Arc<dyn Fn() -> Result<()> + Send + Sync>),
+    /// Change the rank's profiling session (`docs/profiling.md`), at a batch boundary: a session's
+    /// collectors begin and end between two forwards, and only this thread knows where that is.
+    Profile {
+        change: crate::profiling::session::Change,
+        answer: crossbeam_channel::Sender<Result<serde_json::Value>>,
+    },
     /// Wait for the events deferred storage release hangs on.
     After(Vec<Arc<platform::Event>>),
 }
@@ -131,6 +147,10 @@ impl Command {
             Self::Purge(generation) => format!("purging generation {generation}"),
             Self::Discard(generation) => format!("discarding generation {generation}"),
             Self::Sleep => "giving the resident cache segments back".to_owned(),
+            Self::MapHostCache { tokens, .. } => {
+                format!("mapping a host KV cache of {tokens} tokens")
+            }
+            Self::CopyPages(pages) => format!("copying {} pages to the host KV cache", pages.len()),
             Self::Wake { limit } => match limit {
                 Some(limit) => format!("waking {limit} segments of the resident cache planes"),
                 None => "waking every released segment of the resident cache planes".to_owned(),
@@ -139,6 +159,7 @@ impl Command {
             Self::SuspendGraphs => "suspending the graph pools".to_owned(),
             Self::RestoreGraphs => "restoring the graph pools".to_owned(),
             Self::Rebind(_) => "putting new weights at the rank's addresses".to_owned(),
+            Self::Profile { .. } => "changing the rank's profiling session".to_owned(),
             Self::After(_) => "waiting for deferred storage work".to_owned(),
         }
     }
@@ -556,6 +577,8 @@ mod tests {
 
     fn batch() -> Batch {
         Batch {
+            page_loads: Vec::new(),
+            page_offloads: Vec::new(),
             id: crate::batch::BatchId(1),
             phase: ipc::PhaseId(0),
             calls: Vec::new(),

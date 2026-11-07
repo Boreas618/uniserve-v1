@@ -167,7 +167,9 @@ struct HandedPrograms {
 /// replica order after the HTTP listener and before the service descriptors.
 #[derive(Debug, Serialize, Deserialize)]
 struct ReplicaHandoff {
-    control: (bool, Vec<u8>),
+    /// The connection the engine's process lives under. A process an epoch switch started has
+    /// none: it lives under the node's supervision, which the service hands over.
+    control: Option<(bool, Vec<u8>)>,
     engine: u64,
     next_engine: u64,
     served: Vec<u8>,
@@ -386,14 +388,13 @@ impl Restarter {
         let mut descriptors = vec![listener_descriptor];
         let mut replicas = Vec::new();
         for replica in &handoff {
-            let control = replica
-                .client
-                .take_control()
-                .context("the engine's control connection is not this daemon's")?
-                .hand_over();
-            descriptors.push(control.descriptor);
+            let control = replica.client.take_control().map(|control| {
+                let control = control.hand_over();
+                descriptors.push(control.descriptor);
+                (control.unix, control.received)
+            });
             replicas.push(ReplicaHandoff {
-                control: (control.unix, control.received),
+                control,
                 engine: replica.engine,
                 next_engine: replica.next_engine,
                 served: replica.served.encode_to_vec(),
@@ -796,12 +797,18 @@ async fn prepared_successor(
     let replicas = replicas
         .into_iter()
         .map(|replica| {
-            let connection = Connection::resume(Handed {
-                descriptor: next()?,
-                unix: replica.control.0,
-                received: replica.control.1.clone(),
-            })
-            .context("resuming a replica's engine control connection")?;
+            let connection = replica
+                .control
+                .as_ref()
+                .map(|(unix, received)| {
+                    Connection::resume(Handed {
+                        descriptor: next()?,
+                        unix: *unix,
+                        received: received.clone(),
+                    })
+                    .context("resuming a replica's engine control connection")
+                })
+                .transpose()?;
             Ok((replica, connection))
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -850,7 +857,7 @@ async fn prepared_successor(
                     replica.engine,
                     replica.next_engine,
                     served.clone(),
-                    Some(connection),
+                    connection,
                     sink,
                 )?;
                 client.number_requests_from(replica.first_request);

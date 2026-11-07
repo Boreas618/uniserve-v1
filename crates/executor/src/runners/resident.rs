@@ -469,6 +469,29 @@ impl KvProvider for ResidentCache {
     ///
     /// This is the link whose absence made a first batch silently wrong: the gather reads the
     /// pooled table's row for a slot, and no serving path wrote one before this call.
+    fn issue_pages(
+        &mut self,
+        loads: &[ipc::PageCopy],
+        offloads: &[ipc::PageCopy],
+        stream: &Stream,
+    ) -> Result<Option<Arc<platform::Event>>> {
+        if loads.is_empty() && offloads.is_empty() {
+            return Ok(None);
+        }
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let copy = cache.copy_stream().ok_or_else(|| {
+            crate::Error::Invalid("a batch copies pages but the rank maps no page pool".into())
+        })?;
+        let issued = cache.issue_pages(loads, offloads, &copy)?;
+        if let Some(fence) = &issued.loads {
+            stream.wait_event(fence)?;
+        }
+        Ok(issued.offloads)
+    }
+
     fn install_block_tables(
         &mut self,
         tables: &[ipc::BlockTable],

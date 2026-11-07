@@ -246,8 +246,8 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
         .published
         .iter()
         .find(|(_, _, dtype, shape, _)| *dtype == DType::F32 && shape.rank() == 2)
-        .expect("the loader publishes the reciprocal table");
-    let reciprocals: Vec<f32> = published
+        .expect("the loader publishes the tensor scale table");
+    let scales: Vec<f32> = published
         .1
         .as_chunks::<4>()
         .0
@@ -255,16 +255,9 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
         .map(|word| f32::from_le_bytes(*word))
         .collect();
     // The shard states the tensor scales in its own reading order — 1 and 2 for expert 0's up and
-    // gate, then 17 and 18 for expert 1's — and the published table is their reciprocals,
-    // projection-major: up's two experts, then gate's.
-    let expected: Vec<f32> = [1.0_f32, 17.0, 2.0, 18.0].iter().map(|s| 1.0 / s).collect();
-    assert_eq!(reciprocals.len(), expected.len());
-    for (found, want) in reciprocals.iter().zip(&expected) {
-        assert!(
-            (found - want).abs() <= 1e-6,
-            "{reciprocals:?} against {expected:?}"
-        );
-    }
+    // gate, then 17 and 18 for expert 1's — and the published table is those scales, the factor the
+    // product multiplies by, projection-major: up's two experts, then gate's.
+    assert_eq!(scales, [1.0_f32, 17.0, 2.0, 18.0]);
 }
 
 #[test]
@@ -580,21 +573,22 @@ fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_den
     )
     .expect("the calibrated checkpoint loads");
 
-    // The walk states both: the projections' product once per bucket, and the experts' products which
-    // carry no row count.
+    // The walk states both: the projections' product once per row class, and the experts' products
+    // which carry no row count. One row and two hundred lie in two classes (`PACKED_M_CLASSES`); a
+    // pair inside one class compiles one program, so it would state half as many keys.
     let keys = model
-        .keys(nn::DType::BF16, 0, &[1, 15])
+        .keys(nn::DType::BF16, 0, &[1, 200])
         .expect("the deployment's programs");
     let named: Vec<&str> = keys.iter().map(|(operator, _)| operator.as_str()).collect();
     // `q` is `[2 · head_dim, hidden]`, `o` is `[hidden, 2 · head_dim]`, and `k` and `v` are one
-    // geometry between them — so three packed products per bucket, and no dense MLP's at all.
+    // geometry between them — so three packed products per row class, and no dense MLP's at all.
     assert_eq!(
         named
             .iter()
             .filter(|operator| **operator == "nvfp4_gemm")
             .count(),
         3 * 2,
-        "three attention geometries at two buckets, and no dense MLP's: {named:?}"
+        "three attention geometries at two row classes, and no dense MLP's: {named:?}"
     );
     assert!(named.contains(&"nvfp4_quantize"), "{named:?}");
     assert!(named.contains(&"gather_gemm_nvfp4"), "{named:?}");

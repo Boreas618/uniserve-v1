@@ -17,6 +17,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.python.e2e.program_server import (
+    program_server as running_program_server,
+)
 from tests.python.e2e.profiling_helpers import ended, serve, start
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -25,6 +28,8 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 # share the capacity plan keeps for graphs.
 OPTIONS = (
     "dtype=bfloat16",
+    "attention_backend=trtllm",
+    "max_num_batched_tokens=512",
     "chat_config.reasoning_parser=none",
     "cuda_graph_config.prefill_token_sizes=[512]",
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
@@ -48,7 +53,10 @@ def _ranges_past(storage: int) -> int:
 @pytest.fixture(scope="module")
 def served(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     """A Qwen3 deployment whose KV cache is sized by its GPU's quota."""
-    with serve(tmp_path_factory.mktemp("served"), OPTIONS) as base_url:
+    with (
+        running_program_server(tmp_path_factory) as programs,
+        serve(tmp_path_factory.mktemp("served"), OPTIONS, programs) as base_url,
+    ):
         yield base_url
 
 

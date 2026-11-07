@@ -153,8 +153,8 @@ enum Answered {
     Results(Vec<String>),
     /// Each worker group's prefix cache index (`Parked`).
     Index(Vec<wire::GroupIndex>),
-    /// Each worker group's KV cache segments (`CacheDescribed`).
-    Segments(Vec<wire::CacheSegments>),
+    /// What a successor maps of the engine (`CacheDescribed`).
+    Cache(wire::Predecessor),
     Prefixes(Vec<wire::RequestPrefix>),
 }
 
@@ -527,6 +527,12 @@ impl EngineClient {
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(command(id)),
             }));
+        // The reader marks the engine closed before it drops the answers it holds, so an answer
+        // registered after that finds the mark here and no reader ever drops it.
+        if matches!(self.state(), EngineState::Closed | EngineState::Failed(_)) {
+            lock(&self.shared.answers).remove(&id);
+            return Err("the engine ended before it answered".to_owned());
+        }
         answered
             .await
             .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
@@ -594,12 +600,12 @@ impl EngineClient {
     ///
     /// Fails with the reason a scheduler did not describe its cache, or
     /// when the engine ends first.
-    pub async fn describe_cache(&self) -> Result<Vec<wire::CacheSegments>, String> {
+    pub async fn describe_cache(&self) -> Result<wire::Predecessor, String> {
         match self
             .ask(|id| wire::engine_command::Kind::DescribeCache(wire::DescribeCache { id }))
             .await?
         {
-            Answered::Segments(segments) => Ok(segments),
+            Answered::Cache(predecessor) => Ok(predecessor),
             _ => Err("the engine answered a cache description with something else".to_owned()),
         }
     }
@@ -758,7 +764,6 @@ impl EngineClient {
             wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
                 id,
                 change: wire::CacheChange::MakeRoom as i32,
-                preempt_after_ms: None,
                 room_bytes: bytes,
                 device_bytes: devices
                     .iter()
@@ -933,7 +938,7 @@ impl Answered {
     fn results(self) -> Vec<String> {
         match self {
             Self::Results(results) => results,
-            Self::Index(_) | Self::Segments(_) | Self::Prefixes(_) => Vec::new(),
+            Self::Index(_) | Self::Cache(_) | Self::Prefixes(_) => Vec::new(),
         }
     }
 }
@@ -1098,7 +1103,10 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             Some(from_engine::Kind::CacheDescribed(described)) => {
                 if let Some(answer) = lock(&shared.answers).remove(&described.id) {
                     let _ = answer.send(if described.error.is_empty() {
-                        Ok(Answered::Segments(described.segments))
+                        Ok(Answered::Cache(wire::Predecessor {
+                            world: described.storage_world,
+                            segments: described.segments,
+                        }))
                     } else {
                         Err(described.error)
                     });
@@ -1116,11 +1124,11 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             Some(from_engine::Kind::State(_)) | None => {}
         }
     }
-    // A hook or configure the lost engine did not answer fails.
-    lock(&shared.answers).clear();
     if !matches!(*shared.state.borrow(), EngineState::Failed(_)) {
         shared.state.send_replace(EngineState::Closed);
     }
+    // A hook or configure the lost engine did not answer fails.
+    lock(&shared.answers).clear();
     // Every request still in flight leaves with the lost engine as
     // migratable: the daemon submits one that resumes from its generated
     // tokens, or a video request, to the engine that serves next, and fails

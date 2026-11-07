@@ -1563,6 +1563,24 @@ pub trait KvProvider: Send + Sync {
         install_block_tables_unavailable(tables)
     }
 
+    /// Records the batch's page copies on the cache's copy stream, and makes `stream` wait for the
+    /// loads the forward reads. Answers the fence of the offloads, which the batch's output waits
+    /// on. A provider that holds no cache refuses a copy rather than dropping it.
+    fn issue_pages(
+        &mut self,
+        loads: &[ipc::PageCopy],
+        offloads: &[ipc::PageCopy],
+        stream: &platform::Stream,
+    ) -> Result<Option<Arc<platform::Event>>> {
+        let _ = stream;
+        if loads.is_empty() && offloads.is_empty() {
+            return Ok(None);
+        }
+        Err(Error::Invalid(
+            "a batch copies pages and this runner holds no cache".to_owned(),
+        ))
+    }
+
     /// How many attention groups the model's layers index.
     fn groups(&self) -> usize;
 
@@ -1636,6 +1654,10 @@ struct PendingInstall {
     tables: Vec<ipc::BlockTable>,
     /// The units the mechanism allocated for this batch's pages, with their copies.
     units: Vec<ipc::CacheUnitAllocation>,
+    /// The host KV cache's pages the batch's new units load.
+    loads: Vec<ipc::PageCopy>,
+    /// The published pages the batch copies to the host KV cache.
+    offloads: Vec<ipc::PageCopy>,
 }
 
 /// A causal language model's runner: one block's decode and prefill phases.
@@ -1726,6 +1748,8 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// failed one can leave the recording in a state it never recovers from.
     capturing: bool,
     pending_install: Option<PendingInstall>,
+    /// The fence of the running batch's page offloads, until its output waits on it.
+    offload_fence: Option<Arc<platform::Event>>,
     /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
     /// by the device thread, which is the only thread that may issue to this runner's stream.
@@ -1898,6 +1922,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             served: false,
             capturing: false,
             pending_install: None,
+            offload_fence: None,
             pending_dump: None,
             recaptured: false,
             flights: std::collections::VecDeque::new(),
@@ -2077,6 +2102,8 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             batch: batch.id,
             tables: batch.block_tables.clone(),
             units: batch.cache_units.clone(),
+            loads: batch.page_loads.clone(),
+            offloads: batch.page_offloads.clone(),
         });
         // What a batch says about where its tokens read and write their cache, when a deployment
         // asks for it: the addresses a prefill wrote and a decode reads are compared from these
@@ -2204,7 +2231,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // Largest first, so the smaller captures reuse the larger ones' pool blocks
         // (`specs/replaceable-processes.md` 9.3).
         for bucket in self.buckets.capture_order().copied().collect::<Vec<_>>() {
-            if self.lifecycle.graphs.captured(bucket, generation).is_none() {
+            if self.lifecycle.graphs.captured_for(bucket, generation).is_none() {
                 jobs.push(Job::Capture {
                     runner: self.id,
                     bucket,
@@ -2462,6 +2489,11 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 if !eager {
                     captured.launch(&stream)?;
                 }
+                // The output read behind this says the batch's offloads finished: the mechanism
+                // commits their pages from it, and the forward above did not wait for them.
+                if let Some(fence) = self.offload_fence.take() {
+                    stream.wait_event(&fence)?;
+                }
                 self.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1e3;
                 if let Some(counters) = &self.counters {
                     counters.launches(nodes);
@@ -2694,22 +2726,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// exist. The operator's entry can refuse a capture that meets an unprepared runner; this is what
     /// keeps that refusal from firing on a healthy warmup.
     ///
-    /// It runs only where a bucket is first captured - a warmup, before the bucket serves - and not
-    /// where a bucket is rebound: a hot update's new operators are warmed by the shadow pass, and an
-    /// eager walk of a new generation over a serving bucket's own arena is work the switchover
-    /// design does not allow.
+    /// It runs only where a bucket is captured, and it walks the bucket's inert pose, never a batch:
+    /// a walk executes what is staged, and the columns of the last batch stay staged after its
+    /// replay. Walked again they compute that batch's step a second time and commit its slot's token
+    /// state, so the slot's sampled token moves past one the mechanism never read and the request's
+    /// stream loses it. A hot update's new operators are warmed by the shadow pass, and the pose is
+    /// safe beside live requests: it writes no KV page (`slot_mapping` is `-1`) and its commit table
+    /// is inert, and the next batch stages its own columns over it.
     fn warm(&mut self, bucket: Bucket, kernels: &Arc<Generation>) -> Result<()> {
-        // A warm walk runs over the arena of the bucket it walks, so it must not do so while another
-        // bucket's batch is staged: that batch owns the staging and may be half-served. A walk of the
-        // bucket whose own batch is staged is the opposite of a hazard, and it is the case a capture
-        // after serving depends on - the launches build the plans for exactly the pose the capture
-        // records, and an operator whose plan was never built cannot be captured at all (a cuBLASLt
-        // plan allocates its workspace, which a capture cannot carry).
-        // No gate on having served: a capture is its own job on this thread, dispatched between
-        // batches rather than inside one (`Job::Capture`), so no batch is ever mid-serve here and the
-        // warm walk of one bucket can never replace another's. Skipping the walk for a bucket
-        // captured after serving left the plan of every later bucket to be built *inside* its own
-        // recording - which no capture can carry, because a cuBLASLt plan allocates its workspace.
+        // A capture is its own job on this thread, dispatched between batches rather than inside
+        // one (`Job::Capture`), and a batch stages and replays in one command, so no batch is ever
+        // half-served here. The walk has to run for a bucket captured after serving too: it builds
+        // the plans of the pose the capture records, and an operator whose plan was never built
+        // cannot be captured at all (a cuBLASLt plan allocates its workspace).
 
         let began = std::time::Instant::now();
         if self.joins_only(bucket) {
@@ -2719,11 +2748,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         // The pose, stated before the walk that can fault on it: a warm launch that dies names the
         // numbers it was given, and the table it read, rather than leaving them to be inferred from
-        // the bucket. `stage_warm` is idempotent and `walk` reuses what it staged - which is how a
-        // capture during serving walks the serving batch rather than replacing it with a warm pose.
-        if self.staging.staged() != Some(bucket) {
-            self.stage_warm(bucket)?;
-        }
+        // the bucket. The capture's own walk reuses what this stages.
+        self.stage_warm(bucket)?;
         let (lengths, offsets) = warm_span(bucket);
         tracing::info!(
             bucket = %bucket,
@@ -3364,6 +3390,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 copy_us: 0,
                 host_us: host_start.elapsed().as_micros() as u64,
             },
+            forward_stats: None,
         })
     }
 
@@ -3600,7 +3627,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .map(|unit| u64::from(unit.0))
             .or(self.cache_page);
         self.kv.install_block_tables(&install.tables, &self.stream)?;
-        self.kv.apply_cache_units(&install.units, &self.stream)
+        self.kv.apply_cache_units(&install.units, &self.stream)?;
+        self.offload_fence = self
+            .kv
+            .issue_pages(&install.loads, &install.offloads, &self.stream)?;
+        Ok(())
     }
 
     /// What the captured attention launch is given: its grid, and the call its kernel dereferences.
@@ -4889,8 +4920,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // Under the dump, every layer's attended output is read at its own launch: the buffer is
         // reused by the next layer, so any later reading is the last layer's whichever name it has.
         let probe = AttentionOutputs::default();
+        let probes = crate::profiling::fences::capturing(&stream);
         let mut forward = Forward::new(&stream, generation, &arena)
-            .with_live_tokens(self.columns.live_tokens.device);
+            .with_live_tokens(self.columns.live_tokens.device)
+            .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence));
         // Never inside a recording: the probe copies and synchronises per layer, and a synchronise
         // inside a capture is refused by the driver - which is a measurement that breaks what it
         // measures, and one that no line of its own would ever explain.

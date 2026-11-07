@@ -153,6 +153,7 @@ impl Serving {
             Outcome::Success(BatchOutput {
                 calls,
                 timing: TimingCounters::default(),
+                forward_stats: None,
             }),
         );
         *next += 1;

@@ -510,6 +510,7 @@ pub struct KernelNodeParams<'a> {
 /// The values are copied out of the node — the driver keeps each parameter's
 /// size in the kernel's signature — so nothing dangles when the template is
 /// destroyed.
+#[derive(Clone)]
 pub struct OwnedKernelNodeParams {
     /// The kernel the node captured. Valid while the library it was loaded
     /// from is loaded, the same obligation a captured graph has.

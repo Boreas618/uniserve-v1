@@ -217,7 +217,7 @@ fn allocate(
         let buffer = DeviceAllocation::linear(device.id(), plan.bytes)
             .map_err(|error| format!("buffer {name} of {} bytes: {error}", plan.bytes))?;
         if let Some(fill) = &plan.fill {
-            let source = host_path(fill, module, recipe_path);
+            let source = host_path(fill, module, beside(recipe_path));
             let bytes =
                 std::fs::read(&source).map_err(|error| format!("{}: {error}", source.display()))?;
             if bytes.len() > plan.bytes {
@@ -286,6 +286,11 @@ fn dump_buffers(
     Ok(written)
 }
 
+/// The directory a recipe at `recipe` names its relative files from.
+fn beside(recipe: &Path) -> &Path {
+    recipe.parent().unwrap_or_else(|| Path::new("."))
+}
+
 /// A recipe's relative path, taken against its module directory first and the recipe's second.
 fn host_path(path: &Path, module: &Path, base: &Path) -> PathBuf {
     if path.is_absolute() {
@@ -296,4 +301,34 @@ fn host_path(path: &Path, module: &Path, base: &Path) -> PathBuf {
         return beside_module;
     }
     base.join(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A recipe written beside its inputs names them relatively, and they are found there.
+    #[test]
+    fn a_relative_fill_is_taken_from_the_recipes_directory() {
+        let recipe = Path::new("/cases/topk/recipe.json");
+        assert_eq!(
+            host_path(Path::new("logits.bin"), Path::new("/modules/none"), beside(recipe)),
+            PathBuf::from("/cases/topk/logits.bin")
+        );
+        assert_eq!(beside(Path::new("recipe.json")), Path::new(""));
+    }
+
+    #[test]
+    fn a_file_beside_the_module_comes_first_and_an_absolute_path_stands() {
+        let module = tempfile::tempdir().unwrap();
+        std::fs::write(module.path().join("table.bin"), b"").unwrap();
+        assert_eq!(
+            host_path(Path::new("table.bin"), module.path(), Path::new("/cases")),
+            module.path().join("table.bin")
+        );
+        assert_eq!(
+            host_path(Path::new("/data/table.bin"), module.path(), Path::new("/cases")),
+            PathBuf::from("/data/table.bin")
+        );
+    }
 }
