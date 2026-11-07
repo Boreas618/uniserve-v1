@@ -274,6 +274,7 @@ impl Executor {
             session: None,
             step_end: None,
             blocking: platform::cupti::blocking::Calls::default(),
+            refold: false,
         };
         let thread_queue = Arc::clone(&queue);
         let thread = std::thread::Builder::new()
@@ -758,6 +759,9 @@ struct Device {
     step_end: Option<(u64, &'static str, platform::Stream)>,
     /// This thread's driver calls that waited for the device, when its last result left.
     blocking: platform::cupti::blocking::Calls,
+    /// The weights changed while the graph pools were suspended, so the runners fill again what
+    /// they fold from them once the pools are back.
+    refold: bool,
 }
 
 impl Device {
@@ -1171,12 +1175,30 @@ impl Device {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .restore()?;
                 crate::profiling::storage_remapped();
+                if std::mem::take(&mut self.refold) {
+                    for named in &mut self.runners {
+                        named.runner.weights_changed()?;
+                    }
+                    self.synchronize()?;
+                }
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::Rebind(work) => {
                 self.synchronize()?;
                 work()?;
                 crate::profiling::storage_remapped();
+                // What a runner folds from the weights it computes in its arena, which a sleeping
+                // rank has unmapped: that waits for the storage to come back, and no batch runs
+                // before it does.
+                let suspended = self
+                    .pools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .suspended();
+                if suspended {
+                    self.refold = true;
+                    return Ok(Step::Done(BatchOutput::default()));
+                }
                 for named in &mut self.runners {
                     named.runner.weights_changed()?;
                 }
