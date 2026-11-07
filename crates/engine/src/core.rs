@@ -36,10 +36,11 @@ use crate::scheduler::{SchedulerConfig, SchedulerStats};
 use crate::{CommandWaker, GenerationLimits, Request};
 use anyhow::Context as _;
 use executor::batch::Batches;
-#[cfg(test)]
-use ipc::ComponentDistribution;
 use ipc::MainProcessInfo;
-use ipc::{ComponentConfig, ParallelConfig, RequestId};
+use ipc::RequestId;
+use proto::config::BlockConfig;
+#[cfg(test)]
+use proto::config::BlockDistribution;
 use proto::request::ExpertExchange;
 
 /// One cooperative member's physical execution endpoint.
@@ -89,7 +90,7 @@ pub struct ExecutorGroupConfig {
     /// the group.
     pub ranks: Vec<ExecutorRank>,
     /// Components keyed by name, each listing indices into `ranks`.
-    pub components: BTreeMap<String, ComponentConfig>,
+    pub components: BTreeMap<String, BlockConfig>,
     /// Maximum number of physical runs in flight per rank.
     pub queue_depth: usize,
     /// Per-rank share of device storage available to this group for static
@@ -147,13 +148,13 @@ impl ExecutorGroupConfig {
     /// `(host, device)` pair unless the device is `cpu`. Components must be
     /// valid for their executor role; each needs a nonempty name, a nonempty list of distinct
     /// in-range rank indices, a `parallel_config` whose
-    /// `ParallelConfig::world_size` succeeds, and a positive `units_per_rank`.
+    /// `BlockConfig::world_size` succeeds, and a positive `units_per_rank`.
     /// A component without a distribution must have a parallel world size
     /// equal to its rank count; one with a distribution must have world size
     /// one.
     pub fn validate_members(
         ranks: &[ExecutorRank],
-        components: &BTreeMap<String, ComponentConfig>,
+        components: &BTreeMap<String, BlockConfig>,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(!ranks.is_empty(), "executor requires rank members");
         let mut devices = BTreeSet::new();
@@ -226,16 +227,13 @@ impl ExecutorGroupConfig {
     /// is given, and the default engine settings and the simulation use it. A
     /// deployment with several components, or with other partitions, writes
     /// its own configuration.
-    pub fn single_component(name: &str, rank_count: usize) -> BTreeMap<String, ComponentConfig> {
+    pub fn single_component(name: &str, rank_count: usize) -> BTreeMap<String, BlockConfig> {
         BTreeMap::from([(
             name.into(),
-            ComponentConfig::parallel(
-                (0..rank_count).collect(),
-                ParallelConfig {
-                    tensor_parallel_size: rank_count,
-                    ..Default::default()
-                },
-            ),
+            BlockConfig {
+                tensor_parallel_size: rank_count,
+                ..BlockConfig::parallel((0..rank_count).collect())
+            },
         )])
     }
 
@@ -257,7 +255,7 @@ impl ExecutorGroupConfig {
         device: &str,
         rank_count: usize,
         queue_depth: usize,
-        components: BTreeMap<String, ComponentConfig>,
+        components: BTreeMap<String, BlockConfig>,
     ) -> Self {
         // A host takes its share of the ranks, and the first hosts take the
         // remainder, so a count that does not divide evenly still places every
@@ -304,7 +302,7 @@ impl ExecutorGroupConfig {
         cores: usize,
         ranks_per_core: usize,
         queue_depth: usize,
-        components: BTreeMap<String, ComponentConfig>,
+        components: BTreeMap<String, BlockConfig>,
     ) -> Vec<Self> {
         let placed = Self::placed(
             hosts,
@@ -1632,23 +1630,22 @@ mod tests {
     /// Entries covering the shapes a rank layout must validate: one component
     /// parallel over every rank, one dividing its output into units, and one
     /// placed alone.
-    fn mixed_components(rank_count: usize) -> BTreeMap<String, ComponentConfig> {
+    fn mixed_components(rank_count: usize) -> BTreeMap<String, BlockConfig> {
         let members: Vec<_> = (0..rank_count).collect();
         let mut components = ExecutorGroupConfig::single_component("parallel", rank_count);
         components.insert(
             "divided".into(),
-            ComponentConfig {
+            BlockConfig {
                 ranks: members,
-                parallel_config: ParallelConfig::default(),
-                distribution: Some(ComponentDistribution::TemporalUnits),
+                tensor_parallel_size: 1,
+                pipeline_parallel_size: 1,
+                sequence_parallel: Default::default(),
+                distribution: Some(BlockDistribution::TemporalUnits),
                 units_per_rank: 1,
                 weights: Default::default(),
             },
         );
-        components.insert(
-            "alone".into(),
-            ComponentConfig::parallel(vec![0], ParallelConfig::default()),
-        );
+        components.insert("alone".into(), BlockConfig::parallel(vec![0]));
         components
     }
 

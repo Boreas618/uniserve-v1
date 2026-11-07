@@ -97,7 +97,6 @@ mod identity;
 mod info;
 mod media;
 mod output;
-mod parallel;
 /// The first frame between main processes of one epoch (§2.3).
 pub mod peer;
 /// The scheduler's name for one phase (§4.5).
@@ -121,10 +120,6 @@ pub use proto::{MediaLocator, MediaSource, SharedMemory};
 // The request values the engine carries on to its ranks are the request
 // vocabulary's own.
 pub use output::*;
-pub use parallel::{
-    ComponentConfig, ComponentDistribution, ComponentWeights, HeadProjection, ParallelConfig,
-    ParallelConfigError, SequenceParallel,
-};
 pub use peer::{PeerAccepted, PeerRegistration, VERSION};
 pub use phase::PhaseId;
 pub use program::ProgramCommand;

@@ -23,7 +23,8 @@ use engine::{
     GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoderInput,
     ImageGenerationConfig, ImageInput, ImageTrigger, MultimodalInputs, Request,
 };
-use ipc::{ComponentConfig, ImageParams, RequestId, SamplingParams};
+use ipc::{ImageParams, RequestId, SamplingParams};
+use proto::config::BlockConfig;
 
 /// The name of the component that encodes an input image's features.
 const VISION_ENCODER: &str = "vision_encoder";
@@ -46,14 +47,9 @@ fn engine(media_overstatement: u64) -> anyhow::Result<SchedulerHandle> {
 fn logged_engine(
     media_overstatement: u64,
 ) -> anyhow::Result<(SchedulerHandle, engine::ContextLog)> {
-    let components: BTreeMap<String, ComponentConfig> = ["model", "vision_encoder"]
+    let components: BTreeMap<String, BlockConfig> = ["model", "vision_encoder"]
         .into_iter()
-        .map(|name| {
-            (
-                name.to_owned(),
-                ComponentConfig::parallel(vec![0], Default::default()),
-            )
-        })
+        .map(|name| (name.to_owned(), BlockConfig::parallel(vec![0])))
         .collect();
     let mut config = EngineConfig::sim("stub");
     config.generation_limits = GenerationLimits {

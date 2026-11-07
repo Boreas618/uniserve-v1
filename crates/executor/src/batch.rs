@@ -20,7 +20,8 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ipc::{CallStatus, ComponentConfig, ErrorCode, MainProcessInfo, PhaseId, TimingCounters};
+use ipc::{CallStatus, ErrorCode, MainProcessInfo, PhaseId, TimingCounters};
+use proto::config::BlockConfig;
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};
@@ -913,7 +914,7 @@ pub struct PoolLayout {
     /// Ranks the pool was launched with, counted as at least one.
     pub ranks: usize,
     /// The pool's components by name, each with its member ranks, parallel degrees and distribution.
-    pub components: std::collections::BTreeMap<String, ComponentConfig>,
+    pub components: std::collections::BTreeMap<String, BlockConfig>,
 }
 
 /// The mechanism's `Batches` over a node's devices (2.4, 4.4): a batch goes to every device whose

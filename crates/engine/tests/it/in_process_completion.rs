@@ -21,7 +21,8 @@ use engine::{
     Stage,
 };
 use executor::batch::{Batch, Batches, Inventory, PoolLayout};
-use ipc::{ComponentConfig, ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams};
+use ipc::{ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams};
+use proto::config::BlockConfig;
 
 use crate::support::SAMPLED;
 

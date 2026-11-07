@@ -12,7 +12,7 @@
 //! transfer edges a deployment names between its executor groups, which a
 //! replica's spec keeps for its own groups (`EngineConfig::replica_specs`).
 
-pub use ipc::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
+pub use proto::config::{BlockConfig, BlockDistribution, SequenceParallel};
 
 #[cfg(test)]
 use ipc::VideoDenoiserInfo;
@@ -50,7 +50,7 @@ pub struct PoolLayout {
     pub ranks: usize,
     /// The pool's components by name, each with its member ranks, parallel
     /// degrees and distribution.
-    pub components: BTreeMap<String, ComponentConfig>,
+    pub components: BTreeMap<String, BlockConfig>,
 }
 
 /// Concrete pool information reported through the execution boundary.
@@ -152,11 +152,7 @@ impl ExecutorInfo {
 
     /// Returns the configuration the engine placed component `name` with on
     /// `executor`, or `None` when the pool holds no such component.
-    pub fn component_config(
-        &self,
-        worker: &ExecutorGroupId,
-        name: &str,
-    ) -> Option<&ComponentConfig> {
+    pub fn component_config(&self, worker: &ExecutorGroupId, name: &str) -> Option<&BlockConfig> {
         self.layouts.get(worker)?.components.get(name)
     }
 
@@ -1245,27 +1241,26 @@ mod tests {
     /// round leaves out the ranks its executor's text encoder takes.
     #[test]
     fn media_units_count_the_units_one_call_covers() {
-        let parallel = |ranks: Vec<usize>| ComponentConfig::parallel(ranks, Default::default());
-        let temporal = |ranks: Vec<usize>, units_per_rank: usize| ComponentConfig {
-            distribution: Some(ipc::ComponentDistribution::TemporalUnits),
+        let parallel = |ranks: Vec<usize>| BlockConfig::parallel(ranks);
+        let temporal = |ranks: Vec<usize>, units_per_rank: usize| BlockConfig {
+            distribution: Some(proto::config::BlockDistribution::TemporalUnits),
             units_per_rank,
             ..parallel(ranks)
         };
         // A pool placing each named component as configured.
-        let pool =
-            |id: &str, routes: &[(MediaCall, &str)], configs: Vec<(&str, ComponentConfig)>| {
-                let (id, info) = media_pool(id, routes, 0);
-                let layout = PoolLayout {
-                    queue_depth: 1,
-                    ranks: 8,
-                    components: configs
-                        .into_iter()
-                        .map(|(name, config)| (name.to_owned(), config))
-                        .collect(),
-                };
-                ((id.clone(), info), (id, layout))
+        let pool = |id: &str, routes: &[(MediaCall, &str)], configs: Vec<(&str, BlockConfig)>| {
+            let (id, info) = media_pool(id, routes, 0);
+            let layout = PoolLayout {
+                queue_depth: 1,
+                ranks: 8,
+                components: configs
+                    .into_iter()
+                    .map(|(name, config)| (name.to_owned(), config))
+                    .collect(),
             };
-        let encoder = |id: &str, config: ComponentConfig| {
+            ((id.clone(), info), (id, layout))
+        };
+        let encoder = |id: &str, config: BlockConfig| {
             pool(
                 id,
                 &[(MediaCall::LatentEncoding, "latent_encoder")],

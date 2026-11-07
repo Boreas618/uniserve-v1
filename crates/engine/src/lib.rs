@@ -43,11 +43,10 @@ pub use crate::deployment::Deployment;
 #[cfg(feature = "testing")]
 pub use crate::executor::{BatchResult, CallResult, Executor};
 pub use crate::executor::{
-    CommandOutcome, CommandResult, ComponentConfig, ComponentDistribution, ExecuteError,
-    ExecutionBatch, ExecutorError, ExecutorFailure, ExecutorGroupId, ExecutorInfo,
-    ExecutorSubmitError, PageOffloads, ParallelConfig, PoolLayout, RankBuffer, RankEncoderPools,
-    RequestDispatch, SequenceParallel, TransferBackend, TransferConfig, TransferConfigError,
-    TransferEdge,
+    BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ExecuteError, ExecutionBatch,
+    ExecutorError, ExecutorFailure, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError,
+    PageOffloads, PoolLayout, RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel,
+    TransferBackend, TransferConfig, TransferConfigError, TransferEdge,
 };
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,

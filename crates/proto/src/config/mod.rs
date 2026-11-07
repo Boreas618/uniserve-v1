@@ -6,6 +6,7 @@
 //! older build reads what a newer daemon writes; the daemon refuses a key no section knows when it
 //! parses the file (`daemon::options`).
 
+pub mod block;
 pub mod values;
 
 use std::collections::HashMap;
@@ -21,6 +22,10 @@ use serde_json::Value;
 use crate::request::{
     ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat, PrefixCacheDtype, SchedulingPolicy,
     StandbyStorage,
+};
+pub use block::{
+    BlockConfig, BlockConfigError, BlockDistribution, BlockWeights, HeadProjection,
+    SequenceParallel,
 };
 pub use values::ImageSize;
 
