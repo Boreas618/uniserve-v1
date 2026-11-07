@@ -14,12 +14,10 @@
 //!   which epoch serves, drains it and gates its admissions;
 //! - `tokenizer`: the served checkpoint's tokenizer and incremental decoding;
 //! - `model`: the served checkpoint's files, configuration and family
-//!   profile;
-//! - `options`: the deployment-file values the application reads.
+//!   profile.
 
 pub mod control;
 pub mod model;
-pub mod options;
 pub mod tokenizer;
 
 #[cfg(any(test, feature = "testing"))]
