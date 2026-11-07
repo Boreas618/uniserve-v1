@@ -23,6 +23,72 @@ pub(super) struct RawUniqueId {
     pub(super) bytes: [u8; 128],
 }
 
+/// `NCCL_API_MAGIC` in `nccl.h`, which NCCL checks to know a config was initialized.
+pub(super) const NCCL_API_MAGIC: u32 = 0xcafe_beef;
+
+/// `NCCL_CONFIG_UNDEF_INT` in `nccl.h` (`INT_MIN`): an attribute left to NCCL's default.
+const NCCL_CONFIG_UNDEF_INT: i32 = i32::MIN;
+
+/// `NCCL_VERSION(2, 30, 0)`: the release from which every attribute of [`RawConfig`] exists.
+/// NCCL reads a config's attributes as of the version it states, so an attribute newer than the
+/// stated version takes its default whatever value it holds; 2.29 is the first that reads
+/// `graphUsageMode` and 2.30 the first with `maxP2pPeers`, the last field laid out here.
+const NCCL_CONFIG_VERSION: u32 = 23000;
+
+/// `ncclConfig_t` as `nccl.h` lays it out from 2.30 (`ncclConfig_v22800`), compared with the
+/// header by `tests::the_nccl_config_is_laid_out_as_the_header`.
+#[repr(C)]
+pub(super) struct RawConfig {
+    size: usize,
+    magic: u32,
+    version: u32,
+    blocking: i32,
+    cga_cluster_size: i32,
+    min_ctas: i32,
+    max_ctas: i32,
+    net_name: *const c_char,
+    split_share: i32,
+    traffic_class: i32,
+    comm_name: *const c_char,
+    collnet_enable: i32,
+    cta_policy: i32,
+    shrink_share: i32,
+    nvls_ctas: i32,
+    n_channels_per_net_peer: i32,
+    nvlink_centric_sched: i32,
+    pub(super) graph_usage_mode: i32,
+    num_rma_ctx: i32,
+    max_p2p_peers: i32,
+}
+
+impl RawConfig {
+    /// `NCCL_CONFIG_INITIALIZER`: every attribute left to NCCL's default.
+    pub(super) fn initializer() -> Self {
+        Self {
+            size: std::mem::size_of::<Self>(),
+            magic: NCCL_API_MAGIC,
+            version: NCCL_CONFIG_VERSION,
+            blocking: NCCL_CONFIG_UNDEF_INT,
+            cga_cluster_size: NCCL_CONFIG_UNDEF_INT,
+            min_ctas: NCCL_CONFIG_UNDEF_INT,
+            max_ctas: NCCL_CONFIG_UNDEF_INT,
+            net_name: std::ptr::null(),
+            split_share: NCCL_CONFIG_UNDEF_INT,
+            traffic_class: NCCL_CONFIG_UNDEF_INT,
+            comm_name: std::ptr::null(),
+            collnet_enable: NCCL_CONFIG_UNDEF_INT,
+            cta_policy: NCCL_CONFIG_UNDEF_INT,
+            shrink_share: NCCL_CONFIG_UNDEF_INT,
+            nvls_ctas: NCCL_CONFIG_UNDEF_INT,
+            n_channels_per_net_peer: NCCL_CONFIG_UNDEF_INT,
+            nvlink_centric_sched: NCCL_CONFIG_UNDEF_INT,
+            graph_usage_mode: NCCL_CONFIG_UNDEF_INT,
+            num_rma_ctx: NCCL_CONFIG_UNDEF_INT,
+            max_p2p_peers: NCCL_CONFIG_UNDEF_INT,
+        }
+    }
+}
+
 type Collective = unsafe extern "C" fn(Handle, Handle, usize, i32, Handle, Handle) -> NcclResult;
 type Reduction =
     unsafe extern "C" fn(Handle, Handle, usize, i32, i32, Handle, Handle) -> NcclResult;
@@ -33,6 +99,10 @@ pub(super) struct Api {
     pub(super) get_unique_id: unsafe extern "C" fn(*mut RawUniqueId) -> NcclResult,
     pub(super) comm_init_rank:
         unsafe extern "C" fn(*mut Handle, i32, RawUniqueId, i32) -> NcclResult,
+    /// `ncclCommInitRankConfig(comm, nranks, id, rank, config)`, an entry point of 2.14 and later.
+    pub(super) comm_init_rank_config: Result<
+        unsafe extern "C" fn(*mut Handle, i32, RawUniqueId, i32, *mut RawConfig) -> NcclResult,
+    >,
     /// `ncclCommSplit(comm, color, key, newcomm, config)`, an entry point of
     /// newer releases (2.18); a NULL config takes the defaults.
     pub(super) comm_split:
@@ -86,6 +156,7 @@ pub(super) fn api() -> Result<&'static Api> {
                 error_string: symbol(&library, "ncclGetErrorString")?,
                 get_unique_id: symbol(&library, "ncclGetUniqueId")?,
                 comm_init_rank: symbol(&library, "ncclCommInitRank")?,
+                comm_init_rank_config: symbol(&library, "ncclCommInitRankConfig"),
                 comm_split: symbol(&library, "ncclCommSplit"),
                 comm_destroy: symbol(&library, "ncclCommDestroy")?,
                 comm_abort: symbol(&library, "ncclCommAbort")?,

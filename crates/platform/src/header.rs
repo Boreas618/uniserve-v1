@@ -579,8 +579,19 @@ fn define(header: &str, name: &str) -> Option<i64> {
         if !after.starts_with(char::is_whitespace) {
             continue;
         }
+        let after = after.trim_start();
+        // A hexadecimal define (`#define NCCL_API_MAGIC 0xcafebeef`) reads in base 16.
+        if let Some(digits) = after
+            .strip_prefix("0x")
+            .or_else(|| after.strip_prefix("0X"))
+        {
+            let digits: String = digits.chars().take_while(char::is_ascii_hexdigit).collect();
+            if let Ok(value) = i64::from_str_radix(&digits, 16) {
+                return Some(value);
+            }
+            continue;
+        }
         let value: String = after
-            .trim_start()
             .chars()
             .take_while(|character| character.is_ascii_digit() || *character == '-')
             .collect();
