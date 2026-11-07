@@ -2573,6 +2573,7 @@ def test_host_hits_beyond_the_device_cache_all_finish(
     [
         ("expert", ("data_parallel_size=2", "moe_config.expert_parallel=true")),
         ("data", ("data_parallel_size=2",)),
+        ("tensor", ("tensor_parallel_size=2",)),
     ],
     ids=lambda parallel: parallel[0],
 )
@@ -2611,7 +2612,8 @@ def test_a_process_of_two_devices_keeps_the_host_kv_cache(
         assert found > 0, f"{found}{_log_trouble(log)}"
         # An expert union is one process whose two schedulers serve a device
         # each, and each keeps a host KV cache of its own; data parallelism is
-        # a process per device.
+        # a process per device; a tensor group is one scheduler over both
+        # devices, whose pages each device copies its own heads of.
         if kind == "expert":
             assert _occurrences(log, "schedulers=2 devices=2"), _log_trouble(log)
             assert (

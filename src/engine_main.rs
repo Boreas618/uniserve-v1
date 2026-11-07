@@ -8134,13 +8134,14 @@ fn schedulers(
     // launch states, the build config fixes and the model's own geometry, and it refuses by name
     // when a fact it needs is one the launch file does not carry.
     let mut facts = plan.rank_facts(model)?;
-    // The host KV cache copies a rank's pages on that rank's copy stream, into the pool the one rank
-    // of this scheduler's inventory states. A scheduler of an expert union serves one device, as a
-    // scheduler of one rank does, and its peers' schedulers keep their own pools of the same pages:
-    // a page holds what the union computed. A scheduler over several devices would copy one
-    // device's share of every page, so it keeps none, and no text model runs one today: a rank
-    // maps its model on one device.
-    let host_cache = plan.host_kv_cache(model) && executors.len() == 1;
+    // The host KV cache copies a rank's pages on that rank's copy stream, into that rank's pool: the
+    // executors map one pool per device (`Executors::map_host_cache`), and a page copy names the
+    // device it runs on. A scheduler of an expert union serves one device, as a scheduler of one
+    // rank does, and its peers' schedulers keep their own pools of the same pages: a page holds what
+    // the union computed. A scheduler of a tensor group serves every device of the group, and each
+    // device keeps its own heads of every page, so a page is a copy on every device.
+    let tensor_group = matches!(model, crate::engine_plan::Served::Text(_)) && executors.len() > 1;
+    let host_cache = plan.host_kv_cache(model) && (executors.len() == 1 || tensor_group);
     if host_cache {
         facts.deployment = Some(launch.deployment.clone());
         facts.host_kv_cache = true;
