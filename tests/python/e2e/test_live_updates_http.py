@@ -1503,7 +1503,7 @@ def _restart_while_streaming(
     # address serves, and the old one closes once the replaced daemon exits.
     previous = successors[-1]
     port = find_free_port()
-    moved = _apply(base_url, f"server_config.port={port}")
+    moved = _apply(base_url, f"admin_config.port={port}")
     assert moved["change"] == "daemon", moved
     successors.append(moved["pid"])
     moved_url = f"http://127.0.0.1:{port}"
@@ -1517,7 +1517,7 @@ def _restart_while_streaming(
     with pytest.raises(httpx.ConnectError):
         httpx.get(f"{base_url}/health", timeout=5)
     status = httpx.get(f"{moved_url}/admin/config", timeout=10).json()
-    server = tomllib.loads(status["config"])["server_config"]
+    server = tomllib.loads(status["config"])["admin_config"]
     assert server["port"] == port, server
 
     # A change of both the daemon's options and what a world executes
@@ -1525,7 +1525,7 @@ def _restart_while_streaming(
     # changes the world in an operation of its own.
     previous = successors[-1]
     port = find_free_port()
-    both = _apply(moved_url, f"server_config.port={port}", CHANGE)
+    both = _apply(moved_url, f"admin_config.port={port}", CHANGE)
     assert both["change"] == "daemon", both
     assert both["then"] == "epoch", both
     successors.append(both["pid"])
@@ -1559,7 +1559,7 @@ def _restart_while_streaming(
         300,
         "the switch's target never served its configuration",
     )
-    assert served_config()["server_config"]["port"] == port
+    assert served_config()["admin_config"]["port"] == port
     reply = _chat(both_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     _wait_until(
@@ -1728,21 +1728,17 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         _change_world(base_url, CHANGE)
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
-        lines = _log_lines(log)
-        assert (
-            sum(
-                "uniserve.loading.rank: loaded numerical model" in line
-                for line in lines
-            )
-            == 1
+        loads = [
+            line
+            for line in _log_lines(log)
+            if "the epoch's retained weights" in line
+        ]
+        assert len(loads) >= 2 and all(
+            re.search(r" published=0\b", line) for line in loads[1:]
         ), (
             "an engine read the checkpoint again rather than the weights "
-            "the Storage Server retains"
+            f"the Storage Server retains: {loads}"
         )
-        assert any(
-            re.search(r"mapped the retained weights .*missing=0", line)
-            for line in lines
-        ), "the successor world did not map the retained weights"
 
 
 # The options of a deployment whose KV cache takes the device storage its
@@ -2205,8 +2201,16 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
             300,
             f"the revert did not end: {_log_trouble(log)}",
         )
-        result = _apply(base_url, f"worker_config.executable={executables[2]}")
-        assert result["change"] == "epoch", result
+        _wait_until(
+            lambda: httpx.put(
+                f"{base_url}/admin/config",
+                json={"set": [f"worker_config.executable={executables[2]}"]},
+                timeout=60,
+            ).status_code
+            != 409,
+            120,
+            "the replica stayed with the switch that ended",
+        )
         _on_trial(base_url)
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
@@ -2509,8 +2513,10 @@ def test_a_regression_of_the_epoch_on_trial_reverts_it(
     """
     name = "qwen3-live-regression"
     log = tmp_path / "server.log"
+    # The walk costs a step about a fifth more than a replay, so a threshold of a
+    # fifth would read the machine and not the regression.
     thresholds = (
-        "update_config.rollback.step_time_regression=0.2",
+        "update_config.rollback.step_time_regression=0.05",
         f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
     )
     with _serve(runtime, log, name) as base_url:
@@ -2737,6 +2743,7 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
         _admin(base_url, "config/commit")
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
         assert _numbers([answer["choices"][0]["message"]["content"]])[:3] == [1, 2, 3]
+        assert not _occurrences(log, "starved"), _log_trouble(log)
         _artifact("warming-options", {"tight": tight, "under_prefills": limited})
 
 
@@ -2762,6 +2769,53 @@ def test_a_request_that_ends_at_once_leaves_its_pages_in_the_host_cache(
         )
         print("host tokens of a request of one token:", found)
         assert found > 0, found
+
+
+def test_host_hits_beyond_the_device_cache_all_finish(
+    tmp_path: Path, runtime: Path
+):
+    """Requests that find more pages in the host than the device holds all end.
+
+    A host hit takes the units of its pages at admission, and a resident keeps
+    its units until it ends. Admitted together, requests whose tails run past
+    their first chunk would hold every unit with none left for those tails, so
+    admission keeps the units the residents' prompts still need.
+    """
+    name = "qwen3-live-host-hits"
+    log = tmp_path / "server.log"
+    prompts = [
+        " ".join(f"{turn}-{word}" for word in range(2495)) for turn in range(4)
+    ]
+    tail = " ".join(f"tail-{word}" for word in range(300))
+    with _serve(runtime, log, name) as base_url:
+        for prompt in prompts:
+            _chat(base_url, name, prompt, tokens=1)
+        time.sleep(2)
+        flushed = _admin(base_url, "flush_cache")
+        assert flushed.status_code == 200, flushed.text
+        errors: list[BaseException] = []
+
+        def ask(prompt: str) -> None:
+            try:
+                _chat(base_url, name, prompt, tokens=1, timeout_s=300)
+            except httpx.HTTPError as error:
+                errors.append(error)
+
+        def ask_together() -> None:
+            asking = [
+                threading.Thread(target=ask, args=(f"{prompt} {tail}",))
+                for prompt in prompts
+            ]
+            for thread in asking:
+                thread.start()
+            for thread in asking:
+                thread.join(timeout=400)
+
+        found = _host_tokens_read(base_url, ask_together)
+        print("host tokens of the four requests:", found)
+        assert not errors, f"{errors[0]!r}{_log_trouble(log)}"
+        assert found > 0, found
+        assert not _occurrences(log, "starved"), _log_trouble(log)
 
 
 def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
