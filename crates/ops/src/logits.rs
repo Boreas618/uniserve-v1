@@ -148,10 +148,13 @@ impl fmt::Display for UnpadDescriptor {
 /// The arguments of `vocab_unpad`.
 #[derive(Clone, Copy)]
 pub struct UnpadArgs {
-    /// `[rows, padded]` the gathered logits.
+    /// `[rows, padded]` the gathered logits: `ranks` shards of `[rows, padded / ranks]`, rank by
+    /// rank, as a collective gather lays them.
     pub gathered: TensorView,
     /// `[rows, vocabulary]`.
     pub out: TensorView,
+    /// The ranks whose shards the gather holds; one for an unsharded head.
+    pub ranks: u32,
 }
 
 /// Drop the padding of a gathered sharded vocabulary.
@@ -180,6 +183,16 @@ impl Op for VocabUnpad {
         let rows = args.gathered.rows();
         args.gathered
             .require_shape(Self::NAME, Shape::new(&[rows, padded]))?;
+        let ranks = u64::from(args.ranks);
+        if ranks == 0 || padded % ranks != 0 || vocabulary.div_ceil(ranks) > padded / ranks {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "{ranks} shards of a {padded}-column gather do not hold a vocabulary of \
+                     {vocabulary}"
+                ),
+            ));
+        }
         args.out
             .require_shape(Self::NAME, Shape::new(&[rows, vocabulary]))?;
         if args.gathered.dtype != descriptor.dtype || args.out.dtype != descriptor.output {
@@ -198,7 +211,8 @@ impl Op for VocabUnpad {
             .view(args.out)
             .u64(rows)
             .u32(descriptor.padded)
-            .u32(descriptor.vocabulary);
+            .u32(descriptor.vocabulary)
+            .u32(args.ranks);
         kernel.launch(
             LaunchGrid::covering(rows * vocabulary, u64::from(descriptor.block))?,
             &mut arguments,

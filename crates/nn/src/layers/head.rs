@@ -160,9 +160,9 @@ impl ParallelLMHead {
             projected
         };
 
-        // Remove the padding: the gathered width is `padded × ranks`, of which only the first
-        // `vocabulary` columns are real. The shards are contiguous, so the first `vocabulary`
-        // columns of the gathered matrix are exactly the vocabulary, in order.
+        // Remove the padding and order the columns: the gather lays the ranks' `[rows, padded]`
+        // shards one after another, so a row's vocabulary is spread over every shard, and the
+        // unpad reads each column from the shard that holds it.
         let width = u32::try_from(gathered.shape.dim(1)).map_err(|_| {
             Error::shape(
                 "ParallelLMHead",
@@ -170,7 +170,13 @@ impl ParallelLMHead {
             )
         })?;
         let descriptor = self.unpad_descriptor(gathered.dtype, out.dtype, width);
-        let args = logits::UnpadArgs { gathered, out };
+        let args = logits::UnpadArgs {
+            gathered,
+            out,
+            ranks: u32::try_from(ranks).map_err(|_| {
+                Error::shape("ParallelLMHead", format!("{ranks} ranks exceed u32::MAX"))
+            })?,
+        };
 
         f.operate::<VocabUnpad>(&descriptor, args)
     }
