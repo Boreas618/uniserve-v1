@@ -333,11 +333,11 @@ impl engine::Executor for FaultingExecutor {
         self.inner.info()
     }
 
-    fn is_ready(&self, worker: &engine::ExecutorGroupId) -> bool {
+    fn is_ready(&self, worker: &engine::WorkerGroupId) -> bool {
         self.inner.is_ready(worker)
     }
 
-    fn has_capacity(&self, worker: &engine::ExecutorGroupId) -> bool {
+    fn has_capacity(&self, worker: &engine::WorkerGroupId) -> bool {
         self.inner.has_capacity(worker)
     }
 
@@ -425,7 +425,7 @@ impl FaultingExecutor {
             .map(|result| (result.output.request_key, "invalid input".to_owned()))
             .collect();
         let failure = engine::ExecutorFailure {
-            worker_id: engine::ExecutorGroupId("sim".to_owned()),
+            worker_id: engine::WorkerGroupId("sim".to_owned()),
             endpoints: Vec::new(),
             requests: report
                 .results

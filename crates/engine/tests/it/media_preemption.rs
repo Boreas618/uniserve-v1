@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use engine::{
     BatchEvent, BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Executor,
-    ExecutorError, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, Request, SchedulerConfig,
-    SimEngine, SimExecutor, Trajectory,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, Request, SchedulerConfig, SimEngine,
+    SimExecutor, Trajectory, WorkerGroupId,
 };
 use ipc::{
     CallKind, LatentPageCopy, LatentPoolInfo, LatentPoolRef, LatentRestore, MediaCall,
@@ -107,11 +107,11 @@ impl Executor for GatedExecutor {
         self.inner.info()
     }
 
-    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
+    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.inner.is_ready(worker)
     }
 
-    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         !self
             .gate
             .as_ref()

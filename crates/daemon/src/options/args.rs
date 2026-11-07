@@ -818,7 +818,7 @@ mod tests {
         let deployment = written(
             "deployment",
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cpu*2\"]\nqueue_depth = 2\n\
-             [worker_groups.components.model]\ntensor_parallel_size = 2\n",
+             [worker_groups.blocks.model]\ntensor_parallel_size = 2\n",
         );
         let path = deployment.to_str().unwrap();
         let (config, engine) = lowered(&["m", "--worker-groups", path]).unwrap();
@@ -847,7 +847,7 @@ mod tests {
         let deployment = written(
             "engine-deployment",
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cpu\", \"rank-1/cpu\"]\nqueue_depth = 2\n\
-             [worker_groups.components.model]\ntensor_parallel_size = 2\n",
+             [worker_groups.blocks.model]\ntensor_parallel_size = 2\n",
         );
         let (_, engine) = lowered(&[
             "m",

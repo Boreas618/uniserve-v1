@@ -162,7 +162,7 @@ fn retain_devices(served: &wire::EngineSpec, target: &mut wire::EngineSpec) -> a
         }
     }
     target.rank_layout.as_mut().unwrap().worker_groups_content =
-        engine::Deployment::snapshot(&destination.worker_groups)?;
+        proto::config::WorkerGroupConfig::to_file(&destination.worker_groups)?;
     Ok(())
 }
 
@@ -211,7 +211,7 @@ fn assign_devices(
         }
     }
     target.rank_layout.as_mut().unwrap().worker_groups_content =
-        engine::Deployment::snapshot(&config.worker_groups)?;
+        proto::config::WorkerGroupConfig::to_file(&config.worker_groups)?;
     Ok(())
 }
 
@@ -1094,7 +1094,7 @@ mod tests {
                 &path,
                 format!(
                     "[[worker_groups]]\nid = \"model\"\nranks = {ranks}\nqueue_depth = 2\n\n\
-                     [worker_groups.components.model]\ntensor_parallel_size = 2\n"
+                     [worker_groups.blocks.model]\ntensor_parallel_size = 2\n"
                 ),
             )
             .unwrap();

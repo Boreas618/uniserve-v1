@@ -124,7 +124,7 @@ def _deployment(
         "id": "model",
         "ranks": ["cuda:0-1"],
         "queue_depth": 6,
-        "components": {
+        "blocks": {
             "transformer": transformer,
             "text_encoder": {"tensor_parallel_size": 2},
             "video_decoder": {},
@@ -142,7 +142,7 @@ def _deployment(
                 "id": "media",
                 "ranks": ["cpu*4"],
                 "queue_depth": 6,
-                "components": {
+                "blocks": {
                     "video_codec": {"ranks": [0, 1]},
                     "muxer": {"ranks": [2]},
                     "media_reader": {"ranks": [3]},

@@ -169,9 +169,12 @@ pub enum BlockWeights {
 /// size must be one. Call [`Self::validate`] after parsing and before using
 /// the rank-selection methods.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BlockConfig {
     /// Indices into the worker group's ordered rank list; their order assigns
-    /// each rank its position in the parallel degrees or unit schedule.
+    /// each rank its position in the parallel degrees or unit schedule. The
+    /// deployment file may leave them out, for every rank of the group.
+    #[serde(default)]
     pub ranks: Vec<usize>,
     /// Tensor-parallel degree.
     #[serde(default = "one")]

@@ -546,7 +546,7 @@ impl Scheduler {
     /// a free request row. When the executor reports admissible video
     /// codecs for the video decoder's chosen executor, the video codec's
     /// candidates are further limited to those.
-    fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::ExecutorGroupId>> {
+    fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::WorkerGroupId>> {
         use ipc::MediaCall;
 
         let mut required = graph
@@ -772,7 +772,7 @@ impl Scheduler {
     /// on known executors.
     fn reserve_media(
         &mut self,
-        route_workers: &HashSet<crate::ExecutorGroupId>,
+        route_workers: &HashSet<crate::WorkerGroupId>,
         request_key: RequestKey,
         outputs: &[MediaOutput],
     ) -> Result<Option<MediaAllocations>, UnknownMediaGroup> {
@@ -1007,7 +1007,7 @@ impl Scheduler {
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
 
-    /// Whether some executor group prefills only (`ExecutorGroupRole::Prefill`),
+    /// Whether some executor group prefills only (`WorkerGroupRole::Prefill`),
     /// its requests decoding on decode groups.
     fn splits_prefill(&self) -> bool {
         !self.dispatch.prefill_groups.is_empty()
@@ -1677,7 +1677,7 @@ impl Scheduler {
     pub(super) fn prefill_target(
         &self,
         state: &RequestState,
-    ) -> Option<((crate::ExecutorGroupId, String), crate::kv_cache::PrefixHit)> {
+    ) -> Option<((crate::WorkerGroupId, String), crate::kv_cache::PrefixHit)> {
         let cache = self.storage.cache()?;
         self.dispatch
             .worker_candidates(
@@ -1728,7 +1728,7 @@ impl Scheduler {
     /// stays reserved on error.
     fn reserve_admission(
         &mut self,
-        target: &crate::ExecutorGroupId,
+        target: &crate::WorkerGroupId,
     ) -> Result<AdmissionReservation, &'static str> {
         let source = self
             .executor
@@ -1772,7 +1772,7 @@ impl Scheduler {
     pub(super) fn admit_running(
         &mut self,
         mut st: RequestState,
-        target: (crate::ExecutorGroupId, String),
+        target: (crate::WorkerGroupId, String),
         reservation: AdmissionReservation,
     ) {
         let id = st.req.request_id;
@@ -1861,7 +1861,7 @@ impl Scheduler {
     /// cached prefix to the host KV cache's hit, whose units are allocated
     /// now and loaded by its first call. A hit that no longer follows the
     /// device prefix the request acquired is released.
-    fn admit_offloaded_prefix(&mut self, id: RequestId, worker: &crate::ExecutorGroupId) {
+    fn admit_offloaded_prefix(&mut self, id: RequestId, worker: &crate::WorkerGroupId) {
         let Some(kv_offload) = self.kv_offload.as_mut() else {
             return;
         };
@@ -1972,7 +1972,7 @@ pub(super) enum HostHit {
 pub(super) fn host_prefix(
     kv_offload: &mut Option<KvOffloadManager>,
     state: &RequestState,
-    target: &(crate::ExecutorGroupId, String),
+    target: &(crate::WorkerGroupId, String),
     device_hit: usize,
     limit: usize,
     min_deepening: usize,

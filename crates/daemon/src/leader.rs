@@ -3732,11 +3732,11 @@ mod tests {
             self.inner.info()
         }
 
-        fn is_ready(&self, worker: &engine::ExecutorGroupId) -> bool {
+        fn is_ready(&self, worker: &engine::WorkerGroupId) -> bool {
             self.inner.is_ready(worker)
         }
 
-        fn has_capacity(&self, worker: &engine::ExecutorGroupId) -> bool {
+        fn has_capacity(&self, worker: &engine::WorkerGroupId) -> bool {
             self.inner.has_capacity(worker)
         }
 

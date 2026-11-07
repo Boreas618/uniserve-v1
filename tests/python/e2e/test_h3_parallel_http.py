@@ -308,7 +308,7 @@ def test_component_bindings_release_cancelled_requests(
                 "id": worker_id,
                 "ranks": [place(devices[rank]) for rank in members],
                 "queue_depth": 6,
-                "components": components,
+                "blocks": components,
             }
         )
         owners.update(dict.fromkeys(names, worker_id))
@@ -333,7 +333,7 @@ def test_component_bindings_release_cancelled_requests(
             "id": "media",
             "ranks": media_ranks,
             "queue_depth": 6,
-            "components": {
+            "blocks": {
                 "video_codec": {
                     "ranks": list(range(decoder_units)),
                 },

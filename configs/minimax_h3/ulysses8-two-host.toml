@@ -3,25 +3,25 @@ id = "model"
 ranks = ["rank-0/cuda:0-3", "rank-1/cuda:0-3"]
 queue_depth = 6
 
-[worker_groups.components.transformer]
+[worker_groups.blocks.transformer]
 sequence_parallel = { kind = "ulysses", ulysses_degree = 8, projection = "exchange" }
 
-[worker_groups.components.text_encoder]
+[worker_groups.blocks.text_encoder]
 tensor_parallel_size = 8
 
-[worker_groups.components.video_decoder]
+[worker_groups.blocks.video_decoder]
 
-[worker_groups.components.audio_decoder]
+[worker_groups.blocks.audio_decoder]
 distribution = "temporal_units"
 
-[worker_groups.components.latent_encoder]
+[worker_groups.blocks.latent_encoder]
 distribution = "temporal_units"
 
 # The media components are placed on this group's CUDA ranks: the codecs encode and assemble on
 # the host inside the main process (the executor's `Media` lane), and a main process serves CUDA
 # devices only. `video_codec` takes one unit per rank (the resolver inserts its temporal
 # distribution), so each rank encodes the units of the requests it serves.
-[worker_groups.components.video_codec]
+[worker_groups.blocks.video_codec]
 
 
 # The muxer assembles a response's video and audio into one container. It runs on the leader's host,
@@ -34,11 +34,11 @@ id = "muxer"
 ranks = ["rank-0/cuda:0"]
 queue_depth = 6
 
-[worker_groups.components.muxer]
+[worker_groups.blocks.muxer]
 
 [[worker_groups]]
 id = "reader"
 ranks = ["rank-0/cuda:0"]
 queue_depth = 6
 
-[worker_groups.components.media_reader]
+[worker_groups.blocks.media_reader]

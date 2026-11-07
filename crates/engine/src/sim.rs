@@ -24,7 +24,7 @@ use std::time::Duration;
 use crate::CommandWaker;
 use crate::executor::{
     BatchResult, BlockConfig, CallResult, CommandOutcome, CommandResult, ExecutionBatch, Executor,
-    ExecutorFailure, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, PoolLayout,
+    ExecutorFailure, ExecutorInfo, ExecutorSubmitError, PoolLayout, WorkerGroupId,
 };
 use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
@@ -140,14 +140,14 @@ enum Job {
 pub struct SimLoss {
     /// The group reported lost: it stays lost for the executor's lifetime, so
     /// it reports not ready after the report has been answered.
-    group: Arc<Mutex<Option<ExecutorGroupId>>>,
+    group: Arc<Mutex<Option<WorkerGroupId>>>,
     /// Whether the lost group is closed as well as lost: a group that cannot
     /// be replaced closes, while one whose replacement is starting is not
     /// ready but not closed.
     closed: Arc<Mutex<bool>>,
     /// The report the executor's next poll answers with, taken once: the
     /// group, why it failed, and the requests whose work is gone.
-    pending: Arc<Mutex<Option<(ExecutorGroupId, String, Vec<ipc::RequestKey>)>>>,
+    pending: Arc<Mutex<Option<(WorkerGroupId, String, Vec<ipc::RequestKey>)>>>,
     /// Wakes a scheduler parked on this executor, so the loss is answered
     /// without waiting out its park.
     wake: Arc<Mutex<Option<CommandWaker>>>,
@@ -160,7 +160,7 @@ impl SimLoss {
     /// # Panics
     ///
     /// Panics if a previous report is still pending: a loss is delivered once.
-    pub fn lose(&self, group: ExecutorGroupId, message: impl Into<String>) {
+    pub fn lose(&self, group: WorkerGroupId, message: impl Into<String>) {
         {
             let mut lost = self
                 .group
@@ -197,7 +197,7 @@ impl SimLoss {
     ///
     /// Panics if a previous report is still pending: a report is delivered
     /// once.
-    pub fn stall(&self, group: ExecutorGroupId, stall: &ipc::Stall) {
+    pub fn stall(&self, group: WorkerGroupId, stall: &ipc::Stall) {
         {
             let mut lost = self
                 .group
@@ -239,7 +239,7 @@ impl SimLoss {
     /// # Panics
     ///
     /// Panics if a previous report is still pending: a loss is delivered once.
-    pub fn lose_to_replace(&self, group: ExecutorGroupId, message: impl Into<String>) {
+    pub fn lose_to_replace(&self, group: WorkerGroupId, message: impl Into<String>) {
         self.lose(group, message);
         *self
             .closed
@@ -248,7 +248,7 @@ impl SimLoss {
     }
 
     /// Installs a replacement group: it is ready again and takes work.
-    pub fn restore(&self, group: &ExecutorGroupId) {
+    pub fn restore(&self, group: &WorkerGroupId) {
         let mut lost = self
             .group
             .lock()
@@ -259,7 +259,7 @@ impl SimLoss {
     }
 
     /// Whether `group` was reported lost beyond replacement.
-    fn is_closed(&self, group: &ExecutorGroupId) -> bool {
+    fn is_closed(&self, group: &WorkerGroupId) -> bool {
         let lost = self
             .group
             .lock()
@@ -281,7 +281,7 @@ impl SimLoss {
     }
 
     /// Whether `group` has been reported lost.
-    fn is_lost(&self, group: &ExecutorGroupId) -> bool {
+    fn is_lost(&self, group: &WorkerGroupId) -> bool {
         self.group
             .lock()
             .map(|lost| lost.as_ref().is_some_and(|name| name == group))
@@ -289,7 +289,7 @@ impl SimLoss {
     }
 
     /// Takes the report the next poll answers with, if it has not been.
-    fn take(&self) -> Option<(ExecutorGroupId, String, Vec<ipc::RequestKey>)> {
+    fn take(&self) -> Option<(WorkerGroupId, String, Vec<ipc::RequestKey>)> {
         self.pending.lock().ok().and_then(|mut slot| slot.take())
     }
 }
@@ -577,7 +577,7 @@ impl SimExecutor {
             .filter(|buffer| calls.contains(&(buffer.owner, buffer.producer_call_id)))
             .collect::<HashSet<_>>();
         Some(ExecutorFailure {
-            worker_id: ExecutorGroupId("sim".to_owned()),
+            worker_id: WorkerGroupId("sim".to_owned()),
             endpoints: Vec::new(),
             requests: requests.into_iter().collect(),
             refusals,
@@ -605,7 +605,7 @@ impl SimExecutor {
 }
 
 impl Executor for SimExecutor {
-    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         self.is_ready(worker) && self.in_flight < self.depth
     }
 
@@ -629,11 +629,11 @@ impl Executor for SimExecutor {
 
     /// A lost group is closed only once its replacement has failed: while one
     /// is starting it is not ready, and the scheduler waits for it.
-    fn is_closed(&self, worker: &ExecutorGroupId) -> bool {
+    fn is_closed(&self, worker: &WorkerGroupId) -> bool {
         self.handle.is_none() || self.loss.is_closed(worker)
     }
 
-    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
+    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.handle.is_some()
             && !self.loss.is_lost(worker)
             && self
@@ -1241,7 +1241,7 @@ pub struct SimEngine {
     /// A deployment's groups serve different components and fail
     /// independently, so a statement about one group
     /// failing while another serves needs more than one here.
-    groups: Vec<ExecutorGroupId>,
+    groups: Vec<WorkerGroupId>,
     /// Releases for batches that skip a predicated call: such a batch returns
     /// only after taking one release, or once the sender is dropped.
     predicated_release: Option<Receiver<()>>,
@@ -1418,7 +1418,7 @@ impl SimEngine {
                 ranks: 1,
                 components: BTreeMap::new(),
             },
-            groups: vec![ExecutorGroupId("sim".to_owned())],
+            groups: vec![WorkerGroupId("sim".to_owned())],
             max_model_len: SIM_MAX_MODEL_LEN,
             text_len: DEFAULT_TEXT_LEN,
             fake_eos: FAKE_EOS_TOKEN,
@@ -2069,7 +2069,7 @@ impl SimEngine {
     pub fn name_groups(&mut self, names: &[&str]) {
         self.groups = names
             .iter()
-            .map(|name| ExecutorGroupId((*name).to_owned()))
+            .map(|name| WorkerGroupId((*name).to_owned()))
             .collect();
     }
 
@@ -2917,7 +2917,7 @@ mod tests {
             vec![(
                 call,
                 crate::executor::RequestDispatch {
-                    worker: ExecutorGroupId("sim".into()),
+                    worker: WorkerGroupId("sim".into()),
                     request_pool_idx: None,
                     block_tables: Vec::new(),
                     new_cache_units: Vec::new(),

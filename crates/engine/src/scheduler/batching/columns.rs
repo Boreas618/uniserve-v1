@@ -426,7 +426,7 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> executor::plan::Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::ExecutorGroupId;
+    use crate::executor::WorkerGroupId;
 
     /// Four tokens per page, one unit per page: the geometry every token group
     /// reports today.
@@ -497,7 +497,7 @@ mod tests {
             prefix += length;
         }
         RequestDispatch {
-            worker: ExecutorGroupId("w".to_owned()),
+            worker: WorkerGroupId("w".to_owned()),
             request_pool_idx: Some(slot),
             block_tables: vec![table()],
             new_cache_units: Vec::new(),

@@ -6,7 +6,7 @@
 //! component, its later calls for that component stay there. A request's
 //! decode calls stay on the replica that took its first decode-stage call,
 //! which is its prefill replica unless that replica only prefills
-//! (`ExecutorGroupRole::Prefill`): then a decode replica installs its cache.
+//! (`WorkerGroupRole::Prefill`): then a decode replica installs its cache.
 
 use super::*;
 use ipc::{ForwardMode, TransferMode};
@@ -18,17 +18,17 @@ pub(super) struct Dispatch {
     /// Admission records the prefill executor of a token request and every route
     /// of a media request; `select_worker` records an entry each time it places
     /// a call, keyed by the name the executor binds (which may be
-    /// `DEFAULT_COMPONENT` rather than the requested name).
+    /// `DEFAULT_BLOCK` rather than the requested name).
     /// `Scheduler::refill_executor` prunes entries of requests that are no
     /// longer running or retiring.
-    pub(super) affinity: HashMap<(RequestKey, String), crate::ExecutorGroupId>,
+    pub(super) affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
     /// Replica that decodes each request for one bound component name: the
     /// replica of its decode-stage calls (`decodes`), recorded as `affinity`
     /// is.
-    pub(super) decode_affinity: HashMap<(RequestKey, String), crate::ExecutorGroupId>,
-    /// The groups that prefill only (`ExecutorGroupRole::Prefill`): their
+    pub(super) decode_affinity: HashMap<(RequestKey, String), crate::WorkerGroupId>,
+    /// The groups that prefill only (`WorkerGroupRole::Prefill`): their
     /// requests decode on the scheduler's decode groups.
-    pub(super) prefill_groups: HashSet<crate::ExecutorGroupId>,
+    pub(super) prefill_groups: HashSet<crate::WorkerGroupId>,
 }
 
 /// Whether a call of `kind` belongs to a request's decode stage, which a
@@ -49,7 +49,7 @@ pub(super) enum Choice {
     Existing,
     /// The policy's answer for a request that has not run there yet: the executor
     /// it named among the candidates `views::replicas` showed it.
-    Target(crate::ExecutorGroupId),
+    Target(crate::WorkerGroupId),
 }
 
 impl Dispatch {
@@ -65,13 +65,13 @@ impl Dispatch {
         world: &'a dyn super::submission::World,
         info: &'a MainProcessInfo,
         kind: CallKind,
-    ) -> impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a MainProcessInfo)> {
+    ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)> {
         let component = match kind {
             CallKind::Media(media_call) => info
                 .media_components
                 .get(&media_call)
-                .map_or(DEFAULT_COMPONENT, String::as_str),
-            _ => DEFAULT_COMPONENT,
+                .map_or(DEFAULT_BLOCK, String::as_str),
+            _ => DEFAULT_BLOCK,
         };
         self.component_candidates(world, kind, component)
     }
@@ -80,15 +80,15 @@ impl Dispatch {
     /// the component name each one binds.
     ///
     /// An executor binding `component` by name serves it under that name. A
-    /// executor with no component bindings, or with a `DEFAULT_COMPONENT`
-    /// binding, serves any requested component under `DEFAULT_COMPONENT`.
+    /// executor with no component bindings, or with a `DEFAULT_BLOCK`
+    /// binding, serves any requested component under `DEFAULT_BLOCK`.
     /// Other executors are excluded.
     pub(super) fn component_candidates<'a>(
         &'a self,
         world: &'a dyn super::submission::World,
         kind: CallKind,
         component: &'a str,
-    ) -> impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a MainProcessInfo)> {
+    ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)> {
         world.info().workers.iter().filter_map(move |(id, info)| {
             if !info.supported_calls.contains(&kind) {
                 return None;
@@ -103,9 +103,9 @@ impl Dispatch {
                 || info
                     .components
                     .iter()
-                    .any(|binding| binding.name == DEFAULT_COMPONENT)
+                    .any(|binding| binding.name == DEFAULT_BLOCK)
             {
-                DEFAULT_COMPONENT
+                DEFAULT_BLOCK
             } else {
                 return None;
             };
@@ -135,7 +135,7 @@ impl Dispatch {
         kind: CallKind,
         component: &'a str,
         choice: &Choice,
-    ) -> Option<(&'a crate::ExecutorGroupId, &'a str)> {
+    ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
         // A decode-stage call runs on a replica that decodes: a cache
         // install, which a prefill replica could serve, hands the request to
         // a decode replica.
@@ -210,7 +210,7 @@ impl Dispatch {
         request: RequestKey,
         kind: CallKind,
         choice: &Choice,
-    ) -> Option<(&'a crate::ExecutorGroupId, &'a str)> {
+    ) -> Option<(&'a crate::WorkerGroupId, &'a str)> {
         let component = match kind {
             CallKind::Media(media_call) => info
                 .media_components
@@ -233,7 +233,7 @@ impl Dispatch {
         info: &MainProcessInfo,
         request: RequestKey,
         kind: CallKind,
-    ) -> Option<crate::ExecutorGroupId> {
+    ) -> Option<crate::WorkerGroupId> {
         let (id, bound_component) =
             self.worker_target(world, info, request, kind, &Choice::Existing)?;
         let target = (id.clone(), bound_component.to_owned());
@@ -256,8 +256,8 @@ impl Dispatch {
         info: &MainProcessInfo,
         call: &Call,
         choice: &Choice,
-    ) -> Option<(crate::ExecutorGroupId, String)> {
-        let (id, bound_component) = if call.component == DEFAULT_COMPONENT {
+    ) -> Option<(crate::WorkerGroupId, String)> {
+        let (id, bound_component) = if call.component == DEFAULT_BLOCK {
             self.worker_target(world, info, call.request_key, call.kind, choice)
         } else {
             self.component_target(world, call.request_key, call.kind, &call.component, choice)
@@ -277,7 +277,7 @@ impl Dispatch {
     /// Returns each call's placed executor plus every executor holding residency
     /// for a command's request. `Scheduler::dispatch_submissions` uses this
     /// set to hold back later batches that share a blocked destination.
-    pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::ExecutorGroupId> {
+    pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::WorkerGroupId> {
         let mut targets = batch
             .requests
             .iter()

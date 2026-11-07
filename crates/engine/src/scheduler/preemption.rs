@@ -42,7 +42,7 @@
 //!    computed before.
 
 use super::*;
-use crate::ExecutorGroupId;
+use crate::WorkerGroupId;
 use crate::scheduler::completion::CallCompletion;
 use crate::trajectories::{Offloaded, Restored, image_trajectory};
 
@@ -122,13 +122,13 @@ impl Scheduler {
     /// The executor group that holds `request_key`'s trajectory: the replica
     /// its denoising calls are placed on, as the component that serves them
     /// binds there.
-    fn denoiser_worker(&self, request_key: RequestKey) -> Option<ExecutorGroupId> {
+    fn denoiser_worker(&self, request_key: RequestKey) -> Option<WorkerGroupId> {
         let kind = CallKind::Media(MediaCall::Denoising);
         let component = self
             .info
             .media_components
             .get(&MediaCall::Denoising)
-            .map_or(DEFAULT_COMPONENT, String::as_str);
+            .map_or(DEFAULT_BLOCK, String::as_str);
         let (_, bound, _) = self
             .dispatch
             .component_candidates(&self.executor, kind, component)

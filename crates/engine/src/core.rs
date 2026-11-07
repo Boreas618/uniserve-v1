@@ -5,16 +5,16 @@
 //! scheduler's thread and is the front door request producers submit and
 //! control requests through.
 //!
-//! [`ExecutorGroupConfig`] is the static deployment description: each group has
-//! an ordered list of physical [`ExecutorRank`]s and named components whose
+//! [`WorkerGroupConfig`] is the static deployment description: each group has
+//! an ordered list of physical [`WorkerRank`]s and named components whose
 //! `ranks` index into that list. [`EngineConfig`] adds the scheduler's budgets
 //! and the facts of what it serves. A main process builds one scheduler per
 //! rank it holds with `SchedulerHandle::over_batches_telling`, over the
 //! devices of its own process; `SchedulerHandle::with_executor` takes the CPU
 //! simulation backend instead.
 
-use ipc::DEFAULT_COMPONENT;
 use ipc::MediaCall;
+use proto::config::DEFAULT_BLOCK;
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,7 @@ use std::thread::JoinHandle;
 
 #[cfg(feature = "testing")]
 use crate::executor::Executor;
-use crate::executor::ExecutorGroupId;
+use crate::executor::WorkerGroupId;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 use crate::scheduler::guidance_prefix_rows;
 #[cfg(feature = "testing")]
@@ -41,294 +41,8 @@ use ipc::RequestId;
 use proto::config::BlockConfig;
 #[cfg(test)]
 use proto::config::BlockDistribution;
+pub use proto::config::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 use proto::request::ExpertExchange;
-
-/// One cooperative member's physical execution endpoint.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ExecutorRank {
-    /// Host identity: the daemon of the node with this host identity starts
-    /// the rank.
-    pub host: String,
-    /// Device string, such as `cuda:0` for a GPU rank or `cpu` for a CPU executor.
-    pub device: String,
-}
-
-/// The numerical work an executor group owns in a deployment.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutorGroupRole {
-    /// Model capabilities, request state, and (when present) attention/KV.
-    #[default]
-    Model,
-    /// A model group that prefills prompts only: a request continues on a
-    /// `Decode` group of its scheduler, which installs the KV cache the
-    /// prefill exported (prefill/decode disaggregation).
-    Prefill,
-    /// A model group that decodes only, continuing requests a `Prefill`
-    /// group prefilled.
-    Decode,
-    /// Routed experts shared by the deployment's schedulers.
-    Experts,
-}
-
-impl ExecutorGroupRole {
-    /// Whether the group serves requests: every role but `Experts`.
-    pub fn serves_requests(self) -> bool {
-        self != Self::Experts
-    }
-}
-
-/// Static computation components and their ordered physical rank membership.
-///
-/// A deployment file ([`crate::Deployment`]) or the command-line shorthand
-/// ([`ExecutorGroupConfig::data_parallel`]) builds them.
-#[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ExecutorGroupConfig {
-    pub id: ExecutorGroupId,
-    pub role: ExecutorGroupRole,
-    /// Ordered physical members; a rank's position is its rank number within
-    /// the group.
-    pub ranks: Vec<ExecutorRank>,
-    /// Components keyed by name, each listing indices into `ranks`.
-    pub components: BTreeMap<String, BlockConfig>,
-    /// Maximum number of physical runs in flight per rank.
-    pub queue_depth: usize,
-    /// Per-rank share of device storage available to this group for static
-    /// allocations (weights and KV cache), instead of the deployment-wide
-    /// `--mem-fraction-static`.
-    ///
-    /// Distinct groups may share one physical GPU. Their configured
-    /// shares must leave enough aggregate headroom for the device runtime;
-    /// validation checks each group alone, never the sum across groups, and
-    /// accepts the range [`ExecutorGroupConfig::validate_mem_fraction_static`] states.
-    pub mem_fraction_static: Option<f64>,
-}
-
-impl ExecutorGroupConfig {
-    /// Validates one group in isolation.
-    ///
-    /// Fails when the identity is not a valid `ExecutorGroupId`, `queue_depth` is
-    /// zero, `validate_mem_fraction_static` refuses a set `mem_fraction_static`, or
-    /// `validate_members` rejects the ranks and components.
-    pub fn validate(&self) -> anyhow::Result<()> {
-        ExecutorGroupId::new(self.id.0.clone())?;
-        anyhow::ensure!(
-            self.queue_depth > 0,
-            "executor {} queue depth must be positive",
-            self.id
-        );
-        if let Some(fraction) = self.mem_fraction_static {
-            Self::validate_mem_fraction_static(fraction)
-                .map_err(|error| anyhow::anyhow!("executor {}: {error}", self.id))?;
-        }
-        Self::validate_members(&self.ranks, &self.components)?;
-        anyhow::ensure!(
-            self.components.is_empty() != self.role.serves_requests(),
-            "model executors require components; expert executors have no request components"
-        );
-        Ok(())
-    }
-
-    /// Checks a group's static storage fraction, `mem_fraction_static`.
-    ///
-    /// Each rank grants itself this share of every device's total storage,
-    /// less what it already holds and never more than the device has free, so
-    /// any finite value in (0, 1] is meaningful, 1 granting the whole device.
-    pub fn validate_mem_fraction_static(fraction: f64) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            fraction.is_finite() && fraction > 0.0 && fraction <= 1.0,
-            "mem_fraction_static {fraction} must be finite and in (0, 1]"
-        );
-        Ok(())
-    }
-
-    /// Validates a group's rank list and its component membership.
-    ///
-    /// Ranks must be nonempty, name a host and a device, and not repeat a
-    /// `(host, device)` pair unless the device is `cpu`. Components must be
-    /// valid for their executor role; each needs a nonempty name, a nonempty list of distinct
-    /// in-range rank indices, a `parallel_config` whose
-    /// `BlockConfig::world_size` succeeds, and a positive `units_per_rank`.
-    /// A component without a distribution must have a parallel world size
-    /// equal to its rank count; one with a distribution must have world size
-    /// one.
-    pub fn validate_members(
-        ranks: &[ExecutorRank],
-        components: &BTreeMap<String, BlockConfig>,
-    ) -> anyhow::Result<()> {
-        anyhow::ensure!(!ranks.is_empty(), "executor requires rank members");
-        let mut devices = BTreeSet::new();
-        for rank in ranks {
-            anyhow::ensure!(
-                !rank.host.is_empty() && !rank.device.is_empty(),
-                "rank requires host and device"
-            );
-            // Within a group a `(host, device)` pair names one rank, except
-            // `cpu`, which several ranks on one host may share.
-            anyhow::ensure!(
-                devices.insert((&rank.host, &rank.device)) || rank.device == "cpu",
-                "executor repeats a physical device"
-            );
-        }
-        for (name, entry) in components {
-            anyhow::ensure!(!name.is_empty(), "component name must not be empty");
-            anyhow::ensure!(
-                !entry.ranks.is_empty() && entry.ranks.iter().all(|&rank| rank < ranks.len()),
-                "component {name} contains invalid members"
-            );
-            entry.validate()?;
-        }
-        Ok(())
-    }
-
-    /// Validates unique group identities and every local rank layout.
-    ///
-    /// Component names may repeat across groups. Repeated names are
-    /// replicas of the same numerical component; the scheduler binds each
-    /// request to one of them and keeps that affinity for the request lifetime.
-    ///
-    /// Physical devices may repeat across groups; only `validate_members`
-    /// checks device reuse, and it does so within one group.
-    pub fn validate_all(workers: &[Self]) -> anyhow::Result<()> {
-        anyhow::ensure!(!workers.is_empty(), "engine requires executors");
-        let mut ids = BTreeSet::new();
-        for worker in workers {
-            worker.validate()?;
-            anyhow::ensure!(
-                ids.insert(&worker.id),
-                "executor group identity is repeated"
-            );
-        }
-        // A request prefilled on a prefill group decodes on a decode group,
-        // which holds the same text model and nothing else.
-        let has = |role| workers.iter().any(|worker| worker.role == role);
-        anyhow::ensure!(
-            has(ExecutorGroupRole::Prefill) == has(ExecutorGroupRole::Decode),
-            "prefill groups and decode groups are configured together"
-        );
-        for worker in workers {
-            if matches!(
-                worker.role,
-                ExecutorGroupRole::Prefill | ExecutorGroupRole::Decode
-            ) {
-                anyhow::ensure!(
-                    worker.components.keys().eq([DEFAULT_COMPONENT]),
-                    "executor {}: a prefill or decode group places the `{DEFAULT_COMPONENT}` component alone",
-                    worker.id
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// One component tensor-parallel over every rank.
-    ///
-    /// The `uniserve` CLI uses this rank layout when no `--executor-groups` configuration
-    /// is given, and the default engine settings and the simulation use it. A
-    /// deployment with several components, or with other partitions, writes
-    /// its own configuration.
-    pub fn single_component(name: &str, rank_count: usize) -> BTreeMap<String, BlockConfig> {
-        BTreeMap::from([(
-            name.into(),
-            BlockConfig {
-                tensor_parallel_size: rank_count,
-                ..BlockConfig::parallel((0..rank_count).collect())
-            },
-        )])
-    }
-
-    /// Expands the single-group CLI shorthand into explicit device membership
-    /// across the named hosts, carrying the given components.
-    ///
-    /// Ranks are assigned in blocks, so the lowest ranks stay on the first
-    /// host, and each host numbers its devices from zero. A rank layout on one
-    /// host is the same arithmetic with one block. A `device` of `cuda` or
-    /// `gpu` becomes `cuda:<local index>`; any other string is used verbatim
-    /// for every rank.
-    ///
-    /// `components` must already be resolved for `rank_count`; this assigns
-    /// rank identity and nothing else. The group is named `model` and has no
-    /// `mem_fraction_static` of its own. Nothing is validated here, and an empty
-    /// `hosts` yields no ranks.
-    pub fn placed(
-        hosts: &[String],
-        device: &str,
-        rank_count: usize,
-        queue_depth: usize,
-        components: BTreeMap<String, BlockConfig>,
-    ) -> Self {
-        // A host takes its share of the ranks, and the first hosts take the
-        // remainder, so a count that does not divide evenly still places every
-        // rank and keeps each host's block contiguous.
-        let host_count = hosts.len().max(1);
-        let share = rank_count / host_count;
-        let remainder = rank_count % host_count;
-        let mut rank_layout = Vec::with_capacity(rank_count);
-        for (index, host) in hosts.iter().enumerate() {
-            let count = share + usize::from(index < remainder);
-            for local in 0..count {
-                rank_layout.push(ExecutorRank {
-                    host: host.clone(),
-                    device: if matches!(device, "cuda" | "gpu") {
-                        format!("cuda:{local}")
-                    } else {
-                        device.into()
-                    },
-                });
-            }
-        }
-        Self {
-            id: ExecutorGroupId("model".into()),
-            role: ExecutorGroupRole::Model,
-            ranks: rank_layout,
-            components,
-            queue_depth,
-            mem_fraction_static: None,
-        }
-    }
-
-    /// Expands the data-parallel CLI shorthand into one group of
-    /// `ranks_per_core` ranks for each of `cores` schedulers, each carrying
-    /// `components`.
-    ///
-    /// All `cores * ranks_per_core` ranks are placed at once as
-    /// [`ExecutorGroupConfig::placed`] places them, in blocks over `hosts`, and
-    /// consecutive runs of `ranks_per_core` form the groups, so the first
-    /// schedulers fill the engine's host first. The group of one scheduler
-    /// is `model`; the group of core `i` of several is `model-<i>`.
-    pub fn data_parallel(
-        hosts: &[String],
-        device: &str,
-        cores: usize,
-        ranks_per_core: usize,
-        queue_depth: usize,
-        components: BTreeMap<String, BlockConfig>,
-    ) -> Vec<Self> {
-        let placed = Self::placed(
-            hosts,
-            device,
-            cores * ranks_per_core,
-            queue_depth,
-            components,
-        );
-        if cores <= 1 {
-            return vec![placed];
-        }
-        placed
-            .ranks
-            .chunks(ranks_per_core.max(1))
-            .enumerate()
-            .map(|(index, ranks)| Self {
-                id: ExecutorGroupId(format!("model-{index}")),
-                role: ExecutorGroupRole::Model,
-                ranks: ranks.to_vec(),
-                components: placed.components.clone(),
-                queue_depth,
-                mem_fraction_static: None,
-            })
-            .collect()
-    }
-}
 
 /// Configuration of one deployment's schedulers: one per DP rank,
 /// `data_parallel_size` of them.
@@ -367,7 +81,7 @@ pub struct EngineConfig {
     /// and `host_gib`).
     pub host_cache: crate::kv_cache::HostCacheSize,
     /// Static computation components and physical rank membership.
-    pub worker_groups: Vec<ExecutorGroupConfig>,
+    pub worker_groups: Vec<WorkerGroupConfig>,
     /// Number of schedulers `worker_groups` forms, as equal consecutive
     /// blocks of model groups. One means the groups form one scheduler.
     pub data_parallel_size: usize,
@@ -527,20 +241,21 @@ impl EngineConfig {
             "the engine's batch, token, and request budgets must be positive"
         );
 
-        let ranks: Vec<ExecutorRank> = hosts
+        let ranks: Vec<WorkerRank> = hosts
             .into_iter()
             .zip(devices)
-            .map(|(host, device)| ExecutorRank { host, device })
+            .map(|(host, device)| WorkerRank { host, device })
             .collect();
         let host = ranks
             .get(rank)
             .map(|rank| rank.host.clone())
             .unwrap_or_default();
-        let group_config = ExecutorGroupConfig {
-            id: ExecutorGroupId(group),
-            role: crate::ExecutorGroupRole::Model,
+        let group_config = WorkerGroupConfig {
+            replicas: 1,
+            id: WorkerGroupId(group),
+            role: crate::WorkerGroupRole::Model,
             ranks,
-            components: ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, world_size),
+            blocks: WorkerGroupConfig::single_component(DEFAULT_BLOCK, world_size),
             // The ranks are the executor's own jobs: no run is queued.
             queue_depth: 1,
             mem_fraction_static: None,
@@ -613,12 +328,12 @@ impl EngineConfig {
             boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
             state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
             host_cache: crate::kv_cache::HostCacheSize::default(),
-            worker_groups: vec![ExecutorGroupConfig::placed(
+            worker_groups: vec![WorkerGroupConfig::placed(
                 &["localhost".to_owned()],
                 "cpu",
                 1,
                 2,
-                ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, 1),
+                WorkerGroupConfig::single_component(DEFAULT_BLOCK, 1),
             )],
             data_parallel_size: 1,
             expert_parallel: None,
@@ -869,7 +584,7 @@ impl SchedulerHandle {
             config
                 .worker_groups
                 .iter()
-                .filter(|group| group.role == ExecutorGroupRole::Prefill)
+                .filter(|group| group.role == WorkerGroupRole::Prefill)
                 .map(|group| group.id.clone()),
         );
         if config.prefix_cache && config.host_kv_cache {
@@ -1600,10 +1315,10 @@ mod tests {
     /// remainder, and a rank's device is its local index on its own host.
     #[test]
     fn a_rank_layout_shares_ranks_across_the_named_hosts() {
-        let components = ExecutorGroupConfig::single_component("model", 1);
+        let components = WorkerGroupConfig::single_component("model", 1);
 
         let one =
-            ExecutorGroupConfig::placed(&["compute-0".to_owned()], "cpu", 2, 1, components.clone());
+            WorkerGroupConfig::placed(&["compute-0".to_owned()], "cpu", 2, 1, components.clone());
         assert!(
             one.ranks.iter().all(|rank| rank.host == "compute-0"),
             "a rank was placed on a host the rank layout does not name: {:?}",
@@ -1612,7 +1327,7 @@ mod tests {
 
         // Three ranks over two hosts: the first host takes the remainder, so
         // every rank is placed and each host's block stays contiguous.
-        let two = ExecutorGroupConfig::placed(
+        let two = WorkerGroupConfig::placed(
             &["compute-0".to_owned(), "compute-1".to_owned()],
             "cuda",
             3,
@@ -1632,7 +1347,7 @@ mod tests {
     /// placed alone.
     fn mixed_components(rank_count: usize) -> BTreeMap<String, BlockConfig> {
         let members: Vec<_> = (0..rank_count).collect();
-        let mut components = ExecutorGroupConfig::single_component("parallel", rank_count);
+        let mut components = WorkerGroupConfig::single_component("parallel", rank_count);
         components.insert(
             "divided".into(),
             BlockConfig {
@@ -1655,20 +1370,20 @@ mod tests {
     fn static_components_validate_their_own_parallel_members() -> anyhow::Result<()> {
         let mut workers = Vec::new();
         for (name, degree) in [("first", 1), ("second", 4), ("third", 2)] {
-            let mut worker = ExecutorGroupConfig::placed(
+            let mut worker = WorkerGroupConfig::placed(
                 &["localhost".to_owned()],
                 "cuda",
                 degree,
                 2,
-                ExecutorGroupConfig::single_component(name, degree),
+                WorkerGroupConfig::single_component(name, degree),
             );
-            worker.id = ExecutorGroupId(name.into());
+            worker.id = WorkerGroupId(name.into());
             workers.push(worker);
         }
-        ExecutorGroupConfig::validate_all(&workers)?;
+        WorkerGroupConfig::validate_all(&workers)?;
 
         workers[1].ranks.pop();
-        assert!(ExecutorGroupConfig::validate_all(&workers).is_err());
+        assert!(WorkerGroupConfig::validate_all(&workers).is_err());
         Ok(())
     }
 
@@ -1679,7 +1394,7 @@ mod tests {
         // needs the lowest ranks on the first host, and each host must number
         // its own devices from zero.
         let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
-        let worker = ExecutorGroupConfig::placed(&hosts, "cuda", 8, 2, mixed_components(8));
+        let worker = WorkerGroupConfig::placed(&hosts, "cuda", 8, 2, mixed_components(8));
 
         let rank_layout: Vec<_> = worker
             .ranks
@@ -1706,12 +1421,12 @@ mod tests {
         // host.
         for entry in ["parallel", "divided"] {
             assert_eq!(
-                worker.components[entry].ranks.len(),
+                worker.blocks[entry].ranks.len(),
                 8,
                 "{entry} spans the executor group"
             );
         }
-        assert_eq!(worker.components["alone"].ranks, vec![0]);
+        assert_eq!(worker.blocks["alone"].ranks, vec![0]);
     }
 
     /// The two-rank groups of four schedulers over two four-device hosts
@@ -1720,13 +1435,13 @@ mod tests {
     #[test]
     fn the_data_parallel_shorthand_places_engine_cores_in_host_blocks() {
         let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
-        let groups = ExecutorGroupConfig::data_parallel(
+        let groups = WorkerGroupConfig::data_parallel(
             &hosts,
             "cuda",
             4,
             2,
             2,
-            ExecutorGroupConfig::single_component("model", 2),
+            WorkerGroupConfig::single_component("model", 2),
         );
 
         let rank_layout: Vec<_> = groups
@@ -1763,16 +1478,16 @@ mod tests {
                 ),
             ]
         );
-        assert!(ExecutorGroupConfig::validate_all(&groups).is_ok());
+        assert!(WorkerGroupConfig::validate_all(&groups).is_ok());
 
         // One scheduler keeps the single-group identity.
-        let single = ExecutorGroupConfig::data_parallel(
+        let single = WorkerGroupConfig::data_parallel(
             &hosts,
             "cuda",
             1,
             2,
             2,
-            ExecutorGroupConfig::single_component("model", 2),
+            WorkerGroupConfig::single_component("model", 2),
         );
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].id.to_string(), "model");
@@ -1783,12 +1498,12 @@ mod tests {
         // The first hosts take the remainder, which keeps each host's block
         // contiguous and rank zero on the engine's host.
         let hosts = ["a".to_owned(), "b".to_owned(), "c".to_owned()];
-        let worker = ExecutorGroupConfig::placed(
+        let worker = WorkerGroupConfig::placed(
             &hosts,
             "cuda",
             8,
             2,
-            ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, 8),
+            WorkerGroupConfig::single_component(DEFAULT_BLOCK, 8),
         );
 
         let hosts: Vec<_> = worker.ranks.iter().map(|rank| rank.host.as_str()).collect();
@@ -1800,46 +1515,36 @@ mod tests {
     /// is not.
     #[test]
     fn entry_geometry_uses_unique_ordered_rank_members() {
-        let mut worker = ExecutorGroupConfig::placed(
-            &["localhost".to_owned()],
-            "cuda",
-            4,
-            2,
-            mixed_components(4),
-        );
+        let mut worker =
+            WorkerGroupConfig::placed(&["localhost".to_owned()], "cuda", 4, 2, mixed_components(4));
         assert!(worker.validate().is_ok());
 
-        worker
-            .components
-            .get_mut("parallel")
-            .unwrap()
-            .ranks
-            .swap(0, 3);
+        worker.blocks.get_mut("parallel").unwrap().ranks.swap(0, 3);
         assert!(worker.validate().is_ok());
 
-        worker.components.get_mut("parallel").unwrap().ranks[1] = 3;
+        worker.blocks.get_mut("parallel").unwrap().ranks[1] = 3;
         assert!(worker.validate().is_err());
     }
 
     #[test]
     fn static_bindings_reject_duplicate_identities_and_allow_component_replicas() {
-        let worker = ExecutorGroupConfig::placed(
+        let worker = WorkerGroupConfig::placed(
             &["localhost".to_owned()],
             "cuda",
             1,
             2,
-            ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, 1),
+            WorkerGroupConfig::single_component(DEFAULT_BLOCK, 1),
         );
         let mut other = worker.clone();
-        assert!(ExecutorGroupConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
+        assert!(WorkerGroupConfig::validate_all(&[worker.clone(), other.clone()]).is_err());
 
         // Distinct identities on the same device validate, whether the groups
         // replicate one component name or hold different ones.
-        other.id = ExecutorGroupId("other".into());
-        assert!(ExecutorGroupConfig::validate_all(&[worker.clone(), other.clone()]).is_ok());
+        other.id = WorkerGroupId("other".into());
+        assert!(WorkerGroupConfig::validate_all(&[worker.clone(), other.clone()]).is_ok());
 
-        let entry = other.components.remove(DEFAULT_COMPONENT).unwrap();
-        other.components.insert("divided".into(), entry);
-        assert!(ExecutorGroupConfig::validate_all(&[worker, other]).is_ok());
+        let entry = other.blocks.remove(DEFAULT_BLOCK).unwrap();
+        other.blocks.insert("divided".into(), entry);
+        assert!(WorkerGroupConfig::validate_all(&[worker, other]).is_ok());
     }
 }

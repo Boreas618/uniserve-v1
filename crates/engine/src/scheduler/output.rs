@@ -1879,7 +1879,7 @@ impl Scheduler {
         let worker = self
             .dispatch
             .affinity
-            .get(&(key, DEFAULT_COMPONENT.to_owned()))
+            .get(&(key, DEFAULT_BLOCK.to_owned()))
             .cloned();
         let source = worker
             .as_ref()
@@ -2064,7 +2064,7 @@ struct PublishedPages<'a> {
 )]
 fn offloads(
     kv_offload: &KvOffloadManager,
-    worker: &crate::ExecutorGroupId,
+    worker: &crate::WorkerGroupId,
     request: RequestId,
     pool: &BlockPool,
     allocation: &CacheAllocation,

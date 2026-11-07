@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use engine::{
     BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Executor,
-    ExecutorError, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, FinishReason,
-    SchedulerConfig, SimEngine, SimExecutor, WeightsInFlight,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, FinishReason, SchedulerConfig, SimEngine,
+    SimExecutor, WeightsInFlight, WorkerGroupId,
 };
 use engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 use ipc::{BatchCommand, ImageParams, RequestId, SamplingParams};
@@ -191,11 +191,11 @@ impl Executor for Segmented {
         self.inner.info()
     }
 
-    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
+    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.inner.is_ready(worker)
     }
 
-    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         self.inner.has_capacity(worker)
     }
 

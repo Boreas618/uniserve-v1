@@ -8115,10 +8115,7 @@ fn schedulers(
                 .components
                 .iter()
                 .flat_map(|component| {
-                    engine::ExecutorGroupConfig::single_component(
-                        &component.name,
-                        plan.world_size(),
-                    )
+                    engine::WorkerGroupConfig::single_component(&component.name, plan.world_size())
                 })
                 .collect(),
         },

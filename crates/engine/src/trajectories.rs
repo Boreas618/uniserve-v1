@@ -99,7 +99,7 @@ use storage::manifest::{Storage as PagedStorage, StorageLayout};
 use storage::protocol::{PageSlot, Reply, Request};
 use storage::{Key, Scope};
 
-use crate::executor::ExecutorGroupId;
+use crate::executor::WorkerGroupId;
 use crate::host_tier::Servers;
 
 /// The version of [`Record`]: a record of another version names no pages.
@@ -344,7 +344,7 @@ enum OffloadStage {
 }
 
 struct Offload {
-    worker: ExecutorGroupId,
+    worker: WorkerGroupId,
     request_key: RequestKey,
     steps: u32,
     /// Every page's key, by rank.
@@ -425,7 +425,7 @@ pub(crate) struct TrajectoryStore {
     host: String,
     /// The denoising ranks of each executor group the store serves, in rank
     /// order.
-    workers: HashMap<ExecutorGroupId, Vec<RankPool>>,
+    workers: HashMap<WorkerGroupId, Vec<RankPool>>,
     /// The latent seed of what the scheduler's denoising computes.
     seed: u64,
     offloads: HashMap<RequestId, Offload>,
@@ -464,7 +464,7 @@ impl TrajectoryStore {
     /// store serves it.
     pub(crate) fn add_worker(
         &mut self,
-        worker: &ExecutorGroupId,
+        worker: &WorkerGroupId,
         ranks: &[(u32, RankLatents<'_>)],
     ) -> bool {
         let Some((_, first)) = ranks.first() else {
@@ -515,7 +515,7 @@ impl TrajectoryStore {
     }
 
     /// Whether the store serves `executor`.
-    pub(crate) fn serves(&self, worker: &ExecutorGroupId) -> bool {
+    pub(crate) fn serves(&self, worker: &WorkerGroupId) -> bool {
         self.workers.contains_key(worker)
     }
 
@@ -531,7 +531,7 @@ impl TrajectoryStore {
         &mut self,
         request: RequestId,
         request_key: RequestKey,
-        worker: &ExecutorGroupId,
+        worker: &WorkerGroupId,
         trajectory: u64,
         steps: u32,
         layouts: &BTreeMap<u32, String>,
@@ -617,7 +617,7 @@ impl TrajectoryStore {
         &mut self,
         request: RequestId,
         batch: u64,
-    ) -> Option<(ExecutorGroupId, LatentOffload)> {
+    ) -> Option<(WorkerGroupId, LatentOffload)> {
         let offload = self.offloads.get_mut(&request)?;
         if !matches!(offload.stage, OffloadStage::Queued) {
             return None;
@@ -710,7 +710,7 @@ impl TrajectoryStore {
     }
 
     /// `executor` was lost: the offloads its batches carried did not happen.
-    pub(crate) fn worker_failed(&mut self, worker: &ExecutorGroupId) {
+    pub(crate) fn worker_failed(&mut self, worker: &WorkerGroupId) {
         let failed: Vec<RequestId> = self
             .offloads
             .iter()
@@ -862,7 +862,7 @@ impl TrajectoryStore {
     pub(crate) fn restore(
         &mut self,
         request: RequestId,
-        worker: &ExecutorGroupId,
+        worker: &WorkerGroupId,
         trajectory: u64,
         steps: u32,
         state_seed: Option<u64>,

@@ -142,7 +142,7 @@ def one_device(
             worker_config = {
                 "id": "model",
                 "ranks": ["cuda:3"],
-                "components": {"model": {"ranks": [0]}},
+                "blocks": {"model": {"ranks": [0]}},
                 "queue_depth": 2,
             }
             with server_process(
@@ -189,7 +189,7 @@ def test_ordered_bindings_generate_outputs(
     worker_config = {
         "id": "model",
         "ranks": [f"cuda:{device}" for device in (3, 1)],
-        "components": {"model": {"ranks": [1, 0], **parallel}},
+        "blocks": {"model": {"ranks": [1, 0], **parallel}},
         "queue_depth": 2,
     }
     with server_process(

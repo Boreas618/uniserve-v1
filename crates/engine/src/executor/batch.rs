@@ -5,7 +5,7 @@
 //! `Submissions`, which describes it to the device executor or gives it to the
 //! simulated one.
 
-use super::ExecutorGroupId;
+use super::WorkerGroupId;
 use ipc::{
     BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
     ForwardBatch, LatentParams, NewRequest, RequestKey, TensorExport,
@@ -48,7 +48,7 @@ impl RankBuffer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestDispatch {
     /// Executor routing stays outside the call sent across IPC.
-    pub worker: ExecutorGroupId,
+    pub worker: WorkerGroupId,
     /// Executor-local request row when a replicated route owns its own address
     /// space. Unset dispatches retain the admission's canonical row;
     /// The executor applies the override to the request's `Start`.
@@ -74,7 +74,7 @@ pub struct RequestDispatch {
     /// Admission fixes a video request's route, so a product is published
     /// only toward the replicas that read it. `None` for calls outside a
     /// video graph.
-    pub readers: Option<BTreeMap<String, ExecutorGroupId>>,
+    pub readers: Option<BTreeMap<String, WorkerGroupId>>,
 }
 
 /// One logical executor submission. Its rank projections are derived only inside an executor.
@@ -140,7 +140,7 @@ impl PartialEq for ExecutionBatch {
 /// calls carries only them.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PageOffloads {
-    pub worker: ExecutorGroupId,
+    pub worker: WorkerGroupId,
     pub pages: Vec<ipc::PageCopy>,
     pub latents: Vec<ipc::LatentOffload>,
 }
@@ -235,9 +235,9 @@ impl ExecutionBatch {
                 "call identity belongs to another logical batch"
             );
             requests.insert(call.request_key);
-            // `ExecutorGroupId`'s public field admits any string; only its
+            // `WorkerGroupId`'s public field admits any string; only its
             // constructor checks the identifier syntax.
-            ExecutorGroupId::new(dispatch.worker.0.clone())?;
+            WorkerGroupId::new(dispatch.worker.0.clone())?;
             anyhow::ensure!(!call.component.is_empty(), "call requires a component");
             anyhow::ensure!(
                 identities.insert(call.call_id),

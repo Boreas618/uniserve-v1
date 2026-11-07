@@ -36,7 +36,7 @@ def test_shipped_profiles_name_deployments_and_workloads_that_exist(
         deployment = config.root / server.command[flag + 1]
         assert deployment.is_file(), f"{name} names {deployment}"
         groups = tomllib.loads(deployment.read_text())["worker_groups"]
-        assert groups and all(group["components"] for group in groups)
+        assert groups and all(group["blocks"] for group in groups)
 
     for name, point in config.benchmarks.items():
         manifests = (

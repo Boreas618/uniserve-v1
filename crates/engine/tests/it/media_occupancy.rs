@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 
 use engine::{
-    BatchEvent, BatchResult, CommandSender, ExecutionBatch, Executor, ExecutorError,
-    ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, PoolLayout, RequestDispatch,
-    SchedulerConfig, SimEngine, SimExecutor,
+    BatchEvent, BatchResult, CommandSender, ExecutionBatch, Executor, ExecutorError, ExecutorInfo,
+    ExecutorSubmitError, PoolLayout, RequestDispatch, SchedulerConfig, SimEngine, SimExecutor,
+    WorkerGroupId,
 };
 use engine::{ConditionExtent, DiffusionRequest, Event, FinishReason, RejectionKind, Request};
 use ipc::{BufferId, Call, CallKind, DimBound, MediaCall};
@@ -86,7 +86,7 @@ struct Served {
     submissions: Vec<Submission>,
     /// Each submitted media call with the executor its dispatch names for
     /// every component reading its products, in submission order.
-    readers: Vec<(RequestId, MediaCall, BTreeMap<String, ExecutorGroupId>)>,
+    readers: Vec<(RequestId, MediaCall, BTreeMap<String, WorkerGroupId>)>,
     /// Every submitted media call with its dispatch, in submission order.
     calls: Vec<(Call, RequestDispatch)>,
     /// Every event each request's stream delivered.
@@ -376,7 +376,7 @@ fn each_media_call_names_the_workers_routed_to_read_its_products() {
     let routed = |components: &[&str]| {
         components
             .iter()
-            .map(|component| ((*component).to_owned(), ExecutorGroupId("sim".to_owned())))
+            .map(|component| ((*component).to_owned(), WorkerGroupId("sim".to_owned())))
             .collect::<BTreeMap<_, _>>()
     };
     // The video graph: text conditioning feeds latent preparation on the
@@ -834,7 +834,7 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let routed = |components: &[&str]| {
         components
             .iter()
-            .map(|component| ((*component).to_owned(), ExecutorGroupId("sim".to_owned())))
+            .map(|component| ((*component).to_owned(), WorkerGroupId("sim".to_owned())))
             .collect::<BTreeMap<_, _>>()
     };
     for (owner, call, readers) in &served.readers {
@@ -1004,7 +1004,7 @@ struct PooledExecutor {
     inner: SimExecutor,
     info: ExecutorInfo,
     /// The executor the simulator itself reports.
-    simulator: ExecutorGroupId,
+    simulator: WorkerGroupId,
     /// The media call whose first batch is handed back, until it has been.
     hand_back: Option<MediaCall>,
     handed_back: Arc<AtomicBool>,
@@ -1049,11 +1049,11 @@ impl PooledExecutor {
         };
         let pools = [
             (
-                ExecutorGroupId("encoders".to_owned()),
+                WorkerGroupId("encoders".to_owned()),
                 pool(&["media_reader", "text_encoder", "latent_encoder"]),
             ),
             (
-                ExecutorGroupId("generator".to_owned()),
+                WorkerGroupId("generator".to_owned()),
                 pool(&[
                     "denoiser",
                     "video_decoder",
@@ -1093,11 +1093,11 @@ impl Executor for PooledExecutor {
         &self.info
     }
 
-    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
+    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.info.workers.iter().any(|(id, _)| id == worker) && self.inner.is_ready(&self.simulator)
     }
 
-    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         self.is_ready(worker) && self.inner.has_capacity(&self.simulator)
     }
 

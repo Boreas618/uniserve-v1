@@ -5,7 +5,7 @@
 //! host. Requests are routed only to admissible pairings, and a decoding pool
 //! without one is refused at startup.
 
-use crate::executor::ExecutorGroupId;
+use crate::executor::WorkerGroupId;
 
 /// Returns, for each executor that decodes video, the encoder replicas that
 /// keep every media unit it decodes on the host that decoded it.
@@ -25,12 +25,12 @@ use crate::executor::ExecutorGroupId;
 pub(crate) fn video_unit_codecs(
     routing: &std::collections::BTreeMap<ipc::MediaCall, String>,
     layouts: &[(
-        ExecutorGroupId,
+        WorkerGroupId,
         Vec<String>,
         std::collections::BTreeMap<String, crate::BlockConfig>,
     )],
 ) -> anyhow::Result<
-    std::collections::BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>,
+    std::collections::BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>,
 > {
     let mut pairings = std::collections::BTreeMap::new();
     let (Some(decoder), Some(encoder)) = (
@@ -105,13 +105,13 @@ pub(crate) fn video_unit_codecs(
 #[cfg(test)]
 mod tests {
     use super::video_unit_codecs;
-    use crate::ExecutorRank;
-    use crate::executor::{BlockConfig, ExecutorGroupId};
+    use crate::WorkerRank;
+    use crate::executor::{BlockConfig, WorkerGroupId};
     use ipc::MediaCall;
     use std::collections::BTreeMap;
 
-    fn rank(host: &str, device: &str) -> ExecutorRank {
-        ExecutorRank {
+    fn rank(host: &str, device: &str) -> WorkerRank {
+        WorkerRank {
             host: host.to_owned(),
             device: device.to_owned(),
         }
@@ -140,12 +140,11 @@ mod tests {
     /// function itself reads only the ranks' hosts.
     fn pairing(
         layouts: &[(
-            &ExecutorGroupId,
-            &[ExecutorRank],
+            &WorkerGroupId,
+            &[WorkerRank],
             &BTreeMap<String, BlockConfig>,
         )],
-    ) -> anyhow::Result<BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>>
-    {
+    ) -> anyhow::Result<BTreeMap<WorkerGroupId, std::collections::BTreeSet<WorkerGroupId>>> {
         let placed = layouts
             .iter()
             .map(|(id, ranks, components)| {
@@ -161,8 +160,8 @@ mod tests {
 
     #[test]
     fn units_encoded_on_their_own_host_are_admitted() {
-        let model = ExecutorGroupId("model".to_owned());
-        let host = ExecutorGroupId("host".to_owned());
+        let model = WorkerGroupId("model".to_owned());
+        let host = WorkerGroupId("host".to_owned());
         let model_ranks = vec![
             rank("a", "cuda:0"),
             rank("a", "cuda:1"),
@@ -192,8 +191,8 @@ mod tests {
         // Two units per decoding rank: positions 0 to 3 come from host a's
         // decoders and go to host a's encoders, positions 4 to 7 likewise on
         // host b.
-        let model = ExecutorGroupId("model".to_owned());
-        let host = ExecutorGroupId("host".to_owned());
+        let model = WorkerGroupId("model".to_owned());
+        let host = WorkerGroupId("host".to_owned());
         let model_ranks = vec![
             rank("a", "cuda:0"),
             rank("a", "cuda:1"),
@@ -244,8 +243,9 @@ mod tests {
         let mut checked = 0;
         for entry in std::fs::read_dir(&root).expect("the deployment directory exists") {
             let path = entry.expect("readable entry").path();
-            let workers = crate::Deployment::read(path.to_str().expect("UTF-8 path"))
-                .and_then(|deployment| deployment.worker_groups("localhost"))
+            let workers = std::fs::read_to_string(&path)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| proto::config::WorkerGroupConfig::parse_file(&text, "localhost"))
                 .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
             let ids = workers
                 .iter()
@@ -254,13 +254,13 @@ mod tests {
             let layouts = workers
                 .iter()
                 .zip(&ids)
-                .map(|(worker, id)| (id, worker.ranks.as_slice(), &worker.components))
+                .map(|(worker, id)| (id, worker.ranks.as_slice(), &worker.blocks))
                 .collect::<Vec<_>>();
             let pairings =
                 pairing(&layouts).unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
             let decoders = workers
                 .iter()
-                .filter(|worker| worker.components.contains_key("video_decoder"))
+                .filter(|worker| worker.blocks.contains_key("video_decoder"))
                 .count();
             assert_eq!(pairings.len(), decoders, "{}", path.display());
             checked += 1;
@@ -275,21 +275,21 @@ mod tests {
         // the replica's own host.
         let flows = [
             (
-                ExecutorGroupId("flow-a".to_owned()),
+                WorkerGroupId("flow-a".to_owned()),
                 vec![rank("a", "cuda:0")],
             ),
             (
-                ExecutorGroupId("flow-b".to_owned()),
+                WorkerGroupId("flow-b".to_owned()),
                 vec![rank("b", "cuda:0")],
             ),
         ];
         let encoders = [
             (
-                ExecutorGroupId("encoder-a".to_owned()),
+                WorkerGroupId("encoder-a".to_owned()),
                 vec![rank("a", "cpu")],
             ),
             (
-                ExecutorGroupId("encoder-b".to_owned()),
+                WorkerGroupId("encoder-b".to_owned()),
                 vec![rank("b", "cpu")],
             ),
         ];

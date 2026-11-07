@@ -53,7 +53,7 @@ id = "attention"
 ranks = ["cuda:0"]
 queue_depth = 2
 
-[worker_groups.components.model]
+[worker_groups.blocks.model]
 
 [[worker_groups]]
 id = "experts"
@@ -485,7 +485,7 @@ def written_deployment(directory: Path, groups: list[dict[str, Any]]) -> Path:
     worker group's ranks and the components placed on them; a test states
     one the same way a deployment does. Each entry of `groups` is one
     `[[worker_groups]]` table, such as `{"id": "model", "ranks":
-    ["cuda:0-1"], "queue_depth": 2, "components": {"model":
+    ["cuda:0-1"], "queue_depth": 2, "blocks": {"model":
     {"tensor_parallel_size": 2}}}`.
     """
     path = directory / "deployment.toml"

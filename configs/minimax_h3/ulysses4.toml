@@ -5,18 +5,18 @@ id = "model"
 ranks = ["cuda:0-3"]
 queue_depth = 6
 
-[worker_groups.components.transformer]
+[worker_groups.blocks.transformer]
 sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
 
-[worker_groups.components.text_encoder]
+[worker_groups.blocks.text_encoder]
 tensor_parallel_size = 4
 
-[worker_groups.components.video_decoder]
+[worker_groups.blocks.video_decoder]
 
-[worker_groups.components.audio_decoder]
+[worker_groups.blocks.audio_decoder]
 distribution = "temporal_units"
 
-[worker_groups.components.latent_encoder]
+[worker_groups.blocks.latent_encoder]
 distribution = "temporal_units"
 
 # The media components are placed on this group's CUDA ranks: the codecs encode and assemble on
@@ -24,10 +24,10 @@ distribution = "temporal_units"
 # devices only - a rank on `cpu` is refused when the node is launched. `video_codec` takes one
 # unit per rank (the resolver inserts its temporal distribution); the muxer and the reader serve
 # on one rank, as an ordinary component with a one-rank world.
-[worker_groups.components.video_codec]
+[worker_groups.blocks.video_codec]
 
-[worker_groups.components.muxer]
+[worker_groups.blocks.muxer]
 ranks = [0]
 
-[worker_groups.components.media_reader]
+[worker_groups.blocks.media_reader]
 ranks = [0]
