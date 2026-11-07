@@ -31,6 +31,13 @@
 //! Once warm, the rank books what the server cannot see in the ledger
 //! ([`DeviceBudget::book`]): its graph pools' storage and what its process
 //! holds beside them, with the product storage it has yet to make resident.
+//!
+//! An expert transport is such storage, and it comes late: the rank creates it
+//! at its first capture, because only then does it hold the program that knows
+//! its size. The plan therefore fits the cache around a bound of it
+//! (`RankFacts::transport_bytes`), the rank compares that bound with what the
+//! creation took, and the booking after warmup counts the real figure in the
+//! process's item.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;

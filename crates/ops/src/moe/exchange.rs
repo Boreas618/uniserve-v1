@@ -326,6 +326,48 @@ pub struct TransportShape {
     pub attention_ranks: u32,
 }
 
+impl TransportShape {
+    /// What a fused backend holds beside its rows: its counters and its window's granule.
+    const FUSED_FIXED_BYTES: u64 = 64 << 20;
+    /// What any other backend holds beside its rows. A device communicator takes this: creating
+    /// deepep's took about 1.6 GB of the device with 32 MB of rows, and alltoall takes none of it,
+    /// but the process learns which backend it runs only when the epoch's programs arrive.
+    const FIXED_BYTES: u64 = 2 << 30;
+
+    /// The device bytes a rank's transport holds at most, for the capacity plan.
+    ///
+    /// The plan fits the cache before the process holds a program, so this cannot ask a package:
+    /// it is a bound the executor compares with what the transport took when it is created. A
+    /// backend whose experts run in the exchange (`fused`) holds its staged rows; any other holds
+    /// the rows received and computed beside a window of the rows in flight.
+    #[must_use]
+    pub fn device_bytes(&self, fused: bool) -> u64 {
+        let ranks = u64::from(self.ranks);
+        let tokens = u64::from(self.max_tokens);
+        let hidden = u64::from(self.hidden);
+        let top = u64::from(self.top);
+        let rows = ranks * tokens;
+        if fused {
+            // Every route of every rank may land here, with a tile of padding per local expert.
+            // The kernel stages each one encoded, gated, and as a row of the combine's wire type.
+            let local = u64::from(self.experts)
+                / u64::from(self.ranks.saturating_sub(self.attention_ranks).max(1));
+            let pool = rows * top + local * 64;
+            let staged = pool * (3 * hidden + u64::from(self.intermediate));
+            // Each route's partial row comes back in the shared window with its scales, and the
+            // rows this rank sends sit beside them, encoded.
+            let shared = tokens * top * hidden * 9 / 4;
+            let sent = tokens * (hidden / 2 + hidden / 16 + top * 12);
+            staged + shared + sent + Self::FUSED_FIXED_BYTES
+        } else {
+            let element = self.dtype.bytes().unwrap_or(2);
+            let received = rows * (2 * hidden * element + top * 24);
+            let window = (rows + ranks) * (hidden * element + 256);
+            received + window + Self::FIXED_BYTES
+        }
+    }
+}
+
 /// The transport's lifecycle call, as the header declares it.
 #[repr(C)]
 pub struct Lifecycle {
@@ -728,6 +770,40 @@ impl Op for ExpertExchange {
 
 #[cfg(test)]
 mod tests {
+    /// A shape of the deployment the bound was measured on.
+    fn measured(max_tokens: u32, ranks: u32, attention_ranks: u32) -> TransportShape {
+        TransportShape {
+            ranks,
+            rank: 0,
+            experts: 128,
+            hidden: 2048,
+            intermediate: 768,
+            max_tokens,
+            top: 8,
+            dtype: DType::BF16,
+            device: 0,
+            attention_ranks,
+        }
+    }
+
+    #[test]
+    fn the_transport_bound_holds_what_the_backends_were_measured_to_take() {
+        // The fused kernel's local and shared workspaces as it states them, by rows and ranks.
+        for (tokens, ranks, local, shared) in [
+            (128, 2, 10_877_312_u64, 4_720_256_u64),
+            (512, 2, 71_539_712, 18_876_032),
+            (4096, 2, 405_283_200, 150_996_608),
+            (16384, 2, 1_549_547_904, 603_981_440),
+            (512, 8, 196_771_328, 18_875_648),
+            (16384, 8, 6_108_804_608, 603_981_056),
+        ] {
+            let bound = measured(tokens, ranks, 0).device_bytes(true);
+            assert!(bound >= local + shared, "{tokens} rows of {ranks} ranks: {bound}");
+        }
+        // Creating deepep's transport took 1.65 GB of the device at 512 rows over three ranks.
+        assert!(measured(512, 3, 1).device_bytes(false) >= 1_654_652_928);
+    }
+
     use super::*;
 
     #[test]

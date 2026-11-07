@@ -496,6 +496,11 @@ impl EpochPlan {
         })
     }
 
+    /// What this rank's expert transport takes of its device, for the capacity plan.
+    fn transport_bytes(&self, device: DeviceId, model: &qwen3_moe::Qwen3Moe) -> Result<u64> {
+        if self.union.is_none() {
+            return Ok(0);
+        }
         Ok(self
             .transport_shape(device, model)?
             .device_bytes(model.experts_encoded()))
@@ -1572,6 +1577,7 @@ impl EpochPlan {
                     mem_fraction_static: self.build.mem_fraction_static,
                     cache: Some(cache),
                     kv_dtype: cache_dtype(model, self.build.kv_cache.dtype)?,
+                    transport_bytes: self.transport_bytes(device, model)?,
                 };
                 (facts, rank_report(device, &host)?)
             }
@@ -1601,6 +1607,7 @@ impl EpochPlan {
                         proto::request::ModelDtype::BFloat16 => ipc::PrefixCacheDtype::BFloat16,
                         proto::request::ModelDtype::Float32 => ipc::PrefixCacheDtype::Float32,
                     },
+                    transport_bytes: 0,
                 };
                 let clips = frame_clips()?;
                 let frames = (self.build.video.max_seconds * f64::from(minimax_h3::FPS)).round();
