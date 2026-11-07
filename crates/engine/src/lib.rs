@@ -70,7 +70,7 @@ pub use crate::scheduler::{
     ParkedCache, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
     PrefixCacheUsage, PrefixStats, ProgramSource, Progress, RoutePolicy, RouteTrial, Scheduler,
     SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
-    PhaseKind, Validators, WorkerStats, arrival_view, ceilings_of, phase_id,
+    PhaseKind, Validators, ExecutorStats, arrival_view, ceilings_of, phase_id,
 };
 #[cfg(feature = "testing")]
 pub use crate::service::{EpochPolicy, serve_requests};

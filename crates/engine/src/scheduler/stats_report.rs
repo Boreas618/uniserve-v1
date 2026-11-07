@@ -5,7 +5,7 @@
 //!
 //! A snapshot mixes two kinds of fields: interval deltas (admissions, queue
 //! wait totals, prefix-cache queries and hits, batch timing, domain call and
-//! time counters, worker forward counters) and point-in-time or lifetime
+//! time counters, executor forward counters) and point-in-time or lifetime
 //! values (running and waiting requests, the step counter, cache usage, maximum
 //! queue wait, active and peak domain credits).
 
@@ -187,7 +187,7 @@ impl SchedulerStatsReporter {
             .collect()
     }
 
-    /// Returns worker forward counters accumulated since the previous snapshot,
+    /// Returns executor forward counters accumulated since the previous snapshot,
     /// or `None` when nothing changed.
     fn worker_forward_stats(&mut self, stats: &SchedulerStats) -> Option<ForwardStats> {
         let current = worker_forward_stats_snapshot(stats);
@@ -216,7 +216,7 @@ fn domain_cumulative(stats: &crate::scheduler::DomainStats) -> DomainCumulative 
     }
 }
 
-/// Copies the cumulative worker forward-pass counters into plain values.
+/// Copies the cumulative executor forward-pass counters into plain values.
 ///
 /// Each map and counter is read separately while the scheduler may be merging
 /// a new report, so the copy can reflect part of one report. Because every
@@ -376,7 +376,7 @@ fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
     }
 }
 
-/// Computes saturating interval deltas between two worker counter snapshots.
+/// Computes saturating interval deltas between two executor counter snapshots.
 fn delta_worker_forward_stats(current: &ForwardStats, previous: &ForwardStats) -> ForwardStats {
     ForwardStats {
         mode_counts: delta_map(&current.mode_counts, &previous.mode_counts),
@@ -505,7 +505,7 @@ mod tests {
 
     /// The first snapshot reports every counter as a delta from zero and
     /// derives cache usage and average queue wait. A second snapshot over
-    /// unchanged counters reports zero deltas and no worker stats, while the
+    /// unchanged counters reports zero deltas and no executor stats, while the
     /// lifetime maximum queue wait persists.
     #[test]
     fn snapshot_reports_deltas_and_usage() {
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(snapshot.max_queue_wait_us, 9_000);
         assert_eq!(snapshot.prefix_cache_stats.base.queries, 2_560);
         assert_eq!(snapshot.prefix_cache_stats.base.hits, 512);
-        let worker = snapshot.worker_forward_stats.expect("worker stats present");
+        let worker = snapshot.worker_forward_stats.expect("executor stats present");
         assert_eq!(worker.component_us.get("text_model_forward"), Some(&42));
         assert_eq!(worker.flashinfer_decode_plan_calls, 5);
         assert_eq!(worker.flashinfer_decode_plan_reuses, 120);
@@ -585,7 +585,7 @@ mod tests {
         assert!(second_snapshot.worker_forward_stats.is_none());
     }
 
-    /// Directly measured worker compute and host round-trip latency must
+    /// Directly measured executor compute and host round-trip latency must
     /// surface as per-update deltas so they reach Prometheus.
     #[test]
     fn snapshot_surfaces_batch_timing() {
@@ -633,11 +633,11 @@ mod tests {
         let mut reporter = SchedulerStatsReporter::default();
         let snapshot = reporter.snapshot(&stats);
 
-        let worker = snapshot.worker_forward_stats.expect("worker stats present");
+        let worker = snapshot.worker_forward_stats.expect("executor stats present");
         assert_eq!(worker.attention_backend_counts.get("flashinfer"), Some(&9));
         assert_eq!(worker.cuda_graph_runtime_mode_counts.get("graph"), Some(&5));
 
-        // Unchanged maps produce no delta, so the second snapshot omits worker
+        // Unchanged maps produce no delta, so the second snapshot omits executor
         // stats entirely.
         let second_snapshot = reporter.snapshot(&stats);
         assert!(second_snapshot.worker_forward_stats.is_none());

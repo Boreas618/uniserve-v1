@@ -1,7 +1,7 @@
 //! Request admission, resource reservation, and waiting-queue insertion.
 //!
 //! Submission (`enqueue`, `enqueue_media`) validates a request and checks it
-//! against the loaded worker's capabilities and the waiting-queue bound. It
+//! against the loaded executor's capabilities and the waiting-queue bound. It
 //! either queues the request or rejects it synchronously with
 //! `Event::Rejected` on the request's event channel. Admission
 //! (`admit`, `admit_media`), which the scheduling pass runs before and
@@ -12,9 +12,9 @@
 //!
 //! A token request reserves a request row and one cache table per cache group;
 //! every group draws units from one pool, so admission compares the sum of
-//! the groups' unit demand with the free units. Its prefill worker is
+//! the groups' unit demand with the free units. Its prefill executor is
 //! recorded in `Placement::affinity`. A media request
-//! reserves a request row and every declared result buffer on each worker of
+//! reserves a request row and every declared result buffer on each executor of
 //! its route.
 
 use super::*;
@@ -41,8 +41,8 @@ pub(super) enum MediaOutputError {
     /// The serving component has no placement candidate.
     #[error("component {0} has no loaded candidate")]
     Unplaced(String),
-    /// The candidate's worker does not bind the component.
-    #[error("component {0} is not bound on its worker")]
+    /// The candidate's executor does not bind the component.
+    #[error("component {0} is not bound on its executor")]
     Unbound(String),
     /// The component declares no output of the product's name.
     #[error("component {component} declares no {product} output")]
@@ -159,18 +159,18 @@ impl Scheduler {
         }
     }
 
-    /// Checks a token-generation request against the loaded workers and
+    /// Checks a token-generation request against the loaded executors and
     /// returns its worst-case cache token count.
     ///
     /// Refuses, with the client's message, a request when the runtime has no
     /// prefix cache, the request fails validation, a unit the scheduler never
     /// splits (a readout row, a generation canvas, an input image's vision
-    /// block) exceeds the step token budget, the worker lacks a required
+    /// block) exceeds the step token budget, the executor lacks a required
     /// generation feature, or `validate_resources` or `max_cache_tokens`
     /// fails against `generation_limits`.
     pub(super) fn validate_submission(&self, req: &GenerationRequest) -> Result<usize, String> {
         if self.storage.cache.is_none() {
-            return Err("generation request requires worker KV resources".into());
+            return Err("generation request requires executor KV resources".into());
         }
         if let Err(error) = req.validate() {
             return Err(format!("invalid generation request: {error:?}"));
@@ -234,7 +234,7 @@ impl Scheduler {
         }
         if let Some(feature) = self.missing_required_feature(req) {
             return Err(format!(
-                "generation request requires worker feature `{feature}`, but the worker does not support it"
+                "generation request requires executor feature `{feature}`, but the executor does not support it"
             ));
         }
         if let Some(refusal) = self.exceeded_image_step(req) {
@@ -472,7 +472,7 @@ impl Scheduler {
             let mut shape = output.shape_bound.clone();
             // A product laid out at the request's raster holds the canvas in
             // its raster axes, whose declared extents are the largest the
-            // worker admits.
+            // executor admits.
             if let Some(raster) = output.raster_axes {
                 let canvas = graph.canvas();
                 for (axis, extent, side) in [
@@ -535,16 +535,16 @@ impl Scheduler {
     /// calls run on.
     ///
     /// The denoiser is selected first because it defines the expensive replica
-    /// residency. Components co-located with that worker follow it; shared
-    /// components such as a TP text encoder and the host codec worker retain
+    /// residency. Components co-located with that executor follow it; shared
+    /// components such as a TP text encoder and the host codec executor retain
     /// their own independently bounded request rows. Otherwise the candidate
     /// with the fewest distinct requests placed on it in `Placement::affinity`
     /// wins, then the one with the most free request rows.
     ///
-    /// Returns a map from component name to worker, or `None` when some
+    /// Returns a map from component name to executor, or `None` when some
     /// component has no ready candidate that is already on the route or has
     /// a free request row. When the executor reports admissible video
-    /// codecs for the video decoder's chosen worker, the video codec's
+    /// codecs for the video decoder's chosen executor, the video codec's
     /// candidates are further limited to those.
     fn media_routes(&self, graph: &VideoGraph) -> Option<HashMap<String, crate::ExecutorGroupId>> {
         use ipc::MediaCall;
@@ -561,7 +561,7 @@ impl Scheduler {
             .collect::<Vec<_>>();
         // Routing order: the denoiser first, then the calls that feed it, then
         // decoders before encoders, since the video codec's admissible
-        // workers depend on the route chosen for the video decoder.
+        // executors depend on the route chosen for the video decoder.
         required.sort_by_key(|(call, _)| match call {
             MediaCall::Denoising => 0,
             MediaCall::MediaReading
@@ -604,10 +604,10 @@ impl Scheduler {
                 })
                 .collect::<Vec<_>>();
 
-            // A worker already on the route is preferred, so co-located
+            // An executor already on the route is preferred, so co-located
             // components follow the denoiser. It needs no further free row
             // because `reserve_media` takes one request row per distinct
-            // worker.
+            // executor.
             let resident = candidates
                 .iter()
                 .copied()
@@ -634,7 +634,7 @@ impl Scheduler {
     /// Validates and queues one video request.
     ///
     /// Rejects with `RejectionKind::Invalid` when the request fails
-    /// validation; the worker reports no muxing component or no video
+    /// validation; the executor reports no muxing component or no video
     /// denoiser; the denoiser does not serve the request's task; its call
     /// graph cannot be built; or `media_outputs` cannot bound its products. A
     /// served task's calls all have components: the executor checked them at
@@ -656,7 +656,7 @@ impl Scheduler {
             reject(RejectionKind::Invalid, message.to_string());
             return;
         }
-        // A worker reports the component serving each media call it
+        // An executor reports the component serving each media call it
         // implements, so a deployment that assembles an artifact is the one
         // that can serve a video request; reporting some call is not enough.
         if !self
@@ -666,14 +666,14 @@ impl Scheduler {
         {
             reject(
                 RejectionKind::Invalid,
-                "worker does not provide the video media components".to_string(),
+                "executor does not provide the video media components".to_string(),
             );
             return;
         }
         let Some(denoiser) = self.info.video_denoiser.as_ref() else {
             reject(
                 RejectionKind::Invalid,
-                "worker reports no video denoiser".to_string(),
+                "executor reports no video denoiser".to_string(),
             );
             return;
         };
@@ -758,24 +758,24 @@ impl Scheduler {
         self.waiting_media.insert(position, pending);
     }
 
-    /// Reserves a media request's row and output buffers on every routed worker.
+    /// Reserves a media request's row and output buffers on every routed executor.
     ///
     /// Every declared output is reserved in full in the buffer pool of each
-    /// rank that backs it on each routed worker, not only on the worker whose
+    /// rank that backs it on each routed executor, not only on the executor whose
     /// component produces it; spans are sized from the shape bound's maximum
     /// element count and 256-byte aligned.
     ///
     /// Returns `Ok(None)`, with nothing reserved, when a request row or buffer
     /// span cannot be allocated on some rank now; `admit_media` then leaves
     /// the request at the head of the queue. Returns `Err` when a routed
-    /// worker has no media storage, after releasing what was already reserved
-    /// on known workers.
+    /// executor has no media storage, after releasing what was already reserved
+    /// on known executors.
     fn reserve_media(
         &mut self,
         route_workers: &HashSet<crate::ExecutorGroupId>,
         request_key: RequestKey,
         outputs: &[MediaOutput],
-    ) -> Result<Option<MediaAllocations>, UnknownMediaWorker> {
+    ) -> Result<Option<MediaAllocations>, UnknownMediaGroup> {
         let mut reserved = MediaAllocations {
             request_slots: HashMap::new(),
             tensors: HashMap::new(),
@@ -783,7 +783,7 @@ impl Scheduler {
         for worker in route_workers {
             let Some(storage) = self.storage.media_storage.get_mut(worker) else {
                 reserved.free(&mut self.storage)?;
-                return Err(UnknownMediaWorker(worker.clone()));
+                return Err(UnknownMediaGroup(worker.clone()));
             };
             let Ok(slot) = storage.requests.allocate() else {
                 reserved.free(&mut self.storage)?;
@@ -806,7 +806,7 @@ impl Scheduler {
                 let Some(storage) = self.storage.media_storage.get_mut(worker) else {
                     reserved.tensors.insert((component, index), tensor);
                     reserved.free(&mut self.storage)?;
-                    return Err(UnknownMediaWorker(worker.clone()));
+                    return Err(UnknownMediaGroup(worker.clone()));
                 };
                 for rank in storage.holders(&component).to_vec() {
                     let Ok(buffer) =
@@ -839,7 +839,7 @@ impl Scheduler {
                 break;
             };
             // The denoiser's fixed schedule sets every request's step count;
-            // submission refused requests while the worker reports none.
+            // submission refused requests while the executor reports none.
             let Some(steps) = self
                 .info
                 .video_denoiser
@@ -878,9 +878,9 @@ impl Scheduler {
                 }
             };
 
-            // `allocations` holds the request's row on every routed worker;
+            // `allocations` holds the request's row on every routed executor;
             // the admission carries the denoiser's row, and a call placed on
-            // another worker uses that worker's row.
+            // another executor uses that executor's row.
             let primary_component = self.info.media_components[&MediaCall::Denoising].as_str();
             let request_pool_idx = allocations.request_slot(&routes[primary_component]);
             // Submission validated the prompt, sampling and conditions this
@@ -941,7 +941,7 @@ impl Scheduler {
                 muxing_inputs: Vec::new(),
                 audio: None,
                 admission,
-                admission_state: WorkerRegistration::Unsubmitted,
+                admission_state: ExecutorRegistration::Unsubmitted,
                 media_reading_scheduled: false,
                 vision_encoding_scheduled: false,
                 text_encoding_scheduled: false,
@@ -1007,7 +1007,7 @@ impl Scheduler {
         (ip.height as u64 / dl) * (ip.width as u64 / dl)
     }
 
-    /// Whether some worker group prefills only (`ExecutorGroupRole::Prefill`),
+    /// Whether some executor group prefills only (`ExecutorGroupRole::Prefill`),
     /// its requests decoding on decode groups.
     fn splits_prefill(&self) -> bool {
         !self.placement.prefill_groups.is_empty()
@@ -1055,7 +1055,7 @@ impl Scheduler {
     /// Why the image denoiser's step cannot hold `req`'s images, if so: a
     /// step evaluates one framed latent sequence (the image's latent rows
     /// and its `commit_marker_tokens`) per guidance branch, within the rows
-    /// and tokens the workers' step serves (`MainProcessInfo::image_capacity`).
+    /// and tokens the executors' step serves (`MainProcessInfo::image_capacity`).
     fn exceeded_image_step(&self, req: &GenerationRequest) -> Option<String> {
         let capacity = self.info.image_capacity.as_ref()?;
         if !req.generates_images() || capacity.max_step_tokens == 0 {
@@ -1120,7 +1120,7 @@ impl Scheduler {
         ))
     }
 
-    /// Returns a required runtime feature that the worker lacks.
+    /// Returns a required runtime feature that the executor lacks.
     pub(super) fn missing_required_feature(
         &self,
         request: &GenerationRequest,
@@ -1135,7 +1135,7 @@ impl Scheduler {
         self.generation_limits.covers(features).err()
     }
 
-    /// Returns whether the worker tracks image-latent capacity.
+    /// Returns whether the executor tracks image-latent capacity.
     pub(super) fn worker_tracks_image_latent(&self) -> bool {
         self.info.latent_page_units > 0 && self.info.latent_pages > 1
     }
@@ -1156,7 +1156,7 @@ impl Scheduler {
     /// Materializes the cache prefixes multi-branch guidance attends to.
     ///
     /// The text-unconditional branch attends to the negative prompt tokens,
-    /// and the image-unconditional branch to the prefix the worker states
+    /// and the image-unconditional branch to the prefix the executor states
     /// for its model, or to the request's own context when it states none;
     /// two branches with the same tokens share one prefix. Each prefix gets
     /// its own request row and cache tables sized to its tokens, stored in
@@ -1281,7 +1281,7 @@ impl Scheduler {
     pub(super) fn reap_cancellations(&mut self) {
         // A cancelled request closes only after every submitted descendant has
         // resolved. Host cache ownership then remains pinned through the close
-        // acknowledgement and ordered worker request retirement.
+        // acknowledgement and ordered executor request retirement.
         let cancelled: Vec<(RequestId, TerminalIntent)> = self
             .running
             .iter()
@@ -1346,7 +1346,7 @@ impl Scheduler {
     /// over every cache group. A head that can never fit the total cache
     /// capacity is rejected with `RejectionKind::Invalid`. Admission stops
     /// when the queue is empty, `max_running_requests` is reached, no request row is
-    /// free, the head does not fit yet or finds no ready prefill worker, or a
+    /// free, the head does not fit yet or finds no ready prefill executor, or a
     /// scheduler invariant breaks.
     /// Executes the plan's admission decisions (§4.4): the requests it
     /// rejects are refused, and the ones it admits are tried in its order, the
@@ -1448,7 +1448,7 @@ impl Scheduler {
             let Some(head) = self.waiting.front() else {
                 break;
             };
-            // Submission rejects token requests when the worker has no prefix
+            // Submission rejects token requests when the executor has no prefix
             // cache, so a queued one always finds it.
             let Some(cache) = self.storage.cache() else {
                 self.invariant_broken("a queued token request has a prefix cache");
@@ -1605,11 +1605,11 @@ impl Scheduler {
 
     /// Probes the prefix cache on the configured prefill owner.
     ///
-    /// Picks the first ready worker that serves prefill and returns it with
-    /// the component name it binds, plus the prefix hit on that worker's
+    /// Picks the first ready executor that serves prefill and returns it with
+    /// the component name it binds, plus the prefix hit on that executor's
     /// endpoint (prefix-cache residency is keyed by endpoint). The hit is an
     /// estimate; `acquire_cached_prefix` takes the actual prefix. Returns
-    /// `None` when the runtime has no prefix cache or no prefill worker is ready.
+    /// `None` when the runtime has no prefix cache or no prefill executor is ready.
     pub(super) fn prefill_target(
         &self,
         state: &RequestState,
@@ -1659,7 +1659,7 @@ impl Scheduler {
     /// Reserves what admission to `target` needs before the request commits.
     ///
     /// Admission checked request-row capacity and chose `target` among loaded
-    /// workers, and the text prefix cache exists for every queued token request, so
+    /// executors, and the text prefix cache exists for every queued token request, so
     /// an error names the scheduler invariant that no longer holds. Nothing
     /// stays reserved on error.
     fn reserve_admission(
@@ -1673,7 +1673,7 @@ impl Scheduler {
             .iter()
             .find(|(worker, _)| worker == target)
             .map(|(_, worker)| worker.endpoint.clone())
-            .ok_or("the selected prefill worker remains loaded")?;
+            .ok_or("the selected prefill executor remains loaded")?;
         let cache = self
             .storage
             .cache
@@ -1699,7 +1699,7 @@ impl Scheduler {
 
     /// Moves one validated request into the runnable set with its reservation.
     ///
-    /// Records `target`'s worker as the owner of its component for the
+    /// Records `target`'s executor as the owner of its component for the
     /// request, emits the public `Scheduled` event (a closed receiver marks
     /// the request cancelled), adds its encoder-cache entries to the reserved
     /// count, and acquires its cached prefix, which sets the computed-prompt
@@ -1878,7 +1878,7 @@ impl Scheduler {
 
 /// Resources a token request holds from the moment admission commits it.
 pub(super) struct AdmissionReservation {
-    /// The prefill worker's endpoint, which keys its prefix-cache residency.
+    /// The prefill executor's endpoint, which keys its prefix-cache residency.
     source: ipc::MainProcessEndpoint,
     request_slot: RequestSlot,
     prefix_cache: CacheAllocation,
@@ -1886,7 +1886,7 @@ pub(super) struct AdmissionReservation {
 
 /// What the host KV cache says about a request's prompt beyond its device hit.
 pub(super) enum HostHit {
-    /// Nothing to look for: no host cache serves that worker, the request
+    /// Nothing to look for: no host cache serves that executor, the request
     /// reads another world's pages or continues context images, or its prompt
     /// is on the device already.
     Nothing,

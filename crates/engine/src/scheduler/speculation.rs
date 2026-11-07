@@ -2,7 +2,7 @@
 //! verifications carry, and the refill of a draft cache that is missing.
 //!
 //! In a deployment that speculates (`SchedulerConfig::draft_tokens` above
-//! zero) the workers run the model's drafter after every forward. The
+//! zero) the executors run the model's drafter after every forward. The
 //! drafter's entry at position `i` reads the target's hidden state at `i`
 //! and the token at `i + 1`; a forward writes the entries of the positions
 //! it evaluates whose next token it knows, into the request's draft cache
@@ -26,7 +26,7 @@
 //! cache is complete and it speculates.
 //!
 //! The refill policy weighs what the world measures ([`SpeculationMeter`]):
-//! the tokens a verification carrying drafts commits, the worker's time of
+//! the tokens a verification carrying drafts commits, the executor's time of
 //! a decoding step with and without drafts, and its time per prompt token.
 
 use super::*;
@@ -84,7 +84,7 @@ impl MeasuredStep {
 /// (`Plan::refill`).
 ///
 /// A verification carrying drafts commits `s` tokens on average; the
-/// worker's step takes `v` with drafts and `d` without, and `p` per prompt
+/// executor's step takes `v` with drafts and `d` without, and `p` per prompt
 /// token. Speculating, a request takes `v / s` per token in place of `d`:
 /// its speedup is `g = s * d / v`, and a refilled token costs `k = p / d`
 /// decode steps. Until the world has measured a step without drafts
@@ -94,11 +94,11 @@ impl MeasuredStep {
 pub(crate) struct SpeculationMeter {
     /// `s`: tokens a verification carrying drafts commits.
     tokens_per_step: Option<f64>,
-    /// `v`: worker time of a decoding step with drafts, in microseconds.
+    /// `v`: executor time of a decoding step with drafts, in microseconds.
     drafted_step_us: Option<f64>,
-    /// `d`: worker time of a decoding step without drafts, in microseconds.
+    /// `d`: executor time of a decoding step without drafts, in microseconds.
     plain_step_us: Option<f64>,
-    /// `p`: worker time of a prompt step per token, in microseconds.
+    /// `p`: executor time of a prompt step per token, in microseconds.
     prompt_token_us: Option<f64>,
 }
 
@@ -114,7 +114,7 @@ impl SpeculationMeter {
         observe(&mut self.tokens_per_step, committed as f64);
     }
 
-    /// Observes a completed step of `step`'s kind that took the worker
+    /// Observes a completed step of `step`'s kind that took the executor
     /// `worker_us` microseconds.
     pub(crate) fn observe_step(&mut self, step: MeasuredStep, worker_us: u64) {
         let time = worker_us as f64;
@@ -224,7 +224,7 @@ fn cached_token(state: &RequestState, position: u32) -> Option<u32> {
 
 impl Scheduler {
     /// Whether the deployment speculates and its pool keeps the draft cache:
-    /// the world's workers run the drafter.
+    /// the world's executors run the drafter.
     pub(in crate::scheduler) fn speculates(&self) -> bool {
         self.config.draft_tokens > 0
             && self

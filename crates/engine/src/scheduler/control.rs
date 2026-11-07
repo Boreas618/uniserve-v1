@@ -165,7 +165,7 @@ impl Scheduler {
     /// Applies one command; returns true on shutdown.
     ///
     /// Every submission is validated by `enqueue` or `enqueue_media`, which
-    /// refuse what the loaded workers cannot serve and report their own
+    /// refuse what the loaded executors cannot serve and report their own
     /// rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         // Work that finished on another thread before this command arrived is
