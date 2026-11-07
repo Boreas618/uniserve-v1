@@ -786,7 +786,7 @@ def test_a_resource_change_continues_requests_with_a_smaller_cache(
     name = "qwen3-resource-change"
     assignments = (
         "mem_fraction_static=0.8",
-        "placement_config.queue_depth=3",
+        "device_config.queue_depth=3",
         "kv_cache_config.max_tokens=32768",
         "kv_cache_config.host_gib=8",
     )
@@ -812,7 +812,7 @@ def test_a_resource_change_continues_requests_with_a_smaller_cache(
         assert committed.status_code == 200, committed.text
         configured = tomllib.loads(_config(base_url)["config"])
         assert configured["mem_fraction_static"] == 0.8
-        assert configured["placement_config"]["queue_depth"] == 3
+        assert configured["device_config"]["queue_depth"] == 3
         assert configured["kv_cache_config"]["max_tokens"] == 32768
         assert configured["kv_cache_config"]["host_gib"] == 8
         for stream in streams:

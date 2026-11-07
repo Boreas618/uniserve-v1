@@ -409,7 +409,7 @@ def test_component_bindings_release_cancelled_requests(
     else:
         command += [
             "--set",
-            "placement_config.transfer="
+            "device_config.transfer="
             + ",".join(
                 # Device products cross workers over VMM handles where the
                 # devices can map one another; the media group's CPU workers

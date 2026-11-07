@@ -530,7 +530,7 @@ impl Leader {
         updates: Arc<crate::updates::driver::Driver>,
     ) -> anyhow::Result<Self> {
         let prepared = Self::prepare(config, stated).await?;
-        info!(placement = ?prepared.spec.placement, "starting the engine process");
+        info!(rank_layout = ?prepared.spec.rank_layout, "starting the engine process");
         let control = Arc::new(EngineControl::new(
             &config.request_socket(),
             daemon,
@@ -840,7 +840,7 @@ impl Leader {
         stated.refuse_foreign_options(model_config.description())?;
         let max_model_len = model_config.max_model_len;
 
-        // The options state the scheduler and the placement; the loaded model
+        // The options state the scheduler and the rank layout; the loaded model
         // completes what it determines.
         let mut spec = config.engine_spec()?;
         let control_tokens = special_token_ids(&model_config);
@@ -1543,10 +1543,8 @@ impl Leader {
                         reason = %failure.reason,
                         "the update on trial passed a rollback threshold; it reverts"
                     );
-                    let _ = tokio::task::spawn_blocking(move || {
-                        reverting.program_failure(failure)
-                    })
-                    .await;
+                    let _ = tokio::task::spawn_blocking(move || reverting.program_failure(failure))
+                        .await;
                 },
             )
             .await;
@@ -1679,11 +1677,8 @@ impl Leader {
             let leader_host = leader_host.clone();
             let filled = filled.clone();
             let preparing = tokio::task::spawn_blocking(move || {
-                let complete = crate::engine::control::with_store_programs(
-                    &servers,
-                    &leader_host,
-                    &filled,
-                )?;
+                let complete =
+                    crate::engine::control::with_store_programs(&servers, &leader_host, &filled)?;
                 crate::engine::control::prepare_epoch(
                     &servers,
                     &leader_host,
@@ -1945,10 +1940,7 @@ pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), Stri
     use crate::model::assets::model_files::ResolvedModelFiles;
     // A diffusers checkpoint keeps what processes a request in directories of its own, and states
     // no tokenizer at its root for the model's files to resolve.
-    if std::path::Path::new(served)
-        .join(MODULAR_INDEX)
-        .is_file()
-    {
+    if std::path::Path::new(served).join(MODULAR_INDEX).is_file() {
         return same_pipeline(std::path::Path::new(served), std::path::Path::new(path));
     }
     let resolve = |model: &str| {
@@ -2216,15 +2208,14 @@ impl Replica {
                 ));
             }
             let sink = stats_sink(
-            replica.model_name.clone(),
-            Arc::clone(&replica.observer),
-            replica.ordinal,
+                replica.model_name.clone(),
+                Arc::clone(&replica.observer),
+                replica.ordinal,
             );
             let welcomed = spec.clone();
-            let joined = tokio::task::spawn_blocking(move || {
-                control.join_target(engine, welcomed, sink)
-            })
-            .await;
+            let joined =
+                tokio::task::spawn_blocking(move || control.join_target(engine, welcomed, sink))
+                    .await;
             let client = match joined {
                 Ok(Ok(client)) => Arc::new(client),
                 Ok(Err(error)) => {
@@ -2272,12 +2263,18 @@ impl Replica {
                     updates.handed(&host);
                 }
                 Ok(Err(failure)) => {
-                    warn!(engine, "the switch's target took no programs: {}", failure.reason);
+                    warn!(
+                        engine,
+                        "the switch's target took no programs: {}", failure.reason
+                    );
                     updates.rollback(&failure.reason);
                     return;
                 }
                 Err(error) => {
-                    warn!(engine, "handing the switch's target its programs ended: {error}");
+                    warn!(
+                        engine,
+                        "handing the switch's target its programs ended: {error}"
+                    );
                     updates.rollback(&error.to_string());
                     return;
                 }
@@ -2380,7 +2377,12 @@ impl Replica {
                 if relaunched.is_none() && !updates.relaunch_due().is_empty() {
                     relaunched = Some(
                         replica
-                            .relaunch_previous(&publishing, &updates, before.clone(), &config_before)
+                            .relaunch_previous(
+                                &publishing,
+                                &updates,
+                                before.clone(),
+                                &config_before,
+                            )
                             .await,
                     );
                 }
@@ -2409,7 +2411,10 @@ impl Replica {
                         }
                     }
                 }
-                warn!(engine, epoch, "the switch returned this replica to the previous epoch");
+                warn!(
+                    engine,
+                    epoch, "the switch returned this replica to the previous epoch"
+                );
                 replica.start_standby();
             }
             replica.following.store(false, Ordering::SeqCst);
@@ -2420,7 +2425,10 @@ impl Replica {
                 })
                 .await;
                 if !matches!(published, Ok(Ok(()))) {
-                    warn!(epoch, "publishing the committed epoch's world failed: {published:?}");
+                    warn!(
+                        epoch,
+                        "publishing the committed epoch's world failed: {published:?}"
+                    );
                 }
                 // The standby of the epoch before ended with it (`worker_config.standby`).
                 replica.start_standby();
@@ -2488,7 +2496,9 @@ impl Replica {
         let generation = updates
             .epochs()
             .next_generation(crate::engine::control::ENGINE_GROUP, 0);
-        let started = self.start_previous(control, updates, spec, config, generation).await;
+        let started = self
+            .start_previous(control, updates, spec, config, generation)
+            .await;
         // Whether or not it serves, the switch has nothing left to wait for.
         updates.relaunched(&host, generation);
         started
@@ -2537,7 +2547,10 @@ impl Replica {
                 SWITCH_TIMEOUT.as_secs()
             ),
         }
-        info!(generation, "the previous epoch started again on the weights it kept");
+        info!(
+            generation,
+            "the previous epoch started again on the weights it kept"
+        );
         Ok(client)
     }
 

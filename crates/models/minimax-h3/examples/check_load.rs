@@ -134,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sidecars = Sidecars::read(&roots[0], None, &layout)?;
     let config = Config::normalize(&layout, &sidecars)?;
 
-    // The deployment's own placement decides which blocks exist and which directory each reads;
+    // The deployment's own rank layout decides which blocks exist and which directory each reads;
     // `--component` narrows to a subset, which is how a caller keeps one load inside host memory.
     let serving = Partition::serving(&config, task, Ulysses::single(), 1, 0, 0)?;
     let placed = serving.blocks.iter().collect::<Vec<_>>();

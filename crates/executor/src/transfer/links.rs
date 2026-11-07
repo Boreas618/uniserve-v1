@@ -6,7 +6,7 @@ use crate::{Error, Result};
 use ::storage::manifest::Binding;
 use ::storage::manifest::weights::Sources;
 use ::storage::protocol::{Access, LinkBandwidth, LinkEnd, Priority, Region, Span};
-use ::storage::{Placement, StorageRecord, TensorRecord};
+use ::storage::{Location, StorageRecord, TensorRecord};
 use std::collections::BTreeMap;
 use std::os::fd::AsFd;
 
@@ -29,11 +29,11 @@ pub(crate) fn measure(
     retained: &Retained,
     sources: &Sources,
     device: platform::DeviceId,
-    at: Placement,
+    at: Location,
 ) -> Result<Vec<LinkBandwidth>> {
     let into = match at {
-        Placement::Device { gpu } => LinkEnd::Device { gpu },
-        Placement::Host { .. } => LinkEnd::Host,
+        Location::Device { gpu } => LinkEnd::Device { gpu },
+        Location::Host { .. } => LinkEnd::Host,
     };
     let reaches = |links: &[LinkBandwidth], source: &LinkEnd| {
         links.iter().any(|measured| {
@@ -50,8 +50,8 @@ pub(crate) fn measure(
             let source = LinkEnd::Remote {
                 endpoint: endpoint.clone(),
                 gpu: match at {
-                    Placement::Device { gpu } => Some(*gpu),
-                    Placement::Host { .. } => None,
+                    Location::Device { gpu } => Some(*gpu),
+                    Location::Host { .. } => None,
                 },
             };
             if chunk.length == 0 || reaches(&sources.links, &source) {
@@ -70,12 +70,12 @@ pub(crate) fn measure(
     let started = std::time::Instant::now();
     let bytes = 2 * LINK_SAMPLE;
     let (scratch, descriptor) = match at {
-        Placement::Device { .. } => {
+        Location::Device { .. } => {
             let scratch = Storage::segmented(device, &[bytes as usize], &[])?;
             let descriptor = scratch.create_segment(0)?;
             (scratch, descriptor)
         }
-        Placement::Host { .. } => Storage::host_retainable(device, bytes as usize)?,
+        Location::Host { .. } => Storage::host_retainable(device, bytes as usize)?,
     };
     let key = retained.exclusive_key(
         &ExclusiveSpec {
@@ -100,7 +100,7 @@ pub(crate) fn measure(
             }],
             &[(
                 StorageRecord {
-                    placement: at,
+                    location: at,
                     bytes,
                     segment: None,
                     fabric: None,

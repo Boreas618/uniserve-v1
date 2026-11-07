@@ -21,9 +21,9 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 
 use engine::{
-    BatchEvent, BatchResult, CommandSender, ExecutionBatch, Executor, ExecutorError, ExecutorInfo,
-    ExecutorSubmitError, PoolPlacement, RequestPlacement, SchedulerConfig, SimEngine, SimExecutor,
-    ExecutorGroupId,
+    BatchEvent, BatchResult, CommandSender, ExecutionBatch, Executor, ExecutorError,
+    ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, PoolLayout, RequestDispatch,
+    SchedulerConfig, SimEngine, SimExecutor,
 };
 use engine::{ConditionExtent, DiffusionRequest, Event, FinishReason, RejectionKind, Request};
 use ipc::{BufferId, Call, CallKind, DimBound, MediaCall};
@@ -84,11 +84,11 @@ impl Submission {
 struct Served {
     /// Media submissions in the order the executor accepted them.
     submissions: Vec<Submission>,
-    /// Each submitted media call with the executor its placement names for
+    /// Each submitted media call with the executor its dispatch names for
     /// every component reading its products, in submission order.
     readers: Vec<(RequestId, MediaCall, BTreeMap<String, ExecutorGroupId>)>,
-    /// Every submitted media call with its placement, in submission order.
-    calls: Vec<(Call, RequestPlacement)>,
+    /// Every submitted media call with its dispatch, in submission order.
+    calls: Vec<(Call, RequestDispatch)>,
     /// Every event each request's stream delivered.
     outcomes: HashMap<RequestId, Vec<Event>>,
 }
@@ -225,14 +225,14 @@ fn media_calls(batch: &ExecutionBatch) -> Vec<ObservedCall> {
     batch
         .requests
         .iter()
-        .filter_map(|(call, placement)| {
+        .filter_map(|(call, dispatch)| {
             let CallKind::Media(media_call) = call.kind else {
                 return None;
             };
             Some(ObservedCall {
                 request: call.request_key.request_id,
                 call: media_call,
-                units: placement.decode.as_ref().map_or(1, |range| range.max_units),
+                units: dispatch.decode.as_ref().map_or(1, |range| range.max_units),
             })
         })
         .collect()
@@ -328,14 +328,14 @@ fn serve_through(
     for event in boundary.iter() {
         match event {
             BatchEvent::Submitted(batch) => {
-                readers.extend(batch.requests.iter().filter_map(|(call, placement)| {
+                readers.extend(batch.requests.iter().filter_map(|(call, dispatch)| {
                     let CallKind::Media(media_call) = call.kind else {
                         return None;
                     };
                     Some((
                         call.request_key.request_id,
                         media_call,
-                        placement.readers.clone().unwrap_or_default(),
+                        dispatch.readers.clone().unwrap_or_default(),
                     ))
                 }));
                 calls.extend(batch.requests.iter().cloned());
@@ -761,8 +761,8 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     let (audio, rounds) = latents.split_last().unwrap();
     let mut cursor = 0;
     for index in rounds {
-        let (call, placement) = &served.calls[*index];
-        let range = placement.decode.as_ref().unwrap();
+        let (call, dispatch) = &served.calls[*index];
+        let range = dispatch.decode.as_ref().unwrap();
         assert_eq!(range.cursor, cursor);
         let rows = &UNIT_ROWS[cursor as usize..(cursor + range.max_units) as usize];
         assert_eq!(leading(&call.outputs[0]), rows.iter().sum::<u32>());
@@ -772,8 +772,8 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
         cursor += range.max_units;
     }
     assert_eq!(cursor, UNIT_ROWS.len() as u32);
-    let (audio_call, audio_placement) = &served.calls[*audio];
-    let range = audio_placement.decode.as_ref().unwrap();
+    let (audio_call, audio_range) = &served.calls[*audio];
+    let range = audio_range.decode.as_ref().unwrap();
     assert_eq!(
         (range.cursor, range.max_units, range.ranks.len()),
         (0, 1, 1)
@@ -1020,7 +1020,7 @@ impl PooledExecutor {
         let mut inner = SimExecutor::new(sim);
         let boundary = inner.observe();
         let (simulator, worker) = inner.info().workers[0].clone();
-        let launched = inner.info().placements[&simulator].clone();
+        let launched = inner.info().layouts[&simulator].clone();
 
         // Each pool serves its components' media calls and nothing else, and
         // is launched with those components at the simulator's queue depth.
@@ -1035,7 +1035,7 @@ impl PooledExecutor {
                 .keys()
                 .map(|call| CallKind::Media(*call))
                 .collect();
-            let placement = PoolPlacement {
+            let layout = PoolLayout {
                 queue_depth: launched.queue_depth,
                 ranks: launched.ranks,
                 components: launched
@@ -1045,7 +1045,7 @@ impl PooledExecutor {
                     .map(|(name, config)| (name.clone(), config.clone()))
                     .collect(),
             };
-            (info, placement)
+            (info, layout)
         };
         let pools = [
             (
@@ -1070,9 +1070,9 @@ impl PooledExecutor {
                 .collect(),
         )
         .unwrap();
-        info.placements = pools
+        info.layouts = pools
             .into_iter()
-            .map(|(id, (_, placement))| (id, placement))
+            .map(|(id, (_, layout))| (id, layout))
             .collect();
 
         let handed_back = Arc::new(AtomicBool::new(false));
@@ -1149,7 +1149,7 @@ impl Executor for PooledExecutor {
         let pools = batch
             .requests
             .iter_mut()
-            .map(|(_, placement)| std::mem::replace(&mut placement.worker, self.simulator.clone()))
+            .map(|(_, dispatch)| std::mem::replace(&mut dispatch.worker, self.simulator.clone()))
             .collect::<Vec<_>>();
         match self.inner.submit(batch) {
             Ok(()) => {
@@ -1157,8 +1157,8 @@ impl Executor for PooledExecutor {
                 Ok(())
             }
             Err(ExecutorSubmitError::WouldBlock(mut batch)) => {
-                for ((_, placement), pool) in batch.requests.iter_mut().zip(pools) {
-                    placement.worker = pool;
+                for ((_, dispatch), pool) in batch.requests.iter_mut().zip(pools) {
+                    dispatch.worker = pool;
                 }
                 Err(ExecutorSubmitError::WouldBlock(batch))
             }
@@ -1222,12 +1222,12 @@ fn media_buffers_are_placed_in_the_pool_of_each_rank_that_backs_them() {
             .calls
             .iter()
             .filter(|(call, _)| call.kind == CallKind::Media(media_call))
-            .flat_map(|(call, placement)| {
+            .flat_map(|(call, dispatch)| {
                 let outputs = call
                     .buffer_outputs()
                     .map(|product| product.buffer_id())
                     .collect::<Vec<_>>();
-                placement
+                dispatch
                     .buffers
                     .iter()
                     .filter(move |span| outputs.contains(&span.allocation.buffer))
@@ -1250,7 +1250,7 @@ fn media_buffers_are_placed_in_the_pool_of_each_rank_that_backs_them() {
         let lowest = served
             .calls
             .iter()
-            .flat_map(|(_, placement)| placement.buffers.iter())
+            .flat_map(|(_, dispatch)| dispatch.buffers.iter())
             .filter(|span| span.rank == rank)
             .map(|span| span.allocation.offset)
             .min();

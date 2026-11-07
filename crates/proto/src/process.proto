@@ -48,7 +48,7 @@ message Frontend {
 message Join {
   // The node's rank; the leader is rank 0.
   uint32 node_rank = 1;
-  // The node's host identity, as placements name it.
+  // The node's host identity, as rank layouts name it.
   string host = 2;
 }
 

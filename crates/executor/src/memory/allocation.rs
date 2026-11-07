@@ -618,11 +618,11 @@ impl Storage {
     /// storage, which this process exports in place by its descriptor.
     ///
     /// The descriptor must be one `cuMemExportToShareableHandle` produced from
-    /// a `cuMemCreate` allocation, which is what a device placement's is: this
-    /// is the VMM import, and it cannot take a host record. A `Placement::Host`
+    /// a `cuMemCreate` allocation, which is what a device location's is: this
+    /// is the VMM import, and it cannot take a host record. A `Location::Host`
     /// record's storage is a memfd, and it is mapped and registered instead by
     /// [`Storage::import_host`] (read-only) or [`Storage::map_host`]
-    /// (read-write). The record's placement is the rule, not this function.
+    /// (read-write). The record's location is the rule, not this function.
     pub(crate) fn import(
         descriptor: OwnedFd,
         bytes: usize,
@@ -748,9 +748,7 @@ impl Storage {
                     descriptor
                         .try_clone()
                         .map(ShareableHandle::Descriptor)
-                        .map_err(|error| {
-                            Error::transport_source("duplicating a descriptor", error)
-                        })
+                        .map_err(|error| Error::transport_source("duplicating a descriptor", error))
                 })
                 .transpose(),
             _ => Ok(None),

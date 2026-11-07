@@ -1022,7 +1022,10 @@ fn segment_rows(packing: &packing::SegmentPacking) -> (Vec<i32>, Vec<i32>) {
     {
         video[*raster as usize] = *packed as i32;
     }
-    (video, packing.audio_indices().map(|row| row as i32).collect())
+    (
+        video,
+        packing.audio_indices().map(|row| row as i32).collect(),
+    )
 }
 
 /// Where each modality's initial noise begins in the request's one Philox stream.
@@ -1221,7 +1224,7 @@ fn canvas_of_raster(width: u32, height: u32) -> Option<Canvas> {
 ///
 /// A runner hands one raster, one soundtrack and one draw per segment and reads back the row counts
 /// the packing reserved - it does not re-derive them, because those rows are the same arithmetic the
-/// packer's own placements compute and a second statement of them is what makes a dropped condition
+/// packer's own ranges compute and a second statement of them is what makes a dropped condition
 /// invisible. Each segment carries its kind, its request index, its anchor (a keyframe's), its
 /// pixels' raster when it has any, and its audio frames.
 ///
@@ -1232,7 +1235,6 @@ impl Denoiser {
         let canvas = canvas_of(request)?;
         packing::condition_segments(&conditions_of(request), &canvas, self.config.clip)
     }
-
 }
 
 /// The pieces of `request`'s conditions, in the order the packing holds them.
@@ -1461,7 +1463,7 @@ fn check_trace_view(view: TensorView, rows: u64, columns: u64, name: &str) -> Re
 ///
 /// A request whose pieces do not fit the layout's capacity is refused here rather than written past
 /// the rows the packing reserved for it.
-fn condition_placements(
+fn condition_ranges(
     total: u64,
     condition_rows: u32,
     pieces: &[(u32, u32)],
@@ -1484,12 +1486,12 @@ fn condition_placements(
         ))
     })?;
     let mut start = text_rows;
-    let mut placements = Vec::with_capacity(pieces.len());
+    let mut ranges = Vec::with_capacity(pieces.len());
     for (visual, audio) in pieces {
-        placements.push((start, start + u64::from(*audio) + u64::from(*visual)));
+        ranges.push((start, start + u64::from(*audio) + u64::from(*visual)));
         start += u64::from(*visual) + u64::from(*audio);
     }
-    Ok((text_rows, placements))
+    Ok((text_rows, ranges))
 }
 
 fn row_range(source: TensorView, start: u32, rows: u64) -> Result<TensorView> {
@@ -2255,7 +2257,14 @@ pub fn denoise_arena(
     let local = local_heads * head_dim;
     match config.attention {
         crate::config::AttentionKind::Dense => {
-            for name in ["query", "key", "value", "rotated_query", "rotated_key", "attended"] {
+            for name in [
+                "query",
+                "key",
+                "value",
+                "rotated_query",
+                "rotated_key",
+                "attended",
+            ] {
                 push(
                     &mut plan,
                     &format!("attention.{name}"),
@@ -2333,12 +2342,7 @@ pub fn denoise_arena(
     push(&mut plan, "video.groups", "i32", own_video);
     // The prediction is FP32 from the head (`transformer.py:404-421`) and the solver reads one type
     // for the sample and the velocity, so neither of these is the stack's element type.
-    push(
-        &mut plan,
-        "video.velocity_rows",
-        "f32",
-        own_video * patches,
-    );
+    push(&mut plan, "video.velocity_rows", "f32", own_video * patches);
     if arrangement.shard > 1 {
         // The rows every member predicted, collected: a rank's in its own interval, then the whole
         // sequence's, then the modality's in raster order.
@@ -2372,9 +2376,24 @@ pub fn denoise_arena(
             own_audio * audio_features,
         );
         if arrangement.shard > 1 {
-            push(&mut plan, "audio.velocity_owned", "f32", tokens * audio_features);
-            push(&mut plan, "audio.velocity_packed", "f32", total * audio_features);
-            push(&mut plan, "audio.velocity_all", "f32", audio_rows * audio_features);
+            push(
+                &mut plan,
+                "audio.velocity_owned",
+                "f32",
+                tokens * audio_features,
+            );
+            push(
+                &mut plan,
+                "audio.velocity_packed",
+                "f32",
+                total * audio_features,
+            );
+            push(
+                &mut plan,
+                "audio.velocity_all",
+                "f32",
+                audio_rows * audio_features,
+            );
         }
     }
     Ok(plan)
@@ -2419,7 +2438,9 @@ impl Denoiser {
         // the tensors it reads. Keyed from the stack it states four rows the forward never makes -
         // its per-head norms, its two modulation gathers and its attention - and lacks the four it
         // does.
-        programs.extend(crate::conditioning::TokenRefiner::programs(config, boundary)?);
+        programs.extend(crate::conditioning::TokenRefiner::programs(
+            config, boundary,
+        )?);
 
         let video = config.video_channels;
 
@@ -2571,7 +2592,7 @@ impl Denoiser {
     /// Encode the request's raw media and write its condition rows into the prefix source.
     ///
     /// The rows are the layout's - `MediaInput::rows` and `audio_rows` carry the counts the packing
-    /// stated - so this only decides where each block starts ([`condition_placements`]) and checks
+    /// stated - so this only decides where each block starts ([`condition_ranges`]) and checks
     /// the encoders against it. Within a piece the audio rows come first, which is the reference's
     /// order (`uniserve/models/minimax_h3/denoiser.py:585-620`).
     ///
@@ -2610,12 +2631,12 @@ impl Denoiser {
         let reserved = u32::try_from(reserved).map_err(|_| {
             Error::config(format!("{reserved} condition rows do not fit a row count"))
         })?;
-        let (_, placements) = condition_placements(total, reserved, &pieces)?;
+        let (_, ranges) = condition_ranges(total, reserved, &pieces)?;
         let audio_channels = u64::from(self.config.transformer.audio_channels);
         // The trace's `clean` views are one per **visual** condition, in packed order, so the
         // counter advances on the visual pieces alone - an audio-only condition contributes none.
         let mut visual_index = 0_usize;
-        for (piece, (start, _)) in media.iter().zip(placements) {
+        for (piece, (start, _)) in media.iter().zip(ranges) {
             if piece.audio_rows > 0 {
                 let samples = piece.audio.ok_or_else(|| {
                     Error::config(format!(
@@ -2806,7 +2827,12 @@ impl Denoiser {
             let blended = TensorView::with_strides(
                 run.element(&[0, u64::from(span.latent), 0, 0]),
                 DType::F32,
-                Shape::new(&[moment_channels, u64::from(span.latents), run_rows, run_columns]),
+                Shape::new(&[
+                    moment_channels,
+                    u64::from(span.latents),
+                    run_rows,
+                    run_columns,
+                ]),
                 run.strides,
             );
             clip.encode_in(
@@ -4023,11 +4049,15 @@ mod tests {
         };
         assert_eq!(
             ladder(49_152),
-            [1024, 2048, 4096, 6144, 8192, 12_288, 16_384, 24_576, 32_768, 49_152]
+            [
+                1024, 2048, 4096, 6144, 8192, 12_288, 16_384, 24_576, 32_768, 49_152
+            ]
         );
         assert_eq!(
             ladder(40_960),
-            [1024, 2048, 4096, 6144, 8192, 12_288, 16_384, 24_576, 32_768, 40_960]
+            [
+                1024, 2048, 4096, 6144, 8192, 12_288, 16_384, 24_576, 32_768, 40_960
+            ]
         );
         assert_eq!(ladder(2048), [1024, 2048]);
         assert_eq!(ladder(2112), [1024, 2048, 2112]);
@@ -4404,17 +4434,16 @@ mod tests {
         // A `ref2va`-shaped request at the released layout: 128 text rows, 192 condition rows and
         // the zero row. An image takes one 64-row unit, an audio reference 37 rows, and the request
         // does not fill the capacity - which is the case the subtraction convention got wrong, so
-        // the placement is asserted against the layout's numbers and not against the pieces' sum.
+        // the ranges are asserted against the layout's numbers and not against the pieces' sum.
         let text_rows = 128u64;
         let condition_rows = 192u32;
         let pieces = [(64u32, 0u32), (0, 37)];
         let total = text_rows + u64::from(condition_rows) + 1;
-        let (capacity, placements) =
-            super::condition_placements(total, condition_rows, &pieces).unwrap();
+        let (capacity, ranges) = super::condition_ranges(total, condition_rows, &pieces).unwrap();
         assert_eq!(capacity, text_rows);
         // Each block starts where the previous one ended, and inside a block the audio rows lead.
         let mut expected = text_rows;
-        for ((visual, audio), (start, end)) in pieces.iter().zip(&placements) {
+        for ((visual, audio), (start, end)) in pieces.iter().zip(&ranges) {
             assert_eq!(*start, expected);
             assert_eq!(*end - *start, u64::from(*visual) + u64::from(*audio));
             expected = *end;
@@ -4429,9 +4458,9 @@ mod tests {
 
         // A request whose pieces do not fit the layout's capacity is refused rather than written
         // past the rows the packing reserved.
-        assert!(super::condition_placements(total, condition_rows, &[(128, 128)]).is_err());
+        assert!(super::condition_ranges(total, condition_rows, &[(128, 128)]).is_err());
         // And a source that cannot hold the capacity is refused too.
-        assert!(super::condition_placements(text_rows, condition_rows, &pieces).is_err());
+        assert!(super::condition_ranges(text_rows, condition_rows, &pieces).is_err());
     }
 
     #[test]
@@ -4592,7 +4621,10 @@ mod tests {
         let rule = layouts();
         let pieces = pieces_of(&rule.config, Some(800), &request).expect("the conditions pack");
         assert_eq!(
-            pieces.iter().map(|piece| piece.condition).collect::<Vec<_>>(),
+            pieces
+                .iter()
+                .map(|piece| piece.condition)
+                .collect::<Vec<_>>(),
             [2, 0, 1],
             "the keyframe leads, and the references keep their request order"
         );
@@ -4943,7 +4975,10 @@ mod tests {
                 .expect("the layout names the table")
         };
         let prefix: Vec<i32> = decode_i32(&out[at("prefix_index")]);
-        assert_eq!(prefix.len(), tables[at("prefix_index")].shape.dim(0) as usize);
+        assert_eq!(
+            prefix.len(),
+            tables[at("prefix_index")].shape.dim(0) as usize
+        );
         // The prefix segment is packed after the generated rows, so the prompt's twelve rows sit at
         // `prefix_start()` and each points at its own source row.
         let first = rule.packing_of(&layout).unwrap().prefix_start() as usize;

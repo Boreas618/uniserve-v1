@@ -1,6 +1,6 @@
-//! Request residency and capability-based executor placement.
+//! Request residency and capability-based executor dispatch.
 //!
-//! The scheduler asks `Placement` which loaded executor replica executes a call.
+//! The scheduler asks `Dispatch` which loaded executor replica executes a call.
 //! Candidates are the executors whose reported `supported_calls` and component
 //! bindings cover the call; once a request is placed on a replica for a
 //! component, its later calls for that component stay there. A request's
@@ -12,7 +12,7 @@ use super::*;
 use ipc::{ForwardMode, TransferMode};
 
 #[derive(Default)]
-pub(super) struct Placement {
+pub(super) struct Dispatch {
     /// Replica that holds each request's state for one bound component name.
     ///
     /// Admission records the prefill executor of a token request and every route
@@ -52,7 +52,7 @@ pub(super) enum Choice {
     Target(crate::ExecutorGroupId),
 }
 
-impl Placement {
+impl Dispatch {
     /// Enumerates loaded components that can execute the requested call.
     ///
     /// Which component serves a media call is the model's state, not the
@@ -281,7 +281,7 @@ impl Placement {
         let mut targets = batch
             .requests
             .iter()
-            .map(|(_, placement)| placement.worker.clone())
+            .map(|(_, dispatch)| dispatch.worker.clone())
             .collect::<HashSet<_>>();
         for command in &batch.commands {
             targets.extend(

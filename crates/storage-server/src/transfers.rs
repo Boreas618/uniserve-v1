@@ -54,7 +54,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use ::storage::protocol::{
     Access, Allocation, ContextBytes, ErrorKind, Event, FabricExport, FabricHandle, Link,
-    LinkBandwidth, LinkEnd, ListedTask, ListedTransfer, Move, Placement, Priority, Region,
+    LinkBandwidth, LinkEnd, ListedTask, ListedTransfer, Location, Move, Priority, Region,
     Registered, Reply, Role, Span, Throttle, TransferEnd, TransferTotal,
 };
 
@@ -857,9 +857,9 @@ impl Server {
                     .storages
                     .get(&tensor.storage)
                     .ok_or_else(|| invalid(&format!("{} has no storage", tensor.name)))?;
-                let end = match storage.record.placement {
-                    Placement::Device { gpu } => LinkEnd::Device { gpu },
-                    Placement::Host { .. } => LinkEnd::Host,
+                let end = match storage.record.location {
+                    Location::Device { gpu } => LinkEnd::Device { gpu },
+                    Location::Host { .. } => LinkEnd::Host,
                 };
                 Ok(Resolved {
                     allocation: Allocation::Storage {

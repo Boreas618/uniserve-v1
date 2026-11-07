@@ -353,7 +353,7 @@ impl PolicyInstance {
         })
     }
 
-    /// `experts`: the placement of experts on ranks.
+    /// `experts`: the layout of experts on ranks.
     pub fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
         self.run(Call::Experts, |policy| {
             let message = encode(Call::Experts, load)?;

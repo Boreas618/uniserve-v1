@@ -18,7 +18,7 @@
 //! | `route` | the recorded cache rank, else the live rank with the fewest requests in flight, from a rotating cursor |
 //! | `place` | the replica that already holds the request; else the one with the fewest resident requests among those with capacity; a decode-stage call never lands on a prefill-only replica |
 //! | `warm` | the resumed requests' pages in the order the requests were claimed, each request's pages in prefix order, within `Room::prefill_tokens` |
-//! | `experts` | the placement unchanged |
+//! | `experts` | the layout unchanged |
 //!
 //! # The one judgement the interface cannot state
 //!
@@ -723,11 +723,11 @@ impl<K: Order> Policy for Arrival<K> {
     }
 
     fn experts(&mut self, load: &ExpertLoad) -> ExpertOrder {
-        // `fcfs` does not change the expert placement: the identity placement
+        // `fcfs` does not change the expert layout: the identity layout
         // it was launched with, expert `e` on rank `e % ranks`.
         let ranks = load.ranks.max(1);
         ExpertOrder {
-            placement: (0..load.experts).map(|expert| expert % ranks).collect(),
+            layout: (0..load.experts).map(|expert| expert % ranks).collect(),
         }
     }
 
@@ -1234,14 +1234,14 @@ mod tests {
     }
 
     #[test]
-    fn the_expert_placement_is_unchanged() {
+    fn the_expert_layout_is_unchanged() {
         let mut fcfs = policy();
         let order = fcfs.experts(&ExpertLoad {
             ranks: 2,
             experts: 5,
             tokens: vec![0; 5],
         });
-        assert_eq!(order.placement, vec![0, 1, 0, 1, 0]);
+        assert_eq!(order.layout, vec![0, 1, 0, 1, 0]);
     }
 
     #[test]

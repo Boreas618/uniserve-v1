@@ -32,10 +32,10 @@ fn video_output(name: &'static str) -> crate::encoder_outputs::OutputId {
 /// pools the call places tasks on.
 pub(in crate::scheduler) struct Demand {
     /// The executor and component whose capacity the call occupies, taken
-    /// from the request's placement (`Placement::affinity`). Admission places
+    /// from the request's dispatch (`Dispatch::affinity`). Admission places
     /// a media request on an executor for every media component, so a request's
     /// first call is checked against its component too. `None` when no
-    /// component serves the call or the request holds no placement for it.
+    /// component serves the call or the request holds no dispatch for it.
     component: Option<(crate::ExecutorGroupId, String)>,
     units: u32,
     /// Host task pools this call occupies, each named by its executor and rank
@@ -373,7 +373,7 @@ impl Scheduler {
                 .media_components
                 .get(&media_call)
                 .and_then(|component| {
-                    self.placement
+                    self.dispatch
                         .affinity
                         .get(&(request_key, component.clone()))
                 })
@@ -427,7 +427,7 @@ impl Scheduler {
     }
 
     /// Returns the executor serving `component` for one request, with the
-    /// component's placement there.
+    /// component's dispatch there.
     ///
     /// The executor is the request's owner of `component` when it has one,
     /// otherwise the first candidate that can execute `work`. Returns `None`
@@ -439,12 +439,9 @@ impl Scheduler {
         work: CallKind,
         component: &'a str,
     ) -> Option<(&'a crate::ExecutorGroupId, &'a crate::ComponentConfig)> {
-        let owner = self
-            .placement
-            .affinity
-            .get(&(request, component.to_owned()));
+        let owner = self.dispatch.affinity.get(&(request, component.to_owned()));
         let (worker, bound, _) = self
-            .placement
+            .dispatch
             .component_candidates(&self.executor, work, component)
             .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))?;
         let config = self.executor.info().component_config(worker, bound)?;
@@ -457,7 +454,7 @@ impl Scheduler {
     /// each of its ranks per round; any other component counts one unit per
     /// rank, on the executor `placed_component` names.
     ///
-    /// Returns `None` when the component has no placement or the width does
+    /// Returns `None` when the component has no dispatch or the width does
     /// not fit in `u32`.
     fn component_width(&self, request: RequestKey, work: CallKind, component: &str) -> Option<u32> {
         let (_, config) = self.placed_component(request, work, component)?;
@@ -527,7 +524,7 @@ impl Scheduler {
             .flatten()
         {
             let name = &pending.call.component;
-            if self.placement.affinity.get(&(request, name.clone())) != Some(worker) {
+            if self.dispatch.affinity.get(&(request, name.clone())) != Some(worker) {
                 continue;
             }
             match &pending.input {
@@ -596,7 +593,7 @@ impl Scheduler {
     ) -> Demand {
         let component = self.media_component(media_call);
         let placed_component = component.as_ref().and_then(|component| {
-            self.placement
+            self.dispatch
                 .affinity
                 .get(&(request, component.clone()))
                 .map(|worker| (worker.clone(), component.clone()))
@@ -648,10 +645,7 @@ impl Scheduler {
         let Some(component) = component else {
             return Vec::new();
         };
-        let owner = self
-            .placement
-            .affinity
-            .get(&(request, component.to_owned()));
+        let owner = self.dispatch.affinity.get(&(request, component.to_owned()));
         let executor = self.executor.info();
         let Some((worker, config)) = executor.workers.iter().find_map(|(id, _)| {
             if owner.is_some_and(|owner| id != owner) {
@@ -702,7 +696,7 @@ impl Scheduler {
     /// normalization) as one host task on each rank of the component that
     /// encodes it, and the call holds those tasks until its result returns.
     /// The component is the one the executor routes `media_call` to, or the
-    /// default component, as `Placement::worker_target` resolves it.
+    /// default component, as `Dispatch::worker_target` resolves it.
     pub(in crate::scheduler) fn image_demand(
         &self,
         request: RequestKey,
@@ -752,7 +746,7 @@ impl Scheduler {
     /// Returns whether the rank group that owns one call can accept a batch.
     ///
     /// Returns `false` when no component serves `media_call` or
-    /// `Placement::component_target` selects no executor. Residency narrows
+    /// `Dispatch::component_target` selects no executor. Residency narrows
     /// that choice: a request already placed on the component is checked only
     /// against its owning executor's queue, and one resident on a candidate
     /// executor for another component only against that executor's queue.
@@ -765,13 +759,13 @@ impl Scheduler {
             .media_components
             .get(&media_call)
             .is_some_and(|component| {
-                self.placement
+                self.dispatch
                     .component_target(
                         &self.executor,
                         request,
                         CallKind::Media(media_call),
                         component,
-                        &placement::Choice::Existing,
+                        &dispatch::Choice::Existing,
                     )
                     .is_some()
             })
@@ -794,7 +788,7 @@ impl Scheduler {
                 .as_deref()
                 .and_then(|name| {
                     let worker = self
-                        .placement
+                        .dispatch
                         .affinity
                         .get(&(state.admission.request_key, name.to_owned()))?;
                     self.component_units(worker, name)
@@ -841,7 +835,7 @@ impl Scheduler {
         media_call: MediaCall,
         call_id: CallId,
         admissions: &mut Vec<NewRequest>,
-    ) -> Result<(Call, RequestPlacement), &'static str> {
+    ) -> Result<(Call, RequestDispatch), &'static str> {
         let work = CallKind::Media(media_call);
         let component = self.info.media_components[&media_call].clone();
         let state = self.media_state(id).ok_or("a media candidate is running")?;
@@ -1225,12 +1219,12 @@ impl Scheduler {
         // executor, then bind each distinct input and output buffer to its
         // reserved span in the buffer pool of each rank that backs it.
         let (worker, selected_component) = self
-            .placement
+            .dispatch
             .select_worker(
                 &self.executor,
                 &self.info,
                 &call,
-                &placement::Choice::Existing,
+                &dispatch::Choice::Existing,
             )
             .ok_or("a planned call retains an executable component")?;
         call.component = selected_component;
@@ -1264,14 +1258,14 @@ impl Scheduler {
             .filter_map(|consumer| {
                 let component = self.info.media_components.get(consumer)?;
                 let routed = self
-                    .placement
+                    .dispatch
                     .affinity
                     .get(&(request_key, component.clone()))?;
                 Some((component.clone(), routed.clone()))
             })
             .collect();
 
-        let placement = RequestPlacement {
+        let dispatch = RequestDispatch {
             worker,
             request_pool_idx: Some(request_pool_idx),
             block_tables: Vec::new(),
@@ -1286,10 +1280,10 @@ impl Scheduler {
         self.register_inflight(
             call.clone(),
             InflightInput::Media {
-                decode: placement.decode.clone(),
+                decode: dispatch.decode.clone(),
             },
             0,
         );
-        Ok((call, placement))
+        Ok((call, dispatch))
     }
 }

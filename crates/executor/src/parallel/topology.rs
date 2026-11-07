@@ -203,7 +203,7 @@ pub(crate) struct PlanInputs<'a> {
     pub physical: &'a [usize],
     /// Synchronize group creation locally (expert union present).
     pub local_sync: bool,
-    pub placements: &'a BTreeMap<String, ComponentConfig>,
+    pub layouts: &'a BTreeMap<String, ComponentConfig>,
     /// Axis selections each component's calls communicate over, from the
     /// model description; `None` selects every single axis.
     pub selections: Option<&'a BTreeMap<String, BTreeSet<Vec<String>>>>,
@@ -221,18 +221,18 @@ impl GroupPlan {
             components: Vec::new(),
         };
         let owns = inputs
-            .placements
+            .layouts
             .values()
-            .any(|placement| placement.ranks.contains(&inputs.rank));
+            .any(|layout| layout.ranks.contains(&inputs.rank));
 
-        for (name, placement) in inputs.placements {
-            let member = placement.ranks.contains(&inputs.rank);
-            let temporal = placement.distribution.is_some();
+        for (name, layout) in inputs.layouts {
+            let member = layout.ranks.contains(&inputs.rank);
+            let temporal = layout.distribution.is_some();
             let mut units = None;
             if temporal && !is_host_component(name) {
                 // Every process creates the overlap ring, including
                 // non-members; members then use a rank-local numerical mesh.
-                let ring = Mesh::new(placement.ranks.clone(), &[("units", placement.ranks.len())])?;
+                let ring = Mesh::new(layout.ranks.clone(), &[("units", layout.ranks.len())])?;
                 let selections = BTreeSet::from([vec!["units".to_owned()]]);
                 let binding = plan.bind(inputs, ring, &selections)?;
                 if member {
@@ -245,9 +245,9 @@ impl GroupPlan {
                 let ranks = if temporal {
                     vec![inputs.rank]
                 } else {
-                    placement.ranks.clone()
+                    layout.ranks.clone()
                 };
-                let dimensions = placement.parallel_config.dimensions();
+                let dimensions = layout.parallel_config.dimensions();
                 let topology = Mesh::new(ranks, &dimensions)?;
                 let selections = match inputs.selections {
                     None => dimensions
@@ -287,13 +287,13 @@ impl GroupPlan {
     ) -> Result<(Vec<GroupEntry>, Vec<StreamEntry>)> {
         let mut entries = Vec::new();
         let mut streams = Vec::new();
-        for (name, placement) in inputs.placements {
+        for (name, layout) in inputs.layouts {
             let copies = copies.get(name).copied().unwrap_or(0);
-            if copies == 0 || placement.distribution.is_some() || is_host_component(name) {
+            if copies == 0 || layout.distribution.is_some() || is_host_component(name) {
                 continue;
             }
-            let dimensions = placement.parallel_config.dimensions();
-            let mesh = Mesh::new(placement.ranks.clone(), &dimensions)?;
+            let dimensions = layout.parallel_config.dimensions();
+            let mesh = Mesh::new(layout.ranks.clone(), &dimensions)?;
             if mesh.ranks.iter().any(|&rank| rank >= inputs.physical.len()) {
                 return Err(Error::Invalid(
                     "mesh ranks disagree with the process world".into(),
@@ -469,7 +469,7 @@ mod tests {
                 ..ParallelConfig::default()
             },
         );
-        let placements = BTreeMap::from([
+        let layouts = BTreeMap::from([
             ("text".to_owned(), tensor),
             ("decoder".to_owned(), decoder),
             ("denoiser".to_owned(), sequence),
@@ -489,7 +489,7 @@ mod tests {
                     rank,
                     physical: &physical,
                     local_sync: false,
-                    placements: &placements,
+                    layouts: &layouts,
                     selections: Some(&selections),
                 })
                 .unwrap()
@@ -550,8 +550,7 @@ mod tests {
             units_per_rank: 1,
             weights: Default::default(),
         };
-        let placements =
-            BTreeMap::from([("text".to_owned(), text), ("decoder".to_owned(), decoder)]);
+        let layouts = BTreeMap::from([("text".to_owned(), text), ("decoder".to_owned(), decoder)]);
         // The text component communicates over tp and over pp with tp; two
         // stream copies (expert microbatches) run it, and the decoder has
         // none.
@@ -567,7 +566,7 @@ mod tests {
                         rank,
                         physical: &[0, 1, 2, 3],
                         local_sync: false,
-                        placements: &placements,
+                        layouts: &layouts,
                         selections: Some(&selections),
                     },
                     &copies,
@@ -611,7 +610,7 @@ mod tests {
 
     #[test]
     fn an_unplaced_rank_still_plans_every_group() {
-        let placements = BTreeMap::from([(
+        let layouts = BTreeMap::from([(
             "text".to_owned(),
             ComponentConfig::parallel(
                 vec![0, 1],
@@ -625,7 +624,7 @@ mod tests {
             rank: 2,
             physical: &[0, 1, 2],
             local_sync: true,
-            placements: &placements,
+            layouts: &layouts,
             selections: None,
         })
         .unwrap();

@@ -301,8 +301,8 @@ impl Scheduler {
         loop {
             let before = (requests.len(), buffers.len());
             for batch in &self.inflight.pending_submissions {
-                for (call, placement) in &batch.requests {
-                    if (!loss.endpoints.is_empty() && placement.worker == loss.worker_id)
+                for (call, dispatch) in &batch.requests {
+                    if (!loss.endpoints.is_empty() && dispatch.worker == loss.worker_id)
                         || call.input_buffers().any(|buffer| buffers.contains(&buffer))
                     {
                         requests.insert(call.request_key);

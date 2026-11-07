@@ -26,11 +26,11 @@ use std::thread::JoinHandle;
 use crate::executor::Executor;
 use crate::executor::ExecutorGroupId;
 use crate::handle::{CommandSender, EventRx, SubmitError};
+use crate::scheduler::guidance_prefix_rows;
 #[cfg(feature = "testing")]
 use crate::scheduler::{
     DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS,
 };
-use crate::scheduler::guidance_prefix_rows;
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats};
 use crate::{CommandWaker, GenerationLimits, Request};
@@ -180,7 +180,7 @@ impl ExecutorGroupConfig {
         Ok(())
     }
 
-    /// Validates unique group identities and every local placement.
+    /// Validates unique group identities and every local rank layout.
     ///
     /// Component names may repeat across groups. Repeated names are
     /// replicas of the same numerical component; the scheduler binds each
@@ -193,7 +193,10 @@ impl ExecutorGroupConfig {
         let mut ids = BTreeSet::new();
         for worker in workers {
             worker.validate()?;
-            anyhow::ensure!(ids.insert(&worker.id), "executor group identity is repeated");
+            anyhow::ensure!(
+                ids.insert(&worker.id),
+                "executor group identity is repeated"
+            );
         }
         // A request prefilled on a prefill group decodes on a decode group,
         // which holds the same text model and nothing else.
@@ -219,7 +222,7 @@ impl ExecutorGroupConfig {
 
     /// One component tensor-parallel over every rank.
     ///
-    /// The `uniserve` CLI uses this placement when no `--executor-groups` configuration
+    /// The `uniserve` CLI uses this rank layout when no `--executor-groups` configuration
     /// is given, and the default engine settings and the simulation use it. A
     /// deployment with several components, or with other partitions, writes
     /// its own configuration.
@@ -240,7 +243,7 @@ impl ExecutorGroupConfig {
     /// across the named hosts, carrying the given components.
     ///
     /// Ranks are assigned in blocks, so the lowest ranks stay on the first
-    /// host, and each host numbers its devices from zero. A placement on one
+    /// host, and each host numbers its devices from zero. A rank layout on one
     /// host is the same arithmetic with one block. A `device` of `cuda` or
     /// `gpu` becomes `cuda:<local index>`; any other string is used verbatim
     /// for every rank.
@@ -262,11 +265,11 @@ impl ExecutorGroupConfig {
         let host_count = hosts.len().max(1);
         let share = rank_count / host_count;
         let remainder = rank_count % host_count;
-        let mut placement = Vec::with_capacity(rank_count);
+        let mut rank_layout = Vec::with_capacity(rank_count);
         for (index, host) in hosts.iter().enumerate() {
             let count = share + usize::from(index < remainder);
             for local in 0..count {
-                placement.push(ExecutorRank {
+                rank_layout.push(ExecutorRank {
                     host: host.clone(),
                     device: if matches!(device, "cuda" | "gpu") {
                         format!("cuda:{local}")
@@ -279,7 +282,7 @@ impl ExecutorGroupConfig {
         Self {
             id: ExecutorGroupId("model".into()),
             role: ExecutorGroupRole::Model,
-            ranks: placement,
+            ranks: rank_layout,
             components,
             queue_depth,
             mem_fraction_static: None,
@@ -440,15 +443,15 @@ pub struct RankFacts {
     pub dtype: Option<crate::ModelDtype>,
     /// The world the ranks execute (*launch*: `world`).
     pub world: Option<u64>,
-    /// The executor group's identity (*launch*: `placement_config`).
+    /// The executor group's identity (*launch*: `device_config`).
     pub group: Option<String>,
-    /// This process's rank within the group (*launch*: `placement_config`).
+    /// This process's rank within the group (*launch*: `device_config`).
     pub rank: Option<usize>,
-    /// The group's rank count (*launch*: `placement_config`).
+    /// The group's rank count (*launch*: `device_config`).
     pub world_size: Option<usize>,
-    /// The group's devices, in rank order (*launch*: `placement_config`).
+    /// The group's devices, in rank order (*launch*: `device_config`).
     pub devices: Option<Vec<String>>,
-    /// The group's hosts, in rank order (*launch*: `placement_config`).
+    /// The group's hosts, in rank order (*launch*: `device_config`).
     pub hosts: Option<Vec<String>>,
     /// Resident request slots per scheduler (*launch*:
     /// `scheduling.max_running_requests`).
@@ -811,10 +814,7 @@ impl SchedulerHandle {
             );
             // `from_inventory` states every pool's rank count; an executor
             // that reports none places the pool on one rank.
-            let served = info
-                .placements
-                .get(&group.id)
-                .map_or(1, |placement| placement.ranks);
+            let served = info.layouts.get(&group.id).map_or(1, |layout| layout.ranks);
             anyhow::ensure!(
                 served as usize == group.ranks.len(),
                 "the config places {} ranks of pool {}, but the executor serves {served}",
@@ -1588,9 +1588,9 @@ mod tests {
         assert!(refused.contains("launch file"), "{refused}");
     }
 
-    /// The placement must name one device and one host per rank.
+    /// The rank layout must name one device and one host per rank.
     #[test]
-    fn a_placement_that_does_not_cover_every_rank_is_refused() {
+    fn a_rank_layout_that_does_not_cover_every_rank_is_refused() {
         let mut facts = rank_facts();
         facts.world_size = Some(2);
         let refused = EngineConfig::of(&facts).expect_err("two ranks need two devices");
@@ -1601,19 +1601,14 @@ mod tests {
     /// A host takes a contiguous block of the ranks, the first hosts take the
     /// remainder, and a rank's device is its local index on its own host.
     #[test]
-    fn a_placement_shares_ranks_across_the_named_hosts() {
+    fn a_rank_layout_shares_ranks_across_the_named_hosts() {
         let components = ExecutorGroupConfig::single_component("model", 1);
 
-        let one = ExecutorGroupConfig::placed(
-            &["compute-0".to_owned()],
-            "cpu",
-            2,
-            1,
-            components.clone(),
-        );
+        let one =
+            ExecutorGroupConfig::placed(&["compute-0".to_owned()], "cpu", 2, 1, components.clone());
         assert!(
             one.ranks.iter().all(|rank| rank.host == "compute-0"),
-            "a rank was placed on a host the placement does not name: {:?}",
+            "a rank was placed on a host the rank layout does not name: {:?}",
             one.ranks
         );
 
@@ -1634,7 +1629,7 @@ mod tests {
         assert_eq!(devices, ["cuda:0", "cuda:1", "cuda:0"]);
     }
 
-    /// Entries covering the shapes a placement must validate: one component
+    /// Entries covering the shapes a rank layout must validate: one component
     /// parallel over every rank, one dividing its output into units, and one
     /// placed alone.
     fn mixed_components(rank_count: usize) -> BTreeMap<String, ComponentConfig> {
@@ -1689,13 +1684,13 @@ mod tests {
         let hosts = ["rank-0".to_owned(), "rank-1".to_owned()];
         let worker = ExecutorGroupConfig::placed(&hosts, "cuda", 8, 2, mixed_components(8));
 
-        let placement: Vec<_> = worker
+        let rank_layout: Vec<_> = worker
             .ranks
             .iter()
             .map(|rank| (rank.host.as_str(), rank.device.as_str()))
             .collect();
         assert_eq!(
-            placement,
+            rank_layout,
             vec![
                 ("rank-0", "cuda:0"),
                 ("rank-0", "cuda:1"),
@@ -1737,7 +1732,7 @@ mod tests {
             ExecutorGroupConfig::single_component("model", 2),
         );
 
-        let placement: Vec<_> = groups
+        let rank_layout: Vec<_> = groups
             .iter()
             .map(|worker| {
                 (
@@ -1751,7 +1746,7 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            placement,
+            rank_layout,
             vec![
                 (
                     "model-0".into(),
@@ -1804,12 +1799,17 @@ mod tests {
         assert_eq!(worker.ranks.len(), 8);
     }
 
-    /// Reordering a component's ranks is a valid placement; repeating a rank
+    /// Reordering a component's ranks is a valid rank layout; repeating a rank
     /// is not.
     #[test]
     fn entry_geometry_uses_unique_ordered_rank_members() {
-        let mut worker =
-            ExecutorGroupConfig::placed(&["localhost".to_owned()], "cuda", 4, 2, mixed_components(4));
+        let mut worker = ExecutorGroupConfig::placed(
+            &["localhost".to_owned()],
+            "cuda",
+            4,
+            2,
+            mixed_components(4),
+        );
         assert!(worker.validate().is_ok());
 
         worker

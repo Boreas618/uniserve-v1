@@ -37,22 +37,22 @@ mod trajectories;
 mod warmup;
 
 pub use crate::core::{
-    EngineConfig, RankFacts, SchedulerHandle, ExecutorGroupConfig, ExecutorGroupRole, ExecutorRank,
+    EngineConfig, ExecutorGroupConfig, ExecutorGroupRole, ExecutorRank, RankFacts, SchedulerHandle,
 };
 pub use crate::deployment::Deployment;
 #[cfg(feature = "testing")]
 pub use crate::executor::{BatchResult, CallResult, Executor};
 pub use crate::executor::{
-    CommandOutcome, CommandResult, ComponentConfig, ComponentDistribution, ExecutionBatch,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, PageOffloads,
-    ParallelConfig, PoolPlacement, RankBuffer, RankEncoderPools, RequestPlacement,
-    SequenceParallel, TransferBackend, TransferConfig, TransferConfigError, TransferEdge,
-    ExecuteError, ExecutorFailure, ExecutorGroupId,
+    CommandOutcome, CommandResult, ComponentConfig, ComponentDistribution, ExecuteError,
+    ExecutionBatch, ExecutorError, ExecutorFailure, ExecutorGroupId, ExecutorInfo,
+    ExecutorSubmitError, PageOffloads, ParallelConfig, PoolLayout, RankBuffer, RankEncoderPools,
+    RequestDispatch, SequenceParallel, TransferBackend, TransferConfig, TransferConfigError,
+    TransferEdge,
 };
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
-    EventSendError, EventTx, HookBarrier, PolicyPrograms, PolicySlotHandle,
-    StageApplied, StreamCancelCause, Submission, SubmitError, Wake, WeightsInFlight,
+    EventSendError, EventTx, HookBarrier, PolicyPrograms, PolicySlotHandle, StageApplied,
+    StreamCancelCause, Submission, SubmitError, Wake, WeightsInFlight,
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
@@ -66,11 +66,11 @@ pub use crate::scheduler::testing::packaged_policy;
 pub use crate::scheduler::{
     Arrival, BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats,
-    ExecutionDomainStats, GeneralStats, GroupCache, Limits, PREFETCH_FLOOR_TOKENS, Parameters,
-    ParkedCache, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage,
-    PrefixCacheUsage, PrefixStats, ProgramSource, Progress, RoutePolicy, RouteTrial, Scheduler,
-    SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats, TrialState,
-    PhaseKind, Validators, ExecutorStats, arrival_view, ceilings_of, phase_id,
+    ExecutionDomainStats, ExecutorStats, GeneralStats, GroupCache, Limits, PREFETCH_FLOOR_TOKENS,
+    Parameters, ParkedCache, PhaseKind, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot,
+    PolicySource, PolicyUsage, PrefixCacheUsage, PrefixStats, ProgramSource, Progress, RoutePolicy,
+    RouteTrial, Scheduler, SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage,
+    TimingStats, TrialState, Validators, arrival_view, ceilings_of, phase_id,
 };
 #[cfg(feature = "testing")]
 pub use crate::service::{EpochPolicy, serve_requests};

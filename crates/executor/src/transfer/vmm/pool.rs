@@ -59,7 +59,7 @@ impl Drop for Allocation {
     }
 }
 
-/// Own chunk placement and retirement within one device's exported mapping.
+/// Own chunk positions and retirement within one device's exported mapping.
 ///
 /// `backing` retains the exportable allocation the pool places chunks in.
 /// Reader words are copied on a private stream. Polling observes a completed

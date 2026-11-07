@@ -2,13 +2,13 @@
 //!
 //! The leader daemon resolves the serving options and the model's facts into
 //! the spec it hands a main process; this module places the deployment's
-//! ranks (from its deployment file or the placement shorthand), and reads the
+//! ranks (from its deployment file or the rank layout shorthand), and reads the
 //! words the options name values by (element types, the expert exchange) into
 //! the engine's own values.
 
 use anyhow::Context as _;
 use proto::request::GenerationLimits;
-use proto::request::wire::{EngineSpec, Placement, Sizes};
+use proto::request::wire::{EngineSpec, RankLayout, Sizes};
 use serde::de::DeserializeOwned;
 
 use crate::DEFAULT_COMPONENT;
@@ -71,7 +71,7 @@ impl EngineConfig {
                 }
                 let mut replica = spec.clone();
                 let ranks = replica
-                    .placement
+                    .rank_layout
                     .as_mut()
                     .context("the engine spec states no ranks")?;
                 ranks.data_parallel_size = 1;
@@ -92,7 +92,7 @@ impl EngineConfig {
     /// the transfer edges do not resolve, or the precision policy is not a
     /// JSON object.
     pub fn from_spec(spec: &EngineSpec) -> anyhow::Result<Self> {
-        let placement = required(&spec.placement, "placement")?;
+        let rank_layout = required(&spec.rank_layout, "rank layout")?;
         let scheduling = required(&spec.scheduling, "scheduling")?;
         let kv_cache = required(&spec.kv_cache, "kv_cache")?;
         let workers = required(&spec.workers, "executors")?;
@@ -100,10 +100,10 @@ impl EngineConfig {
         let experts = required(&spec.experts, "experts")?;
         let facts = required(&spec.model_facts, "model_facts")?;
 
-        let worker_groups = place(placement, &spec.host)?;
+        let worker_groups = place(rank_layout, &spec.host)?;
         spec.transfer
             .parse::<TransferConfig>()
-            .context("invalid `placement_config.transfer`")?;
+            .context("invalid `device_config.transfer`")?;
         let max_num_batched_tokens = scheduling
             .max_num_batched_tokens
             .map_or(DEFAULT_MAX_NUM_BATCHED_TOKENS, |tokens| tokens as usize);
@@ -148,7 +148,7 @@ impl EngineConfig {
                 kv_cache.host_bytes,
             )?,
             worker_groups,
-            data_parallel_size: placement.data_parallel_size.max(1) as usize,
+            data_parallel_size: rank_layout.data_parallel_size.max(1) as usize,
             expert_parallel: experts
                 .expert_parallel
                 .then(|| named(&experts.exchange, "moe_config.exchange"))
@@ -195,9 +195,9 @@ fn required<'a, T>(table: &'a Option<T>, name: &str) -> anyhow::Result<&'a T> {
 /// The deployment's executor groups: its deployment file placed on `host`, or
 /// the shorthand's groups of one component, with the ranks spread in blocks
 /// over `host` and the hosts after it.
-fn place(placement: &Placement, host: &str) -> anyhow::Result<Vec<ExecutorGroupConfig>> {
-    if !placement.worker_groups_content.is_empty() {
-        return Deployment::parse(&placement.worker_groups_content)?
+fn place(rank_layout: &RankLayout, host: &str) -> anyhow::Result<Vec<ExecutorGroupConfig>> {
+    if !rank_layout.worker_groups_content.is_empty() {
+        return Deployment::parse(&rank_layout.worker_groups_content)?
             .worker_groups(host)
             .context("invalid `worker_groups` deployment");
     }
@@ -205,30 +205,30 @@ fn place(placement: &Placement, host: &str) -> anyhow::Result<Vec<ExecutorGroupC
     // lowest ranks there; a repeat of it, or an empty name, places nothing.
     let mut hosts = vec![host.to_owned()];
     hosts.extend(
-        placement
+        rank_layout
             .worker_hosts
             .iter()
             .filter(|worker_host| !worker_host.is_empty() && *worker_host != host)
             .cloned(),
     );
-    let tensor_parallel_size = placement.tensor_parallel_size.max(1) as usize;
+    let tensor_parallel_size = rank_layout.tensor_parallel_size.max(1) as usize;
     let mut groups = ExecutorGroupConfig::data_parallel(
         &hosts,
-        &placement.device,
-        placement.data_parallel_size.max(1) as usize,
+        &rank_layout.device,
+        rank_layout.data_parallel_size.max(1) as usize,
         tensor_parallel_size,
-        placement.queue_depth.max(1) as usize,
+        rank_layout.queue_depth.max(1) as usize,
         ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, tensor_parallel_size),
     );
-    if !placement.devices.is_empty() {
-        order_devices(&mut groups, &placement.device, &placement.devices)?;
+    if !rank_layout.devices.is_empty() {
+        order_devices(&mut groups, &rank_layout.device, &rank_layout.devices)?;
     }
     Ok(groups)
 }
 
 /// Puts the shorthand's ranks, in rank order across `groups`, on the CUDA
 /// devices `devices` names by their index on each rank's host
-/// (`placement_config.devices`): a world whose ranks a daemon assigned to
+/// (`device_config.devices`): a world whose ranks a daemon assigned to
 /// the GPUs that already hold most of their weights, or an operator's
 /// order.
 ///
@@ -243,12 +243,12 @@ fn order_devices(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(
         matches!(device, "cuda" | "gpu"),
-        "`placement_config.devices` orders CUDA devices; `placement_config.device` is {device:?}"
+        "`device_config.devices` orders CUDA devices; `device_config.device` is {device:?}"
     );
     let ranks: usize = groups.iter().map(|group| group.ranks.len()).sum();
     anyhow::ensure!(
         devices.len() == ranks,
-        "`placement_config.devices` names {} devices for {ranks} ranks",
+        "`device_config.devices` names {} devices for {ranks} ranks",
         devices.len()
     );
     let mut taken = std::collections::BTreeSet::new();
@@ -256,7 +256,7 @@ fn order_devices(
     for (rank, index) in ranks.zip(devices) {
         anyhow::ensure!(
             taken.insert((rank.host.clone(), *index)),
-            "`placement_config.devices` puts two ranks of host {} on device {index}",
+            "`device_config.devices` puts two ranks of host {} on device {index}",
             rank.host
         );
         rank.device = format!("cuda:{index}");
@@ -276,13 +276,13 @@ mod tests {
             deployment: "model".into(),
             model: "/models/model".into(),
             host: "localhost".into(),
-            placement: Some(Placement {
+            rank_layout: Some(RankLayout {
                 tensor_parallel_size: 1,
                 data_parallel_size: 1,
                 device: "cuda".into(),
                 queue_depth: 2,
                 mem_fraction_static: 0.7,
-                ..Placement::default()
+                ..RankLayout::default()
             }),
             transfer: String::new(),
             scheduling: Some(wire::Scheduling {
@@ -340,7 +340,7 @@ mod tests {
     /// the devices `devices` orders.
     fn tensor_experts(ranks: u32, devices: &[u32]) -> EngineSpec {
         let mut spec = spec();
-        let shorthand = spec.placement.as_mut().unwrap();
+        let shorthand = spec.rank_layout.as_mut().unwrap();
         shorthand.tensor_parallel_size = ranks;
         shorthand.devices = devices.to_vec();
         spec.experts.as_mut().unwrap().expert_parallel = true;
@@ -362,7 +362,7 @@ mod tests {
     }
 
     /// The shorthand puts its ranks, in rank order, on the devices
-    /// `placement_config.devices` names.
+    /// `device_config.devices` names.
     #[test]
     fn the_shorthand_puts_ranks_on_the_devices_their_order_names() {
         let config = EngineConfig::from_spec(&tensor_experts(4, &[0, 2, 1, 3])).unwrap();
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn a_device_order_runs_across_the_schedulers_groups() {
         let mut spec = spec();
-        let shorthand = spec.placement.as_mut().unwrap();
+        let shorthand = spec.rank_layout.as_mut().unwrap();
         shorthand.data_parallel_size = 2;
         shorthand.devices = vec![1, 0];
         spec.experts.as_mut().unwrap().expert_parallel = true;
@@ -422,19 +422,19 @@ mod tests {
             let error = EngineConfig::from_spec(&tensor_experts(4, devices))
                 .expect_err("the order must be refused");
             assert!(
-                format!("{error:#}").contains("placement_config.devices"),
+                format!("{error:#}").contains("device_config.devices"),
                 "{error:#}"
             );
         }
         let mut cpu = tensor_experts(2, &[0, 1]);
-        cpu.placement.as_mut().unwrap().device = "cpu".into();
+        cpu.rank_layout.as_mut().unwrap().device = "cpu".into();
         assert!(EngineConfig::from_spec(&cpu).is_err());
     }
 
     #[test]
     fn independent_replicas_preserve_their_assigned_tensor_parallel_ranks() {
         let mut deployment = spec();
-        let ranks = deployment.placement.as_mut().unwrap();
+        let ranks = deployment.rank_layout.as_mut().unwrap();
         ranks.tensor_parallel_size = 2;
         ranks.data_parallel_size = 2;
         let replicas = EngineConfig::replica_specs(&deployment).unwrap();
@@ -463,7 +463,7 @@ mod tests {
     #[test]
     fn communicating_expert_ranks_stay_in_one_replica() {
         let mut deployment = spec();
-        deployment.placement.as_mut().unwrap().data_parallel_size = 4;
+        deployment.rank_layout.as_mut().unwrap().data_parallel_size = 4;
         deployment.experts.as_mut().unwrap().expert_parallel = true;
         let replicas = EngineConfig::replica_specs(&deployment).unwrap();
         assert_eq!(replicas.len(), 1);

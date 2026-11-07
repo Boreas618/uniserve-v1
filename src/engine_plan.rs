@@ -83,7 +83,8 @@ fn expert_classes(buckets: &Buckets, capacity: u64) -> Buckets {
                 // rows, which a graph of the whole capacity would shape every expert layer for.
                 let beside = bucket.variant.is_decode()
                     || bucket.variant == executor::plan::Variant::ExpertJoin;
-                if beside && small < PREFILL_BESIDE && PREFILL_BESIDE.saturating_mul(4) <= capacity {
+                if beside && small < PREFILL_BESIDE && PREFILL_BESIDE.saturating_mul(4) <= capacity
+                {
                     classes.push(bucket.at_capacity(PREFILL_BESIDE));
                 }
                 classes.into_iter()
@@ -240,7 +241,7 @@ pub(crate) struct EpochPlan {
     /// The watchdog the launch file states apart from the build config (§2.4), when it states one.
     watchdog_override: Option<Duration>,
     /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the plan.
-    placement: Placement,
+    mapping: Mapping,
     /// The expert union of this node's ranks, on a deployment whose experts are split.
     union: Option<Arc<executor::runners::experts::Union>>,
 }
@@ -325,7 +326,7 @@ impl EpochPlan {
     /// guessed its devices from the epoch's parallelism would capture graphs on another rank's
     /// device.
     pub(crate) fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
-        let placement = Placement::of(launch, build)?;
+        let mapping = Mapping::of(launch, build)?;
         if launch.devices.is_empty() {
             bail!(
                 "rank {} of group {} was started with no device to serve",
@@ -402,7 +403,7 @@ impl EpochPlan {
             group: launch.group.clone(),
             codec: Arc::default(),
             watchdog_override: launch.watchdog_timeout_s.map(Duration::from_secs),
-            placement,
+            mapping,
             union: None,
         })
     }
@@ -418,11 +419,11 @@ impl EpochPlan {
         let attention = self.attention_ranks()?;
         // Dedicated expert ranks hold the experts between them, whatever the schedulers number.
         let expert_ranks = match attention {
-            0 => self.placement.expert_parallel,
+            0 => self.mapping.expert_parallel,
             _ => self.devices.len() as u32 - attention,
         };
         let union_ranks = expert_ranks + attention;
-        let tensor = self.placement.tensor_parallel;
+        let tensor = self.mapping.tensor_parallel;
         if text && union_ranks == 1 && tensor == 1 {
             return Ok(vec![self.clone()]);
         }
@@ -454,7 +455,7 @@ impl EpochPlan {
                     plan.devices = vec![*device];
                     plan.rank = self.rank + index as u32;
                     plan.world_size = count;
-                    plan.placement.tensor_rank = index as u32;
+                    plan.mapping.tensor_rank = index as u32;
                     plan
                 })
                 .collect());
@@ -484,12 +485,12 @@ impl EpochPlan {
                 if text {
                     // An attention rank holds the first rank's window and computes nothing with
                     // it; `ExchangeViews::source_only` keeps it out of its forward.
-                    plan.placement.union_rank = index as u32;
-                    plan.placement.attention_ranks = attention;
-                    plan.placement.expert_parallel = expert_ranks;
-                    plan.placement.expert_rank = (index as u32).saturating_sub(attention);
-                    plan.placement.load_options.exchange_capacity = capacity;
-                    plan.placement.load_options.exchange_attention = attention;
+                    plan.mapping.union_rank = index as u32;
+                    plan.mapping.attention_ranks = attention;
+                    plan.mapping.expert_parallel = expert_ranks;
+                    plan.mapping.expert_rank = (index as u32).saturating_sub(attention);
+                    plan.mapping.load_options.exchange_capacity = capacity;
+                    plan.mapping.load_options.exchange_attention = attention;
                     plan.union.clone_from(&union);
                     plan.buckets = expert_classes(&plan.buckets, capacity);
                 }
@@ -513,9 +514,8 @@ impl EpochPlan {
         let Some(groups) = self.deployment_groups()? else {
             return Ok(0);
         };
-        let experts = |group: &&engine::ExecutorGroupConfig| {
-            group.role == engine::ExecutorGroupRole::Experts
-        };
+        let experts =
+            |group: &&engine::ExecutorGroupConfig| group.role == engine::ExecutorGroupRole::Experts;
         if !groups.iter().any(|group| experts(&group)) {
             return Ok(0);
         }
@@ -526,8 +526,7 @@ impl EpochPlan {
 
     /// Whether this rank holds a scheduler: every rank but a dedicated expert rank does.
     pub(crate) fn schedules(&self) -> bool {
-        self.placement.attention_ranks == 0
-            || self.placement.union_rank < self.placement.attention_ranks
+        self.mapping.attention_ranks == 0 || self.mapping.union_rank < self.mapping.attention_ranks
     }
 
     /// The expert union this rank is a member of, with its transport's shape.
@@ -559,8 +558,8 @@ impl EpochPlan {
     ) -> Result<ops::moe::exchange::TransportShape> {
         let config = model.config();
         Ok(ops::moe::exchange::TransportShape {
-            ranks: self.placement.expert_parallel + self.placement.attention_ranks,
-            rank: self.placement.union_rank,
+            ranks: self.mapping.expert_parallel + self.mapping.attention_ranks,
+            rank: self.mapping.union_rank,
             experts: narrow(config.num_experts, "num_experts")?,
             hidden: narrow(config.hidden_size, "hidden_size")?,
             intermediate: narrow(config.moe_intermediate_size, "moe_intermediate_size")?,
@@ -569,7 +568,7 @@ impl EpochPlan {
             top: narrow(config.num_experts_per_tok, "num_experts_per_tok")?,
             dtype: model.dtype(),
             device: device.0,
-            attention_ranks: self.placement.attention_ranks,
+            attention_ranks: self.mapping.attention_ranks,
         })
     }
 
@@ -587,7 +586,7 @@ impl EpochPlan {
     pub(crate) fn union(&self) -> Option<(&Arc<executor::runners::experts::Union>, usize)> {
         self.union
             .as_ref()
-            .map(|union| (union, self.placement.union_rank as usize))
+            .map(|union| (union, self.mapping.union_rank as usize))
     }
 
     /// This plan on the cache planes of `world`, when this rank stands by for that world's process.
@@ -622,8 +621,8 @@ impl EpochPlan {
             // The tensor group is the text model's only collective group: an expert union
             // exchanges over its own transport (`union_member`).
             return Ok(ParallelShape {
-                tensor: self.placement.tensor_parallel as usize,
-                tensor_rank: self.placement.tensor_rank as usize,
+                tensor: self.mapping.tensor_parallel as usize,
+                tensor_rank: self.mapping.tensor_rank as usize,
                 ..ParallelShape::default()
             });
         }
@@ -632,8 +631,8 @@ impl EpochPlan {
             groups.as_deref(),
             &self.group,
             self.rank,
-            self.placement.tensor_parallel,
-            self.placement.tensor_rank,
+            self.mapping.tensor_parallel,
+            self.mapping.tensor_rank,
             self.world_size,
         )?;
         Ok(ParallelShape {
@@ -921,7 +920,7 @@ impl EpochPlan {
             // name is the machine's own rather than an invented string, so a report, a log or a
             // transfer that names the host names the host.
             //
-            // A world of more ranks needs the real names for placement and for cross-host weight
+            // A world of more ranks needs the real names for rank layout and for cross-host weight
             // transfer, and a guess there would be worse than the refusal: the fact stays absent
             // and `EngineConfig::of` names what the launch file owes it.
             hosts: match self.world_size {
@@ -1043,8 +1042,7 @@ impl EpochPlan {
             * config.video_vae.temporal_compression();
         let mut decode_buckets: Vec<executor::plan::Bucket> = Vec::new();
         for candidate in &candidates {
-            let bucket =
-                executor::plan::Bucket::clip(window, candidate.height, candidate.width);
+            let bucket = executor::plan::Bucket::clip(window, candidate.height, candidate.width);
             if !decode_buckets.contains(&bucket) {
                 decode_buckets.push(bucket);
             }
@@ -1471,7 +1469,7 @@ impl EpochPlan {
         weights: &mut dyn nn::RetainedWeights,
         experts: &qwen3_moe::load::ExpertOrder,
     ) -> Result<Served> {
-        let placement = &self.placement;
+        let mapping = &self.mapping;
         match ModelClass::of(&self.checkpoint)? {
             ModelClass::CausalLm => {
                 // §8: the checkpoint's own representation stands unless the deployment fixed
@@ -1481,10 +1479,10 @@ impl EpochPlan {
                 let config = qwen3_moe::Config::read(&self.checkpoint)?;
                 let partition = qwen3_moe::Partition::new(
                     &config,
-                    placement.tensor_parallel as usize,
-                    placement.tensor_rank as usize,
-                    placement.expert_parallel as usize,
-                    placement.expert_rank as usize,
+                    mapping.tensor_parallel as usize,
+                    mapping.tensor_rank as usize,
+                    mapping.expert_parallel as usize,
+                    mapping.expert_rank as usize,
                 )?;
                 // The checkpoint states its own representation: a calibrated export is read packed,
                 // and a dense one dense. The layout is the one the serving programs are built for.
@@ -1492,7 +1490,7 @@ impl EpochPlan {
                     &self.checkpoint,
                     partition,
                     &mut loader,
-                    placement.load_options,
+                    mapping.load_options,
                     ops::fp4::ScaleLayout::Linear,
                     experts,
                 )?;
@@ -1520,8 +1518,8 @@ impl EpochPlan {
                     groups.as_deref(),
                     &self.group,
                     self.rank,
-                    placement.tensor_parallel,
-                    placement.tensor_rank,
+                    mapping.tensor_parallel,
+                    mapping.tensor_rank,
                     self.world_size,
                 )?;
                 // **The partition serves the task the checkpoint states, and a checkpoint that
@@ -1542,10 +1540,14 @@ impl EpochPlan {
                 // request's text rows are its prompt rounded up to the attention unit's tile, and
                 // the layout's capacity is what the deployment prepared (`packing.py:557`,
                 // `denoiser.py:411`).
-                let longest = self.build.max_model_len.map(|length| length.get()).context(
-                    "a deployment of the media class states no `max_model_len`, and its prompt \
+                let longest = self
+                    .build
+                    .max_model_len
+                    .map(|length| length.get())
+                    .context(
+                        "a deployment of the media class states no `max_model_len`, and its prompt \
                      capacities are checked against it",
-                )?;
+                    )?;
                 let capacities = prompt_capacities(&self.build.video, longest)?;
                 let text_capacity = *capacities.last().context(
                     "this deployment states no prompt capacity, so no layout could hold a prompt",
@@ -1868,7 +1870,7 @@ pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capa
             ipc::CallKind::Forward(ipc::ForwardMode::Decode),
         ],
         media_components: std::collections::BTreeMap::new(),
-        // The component this rank holds, named as the placement names it (`schedulers` places one
+        // The component this rank holds, named as the rank layout names it (`schedulers` places one
         // component over every rank). The scheduler routes a call by component name, so a rank that
         // advertised a name of its own would hold nothing any pool asks for.
         components: vec![ipc::ComponentInfo {
@@ -1926,9 +1928,11 @@ fn media_outputs(component: &str, bounds: &MediaBounds) -> Vec<ipc::OutputInfo> 
         name: name.to_owned(),
         dtype: ipc::DType::U8,
         shape_bound: ipc::ShapeBound {
-            dims: vec![extent.map_or(ipc::DimBound::Static(1), |max| ipc::DimBound::Device {
-                max,
-            })],
+            dims: vec![
+                extent.map_or(ipc::DimBound::Static(1), |max| ipc::DimBound::Device {
+                    max,
+                }),
+            ],
         },
         raster_axes: None,
     };
@@ -2247,9 +2251,9 @@ fn host_name() -> Result<String> {
 /// would read another request's tokens out of the cache - wrong tokens with no error - so this is a
 /// refusal at spawn, naming both figures, and the block table and the sampler read the same one.
 fn cache_page_size(memory: &Memory, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
-    let cache = memory.shared_cache().context(
-        "the model reads a paged cache and this rank opened none",
-    )?;
+    let cache = memory
+        .shared_cache()
+        .context("the model reads a paged cache and this rank opened none")?;
     let cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -2440,7 +2444,8 @@ fn media_candidates(
     let longest = snap_frames(frames as u32)?;
     // A layout's frames are the request's own, because the video's extent sets the sparse selection
     // budget and the audio timeline: every legal timeline a request may ask for is a bucket.
-    let shortest = snap_frames((models::video::plan::MIN_VIDEO_SECONDS * f64::from(FPS)).round() as u32)?;
+    let shortest =
+        snap_frames((models::video::plan::MIN_VIDEO_SECONDS * f64::from(FPS)).round() as u32)?;
     let clip_frames = frame_clips()?.clip_frames;
     let timelines: Vec<u32> = (shortest..=longest).step_by(clip_frames as usize).collect();
     for edge in &video.resolutions {
@@ -2565,7 +2570,10 @@ fn denoiser_report(
         };
         checkpoint_tasks.contains(&named)
     };
-    let tasks: Vec<VideoTask> = VideoTask::ALL.into_iter().filter(|task| served(*task)).collect();
+    let tasks: Vec<VideoTask> = VideoTask::ALL
+        .into_iter()
+        .filter(|task| served(*task))
+        .collect();
     let steps = first.schedule().num_steps()?;
     let shifts = &first.config().schedule.shifts;
     let report = DenoiserInfo {
@@ -2728,9 +2736,7 @@ fn architectural_class(checkpoint: &Path) -> Result<String> {
         let class = index
             .get("_class_name")
             .and_then(|class| class.as_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!("{} declares no `_class_name`", index_path.display())
-            })?;
+            .ok_or_else(|| anyhow::anyhow!("{} declares no `_class_name`", index_path.display()))?;
         return Ok(class.to_owned());
     }
 
@@ -2746,7 +2752,7 @@ fn architectural_class(checkpoint: &Path) -> Result<String> {
 /// How this rank takes part in the deployment's parallel shape (§4.3, §5.1), as the build config
 /// fixes it and the daemon's launch places it.
 #[derive(Clone)]
-pub(crate) struct Placement {
+pub(crate) struct Mapping {
     tensor_parallel: u32,
     tensor_rank: u32,
     expert_parallel: u32,
@@ -2842,9 +2848,10 @@ fn media_parallel(
     tensor_rank: u32,
     world_size: usize,
 ) -> Result<(minimax_h3::partition::Ulysses, usize, usize, usize)> {
-    let tensor_parallel =
-        usize::try_from(tensor_parallel).context("a tensor-parallel width the process addresses")?;
-    let tensor_rank = usize::try_from(tensor_rank).context("a tensor rank the process addresses")?;
+    let tensor_parallel = usize::try_from(tensor_parallel)
+        .context("a tensor-parallel width the process addresses")?;
+    let tensor_rank =
+        usize::try_from(tensor_rank).context("a tensor rank the process addresses")?;
     let rank = usize::try_from(rank).context("a rank number the process addresses")?;
     // A deployment that states no file places one rank per device, and with one rank there is no
     // other rank for a shape to disagree with: the width the build config states is the whole of it.
@@ -2930,7 +2937,14 @@ fn media_parallel(
     });
     let (_, component) = match (splits.next(), splits.next()) {
         // No split: the sequence is this rank's own, and the tensor degree is the whole shape.
-        (None, _) => return Ok((minimax_h3::partition::Ulysses::single(), tensor_parallel, tensor_rank, rank)),
+        (None, _) => {
+            return Ok((
+                minimax_h3::partition::Ulysses::single(),
+                tensor_parallel,
+                tensor_rank,
+                rank,
+            ));
+        }
         (Some(one), None) => one,
         (Some(first), Some(second)) => bail!(
             "worker group {group:?} states a sequence split on two components ({:?} and {:?}) and \
@@ -2975,7 +2989,7 @@ fn media_parallel(
     Ok((ulysses, tensor_parallel, tensor_rank, sequence_rank))
 }
 
-impl Placement {
+impl Mapping {
     /// This rank's part of the epoch's parallel shape.
     ///
     /// Tensor parallelism splits every layer of the group's ranks; expert parallelism splits the
@@ -3127,7 +3141,11 @@ mod tests {
             if path.extension().and_then(|extension| extension.to_str()) != Some("toml") {
                 continue;
             }
-            let name = path.file_name().expect("a name").to_string_lossy().into_owned();
+            let name = path
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .into_owned();
             let text = std::fs::read_to_string(&path).expect("the file reads");
             let page = engine::Deployment::parse(&text)
                 .unwrap_or_else(|error| panic!("{name} does not parse: {error:#}"));
@@ -3154,7 +3172,10 @@ mod tests {
                 assert!(!groups.is_empty(), "{name} places no group on {host}");
                 for group in &groups {
                     group.validate().unwrap_or_else(|error| {
-                        panic!("{name}: worker group {:?} is invalid: {error:#}", group.id.0)
+                        panic!(
+                            "{name}: worker group {:?} is invalid: {error:#}",
+                            group.id.0
+                        )
                     });
                     for rank in &group.ranks {
                         assert!(
@@ -3203,8 +3224,8 @@ mod tests {
             "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 4, projection = \"exchange\" }\n",
         );
-        let (ulysses, _, _, sequence_rank) =
-            media_parallel(Some(&placed), "engine", 1, 4, 1, 4).expect(
+        let (ulysses, _, _, sequence_rank) = media_parallel(Some(&placed), "engine", 1, 4, 1, 4)
+            .expect(
                 "the group that places the denoiser is this rank's, whatever the launch calls it",
             );
         assert_eq!(ulysses.degree, 4, "its split is the one this rank serves");
@@ -3248,8 +3269,15 @@ mod tests {
             minimax_h3::partition::Projection::Exchange,
             "the page states the projection this stack implements"
         );
-        assert_eq!((tensor_parallel, tensor_rank), (4, 2), "the tensor place is the rank's");
-        assert_eq!(sequence_rank, 2, "a component of every rank places the rank at its ordinal");
+        assert_eq!(
+            (tensor_parallel, tensor_rank),
+            (4, 2),
+            "the tensor place is the rank's"
+        );
+        assert_eq!(
+            sequence_rank, 2,
+            "a component of every rank places the rank at its ordinal"
+        );
     }
 
     /// A deployment with no worker-group file serves one rank, and refuses to guess above one.
@@ -3292,8 +3320,8 @@ mod tests {
             "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 2, projection = \"gather\" }\n",
         );
-        let error =
-            media_parallel(Some(&gather), "model", 0, 2, 0, 2).expect_err("gather is unimplemented");
+        let error = media_parallel(Some(&gather), "model", 0, 2, 0, 2)
+            .expect_err("gather is unimplemented");
         assert!(
             format!("{error:#}").contains("exchange"),
             "the refusal names the mode this stack implements: {error:#}"
@@ -3307,7 +3335,8 @@ mod tests {
         let error =
             media_parallel(Some(&two), "model", 0, 2, 0, 2).expect_err("one partition, one split");
         assert!(
-            format!("{error:#}").contains("transformer") && format!("{error:#}").contains("text_encoder"),
+            format!("{error:#}").contains("transformer")
+                && format!("{error:#}").contains("text_encoder"),
             "the refusal names both components: {error:#}"
         );
     }
@@ -3520,8 +3549,11 @@ mod class_tests {
         .unwrap();
         assert_eq!(ModelClass::of(&root).unwrap(), ModelClass::Media);
 
-        std::fs::write(root.join("config.json"), r#"{"architectures": ["Qwen3MoeForCausalLM"]}"#)
-            .unwrap();
+        std::fs::write(
+            root.join("config.json"),
+            r#"{"architectures": ["Qwen3MoeForCausalLM"]}"#,
+        )
+        .unwrap();
         assert_eq!(ModelClass::of(&root).unwrap(), ModelClass::CausalLm);
 
         std::fs::remove_file(root.join("config.json")).unwrap();

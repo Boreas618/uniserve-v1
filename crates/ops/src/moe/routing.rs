@@ -300,7 +300,7 @@ impl fmt::Display for GatherDescriptor {
     }
 }
 
-/// The logical-to-physical expert map of an expert-parallel placement.
+/// The logical-to-physical expert map of an expert-parallel layout.
 pub struct ExpertGather;
 
 impl Op for ExpertGather {

@@ -2056,7 +2056,7 @@ videos_per_second = "higher"
 # vLLM-Omni's Ref2VA partition directory; it serves ref2va only. The recipe
 # runs with the text encoder sharded over the four ranks
 # (--text-encoder-tp-size 4), which is at least as fast on W4 and W5 as the
-# recipe's own text encoder placement.
+# recipe's own text encoder layout.
 [servers.vllm-omni-gb200-4-reference]
 host = "127.0.0.1"
 port = 18083

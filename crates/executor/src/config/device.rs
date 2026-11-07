@@ -1,4 +1,4 @@
-//! Device names and tower placement, parsed without the numerical library.
+//! Device names and tower layout, parsed without the numerical library.
 //!
 //! A rank names devices with torch's spelling (`cpu`, `cuda`, `cuda:N`); the
 //! worker accepts exactly that grammar. A bare `cuda` resolves to `cuda:0`
@@ -126,7 +126,7 @@ mod tests {
     /// `tower=gen:<device>` places the generation tower on another device
     /// than the rank's; the text tower always runs on the rank's own.
     #[test]
-    fn tower_placement_requires_a_distinct_generation_device() {
+    fn tower_layout_requires_a_distinct_generation_device() {
         let rank = Device::Cuda(DeviceId(0));
         assert_eq!(
             generation_device("tower=gen:cuda:1", rank).ok(),

@@ -705,10 +705,10 @@ impl Scheduler {
             return false;
         };
         let key = RequestKey::new(self.engine_id, id, state.request_epoch);
-        self.placement
+        self.dispatch
             .affinity
             .get(&(key, DEFAULT_COMPONENT.to_owned()))
-            .is_some_and(|owner| self.placement.prefill_groups.contains(owner))
+            .is_some_and(|owner| self.dispatch.prefill_groups.contains(owner))
     }
 
     /// Whether a media request may take its next call.
@@ -732,13 +732,13 @@ impl Scheduler {
                     && state.output.decoder_boundaries.len()
                         < self.info.max_unresolved_calls.max(1) as usize
                     && self.peek_next_call_variant(id).is_none_or(|kind| {
-                        self.placement
+                        self.dispatch
                             .worker_target(
                                 &self.executor,
                                 &self.info,
                                 RequestKey::new(self.engine_id, id, state.request_epoch),
                                 kind,
-                                &placement::Choice::Existing,
+                                &dispatch::Choice::Existing,
                             )
                             .is_some()
                     })

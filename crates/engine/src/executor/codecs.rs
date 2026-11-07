@@ -24,7 +24,7 @@ use crate::executor::ExecutorGroupId;
 /// encoding component.
 pub(crate) fn video_unit_codecs(
     routing: &std::collections::BTreeMap<ipc::MediaCall, String>,
-    placements: &[(
+    layouts: &[(
         ExecutorGroupId,
         Vec<String>,
         std::collections::BTreeMap<String, crate::ComponentConfig>,
@@ -40,7 +40,7 @@ pub(crate) fn video_unit_codecs(
         return Ok(pairings);
     };
     let holders = |component: &str| {
-        placements
+        layouts
             .iter()
             .filter_map(|(id, ranks, components)| {
                 components
@@ -137,13 +137,14 @@ mod tests {
     /// The pairing of a deployment described by its pools' placed ranks: the
     /// function itself reads only the ranks' hosts.
     fn pairing(
-        placements: &[(
+        layouts: &[(
             &ExecutorGroupId,
             &[ExecutorRank],
             &BTreeMap<String, ComponentConfig>,
         )],
-    ) -> anyhow::Result<BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>> {
-        let placed = placements
+    ) -> anyhow::Result<BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>>
+    {
+        let placed = layouts
             .iter()
             .map(|(id, ranks, components)| {
                 (
@@ -229,7 +230,7 @@ mod tests {
     #[test]
     fn every_shipped_deployment_encodes_its_units_on_their_host() {
         // Every video deployment file shipped in `configs/minimax_h3/` must
-        // pass the placement checks the engine applies at startup, including
+        // pass the rank layout checks the engine applies at startup, including
         // the pairing of every decoding executor with an encoder on its host.
         check_shipped_deployments("minimax_h3");
     }
@@ -248,13 +249,13 @@ mod tests {
                 .iter()
                 .map(|worker| worker.id.clone())
                 .collect::<Vec<_>>();
-            let placements = workers
+            let layouts = workers
                 .iter()
                 .zip(&ids)
                 .map(|(worker, id)| (id, worker.ranks.as_slice(), &worker.components))
                 .collect::<Vec<_>>();
-            let pairings = pairing(&placements)
-                .unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
+            let pairings =
+                pairing(&layouts).unwrap_or_else(|error| panic!("{}: {error:#}", path.display()));
             let decoders = workers
                 .iter()
                 .filter(|worker| worker.components.contains_key("video_decoder"))
@@ -292,7 +293,7 @@ mod tests {
         ];
         let decoder = BTreeMap::from([("video_decoder".to_owned(), distributed(vec![0], 1))]);
         let encoder = BTreeMap::from([("video_codec".to_owned(), distributed(vec![0], 1))]);
-        let placements = flows
+        let layouts = flows
             .iter()
             .map(|(id, ranks)| (id, ranks.as_slice(), &decoder))
             .chain(
@@ -302,14 +303,14 @@ mod tests {
             )
             .collect::<Vec<_>>();
 
-        let pairings = pairing(&placements).expect("every host has an encoder");
+        let pairings = pairing(&layouts).expect("every host has an encoder");
 
         assert_eq!(pairings[&flows[0].0], [encoders[0].0.clone()].into());
         assert_eq!(pairings[&flows[1].0], [encoders[1].0.clone()].into());
 
         // Without an encoder on host b, the replica there is refused by name
         // even though another replica pairs.
-        let error = pairing(&placements[..3]).expect_err("host b has no encoder");
+        let error = pairing(&layouts[..3]).expect_err("host b has no encoder");
         let message = error.to_string();
         assert!(message.contains("executor flow-b"), "{message}");
         assert!(

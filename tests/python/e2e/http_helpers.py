@@ -65,9 +65,9 @@ queue_depth = 2
 
 def dedicated_experts(directory: Path) -> Path:
     """Write :data:`DEDICATED_EXPERTS` under ``directory``; return its path."""
-    placement = directory / "attention_experts.toml"
-    placement.write_text(DEDICATED_EXPERTS)
-    return placement
+    rank_layout = directory / "attention_experts.toml"
+    rank_layout.write_text(DEDICATED_EXPERTS)
+    return rank_layout
 
 
 def granted_devices(count: int) -> str:

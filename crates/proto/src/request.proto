@@ -1143,9 +1143,9 @@ message EngineSpec {
   string model = 2;
   // The host identity of the leader, where the engine process runs.
   string host = 3;
-  Placement placement = 4;
+  RankLayout rank_layout = 4;
   reserved 5;
-  // Product transport per worker edge (`placement_config.transfer`); empty
+  // Product transport per worker edge (`device_config.transfer`); empty
   // for the defaults.
   string transfer = 6;
   Scheduling scheduling = 7;
@@ -1248,7 +1248,7 @@ message Predecessor {
 }
 
 // Where the ranks run: a deployment file, or the shorthand.
-message Placement {
+message RankLayout {
   // A deployment file (`worker_groups`), placed on `EngineSpec.host`; empty
   // for the shorthand.
   string worker_groups = 1;
@@ -1264,7 +1264,7 @@ message Placement {
   // Empty for the shorthand.
   string worker_groups_content = 8;
   // Each rank's CUDA device index on its host, in rank order
-  // (`placement_config.devices`); empty numbers each host's ranks from
+  // (`device_config.devices`); empty numbers each host's ranks from
   // zero.
   repeated uint32 devices = 9;
 }

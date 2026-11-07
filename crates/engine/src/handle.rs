@@ -698,7 +698,7 @@ pub enum Command {
     PublishExpertLoad {
         load: Option<scheduling::guest::view::ExpertLoad>,
     },
-    /// Takes the expert placement the policy last answered: the handoff to the
+    /// Takes the expert layout the policy last answered: the handoff to the
     /// executor's world setup, which applies it (§7.6).
     TakeExpertOrder(crossbeam_channel::Sender<Option<scheduling::guest::view::ExpertOrder>>),
     /// Reports the state a policy is instantiated with, as seen from this
@@ -1067,7 +1067,11 @@ impl CommandSender {
     /// The scheduler's own fatal stop is logged where it is recorded; what a caller of one of these
     /// commands needs is that the command was refused and by what, not a sentence inferring it from
     /// a dropped channel.
-    fn refuse_into<T>(&self, answer: &crossbeam_channel::Sender<Result<T, String>>, delivered: bool) {
+    fn refuse_into<T>(
+        &self,
+        answer: &crossbeam_channel::Sender<Result<T, String>>,
+        delivered: bool,
+    ) {
         if !delivered {
             let _ = answer.send(Err(Self::ended()));
         }
@@ -1106,7 +1110,10 @@ impl CommandSender {
         &self,
     ) -> crossbeam_channel::Receiver<Result<Vec<crate::scheduler::GroupCache>, String>> {
         let (answer, described) = crossbeam_channel::bounded(1);
-        self.refuse_into(&answer, self.send(Command::DescribeCache(answer.clone())).is_ok());
+        self.refuse_into(
+            &answer,
+            self.send(Command::DescribeCache(answer.clone())).is_ok(),
+        );
         described
     }
 
@@ -1288,8 +1295,8 @@ impl CommandSender {
         let _ = self.send(Command::PublishExpertLoad { load });
     }
 
-    /// Takes the expert placement the policy last answered, for the executor's
-    /// world setup that applies it (§7.6). `None` when no placement is waiting.
+    /// Takes the expert layout the policy last answered, for the executor's
+    /// world setup that applies it (§7.6). `None` when no layout is waiting.
     pub fn take_expert_order(&self) -> Option<scheduling::guest::view::ExpertOrder> {
         let (answer, taken) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::TakeExpertOrder(answer));

@@ -56,7 +56,7 @@ pub struct DaemonOptions {
     pub nnodes: u32,
     /// This node's rank; the leader is rank 0.
     pub node_rank: u32,
-    /// This node's host identity, as placements name it.
+    /// This node's host identity, as rank layouts name it.
     pub host: String,
     /// The leader's `host:port` the members join at; the leader binds it
     /// for as long as it serves, so nodes may also join the running

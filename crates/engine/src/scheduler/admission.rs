@@ -13,7 +13,7 @@
 //! A token request reserves a request row and one cache table per cache group;
 //! every group draws units from one pool, so admission compares the sum of
 //! the groups' unit demand with the free units. Its prefill executor is
-//! recorded in `Placement::affinity`. A media request
+//! recorded in `Dispatch::affinity`. A media request
 //! reserves a request row and every declared result buffer on each executor of
 //! its route.
 
@@ -38,7 +38,7 @@ pub(super) enum MediaOutputError {
     /// No loaded component serves the call that publishes the product.
     #[error("no loaded component serves {0:?}")]
     Unserved(MediaCall),
-    /// The serving component has no placement candidate.
+    /// The serving component has no dispatch candidate.
     #[error("component {0} has no loaded candidate")]
     Unplaced(String),
     /// The candidate's executor does not bind the component.
@@ -426,7 +426,7 @@ impl Scheduler {
     ///
     /// Each product of the request's graph is found by name among the
     /// outputs of the component serving its call, as bound on that call's
-    /// first placement candidate. A product with a request extent takes it
+    /// first dispatch candidate. A product with a request extent takes it
     /// as the extent of its output's device-sized axis, which must not exceed
     /// the declared maximum; a product without one keeps its declared
     /// extent there. An output declaring raster axes takes the request's
@@ -451,7 +451,7 @@ impl Scheduler {
                 .get(&product.call)
                 .ok_or(MediaOutputError::Unserved(product.call))?;
             let (_, bound, info) = self
-                .placement
+                .dispatch
                 .component_candidates(&self.executor, CallKind::Media(product.call), name)
                 .next()
                 .ok_or_else(|| MediaOutputError::Unplaced(name.clone()))?;
@@ -538,7 +538,7 @@ impl Scheduler {
     /// residency. Components co-located with that executor follow it; shared
     /// components such as a TP text encoder and the host codec executor retain
     /// their own independently bounded request rows. Otherwise the candidate
-    /// with the fewest distinct requests placed on it in `Placement::affinity`
+    /// with the fewest distinct requests placed on it in `Dispatch::affinity`
     /// wins, then the one with the most free request rows.
     ///
     /// Returns a map from component name to executor, or `None` when some
@@ -590,7 +590,7 @@ impl Scheduler {
                 })
                 .flatten();
             let candidates = self
-                .placement
+                .dispatch
                 .component_candidates(&self.executor, CallKind::Media(call), &component)
                 .filter(|(worker, _, _)| {
                     admissible.is_none_or(|encoders| encoders.contains(*worker))
@@ -615,7 +615,7 @@ impl Scheduler {
             let chosen = resident.or_else(|| {
                 candidates.into_iter().min_by_key(|(worker, _, _)| {
                     let active = self
-                        .placement
+                        .dispatch
                         .affinity
                         .iter()
                         .filter_map(|((request, _), owner)| (owner == *worker).then_some(*request))
@@ -910,7 +910,7 @@ impl Scheduler {
 
             // The admission commits here; nothing below requeues the request.
             for (component, worker) in &routes {
-                self.placement
+                self.dispatch
                     .affinity
                     .insert((request_key, component.clone()), worker.clone());
             }
@@ -1010,7 +1010,7 @@ impl Scheduler {
     /// Whether some executor group prefills only (`ExecutorGroupRole::Prefill`),
     /// its requests decoding on decode groups.
     fn splits_prefill(&self) -> bool {
-        !self.placement.prefill_groups.is_empty()
+        !self.dispatch.prefill_groups.is_empty()
     }
 
     /// Why the image denoiser cannot denoise `req`'s images, if so: under
@@ -1545,7 +1545,8 @@ impl Scheduler {
                             kv_offload.poll();
                         }
                         std::thread::yield_now();
-                        answer = host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0);
+                        answer =
+                            host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0);
                     }
                 }
                 match answer {
@@ -1678,7 +1679,7 @@ impl Scheduler {
         state: &RequestState,
     ) -> Option<((crate::ExecutorGroupId, String), crate::kv_cache::PrefixHit)> {
         let cache = self.storage.cache()?;
-        self.placement
+        self.dispatch
             .worker_candidates(
                 &self.executor,
                 &self.info,
@@ -1788,7 +1789,7 @@ impl Scheduler {
             request_slot,
             prefix_cache,
         } = reservation;
-        self.placement
+        self.dispatch
             .affinity
             .insert((request_key, target.1), target.0);
         if st

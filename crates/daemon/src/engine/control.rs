@@ -332,7 +332,10 @@ impl EngineControl {
         let deadline = Instant::now() + TARGET_START;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
-            anyhow::ensure!(!remaining.is_zero(), "engine {engine} stated nothing in time");
+            anyhow::ensure!(
+                !remaining.is_zero(),
+                "engine {engine} stated nothing in time"
+            );
             let Some(message) = reader.recv::<wire::FromEngine>(remaining)? else {
                 continue;
             };
@@ -680,7 +683,7 @@ impl EngineControl {
     ///
     /// # Errors
     ///
-    /// Fails for a spec of no model, no placement or a zero queue depth, a
+    /// Fails for a spec of no model, no rank layout or a zero queue depth, a
     /// child on a host that does not share this daemon's runtime directory, a
     /// node with no Program Server, a spec of no world, and an epoch whose
     /// build config has not been written.
@@ -697,21 +700,21 @@ impl EngineControl {
             spec.host,
             self.runtime.display()
         );
-        let placement = spec
-            .placement
+        let rank_layout = spec
+            .rank_layout
             .as_ref()
-            .context("the engine spec states no placement")?;
+            .context("the engine spec states no rank layout")?;
         // The devices are the deployment's own: each host's ranks are on the
         // ordinals the engine's shorthand gives them (`0..` in rank order), or
-        // on the order `placement_config.devices` names, which
+        // on the order `device_config.devices` names, which
         // `EngineConfig::from_spec` has already folded into the ranks. Reading
         // them from the ranks is the one account: a config that states no
         // order still gives this node's ranks their devices, and a rank on
         // `cpu` is refused here rather than in the child.
         let devices = local_devices(&self.host, spec)?;
         anyhow::ensure!(
-            placement.queue_depth > 0,
-            "the placement's queue_depth is zero for this rank"
+            rank_layout.queue_depth > 0,
+            "the rank layout's queue_depth is zero for this rank"
         );
         let program_server = self.program_server.as_ref().context(
             "this node has no Program Server socket, so a main process could resolve no policy \
@@ -751,7 +754,7 @@ impl EngineControl {
             // config, which the child reads.
             watchdog_timeout_s: None,
             rollback_s: None,
-            queue_depth: placement.queue_depth,
+            queue_depth: rank_layout.queue_depth,
             world_size,
             // A process that starts beside its predecessor is the serving
             // process's standby (§2.5): the spec states the predecessor and
@@ -989,7 +992,11 @@ fn exited(control: &mut Connection) -> anyhow::Result<()> {
             kind: Some(event::Kind::Exit(exit)),
         })) = message.kind
         {
-            anyhow::bail!("the engine process exited: {}: {}", exit.status, exit.last_line.trim());
+            anyhow::bail!(
+                "the engine process exited: {}: {}",
+                exit.status,
+                exit.last_line.trim()
+            );
         }
     }
     Ok(())
@@ -1831,12 +1838,12 @@ mod tests {
         spec.model = "/models/qwen3".to_owned();
         spec.host = "rank-0".to_owned();
         spec.world = 3;
-        let placement = spec
-            .placement
+        let rank_layout = spec
+            .rank_layout
             .as_mut()
             .expect("the default spec places ranks");
-        placement.devices = vec![0];
-        placement.queue_depth = 4;
+        rank_layout.devices = vec![0];
+        rank_layout.queue_depth = 4;
         spec.workers
             .as_mut()
             .expect("the default spec names the workers")
@@ -2041,7 +2048,7 @@ mod tests {
 
 /// The CUDA ordinals `host`'s ranks serve, in rank order and without repeats.
 ///
-/// A deployment that states no `placement_config.devices` still gives each
+/// A deployment that states no `device_config.devices` still gives each
 /// host's ranks the ordinals the engine's shorthand numbers them from zero; one
 /// that does state an order has already had it folded into the ranks by
 /// [`engine::EngineConfig::from_spec`]. Reading the ranks is the one account of
@@ -2084,7 +2091,7 @@ fn local_devices(host: &str, spec: &wire::EngineSpec) -> anyhow::Result<Vec<u32>
     }
     anyhow::ensure!(
         !devices.is_empty(),
-        "the placement names no device for this rank: no rank of the deployment runs on {host}"
+        "the rank layout names no device for this rank: no rank of the deployment runs on {host}"
     );
     Ok(devices)
 }

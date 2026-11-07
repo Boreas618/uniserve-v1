@@ -280,7 +280,7 @@ impl Deployment {
     ///
     /// Two facts are the caller's and are handed in rather than held, because they are the
     /// deployment's *capacity* rather than the checkpoint's shape - the sequence's arrangement and
-    /// the tensor-parallel placement. The served tasks are **not** among them: they are deployment
+    /// the tensor-parallel layout. The served tasks are **not** among them: they are deployment
     /// facts like the canvases, so the modulation cache's groups follow from `Deployment::tasks`,
     /// and a call cannot state a narrower set than the deployment serves. The
     /// packed row bound is not among them: it is derived from the arrangement by the layout rule

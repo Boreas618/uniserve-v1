@@ -36,8 +36,8 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use engine::{
     BatchEvent, BatchResult, CommandSender, EVENT_BUFFER_CAPACITY, ExecutionBatch, Executor,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SimEngine, SimExecutor,
-    SpecialTokenIds, ExecutorGroupId,
+    ExecutorError, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SimEngine,
+    SimExecutor, SpecialTokenIds,
 };
 use engine::{Event, FinishReason};
 use engine::{
@@ -194,7 +194,7 @@ fn first_denoising_rows(
     let _ = scheduler_thread.join();
     assert_eq!(finished, Some(FinishReason::ImageDone));
 
-    let (_, placement) = dispatched
+    let (_, dispatch) = dispatched
         .try_iter()
         .filter_map(|event| match event {
             BatchEvent::Submitted(batch) => Some(batch),
@@ -203,7 +203,7 @@ fn first_denoising_rows(
         .flat_map(|batch| batch.requests)
         .find(|(call, _)| call.kind == CallKind::Media(MediaCall::Denoising))
         .expect("the request denoises");
-    let forward = placement.forward;
+    let forward = dispatch.forward;
     (0..forward.request_pool_indices.len())
         .map(|row| {
             (
@@ -1556,8 +1556,8 @@ fn hybrid_groups_share_one_unit_pool() {
         let BatchEvent::Submitted(batch) = event else {
             continue;
         };
-        for (_, placement) in &batch.requests {
-            for table in &placement.block_tables {
+        for (_, dispatch) in &batch.requests {
+            for table in &dispatch.block_tables {
                 let (block_size, units_per_page) = if table.group_id == 0 {
                     (64, 1)
                 } else {
@@ -1598,7 +1598,10 @@ fn prefix_cache_configuration_controls_reuse() {
             ..EngineConfig::sim("sim-model")
         };
         let executor = SimExecutor::new(sim);
-        let rank = executor.info().runtime_info().expect("the sim states its rank");
+        let rank = executor
+            .info()
+            .runtime_info()
+            .expect("the sim states its rank");
         let engine = SchedulerHandle::with_executor(config, Box::new(executor)).unwrap();
         support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
         let stats = engine.stats();
@@ -1934,7 +1937,10 @@ fn a_state_group_reuses_prefixes_up_to_a_checkpoint() {
         ..EngineConfig::sim("sim-model")
     };
     let executor = SimExecutor::new(sim);
-    let rank = executor.info().runtime_info().expect("the sim states its rank");
+    let rank = executor
+        .info()
+        .runtime_info()
+        .expect("the sim states its rank");
     let engine = SchedulerHandle::with_executor(config, Box::new(executor)).unwrap();
     support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
     let stats = engine.stats();
@@ -2070,8 +2076,7 @@ fn a_scheduler_without_a_host_cache_warms_nothing() {
         .recv()
         .unwrap()
         .unwrap();
-    let snapshot: storage::manifest::cache::Snapshot =
-        serde_json::from_str(&answer[0]).unwrap();
+    let snapshot: storage::manifest::cache::Snapshot = serde_json::from_str(&answer[0]).unwrap();
     assert!(snapshot.prefixes.is_empty());
 
     drop(handle);

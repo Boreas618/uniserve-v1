@@ -33,12 +33,13 @@ use engine::{
     PolicyProgram, PolicySource, Progress, SchedulerHandle, Stage,
 };
 use executor::batch::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, Placement, RowState, Submission,
+    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
     SubmissionId,
 };
 use executor::completion::Outcome;
 use ipc::{
-    ComponentConfig, ImageParams, SamplingParams, TimingCounters, MainProcessEndpoint, MainProcessInfo,
+    ComponentConfig, ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams,
+    TimingCounters,
 };
 use scheduling::Call;
 
@@ -90,7 +91,7 @@ fn pool() -> Inventory {
     Inventory {
         group: "model".to_owned(),
         ranks: vec![rank("gpu-a")],
-        placement: Placement {
+        layout: PoolLayout {
             queue_depth: 1,
             ranks: 1,
             components: std::collections::BTreeMap::from([(

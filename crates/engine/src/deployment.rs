@@ -20,7 +20,7 @@
 //! [`Deployment::read`] parses a file; [`Deployment::worker_groups`] places its
 //! ranks on hosts and expands it into the engine's [`ExecutorGroupConfig`] list,
 //! which the daemon and the main process read. Reading checks the file's syntax and
-//! schema; placement validates the expanded groups with
+//! schema; rank layout validates the expanded groups with
 //! [`ExecutorGroupConfig::validate_all`], so a file that names no host can be
 //! checked only once the engine's own host identity is known.
 
@@ -336,11 +336,11 @@ impl GroupEntry {
 }
 
 impl ComponentEntry {
-    /// The component's placement within one replica of `rank_count` ranks.
+    /// The component's layout within one replica of `rank_count` ranks.
     fn resolve(&self, name: &str, rank_count: usize) -> anyhow::Result<ComponentConfig> {
         // The video decoder and codec run one local copy per member rank
         // and take one independent media unit per rank per round, the only
-        // placement a rank accepts for them.
+        // layout a rank accepts for them.
         let mut distribution = self.distribution;
         if [VIDEO_DECODER_COMPONENT, VIDEO_CODEC_COMPONENT].contains(&name) {
             anyhow::ensure!(
@@ -448,7 +448,7 @@ mod tests {
     }
 
     /// The video decoder and codec are temporal-unit components whether or
-    /// not the file says so, and no other unit count is a placement they
+    /// not the file says so, and no other unit count is a layout they
     /// have.
     #[test]
     fn the_video_decoder_and_codec_take_one_unit_per_rank() {

@@ -19,7 +19,7 @@
 //!
 //! One rank holding every expert is the colocated case this layer serves; an expert-parallel group
 //! routes over `expert_exchange` and is built with the H3 step, whose `moe_config.exchange`
-//! program selects the transport. A `Moe` layer built for a placement that does not hold every
+//! program selects the transport. A `Moe` layer built for a layout that does not hold every
 //! expert refuses the forward rather than computing a routing the weights do not have.
 
 use ops::fp4::{BLOCK_ELEMENTS, Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
@@ -783,7 +783,7 @@ impl Moe {
     ///
     /// `up_gate` is `[experts, 2 · intermediate, hidden]` with the up projection first, `down` is
     /// `[experts, hidden, intermediate]`, and `router` has one output per expert. `map` is the
-    /// expert-parallel map when the placement reorders experts; with every expert colocated it is
+    /// expert-parallel map when the layout reorders experts; with every expert colocated it is
     /// absent and a route's logical id is its weight row.
     #[allow(
         clippy::too_many_arguments,
@@ -1795,7 +1795,7 @@ impl Moe {
                 format!("{tokens} input rows against {} output rows", out.rows()),
             ));
         }
-        // The group's geometry has to agree with the placement the block was built for.
+        // The group's geometry has to agree with the layout the block was built for.
         let expected_ranks = u64::from(self.experts / self.local.max(1));
         if ranks - u64::from(exchange.attention) != expected_ranks {
             return Err(Error::shape(
@@ -2021,8 +2021,7 @@ impl Moe {
 
         // Permuted-height for the reason the dense path's is: the combine below indexes it through
         // `expanded_to_permuted`.
-        let products =
-            arena.tensor(exchange.states.dtype, Shape::new(&[rows, hidden_width]))?;
+        let products = arena.tensor(exchange.states.dtype, Shape::new(&[rows, hidden_width]))?;
         let second = RouteGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
@@ -2096,9 +2095,7 @@ impl Moe {
         let launch_tokens = u32::try_from(tokens)
             .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?;
         if tokens > 0 {
-            let token_scale = f
-                .arena()
-                .tensor(DType::F32, Shape::new(&[tokens]))?;
+            let token_scale = f.arena().tensor(DType::F32, Shape::new(&[tokens]))?;
             let descriptor =
                 self.quantize_descriptor(hidden.dtype, self.hidden, ScaleLayout::Linear);
             let args = QuantizeArgs {
@@ -2120,9 +2117,7 @@ impl Moe {
         }
         let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
         let address = |weight: &Weight| weight.view().ptr.address();
-        let bytes = |weight: &Weight| {
-            weight.view().numel() / u64::from(self.local)
-        };
+        let bytes = |weight: &Weight| weight.view().numel() / u64::from(self.local);
         let layer = exchange::FusedLayer {
             up_gate: address(&up_gate.values),
             up_gate_scales: address(&up_gate.scales),

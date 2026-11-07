@@ -258,12 +258,7 @@ fn every_decision_reaches_its_export_and_answers() {
         .reply(Call::Dispatch.export(), &plan)
         .reply(Call::Reclaim.export(), &victims)
         .reply(Call::Warm.export(), &vec![PageId(9)])
-        .reply(
-            Call::Experts.export(),
-            &ExpertOrder {
-                placement: vec![1, 0],
-            },
-        )
+        .reply(Call::Experts.export(), &ExpertOrder { layout: vec![1, 0] })
         .index(Call::Route.export(), 2)
         .index(Call::Place.export(), 1);
     let mut policy = policy(&engine, toy);
@@ -280,7 +275,7 @@ fn every_decision_reaches_its_export_and_answers() {
     );
     assert_eq!(policy.warm(&Room::default()).unwrap(), vec![PageId(9)]);
     assert_eq!(
-        policy.experts(&ExpertLoad::default()).unwrap().placement,
+        policy.experts(&ExpertLoad::default()).unwrap().layout,
         vec![1, 0]
     );
     assert_eq!(policy.route(&request(), &[]).unwrap(), 2);
@@ -297,13 +292,15 @@ fn reclaim_and_warm_may_answer_nothing() {
     // nothing; that is a decision, not a failure.
     let mut policy = policy(&engine, Toy::new());
 
-    assert!(policy
-        .reclaim(&Shortage {
-            kind: Storage::HostPages,
-            need: 1,
-        })
-        .unwrap()
-        .is_empty());
+    assert!(
+        policy
+            .reclaim(&Shortage {
+                kind: Storage::HostPages,
+                need: 1,
+            })
+            .unwrap()
+            .is_empty()
+    );
     assert!(policy.warm(&Room::default()).unwrap().is_empty());
 }
 

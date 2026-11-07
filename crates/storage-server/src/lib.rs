@@ -53,7 +53,7 @@ use rustix::event::{PollFd, PollFlags, poll};
 use crate::mooncake::BATCH_PAGES;
 use ::storage::protocol::{
     Access, Allocation, Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage,
-    Item, Key, ListedDeployment, ListedTensor, Listing, MIN_VERSION, Mode, PageLevel, Placement,
+    Item, Key, ListedDeployment, ListedTensor, Listing, Location, MIN_VERSION, Mode, PageLevel,
     Reply, Request, Retainer, Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorRecord,
     VERSION, Welcome,
 };
@@ -76,7 +76,7 @@ const SLOW_REQUEST: Duration = Duration::from_millis(100);
 type ClientId = u64;
 type StorageId = u64;
 /// One copy of a tensor: its key and where its storage lies.
-type TensorId = (Key, Placement);
+type TensorId = (Key, Location);
 
 /// A process that holds or may hold access to a tensor.
 #[derive(Clone)]
@@ -212,7 +212,7 @@ pub struct Server {
     /// has at most one copy at each location.
     tensors: HashMap<TensorId, TensorEntry>,
     /// Where each key's copies lie.
-    copies: HashMap<Key, Vec<Placement>>,
+    copies: HashMap<Key, Vec<Location>>,
     deployments: HashMap<String, Deployment>,
     shootdowns: ShootDowns,
     pages: pages::Pools,
@@ -1191,7 +1191,7 @@ impl Server {
                 + self
                     .storages
                     .values()
-                    .filter(|storage| matches!(storage.record.placement, Placement::Host { .. }))
+                    .filter(|storage| matches!(storage.record.location, Location::Host { .. }))
                     .map(|storage| {
                         let allocated = rustix::fs::fstat(&storage._descriptor)
                             .map_or(0, |stat| (stat.st_blocks as u64).saturating_mul(512));
@@ -1210,7 +1210,7 @@ impl Server {
             let Some(storage) = self.storages.get(&tensor.storage) else {
                 continue;
             };
-            if !matches!(storage.record.placement, Placement::Device { .. }) {
+            if !matches!(storage.record.location, Location::Device { .. }) {
                 continue;
             }
             held.entry(tensor.storage)
@@ -1306,7 +1306,7 @@ impl Server {
                 "only the head that claimed {deployment} keeps its worlds' weights"
             )));
         }
-        let released: Vec<(Key, Placement)> = self
+        let released: Vec<(Key, Location)> = self
             .tensors
             .iter_mut()
             .filter(|((key, _), tensor)| {
@@ -1408,7 +1408,7 @@ impl Server {
         &mut self,
         holder: &Holder,
         keys: &[Key],
-        at: &[Placement],
+        at: &[Location],
     ) -> Result<Outcome, (ErrorKind, String)> {
         if !self.current(holder) {
             return Err(stale(holder));
@@ -1472,7 +1472,7 @@ impl Server {
             return Err(shoot_down_failed(writer.pid));
         }
         // A live writer of the current head that is not superseded keeps the
-        // tensor: two current workers of one scope at once is a placement
+        // tensor: two current workers of one scope at once is a location
         // error, never resolved by killing one of them.
         let superseded = !self.current(writer)
             || writer.client.is_none()
@@ -1490,7 +1490,7 @@ impl Server {
     }
 
     /// The copies of `key` at the locations `at` selects.
-    fn copies_of(&self, key: &Key, at: &[Placement]) -> Vec<TensorId> {
+    fn copies_of(&self, key: &Key, at: &[Location]) -> Vec<TensorId> {
         self.copies
             .get(key)
             .into_iter()
@@ -1506,7 +1506,7 @@ impl Server {
         holder: &Holder,
         keys: &[Key],
         mode: Mode,
-        at: &[Placement],
+        at: &[Location],
     ) -> Result<Outcome, (ErrorKind, String)> {
         if mode != Mode::Read && !self.current(holder) {
             return Err(stale(holder));
@@ -1605,7 +1605,7 @@ impl Server {
         bytes: u64,
     ) -> Result<Outcome, (ErrorKind, String)> {
         self.admit_host(bytes)?;
-        let at = Placement::Host { numa_node: None };
+        let at = Location::Host { numa_node: None };
         let descriptor = pages::shared_memory("uniserve-storage", bytes, None).map_err(resource)?;
         self.put(
             holder,
@@ -1620,7 +1620,7 @@ impl Server {
                 access: Access::Exclusive,
             }],
             &[StorageRecord {
-                placement: at,
+                location: at,
                 bytes,
                 segment: None,
                 fabric: None,
@@ -1656,7 +1656,7 @@ impl Server {
             // retained at the same location holds these very bytes, and
             // the put only adds the caller's scope to it. Exclusive tensors
             // are created once.
-            if let Some(existing) = self.tensors.get(&(tensor.key, storage.placement))
+            if let Some(existing) = self.tensors.get(&(tensor.key, storage.location))
                 && (existing.access, tensor.access) != (Access::ReadOnly, Access::ReadOnly)
             {
                 return Err(invalid(&format!("{} is already retained", tensor.name)));
@@ -1686,7 +1686,7 @@ impl Server {
             })
             .collect();
         for tensor in tensors {
-            let location = storages[tensor.storage as usize].placement;
+            let location = storages[tensor.storage as usize].location;
             let unseen = self
                 .tensors
                 .get(&(tensor.key, location))
@@ -1759,14 +1759,14 @@ impl Server {
             .filter(|tensor| {
                 let location = storages
                     .get(tensor.storage as usize)
-                    .map(|storage| storage.placement);
+                    .map(|storage| storage.location);
                 location.is_none_or(|location| !self.tensors.contains_key(&(tensor.key, location)))
             })
             .map(|tensor| tensor.storage as usize)
             .collect();
         let mut added: BTreeMap<[u8; 16], u64> = BTreeMap::new();
         for index in created {
-            if let Placement::Device { gpu } = storages[index].placement {
+            if let Location::Device { gpu } = storages[index].location {
                 *added.entry(gpu).or_default() += storages[index].bytes;
             }
         }
@@ -1880,7 +1880,7 @@ impl Server {
         &mut self,
         holder: &Holder,
         moves: &[(Key, Key)],
-        at: &[Placement],
+        at: &[Location],
     ) -> Result<Outcome, (ErrorKind, String)> {
         if !self.current(holder) {
             return Err(stale(holder));
@@ -1981,9 +1981,9 @@ impl Server {
                     .any(|holder| Arc::ptr_eq(&holder.pidfd, pidfd))
             })
             .filter_map(
-                |tensor| match self.storages.get(&tensor.storage)?.record.placement {
-                    Placement::Device { gpu } => Some(gpu),
-                    Placement::Host { .. } => None,
+                |tensor| match self.storages.get(&tensor.storage)?.record.location {
+                    Location::Device { gpu } => Some(gpu),
+                    Location::Host { .. } => None,
                 },
             )
             .collect();
@@ -2071,7 +2071,7 @@ impl Server {
 
     /// See [`Request::Read`].
     fn read_bytes(&self, deployment: &str, key: &Key) -> Result<Vec<u8>, (ErrorKind, String)> {
-        let host = [Placement::Host { numa_node: None }];
+        let host = [Location::Host { numa_node: None }];
         let tensor = self
             .copies_of(key, &host)
             .into_iter()
@@ -2148,11 +2148,11 @@ impl Server {
                 if !counted.insert((tensor.storage, retainer.clone())) {
                     continue;
                 }
-                match storage.record.placement {
-                    Placement::Device { gpu } => {
+                match storage.record.location {
+                    Location::Device { gpu } => {
                         *device.entry((gpu, retainer.clone())).or_default() += storage.record.bytes;
                     }
-                    Placement::Host { .. } => {
+                    Location::Host { .. } => {
                         *host.entry(retainer.clone()).or_default() += storage.record.bytes;
                     }
                 }
@@ -2168,7 +2168,7 @@ impl Server {
                     .into_iter()
                     .collect(),
                 retainers: tensor.retainers.iter().cloned().collect(),
-                placement: storage.record.placement,
+                location: storage.record.location,
                 storage_bytes: storage.record.bytes,
                 dtype: tensor.dtype.clone(),
                 shape: tensor.shape.clone(),
@@ -2703,7 +2703,7 @@ fn wide(pages: &[(Key, u32)]) -> Vec<(Key, u64)> {
 
 /// Whether a request's locations `at` select `location`: every location
 /// when it lists none.
-fn selected(at: &[Placement], location: &Placement) -> bool {
+fn selected(at: &[Location], location: &Location) -> bool {
     at.is_empty() || at.contains(location)
 }
 

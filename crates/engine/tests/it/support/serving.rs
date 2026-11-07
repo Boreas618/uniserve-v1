@@ -10,11 +10,11 @@ use std::sync::Mutex;
 use engine::EngineConfig;
 
 use executor::batch::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, Placement, RowState, Submission,
+    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
     SubmissionId,
 };
 use executor::completion::Outcome;
-use ipc::{ComponentConfig, TimingCounters, MainProcessEndpoint, MainProcessInfo};
+use ipc::{ComponentConfig, MainProcessEndpoint, MainProcessInfo, TimingCounters};
 
 /// The token this pool samples for the `index`th call of every batch.
 pub(crate) const SAMPLED: u32 = 1000;
@@ -173,7 +173,7 @@ pub(crate) fn pool(group: &str) -> Inventory {
     Inventory {
         group: group.to_owned(),
         ranks: vec![rank("gpu-a")],
-        placement: Placement {
+        layout: PoolLayout {
             queue_depth: 1,
             ranks: 1,
             components: std::collections::BTreeMap::from([(
