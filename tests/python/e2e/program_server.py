@@ -291,7 +291,9 @@ def program_server(
     shared with another run: a store entry is keyed by operator, backend,
     revision, target and descriptor, and a revision counts from 1 in a fresh
     package root, so a store kept across runs would answer a changed package
-    with the module the older source built.
+    with the module the older source built. The environment's
+    ``UNISERVE_PROGRAM_STORE`` names a store ``build_fixtures`` built from this
+    tree instead, for a run of several modules: a build takes minutes.
     """
     binary = require_uniserve_binary()
     work = tmp_path_factory.mktemp("program-server")
@@ -299,8 +301,10 @@ def program_server(
     log = work / "program-server.log"
     target = program_target()
     interpreter = compiler()
-    built = work / "programs"
-    build_store(built, target, interpreter)
+    named = os.environ.get("UNISERVE_PROGRAM_STORE")
+    built = Path(named) if named else work / "programs"
+    if not named:
+        build_store(built, target, interpreter)
     # The builder's two directories are the two the server is given: installed
     # sources for a rebuild, prepared modules for what it serves.
     packages = built / "packages"

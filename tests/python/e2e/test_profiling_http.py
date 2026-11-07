@@ -270,7 +270,7 @@ def test_a_world_change_ends_the_session_of_the_world_it_replaces(
         changed = _apply(
             served, "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
         )
-        assert changed["change"] == "world", changed
+        assert changed["change"] == "epoch", changed
         session = _profile(served)
         assert session["state"] == "ended", session
         assert session["end_reason"] == "world change", session
