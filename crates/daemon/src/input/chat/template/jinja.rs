@@ -22,7 +22,6 @@ use super::format::{ChatTemplateContentFormat, detect_chat_template_content_form
 use super::tojson::hf_tojson_filter;
 use super::{TemplateMessage, TemplateTool};
 use crate::input::chat::ReasoningEffort;
-use crate::options::ChatTemplateContentFormatOption;
 
 #[derive(Debug, ThisError)]
 /// Error returned while loading, detecting, or rendering a chat template.
@@ -172,13 +171,10 @@ impl CompiledChatTemplate {
     /// Compiles the given chat template string into a [`CompiledChatTemplate`].
     pub(super) fn new(
         template: String,
-        content_format: ChatTemplateContentFormatOption,
+        content_format: Option<ChatTemplateContentFormat>,
     ) -> Result<Self> {
-        let content_format = match content_format {
-            ChatTemplateContentFormatOption::Auto => detect_chat_template_content_format(&template),
-            ChatTemplateContentFormatOption::String => ChatTemplateContentFormat::String,
-            ChatTemplateContentFormatOption::OpenAi => ChatTemplateContentFormat::OpenAi,
-        };
+        let content_format =
+            content_format.unwrap_or_else(|| detect_chat_template_content_format(&template));
         let env = build_environment(template)?;
         Ok(Self {
             env,
@@ -209,21 +205,14 @@ mod tests {
 
     #[test]
     fn test_chat_template_state_valid_template() {
-        let template = CompiledChatTemplate::new(
-            "{{ messages }}".to_string(),
-            ChatTemplateContentFormatOption::Auto,
-        )
-        .unwrap();
+        let template = CompiledChatTemplate::new("{{ messages }}".to_string(), None).unwrap();
         let result = template.apply(TemplateContext::default()).unwrap();
         assert_eq!(result, "[]");
     }
 
     #[test]
     fn test_chat_template_state_invalid_template() {
-        let result = CompiledChatTemplate::new(
-            "{% invalid".to_string(),
-            ChatTemplateContentFormatOption::Auto,
-        );
+        let result = CompiledChatTemplate::new("{% invalid".to_string(), None);
         assert!(result.is_err());
         let err = result.err().unwrap().to_string();
         assert!(
@@ -235,9 +224,7 @@ mod tests {
     #[test]
     fn test_special_tokens_undefined_when_not_provided() {
         let template = "{% if bos_token is defined %}{{ bos_token }}{% endif %}hello";
-        let template =
-            CompiledChatTemplate::new(template.to_string(), ChatTemplateContentFormatOption::Auto)
-                .unwrap();
+        let template = CompiledChatTemplate::new(template.to_string(), None).unwrap();
 
         let result = template.apply(TemplateContext::default()).unwrap();
         assert_eq!(result, "hello");

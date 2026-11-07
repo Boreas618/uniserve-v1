@@ -38,11 +38,10 @@ use models::ModelDescription;
 
 pub use args::{FLAG_PATHS, Listen, ServeArgs, Stated, overridden, printed, resolve_text};
 pub use proto::config::{
-    ChatConfig, ChatTemplateContentFormatOption, CudaGraphConfig, DEFAULT_FENCE_COMPONENTS,
-    DeviceConfig, FlashInferConfig, ImageFetchConfig, ImageSize, KvCacheConfig, LoadConfig,
-    LoggingConfig, MediaConfig, MigrationConfig, MoeConfig, MooncakeConfig, ProfilingConfig,
-    ReasoningParser, SchedulerConfig, ServerConfig, SpeculativeConfig, VideoConfig, VideoJobConfig,
-    WorkerConfig,
+    ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DEFAULT_FENCE_COMPONENTS, DeviceConfig,
+    FlashInferConfig, ImageFetchConfig, ImageSize, KvCacheConfig, LoadConfig, LoggingConfig,
+    MediaConfig, MigrationConfig, MoeConfig, MooncakeConfig, ProfilingConfig, ReasoningParser,
+    SchedulerConfig, ServerConfig, SpeculativeConfig, VideoConfig, VideoJobConfig, WorkerConfig,
 };
 use proto::config::{positive, values};
 

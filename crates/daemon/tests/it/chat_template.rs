@@ -1,7 +1,7 @@
 //! Public Hugging Face chat-template rendering behavior.
 //!
 //! The integration cases cover content-shape detection under
-//! `ChatTemplateContentFormatOption::Auto`, byte-exact rendering of prior
+//! `None`, byte-exact rendering of prior
 //! assistant turns through the Qwen3 template, and key-order-preserving
 //! tool-argument formatting with `serde_json`-normalized numbers.
 
@@ -10,14 +10,14 @@ use std::collections::HashMap;
 use daemon::input::chat::{
     ChatContentPart, ChatMessage, ChatRequest, ChatRole, GenerationPromptMode, HfChatRenderer,
 };
-use daemon::options::ChatTemplateContentFormatOption;
+use daemon::options::ChatTemplateContentFormat;
 use daemon::output::chat::{AssistantContentBlock, AssistantToolCall};
 
 const QWEN3_TEMPLATE: &str = include_str!("../templates/qwen3.jinja");
 
 fn hf_render(
     template: &str,
-    format: ChatTemplateContentFormatOption,
+    format: Option<ChatTemplateContentFormat>,
     request: &ChatRequest,
 ) -> String {
     HfChatRenderer::new(Some(template.to_owned()), HashMap::new(), format)
@@ -54,11 +54,7 @@ fn auto_detection_treats_alias_loop_template_as_string() {
     // renders.
     let template = "{%- for message in messages -%}{%- set parts = message.content -%}\
 {%- if parts is string -%}STR:{{ parts }}{%- else -%}LIST{%- endif -%}{%- endfor -%}";
-    let rendered = hf_render(
-        template,
-        ChatTemplateContentFormatOption::Auto,
-        &multipart_user(),
-    );
+    let rendered = hf_render(template, None, &multipart_user());
     assert_eq!(rendered, "STR:ab");
 }
 
@@ -67,11 +63,7 @@ fn auto_detection_treats_length_and_index_access_template_as_string() {
     // Length / index access on content must not be mistaken for a content loop.
     let template = "{%- for message in messages -%}len={{ message.content|length }};\
 first={{ message.content[0] }}{%- endfor -%}";
-    let rendered = hf_render(
-        template,
-        ChatTemplateContentFormatOption::Auto,
-        &multipart_user(),
-    );
+    let rendered = hf_render(template, None, &multipart_user());
     // String content "ab": length 2, index 0 is the character 'a'.
     assert_eq!(rendered, "len=2;first=a");
 }
@@ -80,11 +72,7 @@ first={{ message.content[0] }}{%- endfor -%}";
 fn auto_detection_treats_direct_content_loop_template_as_openai() {
     let template = "{%- for message in messages -%}\
 {%- for part in message.content -%}{{ part.text }}|{%- endfor -%}{%- endfor -%}";
-    let rendered = hf_render(
-        template,
-        ChatTemplateContentFormatOption::Auto,
-        &multipart_user(),
-    );
+    let rendered = hf_render(template, None, &multipart_user());
     // Each part surfaces as a structured `{text: ...}` object.
     assert_eq!(rendered, "a|b|");
 }
@@ -100,11 +88,7 @@ fn qwen_history() -> ChatRequest {
 #[test]
 fn qwen3_preserves_prior_assistant_completion_text_byte_identically() {
     let request = qwen_history();
-    let rendered = hf_render(
-        QWEN3_TEMPLATE,
-        ChatTemplateContentFormatOption::Auto,
-        &request,
-    );
+    let rendered = hf_render(QWEN3_TEMPLATE, None, &request);
 
     // The prior assistant turn's visible completion text must survive
     // intact inside the rendered prompt, framed by the assistant turn markers.
@@ -141,7 +125,7 @@ fn configured_template_preserves_tool_argument_order_via_items_iteration() {
     let request = base_request(assistant_tool_call_history(MIXED_ARGS));
     let template = "{%- set args = messages[1].tool_calls[0].function.arguments -%}\
 {%- for key, value in args.items() -%}{{ key }}={{ value }};{%- endfor -%}";
-    let rendered = hf_render(template, ChatTemplateContentFormatOption::Auto, &request);
+    let rendered = hf_render(template, None, &request);
 
     // Key order preserved; integer stays 2; `1.00` -> 1.0; array stringified.
     assert_eq!(rendered, "zulu=2;alpha=1.0;mike=hi;delta=[3, 4];");
@@ -154,7 +138,7 @@ fn configured_template_tojson_preserves_key_order_and_number_precision() {
     let request = base_request(assistant_tool_call_history(MIXED_ARGS));
     let template =
         "{{ messages[1].tool_calls[0].function.arguments|tojson(separators=[',', ':']) }}";
-    let rendered = hf_render(template, ChatTemplateContentFormatOption::Auto, &request);
+    let rendered = hf_render(template, None, &request);
 
     assert_eq!(
         rendered,

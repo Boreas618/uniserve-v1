@@ -18,7 +18,7 @@
 //! independent.
 
 pub use proto::config::{
-    ChatConfig, ChatTemplateContentFormatOption, ImageFetchConfig, LoadConfig, LoggingConfig,
+    ChatConfig, ChatTemplateContentFormat, ImageFetchConfig, LoadConfig, LoggingConfig,
     MediaConfig, MigrationConfig, ReasoningParser, ServerConfig, VideoConfig, VideoJobConfig,
 };
 use std::num::NonZeroU32;
