@@ -18,7 +18,8 @@
 //! - `capacity`, the exchange's rows per rank on a deployment that shards the experts, which the
 //!   exchange path refuses as zero because that is the size of its buffers;
 //! - `buckets`, the row counts the executor captures, because **the dense packed product is compiled
-//!   per row count**: its grid is `m` rows, so a module serves one `m` and the deployment states the
+//!   per row class**: its grid is `m` rows, so a module serves one `m`, a count rounds up to the
+//!   smallest class that holds it (`nn::layers::PACKED_M_CLASSES`), and the deployment states the
 //!   finite set it pads to (`specs/replaceable-processes.md`: "a forward no bucket holds is an error,
 //!   never an eager fallback"). An empty list is refused when the projections are packed, because a
 //!   store built from it would hold no product for any row count the executor runs.
@@ -26,7 +27,7 @@
 //! The asymmetry is worth reading twice: the **expert** products' grid is over *routes*
 //! (tokens × top, computed at launch) and their keys carry no row count, so `buckets` does not
 //! multiply them, and the encoder's grid covers its rows in one launch so it is keyed by `columns`,
-//! not by `m`. Only `nvfp4_gemm` — the dense encoded product — is per bucket.
+//! not by `m`. Only `nvfp4_gemm` — the dense encoded product — is per row class.
 //!
 //! # What is not here
 //!
@@ -102,7 +103,7 @@ impl Qwen3Moe {
 /// `experts_encoded` states that the checkpoint's expert stacks are calibrated NVFP4, which makes
 /// every routed layer's step encode its activations and read the packed products; `projections_packed`
 /// states the same for the attention and dense-MLP projections, whose product is
-/// [`ops::fp4::Nvfp4Gemm`] and is compiled **once per entry of `buckets`**.
+/// [`ops::fp4::Nvfp4Gemm`] and is compiled **once per row class `buckets` reach**.
 #[allow(clippy::too_many_arguments)]
 pub fn keys(
     config: &Config,
