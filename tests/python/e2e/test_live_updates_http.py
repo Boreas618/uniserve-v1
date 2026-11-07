@@ -16,9 +16,8 @@ and the server the daemon starts there is stopped at the end).
   the cached prefix pages; scheduling limits within the batch the workers
   were started for change in place while a request streams, and a change
   of the decode batch sizes is a world change under the same stream,
-  which the operator commits; a worker hook no plugin implements fails
-  with that reason; the manager attaches to the node, follows its events
-  and detaches while it serves.
+  which the operator commits; the manager attaches to the node, follows
+  its events and detaches while it serves.
 - A world change while another process holds the device's free storage
   gives back the tail of the serving world's KV cache for the successor,
   and the committed successor grows its cache into the storage the
@@ -986,11 +985,6 @@ def test_a_serving_deployment_answers_its_admin_api(
             "the engine took the new scheduling limits in place" in line
             for line in _log_lines(log)
         )
-
-        # A worker hook no plugin implements fails with that reason.
-        hook = _admin(base_url, "hooks/plugin_probe", {"probe": 1})
-        assert hook.status_code >= 400, hook.text
-        assert "no plugin implements the worker hook" in hook.text, hook.text
 
         # The manager attaches, follows the node's events and detaches.
         manager = shutil.which("uniserve-manager") or str(

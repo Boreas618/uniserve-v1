@@ -37,6 +37,7 @@ pub mod capacity;
 pub mod completion;
 pub mod control;
 pub mod config;
+pub mod data_plane;
 pub mod error;
 pub mod host;
 pub mod hot_update;

@@ -295,7 +295,7 @@ fn a_migration_reuses_the_pages_of_the_tokens_it_generated() {
 /// How the executors of [`FaultingExecutor`] fail once told to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Fault {
-    /// Every poll fails, as an executor process's exit does.
+    /// Every poll fails, as a lost executor's does.
     Lost,
     /// Every call reports non-finite logits, as an executor whose forward
     /// produced a NaN does (`ErrorCode::NumericalFault`).
@@ -358,7 +358,7 @@ impl engine::Executor for FaultingExecutor {
         }
         let fault = *self.fault.lock().unwrap();
         if fault == Some(Fault::Lost) {
-            return Err(anyhow::anyhow!("worker process exited"));
+            return Err(anyhow::anyhow!("the executor was lost"));
         }
         let failed = self
             .refused_batches
@@ -563,7 +563,7 @@ fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
         "{terminal:?}"
     );
     let failure = failure.expect("the scheduler reports its first error");
-    assert!(failure.contains("worker process exited"), "{failure}");
+    assert!(failure.contains("the executor was lost"), "{failure}");
 }
 
 /// An image-generating request leaves as migratable for a loss when the

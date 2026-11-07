@@ -288,7 +288,7 @@ enum Kind {
     /// descriptor that maps it, which this process exports it by.
     Mapped {
         mapping: Mutex<PeerMapping>,
-        descriptor: Option<OwnedFd>,
+        descriptor: Mutex<Option<OwnedFd>>,
     },
     /// Host storage the Storage Server retains: a memfd mapped into this
     /// process and registered for device copies.
@@ -511,7 +511,7 @@ impl Storage {
         Arc::new(Self {
             kind: Kind::Mapped {
                 mapping: Mutex::new(mapping),
-                descriptor: None,
+                descriptor: Mutex::new(None),
             },
         })
     }
@@ -635,7 +635,7 @@ impl Storage {
         let storage = Arc::new(Self {
             kind: Kind::Mapped {
                 mapping: Mutex::new(mapping),
-                descriptor: Some(descriptor),
+                descriptor: Mutex::new(Some(descriptor)),
             },
         });
         lock(&EXPORTABLE).insert(address, (Arc::downgrade(&storage), Residency::Resident));
@@ -742,13 +742,17 @@ impl Storage {
     pub(crate) fn export(&self, cross_hosts: bool) -> Result<Option<ShareableHandle>> {
         match &self.kind {
             Kind::Device(allocation) => Ok(allocation.export()?),
-            Kind::Mapped {
-                descriptor: Some(descriptor),
-                ..
-            } if !cross_hosts => descriptor
-                .try_clone()
-                .map(|descriptor| Some(ShareableHandle::Descriptor(descriptor)))
-                .map_err(|error| Error::transport_source("duplicating a descriptor", error)),
+            Kind::Mapped { descriptor, .. } if !cross_hosts => lock(descriptor)
+                .as_ref()
+                .map(|descriptor| {
+                    descriptor
+                        .try_clone()
+                        .map(ShareableHandle::Descriptor)
+                        .map_err(|error| {
+                            Error::transport_source("duplicating a descriptor", error)
+                        })
+                })
+                .transpose(),
             _ => Ok(None),
         }
     }
@@ -785,11 +789,11 @@ impl Storage {
         let (
             Kind::Mapped {
                 mapping: target,
-                descriptor: None,
+                descriptor: target_descriptor,
             },
             Kind::Mapped {
                 mapping: source,
-                descriptor: None,
+                descriptor: source_descriptor,
             },
         ) = (&self.kind, &source.kind)
         else {
@@ -797,7 +801,51 @@ impl Storage {
                 "alias replacement requires composite mappings",
             ));
         };
-        Ok(lock(target).remap_from(&lock(source))?)
+        if lock(target_descriptor).is_some() || lock(source_descriptor).is_some() {
+            return Err(Error::State(
+                "alias replacement requires composite mappings",
+            ));
+        }
+        Ok(lock(target).remap_from(&lock(source), Protection::ReadWrite)?)
+    }
+
+    /// Puts the physical allocation `source` maps at this storage's address: a retained weight
+    /// takes another retained allocation's bytes while every pointer to it, a captured graph's
+    /// among them, stays what it was (§7.6). `source` keeps its own mapping until its owner drops
+    /// it, and this storage exports what it maps now.
+    ///
+    /// No device work may read this storage during the call. A failure after the driver unmapped
+    /// the old allocation leaves the address unusable, and the caller retires the rank.
+    pub(crate) fn rebind_retained(&self, source: &Self) -> Result<()> {
+        let (
+            Kind::Mapped {
+                mapping: target,
+                descriptor: target_descriptor,
+            },
+            Kind::Mapped {
+                mapping: source,
+                descriptor: source_descriptor,
+            },
+        ) = (&self.kind, &source.kind)
+        else {
+            return Err(Error::State(
+                "only a retained device mapping takes another retained allocation",
+            ));
+        };
+        let replacement = lock(source_descriptor)
+            .as_ref()
+            .map(|descriptor| {
+                descriptor
+                    .try_clone()
+                    .map_err(|error| Error::transport_source("duplicating a descriptor", error))
+            })
+            .transpose()?
+            .ok_or(Error::State(
+                "only a retained device mapping takes another retained allocation",
+            ))?;
+        lock(target).remap_from(&lock(source), Protection::ReadOnly)?;
+        *lock(target_descriptor) = Some(replacement);
+        Ok(())
     }
 
     /// The live exportable allocation containing `address`, with the
@@ -841,8 +889,8 @@ impl Drop for Storage {
             }
             Kind::Mapped {
                 mapping,
-                descriptor: Some(_),
-            } => Some(lock(mapping).address()),
+                descriptor,
+            } if lock(descriptor).is_some() => Some(lock(mapping).address()),
             _ => None,
         };
         if let Some(address) = registered {

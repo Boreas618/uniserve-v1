@@ -55,7 +55,7 @@ fn request(id: u64, length: u32, first: u32) -> GenerationRequest {
 /// serving: a request submitted meanwhile waits rather than failing, and it
 /// completes on the replacement.
 #[test]
-fn an_engine_serves_once_its_only_group_is_relaunched() {
+fn an_engine_serves_once_its_only_group_is_replaced() {
     let mut sim = SimEngine::new();
     sim.set_text_len(16);
     let executor = SimExecutor::new(sim);
@@ -112,12 +112,8 @@ fn an_engine_serves_once_its_only_group_is_relaunched() {
 /// with it: the deployment's other group keeps its capacity and its readiness
 /// while the first is not ready, and the first takes work again once its
 /// replacement stands.
-///
-/// The launched-path case states the same events with two launches: one rank
-/// dies, its group's failure domain starts another, and the executor goes on
-/// serving the other group while that launch starts.
 #[test]
-fn a_relaunching_group_leaves_its_executor_serving_the_others() {
+fn a_group_being_replaced_leaves_its_executor_serving_the_others() {
     use engine::{Executor, ExecutorGroupId};
 
     let mut sim = SimEngine::new();
@@ -230,9 +226,6 @@ fn generate(
 
 /// An engine whose every group is lost, with no replacement coming, stops
 /// admitting work.
-///
-/// The launched path reaches the same scheduler state when its rank processes
-/// are killed and their recovery fails; here the executor states the loss.
 #[test]
 fn losing_every_worker_stops_request_admission() {
     use engine::{EngineConfig, Executor, ExecutorGroupId, SchedulerHandle, SubmitError};

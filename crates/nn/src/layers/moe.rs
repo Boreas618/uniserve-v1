@@ -30,9 +30,7 @@ use ops::moe::grouped::{
     GatherGemmNvfp4Args, GatherGemmNvfp4Descriptor, RouteGemm, RouteGemmArgs, RouteGemmDescriptor,
     RouteGemmNvfp4, RouteGemmNvfp4Args, RouteGemmNvfp4Descriptor,
 };
-use ops::moe::routing::{
-    ExpertGather, GatherArgs, GatherDescriptor, TopkArgs, TopkDescriptor, TopkSoftmax,
-};
+use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
 use ops::{DType, DevicePtr, Op, Shape, TensorView};
 
@@ -157,14 +155,6 @@ impl MoeGeometry {
             top: self.top as u32,
             renormalize,
             scale,
-        }
-    }
-
-    /// The descriptor that turns logical expert ids into this rank's weight rows.
-    pub fn map_descriptor(&self) -> GatherDescriptor {
-        GatherDescriptor {
-            experts: self.experts as u32,
-            top: self.top as u32,
         }
     }
 
@@ -1230,6 +1220,7 @@ impl Moe {
             scale: self.scale.as_ref().map(Weight::view),
             ids,
             weights,
+            map: self.map.as_ref().map(Weight::view),
         };
 
         f.operate::<TopkSoftmax>(&routing, args)?;
@@ -1245,24 +1236,9 @@ impl Moe {
 
         let ids = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
         let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
+        // The top-k writes each route's weight row: logical ids stop there.
         self.route(f, hidden, ids, weights)?;
-
-        // Logical ids become weight rows.
-        let local_ids = match &self.map {
-            Some(map) => {
-                let mapped = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
-                let descriptor = self.map_descriptor();
-                let args = GatherArgs {
-                    ids,
-                    map: map.view(),
-                    out: mapped,
-                };
-
-                f.operate::<ExpertGather>(&descriptor, args)?;
-                mapped
-            }
-            None => ids,
-        };
+        let local_ids = ids;
 
         // Group the routes by expert into the tiles the products read.
         let tiles = ops::moe::max_tiles(tokens, top, experts, u64::from(self.tile));
@@ -1412,12 +1388,6 @@ impl Moe {
             experts: u64::from(self.experts),
             tile: u64::from(self.tile),
         }
-    }
-
-    /// The descriptor that turns logical expert ids into this rank's weight rows. It is launched
-    /// only when the rank holds a subset of the experts.
-    pub fn map_descriptor(&self) -> GatherDescriptor {
-        self.geometry().map_descriptor()
     }
 
     /// The sort's descriptor, for a block whose rank holds `local_experts` experts.
@@ -1838,32 +1808,18 @@ impl Moe {
         let weights = arena.tensor(DType::F32, Shape::new(&[tokens, top]))?;
         self.router.forward(f, hidden, scores)?;
         let routing = self.topk_descriptor(scores.dtype);
+        // 2. The top-k writes weight rows, so logical ids stop before anything leaves the rank and
+        //    a peer sorts by the same physical order the weights are stacked in.
         let args = TopkArgs {
             scores,
             scale: self.scale.as_ref().map(Weight::view),
             ids,
             weights,
+            map: self.map.as_ref().map(Weight::view),
         };
 
         f.operate::<TopkSoftmax>(&routing, args)?;
-
-        // 2. Logical ids become weight rows before anything leaves the rank, so a peer sorts by the
-        //    same physical order the weights are stacked in.
-        let sent = match &self.map {
-            Some(map) => {
-                let mapped = arena.tensor(DType::I32, Shape::new(&[tokens, top]))?;
-                let descriptor = self.map_descriptor();
-                let args = GatherArgs {
-                    ids,
-                    map: map.view(),
-                    out: mapped,
-                };
-
-                f.operate::<ExpertGather>(&descriptor, args)?;
-                mapped
-            }
-            None => ids,
-        };
+        let sent = ids;
 
         // 3. Dispatch: each token's payload goes to the ranks that hold its experts.
         let exchange_descriptor = |mode: Mode| exchange::Descriptor {

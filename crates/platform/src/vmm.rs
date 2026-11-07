@@ -501,7 +501,11 @@ impl PeerMapping {
     ///
     /// A driver failure after unmapping leaves the destination unusable; its
     /// execution owner must retire it rather than resume numerical work.
-    pub fn remap_from(&mut self, source: &Self) -> Result<()> {
+    ///
+    /// `protection` is what the destination grants afterwards: a retained
+    /// weight stays read-only through the replacement, so no kernel can write
+    /// the storage the Storage Server shares.
+    pub fn remap_from(&mut self, source: &Self, protection: Protection) -> Result<()> {
         if self.device != source.device || self.bytes != source.bytes {
             return Err(Error::invalid(
                 "alias replacement requires one device and byte extent",
@@ -540,7 +544,7 @@ impl PeerMapping {
         for (offset, bytes, handle) in segments {
             self.range.map(offset, bytes, handle)?;
         }
-        self.range.grant(&self.access, Protection::ReadWrite)
+        self.range.grant(&self.access, protection)
     }
 
     /// Maps whole exportable allocations of one device contiguously, without

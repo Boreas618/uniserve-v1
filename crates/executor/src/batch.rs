@@ -832,6 +832,24 @@ pub trait Batches: Send + Sync {
         &[]
     }
 
+    /// Runs the storage operation `name` with the JSON `payload` on every rank, while no batch runs
+    /// (7.6), and answers each rank's JSON result.
+    ///
+    /// An executor with no storage of its own has nothing to change and nothing to report, which
+    /// is an empty answer: the mechanism reads it as a cache that is not split into segments.
+    fn hook(&self, _name: &str, _payload: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Puts the prepared expert redistribution of `order` in place, while no batch runs (7.6), and
+    /// answers each rank's result.
+    fn commit_experts(
+        &self,
+        _order: &std::collections::BTreeMap<String, Vec<u32>>,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
     /// Maps the host KV cache's page pools on this rank's devices, `tokens` tokens of each cache
     /// group, and copies pages through them from now on. Answers each pool's name with its ranks'
     /// pools, in rank order, as the mechanism keys the host KV cache by them. An executor that keeps
@@ -903,6 +921,8 @@ pub struct Executors {
     inventory: Vec<Inventory>,
     /// What keys this rank's pages in the host KV cache, when the deployment keeps one.
     host_cache: Option<HostCacheKeys>,
+    /// What the storage operations of 7.6 reach, on a rank that keeps storage at a Storage Server.
+    data: Option<Arc<crate::data_plane::DataPlane>>,
 }
 
 impl Executors {
@@ -922,6 +942,7 @@ impl Executors {
             executors,
             inventory: Vec::new(),
             host_cache: None,
+            data: None,
         })
     }
 
@@ -929,6 +950,13 @@ impl Executors {
     #[must_use]
     pub fn keeping_host_cache(mut self, keys: HostCacheKeys) -> Self {
         self.host_cache = Some(keys);
+        self
+    }
+
+    /// States what the storage operations of 7.6 reach on this rank.
+    #[must_use]
+    pub fn with_data_plane(mut self, data: Arc<crate::data_plane::DataPlane>) -> Self {
+        self.data = Some(data);
         self
     }
 
@@ -1103,6 +1131,23 @@ impl Batches for Executors {
             .pop()
             .ok_or_else(|| crate::Error::Invalid("this rank holds no device".to_owned()))?;
         Ok(first.joined(submissions))
+    }
+
+    fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>> {
+        match &self.data {
+            Some(data) => data.operate(name, payload),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn commit_experts(
+        &self,
+        order: &std::collections::BTreeMap<String, Vec<u32>>,
+    ) -> Result<Vec<String>> {
+        match &self.data {
+            Some(data) => data.commit_experts(order),
+            None => Ok(Vec::new()),
+        }
     }
 }
 

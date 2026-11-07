@@ -272,7 +272,6 @@ pub fn keys(
                 moe.topk_descriptor(dtype, config.norm_topk_prob, None)
                     .to_string(),
             );
-            push("expert_gather", moe.map_descriptor().to_string());
             // The sort covers the experts this rank owns: every expert of a dense deployment, its
             // own shard under expert parallelism.
             let local = width(partition.expert_range(config).len(), "local expert count")?;

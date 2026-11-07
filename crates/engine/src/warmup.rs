@@ -180,7 +180,7 @@ pub(crate) fn groups(
     let servable = |what: &str, requests: Vec<GenerationRequest>| {
         // A deployment with block sampling generates every request but a
         // readout in canvases, so admission checks its canvas features.
-        let canvases = config.worker_process.canvas_sampling.is_some();
+        let canvases = config.canvas_sampling.is_some();
         let (kept, refused): (Vec<_>, Vec<_>) = requests.into_iter().partition(|request| {
             let needs = if canvases && !request.is_readout() {
                 request.canvas_features()
@@ -227,7 +227,7 @@ pub(crate) fn groups(
     }
 
     if info.diffusion_lm_step_rows > 0 {
-        let sampling = config.worker_process.canvas_sampling.context(
+        let sampling = config.canvas_sampling.context(
             "executors report diffusion LM step rows but the deployment has no block sampling",
         )?;
         let length = sampling.canvas_length as usize;
@@ -302,7 +302,7 @@ pub(crate) fn warm(core: &Warm, config: &EngineConfig) -> anyhow::Result<()> {
         .iter()
         .flat_map(|worker| &worker.ranks)
         .any(|rank| rank.device == "cuda" || rank.device.starts_with("cuda:"));
-    if config.worker_process.stub || !on_cuda {
+    if !on_cuda {
         return Ok(());
     }
 
@@ -597,7 +597,7 @@ mod tests {
             confidence_threshold: 0.005,
             stability_threshold: 1,
         };
-        // The ranks are launched with the deployment's block sampling.
+        // The ranks run under the deployment's block sampling.
         sim.set_canvas_sampling(canvas);
 
         let groups = groups_of(sim, |config| {
@@ -605,7 +605,7 @@ mod tests {
                 features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::TOKEN_DENOISING,
                 ..config.generation_limits.clone()
             };
-            config.worker_process.canvas_sampling = Some(canvas);
+            config.canvas_sampling = Some(canvas);
         });
 
         let rows: Vec<usize> = groups
