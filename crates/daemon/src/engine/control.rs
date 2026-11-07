@@ -538,6 +538,44 @@ impl EngineControl {
         Ok(storage)
     }
 
+    /// The storage ledgers every node's Storage Server keeps for the deployment, one JSON report
+    /// per node: `{"host": ..., "ledgers": [...], "host_storage": {...}, "transfers": [...]}`.
+    /// Each node's daemon reads them over its claim, so no main process is asked.
+    pub(crate) fn storage_reports(&self) -> anyhow::Result<Vec<String>> {
+        let (mut connection, nodes) = self.connect()?;
+        let mut reports = Vec::with_capacity(nodes.len());
+        for (index, node) in nodes.iter().enumerate() {
+            let host = node.host.clone();
+            connection.send(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: index as u64 + 1,
+                    kind: Some(request::Kind::Ledger(process::LedgerQuery {
+                        host: host.clone(),
+                        deployment: self.deployment.clone(),
+                    })),
+                })),
+            })?;
+            let answer: process::Downstream = connection
+                .recv(DAEMON_TIMEOUT)?
+                .context("the daemon did not report its storage ledgers")?;
+            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
+                anyhow::bail!("the daemon did not answer its ledger query");
+            };
+            anyhow::ensure!(
+                answer.error.is_empty(),
+                "the storage ledgers of {host}: {}",
+                answer.error
+            );
+            let Some(reply::Kind::Ledger(report)) = answer.kind else {
+                anyhow::bail!("the daemon returned no storage ledger");
+            };
+            let mut report: serde_json::Value = serde_json::from_str(&report.ledgers)?;
+            report["host"] = serde_json::Value::String(host);
+            reports.push(report.to_string());
+        }
+        Ok(reports)
+    }
+
     /// Publishes one commit decision at every deployment node. Publication
     /// is atomic within each Storage Server and idempotent across retries;
     /// the daemon retains its commit decision until every node has answered.

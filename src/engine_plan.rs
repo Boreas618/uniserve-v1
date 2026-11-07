@@ -182,6 +182,9 @@ pub(crate) struct EpochPlan {
     /// The world whose cache planes this rank maps, on a standby: it serves from the planes its
     /// predecessor serves from, whose segments that world created.
     cache_world: Option<u64>,
+    /// The planes of the world `cache_world` names, as that world laid them out: what a standby
+    /// maps is the serving rank's cache, which only that rank sized.
+    adopted_cache: Option<ipc::CacheTable>,
     /// Ranks in the deployment, whose minimum the cache plan's block size and slot count are
     /// agreed by (§4.1).
     world_size: usize,
@@ -346,6 +349,7 @@ impl EpochPlan {
             rank: launch.rank,
             world: launch.world,
             cache_world: None,
+            adopted_cache: None,
             world_size: launch.world_size as usize,
             queue_depth: launch.queue_depth as usize,
             group: launch.group.clone(),
@@ -381,8 +385,13 @@ impl EpochPlan {
     }
 
     /// This plan on the cache planes of `world`, when this rank stands by for that world's process.
-    pub(crate) fn sharing_cache_of(mut self, world: Option<u64>) -> Self {
+    pub(crate) fn sharing_cache_of(
+        mut self,
+        world: Option<u64>,
+        table: Option<ipc::CacheTable>,
+    ) -> Self {
         self.cache_world = world;
+        self.adopted_cache = table;
         self
     }
 
@@ -1432,6 +1441,14 @@ impl EpochPlan {
                     max_batch_tokens: tokens as usize,
                     max_request_pool_size: self.build.max_running_requests.get(),
                     max_model_len: self.max_kv_len(served)? as usize,
+                    max_total_tokens: self
+                        .build
+                        .kv_cache
+                        .max_tokens
+                        .map(|tokens| usize::try_from(tokens.get()))
+                        .transpose()
+                        .context("kv_cache_config.max_tokens")?,
+                    segments: self.adopted_cache.clone(),
                     mem_fraction_static: self.build.mem_fraction_static,
                     cache: Some(cache),
                     kv_dtype: cache_dtype(model, self.build.kv_cache.dtype)?,
@@ -1454,6 +1471,8 @@ impl EpochPlan {
                     max_batch_tokens: tokens as usize,
                     max_request_pool_size: self.build.max_running_requests.get(),
                     max_model_len: self.max_kv_len(served)? as usize,
+                    max_total_tokens: None,
+                    segments: None,
                     mem_fraction_static: self.build.mem_fraction_static,
                     cache: None,
                     // The media plan fits no cache, so this figure is never read: it states the

@@ -114,6 +114,7 @@ impl DeviceBudget {
 
     /// Device storage this process holds on `device`, with the storages its
     /// scope retains there.
+    #[allow(dead_code, reason = "the warm booking reads `own_bytes`; this states the whole")]
     pub(crate) fn process_bytes(&self, device: DeviceId) -> Result<u64> {
         Ok(self.own_bytes(device)? + self.retained.scope_bytes(device)?.held)
     }

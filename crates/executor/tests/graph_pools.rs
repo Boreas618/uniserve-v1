@@ -322,7 +322,7 @@ fn a_purge_keeps_the_graph_a_live_generation_still_serves() {
     // generation over the zeroed buffer is 20. A shared or re-pointed node would show the serving
     // generation's 1 (2) or nothing at all.
     assert_eq!(
-        replay(&stream, live.exec(), data),
+        replay(&stream, &live.exec(), data),
         vec![20; WORDS],
         "the live generation's graph no longer adds its own value (10) twice"
     );

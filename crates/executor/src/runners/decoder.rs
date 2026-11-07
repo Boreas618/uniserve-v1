@@ -1334,6 +1334,7 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()
                     },
+                    forward_stats: None,
                 })
             }
             Job::Capture {

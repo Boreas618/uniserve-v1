@@ -149,6 +149,9 @@ pub struct BatchOutput {
     /// the step on the host. `copy_us` is zero in-process and states a fact rather than a
     /// measurement: nothing is transferred for the completion, since the mechanism reads it here.
     pub timing: TimingCounters,
+    /// What this rank's counters, probes and profiling session accumulated since its last result,
+    /// which the scheduler adds into its statistics. Empty and absent while nothing observes it.
+    pub forward_stats: Option<ipc::ForwardStats>,
 }
 
 /// One batch: one phase of one step, as the mechanism assembles it.
@@ -1097,6 +1100,8 @@ pub enum JobKind {
     Sleep,
     /// Mapping the released cache segments again, with the unit resets that follow (2.5).
     Wake,
+    /// A change of the rank's profiling session.
+    Profile,
     /// A job that only waits for the events it was given.
     After,
 }
@@ -1119,6 +1124,7 @@ impl JobKind {
             Self::Discard => "discard",
             Self::Sleep => "sleep",
             Self::Wake => "wake",
+            Self::Profile => "profile",
             Self::After => "after",
         }
     }
