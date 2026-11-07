@@ -1137,6 +1137,7 @@ mod tests {
                 commands: Vec::new(),
                 worker_exec_us: 0,
                 prefill: true,
+                tokens: 0,
                 measured: None,
             },
         );

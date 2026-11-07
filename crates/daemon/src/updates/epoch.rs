@@ -50,12 +50,17 @@ pub(crate) struct EpochChange {
     pub(crate) group: String,
     /// How the target's main processes are started.
     pub(crate) start: Start,
+    /// The world the serving epoch executes.
+    pub(crate) previous_world: u64,
     /// The serving epoch's launch generation.
     pub(crate) previous_generation: u64,
     /// The launch generation the target's children are spawned at, from
     /// `Epochs::next_generation`: above every live generation of the group
     /// and rank, the serving epoch's standby included.
     pub(crate) spawn_generation: u64,
+    /// What the previous epoch keeps through the trial
+    /// (`update_config.previous_world`).
+    pub(crate) keeps: crate::options::PreviousWorld,
 }
 
 /// Runs the epoch layer of a change into `running`, or says the change is
@@ -115,7 +120,7 @@ pub(crate) fn epoch_arm(
         change.update,
         change.target,
         record,
-        change.previous,
+        (change.previous, change.previous_world),
         change.previous_generation,
         change.spawn_generation,
         change.group,
@@ -123,6 +128,7 @@ pub(crate) fn epoch_arm(
         change.start,
         requests,
         Vec::new(),
+        change.keeps,
     );
     switch.start(roster);
     let report = report(&switch);
@@ -211,6 +217,9 @@ pub(crate) fn report(switch: &Switch) -> Value {
             "reason": failure.reason,
             "device": failure.device,
         })),
+        "previous_world_kept": switch.previous_kept(),
+        "host_refused": switch.host_refused(),
+        "moved_to_host_bytes": switch.moved_bytes(),
     })
 }
 
@@ -359,8 +368,10 @@ mod tests {
                 },
                 environment: HashMap::new(),
             },
+            previous_world: 11,
             previous_generation: 5,
             spawn_generation: 7,
+            keeps: crate::options::PreviousWorld::Parked,
         }
     }
 

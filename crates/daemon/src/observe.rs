@@ -49,10 +49,6 @@ const OBSERVED: Duration = Duration::from_secs(600);
 impl Observer {
     /// Records the report of scheduler `scheduler` of `world`.
     pub(crate) fn record(&self, world: u64, scheduler: u32, stats: &SchedulerStats) {
-        let tokens = stats
-            .worker_forward_stats
-            .as_ref()
-            .map_or(0, |forward| forward.mode_tokens.values().sum());
         if let Some(forward) = &stats.worker_forward_stats {
             let mut profile = locked(&self.profile);
             for (key, value) in &forward.profile {
@@ -67,7 +63,7 @@ impl Observer {
             scheduler,
             batch_us: stats.batch_roundtrip_us,
             batches: stats.batch_count,
-            tokens,
+            tokens: stats.batch_tokens,
             numerical_faults: stats.numerical_faults,
         });
         while samples
@@ -83,12 +79,18 @@ impl Observer {
     pub(crate) fn rates(&self, world: u64, since: Instant, window: Duration) -> Option<Rates> {
         let now = Instant::now();
         let from = since.max(now.checked_sub(window).unwrap_or(since));
+        self.rates_between(world, from, now)
+    }
+
+    /// `world`'s rates over the reports it made in `[from, until)`; `None`
+    /// without a batch among them.
+    pub(crate) fn rates_between(&self, world: u64, from: Instant, until: Instant) -> Option<Rates> {
         let samples = locked(&self.samples);
         let (mut batch_us, mut batches, mut tokens) = (0_u64, 0_u64, 0_u64);
         let mut first: Option<Instant> = None;
         for sample in samples
             .iter()
-            .filter(|sample| sample.world == world && sample.at >= from)
+            .filter(|sample| sample.world == world && sample.at >= from && sample.at < until)
         {
             batch_us += sample.batch_us;
             batches += sample.batches;
@@ -98,8 +100,8 @@ impl Observer {
         if batches == 0 {
             return None;
         }
-        let span = now
-            .duration_since(first.unwrap_or(from))
+        let span = until
+            .saturating_duration_since(first.unwrap_or(from))
             .max(Duration::from_secs(1));
         Some(Rates {
             step_us: batch_us as f64 / batches as f64,
@@ -152,17 +154,13 @@ impl Observer {
 mod tests {
     use super::*;
     use proto::report::SchedulerStats;
-    use std::collections::BTreeMap;
 
     fn stats(batch_us: u64, batches: u64, tokens: u64, faults: u64) -> SchedulerStats {
         SchedulerStats {
             batch_roundtrip_us: batch_us,
             batch_count: batches,
             numerical_faults: faults,
-            worker_forward_stats: Some(proto::report::ForwardStats {
-                mode_tokens: BTreeMap::from([("decode".to_owned(), tokens)]),
-                ..Default::default()
-            }),
+            batch_tokens: tokens,
             ..Default::default()
         }
     }
@@ -184,5 +182,22 @@ mod tests {
         assert_eq!(observer.numerical_faults(1, since), 0);
         assert_eq!(observer.numerical_faults(2, since), 2);
         assert!(observer.rates(3, since, Duration::from_secs(60)).is_none());
+    }
+
+    /// A report counts toward the span it arrived in: the steps of a span
+    /// that ended are read apart from the ones after it.
+    #[test]
+    fn rates_between_read_the_reports_of_one_span() {
+        let observer = Observer::default();
+        let started = Instant::now();
+        observer.record(1, 0, &stats(1_000, 10, 500, 0));
+        let ended = Instant::now();
+        std::thread::sleep(Duration::from_millis(2));
+        observer.record(1, 0, &stats(9_000, 10, 500, 0));
+        let rates = observer
+            .rates_between(1, started, ended)
+            .expect("the span holds a report");
+        assert!((rates.step_us - 100.0).abs() < 1e-9, "{rates:?}");
+        assert_eq!(observer.rates_between(1, ended, ended), None);
     }
 }

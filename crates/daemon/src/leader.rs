@@ -150,6 +150,8 @@ pub(crate) struct SwitchTarget {
     pub(crate) engine: u64,
     /// The epoch the target serves.
     pub(crate) epoch: u64,
+    /// The options that govern this update (`update_config`, with what its own `set` stated).
+    pub(crate) update: crate::options::UpdateOptions,
 }
 
 /// Records each scheduler's statistics under `model_name`, and with
@@ -1427,6 +1429,7 @@ impl Leader {
         &self,
         number: u64,
         target: &ServeConfig,
+        options: &crate::options::UpdateOptions,
         force: bool,
         dry_run: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
@@ -1471,6 +1474,7 @@ impl Leader {
         let epochs = Arc::clone(&self.epochs());
         let processes = self.main_processes();
         let recorded = update.clone();
+        let promotion = std::time::Instant::now();
         tokio::task::spawn_blocking(move || epochs.apply_programs(update, processes, force))
             .await
             .map_err(|error| UpdateError::Failed(anyhow::anyhow!("applying the update: {error}")))?
@@ -1486,7 +1490,76 @@ impl Leader {
         for replica in self.replicas.serving.borrow().iter() {
             replica.restart_standby();
         }
+        self.watch_program_trial(number, options, promotion);
         Ok(Some(recorded))
+    }
+
+    /// Reads update `number`'s thresholds for as long as it stands on probation in the serving
+    /// epoch (§7.3 step 4), and reverts it through the path a main process's failure takes once
+    /// one is passed. Serving and the update share a world, so the baseline ends at `promotion`,
+    /// when the update began to switch, and the trial's reports begin after the switch.
+    fn watch_program_trial(
+        &self,
+        number: u64,
+        options: &crate::options::UpdateOptions,
+        promotion: std::time::Instant,
+    ) {
+        let window = options.rollback.window;
+        let observed = self
+            .replicas()
+            .iter()
+            .filter_map(|replica| {
+                let world = replica.hold.client()?.world();
+                Some(crate::updates::trial::Observed::new(
+                    Arc::clone(&replica.observer),
+                    world,
+                    world,
+                    window,
+                    promotion,
+                ))
+            })
+            .collect();
+        let trial = Arc::new(crate::updates::trial::Trial::begin(
+            options.rollback.clone(),
+            observed,
+            outcomes(),
+        ));
+        self.updates.begin_trial(Arc::clone(&trial));
+        let updates = Arc::clone(&self.updates);
+        let epochs = Arc::clone(&self.epochs());
+        tokio::spawn(async move {
+            let standing = Arc::clone(&epochs);
+            let reverting = Arc::clone(&epochs);
+            crate::updates::trial::watch(
+                &trial,
+                outcomes,
+                move || {
+                    standing
+                        .program_update()
+                        .is_some_and(|program| program.update.number == number)
+                },
+                move |failure| async move {
+                    warn!(
+                        number,
+                        kind = %failure.kind,
+                        reason = %failure.reason,
+                        "the update on trial passed a rollback threshold; it reverts"
+                    );
+                    let _ = tokio::task::spawn_blocking(move || {
+                        reverting.program_failure(failure)
+                    })
+                    .await;
+                },
+            )
+            .await;
+            updates.end_trial(serde_json::json!({
+                "change": "program",
+                "update": number,
+                "failure": epochs.update().and_then(|update| update.unavailable().map(|failure| {
+                    serde_json::json!({ "kind": failure.kind, "reason": failure.reason })
+                })),
+            }));
+        });
     }
 
     /// Ends update `number`'s program-layer probation: every main process
@@ -1970,6 +2043,10 @@ pub(crate) struct Replica {
     /// successor owns its life then, and a watch that sees its client go away
     /// must not relaunch it.
     pub(crate) handed_over: AtomicBool,
+    /// Whether an epoch switch owns this replica's engines: from the moment its target serves
+    /// until the switch settled and the hold names the epoch that serves on. An engine lost
+    /// meanwhile is the switch's to judge, not the watcher's to relaunch.
+    following: AtomicBool,
 }
 
 impl Replica {
@@ -2007,6 +2084,7 @@ impl Replica {
             standby_starting: tokio::sync::Mutex::new(()),
             programs_serve: std::sync::atomic::AtomicBool::new(false),
             handed_over: AtomicBool::new(false),
+            following: AtomicBool::new(false),
         });
         hold.serve(client);
         replica
@@ -2052,11 +2130,35 @@ impl Replica {
             leader,
             engine,
             epoch,
+            update,
         } = target;
         let mut served = updates.epochs().served();
         let serving_config = config.clone();
         let publishing = Arc::clone(&control);
         tokio::spawn(async move {
+            // While the target prepares, its transfers yield to the serving epoch's steps
+            // (`update_config.transfer_slowdown`); the guard ends that however the preparation ends.
+            let preparing = tokio_util::sync::CancellationToken::new();
+            let preparation = preparing.clone().drop_guard();
+            if let Some(serving) = replica.hold.client() {
+                let steps = Arc::new(std::sync::Mutex::new(
+                    crate::interference::StepTime::default(),
+                ));
+                updates.watch_transfers(Arc::clone(&steps));
+                let throttling = crate::interference::Throttling::new(
+                    &replica.observer,
+                    serving.world(),
+                    update.transfer_slowdown,
+                    std::time::Instant::now(),
+                );
+                tokio::spawn(crate::interference::control(
+                    Arc::clone(&publishing) as Arc<dyn crate::interference::Throttle>,
+                    vec![(Arc::clone(&replica.observer), throttling)],
+                    crate::interference::INTERVAL,
+                    preparing,
+                    steps,
+                ));
+            }
             let sink = stats_sink(
             replica.model_name.clone(),
             Arc::clone(&replica.observer),
@@ -2082,6 +2184,12 @@ impl Replica {
             // once it holds them.
             let host = config.host_identity.clone();
             let handing = Arc::clone(updates.epochs());
+            let target_page = spec
+                .kv_cache
+                .as_ref()
+                .and_then(|kv| kv.block_size)
+                .unwrap_or(0);
+            let mut source = None;
             let handed = tokio::task::spawn_blocking(move || {
                 // The update names backends, and a revision is the Program Server's to select.
                 let steps = crate::engine::control::PrepareSteps::new();
@@ -2101,7 +2209,10 @@ impl Replica {
             })
             .await;
             match handed {
-                Ok(Ok(())) => updates.handed(&host),
+                Ok(Ok(())) => {
+                    source = replica.warm_target(&updates, &update, target_page).await;
+                    updates.handed(&host);
+                }
                 Ok(Err(failure)) => {
                     warn!(engine, "the switch's target took no programs: {}", failure.reason);
                     updates.rollback(&failure.reason);
@@ -2113,12 +2224,45 @@ impl Replica {
                     return;
                 }
             }
-            while *served.borrow_and_update() < epoch {
-                if served.changed().await.is_err() {
-                    return;
+            let settled = async {
+                while !updates.settled() {
+                    tokio::time::sleep(crate::updates::trial::POLL).await;
                 }
+            };
+            let promoted = async {
+                while *served.borrow_and_update() < epoch {
+                    if served.changed().await.is_err() {
+                        return false;
+                    }
+                }
+                true
+            };
+            let served_target = tokio::select! {
+                promoted = promoted => promoted,
+                () = settled => false,
+            };
+            if !served_target {
+                // The target fell before the frontend moved: the serving epoch serves on, at the
+                // prefill budget it was configured with.
+                if let Some(source) = source.take() {
+                    restore_prefill(source).await;
+                }
+                return;
+            }
+            drop(preparation);
+            // The promotion restores the prefill budget the warming limited.
+            if let Some(source) = source.take() {
+                restore_prefill(source).await;
+            }
+            // The target maps the serving epoch's cache storage, and two epochs must not write it
+            // at once: a request reaches the target only once the epoch that serves stopped
+            // stepping. The drained epoch's state says the requests that move wait meanwhile.
+            while updates.phase() == Some(crate::updates::switch::Phase::Serving) {
+                tokio::time::sleep(DRAIN_POLL).await;
             }
             spec.predecessor = None;
+            replica.following.store(true, Ordering::SeqCst);
+            let world = spec.world;
             let before = locked(&replica.served).replace(spec);
             // The configuration is the one the target serves from here, as the spec is, and a
             // revert puts both back: the next apply starts from it, and the operator reads it.
@@ -2129,19 +2273,86 @@ impl Replica {
             replica.hold.serve(Arc::clone(&client));
             tokio::spawn(watch_engine(Arc::clone(&replica), Arc::downgrade(&client)));
             info!(engine, epoch, "the switch's target serves this replica");
+            // The trial (§7.3 step 4, §7.4 step 3): the steps the previous epoch served before the
+            // promotion are what the target's are read against, until the switch settles.
+            let promoted = updates
+                .promotion()
+                .map_or_else(std::time::Instant::now, |(promoted, _)| promoted);
+            let previous_world = previous.as_ref().map_or(0, |client| client.world());
+            let trial = Arc::new(crate::updates::trial::Trial::begin(
+                update.rollback.clone(),
+                vec![crate::updates::trial::Observed::new(
+                    Arc::clone(&replica.observer),
+                    world,
+                    previous_world,
+                    update.rollback.window,
+                    promoted,
+                )],
+                outcomes(),
+            ));
+            updates.begin_trial(Arc::clone(&trial));
+            let mut relaunched = None;
+            let host = locked(&replica.config).host_identity.clone();
+            let mut keeps = update.previous_world != crate::options::PreviousWorld::Parked;
             while !updates.settled() {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                // The trial stopped the previous epoch's process: once it ended its node keeps
+                // the weights alone.
+                if keeps
+                    && previous
+                        .as_ref()
+                        .is_some_and(|client| client.state() == EngineState::Closed)
+                {
+                    keeps = false;
+                    updates.previous_ended(&host);
+                }
+                if let Some(failure) = trial.breach(outcomes())
+                    && updates.fail_trial(failure.clone())
+                {
+                    warn!(
+                        epoch,
+                        kind = %failure.kind,
+                        reason = %failure.reason,
+                        "the epoch on trial passed a rollback threshold; it reverts"
+                    );
+                }
+                // A revert of an epoch whose processes the trial stopped starts them again on
+                // the weights they kept. The switch asks once the target stopped.
+                if relaunched.is_none() && !updates.relaunch_due().is_empty() {
+                    relaunched = Some(
+                        replica
+                            .relaunch_previous(&publishing, &updates, before.clone(), &config_before)
+                            .await,
+                    );
+                }
+                tokio::time::sleep(crate::updates::trial::POLL).await;
             }
             let committed = updates
                 .epochs()
                 .serving()
                 .is_some_and(|(serving, _)| serving == epoch);
-            if !committed && let Some(previous) = previous {
+            if !committed {
                 *locked(&replica.served) = before;
                 *locked(&replica.config) = config_before;
-                replica.hold.serve(previous);
+                match relaunched {
+                    Some(Ok(started)) => {
+                        replica.hold.serve(Arc::clone(&started));
+                        tokio::spawn(watch_engine(Arc::clone(&replica), Arc::downgrade(&started)));
+                    }
+                    Some(Err(error)) => {
+                        let reason = format!("the previous epoch did not start again: {error:#}");
+                        tracing::error!(%reason, "no engine serves requests");
+                        replica.hold.close(reason);
+                    }
+                    None => {
+                        if let Some(previous) = previous {
+                            replica.hold.serve(previous);
+                        }
+                    }
+                }
                 warn!(engine, epoch, "the switch returned this replica to the previous epoch");
+                replica.start_standby();
             }
+            replica.following.store(false, Ordering::SeqCst);
             if committed {
                 // The committed target is what the next switch starts from.
                 let published = tokio::task::spawn_blocking(move || {
@@ -2153,6 +2364,119 @@ impl Replica {
                 }
             }
         });
+    }
+
+    /// Runs the switch's warming once its target parked (§7.4 step 1), and answers the serving
+    /// client whose prefill budget it limited, for the caller to restore. A warming that fails
+    /// costs the requests in flight the tail they compute on the target and nothing else, so it
+    /// neither fails the switch nor delays it further.
+    async fn warm_target(
+        self: &Arc<Self>,
+        updates: &Arc<crate::updates::driver::Driver>,
+        update: &crate::options::UpdateOptions,
+        target_page: u32,
+    ) -> Option<Arc<EngineClient>> {
+        let source = self.hold.client()?;
+        loop {
+            match updates.parked() {
+                Some(true) => break,
+                Some(false) => tokio::time::sleep(crate::updates::trial::POLL).await,
+                None => return None,
+            }
+        }
+        let asking = Arc::clone(&source);
+        let warmed = crate::updates::warming::warm(
+            |operation| {
+                let asking = Arc::clone(&asking);
+                async move { asking.cache_warm(operation).await }
+            },
+            update.cache_tail_tokens.map(std::num::NonZeroU32::get),
+            update.cache_prefill_tokens.map(std::num::NonZeroU32::get),
+            target_page,
+            crate::updates::warming::LIMIT,
+        )
+        .await;
+        match warmed {
+            Ok(warming) => {
+                info!(?warming, "the requests in flight warmed the target's cache");
+                updates.warmed(serde_json::to_value(&warming).unwrap_or_default());
+            }
+            Err(error) => {
+                warn!(%error, "the warming ended: the requests compute their tails on the target");
+                updates.warmed(serde_json::json!({ "error": error }));
+            }
+        }
+        Some(source)
+    }
+
+    /// Starts the previous epoch again for a revert (§7.4): its processes exited for the trial
+    /// (`update_config.previous_world`), the target stopped, and the epoch binds the weights it
+    /// kept. The switch waits for this process exactly as it waits for one that drained.
+    ///
+    /// A start that fails leaves no engine: the switch ends all the same, since nothing it commands
+    /// can serve the epoch, and the caller closes the hold with the reason.
+    async fn relaunch_previous(
+        self: &Arc<Self>,
+        control: &Arc<EngineControl>,
+        updates: &Arc<crate::updates::driver::Driver>,
+        spec: Option<wire::EngineSpec>,
+        config: &ServeConfig,
+    ) -> anyhow::Result<Arc<EngineClient>> {
+        let host = config.host_identity.clone();
+        let generation = updates
+            .epochs()
+            .next_generation(crate::engine::control::ENGINE_GROUP, 0);
+        let started = self.start_previous(control, updates, spec, config, generation).await;
+        // Whether or not it serves, the switch has nothing left to wait for.
+        updates.relaunched(&host, generation);
+        started
+    }
+
+    /// The process of [`Self::relaunch_previous`], holding the epoch's programs.
+    async fn start_previous(
+        self: &Arc<Self>,
+        control: &Arc<EngineControl>,
+        updates: &Arc<crate::updates::driver::Driver>,
+        spec: Option<wire::EngineSpec>,
+        config: &ServeConfig,
+        generation: u64,
+    ) -> anyhow::Result<Arc<EngineClient>> {
+        let spec = spec.context("the replica has no served spec")?;
+        let sink = stats_sink(
+            self.model_name.clone(),
+            Arc::clone(&self.observer),
+            self.ordinal,
+        );
+        let build = crate::epoch::BuildConfig::of(config);
+        let starting = Arc::clone(control);
+        let client = Arc::new(
+            tokio::task::spawn_blocking(move || starting.start_at(spec, generation, &build, sink))
+                .await??,
+        );
+        reload_adapters(self, &client).await;
+        let handing = Arc::clone(updates.epochs());
+        let host = config.host_identity.clone();
+        let config = config.clone();
+        let handed =
+            tokio::task::spawn_blocking(move || handing.hand_to(&host, generation, &config));
+        match tokio::time::timeout(SWITCH_TIMEOUT, handed).await {
+            Ok(joined) => joined
+                .context("handing the epoch's programs to the started engine")?
+                .map_err(|failure| {
+                    anyhow::anyhow!(
+                        "the started engine did not take the epoch's programs ({}): {}",
+                        failure.kind,
+                        failure.reason
+                    )
+                })?,
+            Err(_) => anyhow::bail!(
+                "the started engine took the epoch's programs in neither Precopy, Switchover nor \
+                 Commit within {} s",
+                SWITCH_TIMEOUT.as_secs()
+            ),
+        }
+        info!(generation, "the previous epoch started again on the weights it kept");
+        Ok(client)
     }
 
     /// Restarts the committed world while the caller owns its replacement
@@ -2217,6 +2541,19 @@ impl Replica {
         info!("the relaunched engine serves");
         self.start_standby();
         Ok(client)
+    }
+}
+
+/// How often a switch reads whether the serving epoch drained: part of its pause.
+const DRAIN_POLL: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// Gives `source` back the prefill budget a warming limited.
+async fn restore_prefill(source: Arc<EngineClient>) {
+    let restored = source
+        .cache_warm(storage::manifest::cache::Operation::Prefill { tokens: None })
+        .await;
+    if let Err(error) = restored {
+        warn!(%error, "the warming's prefill limit stays until this engine ends");
     }
 }
 
@@ -2946,6 +3283,10 @@ pub(crate) async fn watch_engine(replica: Arc<Replica>, mut client: std::sync::W
         // again from a `served` spec the switch is in the middle of reverting.
         // Before the switchover the lost engine is the previous epoch's, which
         // a relaunch restores as any loss does.
+        if replica.following.load(Ordering::SeqCst) {
+            tracing::info!(%reason, "the engine ended under an epoch switch, which owns it");
+            return;
+        }
         if let Some(registry) = replica.registry.upgrade()
             && let Some(updates) = registry.updates.upgrade()
             && updates.phase().is_some_and(|phase| {
