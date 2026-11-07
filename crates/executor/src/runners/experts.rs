@@ -424,6 +424,8 @@ impl Member {
         let kernel = generation
             .op::<ops::moe::ExpertExchange>(&descriptor)
             .map_err(|error| Error::Invalid(format!("the expert exchange's program: {error}")))?;
+        let device = platform::DeviceId(shape.device);
+        let before = device.memory_info().map_err(Error::Cuda)?.free;
         let transport = Transport::create(
             Arc::clone(kernel),
             std::ptr::from_ref(self.backend.group.as_ref()),
@@ -431,6 +433,21 @@ impl Member {
             stream,
         )
         .map_err(|error| Error::Invalid(format!("creating the expert transport: {error}")))?;
+        let held = before.saturating_sub(device.memory_info().map_err(Error::Cuda)?.free);
+        // The plan reserved a bound before any program existed, so this is where it is checked.
+        // The figure is the device's, which another process can move, so it refuses nothing: the
+        // rank's booking after warmup holds it to the quota with its own process's figure.
+        let planned = shape.device_bytes(self.mode == ops::moe::exchange::Mode::Fused);
+        if held > planned {
+            tracing::warn!(
+                rank = self.rank,
+                held,
+                planned,
+                "the expert transport took more of the device than the capacity plan reserved"
+            );
+        } else {
+            tracing::info!(rank = self.rank, held, planned, "the expert transport's storage");
+        }
         let views = transport
             .views()
             .map_err(|error| Error::Invalid(format!("reading the expert transport: {error}")))?;

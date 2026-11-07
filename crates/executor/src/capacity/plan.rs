@@ -365,6 +365,9 @@ pub struct RankFacts<'a> {
     /// other can honour, and the two would differ silently if a zero stood for absence.
     pub cache: Option<CacheGeometry>,
     pub kv_dtype: ipc::PrefixCacheDtype,
+    /// Device bytes the rank's expert transport takes at its first capture, after the cache is
+    /// fitted, or zero for a rank that exchanges no experts.
+    pub transport_bytes: u64,
 }
 
 /// A rank's plan with the figures no owner states: the widest block table a
@@ -732,7 +735,9 @@ fn plan(
         facts.queue_depth,
         0,
         total_bytes,
-        reserved_bytes,
+        // The transport is created at the first capture, when a program exists, so the cache is
+        // fitted around what it will take.
+        reserved_bytes + facts.transport_bytes,
         granularity,
         group,
         |size| match &cache {
@@ -1311,6 +1316,7 @@ mod tests {
             mem_fraction_static: 0.5,
             cache,
             kv_dtype: ipc::PrefixCacheDtype::BFloat16,
+            transport_bytes: 0,
         }
     }
 
