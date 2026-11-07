@@ -1,12 +1,12 @@
-//! The words of an engine spec: the closed vocabularies a serving option
+//! The words of the serving options: the closed vocabularies a serving option
 //! names by a word (a policy, a backend, an element type).
 //!
 //! The daemon parses its options into these values, so a word no engine
-//! takes is refused while the options are read, naming its option. The spec
-//! carries each as its word ([`EngineSpec`](super::wire::EngineSpec)), which
-//! the engine parses back into the same value and its interface with its
-//! workers (`ipc`) carries on to the ranks. A new word is an addition: a
-//! daemon that does not know it never names it.
+//! takes is refused while the options are read, naming its option. The engine
+//! configuration (`config::EngineConfig`) carries each value to the engine
+//! processes, and their interface with their workers (`ipc`) carries it on to
+//! the ranks. A new word is an addition: a daemon that does not know it never
+//! names it.
 
 use serde::{Deserialize, Serialize};
 

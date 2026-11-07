@@ -9,8 +9,9 @@
 //! [`ExecutorInfo`], which merges the pools' reported capabilities, beside
 //! their layout, into the single capacity view the scheduler plans against;
 //! the result types a poll returns; and [`TransferConfig`], the directed
-//! transfer edges a deployment names between its executor groups, which a
-//! replica's spec keeps for its own groups (`EngineConfig::replica_specs`).
+//! transfer edges a deployment names between its executor groups, which each
+//! replica's engine configuration keeps for its own groups (the daemon's
+//! `replica_configs`).
 
 pub use proto::config::{BlockConfig, BlockDistribution, SequenceParallel, WorkerGroupId};
 

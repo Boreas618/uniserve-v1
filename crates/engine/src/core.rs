@@ -60,8 +60,8 @@ pub struct EngineConfig {
     pub max_queued_requests: Option<usize>,
     /// When a request whose draft cache is missing has it refilled.
     /// The captured graph sizes the deployment states, in tokens, ascending
-    /// and without duplicates (`Room.graph_tiers`). Empty when the spec states
-    /// none; see `SchedulerConfig::graph_tiers`.
+    /// and without duplicates (`Room.graph_tiers`). Empty when the deployment
+    /// states none; see `SchedulerConfig::graph_tiers`.
     pub graph_tiers: Vec<u32>,
     /// Per-request token ceiling for one prefill chunk.
     pub chunked_prefill_size: usize,
@@ -116,7 +116,7 @@ pub struct EngineConfig {
     pub eos: Vec<u32>,
     /// Token identifier that terminates encoded image content.
     pub end_of_image: u32,
-    /// The world the engine executes (`EngineSpec::world`): its storage is
+    /// The world the engine executes (`EngineArgs::world`): its storage is
     /// keyed and retained under it.
     pub world: u64,
     /// Whether the schedulers start on trial, as a successor world's do: they
@@ -136,7 +136,7 @@ pub struct EngineConfig {
 /// it does not run.
 ///
 /// Each field names its source: *launch* is the launch file the daemon writes
-/// for this world (`EngineSpec`, and the deployment it places), *model* is the
+/// for this process (`EngineArgs`, and the deployment it places), *model* is the
 /// model's own configuration the launcher reads at the model path and states in
 /// the launch file, and *build config* is what this build was compiled for.
 /// Nothing here is a scheduling decision: those belong to the policy program

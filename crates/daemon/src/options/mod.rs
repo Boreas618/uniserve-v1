@@ -6,11 +6,11 @@
 //! rest sit in `*_config` tables, one per owner of the behavior they
 //! configure (`cuda_graph_config` for graph capture, `moe_config` for expert
 //! parallelism, `video_config` for MiniMax-H3 video generation, and so on).
-//! [`ServeArgs`] reads the tree: a `--config` file first, then the flags that
-//! name a path of it, then `--set` assignments, each overriding the last.
-//! The tree is the server's configuration: each part of the server reads its
-//! own table, and [`ServerArgs::engine_spec`] states what of it concerns
-//! the engine process.
+//! [`ServerArgs::resolve`] reads the tree: a `--config` file first, then the
+//! flags that name a path of it, then `--set` assignments, each overriding the
+//! last. The tree is the server's configuration: each part of the server reads
+//! its own table, and [`ServerArgs::engine_config`] resolves what of it builds
+//! the engine processes.
 //!
 //! Some options configure one model family: the token batch budgets,
 //! `chat_config` and `image_fetch_config` token models, `video_config`,
@@ -21,16 +21,15 @@
 mod args;
 
 use std::collections::BTreeSet;
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::supervision::DaemonOptions;
 use anyhow::Context as _;
 use proto::config::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
+use proto::request::ModelDtype;
 pub use proto::request::StandbyStorage;
-use proto::request::wire;
-use proto::request::{ModelDtype, PrefixCacheDtype};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -423,7 +422,7 @@ pub fn with_daemon_options(current: &ServerArgs, target: &ServerArgs) -> ServerA
 /// Whether `current` and `target` differ in the options the daemon reads
 /// alone (its HTTP server, the request and output processing, the media
 /// and video jobs, logging and migration), which a hot restart of the
-/// daemon applies; the engine spec covers every other option.
+/// daemon applies; the engine configuration covers every other option.
 pub fn daemon_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool {
     current.server_config != target.server_config
         || current.admin_config != target.admin_config
@@ -639,6 +638,20 @@ impl ServerArgs {
         // policy's declared limits would be refused at the first prepare
         // instead (`crates/scheduling/src/limits.rs`). A stated value is never
         // clamped — the deployment either means it or is wrong.
+        let graphs = &self.cuda_graph_config;
+        increasing(
+            "cuda_graph_config.decode_batch_sizes",
+            &graphs.decode_batch_sizes,
+        )?;
+        increasing(
+            "cuda_graph_config.prefill_token_sizes",
+            &graphs.prefill_token_sizes,
+        )?;
+        distinct("cuda_graph_config.flow_shapes", &graphs.flow_shapes)?;
+        increasing(
+            "video_config.text_capacities",
+            &self.video_config.text_capacities,
+        )?;
         let tiers = self.cuda_graph_config.tiers();
         let mut token_bounds = Vec::new();
         if let Some(budget) = self.max_num_batched_tokens {
@@ -823,188 +836,6 @@ impl ServerArgs {
             join_timeout: crate::supervision::JOIN_TIMEOUT,
         }
     }
-
-    /// The engine spec these options state, without the model's facts,
-    /// which the leader resolves from the checkpoint.
-    ///
-    /// Values the options name by a word (a policy, a backend, an element
-    /// type) travel as that word, which the engine reads; the rank layout
-    /// travels as stated, which the engine places.
-    ///
-    /// # Errors
-    ///
-    /// Fails, naming the option, when a capture list is not strictly
-    /// increasing or repeats a shape, or a batch bound exceeds the worker's
-    /// `u32` fields; and when the deployment file cannot be read.
-    pub fn engine_spec(&self) -> anyhow::Result<wire::EngineSpec> {
-        let graphs = &self.cuda_graph_config;
-        let kv_cache = &self.kv_cache_config;
-        let worker = &self.worker_config;
-        let text = |path: &Option<PathBuf>| {
-            path.as_ref()
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        };
-        let bounded = |value: usize, option: &str| {
-            u32::try_from(value)
-                .with_context(|| format!("`{option}` exceeds the worker field width"))
-        };
-        let scheduling = wire::Scheduling {
-            max_batch: bounded(
-                self.scheduler_config.max_batch.get(),
-                "scheduler_config.max_batch",
-            )?,
-            max_num_batched_tokens: self
-                .max_num_batched_tokens
-                .map(|tokens| bounded(tokens.get(), "max_num_batched_tokens"))
-                .transpose()?,
-            max_running_requests: bounded(self.max_running_requests.get(), "max_running_requests")?,
-            max_queued_requests: self
-                .scheduler_config
-                .max_queued_requests
-                .map(|requests| requests.get() as u64),
-            chunked_prefill_size: self
-                .scheduler_config
-                .chunked_prefill_size
-                .map(|size| bounded(size.get(), "scheduler_config.chunked_prefill_size"))
-                .transpose()?,
-        };
-        Ok(wire::EngineSpec {
-            // A deployment is what one leader serves under its served name.
-            deployment: self.served_model_name().to_owned(),
-            model: self.model().to_owned(),
-            host: self
-                .engine_host
-                .as_ref()
-                .unwrap_or(&self.host_identity)
-                .clone(),
-            rank_layout: Some(wire::RankLayout {
-                worker_groups: text(&self.worker_groups),
-                worker_groups_content: self
-                    .worker_groups
-                    .as_deref()
-                    .map(|path| {
-                        std::fs::read_to_string(path).with_context(|| {
-                            format!("reading the deployment file {}", path.display())
-                        })
-                    })
-                    .transpose()?
-                    .unwrap_or_default(),
-                tensor_parallel_size: bounded(
-                    self.tensor_parallel_size.get(),
-                    "tensor_parallel_size",
-                )?,
-                data_parallel_size: bounded(self.data_parallel_size.get(), "data_parallel_size")?,
-                device: self.device_config.device.clone(),
-                devices: self.device_config.devices.clone(),
-                queue_depth: bounded(
-                    self.device_config.queue_depth.get(),
-                    "device_config.queue_depth",
-                )?,
-                worker_hosts: self.device_config.worker_hosts.clone(),
-                mem_fraction_static: self.mem_fraction_static,
-            }),
-            transfer: self.device_config.transfer.clone().unwrap_or_default(),
-            scheduling: Some(scheduling),
-            kv_cache: Some(wire::KvCache {
-                max_tokens: kv_cache.max_tokens.map(NonZeroU64::get),
-                block_size: kv_cache.block_size.map(NonZeroU32::get),
-                dtype: kv_cache
-                    .dtype
-                    .map(PrefixCacheDtype::as_str)
-                    .unwrap_or_default()
-                    .to_owned(),
-                prefix_caching: kv_cache.prefix_caching,
-                host_tier: kv_cache.host_tier,
-                mooncake: kv_cache.mooncake.as_ref().map(|mooncake| wire::Mooncake {
-                    master: mooncake.master.clone(),
-                    metadata_server: mooncake.metadata_server.clone(),
-                    protocol: mooncake.protocol.clone(),
-                    device: mooncake.device.clone(),
-                    segment_bytes: mooncake.global_segment_gib << 30,
-                    library: text(&mooncake.library),
-                }),
-                boundary_interval: kv_cache.boundary_interval.map(NonZeroU32::get),
-                state_interval: kv_cache.state_interval.map(NonZeroU32::get),
-                host_ratio: kv_cache.host_ratio,
-                host_bytes: kv_cache.host_gib.map(|gib| gib.get() << 30),
-            }),
-            workers: Some(wire::Workers {
-                executable: worker.executable.to_string_lossy().into_owned(),
-                watchdog_timeout_ms: u64::try_from(worker.watchdog_timeout.as_millis())
-                    .unwrap_or(u64::MAX),
-                mesh: worker.mesh.clone().unwrap_or_default(),
-                standby: worker.standby,
-                attention_backend: self.attention_backend.clone(),
-                dtype: word(&self.dtype),
-                quantization: Value::Object(self.quantization.clone()).to_string(),
-                load_format: word(&self.load_config.format),
-                download_dir: text(&self.load_config.download_dir),
-                load_threads: self.load_config.threads.map(NonZeroU32::get),
-                standby_storage: word(&worker.standby_storage),
-                weights: self.load_config.weights.clone().unwrap_or_default(),
-                parallel_degrees: self
-                    .load_config
-                    .parallel_degrees
-                    .iter()
-                    .map(|degree| degree.get())
-                    .collect(),
-            }),
-            cuda_graphs: Some(wire::CudaGraphs {
-                policy: word(&graphs.policy),
-                decode_batch_sizes: increasing(
-                    "cuda_graph_config.decode_batch_sizes",
-                    &graphs.decode_batch_sizes,
-                )?,
-                prefill_token_sizes: increasing(
-                    "cuda_graph_config.prefill_token_sizes",
-                    &graphs.prefill_token_sizes,
-                )?,
-                flow_shapes: distinct("cuda_graph_config.flow_shapes", &graphs.flow_shapes)?,
-            }),
-            // Video workers size resident media state for the longest
-            // duration served and provision only the frame counts the API
-            // admits, and prepare exactly the canvases these resolutions and
-            // aspect ratios name.
-            video: Some(wire::Video {
-                max_seconds: self.video_config.max_seconds,
-                min_seconds: MIN_VIDEO_SECONDS,
-                resolutions: self.video_config.resolutions.clone(),
-                aspect_ratios: self.video_config.aspect_ratios.clone(),
-                text_capacities: increasing(
-                    "video_config.text_capacities",
-                    &self.video_config.text_capacities,
-                )?,
-                max_condition_rows: self.video_config.max_condition_rows,
-                ffmpeg: self.media_config.ffmpeg.to_string_lossy().into_owned(),
-            }),
-            experts: Some(wire::Experts {
-                expert_parallel: self.moe_config.expert_parallel,
-                exchange: word(&self.moe_config.exchange),
-                microbatches: self.moe_config.microbatches.get(),
-            }),
-            model_facts: None,
-            world: 0,
-            predecessor: None,
-            stage_cache: false,
-            cache_keys: Vec::new(),
-            segments: Vec::new(),
-            retire: Vec::new(),
-            speculation: (self.speculative_config.num_draft_tokens > 0).then_some(
-                wire::Speculation {
-                    num_draft_tokens: self.speculative_config.num_draft_tokens,
-                },
-            ),
-            profiling: Some(wire::Profiling {
-                fence_probes: self.profiling_config.fence_probes,
-                fence_components: self.profiling_config.fence_components.clone(),
-                fence_probes_off: self.profiling_config.fence_probes_off.clone(),
-                graph_pc_sampling: self.profiling_config.graph_pc_sampling,
-            }),
-            received_weights: Vec::new(),
-            expert_order: Default::default(),
-        })
-    }
 }
 
 /// The user's runtime directory, where this node's sockets lie beside its
@@ -1015,15 +846,6 @@ pub(crate) fn runtime_directory() -> PathBuf {
     storage::socket::default_socket()
         .parent()
         .map_or_else(std::env::temp_dir, Path::to_path_buf)
-}
-
-/// The word a serving option names `value` by, as the option tree prints
-/// it.
-fn word<T: Serialize>(value: &T) -> String {
-    match serde_json::to_value(value) {
-        Ok(Value::String(word)) => word,
-        _ => String::new(),
-    }
 }
 
 /// Returns the bearer token the server requires, if any.
@@ -1049,36 +871,25 @@ fn non_empty_secret(value: Option<&str>) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Checks that a stated capture or capacity list is strictly increasing.
-fn increasing(path: &str, values: &Option<Vec<NonZeroU32>>) -> anyhow::Result<Option<wire::Sizes>> {
-    let Some(values) = values else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        values.windows(2).all(|pair| pair[0] < pair[1]),
-        "`{path}` must be strictly increasing, got {values:?}"
-    );
-    Ok(Some(wire::Sizes {
-        values: values.iter().map(|value| value.get()).collect(),
-    }))
+/// Checks that a stated capture or capacity list is strictly increasing: the workers capture or
+/// size each entry once, in order.
+fn increasing(path: &str, values: &Option<Vec<NonZeroU32>>) -> anyhow::Result<()> {
+    if let Some(values) = values {
+        anyhow::ensure!(
+            values.windows(2).all(|pair| pair[0] < pair[1]),
+            "`{path}` must be strictly increasing, got {values:?}"
+        );
+    }
+    Ok(())
 }
 
-/// Checks that stated image capture sizes are distinct.
-fn distinct(path: &str, shapes: &Option<Vec<ImageSize>>) -> anyhow::Result<Option<wire::Shapes>> {
-    let Some(shapes) = shapes else {
-        return Ok(None);
-    };
-    anyhow::ensure!(
-        shapes.iter().collect::<BTreeSet<_>>().len() == shapes.len(),
-        "`{path}` repeats an image size"
-    );
-    Ok(Some(wire::Shapes {
-        shapes: shapes
-            .iter()
-            .map(|shape| wire::Shape {
-                height: shape.0[0],
-                width: shape.0[1],
-            })
-            .collect(),
-    }))
+/// Checks that stated image capture sizes are distinct: the workers capture each size once.
+fn distinct(path: &str, shapes: &Option<Vec<ImageSize>>) -> anyhow::Result<()> {
+    if let Some(shapes) = shapes {
+        anyhow::ensure!(
+            shapes.iter().collect::<BTreeSet<_>>().len() == shapes.len(),
+            "`{path}` repeats an image size"
+        );
+    }
+    Ok(())
 }

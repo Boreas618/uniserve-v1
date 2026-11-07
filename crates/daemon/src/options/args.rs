@@ -724,14 +724,12 @@ mod tests {
         );
     }
 
-    /// Resolves `args`, checks them, and derives the engine configuration
-    /// the engine reads from the spec they state.
-    fn lowered(args: &[&str]) -> anyhow::Result<(ServerArgs, engine::EngineConfig)> {
+    /// Resolves `args`, checks them, and resolves the engine configuration
+    /// they state.
+    fn lowered(args: &[&str]) -> anyhow::Result<(ServerArgs, proto::config::EngineConfig)> {
         let (config, stated) = resolved(args)?;
         config.validate(&stated)?;
-        let mut spec = config.engine_spec()?;
-        spec.model_facts = Some(Default::default());
-        let engine = engine::EngineConfig::from_spec(&spec)?;
+        let engine = config.engine_config()?;
         Ok((config, engine))
     }
 
@@ -784,7 +782,7 @@ mod tests {
         let (config, engine) = lowered(&["/models/m"]).unwrap();
         assert_eq!(config.model(), "/models/m");
         assert_eq!(config.served_model_name(), "/models/m");
-        assert_eq!(engine.model, "/models/m");
+        assert_eq!(engine.model.model, "/models/m");
 
         let file = written("model", "model = \"/models/file\"\n");
         let (config, _) = lowered(&["--config", file.to_str().unwrap()]).unwrap();
@@ -806,9 +804,10 @@ mod tests {
             "device_config.device=cpu",
         ])
         .unwrap();
-        assert_eq!(engine.worker_groups.len(), 2);
+        assert_eq!(engine.parallel.worker_groups.len(), 2);
         assert!(
             engine
+                .parallel
                 .worker_groups
                 .iter()
                 .all(|worker| worker.ranks.len() == 2)
@@ -821,7 +820,7 @@ mod tests {
         );
         let path = deployment.to_str().unwrap();
         let (config, engine) = lowered(&["m", "--worker-groups", path]).unwrap();
-        assert_eq!(engine.worker_groups.len(), 1);
+        assert_eq!(engine.parallel.worker_groups.len(), 1);
         let (reread, stated) = resolve_text(&printed(&config).unwrap(), &[]).unwrap();
         assert_eq!(reread, config);
         reread.validate(&stated).unwrap();
@@ -856,7 +855,7 @@ mod tests {
             "rank-0",
         ])
         .unwrap();
-        let hosts = engine.worker_groups[0]
+        let hosts = engine.parallel.worker_groups[0]
             .ranks
             .iter()
             .map(|rank| rank.host.as_str())
@@ -868,7 +867,7 @@ mod tests {
     /// Capture lists and capacities are checked before any rank starts.
     #[test]
     fn capture_lists_are_strictly_increasing_and_shapes_distinct() {
-        let (config, _) = lowered(&[
+        let (_, engine) = lowered(&[
             "m",
             "--set",
             "video_config.text_capacities=1024,4096",
@@ -876,17 +875,17 @@ mod tests {
             "cuda_graph_config.flow_shapes=1152x2048,2048x1152",
         ])
         .unwrap();
-        let spec = config.engine_spec().unwrap();
+        let capacities = engine.video.text_capacities.unwrap();
         assert_eq!(
-            spec.video.unwrap().text_capacities.unwrap().values,
+            capacities
+                .iter()
+                .map(|value| value.get())
+                .collect::<Vec<_>>(),
             vec![1024, 4096]
         );
-        let shapes = spec.cuda_graphs.unwrap().flow_shapes.unwrap().shapes;
+        let shapes = engine.cuda_graph.flow_shapes.unwrap();
         assert_eq!(
-            shapes
-                .iter()
-                .map(|shape| [shape.height, shape.width])
-                .collect::<Vec<_>>(),
+            shapes.iter().map(|shape| shape.0).collect::<Vec<_>>(),
             vec![[1152, 2048], [2048, 1152]]
         );
 
@@ -905,10 +904,10 @@ mod tests {
 
     /// The precision policy, expert parallelism, prefix caching and the
     /// scheduler budgets reach the engine configuration as stated, and
-    /// unstated budgets take the engine defaults.
+    /// unstated budgets stay unstated for the engine to default.
     #[test]
     fn grouped_options_reach_the_engine() {
-        let (config, engine) = lowered(&[
+        let (_, engine) = lowered(&[
             "m",
             "--set",
             "quantization.mode=performance",
@@ -920,17 +919,15 @@ mod tests {
             "scheduler_config.chunked_prefill_size=512",
         ])
         .unwrap();
-        let spec = config.engine_spec().unwrap();
-        let quantization: serde_json::Value =
-            serde_json::from_str(&spec.workers.unwrap().quantization).unwrap();
-        assert_eq!(quantization["mode"], "performance");
-        assert_eq!(engine.expert_parallel, Some(ExpertExchange::Dwdp));
-        assert!(!engine.prefix_cache);
-        assert_eq!(engine.chunked_prefill_size, 512);
+        assert_eq!(engine.model.quantization["mode"], "performance");
+        assert!(engine.moe.expert_parallel);
+        assert_eq!(engine.moe.exchange, ExpertExchange::Dwdp);
+        assert!(!engine.kv_cache.prefix_caching);
         assert_eq!(
-            engine.max_num_batched_tokens,
-            engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
+            engine.scheduler.chunked_prefill_size,
+            std::num::NonZeroUsize::new(512)
         );
+        assert_eq!(engine.max_num_batched_tokens, None);
     }
 
     /// The server listens on a non-blank host or Unix socket path, port 0

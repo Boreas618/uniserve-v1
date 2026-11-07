@@ -10,7 +10,7 @@ pub mod block;
 pub mod values;
 pub mod worker_group;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::{Path, PathBuf};
@@ -20,6 +20,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::request::wire::{ExpertOrder, Predecessor};
 use crate::request::{
     ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat, PrefixCacheDtype, SchedulingPolicy,
     StandbyStorage,
@@ -920,17 +921,38 @@ impl EngineConfig {
     }
 }
 
-/// Everything one engine process starts with (`uniserve engine --launch <path>`): which epoch it
-/// executes and the configuration file every engine process of that epoch reads, where this process
-/// sits in the epoch, and the interfaces it reaches. The daemon writes it and the engine reads it;
-/// the claim token and the Storage Server's socket are runtime facts of the node, which the daemon
-/// answers when the process asks, so they are not here.
+/// Everything one engine process starts with (`uniserve engine --launch <path>`): the epoch's
+/// engine configuration, which every engine process of the epoch shares; the world it executes and
+/// what it takes over from the process it succeeds; where this process sits in the epoch; and the
+/// interfaces it reaches.
+///
+/// A replica's record of what serves is the arguments its engine process started with: the daemon
+/// keeps one per replica, and starts a replacement or a standby from it. The daemon's engine
+/// control states the process's own place and interfaces when it launches one, so arguments built
+/// from a configuration alone ([`EngineArgs::new`]) state none yet. The claim token and the
+/// Storage Server's socket are runtime facts of the node, which the daemon answers when the
+/// process asks, so they are not here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EngineArgs {
-    /// The epoch's build config, as the daemon wrote it.
-    pub engine_config: PathBuf,
-    /// The checkpoint the epoch serves.
-    pub model: PathBuf,
+    /// The epoch's engine configuration, the same for every engine process of the epoch.
+    pub engine_config: EngineConfig,
+    /// The world the epoch executes, which keys the storage it creates. It is zero until the first
+    /// process of a new world starts, and that process's engine number becomes the world's.
+    pub world: u64,
+    /// The process this one succeeds on the same devices, whose KV cache it maps read-only.
+    ///
+    /// It is present for the serving process's standby (§2.5), which claims its scope's storage
+    /// read-only, parks once it is prepared, and is promoted in place when the serving process of
+    /// its failure domain fails. A standby that claimed writable storage would give the scope two
+    /// writers, so the role is stated here, before the process claims anything.
+    #[serde(default)]
+    pub predecessor: Option<Predecessor>,
+    /// The expert order each MoE module loads, keyed by module, once the daemon has rebalanced the
+    /// experts; empty for the checkpoint's own order.
+    #[serde(default)]
+    pub expert_order: BTreeMap<String, ExpertOrder>,
+    /// This node's host identity, which keys this rank's storage claim.
+    pub host: String,
     /// The leader daemon's request interface, `unix:<path>` or
     /// `<host>:<port>`.
     pub requests: String,
@@ -951,10 +973,6 @@ pub struct EngineArgs {
     pub group: String,
     /// This rank's ordinal inside its group.
     pub rank: u32,
-    /// The deployment's name, under which the Storage Servers key its claims.
-    pub deployment: String,
-    /// The world the epoch executes, which keys the storage it creates.
-    pub world: u64,
     /// Whether this node holds the epoch's schedulers.
     #[serde(default)]
     pub scheduler_node: bool,
@@ -963,7 +981,7 @@ pub struct EngineArgs {
     #[serde(default)]
     pub peers: Vec<String>,
     /// How long a job may run without progress before it is reported
-    /// `Stalled`, when the daemon states it apart from the build config.
+    /// `Stalled`, when the daemon states it apart from the engine configuration.
     #[serde(default)]
     pub watchdog_timeout_s: Option<u64>,
     /// The probation an update must survive before the daemon commits it.
@@ -974,16 +992,41 @@ pub struct EngineArgs {
     /// The number of ranks in this process's world, of which this group's rank
     /// is one.
     pub world_size: u32,
-    /// Whether this process starts as the serving process's standby (§2.5): it
-    /// claims its scope's storage read-only, parks once it is prepared, and is
-    /// promoted in place when the serving process of its failure domain fails.
-    /// The role is stated here because a standby that claimed writable storage
-    /// would give the scope two writers.
-    #[serde(default)]
-    pub standby: bool,
 }
 
 impl EngineArgs {
+    /// The arguments of an engine process of `engine_config` before the daemon's engine control
+    /// states the process's place and interfaces: a new world, succeeding no process, with the
+    /// checkpoint's expert order.
+    pub fn new(engine_config: EngineConfig) -> Self {
+        Self {
+            engine_config,
+            world: 0,
+            predecessor: None,
+            expert_order: BTreeMap::new(),
+            host: String::new(),
+            requests: String::new(),
+            processes: String::new(),
+            engine: 0,
+            program_server: String::new(),
+            devices: Vec::new(),
+            group: String::new(),
+            rank: 0,
+            scheduler_node: false,
+            peers: Vec::new(),
+            watchdog_timeout_s: None,
+            rollback_s: None,
+            queue_depth: 0,
+            world_size: 0,
+        }
+    }
+
+    /// Whether this process starts as the serving process's standby: it states the process it
+    /// succeeds.
+    pub fn standby(&self) -> bool {
+        self.predecessor.is_some()
+    }
+
     /// §2.4's watchdog bound: this process's when the daemon states one apart from the epoch's.
     pub fn watchdog_timeout(&self) -> Option<Duration> {
         self.watchdog_timeout_s.map(Duration::from_secs)

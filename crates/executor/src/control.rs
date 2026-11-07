@@ -582,7 +582,6 @@ mod tests {
                     minor: proto::PROTOCOL_MINOR,
                     build: proto::BUILD.to_owned(),
                     refusal,
-                    spec: None,
                 })
                 .expect("answering the hello");
             // A refused engine states nothing: the refusal is the whole answer and the engine

@@ -145,7 +145,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={}", schema.display());
     }
     let descriptors = protox::compile(&schemas, [manifest.join("src")])?;
-    prost_build::Config::new().compile_fds(descriptors)?;
+    // An engine process's launch file is JSON (`config::EngineArgs`), and the handover messages it
+    // carries read and write there as well as on the wire.
+    let mut config = prost_build::Config::new();
+    for message in [
+        "Predecessor",
+        "CacheSegments",
+        "CacheSegment",
+        "ExpertOrder",
+    ] {
+        config.type_attribute(
+            format!(".uniserve.request.{message}"),
+            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(default)]",
+        );
+    }
+    config.compile_fds(descriptors)?;
 
     emit_source_digest()?;
     Ok(())

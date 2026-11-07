@@ -194,8 +194,7 @@ impl Replica {
         // collectors CUPTI cannot run beside it.
         let graph_pc_sampling = locked(&self.served)
             .as_ref()
-            .and_then(|spec| spec.profiling.as_ref())
-            .is_some_and(|profiling| profiling.graph_pc_sampling);
+            .is_some_and(|args| args.engine_config.profiling.graph_pc_sampling);
         if graph_pc_sampling && let Some(reason) = request.refused_beside_graph_pc_sampling() {
             return Err(UpdateError::Refused(reason));
         }

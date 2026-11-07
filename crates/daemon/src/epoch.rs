@@ -1336,7 +1336,7 @@ fn policy_arguments(config: &ServerArgs) -> toml::Table {
     }
     let scheduler = &config.scheduler_config;
     // The token bound this launch gives its workers, which is the same
-    // `max_num_batched_tokens` its `EngineSpec` states (§2.5): the policy's
+    // `max_num_batched_tokens` its engine configuration states (§2.5): the policy's
     // declared limits are these bounds, not a second opinion about them. A
     // prefill chunk that the deployment states larger than its token bound is
     // refused by the mechanism (`PolicyError::BadLimits`), never clamped here.
@@ -2732,8 +2732,9 @@ mod tests {
         assert_eq!(report["processes"][1]["state"], Value::from("parked"));
     }
 
-    /// The epoch's build config is written by the daemon and read by the main
-    /// process through this same type, so what the writer serializes must read
+    /// The epoch's engine configuration is written by the daemon into each
+    /// launch file and read by the main process through this same type, so
+    /// what the writer serializes must read
     /// back: an unset list is written as `null` and must be read as `None`,
     /// not refused.
     #[test]

@@ -93,8 +93,8 @@ pub struct EngineControl {
     /// leaves an engine with no policy store, and it refuses every policy
     /// precopy with a reason rather than serving without one.
     program_server: Option<PathBuf>,
-    /// Where this daemon writes the files its main processes read: the
-    /// epoch's build config and each process's launch (§2.3).
+    /// Where this daemon writes the file each of its main processes reads:
+    /// the process's launch file (§2.3).
     runtime: PathBuf,
     next_engine: AtomicU64,
     /// Engine handoffs can connect in any order. Reading and assigning
@@ -142,11 +142,11 @@ impl EngineControl {
         })
     }
 
-    /// Starts an engine process that serves `spec` and returns its client
-    /// once it reports that it serves, or, for a spec that stands by for the
-    /// running engine (`EngineSpec::standby`), once it reports that it
-    /// stands by; `stats` receives its schedulers' statistics. The process
-    /// runs the executable of the spec's build (`workers.executable`).
+    /// Starts an engine process with `args` and returns its client once it reports that it
+    /// serves, or, for arguments that name the process it succeeds ([`EngineArgs::standby`]), once
+    /// it reports that it stands by; `stats` receives its schedulers' statistics. The process runs
+    /// the executable the engine configuration names (`worker_config.executable`). This control
+    /// states the process's place and interfaces in the arguments it writes ([`Self::launch`]).
     /// Blocks for the engine's whole start, its workers' loading included.
     ///
     /// # Errors
@@ -154,14 +154,9 @@ impl EngineControl {
     /// Fails when the daemon cannot start the process, the process exits or
     /// does not connect back, its build speaks another major version, or it
     /// reports that its start failed.
-    pub fn start(
-        &self,
-        spec: wire::EngineSpec,
-        build: &proto::config::EngineConfig,
-        stats: StatsSink,
-    ) -> anyhow::Result<EngineClient> {
+    pub fn start(&self, args: EngineArgs, stats: StatsSink) -> anyhow::Result<EngineClient> {
         let engine = self.next_engine.fetch_add(1, Ordering::Relaxed);
-        self.start_at(spec, engine, build, stats)
+        self.start_at(args, engine, stats)
     }
 
     /// [`EngineControl::start`] under a number the caller allocated.
@@ -177,31 +172,21 @@ impl EngineControl {
     /// As [`EngineControl::start`].
     pub fn start_at(
         &self,
-        mut spec: wire::EngineSpec,
+        args: EngineArgs,
         engine: u64,
-        build: &proto::config::EngineConfig,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
-        // A spec of no world starts a world of its own, which takes the
-        // identity of its first engine; an engine that replaces a lost one
-        // goes on with its world.
-        if spec.world == 0 {
-            spec.world = engine;
-        }
-        let world = spec.world;
-        let executable = spec
-            .workers
-            .as_ref()
-            .map(|workers| workers.executable.clone())
-            .context("the engine spec states no workers")?;
-        let standby = spec.predecessor.is_some();
-        // The epoch's build config, written once per world: every process of
-        // that world reads the same bytes, and the launch file names its path
-        // (`specs/worker.md` §2.3).
-        self.write_engine_config(world, build)?;
-        let launch = self.launch(&spec, engine)?;
+        let launch = self.launch(args, engine)?;
+        let world = launch.world;
+        let standby = launch.standby();
+        let executable = launch
+            .engine_config
+            .worker
+            .executable
+            .to_string_lossy()
+            .into_owned();
         let path = launch::write(&self.runtime, engine, &launch)?;
-        let mut control = self.spawn(engine, &executable, &spec.host, Self::arguments(&path))?;
+        let mut control = self.spawn(engine, &executable, &launch.host, Self::arguments(&path))?;
         let (mut reader, mut writer, hello) = self.accept(engine, Some(&mut control))?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
@@ -219,7 +204,6 @@ impl EngineControl {
             minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
-            spec: refusal.is_empty().then_some(spec),
         })?;
         anyhow::ensure!(refusal.is_empty(), "refused the engine process: {refusal}");
         tracing::info!(engine, build = %hello.build, "the engine process connected; awaiting its start");
@@ -297,8 +281,8 @@ impl EngineControl {
         self.next_engine.load(Ordering::Relaxed)
     }
 
-    /// Joins an epoch switch's target: the child the switch started dials this daemon's request
-    /// socket, is welcomed with the epoch's spec, and states what it is. The switch commands it on
+    /// Joins an epoch switch's target, which executes `world`: the child the switch started dials
+    /// this daemon's request socket, is welcomed, and states what it is. The switch commands it on
     /// the process link, so this connection carries only its requests from `Serve` on.
     ///
     /// # Errors
@@ -308,10 +292,9 @@ impl EngineControl {
     pub fn join_target(
         &self,
         engine: u64,
-        spec: wire::EngineSpec,
+        world: u64,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
-        let world = spec.world;
         let (mut reader, mut writer, hello) = self.accept(engine, None)?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
@@ -327,7 +310,6 @@ impl EngineControl {
             minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
-            spec: refusal.is_empty().then_some(spec),
         })?;
         anyhow::ensure!(refusal.is_empty(), "refused the engine: {refusal}");
         let deadline = Instant::now() + TARGET_START;
@@ -359,7 +341,7 @@ impl EngineControl {
     }
 
     /// Takes over the engine `engine` a daemon this one replaced started,
-    /// which serves `served` and lives under `control`: the engine connects
+    /// which executes `world` and lives under `control`: the engine connects
     /// to this daemon's request socket, as the replaced daemon commanded it
     /// (`EngineClient::attach`), is welcomed, and reports itself ready.
     /// Later engines this control starts take the identities from
@@ -375,12 +357,11 @@ impl EngineControl {
         &self,
         engine: u64,
         next_engine: u64,
-        served: wire::EngineSpec,
+        world: u64,
         mut control: Option<Connection>,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         self.next_engine.fetch_max(next_engine, Ordering::Relaxed);
-        let world = served.world;
         let (mut reader, mut writer, hello) = self.accept(engine, control.as_mut())?;
         let refusal = if hello.major != proto::PROTOCOL_MAJOR {
             format!(
@@ -401,7 +382,6 @@ impl EngineControl {
             minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
-            spec: refusal.is_empty().then_some(served),
         })?;
         anyhow::ensure!(refusal.is_empty(), "refused the engine: {refusal}");
         let deadline = Instant::now() + CONNECT_TIMEOUT;
@@ -675,8 +655,8 @@ impl EngineControl {
         ]
     }
 
-    /// The launch file's contents for the process `engine`, from the spec the
-    /// deployment resolved for it.
+    /// The launch file's contents for the process `engine`: `args`, with this
+    /// control's statement of the process's place and interfaces.
     ///
     /// A value the file requires and the daemon cannot state is an error here
     /// rather than a default: the engine refuses a launch file that lacks one,
@@ -684,102 +664,69 @@ impl EngineControl {
     ///
     /// # Errors
     ///
-    /// Fails for a spec of no model, no rank layout or a zero queue depth, a
-    /// child on a host that does not share this daemon's runtime directory, a
-    /// node with no Program Server, a spec of no world, and an epoch whose
-    /// build config has not been written.
-    fn launch(&self, spec: &wire::EngineSpec, engine: u64) -> anyhow::Result<EngineArgs> {
-        anyhow::ensure!(!spec.model.is_empty(), "the engine spec names no model");
+    /// Fails for a configuration of no model, a child on a host that does not
+    /// share this daemon's runtime directory, a rank of this host on a device
+    /// that is not CUDA's, a queue depth the file cannot hold, and a node with
+    /// no Program Server.
+    fn launch(&self, mut args: EngineArgs, engine: u64) -> anyhow::Result<EngineArgs> {
+        let config = &args.engine_config;
+        anyhow::ensure!(
+            !config.model.model.is_empty(),
+            "the engine configuration names no model"
+        );
         // Form (A): the child opens the launch file this daemon wrote, so it
         // has to be this daemon's own host. A remote host needs the launch
         // contents carried in `process::Spawn`, which the protocol does not do
         // yet, and a path that exists only here would fail in the child.
         anyhow::ensure!(
-            spec.host == self.host,
+            config.parallel.engine_host == self.host,
             "engine host {} does not share this daemon's runtime directory {}: a main process on \
              another host needs the launch contents carried in `process::Spawn`",
-            spec.host,
+            config.parallel.engine_host,
             self.runtime.display()
         );
-        let rank_layout = spec
-            .rank_layout
-            .as_ref()
-            .context("the engine spec states no rank layout")?;
         // The devices are the deployment's own: each host's ranks are on the
-        // ordinals the engine's shorthand gives them (`0..` in rank order), or
-        // on the order `device_config.devices` names, which
-        // `EngineConfig::from_spec` has already folded into the ranks. Reading
-        // them from the ranks is the one account: a config that states no
-        // order still gives this node's ranks their devices, and a rank on
-        // `cpu` is refused here rather than in the child.
-        let devices = local_devices(&self.host, spec)?;
-        anyhow::ensure!(
-            rank_layout.queue_depth > 0,
-            "the rank layout's queue_depth is zero for this rank"
-        );
+        // ordinals the shorthand gives them (`0..` in rank order), or on the
+        // order `device_config.devices` names, which the shorthand has already
+        // folded into the ranks. Reading them from the ranks is the one account:
+        // a config that states no order still gives this node's ranks their
+        // devices, and a rank on `cpu` is refused here rather than in the child.
+        let devices = local_devices(&self.host, config)?;
+        let queue_depth = u32::try_from(config.device.queue_depth.get())
+            .context("`device_config.queue_depth` exceeds the launch file's field")?;
         let program_server = self.program_server.as_ref().context(
             "this node has no Program Server socket, so a main process could resolve no policy \
              module: it is not started without one",
         )?;
-        anyhow::ensure!(spec.world != 0, "the engine spec names no world");
-        let engine_config = launch::engine_config_path(&self.runtime, spec.world);
-        anyhow::ensure!(
-            engine_config.is_file(),
-            "the epoch's build config {} has not been written: write it with \
-             `EngineControl::write_engine_config` before starting a main process",
-            engine_config.display()
-        );
+        // A new world takes the identity of its first engine; an engine that
+        // replaces a lost one goes on with its world.
+        if args.world == 0 {
+            args.world = engine;
+        }
         // One main process per node today, so it has no peer to accept: the
         // world is this rank alone. A deployment that starts more states their
         // addresses here, and the world grows with them (exec's rule: the
         // world is its peers and itself).
         let peers: Vec<String> = Vec::new();
-        let world_size = u32::try_from(peers.len() + 1).unwrap_or(u32::MAX);
-        Ok(EngineArgs {
-            engine_config,
-            model: PathBuf::from(&spec.model),
-            requests: self.request_address.clone(),
-            processes: self.processes.clone(),
-            engine,
-            program_server: program_server.display().to_string(),
-            devices,
-            group: ENGINE_GROUP.to_owned(),
-            rank: 0,
-            deployment: self.deployment.clone(),
-            world: spec.world,
-            // The check above makes this node the engine's host, and the
-            // deployment keeps one scheduler node, which is this one.
-            scheduler_node: true,
-            peers,
-            // Both are the epoch's, and the epoch states them in its build
-            // config, which the child reads.
-            watchdog_timeout_s: None,
-            rollback_s: None,
-            queue_depth: rank_layout.queue_depth,
-            world_size,
-            // A process that starts beside its predecessor is the serving
-            // process's standby (§2.5): the spec states the predecessor and
-            // the child has to know the role before it claims storage.
-            standby: spec.predecessor.is_some(),
-        })
-    }
-
-    /// Writes the config `config` builds the epoch whose world is `world`, and
-    /// answers the path every process of that epoch reads.
-    ///
-    /// Whoever owns the epoch's record calls this before starting any of its
-    /// processes: the launch file names the path, and two engines of one epoch
-    /// read the same bytes.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the file cannot be written.
-    pub(crate) fn write_engine_config(
-        &self,
-        world: u64,
-        config: &proto::config::EngineConfig,
-    ) -> anyhow::Result<PathBuf> {
-        Ok(launch::write_engine_config(&self.runtime, world, config)?)
+        args.world_size = u32::try_from(peers.len() + 1).unwrap_or(u32::MAX);
+        args.host = self.host.clone();
+        args.requests = self.request_address.clone();
+        args.processes = self.processes.clone();
+        args.engine = engine;
+        args.program_server = program_server.display().to_string();
+        args.devices = devices;
+        args.group = ENGINE_GROUP.to_owned();
+        args.rank = 0;
+        // The check above makes this node the engine's host, and the
+        // deployment keeps one scheduler node, which is this one.
+        args.scheduler_node = true;
+        args.peers = peers;
+        // Both are the epoch's, and the epoch states them in its engine
+        // configuration, which the child reads.
+        args.watchdog_timeout_s = None;
+        args.rollback_s = None;
+        args.queue_depth = queue_depth;
+        Ok(args)
     }
 
     /// What the epoch layer starts one epoch's main process with: the
@@ -791,15 +738,16 @@ impl EngineControl {
     /// `Hello` fixes the identity every other child of the epoch must report.
     pub(crate) fn epoch_start(
         &self,
-        spec: &wire::EngineSpec,
+        args: &EngineArgs,
         engine: u64,
     ) -> anyhow::Result<crate::updates::switch::Start> {
-        let launch = self.launch(spec, engine)?;
-        let executable = spec
-            .workers
-            .as_ref()
-            .map(|workers| workers.executable.clone())
-            .context("the engine spec states no workers")?;
+        let launch = self.launch(args.clone(), engine)?;
+        let executable = launch
+            .engine_config
+            .worker
+            .executable
+            .to_string_lossy()
+            .into_owned();
         Ok(crate::updates::switch::Start {
             build: own_executable(&executable).then(|| proto::BUILD.to_owned()),
             executable,
@@ -1822,40 +1770,21 @@ mod tests {
             Some(std::path::PathBuf::from("/run/program-server.sock")),
         )
         .unwrap();
-        control
-            .write_engine_config(
-                3,
-                &ServerArgs::default()
-                    .engine_config()
-                    .expect("the configuration resolves"),
-            )
-            .unwrap();
-        let own = std::env::current_exe().unwrap().display().to_string();
-        // The deployment's own spec, as `ServeOptions` builds it: an epoch's
-        // start reads the ranks it places, and a spec with no scheduling or
-        // cache tables is no deployment's.
-        let mut spec = ServerArgs::default().engine_spec().unwrap();
-        // The leader completes the options' spec with what the loaded model
-        // determines, and a start reads it back (`crate::leader`), so a spec an
-        // epoch could start always states facts. This test starts a process,
-        // not a model, so it states the empty ones the crate's other specs do.
-        spec.model_facts = Some(Default::default());
-        spec.deployment = "model".to_owned();
-        spec.model = "/models/qwen3".to_owned();
-        spec.host = "rank-0".to_owned();
-        spec.world = 3;
-        let rank_layout = spec
-            .rank_layout
-            .as_mut()
-            .expect("the default spec places ranks");
-        rank_layout.devices = vec![0];
-        rank_layout.queue_depth = 4;
-        spec.workers
-            .as_mut()
-            .expect("the default spec names the workers")
-            .executable = own;
+        let own = std::env::current_exe().unwrap();
+        // The deployment's own engine configuration, as the options resolve it, on this control's
+        // host: an epoch's start reads the ranks it places.
+        let mut options = ServerArgs::default();
+        options.model = Some("/models/qwen3".to_owned());
+        options.served_model_name = Some("model".to_owned());
+        options.host_identity = "rank-0".to_owned();
+        options.device_config.devices = vec![0];
+        options.device_config.queue_depth = std::num::NonZeroUsize::new(4).unwrap();
+        options.worker_config.executable = own;
+        let mut args =
+            EngineArgs::new(options.engine_config().expect("the configuration resolves"));
+        args.world = 3;
 
-        let start = control.epoch_start(&spec, 9).unwrap();
+        let start = control.epoch_start(&args, 9).unwrap();
         assert_eq!(start.build, Some(proto::BUILD.to_owned()));
         // The file is the adapter's to write for the process it starts; the
         // start carries its contents, with this process's generation.
@@ -1869,18 +1798,18 @@ mod tests {
         // The launch states whether the child stands by (§2.5): a standby has
         // to know the role before it claims storage, and a serving child must
         // not read the file as one.
-        assert!(!start.launch.standby);
-        spec.predecessor = Some(wire::Predecessor {
+        assert!(!start.launch.standby());
+        args.predecessor = Some(wire::Predecessor {
             world: 3,
             segments: Vec::new(),
         });
-        let standby = control.epoch_start(&spec, 10).unwrap();
-        assert!(standby.launch.standby);
+        let standby = control.epoch_start(&args, 10).unwrap();
+        assert!(standby.launch.standby());
         assert_eq!(standby.launch.world, 3);
-        spec.predecessor = None;
+        args.predecessor = None;
 
-        spec.workers.as_mut().unwrap().executable = "/opt/uniserve-b".to_owned();
-        let other = control.epoch_start(&spec, 9).unwrap();
+        args.engine_config.worker.executable = std::path::PathBuf::from("/opt/uniserve-b");
+        let other = control.epoch_start(&args, 9).unwrap();
         assert_eq!(other.build, None);
         assert_eq!(other.executable, "/opt/uniserve-b");
     }
@@ -2063,21 +1992,19 @@ mod tests {
 /// The CUDA ordinals `host`'s ranks serve, in rank order and without repeats.
 ///
 /// A deployment that states no `device_config.devices` still gives each
-/// host's ranks the ordinals the engine's shorthand numbers them from zero; one
-/// that does state an order has already had it folded into the ranks by
-/// [`engine::EngineConfig::from_spec`]. Reading the ranks is the one account of
-/// both, and it is what the launch file states as the devices of this node's
-/// process (§2.3, §7.4).
+/// host's ranks the ordinals the shorthand numbers them from zero; one that
+/// does state an order has already had it folded into the ranks by
+/// [`proto::config::WorkerGroupConfig::shorthand`]. Reading the ranks is the
+/// one account of both, and it is what the launch file states as the devices
+/// of this node's process (§2.3, §7.4).
 ///
 /// # Errors
 ///
-/// Fails when the spec does not resolve to an engine configuration, when a rank
-/// of `host` does not run on a CUDA device, or when no rank of the deployment
-/// runs on `host`.
-fn local_devices(host: &str, spec: &wire::EngineSpec) -> anyhow::Result<Vec<u32>> {
-    let config = engine::EngineConfig::from_spec(spec)?;
+/// Fails when a rank of `host` does not run on a CUDA device, or when no rank
+/// of the deployment runs on `host`.
+fn local_devices(host: &str, config: &proto::config::EngineConfig) -> anyhow::Result<Vec<u32>> {
     let mut devices = Vec::new();
-    for group in &config.worker_groups {
+    for group in &config.parallel.worker_groups {
         for rank in &group.ranks {
             if rank.host != host {
                 continue;

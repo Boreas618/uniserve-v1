@@ -136,7 +136,7 @@ pub(crate) struct Epoch {
     /// which a relaunch and a standby load again.
     pub experts: BTreeMap<String, Vec<u32>>,
     /// The deployment's always-on profiling (`profiling_config`).
-    pub profiling: proto::request::wire::Profiling,
+    pub profiling: proto::config::ProfilingConfig,
     /// The KV cache the world this process succeeds holds, by worker group.
     pub predecessor_cache: Vec<proto::request::wire::CacheSegments>,
 }
@@ -441,7 +441,7 @@ fn load_rank(
         .predecessor_cache
         .iter()
         .find(|cache| cache.worker_group == launch.group)
-        .filter(|_| launch.standby)
+        .filter(|_| launch.standby())
         .map(|cache| ipc::CacheTable {
             segments: cache
                 .segments
@@ -454,7 +454,10 @@ fn load_rank(
                 .collect(),
             held: cache.held,
         });
-    let plan = plan.sharing_cache_of(epoch.predecessor_world.filter(|_| launch.standby), adopted);
+    let plan = plan.sharing_cache_of(
+        epoch.predecessor_world.filter(|_| launch.standby()),
+        adopted,
+    );
     let host = HostGroup::connect(rendezvous, index, count, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
     // §8: the rank's Storage Server and its claim are the node's, which the daemon answered for; the
@@ -556,7 +559,7 @@ fn claim(
         kind: Some(proto::process::request::Kind::Claim(
             proto::process::Claim {
                 host: host.to_owned(),
-                deployment: launch.deployment.clone(),
+                deployment: launch.engine_config.deployment.clone(),
                 scopes: ranks
                     .iter()
                     .map(|rank| proto::process::Scope {
@@ -581,7 +584,7 @@ fn claim(
     };
     Ok(ipc::StorageLaunch {
         socket: claimed.socket,
-        deployment: launch.deployment.clone(),
+        deployment: launch.engine_config.deployment.clone(),
         claim: claim_token(&claimed.claim)?,
         // The host KV cache is the deployment's decision, from the build config: a rank whose
         // deployment keeps a host tier maps a page pool per cache group, and one that does not
@@ -599,7 +602,7 @@ fn claim(
         // The standby role is the epoch layer's (§2.5, §7.4): a standby maps its scope's storage
         // read-only until it is promoted, and claiming it writable would give the scope two
         // writers. The launch file states the role, so the process never has to infer it.
-        standby: launch.standby,
+        standby: launch.standby(),
         standby_storage: ipc::StandbyStorage::Auto,
     })
 }
@@ -627,17 +630,7 @@ pub(crate) fn run(
     );
 
     let launch = read_engine_args(launch_file)?;
-    let build: proto::config::EngineConfig = serde_json::from_reader(
-        std::fs::File::open(&launch.engine_config)
-            .with_context(|| format!("opening {}", launch.engine_config.display()))?,
-    )
-    .with_context(|| {
-        format!(
-            "reading the build config {}",
-            launch.engine_config.display()
-        )
-    })?;
-    let mut main = MainProcess::start(&launch, &build)?;
+    let mut main = MainProcess::start(&launch, &launch.engine_config)?;
     let ending = main.serve();
     main.close();
     // Why this process ends is the daemon's own diagnostic: the supervisor reports
@@ -988,8 +981,11 @@ impl MainProcess {
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
-        let mut process =
-            ProcessInterface::connect(&launch.processes, &launch.deployment, launch.engine)?;
+        let mut process = ProcessInterface::connect(
+            &launch.processes,
+            &launch.engine_config.deployment,
+            launch.engine,
+        )?;
         // Every command of the program layer arrives on this socket, and a stage waits for the
         // command before it: the control thread sleeps on it as it does on the request socket.
         connected.watch_process(Some(process.connection.descriptor()));
@@ -1178,7 +1174,7 @@ impl MainProcess {
         let data = Arc::new(executor::data_plane::DataPlane::new(
             data_ranks,
             executor::data_plane::Target {
-                checkpoint: launch.model.clone(),
+                checkpoint: PathBuf::from(&launch.engine_config.model.model),
                 experts: epoch.experts.clone(),
             },
             build.mem_fraction_static,
@@ -1294,7 +1290,7 @@ impl MainProcess {
             serving_programs: Programs::new(),
             retired_programs: Programs::new(),
             prepared_programs: Programs::new(),
-            standby: launch.standby,
+            standby: launch.standby(),
             promoted: false,
             parked: None,
             draining: None,
@@ -1306,13 +1302,13 @@ impl MainProcess {
             weights: None,
             asleep: false,
         };
-        if launch.standby {
+        if launch.standby() {
             process.park_standby()?;
         }
         // What the daemon waits for before the epoch's first `Precopy`: a process started beside a
         // serving one is `Standby`, and one launched to serve is `Ready`. Waiting to be ready until
         // this process had a policy would be waiting for the command that waits for it.
-        let state = if launch.standby {
+        let state = if launch.standby() {
             proto::request::wire::EngineState::Standby
         } else {
             proto::request::wire::EngineState::Ready
@@ -8085,7 +8081,7 @@ fn schedulers(
     // maps its model on one device.
     let host_cache = plan.host_kv_cache(model) && executors.len() == 1;
     if host_cache {
-        facts.deployment = Some(launch.deployment.clone());
+        facts.deployment = Some(launch.engine_config.deployment.clone());
         facts.host_kv_cache = true;
     }
     let config = engine::EngineConfig::of(&facts)?;
@@ -8137,11 +8133,11 @@ fn schedulers(
     Ok(vec![handle])
 }
 
-/// The daemon states that this build may serve the epoch, this node's host identity, and, later,
-/// the program revision of the generation it prepares (§7.3). The programs themselves never come
-/// through this interface: the daemon names them and this process resolves their modules from the
-/// Program Server (§5.1). The build config is the one the daemon wrote for this node, which `run`
-/// reads before the handshake.
+/// The daemon states that this build may serve the epoch, and, later, the program revision of the
+/// generation it prepares (§7.3). The launch file states the rest of what the epoch starts from:
+/// this node's host identity, the process this one succeeds, the expert order and the profiling.
+/// The programs themselves never come through this interface: the daemon names them and this
+/// process resolves their modules from the Program Server (§5.1).
 fn handshake(control: &mut Control, launch: &EngineArgs) -> Result<Epoch> {
     control.daemon_mut().send(&proto::request::wire::Hello {
         engine: launch.engine,
@@ -8159,38 +8155,33 @@ fn handshake(control: &mut Control, launch: &EngineArgs) -> Result<Epoch> {
     if !welcome.refusal.is_empty() {
         bail!("the daemon refused this main process: {}", welcome.refusal);
     }
-    let spec = welcome.spec.unwrap_or_default();
-    // The epoch's programs and the generation that serves at start are not in the spec: the
-    // programs arrive as the daemon's first `Precopy` (§7.3 step 2) and the generation number is the
-    // daemon's own. Until it states one, this process serves generation zero, whose `Precopy` names
-    // the daemon's next number.
+    // The epoch's programs and the generation that serves at start are not in the launch file:
+    // the programs arrive as the daemon's first `Precopy` (§7.3 step 2) and the generation number
+    // is the daemon's own. Until it states one, this process serves generation zero, whose
+    // `Precopy` names the daemon's next number.
     //
     // The host identity is the daemon's fact and nothing else can supply it: the Storage Server
     // keys this rank's claim by it, so an empty one would mint a claim on a host that does not
     // exist and every peer would compare its products against the wrong node.
-    if spec.host.is_empty() {
+    if launch.host.is_empty() {
         bail!(
-            "the daemon's welcome states no host identity, which this rank's storage claim is keyed by"
+            "the launch file states no host identity, which this rank's storage claim is keyed by"
         );
     }
+    let predecessor = launch.predecessor.as_ref();
     Ok(Epoch {
         generation: 0,
-        predecessor_world: spec
-            .predecessor
-            .as_ref()
-            .map(|predecessor| predecessor.world),
-        predecessor_cache: spec
-            .predecessor
-            .as_ref()
+        predecessor_world: predecessor.map(|predecessor| predecessor.world),
+        predecessor_cache: predecessor
             .map(|predecessor| predecessor.segments.clone())
             .unwrap_or_default(),
-        experts: spec
+        experts: launch
             .expert_order
-            .into_iter()
-            .map(|(module, order)| (module, order.experts))
+            .iter()
+            .map(|(module, order)| (module.clone(), order.experts.clone()))
             .collect(),
-        host: spec.host,
-        profiling: spec.profiling.unwrap_or_default(),
+        host: launch.host.clone(),
+        profiling: launch.engine_config.profiling.clone(),
     })
 }
 

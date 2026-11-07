@@ -31,7 +31,6 @@ mod scheduler;
 mod service;
 #[cfg(feature = "testing")]
 mod sim;
-mod spec;
 mod trajectories;
 mod warmup;
 
