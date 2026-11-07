@@ -27,7 +27,10 @@ fn stderr(output: &Output) -> String {
 
 /// A directory of this test's own, so two runs of the cases do not collide.
 fn workspace(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("scheduling-precompile-{name}-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!(
+        "scheduling-precompile-{name}-{}",
+        std::process::id()
+    ));
     let _ = fs::remove_dir_all(&dir);
     fs::create_dir_all(&dir).expect("a temporary directory");
     dir
@@ -57,14 +60,19 @@ fn a_command_line_it_cannot_serve_is_a_usage_failure() {
         .output()
         .expect("the tool runs");
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert!(stderr(&output).contains("--out is required"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("--out is required"),
+        "{}",
+        stderr(&output)
+    );
 
-    let output = tool()
-        .arg("--nonsense")
-        .output()
-        .expect("the tool runs");
+    let output = tool().arg("--nonsense").output().expect("the tool runs");
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert!(stderr(&output).contains("--nonsense"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("--nonsense"),
+        "{}",
+        stderr(&output)
+    );
 }
 
 /// What the tool wrote is what the main process loads: the artifact is
@@ -88,9 +96,17 @@ fn the_artifact_the_tool_wrote_is_what_the_main_process_loads() {
 
     let bytes = fs::read(&artifact).expect("the artifact is written");
     let engine = scheduling::Engine::new().expect("this host has a policy engine");
-    let module = engine.module(&bytes).expect("the main process loads the artifact");
+    let module = engine
+        .module(&bytes)
+        .expect("the main process loads the artifact");
     assert!(
-        module.instantiate(&scheduling::guest::Snapshot::default(), &Default::default(), &Default::default()).is_err(),
+        module
+            .instantiate(
+                &scheduling::guest::Snapshot::default(),
+                &Default::default(),
+                &Default::default()
+            )
+            .is_err(),
         "the artifact carries the policy's exports, and an empty module has none"
     );
     let _ = fs::remove_dir_all(&dir);
@@ -110,8 +126,16 @@ fn an_input_it_cannot_use_names_what_failed() {
         .output()
         .expect("the tool runs");
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(stderr(&output).contains("cannot read"), "{}", stderr(&output));
-    assert!(stderr(&output).contains("absent.wasm"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("cannot read"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(
+        stderr(&output).contains("absent.wasm"),
+        "{}",
+        stderr(&output)
+    );
 
     let garbage = dir.join("garbage.wasm");
     fs::write(&garbage, b"not a module at all").expect("the file is written");
@@ -123,6 +147,10 @@ fn an_input_it_cannot_use_names_what_failed() {
         .output()
         .expect("the tool runs");
     assert_eq!(output.status.code(), Some(1), "{}", stderr(&output));
-    assert!(stderr(&output).contains("cannot precompile"), "{}", stderr(&output));
+    assert!(
+        stderr(&output).contains("cannot precompile"),
+        "{}",
+        stderr(&output)
+    );
     let _ = fs::remove_dir_all(&dir);
 }

@@ -200,7 +200,6 @@ impl ModelConfig {
     }
 }
 
-
 /// Extracts serving generation defaults from repository configuration.
 fn generation_defaults(config: &GenerationConfig) -> SamplingDefaults {
     SamplingDefaults {
@@ -378,5 +377,4 @@ mod tests {
                 if actual == "unsupported_architecture"
         ));
     }
-
 }

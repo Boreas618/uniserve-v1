@@ -456,7 +456,12 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
         let generation = self.lifecycle.generation.number();
         let mut jobs = Vec::new();
         for bucket in self.capture_order() {
-            if self.lifecycle.graphs.captured_for(bucket, generation).is_none() {
+            if self
+                .lifecycle
+                .graphs
+                .captured_for(bucket, generation)
+                .is_none()
+            {
                 jobs.push(Job::Capture {
                     runner: self.id,
                     bucket,

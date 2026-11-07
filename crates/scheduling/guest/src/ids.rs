@@ -25,7 +25,9 @@ pub struct EncodingId(pub u64);
 /// A phase: one block's computation for one kind of call, the unit the
 /// scheduler addresses (design §0). The mechanism assigns the ids for an epoch
 /// and describes each in [`crate::view::PhaseView`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+)]
 #[serde(transparent)]
 pub struct PhaseId(pub u32);
 

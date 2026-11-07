@@ -1708,10 +1708,7 @@ mod nvfp4_call_layout_tests {
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, global_scale_gate), 48);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_expert), 56);
         assert_eq!(std::mem::offset_of!(GatherNvfp4Call, tile_to_limit), 64);
-        assert_eq!(
-            std::mem::offset_of!(GatherNvfp4Call, permuted_to_token),
-            72
-        );
+        assert_eq!(std::mem::offset_of!(GatherNvfp4Call, permuted_to_token), 72);
         assert_eq!(
             std::mem::offset_of!(GatherNvfp4Call, num_non_exiting_tiles),
             80

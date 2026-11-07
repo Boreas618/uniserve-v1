@@ -22,9 +22,7 @@
 //! Sharding two blocks over a thousand rows would save nothing and put two exchanges on the first
 //! step of every request.
 
-use nn::layers::{
-    Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual,
-};
+use nn::layers::{Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -434,7 +432,9 @@ impl TokenRefiner {
     ) -> Result<()> {
         let rows = features.shape.dim(0);
         if rows == 0 {
-            return Err(Error::checkpoint("a refiner reads at least one row".to_owned()));
+            return Err(Error::checkpoint(
+                "a refiner reads at least one row".to_owned(),
+            ));
         }
         if features.shape.last() != u64::from(self.text_dim) {
             return Err(Error::checkpoint(format!(

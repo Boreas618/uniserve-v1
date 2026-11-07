@@ -114,10 +114,7 @@ impl Op for Probe {
         stream: &Stream,
     ) -> ops::Result<()> {
         let mut arguments = Arguments::new();
-        arguments
-            .view(args.data)
-            .u32(args.count)
-            .u32(args.value);
+        arguments.view(args.data).u32(args.count).u32(args.value);
         let threads = 128_u64;
         let blocks = u64::from(descriptor.words).div_ceil(threads).max(1);
         kernel.launch(LaunchGrid::new([blocks, 1, 1])?, &mut arguments, stream)
@@ -143,7 +140,8 @@ impl Op for Probe {
 fn cubin() -> PathBuf {
     let source =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe_generation.cu");
-    let output = std::env::temp_dir().join(format!("probe-generation-{}.cubin", std::process::id()));
+    let output =
+        std::env::temp_dir().join(format!("probe-generation-{}.cubin", std::process::id()));
     let arch = std::env::var("UNISERVE_PROBE_ARCH").unwrap_or_else(|_| "sm_100a".to_owned());
     let status = Command::new("nvcc")
         .arg("-cubin")

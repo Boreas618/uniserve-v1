@@ -660,17 +660,17 @@ pub fn read_conditions(
                 let out = pixels[index].take().ok_or_else(|| {
                     Error::Plan("a condition's pixels have no product".to_owned())
                 })?;
-                decoders.push(scope.spawn(move || {
-                    read_image(&encoded_bytes(&condition.source)?, &plan, out)
-                }));
+                decoders.push(
+                    scope.spawn(move || read_image(&encoded_bytes(&condition.source)?, &plan, out)),
+                );
             }
             if let Some(plan) = condition.audio {
                 let out = samples[index].take().ok_or_else(|| {
                     Error::Plan("a condition's samples have no product".to_owned())
                 })?;
-                decoders.push(scope.spawn(move || {
-                    read_audio(&encoded_bytes(&condition.source)?, &plan, out)
-                }));
+                decoders.push(
+                    scope.spawn(move || read_audio(&encoded_bytes(&condition.source)?, &plan, out)),
+                );
             }
         }
         for decoder in decoders {

@@ -780,7 +780,11 @@ impl Scheduler {
         let Some((stage, answer, _at)) = self.policy_stage.take() else {
             return;
         };
-        tracing::info!(stage = stage_name(stage), step = self.step, "a policy stage applies");
+        tracing::info!(
+            stage = stage_name(stage),
+            step = self.step,
+            "a policy stage applies"
+        );
         let state = views::trial_state(self, self.step, self.recorder.recorded());
         // The step the stage applied at: the boundary this scheduler reached,
         // where the policy it replaced had decided its last batch. The ranks of

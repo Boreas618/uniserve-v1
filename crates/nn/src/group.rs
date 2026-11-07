@@ -186,9 +186,7 @@ impl Group {
         stream: &Stream,
     ) -> Result<Transfer> {
         self.fork.record(stream).map_err(Error::Platform)?;
-        self.lane
-            .wait_event(&self.fork)
-            .map_err(Error::Platform)?;
+        self.lane.wait_event(&self.fork).map_err(Error::Platform)?;
         self.all_to_all(send, recv, &self.lane)?;
         let landing = self.next.fetch_add(1, Ordering::Relaxed) % LANDINGS;
         self.landings[landing]
@@ -221,9 +219,7 @@ impl Group {
             range(gathered.at(at), bytes)
         };
         self.fork.record(stream).map_err(Error::Platform)?;
-        self.lane
-            .wait_event(&self.fork)
-            .map_err(Error::Platform)?;
+        self.lane.wait_event(&self.fork).map_err(Error::Platform)?;
         {
             let communicator = self.locked();
             let rank = communicator.rank();

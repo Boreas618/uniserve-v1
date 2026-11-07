@@ -466,7 +466,11 @@ mod tests {
         update.commit(8).expect("commit");
         assert_eq!(update.phase(), Phase::Serving);
         assert_eq!(update.current(), 8);
-        assert_eq!(update.previous(), None, "the update is accepted, so nothing reverts");
+        assert_eq!(
+            update.previous(),
+            None,
+            "the update is accepted, so nothing reverts"
+        );
         assert_eq!(
             update.awaiting_purge(),
             &[7],
@@ -595,7 +599,9 @@ mod tests {
         update.precopied(8).expect("precopy finished");
         update.switchover(8, Instant::now()).expect("switchover");
         update.commit(8).expect("commit");
-        update.request_purge(7).expect("the switchover's generation");
+        update
+            .request_purge(7)
+            .expect("the switchover's generation");
         assert_eq!(update.purge_due(), Some(7));
         update.purged(7).expect("purged");
         assert!(update.request_purge(7).is_err());
@@ -638,7 +644,11 @@ mod tests {
         update.revert(8, stall()).expect("revert before switchover");
         assert_eq!(update.current(), 7, "nothing was switched over");
         assert_eq!(update.previous(), None, "no generation was replaced");
-        assert_eq!(update.purge_due(), None, "a discarded generation is not purged");
+        assert_eq!(
+            update.purge_due(),
+            None,
+            "a discarded generation is not purged"
+        );
 
         // The next update's purge waits for its commit: until then the generation the switchover
         // replaced is what a revert would return to, and releasing its kernels would leave the
@@ -664,7 +674,11 @@ mod tests {
         update.switchover(8, Instant::now()).expect("switchover");
         update.revert(8, stall()).expect("revert");
         assert_eq!(update.current(), 7);
-        assert_eq!(update.previous(), None, "the revert returned to the older generation");
+        assert_eq!(
+            update.previous(),
+            None,
+            "the revert returned to the older generation"
+        );
         assert_eq!(update.awaiting_purge(), &[8]);
         update
             .request_purge(8)

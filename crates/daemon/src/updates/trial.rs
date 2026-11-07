@@ -134,9 +134,7 @@ impl Trial {
         for observed in &self.observed {
             let (Some(baseline), Some(rates)) = (
                 observed.baseline,
-                observed
-                    .observer
-                    .rates(observed.world, self.began, window),
+                observed.observer.rates(observed.world, self.began, window),
             ) else {
                 continue;
             };
@@ -178,9 +176,8 @@ impl Trial {
             .observed
             .iter()
             .map(|observed| {
-                let rates = window.and_then(|window| {
-                    observed.observer.rates(observed.world, self.began, window)
-                });
+                let rates = window
+                    .and_then(|window| observed.observer.rates(observed.world, self.began, window));
                 json!({
                     "world": observed.world,
                     "baseline": observed.baseline,
@@ -271,7 +268,10 @@ mod tests {
         observer.record(2, 0, &stats(2_000, 100, 10_000));
         let failure = trial.breach((10, 1)).expect("the average is past 20%");
         assert_eq!(failure.kind, "step_time_regression");
-        assert!(failure.reason.contains("1550 us against 1000 us"), "{failure:?}");
+        assert!(
+            failure.reason.contains("1550 us against 1000 us"),
+            "{failure:?}"
+        );
     }
 
     /// The same slowed target states no breach when no threshold names it: a
@@ -359,9 +359,12 @@ mod tests {
         .await;
         assert_eq!(*reverted.lock().expect("the list"), ["failure_rate"]);
 
-        watch(&trial, || (2, 2), || false, |_| async {
-            panic!("an update that ended reverts nothing")
-        })
+        watch(
+            &trial,
+            || (2, 2),
+            || false,
+            |_| async { panic!("an update that ended reverts nothing") },
+        )
         .await;
     }
 

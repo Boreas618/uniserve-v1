@@ -324,11 +324,7 @@ fn run() -> Result<(), String> {
     // occupy the same offsets, because the capture walk runs the evaluation alone from the region's
     // base and the fold runs only on the live path, before the first replay.
     let fold_rows = layout.text_rows.saturating_add(layout.condition_rows);
-    let fold = minimax_h3::conditioning::fold_bytes(
-        &denoiser.transformer,
-        fold_rows,
-        args.dtype,
-    );
+    let fold = minimax_h3::conditioning::fold_bytes(&denoiser.transformer, fold_rows, args.dtype);
     // The plan's own reservation, not the element count times one width: a plan carries `f32`,
     // `bf16` and `i32` entries, and the executor sums each entry's own width.
     let evaluation = minimax_h3::decoding::arena_reservation(&plan);

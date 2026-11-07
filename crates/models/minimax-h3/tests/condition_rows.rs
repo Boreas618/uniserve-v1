@@ -4,7 +4,9 @@
 //! statements are held against each other here over every kind of condition.
 
 use minimax_h3::packing::{self, Condition, Frame, Role};
-use models::video::plan::{AudioClip, ConditionPlan, FramePosition, KeyframeFit, Prepared, VideoClip};
+use models::video::plan::{
+    AudioClip, ConditionPlan, FramePosition, KeyframeFit, Prepared, VideoClip,
+};
 use models::video::{Canvas, ConditionPacking, FrameClips};
 
 const CLIPS: FrameClips = FrameClips {
@@ -95,7 +97,13 @@ fn a_rule_counts_a_condition_as_the_packing_does() {
         assert_eq!(rule_rows(&keyframe, tile), packed_rows(packed, tile));
 
         // The released image sizes, the enlarged one of each aspect among them.
-        for (width, height) in [(3648, 2048), (2560, 1440), (2048, 2048), (768, 768), (1088, 800)] {
+        for (width, height) in [
+            (3648, 2048),
+            (2560, 1440),
+            (2048, 2048),
+            (768, 768),
+            (1088, 800),
+        ] {
             let image = plan(Prepared::Image(Canvas { width, height }), 0);
             let packed = Condition {
                 role: Role::Reference,

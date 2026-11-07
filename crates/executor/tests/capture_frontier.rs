@@ -87,7 +87,12 @@ fn cubin() -> PathBuf {
 /// capture attributed to it, with the graph's own node count beside it.
 ///
 /// `data` must outlive the capture: the driver records its address as the node's argument.
-fn attributed(stream: &Stream, kernel: &Function, data: &mut u64, mode: CaptureMode) -> (Vec<usize>, usize) {
+fn attributed(
+    stream: &Stream,
+    kernel: &Function,
+    data: &mut u64,
+    mode: CaptureMode,
+) -> (Vec<usize>, usize) {
     let mut count = WORDS as i32;
     let mut value = 1u32;
     let mut parameters: [*mut c_void; 3] = [
@@ -105,12 +110,7 @@ fn attributed(stream: &Stream, kernel: &Function, data: &mut u64, mode: CaptureM
                 &mut parameters,
             )
             .expect("launch inside the capture");
-        per_launch.push(
-            recording
-                .record()
-                .expect("record the launch's nodes")
-                .len(),
-        );
+        per_launch.push(recording.record().expect("record the launch's nodes").len());
     }
     let graph = recording.end().expect("end the capture");
     (per_launch, graph.nodes().expect("the graph's nodes").len())
@@ -123,7 +123,9 @@ fn a_capture_attributes_the_nodes_each_launch_added() {
     let stream = Stream::new(DEVICE).expect("a stream");
     let image = std::fs::read(cubin()).expect("the compiled probe kernel");
     let library = Library::load(&device, &image).expect("load the probe kernel");
-    let kernel: Function = library.kernel("generation_0").expect("the fixture's kernel");
+    let kernel: Function = library
+        .kernel("generation_0")
+        .expect("the fixture's kernel");
     let allowance = Arc::new(Allowance::default());
     let mut allocator = Allocator::new(&device, allowance).expect("an allocator");
     allocator

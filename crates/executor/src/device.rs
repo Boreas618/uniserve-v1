@@ -185,7 +185,9 @@ impl Executor {
         // its first capture as an allocator fault. A preparation takes one more range than the
         // serving generation does, so the check allows for it.
         {
-            let pools = pools.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let pools = pools
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             let needed = runners.len() + 1;
             if needed > pools.streams() {
                 return Err(Error::Interface(format!(
@@ -527,12 +529,12 @@ impl Executor {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner),
             )),
-            crate::completion::Outcome::Failed(error) => {
-                Err(Error::Invalid(format!("mapping the host KV cache: {error}")))
-            }
-            crate::completion::Outcome::Cancelled => {
-                Err(Error::Invalid("mapping the host KV cache was cancelled".into()))
-            }
+            crate::completion::Outcome::Failed(error) => Err(Error::Invalid(format!(
+                "mapping the host KV cache: {error}"
+            ))),
+            crate::completion::Outcome::Cancelled => Err(Error::Invalid(
+                "mapping the host KV cache was cancelled".into(),
+            )),
         }
     }
 
@@ -562,12 +564,10 @@ impl Executor {
     /// # Errors
     ///
     /// When the session refuses, or the device's thread is gone.
-    pub fn profile(
-        &self,
-        change: crate::profiling::session::Change,
-    ) -> Result<serde_json::Value> {
+    pub fn profile(&self, change: crate::profiling::session::Change) -> Result<serde_json::Value> {
         let (answer, answered) = crossbeam_channel::bounded(1);
-        let submission = self.storage_command(Command::Profile { change, answer }, JobKind::Profile)?;
+        let submission =
+            self.storage_command(Command::Profile { change, answer }, JobKind::Profile)?;
         match answered.recv() {
             Ok(result) => result,
             Err(_) => match submission.wait() {
@@ -1173,7 +1173,11 @@ impl Device {
                 self.shadow_attached = true;
                 Ok(Step::Done(BatchOutput::default()))
             }
-            Command::MapHostCache { tokens, keys, pools } => {
+            Command::MapHostCache {
+                tokens,
+                keys,
+                pools,
+            } => {
                 let client = self.storage()?;
                 for cache in self.caches() {
                     let setup = crate::memory::prefix_cache::host::HostCacheSetup {
@@ -1408,8 +1412,10 @@ impl Device {
                 // The step's end marker goes right behind its last launch: launched after the wait
                 // below, its span would hold the host's trip back as well as the device's work.
                 if index == last
-                    && let (Some((step, stage, stream)), Some(fences)) =
-                        (self.step_end.take(), crate::profiling::fences::Fences::installed())
+                    && let (Some((step, stage, stream)), Some(fences)) = (
+                        self.step_end.take(),
+                        crate::profiling::fences::Fences::installed(),
+                    )
                 {
                     fences.mark(&stream, step, stage, false)?;
                 }
@@ -1579,9 +1585,7 @@ impl Device {
                 rank,
             } => {
                 let mut answer = match &mut self.session {
-                    Some(running) if running.id() == session => {
-                        running.release(collector, &reason)
-                    }
+                    Some(running) if running.id() == session => running.release(collector, &reason),
                     _ => serde_json::json!({ "released": false }),
                 };
                 answer["rank"] = serde_json::json!(rank);

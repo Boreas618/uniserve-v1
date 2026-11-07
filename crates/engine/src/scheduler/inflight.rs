@@ -167,7 +167,11 @@ impl Inflight {
                     .requests
                     .iter()
                     .any(|(call, _)| batch_kind(call.kind) == BatchKind::Prefill),
-                tokens: batch.requests.iter().map(|(call, _)| query_tokens(call)).sum(),
+                tokens: batch
+                    .requests
+                    .iter()
+                    .map(|(call, _)| query_tokens(call))
+                    .sum(),
                 measured: speculation::MeasuredStep::of(
                     batch.requests.iter().map(|(call, _)| call),
                 ),

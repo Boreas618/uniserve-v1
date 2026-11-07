@@ -9,11 +9,11 @@
 
 use std::sync::Arc;
 
-use crate::batch::{Job, Jobs};
+use crate::arena::Pools;
 use crate::arena::StreamId;
+use crate::batch::{Job, Jobs};
 use crate::captured::{Captured, Nodes};
 use crate::error::{Error, Result};
-use crate::arena::Pools;
 use crate::graph::Graphs;
 use crate::plan::Bucket;
 use crate::runner::RunnerId;
@@ -45,7 +45,11 @@ pub(crate) struct Lifecycle {
 
 impl Lifecycle {
     /// A lifecycle serving `generation` with no other generation held.
-    pub(crate) fn new(id: RunnerId, generation: Arc<ops::Generation>, stream: platform::Stream) -> Self {
+    pub(crate) fn new(
+        id: RunnerId,
+        generation: Arc<ops::Generation>,
+        stream: platform::Stream,
+    ) -> Self {
         Self {
             id,
             graphs: Graphs::default(),
@@ -88,9 +92,13 @@ impl Lifecycle {
 
     /// The generation numbered `number`, from any this runner holds.
     pub(crate) fn generation_named(&self, number: u64) -> Result<Arc<ops::Generation>> {
-        for candidate in [Some(&self.generation), self.next.as_ref(), self.previous.as_ref()]
-            .into_iter()
-            .flatten()
+        for candidate in [
+            Some(&self.generation),
+            self.next.as_ref(),
+            self.previous.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
         {
             if candidate.number() == number {
                 return Ok(Arc::clone(candidate));
@@ -99,7 +107,8 @@ impl Lifecycle {
         Err(Error::Invariant(format!(
             "the runner holds no generation {number}"
         )))
-    }    pub(crate) fn switchover(&mut self, generation: u64) -> Result<()> {
+    }
+    pub(crate) fn switchover(&mut self, generation: u64) -> Result<()> {
         // From the next batch on, the prepared generation serves; the old one stays for a revert
         // (7.3 step 4).
         let prepared = self.next.take().filter(|next| next.number() == generation);
@@ -168,7 +177,9 @@ impl Lifecycle {
             return Err(Error::Invariant(format!(
                 "generation {generation} is one this runner serves (serving {serving}, probation {}) \
                  and cannot be discarded",
-                probation.map(|number| number.to_string()).unwrap_or_else(|| "none".into())
+                probation
+                    .map(|number| number.to_string())
+                    .unwrap_or_else(|| "none".into())
             )));
         }
         // A prepared generation that never served: its graphs go, then their arena regions where
@@ -177,10 +188,7 @@ impl Lifecycle {
         // about that generation's annotation goes with it.
         let dropped = self.graphs.discard(generation);
         let dropped_count = dropped.len();
-        for bucket in dropped
-            .iter()
-            .filter(|bucket| !self.graphs.holds(**bucket))
-        {
+        for bucket in dropped.iter().filter(|bucket| !self.graphs.holds(**bucket)) {
             if let Err(error) = self
                 .pool()
                 .and_then(|mut pools| pools.release_bucket(self.stream_id(), *bucket))
@@ -216,10 +224,7 @@ impl Lifecycle {
         // Both generations' graphs can address one bucket's plan: the pool records a plan per
         // bucket, not per generation, so a purged generation's bucket keeps its region while the
         // serving (or probation's) generation still has a graph for it.
-        for bucket in dropped
-            .iter()
-            .filter(|bucket| !self.graphs.holds(**bucket))
-        {
+        for bucket in dropped.iter().filter(|bucket| !self.graphs.holds(**bucket)) {
             let released_bucket = self
                 .pool()
                 .and_then(|mut pools| pools.release_bucket(self.stream_id(), *bucket));
@@ -464,10 +469,7 @@ impl Lifecycle {
                 // An operator the serving generation already holds a kernel for is one its graphs
                 // launch, so a graph that names none of them was captured without the annotation.
                 // A genuinely new operator names no graph for the honest reason, and says nothing.
-                let existed = self
-                    .generation
-                    .iter()
-                    .any(|(name, _, _)| name == operator);
+                let existed = self.generation.iter().any(|(name, _, _)| name == operator);
                 if existed && !launching.is_empty() {
                     tracing::error!(
                         %operator,
@@ -535,60 +537,59 @@ pub(crate) fn walk_capture(
     stream: &platform::Stream,
     walk: impl FnOnce() -> Result<()>,
 ) -> Result<Walked> {
-        // One thread records and takes the capture back: an `Arc`/`Mutex` here would say the
-        // handle is shared across threads, which it is not, and the allocator is right to warn
-        // about a non-`Send` handle in an `Arc`.
-        let started = std::time::Instant::now();
-        let capture = std::rc::Rc::new(std::cell::RefCell::new(platform::Capture::begin(
-            stream,
-            platform::CaptureMode::Relaxed,
-        )?));
-        // The phases of one capture, at `debug`: a cold epoch's first capture may legitimately pay
-        // minutes, and which phase pays them is the difference between a slow device and a walk
-        // that is waiting on something. Descriptor resolution and the launches are inside the walk.
-        let begun = started.elapsed().as_micros() as u64;
-        let mut recording = Recording::new(std::rc::Rc::clone(&capture));
-        // The forward runs with the generation being walked and the bucket's arena, so every
-        // operator launch becomes a node of the template and is reported to `recording`.
-        ops::capture::set_sink(Some(&mut recording));
-        let walked = walk();
-        ops::capture::set_sink(None);
-        // The recorder holds a clone of the capture while the walk runs, and this thread holds the
-        // other: taking the table and the failure out by field would leave the clone alive to the
-        // end of the function, so `try_unwrap` below would refuse the only handle that can end the
-        // capture. Destructuring drops the recorder with it, which is what makes the capture ours
-        // again.
-        let Recording {
-            nodes,
-            failure,
-            capture: recorder,
-        } = recording;
-        drop(recorder);
-        if let Some(failure) = failure {
-            return Err(failure.into());
-        }
-        walked?;
-        let walked_us = started.elapsed().as_micros() as u64;
-        let capture = std::rc::Rc::try_unwrap(capture).map_err(|_| {
-            Error::Invariant("the capture is still shared by its recorder".into())
-        })?;
-        let capture = capture.into_inner();
-        let template = capture.end()?;
-        tracing::debug!(
-            begin_us = begun,
-            walk_us = walked_us.saturating_sub(begun),
-            end_us = started.elapsed().as_micros() as u64 - walked_us,
-            nodes = nodes.len(),
-            "the phases of one capture"
-        );
-        // The node table comes from the capture sink, and the template is the record of what was
-        // actually launched: the two can only be compared here. A graph that launched kernels and
-        // reported no node table serves batches correctly but cannot be rebound, because there is
-        // no node to set the new kernel's parameters on. It is recorded rather than refused - a
-        // programme update is what needs it, and `precopy` refuses there by name instead of letting
-        // the update silently do nothing.
-        Ok(Walked { template, nodes })
+    // One thread records and takes the capture back: an `Arc`/`Mutex` here would say the
+    // handle is shared across threads, which it is not, and the allocator is right to warn
+    // about a non-`Send` handle in an `Arc`.
+    let started = std::time::Instant::now();
+    let capture = std::rc::Rc::new(std::cell::RefCell::new(platform::Capture::begin(
+        stream,
+        platform::CaptureMode::Relaxed,
+    )?));
+    // The phases of one capture, at `debug`: a cold epoch's first capture may legitimately pay
+    // minutes, and which phase pays them is the difference between a slow device and a walk
+    // that is waiting on something. Descriptor resolution and the launches are inside the walk.
+    let begun = started.elapsed().as_micros() as u64;
+    let mut recording = Recording::new(std::rc::Rc::clone(&capture));
+    // The forward runs with the generation being walked and the bucket's arena, so every
+    // operator launch becomes a node of the template and is reported to `recording`.
+    ops::capture::set_sink(Some(&mut recording));
+    let walked = walk();
+    ops::capture::set_sink(None);
+    // The recorder holds a clone of the capture while the walk runs, and this thread holds the
+    // other: taking the table and the failure out by field would leave the clone alive to the
+    // end of the function, so `try_unwrap` below would refuse the only handle that can end the
+    // capture. Destructuring drops the recorder with it, which is what makes the capture ours
+    // again.
+    let Recording {
+        nodes,
+        failure,
+        capture: recorder,
+    } = recording;
+    drop(recorder);
+    if let Some(failure) = failure {
+        return Err(failure.into());
     }
+    walked?;
+    let walked_us = started.elapsed().as_micros() as u64;
+    let capture = std::rc::Rc::try_unwrap(capture)
+        .map_err(|_| Error::Invariant("the capture is still shared by its recorder".into()))?;
+    let capture = capture.into_inner();
+    let template = capture.end()?;
+    tracing::debug!(
+        begin_us = begun,
+        walk_us = walked_us.saturating_sub(begun),
+        end_us = started.elapsed().as_micros() as u64 - walked_us,
+        nodes = nodes.len(),
+        "the phases of one capture"
+    );
+    // The node table comes from the capture sink, and the template is the record of what was
+    // actually launched: the two can only be compared here. A graph that launched kernels and
+    // reported no node table serves batches correctly but cannot be rebound, because there is
+    // no node to set the new kernel's parameters on. It is recorded rather than refused - a
+    // programme update is what needs it, and `precopy` refuses there by name instead of letting
+    // the update silently do nothing.
+    Ok(Walked { template, nodes })
+}
 
 /// Every kernel a walk's launches reference, so a graph built from it keeps them loaded (4.5).
 pub(crate) fn hold_kernels(

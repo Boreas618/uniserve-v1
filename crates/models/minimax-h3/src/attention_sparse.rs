@@ -127,7 +127,13 @@ impl Sparse {
         // one - an FP16 stack would have had its attended rows narrowed to BF16 by a layer that never
         // asked what the stack was.
         let head_projection = |loader: &mut WeightLoader<'_>, name: &str| {
-            HeadProjection::load(loader, &format!("{prefix}.{name}"), inner, hidden, partition)
+            HeadProjection::load(
+                loader,
+                &format!("{prefix}.{name}"),
+                inner,
+                hidden,
+                partition,
+            )
         };
         let query = head_projection(loader, "to_q.weight")?;
         let stack = query.dtype();
@@ -205,7 +211,16 @@ impl Sparse {
         scratch: &Scratch,
         out: TensorView,
     ) -> Result<()> {
-        self.attend(f, normalized, factors, sizes, segments, keep, scratch, Vec::new())?;
+        self.attend(
+            f,
+            normalized,
+            factors,
+            sizes,
+            segments,
+            keep,
+            scratch,
+            Vec::new(),
+        )?;
         // The compression is folded into the fine rows, in place, and one binding names both the
         // buffer the fold writes and the buffer the projection reads: `add_gated` modifies its first
         // argument only, so folding into any other buffer would drop this branch without a shape
@@ -291,12 +306,18 @@ impl Sparse {
         let gate = match (exchange, self.projection) {
             (Some(exchange), Projection::Exchange) => {
                 let (even, odd) = (scratch.staging, scratch.returned);
-                let query = self.query.start(f, exchange, normalized, even, scratch.query)?;
+                let query = self
+                    .query
+                    .start(f, exchange, normalized, even, scratch.query)?;
                 let key = self.key.start(f, exchange, normalized, odd, scratch.key)?;
                 exchange.finish(f, query)?;
-                let value = self.value.start(f, exchange, normalized, even, scratch.value)?;
+                let value = self
+                    .value
+                    .start(f, exchange, normalized, even, scratch.value)?;
                 exchange.finish(f, key)?;
-                let gate = self.gate.start(f, exchange, normalized, odd, scratch.gate)?;
+                let gate = self
+                    .gate
+                    .start(f, exchange, normalized, odd, scratch.gate)?;
                 exchange.finish(f, value)?;
                 Some(gate)
             }

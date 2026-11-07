@@ -53,7 +53,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use ::storage::protocol::{Link, LinkBandwidth, LinkEnd, Priority, Throttle, TransferEnd};
-use platform::{DeviceId, Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream, memcpy_async};
+use platform::{
+    DeviceId, Event, EventFlags, Pitched, PitchedBatch, SourceOrder, Stream, memcpy_async,
+};
 
 use super::contexts::{Contexts, Hold};
 use super::network::{Network, Source};

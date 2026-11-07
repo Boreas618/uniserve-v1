@@ -440,9 +440,8 @@ impl Waker {
         let deadline = Instant::now().checked_add(timeout);
         loop {
             let mut descriptors = [self.local.poll_fd()];
-            let remaining = deadline.map(|deadline| {
-                deadline.saturating_duration_since(Instant::now())
-            });
+            let remaining =
+                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
             wait_ready(&mut descriptors, remaining)?;
             if self.local.take() {
                 return Ok(true);
@@ -1027,7 +1026,8 @@ mod tests {
     #[test]
     fn a_frame_decodes_only_as_the_message_it_carries() {
         let (mut channel, mut peer) = with_raw_peer();
-        peer.write_all(&frame_of(&MainProcessRequest::info())).unwrap();
+        peer.write_all(&frame_of(&MainProcessRequest::info()))
+            .unwrap();
         assert!(matches!(
             recv::<MainProcessResponse>(&mut channel),
             Err(IpcError::Encoding(_))
