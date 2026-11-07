@@ -626,6 +626,9 @@ message Exit {
   uint64 generation = 4;
   // Its exit status, or why the status could not be read.
   string status = 5;
+  // The last line it wrote to its standard error: a process that ends before
+  // it can state why says so there.
+  string last_line = 6;
 }
 
 // What travels from a connecting peer after its `Hello`.

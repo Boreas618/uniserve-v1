@@ -837,6 +837,7 @@ mod tests {
             rank: 0,
             generation,
             status: status.to_owned(),
+            last_line: String::new(),
         };
         service.exits.send(exit(7, "exit status: 0")).unwrap();
         service.exits.send(exit(8, "signal: 11")).unwrap();
