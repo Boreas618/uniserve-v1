@@ -281,6 +281,7 @@ impl Scheduler {
             trajectories: None,
             encoder_outputs: None,
             closing: false,
+            held: false,
             resizing: None,
             starved: Vec::new(),
             asleep: false,

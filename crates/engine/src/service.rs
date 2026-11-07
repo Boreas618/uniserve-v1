@@ -1402,83 +1402,15 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
 /// Gives back or restores every scheduler's KV cache storage, and answers
 /// the daemon `front` with `Hooked` as `run_hook` does.
 fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>) {
-    let successor = crate::Successor {
-        loads_weights: resize.successor_loads_weights,
-        unmapped_cache: resize.successor_unmapped_cache,
-        host_cache: resize.successor_host_cache,
-        eager_source: resize.eager_source,
-        captures_graphs: resize.successor_captures_graphs,
-        // A malformed UUID names no GPU of this deployment.
-        rank_budgets: resize
-            .rank_budgets
-            .iter()
-            .filter_map(|weights| {
-                <[u8; 16]>::try_from(weights.gpu.as_slice())
-                    .ok()
-                    .map(|gpu| {
-                        (
-                            gpu,
-                            storage::manifest::weights::RankBudget {
-                                weights: weights.weights,
-                                quota: weights.quota,
-                                process: weights.process,
-                                graphs: weights.graphs,
-                                fixed: weights.fixed,
-                                cache: weights.cache,
-                                cache_capacity: weights.cache_capacity,
-                                cache_segment: weights.cache_segment,
-                                in_flight: weights.in_flight.as_ref().map(|cache| {
-                                    storage::manifest::weights::CacheReservation {
-                                        bytes: cache.bytes,
-                                        mapped: cache.mapped,
-                                    }
-                                }),
-                                pages: weights
-                                    .pages
-                                    .iter()
-                                    .map(|page| storage::manifest::weights::CachePage {
-                                        tokens: page.tokens,
-                                        bytes: page.bytes,
-                                        window: page.window,
-                                        state: page.state,
-                                    })
-                                    .collect(),
-                            },
-                        )
-                    })
-            })
-            .collect(),
-    };
-    let change = match wire::CacheChange::try_from(resize.change) {
-        Ok(wire::CacheChange::Shrink) => crate::CacheChange::Shrink {
-            preempt_after: resize.preempt_after_ms.map(Duration::from_millis),
-            successor,
-        },
-        Ok(wire::CacheChange::Grow) => crate::CacheChange::Grow,
-        Ok(wire::CacheChange::Plan) => crate::CacheChange::Plan(successor),
-        Ok(wire::CacheChange::Evict) => crate::CacheChange::Evict,
-        Ok(wire::CacheChange::MakeRoom) => crate::CacheChange::MakeRoom {
-            bytes: resize.room_bytes,
-            devices: resize
-                .device_bytes
-                .iter()
-                .filter_map(|device| {
-                    <[u8; 16]>::try_from(device.gpu.as_slice())
-                        .ok()
-                        .map(|gpu| (gpu, device.bytes))
-                })
-                .collect(),
-        },
-        Ok(wire::CacheChange::Restore) => crate::CacheChange::Restore,
-        Ok(wire::CacheChange::Sleep) => crate::CacheChange::Sleep,
-        Ok(wire::CacheChange::Wake) => crate::CacheChange::Wake,
-        Err(_) => {
+    let change = match crate::CacheChange::from_wire(resize) {
+        Ok(change) => change,
+        Err(error) => {
             routing.send(
                 front,
                 Frame::plain(from_engine::Kind::Hooked(wire::Hooked {
                     id: resize.id,
                     results: Vec::new(),
-                    error: format!("unknown KV cache change {}", resize.change),
+                    error,
                 })),
             );
             return;

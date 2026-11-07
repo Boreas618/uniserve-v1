@@ -503,7 +503,7 @@ impl Scheduler {
     fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
         // A closing scheduler lets what is in flight drain before its
         // workers close; a sleeping one runs nothing.
-        if self.closing || self.asleep {
+        if self.closing || self.asleep || self.held {
             return Vec::new();
         }
         let started = std::time::Instant::now();
