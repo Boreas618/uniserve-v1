@@ -390,9 +390,9 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The executor groups that prefill only (`ExecutorGroupRole::Prefill`),
+    /// The executor groups that prefill only (`WorkerGroupRole::Prefill`),
     /// whose requests hand their KV cache to a decode group.
-    pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::ExecutorGroupId>) {
+    pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
         self.dispatch.prefill_groups = groups.into_iter().collect();
     }
 
@@ -535,7 +535,7 @@ impl Scheduler {
             .media_components
             .get(&MediaCall::Denoising)
             .cloned()
-            .unwrap_or_else(|| DEFAULT_COMPONENT.to_owned());
+            .unwrap_or_else(|| DEFAULT_BLOCK.to_owned());
         let info = self.executor.info();
         let mut denoisers = Vec::new();
         for (worker, ranks) in &info.rank_latents {
@@ -606,7 +606,7 @@ impl Scheduler {
     ) {
         let info = self.executor.info();
         let groups: Vec<(
-            crate::ExecutorGroupId,
+            crate::WorkerGroupId,
             Vec<(u32, crate::encoder_outputs::RankEncoders<'_>)>,
         )> = info
             .rank_encoders

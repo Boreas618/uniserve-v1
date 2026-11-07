@@ -24,7 +24,7 @@
 
 use super::ledger::{CacheStorage, growable, room, room_refusal};
 use super::*;
-use crate::executor::ExecutorGroupId;
+use crate::executor::WorkerGroupId;
 use crate::handle::CacheChange;
 use crate::kv_cache::PageRef;
 
@@ -394,7 +394,7 @@ impl Scheduler {
                     let value: serde_json::Value = serde_json::from_str(result).ok()?;
                     let group = value.get("group")?.as_str()?;
                     store
-                        .serves(&crate::ExecutorGroupId(group.to_owned()))
+                        .serves(&crate::WorkerGroupId(group.to_owned()))
                         .then(|| value.get("identity")?.as_str().map(str::to_owned))
                         .flatten()
                 })
@@ -442,7 +442,7 @@ impl Scheduler {
             }
         }
         for (group, contents) in seeds {
-            kv_offload.reseed(&ExecutorGroupId(group), &contents)?;
+            kv_offload.reseed(&WorkerGroupId(group), &contents)?;
         }
         Ok(())
     }
@@ -605,14 +605,14 @@ impl Scheduler {
         let Some(kv_offload) = self.kv_offload.as_mut() else {
             return 0;
         };
-        let workers: Vec<(ExecutorGroupId, ipc::MainProcessEndpoint)> = self
+        let workers: Vec<(WorkerGroupId, ipc::MainProcessEndpoint)> = self
             .executor
             .info()
             .workers
             .iter()
             .map(|(id, worker)| (id.clone(), worker.endpoint.clone()))
             .collect();
-        let mut offloads: BTreeMap<(ExecutorGroupId, usize), (Vec<storage::Key>, Vec<PageRef>)> =
+        let mut offloads: BTreeMap<(WorkerGroupId, usize), (Vec<storage::Key>, Vec<PageRef>)> =
             BTreeMap::new();
         for page in idle {
             let worker = workers

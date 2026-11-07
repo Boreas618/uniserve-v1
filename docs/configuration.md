@@ -399,7 +399,7 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 
 A configuration update reads the deployment file again, so editing its contents at the same path can move ranks to other devices or hosts. The resolved configuration carries those contents to the engine; subsequent file edits do not change the ranks that configuration launches.
 
-A deployment file, the `worker_groups` option, places worker groups on devices and hosts and names the components each runs. It is TOML: one `[[worker_groups]]` table per group and one `[worker_groups.components.<name>]` table per component of the group, as in `configs/minimax_h3/fasth3-ulysses4x2.toml`:
+A deployment file, the `worker_groups` option, places worker groups on devices and hosts and names the components each runs. It is TOML: one `[[worker_groups]]` table per group and one `[worker_groups.blocks.<name>]` table per component of the group, as in `configs/minimax_h3/fasth3-ulysses4x2.toml`:
 
 ```toml
 # FastH3 on eight GPUs of one host: two Ulysses4 denoiser replicas, each with
@@ -412,7 +412,7 @@ ranks = ["cuda:0-7"]
 queue_depth = 6
 mem_fraction_static = 0.26
 
-[worker_groups.components.text_encoder]
+[worker_groups.blocks.text_encoder]
 tensor_parallel_size = 4
 
 [[worker_groups]]
@@ -422,15 +422,15 @@ ranks = ["cuda:0-7"]
 queue_depth = 6
 mem_fraction_static = 0.73
 
-[worker_groups.components.transformer]
+[worker_groups.blocks.transformer]
 sequence_parallel = { kind = "ulysses", ulysses_degree = 4 }
 
-[worker_groups.components.video_decoder]
+[worker_groups.blocks.video_decoder]
 
-[worker_groups.components.audio_decoder]
+[worker_groups.blocks.audio_decoder]
 distribution = "temporal_units"
 
-[worker_groups.components.latent_encoder]
+[worker_groups.blocks.latent_encoder]
 distribution = "temporal_units"
 
 [[worker_groups]]
@@ -439,21 +439,21 @@ replicas = 2
 ranks = ["cpu*8"]
 queue_depth = 6
 
-[worker_groups.components.video_codec]
+[worker_groups.blocks.video_codec]
 
 [[worker_groups]]
 id = "reader"
 ranks = ["cpu"]
 queue_depth = 6
 
-[worker_groups.components.media_reader]
+[worker_groups.blocks.media_reader]
 
 [[worker_groups]]
 id = "muxer"
 ranks = ["cpu"]
 queue_depth = 12
 
-[worker_groups.components.muxer]
+[worker_groups.blocks.muxer]
 ```
 
 A `[[worker_groups]]` table takes:

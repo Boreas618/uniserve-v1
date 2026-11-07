@@ -43,7 +43,7 @@ id = "attention"
 ranks = ["cuda:0"]
 queue_depth = 2
 
-[worker_groups.components.model]
+[worker_groups.blocks.model]
 
 [[worker_groups]]
 id = "experts"

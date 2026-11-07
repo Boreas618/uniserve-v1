@@ -21,7 +21,6 @@
 pub mod allocation;
 mod clock;
 mod core;
-mod deployment;
 mod encoder_outputs;
 mod executor;
 mod handle;
@@ -37,16 +36,15 @@ mod trajectories;
 mod warmup;
 
 pub use crate::core::{
-    EngineConfig, ExecutorGroupConfig, ExecutorGroupRole, ExecutorRank, RankFacts, SchedulerHandle,
+    EngineConfig, RankFacts, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
 };
-pub use crate::deployment::Deployment;
 #[cfg(feature = "testing")]
 pub use crate::executor::{BatchResult, CallResult, Executor};
 pub use crate::executor::{
     BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ExecuteError, ExecutionBatch,
-    ExecutorError, ExecutorFailure, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError,
-    PageOffloads, PoolLayout, RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel,
-    TransferBackend, TransferConfig, TransferConfigError, TransferEdge,
+    ExecutorError, ExecutorFailure, ExecutorInfo, ExecutorSubmitError, PageOffloads, PoolLayout,
+    RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel, TransferBackend,
+    TransferConfig, TransferConfigError, TransferEdge, WorkerGroupId,
 };
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
@@ -82,7 +80,8 @@ pub use crate::sim::{
     BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,
     sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
 };
-pub use ipc::{DEFAULT_COMPONENT, MediaCall, VideoDenoiserInfo, VideoTaskInfo};
+pub use ipc::{MediaCall, VideoDenoiserInfo, VideoTaskInfo};
+pub use proto::config::DEFAULT_BLOCK;
 /// Serializable scheduler, cache, and executor performance snapshots.
 pub use proto::report;
 pub use proto::request::{

@@ -60,7 +60,7 @@ fn an_engine_serves_once_its_only_group_is_replaced() {
     sim.set_text_len(16);
     let executor = SimExecutor::new(sim);
     let loss = executor.loss();
-    let group = engine::ExecutorGroupId("sim".to_owned());
+    let group = engine::WorkerGroupId("sim".to_owned());
     let scheduler = support::scheduler(Box::new(executor), SimEngine::special_tokens(), 8)
         .expect("the scheduler is built over the simulated executor");
     let (tx, rx) = crossbeam_channel::unbounded();
@@ -114,14 +114,14 @@ fn an_engine_serves_once_its_only_group_is_replaced() {
 /// replacement stands.
 #[test]
 fn a_group_being_replaced_leaves_its_executor_serving_the_others() {
-    use engine::{Executor, ExecutorGroupId};
+    use engine::{Executor, WorkerGroupId};
 
     let mut sim = SimEngine::new();
     sim.name_groups(&["model", "vision"]);
     let executor = SimExecutor::new(sim);
     let loss = executor.loss();
-    let model = ExecutorGroupId("model".to_owned());
-    let vision = ExecutorGroupId("vision".to_owned());
+    let model = WorkerGroupId("model".to_owned());
+    let vision = WorkerGroupId("vision".to_owned());
 
     assert!(executor.is_ready(&model) && executor.is_ready(&vision));
     assert!(executor.has_capacity(&model) && executor.has_capacity(&vision));
@@ -167,10 +167,10 @@ fn greedy_request(id: u64, prompt: Vec<u32>, max_und_tokens: usize) -> Generatio
 
 /// Serves `requests` on `groups` and returns the tokens each generated.
 fn generate(
-    groups: &[(&str, engine::ExecutorGroupRole)],
+    groups: &[(&str, engine::WorkerGroupRole)],
     requests: Vec<GenerationRequest>,
 ) -> Vec<Vec<u32>> {
-    use engine::{EngineConfig, Executor, ExecutorGroupId, SchedulerHandle};
+    use engine::{EngineConfig, Executor, SchedulerHandle, WorkerGroupId};
 
     let mut sim = SimEngine::new();
     sim.set_text_len(16);
@@ -189,8 +189,8 @@ fn generate(
         let base = config.worker_groups.remove(0);
         config.worker_groups = groups
             .iter()
-            .map(|(name, role)| engine::ExecutorGroupConfig {
-                id: ExecutorGroupId((*name).to_owned()),
+            .map(|(name, role)| engine::WorkerGroupConfig {
+                id: WorkerGroupId((*name).to_owned()),
                 role: *role,
                 ..base.clone()
             })
@@ -235,7 +235,7 @@ fn generate(
 /// admitting work.
 #[test]
 fn losing_every_worker_stops_request_admission() {
-    use engine::{EngineConfig, Executor, ExecutorGroupId, SchedulerHandle, SubmitError};
+    use engine::{EngineConfig, Executor, SchedulerHandle, SubmitError, WorkerGroupId};
 
     let mut sim = SimEngine::new();
     sim.set_text_len(4);
@@ -265,7 +265,7 @@ fn losing_every_worker_stops_request_admission() {
 
     // Every rank is gone, and no replacement will stand.
     loss.lose(
-        ExecutorGroupId("sim".to_owned()),
+        WorkerGroupId("sim".to_owned()),
         "every rank of the group was lost",
     );
     let deadline = Instant::now() + ANSWER;
@@ -289,7 +289,7 @@ fn losing_every_worker_stops_request_admission() {
 /// tokens are the model's either way.
 #[test]
 fn a_prefill_group_hands_its_requests_to_a_decode_group() {
-    use engine::ExecutorGroupRole;
+    use engine::WorkerGroupRole;
 
     let prompts = vec![
         vec![7, 8, 9],
@@ -306,8 +306,8 @@ fn a_prefill_group_hands_its_requests_to_a_decode_group() {
     let alone = generate(&[], requests());
     let handed = generate(
         &[
-            ("prefill", ExecutorGroupRole::Prefill),
-            ("decode", ExecutorGroupRole::Decode),
+            ("prefill", WorkerGroupRole::Prefill),
+            ("decode", WorkerGroupRole::Decode),
         ],
         requests(),
     );

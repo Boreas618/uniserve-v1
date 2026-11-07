@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::ExecutorGroupId;
+use crate::WorkerGroupId;
 use crate::executor::ExecutionBatch;
 #[cfg(feature = "testing")]
 use crate::executor::Executor;
@@ -39,7 +39,7 @@ pub(super) trait World {
     fn info(&self) -> &ExecutorInfo;
 
     /// Whether `worker` has an unclaimed submission slot.
-    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool;
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool;
 }
 
 /// How often the waiting thread looks at the batches in flight.
@@ -100,9 +100,9 @@ struct InProcess {
     /// a request becomes ready when its own batch ends, so a mechanism that refills at once sends
     /// it alone, the batch after it carries one row again, and requests that run together never
     /// meet in a step. While the slots are taken the ready requests wait for each other.
-    unresolved: HashMap<u64, Vec<ExecutorGroupId>>,
+    unresolved: HashMap<u64, Vec<WorkerGroupId>>,
     /// How many batches hold a slot of each pool.
-    occupied: HashMap<ExecutorGroupId, usize>,
+    occupied: HashMap<WorkerGroupId, usize>,
 }
 
 /// The state of the shadow submissions an update's pass asked for (7.3 step 2).
@@ -268,7 +268,7 @@ impl Submissions {
     }
 
     /// Whether every rank of the pool `worker` is ready to accept execution.
-    pub(super) fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
+    pub(super) fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         match &self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(executor) => executor.is_ready(worker),
@@ -278,7 +278,7 @@ impl Submissions {
     }
 
     /// Whether `worker` executes nothing further.
-    pub(super) fn is_closed(&self, worker: &ExecutorGroupId) -> bool {
+    pub(super) fn is_closed(&self, worker: &WorkerGroupId) -> bool {
         match &self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(executor) => executor.is_closed(worker),
@@ -288,7 +288,7 @@ impl Submissions {
     }
 
     /// Whether `worker` has an unclaimed destination submission slot.
-    pub(super) fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
+    pub(super) fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         match &self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(executor) => executor.has_capacity(worker),
@@ -416,7 +416,7 @@ impl Submissions {
     pub(super) fn map_host_cache(
         &mut self,
         tokens: u64,
-    ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
+    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(executor) => executor.map_host_cache(tokens),
@@ -435,7 +435,7 @@ impl Submissions {
                             .map(|pools| serde_json::to_string(&Some(pools)))
                             .collect::<Result<Vec<_>, _>>()
                             .map_err(|error| anyhow::anyhow!(error))?;
-                        Ok((ExecutorGroupId(group), results))
+                        Ok((WorkerGroupId(group), results))
                     })
                     .collect()
             }
@@ -522,7 +522,7 @@ impl Submissions {
         &mut self,
         name: &str,
         payload: &str,
-    ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
+    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(executor) => executor.hook_groups(name, payload),
@@ -566,7 +566,7 @@ impl World for Submissions {
         Submissions::info(self)
     }
 
-    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         Submissions::has_capacity(self, worker)
     }
 }
@@ -607,7 +607,7 @@ impl InProcess {
     }
 
     /// Whether `worker` is a stated pool with a slot free.
-    fn has_room(&self, worker: &ExecutorGroupId) -> bool {
+    fn has_room(&self, worker: &WorkerGroupId) -> bool {
         if !self.info.workers.iter().any(|(id, _)| id == worker) {
             return false;
         }
@@ -620,8 +620,8 @@ impl InProcess {
     }
 
     /// The pools `batch` takes a slot of: those its calls and its page offloads run on.
-    fn pools(batch: &ExecutionBatch) -> Vec<ExecutorGroupId> {
-        let mut pools: Vec<ExecutorGroupId> = batch
+    fn pools(batch: &ExecutionBatch) -> Vec<WorkerGroupId> {
+        let mut pools: Vec<WorkerGroupId> = batch
             .requests
             .iter()
             .map(|(_, dispatch)| dispatch.worker.clone())
@@ -1097,7 +1097,7 @@ mod tests {
         (
             call,
             crate::executor::RequestDispatch {
-                worker: ExecutorGroupId("gpu".to_owned()),
+                worker: WorkerGroupId("gpu".to_owned()),
                 request_pool_idx: None,
                 block_tables: Vec::new(),
                 new_cache_units: Vec::new(),

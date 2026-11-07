@@ -1096,7 +1096,7 @@ impl Scheduler {
             && let Some((_, first)) = batch.requests.first()
             && batch.requests.iter().all(|(call, dispatch)| {
                 dispatch.worker == first.worker
-                    && call.component == DEFAULT_COMPONENT
+                    && call.component == DEFAULT_BLOCK
                     && matches!(
                         call.kind,
                         CallKind::Forward(ForwardMode::Prefill | ForwardMode::Decode)

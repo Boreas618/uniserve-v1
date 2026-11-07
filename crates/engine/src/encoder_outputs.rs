@@ -48,7 +48,7 @@ use storage::key::Digest;
 use storage::protocol::{PageSlot, Reply, Request};
 use storage::{Key, Scope};
 
-use crate::executor::ExecutorGroupId;
+use crate::executor::WorkerGroupId;
 use crate::host_tier::Servers;
 
 /// One encoder output of a request: its name (the product an encoder
@@ -80,7 +80,7 @@ impl Access {
 /// The encoder pool an executor group's ranks share.
 #[derive(Clone)]
 struct GroupPool {
-    worker: ExecutorGroupId,
+    worker: WorkerGroupId,
     /// The connection to the pool's server (`EncoderStore::servers`).
     client: usize,
     pool: u64,
@@ -173,7 +173,7 @@ enum Purpose {
 pub(crate) struct EncoderStore {
     servers: Servers<Purpose>,
     /// The pool of each executor group the store serves.
-    workers: HashMap<ExecutorGroupId, GroupPool>,
+    workers: HashMap<WorkerGroupId, GroupPool>,
     /// Each admission's outputs.
     requests: HashMap<RequestKey, HashMap<OutputId, Output>>,
     /// The output each encoder call in flight reads or writes.
@@ -210,7 +210,7 @@ impl EncoderStore {
     /// the store serves it.
     pub(crate) fn add_worker(
         &mut self,
-        worker: &ExecutorGroupId,
+        worker: &WorkerGroupId,
         ranks: &[(u32, RankEncoders<'_>)],
     ) -> bool {
         let Some((first_rank, first)) = ranks.first() else {
@@ -272,7 +272,7 @@ impl EncoderStore {
 
     /// Whether `executor`'s pool stores outputs named `name`: the store serves
     /// the group and its ranks agree on what computes them.
-    pub(crate) fn serves(&self, worker: &ExecutorGroupId, name: &str) -> bool {
+    pub(crate) fn serves(&self, worker: &WorkerGroupId, name: &str) -> bool {
         self.workers
             .get(worker)
             .is_some_and(|pool| pool.identities.contains_key(name))
@@ -286,7 +286,7 @@ impl EncoderStore {
     pub(crate) fn lookup(
         &mut self,
         request: RequestKey,
-        worker: &ExecutorGroupId,
+        worker: &WorkerGroupId,
         output: OutputId,
         inputs: &[u8; 32],
         rows: u32,
@@ -554,7 +554,7 @@ impl EncoderStore {
     /// flight: the outputs whose lookups ended end now, and those of
     /// admissions still running count no call in flight, so they end when
     /// their admission leaves.
-    pub(crate) fn worker_failed(&mut self, worker: &ExecutorGroupId) {
+    pub(crate) fn worker_failed(&mut self, worker: &WorkerGroupId) {
         for outputs in self.requests.values_mut() {
             for output in outputs.values_mut() {
                 if output.pool.worker == *worker {

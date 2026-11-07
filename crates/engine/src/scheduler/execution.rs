@@ -65,7 +65,7 @@ impl Scheduler {
     /// handed to `on_executor_error` and stops dispatching.
     fn dispatch_submissions(
         &mut self,
-        blocked_workers: &mut HashSet<crate::ExecutorGroupId>,
+        blocked_workers: &mut HashSet<crate::WorkerGroupId>,
     ) -> bool {
         let mut progressed = false;
         // Products of the batches held back in this pass. A call may be

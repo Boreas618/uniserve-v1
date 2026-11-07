@@ -138,11 +138,12 @@ use ipc::RequestId;
 use ipc::UnitId;
 use ipc::{
     BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId, CacheUnitAllocation,
-    Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange, DimBound,
-    ForwardBatch, ForwardStats, GenerationParams, MainProcessInfo, NewRequest, RequestKey,
-    SamplingState, ShapeBound, TensorRef, TimingCounters,
+    Call, CallId, CallKind, CallStatus, DType, DecodeRange, DimBound, ForwardBatch, ForwardStats,
+    GenerationParams, MainProcessInfo, NewRequest, RequestKey, SamplingState, ShapeBound,
+    TensorRef, TimingCounters,
 };
 use ipc::{SharedMedia, TokenLogprob};
+use proto::config::DEFAULT_BLOCK;
 use proto::request::MigrationCause;
 
 use crate::executor::{ExecutorFailure, RankBuffer};

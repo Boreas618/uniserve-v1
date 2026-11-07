@@ -13,7 +13,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use engine::{ExecutorGroupId, SimEngine, SimExecutor, SpecialTokenIds};
+use engine::{SimEngine, SimExecutor, SpecialTokenIds, WorkerGroupId};
 use ipc::{CallId, ErrorCallIdentity, RequestKey, Stall};
 
 use crate::support;
@@ -22,8 +22,8 @@ use crate::support;
 const DEADLINE: Duration = Duration::from_secs(30);
 
 /// The group the simulated executor serves.
-fn group() -> ExecutorGroupId {
-    ExecutorGroupId("sim".to_owned())
+fn group() -> WorkerGroupId {
+    WorkerGroupId("sim".to_owned())
 }
 
 /// The call identity a stalled job names: one request's prefill call.

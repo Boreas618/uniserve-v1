@@ -515,7 +515,7 @@ impl EpochPlan {
             return Ok(0);
         };
         let experts =
-            |group: &&engine::ExecutorGroupConfig| group.role == engine::ExecutorGroupRole::Experts;
+            |group: &&engine::WorkerGroupConfig| group.role == engine::WorkerGroupRole::Experts;
         if !groups.iter().any(|group| experts(&group)) {
             return Ok(0);
         }
@@ -1430,14 +1430,14 @@ impl EpochPlan {
         served_tasks(&config.serving(), groups.as_deref(), &self.checkpoint)
     }
 
-    fn deployment_groups(&self) -> Result<Option<Vec<engine::ExecutorGroupConfig>>> {
+    fn deployment_groups(&self) -> Result<Option<Vec<engine::WorkerGroupConfig>>> {
         let Some(path) = self.build.parallel.worker_groups.as_ref() else {
             return Ok(None);
         };
         let text = path
             .to_str()
             .with_context(|| format!("the deployment file {} is not UTF-8", path.display()))?;
-        let deployment = engine::Deployment::read(text)
+        let deployment = std::fs::read_to_string(text)
             .with_context(|| format!("reading the deployment file {}", path.display()))?;
         let host = self
             .build
@@ -1445,8 +1445,7 @@ impl EpochPlan {
             .engine_host
             .clone()
             .unwrap_or_else(|| "localhost".to_owned());
-        deployment
-            .worker_groups(&host)
+        proto::config::WorkerGroupConfig::parse_file(&deployment, &host)
             .map(Some)
             .with_context(|| format!("placing the deployment file {} on {host}", path.display()))
     }
@@ -1877,7 +1876,7 @@ pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capa
         // component over every rank). The scheduler routes a call by component name, so a rank that
         // advertised a name of its own would hold nothing any pool asks for.
         components: vec![ipc::ComponentInfo {
-            name: ipc::DEFAULT_COMPONENT.to_owned(),
+            name: proto::config::DEFAULT_BLOCK.to_owned(),
             outputs: Vec::new(),
         }],
     })
@@ -2774,7 +2773,7 @@ pub(crate) struct Mapping {
 /// page has no such statement, so it serves what the checkpoint states when that is one network's.
 fn served_tasks(
     stated: &[nn::VideoTask],
-    groups: Option<&[engine::ExecutorGroupConfig]>,
+    groups: Option<&[engine::WorkerGroupConfig]>,
     checkpoint: &Path,
 ) -> Result<Vec<nn::VideoTask>> {
     if stated.is_empty() {
@@ -2793,11 +2792,7 @@ fn served_tasks(
             checkpoint.display()
         );
     };
-    let places = |name: &str| {
-        groups
-            .iter()
-            .any(|group| group.components.contains_key(name))
-    };
+    let places = |name: &str| groups.iter().any(|group| group.blocks.contains_key(name));
     let served: Vec<nn::VideoTask> = stated
         .iter()
         .copied()
@@ -2833,7 +2828,7 @@ fn served_tasks(
 /// is Ulysses' alone.
 /// The component a media rank serves: the denoiser's node in the deployment page's group.
 ///
-/// It is the page's key (`[worker_groups.components.transformer]`), and it is what tells one engine's
+/// It is the page's key (`[worker_groups.blocks.transformer]`), and it is what tells one engine's
 /// group from another's when the name the launch states is the daemon's process group.
 const DENOISER_COMPONENT: &str = "transformer";
 
@@ -2844,7 +2839,7 @@ const REFERENCE_COMPONENT: &str = "transformer_ref";
 const TEXT_COMPONENT: &str = "text_encoder";
 
 fn media_parallel(
-    groups: Option<&[engine::ExecutorGroupConfig]>,
+    groups: Option<&[engine::WorkerGroupConfig]>,
     group: &str,
     rank: u32,
     tensor_parallel: u32,
@@ -2875,11 +2870,11 @@ fn media_parallel(
     // answer: **which group places this class's component?** A media rank serves the denoiser, and a
     // group that places no transformer is another engine's.
     let named = groups.iter().find(|candidate| candidate.id.0 == group);
-    let denoisers: Vec<&engine::ExecutorGroupConfig> = groups
+    let denoisers: Vec<&engine::WorkerGroupConfig> = groups
         .iter()
         .filter(|candidate| {
-            candidate.components.contains_key(DENOISER_COMPONENT)
-                || candidate.components.contains_key(REFERENCE_COMPONENT)
+            candidate.blocks.contains_key(DENOISER_COMPONENT)
+                || candidate.blocks.contains_key(REFERENCE_COMPONENT)
         })
         .collect();
     // Both sides as a pair in either refusal: the launch's name is the daemon's roster label and the
@@ -2913,7 +2908,7 @@ fn media_parallel(
     };
     // The page states the text encoder's degree beside it, so the group's width is the page's and
     // the rank's place in it is the rank's place in the component.
-    let (tensor_parallel, tensor_rank) = match placed.components.get(TEXT_COMPONENT) {
+    let (tensor_parallel, tensor_rank) = match placed.blocks.get(TEXT_COMPONENT) {
         Some(text) if text.tensor_parallel_size > 1 => {
             let position = if text.ranks.is_empty() {
                 rank
@@ -2932,7 +2927,7 @@ fn media_parallel(
         }
         _ => (tensor_parallel, tensor_rank),
     };
-    let mut splits = placed.components.iter().filter(|(_, component)| {
+    let mut splits = placed.blocks.iter().filter(|(_, component)| {
         !matches!(
             component.sequence_parallel,
             proto::config::SequenceParallel::Local
@@ -3152,8 +3147,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned();
             let text = std::fs::read_to_string(&path).expect("the file reads");
-            let page = engine::Deployment::parse(&text)
-                .unwrap_or_else(|error| panic!("{name} does not parse: {error:#}"));
+            let page = text.clone();
             // The hosts the file names: a rank is `[HOST/]DEVICE`, and a file that names no host
             // places on the local one.
             let mut hosts: Vec<String> = Vec::new();
@@ -3171,8 +3165,7 @@ mod tests {
                 hosts.push("localhost".to_owned());
             }
             for host in &hosts {
-                let groups = page
-                    .worker_groups(host)
+                let groups = proto::config::WorkerGroupConfig::parse_file(&page, host)
                     .unwrap_or_else(|error| panic!("{name} does not place on {host}: {error:#}"));
                 assert!(!groups.is_empty(), "{name} places no group on {host}");
                 for group in &groups {
@@ -3200,15 +3193,12 @@ mod tests {
     }
 
     /// A deployment page as written, parsed and placed on this host.
-    fn page(toml: &str) -> Vec<engine::ExecutorGroupConfig> {
-        engine::Deployment::parse(toml)
-            .expect("the page parses")
-            .worker_groups("localhost")
-            .expect("the page places")
+    fn page(toml: &str) -> Vec<engine::WorkerGroupConfig> {
+        proto::config::WorkerGroupConfig::parse_file(toml, "localhost").expect("the page places")
     }
 
     /// A deployment page holding one group named `model`, with the components it names.
-    fn groups(components: &str) -> Vec<engine::ExecutorGroupConfig> {
+    fn groups(components: &str) -> Vec<engine::WorkerGroupConfig> {
         page(&format!(
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n{components}"
         ))
@@ -3226,7 +3216,7 @@ mod tests {
     #[test]
     fn the_group_is_the_one_that_places_the_denoiser_when_the_launch_name_is_not_on_the_page() {
         let placed = groups(
-            "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+            "[worker_groups.blocks.transformer]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 4, projection = \"exchange\" }\n",
         );
         let (ulysses, _, _, sequence_rank) = media_parallel(Some(&placed), "engine", 1, 4, 1, 4)
@@ -3238,12 +3228,12 @@ mod tests {
 
         let two = page(
             "[[worker_groups]]\nid = \"text\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
-             [worker_groups.components.text_encoder]\ntensor_parallel_size = 4\n\
+             [worker_groups.blocks.text_encoder]\ntensor_parallel_size = 4\n\
              [[worker_groups]]\nid = \"flow\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
-             [worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+             [worker_groups.blocks.transformer]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 4 }\n\
              [[worker_groups]]\nid = \"other\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
-             [worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+             [worker_groups.blocks.transformer]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 4 }\n",
         );
         let error = media_parallel(Some(&two), "engine", 0, 1, 0, 1)
@@ -3263,9 +3253,9 @@ mod tests {
     #[test]
     fn the_sequence_split_comes_from_the_group_the_rank_serves() {
         let placed = groups(
-            "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+            "[worker_groups.blocks.transformer]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 4, projection = \"exchange\" }\n\
-             [worker_groups.components.text_encoder]\ntensor_parallel_size = 4\n",
+             [worker_groups.blocks.text_encoder]\ntensor_parallel_size = 4\n",
         );
         let (ulysses, tensor_parallel, tensor_rank, sequence_rank) =
             media_parallel(Some(&placed), "model", 2, 4, 2, 4)
@@ -3313,7 +3303,7 @@ mod tests {
     fn a_group_with_no_sequence_split_serves_one_rank() {
         let placed = page(
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0\"]\nqueue_depth = 2\n\
-             [worker_groups.components.transformer]\n",
+             [worker_groups.blocks.transformer]\n",
         );
         let (ulysses, _, _, sequence_rank) =
             media_parallel(Some(&placed), "model", 0, 1, 0, 1).expect("one rank's sequence");
@@ -3330,7 +3320,7 @@ mod tests {
         for projection in ["gather", "exchange"] {
             let placed = page(&format!(
                 "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-1\"]\nqueue_depth = 2\n\
-                 [worker_groups.components.transformer]\nsequence_parallel = {{ kind = \"ulysses\", \
+                 [worker_groups.blocks.transformer]\nsequence_parallel = {{ kind = \"ulysses\", \
                  ulysses_degree = 2, projection = \"{projection}\" }}\n"
             ));
             let (ulysses, _, _, _) = media_parallel(Some(&placed), "model", 0, 1, 0, 2)
@@ -3339,9 +3329,9 @@ mod tests {
         }
         let two = page(
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-1\"]\nqueue_depth = 2\n\
-             [worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+             [worker_groups.blocks.transformer]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 2 }\n\
-             [worker_groups.components.text_encoder]\nsequence_parallel = { kind = \"ulysses\", \
+             [worker_groups.blocks.text_encoder]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 2 }\n",
         );
         let error =

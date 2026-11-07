@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::Engine as _;
-use engine::{EngineConfig, ExecutorGroupConfig, SchedulerHandle};
+use engine::{EngineConfig, SchedulerHandle, WorkerGroupConfig};
 use engine::{
     Event, FeedbackNextToken, FeedbackSource, FinishReason, GenerationConstraint,
     GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoderInput,
@@ -71,7 +71,7 @@ fn logged_engine(
     };
     config.eos = vec![END_OF_IMAGE];
     config.end_of_image = END_OF_IMAGE;
-    config.worker_groups = vec![ExecutorGroupConfig::placed(
+    config.worker_groups = vec![WorkerGroupConfig::placed(
         &["localhost".to_owned()],
         "cpu",
         1,

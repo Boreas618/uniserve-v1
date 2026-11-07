@@ -895,7 +895,7 @@ pub struct HostCacheKeys {
 /// One pool of the deployment an executor serves (4.2, 7.3).
 #[derive(Clone, Debug, Default)]
 pub struct Inventory {
-    /// The deployment's name for the pool, the identity the mechanism's `ExecutorGroupId` carries.
+    /// The deployment's name for the pool, the identity the mechanism's `WorkerGroupId` carries.
     pub group: String,
     /// The pool's ranks in launch order, each with what it reported at handshake.
     pub ranks: Vec<MainProcessInfo>,

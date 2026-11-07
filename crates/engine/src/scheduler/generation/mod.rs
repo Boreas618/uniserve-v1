@@ -156,7 +156,7 @@ pub(crate) enum GenerationPhase {
     /// (`Scheduler::next_context_call`).
     Prefill,
     /// Move the request's KV cache from the prefill group that prefilled its
-    /// prompt to a decode group (`ExecutorGroupRole::Decode`): export it on
+    /// prompt to a decode group (`WorkerGroupRole::Decode`): export it on
     /// the prefill group (`RequestState::handoff_export`), then install it
     /// on the decode group, which decodes the request from then on.
     HandOff,

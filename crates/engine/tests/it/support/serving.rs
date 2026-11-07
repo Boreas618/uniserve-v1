@@ -178,7 +178,7 @@ pub(crate) fn pool(group: &str) -> Inventory {
             queue_depth: 1,
             ranks: 1,
             components: std::collections::BTreeMap::from([(
-                ipc::DEFAULT_COMPONENT.to_owned(),
+                proto::config::DEFAULT_BLOCK.to_owned(),
                 BlockConfig {
                     ranks: vec![0],
                     tensor_parallel_size: 1,

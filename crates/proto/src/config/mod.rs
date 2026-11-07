@@ -8,6 +8,7 @@
 
 pub mod block;
 pub mod values;
+pub mod worker_group;
 
 use std::collections::HashMap;
 use std::fmt;
@@ -28,6 +29,10 @@ pub use block::{
     SequenceParallel,
 };
 pub use values::ImageSize;
+pub use worker_group::{
+    DEFAULT_BLOCK, VIDEO_CODEC_BLOCK, VIDEO_DECODER_BLOCK, WorkerGroupConfig, WorkerGroupId,
+    WorkerGroupRole, WorkerRank,
+};
 
 /// Shortest admitted clip, in seconds.
 pub const MIN_VIDEO_SECONDS: f64 = 4.0;

@@ -287,11 +287,7 @@ impl Scheduler {
                 continue;
             };
             let key = RequestKey::new(self.engine_id, id, state.request_epoch);
-            let Some(worker) = self
-                .dispatch
-                .affinity
-                .get(&(key, DEFAULT_COMPONENT.to_owned()))
-            else {
+            let Some(worker) = self.dispatch.affinity.get(&(key, DEFAULT_BLOCK.to_owned())) else {
                 continue;
             };
             let own = state

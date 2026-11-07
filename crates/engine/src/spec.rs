@@ -11,9 +11,8 @@ use proto::request::GenerationLimits;
 use proto::request::wire::{EngineSpec, RankLayout, Sizes};
 use serde::de::DeserializeOwned;
 
-use crate::DEFAULT_COMPONENT;
-use crate::core::{EngineConfig, ExecutorGroupConfig};
-use crate::deployment::Deployment;
+use crate::DEFAULT_BLOCK;
+use crate::core::{EngineConfig, WorkerGroupConfig};
 use crate::executor::TransferConfig;
 use crate::scheduler::{DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS};
 
@@ -52,7 +51,7 @@ impl EngineConfig {
             .worker_groups
             .chunks(groups_per_replica)
             .map(|groups| {
-                let contains = |id: &crate::executor::ExecutorGroupId| {
+                let contains = |id: &crate::executor::WorkerGroupId| {
                     groups.iter().any(|group| &group.id == id)
                 };
                 let mut local = TransferConfig::default();
@@ -76,7 +75,7 @@ impl EngineConfig {
                     .context("the engine spec states no ranks")?;
                 ranks.data_parallel_size = 1;
                 ranks.worker_groups.clear();
-                ranks.worker_groups_content = Deployment::snapshot(groups)?;
+                ranks.worker_groups_content = WorkerGroupConfig::to_file(groups)?;
                 replica.transfer = local.to_string();
                 Ok(replica)
             })
@@ -195,10 +194,9 @@ fn required<'a, T>(table: &'a Option<T>, name: &str) -> anyhow::Result<&'a T> {
 /// The deployment's executor groups: its deployment file placed on `host`, or
 /// the shorthand's groups of one component, with the ranks spread in blocks
 /// over `host` and the hosts after it.
-fn place(rank_layout: &RankLayout, host: &str) -> anyhow::Result<Vec<ExecutorGroupConfig>> {
+fn place(rank_layout: &RankLayout, host: &str) -> anyhow::Result<Vec<WorkerGroupConfig>> {
     if !rank_layout.worker_groups_content.is_empty() {
-        return Deployment::parse(&rank_layout.worker_groups_content)?
-            .worker_groups(host)
+        return WorkerGroupConfig::parse_file(&rank_layout.worker_groups_content, host)
             .context("invalid `worker_groups` deployment");
     }
     // Leading with the leader's own host keeps rank zero and the other
@@ -212,13 +210,13 @@ fn place(rank_layout: &RankLayout, host: &str) -> anyhow::Result<Vec<ExecutorGro
             .cloned(),
     );
     let tensor_parallel_size = rank_layout.tensor_parallel_size.max(1) as usize;
-    let mut groups = ExecutorGroupConfig::data_parallel(
+    let mut groups = WorkerGroupConfig::data_parallel(
         &hosts,
         &rank_layout.device,
         rank_layout.data_parallel_size.max(1) as usize,
         tensor_parallel_size,
         rank_layout.queue_depth.max(1) as usize,
-        ExecutorGroupConfig::single_component(DEFAULT_COMPONENT, tensor_parallel_size),
+        WorkerGroupConfig::single_component(DEFAULT_BLOCK, tensor_parallel_size),
     );
     if !rank_layout.devices.is_empty() {
         order_devices(&mut groups, &rank_layout.device, &rank_layout.devices)?;
@@ -237,7 +235,7 @@ fn place(rank_layout: &RankLayout, host: &str) -> anyhow::Result<Vec<ExecutorGro
 /// Fails unless `device` is CUDA, `devices` names one device per rank, and
 /// no two ranks of a host share a device.
 fn order_devices(
-    groups: &mut [ExecutorGroupConfig],
+    groups: &mut [WorkerGroupConfig],
     device: &str,
     devices: &[u32],
 ) -> anyhow::Result<()> {

@@ -698,7 +698,7 @@ impl Scheduler {
     }
 
     /// Whether the request's prompt was prefilled on a group that does not
-    /// decode (`ExecutorGroupRole::Prefill`): it decodes on a decode group,
+    /// decode (`WorkerGroupRole::Prefill`): it decodes on a decode group,
     /// to which `Phase::HandOff` moves its KV cache.
     pub(in crate::scheduler) fn decodes_elsewhere(&self, id: RequestId) -> bool {
         let Some(state) = self.running.get(&id) else {
@@ -707,7 +707,7 @@ impl Scheduler {
         let key = RequestKey::new(self.engine_id, id, state.request_epoch);
         self.dispatch
             .affinity
-            .get(&(key, DEFAULT_COMPONENT.to_owned()))
+            .get(&(key, DEFAULT_BLOCK.to_owned()))
             .is_some_and(|owner| self.dispatch.prefill_groups.contains(owner))
     }
 

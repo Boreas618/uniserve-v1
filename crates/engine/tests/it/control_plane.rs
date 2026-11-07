@@ -36,8 +36,8 @@ use tokio::sync::mpsc::error::TryRecvError;
 
 use engine::{
     BatchEvent, BatchResult, CommandSender, EVENT_BUFFER_CAPACITY, ExecutionBatch, Executor,
-    ExecutorError, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SimEngine,
-    SimExecutor, SpecialTokenIds,
+    ExecutorError, ExecutorInfo, ExecutorSubmitError, SchedulerConfig, SimEngine, SimExecutor,
+    SpecialTokenIds, WorkerGroupId,
 };
 use engine::{Event, FinishReason};
 use engine::{
@@ -3938,11 +3938,11 @@ impl Executor for LosableExecutor {
         self.inner.info()
     }
 
-    fn is_ready(&self, worker: &ExecutorGroupId) -> bool {
+    fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.inner.is_ready(worker)
     }
 
-    fn has_capacity(&self, worker: &ExecutorGroupId) -> bool {
+    fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         self.inner.has_capacity(worker)
     }
 
@@ -4146,7 +4146,7 @@ fn losing_every_worker_stops_request_admission() {
 
     // The deployment's only group is lost, and nothing can replace it.
     loss.lose(
-        ExecutorGroupId("sim".to_owned()),
+        WorkerGroupId("sim".to_owned()),
         "the simulated launch could not be replaced",
     );
 

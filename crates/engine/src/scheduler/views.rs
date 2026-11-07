@@ -236,8 +236,8 @@ fn block_of(table: &[String], info: &MainProcessInfo, kind: PhaseKind) -> Compon
         Some(CallKind::Media(call)) => info
             .media_components
             .get(&call)
-            .map_or(DEFAULT_COMPONENT, String::as_str),
-        _ => DEFAULT_COMPONENT,
+            .map_or(DEFAULT_BLOCK, String::as_str),
+        _ => DEFAULT_BLOCK,
     };
     block_id(table, name).unwrap_or(ComponentId(0))
 }
@@ -1134,7 +1134,7 @@ pub(crate) fn encodings(scheduler: &Scheduler) -> Vec<EncodingView> {
 
 /// The distinct requests resident on one executor, by the request affinity the
 /// mechanism records when it places a call.
-fn resident_requests(dispatch: &Dispatch, worker: &crate::ExecutorGroupId) -> u32 {
+fn resident_requests(dispatch: &Dispatch, worker: &crate::WorkerGroupId) -> u32 {
     let mut requests = HashSet::new();
     for ((key, _), owner) in &dispatch.affinity {
         if owner == worker {
@@ -1153,7 +1153,7 @@ fn resident_requests(dispatch: &Dispatch, worker: &crate::ExecutorGroupId) -> u3
 fn holds_component(
     dispatch: &Dispatch,
     request: RequestKey,
-    worker: &crate::ExecutorGroupId,
+    worker: &crate::WorkerGroupId,
 ) -> bool {
     dispatch
         .affinity
@@ -1169,7 +1169,7 @@ fn holds_request(
     request: RequestKey,
     bound: &str,
     decode_stage: bool,
-    worker: &crate::ExecutorGroupId,
+    worker: &crate::WorkerGroupId,
 ) -> bool {
     let pinned = if decode_stage {
         &dispatch.decode_affinity
@@ -1224,7 +1224,7 @@ pub(crate) fn replica_targets(
     scheduler: &Scheduler,
     request: RequestKey,
     kind: CallKind,
-) -> Vec<(crate::ExecutorGroupId, String)> {
+) -> Vec<(crate::WorkerGroupId, String)> {
     replica_facts(scheduler, request, kind)
         .into_iter()
         .map(|(_, worker, bound)| (worker, bound))
@@ -1238,7 +1238,7 @@ fn replica_facts(
     scheduler: &Scheduler,
     request: RequestKey,
     kind: CallKind,
-) -> Vec<(ReplicaView, crate::ExecutorGroupId, String)> {
+) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
     candidate_facts(
         scheduler,
         request,
@@ -1259,8 +1259,8 @@ fn candidate_facts<'a>(
     scheduler: &'a Scheduler,
     request: RequestKey,
     kind: CallKind,
-    candidates: impl Iterator<Item = (&'a crate::ExecutorGroupId, &'a str, &'a MainProcessInfo)>,
-) -> Vec<(ReplicaView, crate::ExecutorGroupId, String)> {
+    candidates: impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)>,
+) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
     let world = &scheduler.executor;
     let table = world_blocks(world);
     let decode_stage = matches!(
@@ -1327,7 +1327,7 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
             let bound = info
                 .components
                 .first()
-                .map_or(DEFAULT_COMPONENT, |component| component.name.as_str());
+                .map_or(DEFAULT_BLOCK, |component| component.name.as_str());
             replica_view(ReplicaFacts {
                 index,
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
