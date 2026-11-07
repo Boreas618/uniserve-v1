@@ -1529,7 +1529,26 @@ impl Scheduler {
                 // continuing another world's state reads none: the host's
                 // pages are keyed by the world that serves.
                 let mut host_tokens = 0;
-                match host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0) {
+                let mut answer =
+                    host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0);
+                // A lookup is a round trip to this host's Storage Server, which answers well
+                // within a millisecond. Taking the answer at the next step instead admitted a burst
+                // of prompts one per step: GSM8K at 64 slots ran 1320 prefill batches with the
+                // host tier on against 1101 with it off. So the head waits a bounded moment for
+                // its own answer; a prefetch from the KV storage, which takes longer, still waits
+                // across steps.
+                if matches!(answer, HostHit::Pending) {
+                    let deadline = std::time::Instant::now() + HOST_ANSWER_WAIT;
+                    while matches!(answer, HostHit::Pending) && std::time::Instant::now() < deadline
+                    {
+                        if let Some(kv_offload) = self.kv_offload.as_mut() {
+                            kv_offload.poll();
+                        }
+                        std::thread::yield_now();
+                        answer = host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0);
+                    }
+                }
+                match answer {
                     HostHit::Serving(boundary) => host_tokens = boundary - cached_tokens,
                     // The host is looking up this request's pages: the head
                     // waits for the pins.
@@ -1927,6 +1946,9 @@ pub(super) struct AdmissionReservation {
     request_slot: RequestSlot,
     prefix_cache: CacheAllocation,
 }
+
+/// How long admission waits for the head request's host KV lookup within one step.
+const HOST_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// What the host KV cache says about a request's prompt beyond its device hit.
 pub(super) enum HostHit {
