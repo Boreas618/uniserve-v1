@@ -227,11 +227,7 @@ impl EngineControl {
         // process's exit, which the control connection reports, ends the
         // wait too.
         loop {
-            let message = match reader.try_recv::<wire::FromEngine>() {
-                Ok(message) => message,
-                Err(closed) => return Err(why_it_ended(&mut control, closed.into())),
-            };
-            match message {
+            match reader.try_recv::<wire::FromEngine>()? {
                 Some(wire::FromEngine {
                     kind: Some(wire::from_engine::Kind::State(state)),
                 }) => match wire::EngineState::try_from(state.state) {
@@ -273,9 +269,7 @@ impl EngineControl {
                 Some(_) => {}
                 None => {
                     exited(&mut control)?;
-                    if let Err(closed) = reader.wait(POLL_INTERVAL) {
-                        return Err(why_it_ended(&mut control, closed.into()));
-                    }
+                    reader.wait(POLL_INTERVAL)?;
                 }
             }
         }
@@ -971,27 +965,14 @@ fn still_serving(control: &mut Connection) -> anyhow::Result<bool> {
 /// Waits up to `timeout` for the daemon to report the engine process's exit
 /// on its control connection; a wait that times out is logged.
 fn await_exit(control: &mut Connection, timeout: Duration) {
-    if exit_of(control, timeout).is_none() {
-        tracing::warn!("the failed engine process did not exit within {timeout:?}");
-    }
-}
-
-/// The exit the daemon reports on the control connection within `timeout`.
-fn exit_of(control: &mut Connection, timeout: Duration) -> Option<anyhow::Error> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         match exited(control) {
             Ok(()) => std::thread::sleep(POLL_INTERVAL),
-            Err(exit) => return Some(exit),
+            Err(_) => return,
         }
     }
-    None
-}
-
-/// Why a starting engine closed its connection: its exit states it, in the last line it wrote,
-/// and `closed` says only that it went.
-fn why_it_ended(control: &mut Connection, closed: anyhow::Error) -> anyhow::Error {
-    exit_of(control, FAILED_EXIT).unwrap_or(closed)
+    tracing::warn!("the failed engine process did not exit within {timeout:?}");
 }
 
 /// Fails when the daemon reported the engine process's exit on its control
