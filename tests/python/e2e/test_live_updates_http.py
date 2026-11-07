@@ -2965,6 +2965,42 @@ def test_a_regression_of_the_epoch_on_trial_reverts_it(
         )
 
 
+def test_a_program_update_past_a_threshold_reverts_in_its_epoch(
+    tmp_path: Path, runtime: Path
+):
+    """A program-layer update stands the same trial as an epoch switch.
+
+    The serving epoch computes a stream before the update and a trickle after
+    it, so its token throughput falls past the threshold. The update reverts in
+    the same main process, with the threshold as its failure.
+    """
+    name = "qwen3-live-program-trial"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        streaming, streamed = _start_count(base_url, name)
+        time.sleep(TRIAL_WINDOW_S + 2)
+        result = _apply(
+            base_url,
+            "scheduler_config.max_batch=4",
+            "update_config.rollback.throughput_regression=0.5",
+            f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
+        )
+        assert result["change"] == "program", result
+        streaming.join(timeout=1800)
+        assert not streamed["errors"], streamed["errors"][0]
+
+        def reverted() -> bool:
+            _chat(base_url, name, RECOVERY_PROMPT, tokens=2)
+            time.sleep(1)
+            return bool(_update(base_url).get("failure"))
+
+        _wait_until(reverted, 120, "the update was not reverted")
+        update = _update(base_url)
+        print("reverted:", json.dumps(update))
+        assert update["failure"]["kind"] == "throughput_regression", update
+        _artifact("program-throughput-regression", {"update": update})
+
+
 @pytest.mark.xfail(
     strict=True,
     reason="a main process maps no host page pool, so no page reaches the host "
