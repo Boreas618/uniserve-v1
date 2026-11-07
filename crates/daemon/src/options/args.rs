@@ -887,7 +887,7 @@ mod tests {
         let (config, engine) = lowered(&["/models/m"]).unwrap();
         assert_eq!(config.model(), "/models/m");
         assert_eq!(config.served_model_name(), "/models/m");
-        assert_eq!(engine.worker_process.model, "/models/m");
+        assert_eq!(engine.model, "/models/m");
 
         let file = written("model", "model = \"/models/file\"\n");
         let (config, _) = lowered(&["--config", file.to_str().unwrap()]).unwrap();
@@ -971,7 +971,7 @@ mod tests {
     /// Capture lists and capacities are checked before any rank starts.
     #[test]
     fn capture_lists_are_strictly_increasing_and_shapes_distinct() {
-        let (_, engine) = lowered(&[
+        let (config, _) = lowered(&[
             "m",
             "--set",
             "video_config.text_capacities=1024,4096",
@@ -979,11 +979,18 @@ mod tests {
             "cuda_graph_config.flow_shapes=1152x2048,2048x1152",
         ])
         .unwrap();
-        let worker = &engine.worker_process;
-        assert_eq!(worker.video_text_capacities, Some(vec![1024, 4096]));
+        let spec = config.engine_spec().unwrap();
         assert_eq!(
-            worker.flow_graph_shapes,
-            Some(vec![[1152, 2048], [2048, 1152]])
+            spec.video.unwrap().text_capacities.unwrap().values,
+            vec![1024, 4096]
+        );
+        let shapes = spec.cuda_graphs.unwrap().flow_shapes.unwrap().shapes;
+        assert_eq!(
+            shapes
+                .iter()
+                .map(|shape| [shape.height, shape.width])
+                .collect::<Vec<_>>(),
+            vec![[1152, 2048], [2048, 1152]]
         );
 
         for refused in [
@@ -1004,7 +1011,7 @@ mod tests {
     /// unstated budgets take the engine defaults.
     #[test]
     fn grouped_options_reach_the_engine() {
-        let (_, engine) = lowered(&[
+        let (config, engine) = lowered(&[
             "m",
             "--set",
             "quantization.mode=performance",
@@ -1016,17 +1023,15 @@ mod tests {
             "scheduler_config.chunked_prefill_size=512",
         ])
         .unwrap();
-        let worker = &engine.worker_process;
-        assert_eq!(worker.quantization["mode"], "performance");
+        let spec = config.engine_spec().unwrap();
+        let quantization: serde_json::Value =
+            serde_json::from_str(&spec.workers.unwrap().quantization).unwrap();
+        assert_eq!(quantization["mode"], "performance");
         assert_eq!(engine.expert_parallel, Some(ExpertExchange::Dwdp));
         assert!(!engine.prefix_cache);
         assert_eq!(engine.chunked_prefill_size, 512);
         assert_eq!(
             engine.max_num_batched_tokens,
-            engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
-        );
-        assert_eq!(
-            worker.max_batch_tokens as usize,
             engine::DEFAULT_MAX_NUM_BATCHED_TOKENS
         );
     }

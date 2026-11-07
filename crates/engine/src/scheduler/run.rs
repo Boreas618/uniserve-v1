@@ -67,11 +67,6 @@ fn resolve_generation_limits(
     limits
 }
 
-/// Largest number of request-pool rows a runtime keeps outside
-/// `max_running_requests` (`guidance_prefix_rows`). A launch sizes worker request pools
-/// before the loaded capabilities decide the actual reserve.
-pub(crate) const MAX_GUIDANCE_PREFIX_ROWS: usize = 2;
-
 /// Request-pool rows the runtime keeps outside `max_running_requests`.
 ///
 /// A cache runtime with denoising keeps a row for a running request's
@@ -148,11 +143,11 @@ impl Scheduler {
         config.max_queued_requests = config.max_queued_requests.map(|bound| bound.max(1));
 
         // The request pool also holds the rows the runtime keeps outside
-        // `max_running_requests` (`guidance_prefix_rows`). `SchedulerHandle::start_all` launches
-        // workers with enough rows and refuses a token runtime whose workers
-        // hold fewer, so this clamp lowers the limit only for a supplied
-        // executor or for workers that fit their request pools to device
-        // storage.
+        // `max_running_requests` (`guidance_prefix_rows`).
+        // `SchedulerHandle::over_batches_telling` refuses a token runtime whose
+        // ranks hold too few, so this clamp lowers the limit only for a
+        // supplied executor or for ranks that fit their request pools to
+        // device storage.
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(guidance_prefix_rows(&info))
@@ -544,7 +539,7 @@ impl Scheduler {
         let mut denoisers = Vec::new();
         for (worker, ranks) in &info.rank_latents {
             // The ranks that hold trajectories: those the denoiser's component
-            // config assigns, or every rank of a group launched without one.
+            // config assigns, or every rank of a group placed without one.
             let holders: Vec<usize> = info
                 .component_config(worker, &component)
                 .map_or_else(|| (0..ranks.len()).collect(), |config| config.ranks.clone());
@@ -983,14 +978,6 @@ impl Scheduler {
         )
     }
 
-    /// Names what a drain that stopped progressing still holds: each batch
-    /// with its age and the requests it carries, and the submissions never
-    /// accepted.
-    /// Names what a drain that stopped progressing still holds.
-    fn abandoned_drain(&self, held: (usize, usize)) -> String {
-        abandoned_drain(&self.inflight, held)
-    }
-
     /// Runs the worker hook on every worker, its batches complete.
     fn hook_workers(&mut self, name: &str, payload: &str) -> Result<Vec<String>, String> {
         let results = self
@@ -1005,7 +992,7 @@ impl Scheduler {
     ///
     /// Waits in `Executor::poll` and applies at most one returned result.
     /// Commands and consumer reads fire the engine's `CommandWaker`. A real
-    /// waker, such as `Dispatcher::command_waker`, ends the poll early.
+    /// waker, such as `Submissions::waker`, ends the poll early.
     /// With the no-op waker, a command waits for the executor's own wake
     /// sources or the timeout. The timeout (`IDLE_LIVENESS_POLL`) is solely a
     /// liveness deadline.

@@ -42,15 +42,15 @@ pub use config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
-pub(crate) use execution::generation_consuming_calls;
 use ipc::{ForwardMode, MediaCall, TransferMode};
+#[cfg(feature = "testing")]
 pub(crate) use policy::process_engine;
 pub use policy::{
     Arrival, BatchCapacity, Candidate, Limits, PREFETCH_FLOOR_TOKENS, Parameters, PolicyBytes,
     PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress,
     RoutePolicy, RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
-pub(crate) use run::{MAX_GUIDANCE_PREFIX_ROWS, guidance_prefix_rows};
+pub(crate) use run::guidance_prefix_rows;
 pub use stats::{
     DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, PrefixCacheUsage, PrefixStats,
     SchedulerStats, TimingStats, WorkerStats,
@@ -89,7 +89,8 @@ pub(crate) mod submission;
 #[cfg(feature = "testing")]
 pub(crate) mod testing;
 
-/// The mechanism's door to the executor this process launched.
+/// The mechanism's door to an executor a test supplies.
+#[cfg(feature = "testing")]
 pub(crate) fn submissions(executor: Box<dyn Executor>) -> submission::Submissions {
     submission::Submissions::new(executor)
 }
@@ -105,9 +106,9 @@ pub(crate) mod views;
 mod warming;
 mod world;
 
-pub(crate) use crate::executor::{
-    BatchResult, ExecutionBatch, Executor, ExecutorSubmitError, RequestPlacement,
-};
+#[cfg(feature = "testing")]
+pub(crate) use crate::executor::Executor;
+pub(crate) use crate::executor::{ExecutionBatch, ExecutorSubmitError, RequestPlacement};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 

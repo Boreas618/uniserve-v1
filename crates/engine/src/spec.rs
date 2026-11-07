@@ -1,28 +1,21 @@
 //! The engine configuration an [`EngineSpec`] states.
 //!
 //! The leader daemon resolves the serving options and the model's facts into
-//! the spec it hands the engine process; this module places the deployment's
-//! ranks (from its deployment file or the placement shorthand), reads the
-//! words the options name values by (policies, backends, element types) into
-//! the engine's own values, and completes every executor's launch arguments.
-
-use std::num::NonZeroU64;
-use std::path::PathBuf;
-use std::time::Duration;
+//! the spec it hands a main process; this module places the deployment's
+//! ranks (from its deployment file or the placement shorthand), and reads the
+//! words the options name values by (element types, the expert exchange) into
+//! the engine's own values.
 
 use anyhow::Context as _;
 use proto::request::GenerationLimits;
-use proto::request::wire::{CudaGraphs, EngineSpec, Placement, Scheduling, Sizes};
+use proto::request::wire::{EngineSpec, Placement, Sizes};
 use serde::de::DeserializeOwned;
 
 use crate::DEFAULT_COMPONENT;
 use crate::core::{EngineConfig, ExecutorGroupConfig};
 use crate::deployment::Deployment;
 use crate::executor::TransferConfig;
-use crate::scheduler::{
-    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS, SchedulerConfig,
-};
-use crate::executors::ExecutorProcessArgs;
+use crate::scheduler::{DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_NUM_BATCHED_TOKENS};
 
 /// The value the word `value` names for the option at `option`, read as the
 /// serving options name it.
@@ -31,41 +24,9 @@ fn named<T: DeserializeOwned>(value: &str, option: &str) -> anyhow::Result<T> {
         .with_context(|| format!("invalid `{option}`: {value:?}"))
 }
 
-/// The scheduling limits and policy `scheduling` states, with the engine's
-/// defaults for those it leaves out; the canvas is the scheduler's own.
-///
-/// # Errors
-///
-/// Fails on a policy the engine does not know.
-pub(crate) fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<SchedulerConfig> {
-    Ok(SchedulerConfig {
-        max_batch: scheduling.max_batch.max(1) as usize,
-        max_num_batched_tokens: scheduling
-            .max_num_batched_tokens
-            .map_or(DEFAULT_MAX_NUM_BATCHED_TOKENS, |tokens| tokens as usize),
-        max_running_requests: scheduling.max_running_requests.max(1) as usize,
-        chunked_prefill_size: scheduling
-            .chunked_prefill_size
-            .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
-        max_queued_requests: scheduling
-            .max_queued_requests
-            .map(|requests| requests as usize),
-        canvas: None,
-        draft_tokens: 0,
-        // A `Configure` command states the scheduling limits, not the
-        // deployment's graph catalog.
-        graph_tiers: Vec::new(),
-    })
-}
-
 /// A list the spec states, `None` when absent.
 fn sizes(list: &Option<Sizes>) -> Option<Vec<u32>> {
     list.as_ref().map(|list| list.values.clone())
-}
-
-/// An optional text the spec states as empty when unset.
-fn stated(text: &str) -> Option<String> {
-    (!text.is_empty()).then(|| text.to_owned())
 }
 
 impl EngineConfig {
@@ -136,149 +97,17 @@ impl EngineConfig {
         let kv_cache = required(&spec.kv_cache, "kv_cache")?;
         let workers = required(&spec.workers, "executors")?;
         let graphs = required(&spec.cuda_graphs, "cuda_graphs")?;
-        let video = required(&spec.video, "video")?;
         let experts = required(&spec.experts, "experts")?;
         let facts = required(&spec.model_facts, "model_facts")?;
 
         let worker_groups = place(placement, &spec.host)?;
-        let transfer = if spec.transfer.is_empty() {
-            TransferConfig::default()
-        } else {
-            spec.transfer
-                .parse::<TransferConfig>()
-                .context("invalid `placement_config.transfer`")?
-        };
-        let quantization: serde_json::Value = if workers.quantization.is_empty() {
-            serde_json::Value::Object(serde_json::Map::new())
-        } else {
-            serde_json::from_str(&workers.quantization)
-                .context("invalid `quantization`")?
-        };
-        anyhow::ensure!(quantization.is_object(), "`quantization` must be a table");
-
+        spec.transfer
+            .parse::<TransferConfig>()
+            .context("invalid `placement_config.transfer`")?;
         let max_num_batched_tokens = scheduling
             .max_num_batched_tokens
             .map_or(DEFAULT_MAX_NUM_BATCHED_TOKENS, |tokens| tokens as usize);
         let host_kv_cache = kv_cache.prefix_caching && kv_cache.host_tier;
-        let cache_keys = spec
-            .cache_keys
-            .iter()
-            .map(|key| {
-                <[u8; 32]>::try_from(key.as_slice())
-                    .context("a retained cache key must contain 32 bytes")
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
-        let worker_process = ExecutorProcessArgs {
-            executable: PathBuf::from(&workers.executable),
-            // A deployment is what one daemon serves under its served name.
-            deployment: spec.deployment.clone(),
-            host_kv_cache,
-            kv_storage: kv_cache
-                .mooncake
-                .as_ref()
-                .filter(|_| host_kv_cache)
-                .map(|mooncake| storage::connector::Settings {
-                    master: mooncake.master.clone(),
-                    metadata: mooncake.metadata_server.clone(),
-                    protocol: mooncake.protocol.clone(),
-                    device: mooncake.device.clone(),
-                    // Each host names itself to Mooncake.
-                    hostname: None,
-                    segment_bytes: mooncake.segment_bytes,
-                    library: stated(&mooncake.library).map(PathBuf::from),
-                }),
-            keep_standby: workers.standby,
-            standby: false,
-            standby_storage: if workers.standby_storage.is_empty() {
-                proto::request::StandbyStorage::Auto
-            } else {
-                named(&workers.standby_storage, "worker_config.standby_storage")?
-            },
-            segments: None,
-            world: spec.world,
-            retire: spec.retire.clone(),
-            predecessor: None,
-            stage_cache: spec.stage_cache,
-            cache_keys: cache_keys.clone(),
-            received_weights: None,
-            model: spec.model.clone(),
-            expert_order: spec
-                .expert_order
-                .iter()
-                .map(|(path, order)| (path.clone(), order.experts.clone()))
-                .collect(),
-            weights: stated(&workers.weights),
-            host: spec.host.clone(),
-            queue_depth: placement.queue_depth.max(1) as usize,
-            watchdog_timeout: Duration::from_millis(workers.watchdog_timeout_ms),
-            max_total_tokens: kv_cache
-                .max_tokens
-                .and_then(NonZeroU64::new)
-                .map(NonZeroU64::get),
-            block_size: kv_cache.block_size,
-            attention_backend: workers.attention_backend.clone(),
-            expert_microbatches: experts.microbatches.max(1),
-            load_format: named(&workers.load_format, "load_config.format")?,
-            download_dir: stated(&workers.download_dir).map(PathBuf::from),
-            load_threads: workers.load_threads,
-            parallel_degrees: workers.parallel_degrees.clone(),
-            dtype: named(&workers.dtype, "dtype")?,
-            quantization,
-            kv_cache_dtype: stated(&kv_cache.dtype)
-                .map(|dtype| named(&dtype, "kv_cache_config.dtype"))
-                .transpose()?,
-            mem_fraction_static: placement.mem_fraction_static,
-            worker_mesh: stated(&workers.mesh),
-            max_model_len: facts.max_model_len,
-            canvas_sampling: facts
-                .canvas_sampling
-                .as_ref()
-                .map(|canvas| ipc::CanvasSampling {
-                    canvas_length: canvas.canvas_length,
-                    max_steps: canvas.max_steps,
-                    entropy_bound: canvas.entropy_bound,
-                    t_min: canvas.t_min,
-                    t_max: canvas.t_max,
-                    confidence_threshold: canvas.confidence_threshold,
-                    stability_threshold: canvas.stability_threshold,
-                }),
-            prefill_outputs: facts.prefill_outputs,
-            draft_tokens: spec
-                .speculation
-                .as_ref()
-                .map_or(0, |speculation| speculation.num_draft_tokens),
-            video_text_capacities: sizes(&video.text_capacities),
-            ffmpeg: PathBuf::from(&video.ffmpeg),
-            // Each forward batch is bounded by the scheduler's batch and
-            // token budgets, which the executor's launch descriptor carries.
-            max_batch_calls: scheduling.max_batch,
-            max_batch_tokens: u32::try_from(max_num_batched_tokens)
-                .context("`max_num_batched_tokens` exceeds the executor field width")?,
-            max_video_seconds: video.max_seconds,
-            min_video_seconds: (video.min_seconds > 0.0).then_some(video.min_seconds),
-            max_condition_rows: video.max_condition_rows,
-            video_resolutions: video.resolutions.clone(),
-            video_aspect_ratios: video.aspect_ratios.clone(),
-            fence_probes: spec
-                .profiling
-                .as_ref()
-                .is_some_and(|profiling| profiling.fence_probes),
-            fence_components: spec
-                .profiling
-                .as_ref()
-                .map(|profiling| profiling.fence_components.clone())
-                .unwrap_or_default(),
-            fence_probes_off: spec
-                .profiling
-                .as_ref()
-                .map(|profiling| profiling.fence_probes_off.clone())
-                .unwrap_or_default(),
-            graph_pc_sampling: spec
-                .profiling
-                .as_ref()
-                .is_some_and(|profiling| profiling.graph_pc_sampling),
-            ..graph_arguments(graphs)?
-        };
 
         Ok(Self {
             generation_limits: facts.limits.map(GenerationLimits::from).unwrap_or_default(),
@@ -319,79 +148,39 @@ impl EngineConfig {
                 kv_cache.host_bytes,
             )?,
             worker_groups,
-            transfer,
             data_parallel_size: placement.data_parallel_size.max(1) as usize,
             expert_parallel: experts
                 .expert_parallel
                 .then(|| named(&experts.exchange, "moe_config.exchange"))
                 .transpose()?,
-            worker_process,
+            model: spec.model.clone(),
+            dtype: named(&workers.dtype, "dtype")?,
+            // A deployment is what one daemon serves under its served name.
+            deployment: spec.deployment.clone(),
+            host: spec.host.clone(),
+            host_kv_cache,
+            kv_storage: host_kv_cache && kv_cache.mooncake.is_some(),
+            canvas_sampling: facts
+                .canvas_sampling
+                .as_ref()
+                .map(|canvas| ipc::CanvasSampling {
+                    canvas_length: canvas.canvas_length,
+                    max_steps: canvas.max_steps,
+                    entropy_bound: canvas.entropy_bound,
+                    t_min: canvas.t_min,
+                    t_max: canvas.t_max,
+                    confidence_threshold: canvas.confidence_threshold,
+                    stability_threshold: canvas.stability_threshold,
+                }),
+            draft_tokens: spec
+                .speculation
+                .as_ref()
+                .map_or(0, |speculation| speculation.num_draft_tokens),
             bos: facts.bos,
             eos: facts.eos.clone(),
             end_of_image: facts.end_of_image,
             world: spec.world,
-            stage_cache: spec.stage_cache,
-            cache_keys,
-            predecessor: spec.predecessor.as_ref().map(|predecessor| {
-                predecessor
-                    .segments
-                    .iter()
-                    .map(|group| {
-                        (
-                            group.worker_group.clone(),
-                            ipc::PredecessorCache {
-                                world: predecessor.world,
-                                segments: group
-                                    .segments
-                                    .iter()
-                                    .take(group.held as usize)
-                                    .map(|segment| ipc::CacheSegment {
-                                        world: segment.world,
-                                        ordinal: segment.ordinal,
-                                        units: segment.units,
-                                    })
-                                    .collect(),
-                                num_units: group.units,
-                                scratch_units: group.scratch,
-                            },
-                        )
-                    })
-                    .collect()
-            }),
-            segments: spec
-                .segments
-                .iter()
-                .map(|group| {
-                    (
-                        group.worker_group.clone(),
-                        ipc::CacheTable {
-                            segments: group
-                                .segments
-                                .iter()
-                                .map(|segment| ipc::CacheSegment {
-                                    world: segment.world,
-                                    ordinal: segment.ordinal,
-                                    units: segment.units,
-                                })
-                                .collect(),
-                            held: group.held,
-                        },
-                    )
-                })
-                .collect(),
-            received_weights: spec
-                .received_weights
-                .iter()
-                .map(|group| {
-                    Ok((
-                        group.worker_group.clone(),
-                        ipc::ReceivedWeights {
-                            worlds: group.worlds.clone(),
-                            manifest: group.manifest.clone(),
-                        },
-                    ))
-                })
-                .collect::<anyhow::Result<_>>()?,
+            trial: spec.predecessor.is_some(),
         })
     }
 }
@@ -475,23 +264,6 @@ fn order_devices(
     Ok(())
 }
 
-/// The launch arguments the graph and attention-provider tables state.
-fn graph_arguments(graphs: &CudaGraphs) -> anyhow::Result<ExecutorProcessArgs> {
-    Ok(ExecutorProcessArgs {
-        graph_policy: named(&graphs.policy, "cuda_graph_config.policy")?,
-        decode_graph_batch_sizes: sizes(&graphs.decode_batch_sizes),
-        prefill_graph_token_sizes: sizes(&graphs.prefill_token_sizes),
-        flow_graph_shapes: graphs.flow_shapes.as_ref().map(|shapes| {
-            shapes
-                .shapes
-                .iter()
-                .map(|shape| [shape.height, shape.width])
-                .collect()
-        }),
-        ..ExecutorProcessArgs::default()
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use proto::request::wire;
@@ -527,9 +299,9 @@ mod tests {
                 load_format: "auto".into(),
                 ..wire::Workers::default()
             }),
-            cuda_graphs: Some(CudaGraphs {
+            cuda_graphs: Some(wire::CudaGraphs {
                 policy: "auto".into(),
-                ..CudaGraphs::default()
+                ..wire::CudaGraphs::default()
             }),
             video: Some(wire::Video {
                 max_seconds: 15.0,
@@ -559,12 +331,9 @@ mod tests {
     #[test]
     fn an_unknown_word_is_refused_naming_its_option() {
         let mut unknown = spec();
-        unknown.cuda_graphs.as_mut().unwrap().policy = "sometimes".into();
+        unknown.workers.as_mut().unwrap().dtype = "sometimes".into();
         let error = EngineConfig::from_spec(&unknown).expect_err("the word must be refused");
-        assert!(
-            format!("{error:#}").contains("cuda_graph_config.policy"),
-            "{error:#}"
-        );
+        assert!(format!("{error:#}").contains("dtype"), "{error:#}");
     }
 
     /// A spec of `ranks` tensor-parallel ranks sharing their experts, on
@@ -578,62 +347,70 @@ mod tests {
         spec
     }
 
-    /// The shorthand puts its ranks, in rank order, on the devices
-    /// `placement_config.devices` names; a planned world's launches state
-    /// them, with the ranks each loads its weights with.
-    #[test]
-    fn the_shorthand_puts_ranks_on_the_devices_their_order_names() {
-        let launches = crate::launches::rank_launches(&tensor_experts(4, &[0, 2, 1, 3])).unwrap();
-        let devices: Vec<&str> = launches
+    /// The devices of `config`'s groups, group by group in rank order.
+    fn devices(config: &EngineConfig) -> Vec<(String, Vec<String>)> {
+        config
+            .worker_groups
             .iter()
-            .map(|launch| launch.descriptor.device.as_str())
-            .collect();
-        assert_eq!(devices, ["cuda:0", "cuda:2", "cuda:1", "cuda:3"]);
-        for (index, launch) in launches.iter().enumerate() {
-            assert_eq!(launch.rank, index as u32);
-            assert_eq!(launch.descriptor.rank, index as u32);
-            assert_eq!(
-                launch.agreement,
-                crate::launches::Agreement::Group("model".into())
-            );
-            assert_eq!(launch.agreement_index, index as u32);
-            assert!(launch.descriptor.tensor_experts);
-            assert_eq!(launch.environment["LOCAL_RANK"], index.to_string());
-        }
-
-        // Without an order each host's ranks number its devices from zero.
-        let launches = crate::launches::rank_launches(&tensor_experts(4, &[])).unwrap();
-        let devices: Vec<&str> = launches
-            .iter()
-            .map(|launch| launch.descriptor.device.as_str())
-            .collect();
-        assert_eq!(devices, ["cuda:0", "cuda:1", "cuda:2", "cuda:3"]);
+            .map(|group| {
+                (
+                    group.id.to_string(),
+                    group.ranks.iter().map(|rank| rank.device.clone()).collect(),
+                )
+            })
+            .collect()
     }
 
-    /// Schedulers that share their experts load their weights together
-    /// over the expert union, each at its union rank.
+    /// The shorthand puts its ranks, in rank order, on the devices
+    /// `placement_config.devices` names.
     #[test]
-    fn the_ranks_of_an_expert_union_load_together() {
+    fn the_shorthand_puts_ranks_on_the_devices_their_order_names() {
+        let config = EngineConfig::from_spec(&tensor_experts(4, &[0, 2, 1, 3])).unwrap();
+        assert_eq!(
+            devices(&config),
+            [(
+                "model".to_owned(),
+                vec![
+                    "cuda:0".to_owned(),
+                    "cuda:2".to_owned(),
+                    "cuda:1".to_owned(),
+                    "cuda:3".to_owned(),
+                ],
+            )]
+        );
+
+        // Without an order each host's ranks number its devices from zero.
+        let config = EngineConfig::from_spec(&tensor_experts(4, &[])).unwrap();
+        assert_eq!(
+            devices(&config),
+            [(
+                "model".to_owned(),
+                vec![
+                    "cuda:0".to_owned(),
+                    "cuda:1".to_owned(),
+                    "cuda:2".to_owned(),
+                    "cuda:3".to_owned(),
+                ],
+            )]
+        );
+    }
+
+    /// Schedulers that share their experts keep the order across their groups:
+    /// the devices name each scheduler's rank in turn.
+    #[test]
+    fn a_device_order_runs_across_the_schedulers_groups() {
         let mut spec = spec();
         let shorthand = spec.placement.as_mut().unwrap();
         shorthand.data_parallel_size = 2;
         shorthand.devices = vec![1, 0];
         spec.experts.as_mut().unwrap().expert_parallel = true;
-        let launches = crate::launches::rank_launches(&spec).unwrap();
-        let planned: Vec<(&str, &str, u32)> = launches
-            .iter()
-            .map(|launch| {
-                assert_eq!(launch.agreement, crate::launches::Agreement::ExpertUnion);
-                (
-                    launch.group.as_str(),
-                    launch.descriptor.device.as_str(),
-                    launch.agreement_index,
-                )
-            })
-            .collect();
+        let config = EngineConfig::from_spec(&spec).unwrap();
         assert_eq!(
-            planned,
-            [("model-0", "cuda:1", 0), ("model-1", "cuda:0", 1)]
+            devices(&config),
+            [
+                ("model-0".to_owned(), vec!["cuda:1".to_owned()]),
+                ("model-1".to_owned(), vec!["cuda:0".to_owned()]),
+            ]
         );
     }
 

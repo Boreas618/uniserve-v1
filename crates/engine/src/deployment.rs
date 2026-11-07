@@ -1,4 +1,4 @@
-//! Deployment files: the executor groups a server launches, stated in TOML.
+//! Deployment files: the executor groups a server runs, stated in TOML.
 //!
 //! A deployment file lists executor groups as `[[worker_groups]]` tables. Each group
 //! names its ranks compactly and the components placed on them:
@@ -19,7 +19,7 @@
 //!
 //! [`Deployment::read`] parses a file; [`Deployment::worker_groups`] places its
 //! ranks on hosts and expands it into the engine's [`ExecutorGroupConfig`] list,
-//! which every launch path consumes. Reading checks the file's syntax and
+//! which the daemon and the main process read. Reading checks the file's syntax and
 //! schema; placement validates the expanded groups with
 //! [`ExecutorGroupConfig::validate_all`], so a file that names no host can be
 //! checked only once the engine's own host identity is known.
@@ -64,7 +64,7 @@ struct GroupEntry {
     replicas: usize,
     /// The group's ranks, every replica's together, in rank order.
     ranks: Vec<RankRange>,
-    /// Physical runs in flight per rank (`ExecutorProcessArgs::queue_depth`).
+    /// Physical runs in flight per rank.
     queue_depth: usize,
     /// Per-rank device-storage share; the server-wide `mem_fraction_static`
     /// applies when absent.
@@ -181,7 +181,7 @@ impl TryFrom<String> for RankRange {
 impl Deployment {
     /// Encodes resolved executor groups as a deployment snapshot. Each rank
     /// names its host and device explicitly; component membership and group
-    /// identities are preserved across independently launched replicas.
+    /// identities are preserved across independently started replicas.
     pub fn snapshot(groups: &[ExecutorGroupConfig]) -> anyhow::Result<String> {
         let deployment = Self {
             worker_groups: groups
