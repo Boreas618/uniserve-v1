@@ -27,6 +27,7 @@ def spec(fields, parameters, target):
             "rows": "i64",
             "padded": "i32",
             "vocabulary": "i32",
+            "ranks": "i32",
             "BLOCK": "constexpr",
         },
         "constexprs": {"BLOCK": int(fields["block"])},

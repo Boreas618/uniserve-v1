@@ -9,23 +9,32 @@ import triton
 import triton.language as tl
 
 
-@triton.jit(do_not_specialize=["rows", "padded", "vocabulary"])
+@triton.jit(do_not_specialize=["rows", "padded", "vocabulary", "ranks"])
 def _vocab_unpad_kernel(
     gathered_ptr,
     out_ptr,
     rows,
     padded,
     vocabulary,
+    ranks,
     BLOCK: tl.constexpr,
 ):
-    """Copy the unpadded prefix of every row of ``gathered``.
+    """Copy every row's vocabulary out of the ranks' gathered shards.
 
-    ``gathered`` is ``[rows, padded]`` and ``out`` ``[rows, vocabulary]``. Grid:
-    ``ceil(rows · vocabulary / BLOCK)``.
+    A collective gather lays the ranks' shards one after another: ``gathered`` holds ``ranks``
+    blocks of ``[rows, padded / ranks]``, rank by rank, and shard ``r`` holds the ids from
+    ``r · ceil(vocabulary / ranks)`` on. Column ``c`` of a row is column ``c mod shard`` of that row
+    in shard ``c / shard``. One rank is one block, which is the row-major ``[rows, padded]``.
+    ``out`` is ``[rows, vocabulary]``. Grid: ``ceil(rows · vocabulary / BLOCK)``.
     """
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     mask = offsets < rows * vocabulary
     row = offsets // vocabulary
     column = offsets % vocabulary
-    value = tl.load(gathered_ptr + row * padded + column, mask=mask)
+    width = padded // ranks
+    shard = (vocabulary + ranks - 1) // ranks
+    rank = column // shard
+    value = tl.load(
+        gathered_ptr + rank * rows * width + row * width + column % shard, mask=mask
+    )
     tl.store(out_ptr + offsets, value, mask=mask)

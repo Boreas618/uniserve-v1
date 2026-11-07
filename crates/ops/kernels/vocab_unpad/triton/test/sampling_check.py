@@ -229,10 +229,17 @@ def run_vocab_unpad(case):
     dtype = TORCH_TYPES[case["dtype"]]
     generator = torch.Generator().manual_seed(case["seed"])
     rows, vocabulary, padded = case["rows"], case["vocabulary"], case["padded"]
-    gathered = torch.randn(rows, padded, generator=generator).to(dtype)
+    ranks = case.get("ranks", 1)
+    # The gather lays the ranks' shards one after another: shard `r` is `[rows, padded / ranks]`
+    # and holds the ids from `r * ceil(vocabulary / ranks)` on, its padding after them.
+    width, shard = padded // ranks, -(-vocabulary // ranks)
+    shards = torch.randn(ranks, rows, width, generator=generator).to(dtype)
     if case["marks_padding"]:
         # The padding columns are marked, so a copy that took the wrong offset shows at once.
-        gathered[:, vocabulary:] = -7.0
+        for rank in range(ranks):
+            held = min(shard, vocabulary - rank * shard)
+            shards[rank, :, held:] = -7.0
+    gathered = shards.reshape(rows, padded).clone()
     out = torch.full((rows, vocabulary), float("nan"), dtype=dtype)
 
     launch(
@@ -243,14 +250,19 @@ def run_vocab_unpad(case):
         rows,
         padded,
         vocabulary,
+        ranks,
         BLOCK=case["block"],
     )
 
-    expected = gathered.cpu()[:, :vocabulary]
+    expected = torch.cat(
+        [shards[rank, :, : min(shard, vocabulary - rank * shard)] for rank in range(ranks)],
+        dim=1,
+    ).cpu()
     failures, line = compare_exact("out", out.cpu(), expected)
     print(
         f"{'exact' if failures == 0 else 'FAIL'}: vocab_unpad, {case['label']} — "
-        f"{rows} x {vocabulary} of {padded} gathered columns, block {case['block']}, "
+        f"{rows} x {vocabulary} of {padded} gathered columns over {ranks} ranks, "
+        f"block {case['block']}, "
         f"{case['dtype']}"
     )
     print(line)
@@ -775,6 +787,28 @@ def cases(operator, flags):
                 "block": 512,
                 "marks_padding": True,
                 "seed": 2,
+            },
+            {
+                "label": "two ranks' shards of three rows, each padded, gathered rank by rank",
+                "dtype": flags.dtype,
+                "rows": 3,
+                "vocabulary": 1000,
+                "padded": 1008,
+                "ranks": 2,
+                "block": 512,
+                "marks_padding": True,
+                "seed": 3,
+            },
+            {
+                "label": "four ranks' shards, the last one short",
+                "dtype": flags.dtype,
+                "rows": 5,
+                "vocabulary": 1001,
+                "padded": 1024,
+                "ranks": 4,
+                "block": 512,
+                "marks_padding": True,
+                "seed": 4,
             },
         ]
     if operator == "filter_candidates":
