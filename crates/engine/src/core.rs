@@ -446,9 +446,6 @@ pub struct RankFacts {
     pub devices: Option<Vec<String>>,
     /// The group's hosts, in rank order (*launch*: `placement_config`).
     pub hosts: Option<Vec<String>>,
-    /// The groups this rank's group exchanges state with, each with the
-    /// components it serves (*launch*: `placement_config`'s edges).
-    pub peers: Option<BTreeMap<String, BTreeMap<String, ComponentConfig>>>,
     /// Resident request slots per scheduler (*launch*:
     /// `scheduling.max_running_requests`).
     pub max_running_requests: Option<usize>,
@@ -456,10 +453,6 @@ pub struct RankFacts {
     pub max_batch: Option<usize>,
     /// Tokens one step may carry (*launch*: `scheduling.max_num_batched_tokens`).
     pub max_num_batched_tokens: Option<usize>,
-    /// The KV cache's block size in tokens (*launch*: `kv_cache_config.block_size`).
-    pub block_size: Option<u32>,
-    /// The KV cache's dtype (*launch*: `kv_cache_config.dtype`).
-    pub kv_cache_dtype: Option<ipc::PrefixCacheDtype>,
     /// The host KV cache's size (*launch*: `kv_cache_config.host_ratio` and
     /// `host_bytes`); `None` for a deployment that states none.
     pub host_cache: Option<crate::kv_cache::HostCacheSize>,
@@ -476,12 +469,6 @@ pub struct RankFacts {
     /// What one request may be given to generate (*model*: the model's own
     /// generation limits).
     pub generation_limits: Option<GenerationLimits>,
-    /// The model's context length in tokens (*model*: the model's
-    /// configuration).
-    pub max_model_len: Option<u32>,
-    /// The watchdog timeout a job may run without progress (*launch*:
-    /// `worker_config.watchdog_timeout_ms`).
-    pub watchdog_timeout: Option<std::time::Duration>,
 }
 
 /// A fact the derivation needs, named with where it comes from.
