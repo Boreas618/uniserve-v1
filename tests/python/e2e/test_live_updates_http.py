@@ -2568,6 +2568,145 @@ def test_host_hits_beyond_the_device_cache_all_finish(
         assert not _occurrences(log, "starved"), _log_trouble(log)
 
 
+@pytest.mark.parametrize(
+    "parallel",
+    [
+        ("expert", ("data_parallel_size=2", "moe_config.expert_parallel=true")),
+        ("data", ("data_parallel_size=2",)),
+    ],
+    ids=lambda parallel: parallel[0],
+)
+def test_a_process_of_two_devices_keeps_the_host_kv_cache(
+    tmp_path: Path, runtime: Path, parallel: tuple[str, tuple[str, ...]]
+):
+    """A main process over two devices finds a prompt's pages in the host.
+
+    Each of its schedulers serves one device and keeps the host pools of its
+    own pages, which an expert union computes on both devices. A prompt flushed
+    from the device cache is read back from the host, and the answer is the one
+    it gave before.
+    """
+    kind, options = parallel
+    name = f"qwen3-live-host-{kind}"
+    log = tmp_path / "server.log"
+    first = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
+    second = os.environ.get("UNISERVE_SECOND_DEVICE", "1")
+    prompt = " ".join(f"item {index} of the list" for index in range(800))
+    with _serve(
+        runtime,
+        log,
+        name,
+        env={"CUDA_VISIBLE_DEVICES": f"{first},{second}"},
+        options=(*OPTIONS, *options),
+    ) as base_url:
+        answer = _chat(base_url, name, prompt, tokens=16)
+        time.sleep(2)
+        flushed = _admin(base_url, "flush_cache")
+        assert flushed.status_code == 200, flushed.text
+        answers = []
+        found = _host_tokens_read(
+            base_url, lambda: answers.append(_chat(base_url, name, prompt, tokens=16))
+        )
+        print(f"host tokens on {kind} parallel devices:", found)
+        assert found > 0, f"{found}{_log_trouble(log)}"
+        # An expert union is one process whose two schedulers serve a device
+        # each, and each keeps a host KV cache of its own; data parallelism is
+        # a process per device.
+        if kind == "expert":
+            assert _occurrences(log, "schedulers=2 devices=2"), _log_trouble(log)
+            assert (
+                _occurrences(log, "the host KV cache serves the executor group") == 2
+            ), _log_trouble(log)
+        assert (
+            answers[0]["choices"][0]["message"]["content"]
+            == answer["choices"][0]["message"]["content"]
+        )
+
+
+@pytest.mark.parametrize(
+    "tiers",
+    [
+        (),
+        ("kv_cache_config.host_tier=false",),
+        ("kv_cache_config.prefix_caching=false",),
+    ],
+    ids=["host", "device", "uncached"],
+)
+def test_requests_that_outgrow_the_cache_in_decode_all_finish(
+    tmp_path: Path, runtime: Path, tiers: tuple[str, ...]
+):
+    """A cache that fills while its requests decode gives one of them up.
+
+    Admission holds what a request's prompt takes and not what it generates, so
+    eight counts on a cache of 8192 tokens outgrow it as they decode. The one
+    admitted last gives its units back and continues from the tokens it
+    generated, so every count ends whole and none starves. A count alone that
+    fills the whole cache ends at the length the cache holds.
+    """
+    name = "qwen3-live-decode-growth"
+    log = tmp_path / "server.log"
+    options = (
+        *SIZED_OPTIONS,
+        "kv_cache_config.max_tokens=8192",
+        *tiers,
+    )
+    # About 3400 tokens each (a number of three digits, its comma and its
+    # space are five tokens), so eight of them need more than three caches of
+    # 8192 tokens by their ends, and the cache fills while every one decodes.
+    prompt = "Count from 1 to 700, separated by commas and spaces. Write only the numbers."
+    with _serve(runtime, log, name, options=options) as base_url:
+        streams = []
+        for _ in range(8):
+            stream = {
+                "read": [],
+                "done": threading.Event(),
+                "reasons": [],
+                "errors": [],
+            }
+            stream["thread"] = threading.Thread(
+                target=_stream_count,
+                args=(base_url, name, stream["read"], stream["done"]),
+                kwargs={
+                    "reasons": stream["reasons"],
+                    "errors": stream["errors"],
+                    "prompt": prompt,
+                },
+            )
+            streams.append(stream)
+        for stream in streams:
+            stream["thread"].start()
+        for stream in streams:
+            stream["thread"].join(timeout=1800)
+        counts = []
+        for stream in streams:
+            assert stream["done"].is_set(), "a count did not end"
+            assert not stream["errors"], (
+                f"{stream['errors'][0]!r}{_log_trouble(log)}"
+            )
+            numbers = _numbers(stream["read"])
+            assert numbers == list(range(1, 701)), numbers[-60:]
+            assert stream["reasons"] == ["stop"], stream["reasons"]
+            counts.append(len(numbers))
+        recomputed = _occurrences(log, "migrates to the engine that serves it now")
+        print("numbers of each count:", counts, "recomputations:", recomputed)
+        assert recomputed > 0, "the counts never outgrew the cache"
+        # A count longer than the cache holds runs alone until it fills it, and
+        # ends there as it would at its token limit.
+        read: list[str] = []
+        done = threading.Event()
+        reasons: list[str] = []
+        errors: list[BaseException] = []
+        _stream_count(base_url, name, read, done, reasons=reasons, errors=errors)
+        assert not errors, f"{errors[0]!r}{_log_trouble(log)}"
+        *whole, last = _numbers(read)
+        print("numbers of a count the cache cannot hold:", len(whole), reasons)
+        assert whole == list(range(1, len(whole) + 1)), whole[-60:]
+        # The cache is full where it ends, which may be inside its last number.
+        assert str(len(whole) + 1).startswith(str(last)), (whole[-5:], last)
+        assert reasons == ["length"], reasons
+        assert not _occurrences(log, "starved"), _log_trouble(log)
+
+
 def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
     tmp_path: Path, runtime: Path
 ):
