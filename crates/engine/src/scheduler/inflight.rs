@@ -78,8 +78,20 @@ pub(super) struct PendingBatch {
     /// Whether the batch carries a `BatchKind::Prefill` call, which the room
     /// reports as a prefill batch in flight.
     pub(super) prefill: bool,
+    /// The query tokens of the batch's calls, which the once-a-second report
+    /// states beside its batch time.
+    pub(super) tokens: u64,
     /// The kind of step the batch's worker time measures, if any.
     pub(super) measured: Option<speculation::MeasuredStep>,
+}
+
+/// The tokens `call`'s forward computes: its input tokens, or the one token a continuation reads
+/// from its predecessor on the device; none for a call that runs no token forward.
+fn query_tokens(call: &ipc::Call) -> u64 {
+    match call.kind {
+        ipc::CallKind::Forward(_) => call.input_token_ids.len().max(1) as u64,
+        ipc::CallKind::Media(_) | ipc::CallKind::Transfer(_) => 0,
+    }
 }
 
 /// Owns submitted identities and their lifetime through ordered reconciliation.
@@ -155,6 +167,7 @@ impl Inflight {
                     .requests
                     .iter()
                     .any(|(call, _)| batch_kind(call.kind) == BatchKind::Prefill),
+                tokens: batch.requests.iter().map(|(call, _)| query_tokens(call)).sum(),
                 measured: speculation::MeasuredStep::of(
                     batch.requests.iter().map(|(call, _)| call),
                 ),

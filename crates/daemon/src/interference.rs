@@ -395,10 +395,8 @@ pub(crate) async fn control(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
-
     use engine::{EngineConfig, SchedulerHandle, SimEngine, SimExecutor};
-    use proto::report::{ForwardStats, SchedulerStats};
+    use proto::report::SchedulerStats;
 
     use super::*;
 
@@ -408,13 +406,7 @@ mod tests {
         SchedulerStats {
             batch_roundtrip_us: step_us * batches,
             batch_count: batches,
-            worker_forward_stats: Some(ForwardStats {
-                mode_tokens: BTreeMap::from([(
-                    "graph_replay".to_owned(),
-                    tokens_per_batch * batches,
-                )]),
-                ..Default::default()
-            }),
+            batch_tokens: tokens_per_batch * batches,
             ..Default::default()
         }
     }
