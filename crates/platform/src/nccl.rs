@@ -4,7 +4,7 @@ mod ffi;
 
 use std::ffi::c_void;
 
-use ffi::{Handle, RawUniqueId, api};
+use ffi::{Handle, RawConfig, RawUniqueId, api};
 
 use crate::{DataType, DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, Result, Stream};
 
@@ -23,6 +23,25 @@ const NCCL_SUSPEND_MEM: i32 = 0x01;
 /// `#define NCCL_SPLIT_NOCOLOR -1` in `nccl.h`, compared there by
 /// `tests::the_nccl_constants_are_the_headers`.
 const NCCL_SPLIT_NOCOLOR: i32 = -1;
+
+/// `graphUsageMode` 1: the communicator's collectives are captured into CUDA graphs, at most one
+/// such graph is in flight at a time, and its eager collectives are ordered behind that graph by
+/// the stream they share.
+///
+/// NCCL's default, 2, also serves graphs and eager launches in flight on unrelated streams. It
+/// pays with one event-record node per captured collective, which serializes the collective
+/// against launches NCCL cannot see. The driver holds about 2^18 such nodes in one process; a
+/// Qwen3-MoE TP2 process held 261,072 and ran, and TP4 failed instantiating a graph at 286,552
+/// with `CUDA_ERROR_OUT_OF_MEMORY` and "Failed to instantiate EVENT_RECORD node". A main process
+/// holds a graph per bucket per device with a collective after attention and after the experts of
+/// every layer, so the default does not fit a node's worth of devices.
+///
+/// Mode 1 holds here by construction. Each communicator belongs to one runner, which launches its
+/// graphs and its eager forwards on its own stream, and a [`Communicator`]'s collectives started
+/// on another stream fork from that stream and join it again. In one graph NCCL still orders a
+/// communicator's collectives in capture order. `NCCL_GRAPH_MIXING_SUPPORT`, when it is set,
+/// overrides this attribute.
+const GRAPH_USAGE_ONE_GRAPH: i32 = 1;
 
 /// The 128-byte rendezvous token every rank of a communicator initializes
 /// with. Rank 0 creates it and the caller hands it to the other ranks.
@@ -109,7 +128,9 @@ impl Communicator {
     /// calls this once with the same id; the call blocks until all joined.
     ///
     /// The communicator takes NCCL's default configuration, which `NCCL_*`
-    /// environment variables tune. Its collectives run as NCCL kernels on
+    /// environment variables tune, except its graph usage mode
+    /// ([`GRAPH_USAGE_ONE_GRAPH`]); a library older than 2.14, which has no
+    /// `ncclCommInitRankConfig`, gives it the default. Its collectives run as NCCL kernels on
     /// SMs: NCCL's copy-engine (zero-CTA) algorithms apply only to buffers
     /// registered as symmetric windows, and this type registers none.
     pub fn init(device: DeviceId, size: i32, rank: i32, id: &UniqueId) -> Result<Self> {
@@ -123,10 +144,22 @@ impl Communicator {
         let _guard = context.enter()?;
 
         let mut raw = std::ptr::null_mut();
-        // SAFETY: NCCL writes one communicator handle.
-        let status =
-            unsafe { (api.comm_init_rank)(&mut raw, size, RawUniqueId { bytes: id.0 }, rank) };
-        if let Err(error) = api.check(status, "ncclCommInitRank") {
+        let token = RawUniqueId { bytes: id.0 };
+        let (status, entry) = match &api.comm_init_rank_config {
+            Ok(init) => {
+                let mut config = RawConfig::initializer();
+                config.graph_usage_mode = GRAPH_USAGE_ONE_GRAPH;
+                // SAFETY: NCCL reads the config, which outlives the call, and writes one handle.
+                let status = unsafe { init(&mut raw, size, token, rank, &mut config) };
+                (status, "ncclCommInitRankConfig")
+            }
+            // SAFETY: NCCL writes one communicator handle.
+            Err(_) => (
+                unsafe { (api.comm_init_rank)(&mut raw, size, token, rank) },
+                "ncclCommInitRank",
+            ),
+        };
+        if let Err(error) = api.check(status, entry) {
             if !raw.is_null() {
                 // SAFETY: a partially initialized communicator is owned here.
                 let _ = unsafe { (api.comm_abort)(raw) };
@@ -651,11 +684,8 @@ mod tests {
     /// the contract: a larger `UniqueId` would be a different rendezvous value
     /// than the other ranks hold.
     ///
-    /// `ncclConfig_t` is the other structure the header offers and this crate
-    /// never builds one: `ncclCommSplit` is called with a null config (the
-    /// defaults) and `ncclCommInitRankConfig` is not called at all, so there is
-    /// no attribute encoding here to compare. A crate that starts passing a
-    /// config owes this test that structure's size and its attribute offsets.
+    /// `ncclConfig_t` is laid out by `ffi::RawConfig` and compared by
+    /// `the_nccl_config_is_laid_out_as_the_header`.
     /// Every entry point this crate requires is declared by `nccl.h`.
     ///
     /// The four it binds only when the library has them — `ncclCommSplit`,
@@ -709,13 +739,55 @@ mod tests {
         }
     }
 
-    /// The one constant this crate takes from `nccl.h` is compared with it: a
-    /// split is only correct if the "not in this group" colour is the header's.
+    /// The one constant this crate takes from every `nccl.h` is compared with
+    /// it: a split is only correct if the "not in this group" colour is the
+    /// header's.
     #[test]
     fn the_nccl_constants_are_the_headers() {
         crate::header::assert_constants(
             "nccl.h",
             &[("NCCL_SPLIT_NOCOLOR", super::NCCL_SPLIT_NOCOLOR as i64)],
         );
+    }
+
+    /// NCCL reads a config by the header's layout up to the size it states, so
+    /// a field out of place would set another attribute than the one named.
+    /// The total size is compared, and the graph usage mode's offset, the one
+    /// attribute this crate sets, is fixed by the fields before it.
+    #[test]
+    fn the_nccl_config_is_laid_out_as_the_header() {
+        let ours = std::mem::size_of::<super::ffi::RawConfig>();
+        assert_eq!(
+            std::mem::offset_of!(super::ffi::RawConfig, graph_usage_mode),
+            80,
+            "graphUsageMode follows sixteen bytes of header, four ints, a pointer, two ints, a \
+             pointer and six ints"
+        );
+        // An older header lays out an older config, which NCCL reads by the version it states.
+        let version = crate::header::value("nccl.h", "NCCL_VERSION_CODE");
+        if version.is_some_and(|version| version < 23000) {
+            eprintln!(
+                "skipped: nccl.h is release {version:?}, older than the 2.30 config the crate's \
+                 {ours} bytes lay out"
+            );
+            return;
+        }
+        // NCCL refuses a config whose magic is not the header's; 2.30 names it, and older
+        // headers spell it only inside their initializer.
+        assert_eq!(
+            crate::header::value("nccl.h", "NCCL_API_MAGIC"),
+            version.map(|_| i64::from(super::ffi::NCCL_API_MAGIC)),
+            "nccl.h and the crate disagree on NCCL_API_MAGIC"
+        );
+        match crate::header::struct_size("nccl.h", "ncclConfig_t") {
+            Some(header) => assert_eq!(
+                header, ours,
+                "nccl.h lays ncclConfig_t out in {header} bytes, this crate in {ours}"
+            ),
+            None => eprintln!(
+                "skipped: nccl.h does not let ncclConfig_t be laid out here, so the crate's \
+                 {ours} bytes for it went uncompared"
+            ),
+        }
     }
 }
