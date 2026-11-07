@@ -2490,6 +2490,16 @@ def test_a_request_that_ends_at_once_leaves_its_pages_in_the_host_cache(
         )
         print("host tokens of a request of one token:", found)
         assert found > 0, found
+        # What moved the pages is on the report beside what computed them.
+        metrics = httpx.get(f"{base_url}/metrics", timeout=10).text
+        copied = [
+            line
+            for line in metrics.splitlines()
+            if line.startswith("uniserve:worker_stream_us")
+            and 'stream="copy"' in line
+        ]
+        print("copy stream:", copied)
+        assert copied, metrics[:2000]
 
 
 def test_host_hits_beyond_the_device_cache_all_finish(

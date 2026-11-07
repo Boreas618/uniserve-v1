@@ -1287,11 +1287,17 @@ impl MainProcess {
             )?
         };
 
-        // The always-on counters: every stream a runner computes on is `device`.
+        // The always-on counters: every stream a runner computes on is `device`, and the one the
+        // host KV cache's pages move on is `copy`.
         let observed: Vec<(&'static str, platform::Stream)> = executors
             .iter()
             .flat_map(|executor| executor.streams().iter().cloned())
             .map(|stream| ("device", stream))
+            .chain(
+                executors
+                    .iter()
+                    .map(|executor| ("copy", executor.copy_stream().clone())),
+            )
             .collect();
         let counters = executor::profiling::counters::Counters::start(
             &observed,
