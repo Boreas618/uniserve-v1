@@ -28,7 +28,6 @@ use std::env;
 use std::ffi::OsString;
 
 use anyhow::{Context, Result};
-use clap::Parser as _;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 

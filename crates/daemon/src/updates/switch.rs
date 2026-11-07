@@ -1349,7 +1349,6 @@ mod tests {
     use super::*;
     use crate::epoch::{Deployment, Program, UpdateState};
     use crate::options::ServerArgs;
-    use proto::config::EngineConfig;
 
     /// A roster that records what the switch asks of it and replays the
     /// events a test scripts.
@@ -1470,7 +1469,7 @@ mod tests {
     fn record() -> EpochRecord {
         let config = ServerArgs::default();
         EpochRecord {
-            config: config.engine_config(),
+            config: config.engine_config().expect("the configuration resolves"),
             kernels: BTreeMap::new(),
             policy: Program {
                 backend: "fcfs".to_owned(),
@@ -1538,7 +1537,10 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let switch = Switch::new(
             Arc::clone(&epochs),
-            Update::new(7, Deployment::of(ServerArgs::default())),
+            Update::new(
+                7,
+                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+            ),
             12,
             record(),
             (11, 11),
@@ -1996,7 +1998,10 @@ mod tests {
         let discarded = switch.discarded().to_vec();
         let mut next = Switch::new(
             Arc::clone(&epochs),
-            Update::new(8, Deployment::of(ServerArgs::default())),
+            Update::new(
+                8,
+                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+            ),
             13,
             record(),
             (12, 12),
@@ -2167,7 +2172,10 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let mut switch = Switch::new(
             Arc::clone(&epochs),
-            Update::new(7, Deployment::of(ServerArgs::default())),
+            Update::new(
+                7,
+                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+            ),
             12,
             record(),
             (11, 11),
@@ -2678,7 +2686,10 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let mut switch = Switch::new(
             Arc::clone(&epochs),
-            Update::new(7, Deployment::of(ServerArgs::default())),
+            Update::new(
+                7,
+                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+            ),
             12,
             record(),
             (11, 11),
@@ -2925,7 +2936,10 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let mut switch = Switch::new(
             Arc::clone(&epochs),
-            Update::new(7, Deployment::of(ServerArgs::default())),
+            Update::new(
+                7,
+                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+            ),
             12,
             record(),
             (11, 11),

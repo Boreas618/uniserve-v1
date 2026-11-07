@@ -540,7 +540,7 @@ impl Leader {
         )?);
         let specs = engine::EngineConfig::replica_specs(&prepared.spec)?;
         // The epoch's build config: every main process of it reads these bytes.
-        let build = config.engine_config();
+        let build = config.engine_config()?;
         let clients =
             futures::future::join_all(specs.into_iter().enumerate().map(|(index, mut spec)| {
                 let model = config.model().to_owned();
@@ -735,10 +735,7 @@ impl Leader {
         // `GET /admin/config` naming numbers no package has and a later
         // handover to a joining process (`Epochs::hand_to`) sending a revision
         // the store never built.
-        let deployment = crate::epoch::Deployment {
-            config: config.clone(),
-            programs: prepared.clone(),
-        };
+        let deployment = crate::epoch::Deployment::with_programs(config.clone(), prepared.clone())?;
         let processes: Vec<crate::engine::control::EpochProcess> = engines
             .into_iter()
             .map(|engine| crate::engine::control::EpochProcess {
@@ -804,7 +801,7 @@ impl Leader {
                 rank: 0,
                 pid: None,
                 epoch: Some(world),
-                build: deployment.config.engine_config().executable,
+                build: deployment.engine.executable.clone(),
                 generation: engine,
                 state: crate::epoch::ProcessState::Serving,
             });
@@ -1450,11 +1447,8 @@ impl Leader {
         // A target that reverted with a failure is unavailable until it is
         // applied with `force` (§7.2, §7.3 step 4), the program layer's as
         // much as the epoch layer's.
-        if !force
-            && let Some(failure) = self
-                .epochs()
-                .unavailable(&crate::epoch::Deployment::of(target.clone()))
-        {
+        let resolved_target = deployment(target)?;
+        if !force && let Some(failure) = self.epochs().unavailable(&resolved_target) {
             return Err(UpdateError::Refused(format!(
                 "the configuration reverted with a failure ({}); apply it again with force",
                 failure.reason
@@ -1654,7 +1648,8 @@ impl Leader {
         if crate::epoch::host_layer_differ(current, target) {
             return Ok(None);
         }
-        if current.engine_config().build_hash() != target.engine_config().build_hash() {
+        let engine = resolved(target)?;
+        if resolved(current)?.build_hash() != engine.build_hash() {
             return Ok(None);
         }
         // From here only the programs can differ. The descriptors a
@@ -1723,6 +1718,7 @@ impl Leader {
         };
         let next = crate::epoch::Deployment {
             config: target.clone(),
+            engine,
             programs: prepared,
         };
         // Nothing the configuration states and no revision the Program
@@ -1874,6 +1870,21 @@ pub enum WeightsInFlight {
     Recompute,
     /// Each ends, aborted.
     Abort,
+}
+
+/// The engine configuration `config` resolves into, refused as a request when it does not:
+/// its deployment file does not read or does not place.
+pub(crate) fn resolved(config: &ServerArgs) -> Result<proto::config::EngineConfig, UpdateError> {
+    config.engine_config().map_err(|error| {
+        UpdateError::Refused(format!("the configuration does not resolve: {error:#}"))
+    })
+}
+
+/// The deployment `config` describes, refused as [`resolved`] refuses.
+pub(crate) fn deployment(config: &ServerArgs) -> Result<crate::epoch::Deployment, UpdateError> {
+    crate::epoch::Deployment::of(config.clone()).map_err(|error| {
+        UpdateError::Refused(format!("the configuration does not resolve: {error:#}"))
+    })
 }
 
 /// Why a change of the deployment did not happen or did not complete.
@@ -2516,7 +2527,7 @@ impl Replica {
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let build = config.engine_config();
+        let build = config.engine_config()?;
         let starting = Arc::clone(control);
         let client = Arc::new(
             tokio::task::spawn_blocking(move || starting.start_at(spec, generation, &build, sink))
@@ -2568,7 +2579,7 @@ impl Replica {
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let build = locked(&self.config).engine_config();
+        let build = locked(&self.config).engine_config()?;
         let client = Arc::new(
             tokio::task::spawn_blocking(move || control.start(spec, &build, sink)).await??,
         );
@@ -2871,7 +2882,7 @@ impl Replica {
             }
         };
         spec.predecessor = Some(predecessor);
-        let build = locked(&self.config).engine_config();
+        let build = locked(&self.config).engine_config()?;
         let sink = stats_sink(
             self.model_name.clone(),
             Arc::clone(&self.observer),

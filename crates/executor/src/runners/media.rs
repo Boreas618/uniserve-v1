@@ -1364,8 +1364,6 @@ mod tests {
         );
     }
 
-    use super::*;
-
     /// A request's two units and its track assemble into one MP4.
     ///
     /// This is the artifact a served `t2va` request ends with, and the one thing this module can

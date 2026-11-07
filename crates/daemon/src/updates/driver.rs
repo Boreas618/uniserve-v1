@@ -355,7 +355,6 @@ mod tests {
     use crate::epoch::{EpochRecord, Program, Status, Update};
     use crate::options::ServerArgs;
     use crate::updates::switch::{Event, Start};
-    use proto::config::EngineConfig;
 
     /// The reports the test feeds as if the adapter had delivered them.
     type Feed = Arc<Mutex<Vec<Event>>>;
@@ -416,7 +415,9 @@ mod tests {
 
     fn record(world: u64) -> EpochRecord {
         EpochRecord {
-            config: ServerArgs::default().engine_config(),
+            config: ServerArgs::default()
+                .engine_config()
+                .expect("the configuration resolves"),
             kernels: Default::default(),
             policy: Program {
                 backend: "fcfs".to_owned(),
@@ -435,7 +436,10 @@ mod tests {
         EpochChange {
             previous: 11,
             target,
-            update: Update::new(7, Deployment::of(ServerArgs::default())),
+            update: Update::new(
+                7,
+                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+            ),
             group: "engine".to_owned(),
             start: Start {
                 executable: "/opt/uniserve".to_owned(),
@@ -491,10 +495,10 @@ mod tests {
         epochs.record(11, record(11));
         let (roster, feed) = Fake::with_feed();
         let driver = Driver::new(Arc::clone(&epochs), Box::new(roster));
-        let previous = Deployment::of(ServerArgs::default());
+        let previous = Deployment::of(ServerArgs::default()).expect("the configuration resolves");
         let mut target_config = ServerArgs::default();
         target_config.worker_config.executable = "/opt/uniserve-b".into();
-        let target = Deployment::of(target_config);
+        let target = Deployment::of(target_config).expect("the configuration resolves");
 
         // The switch's nodes are the target configuration's: one node here.
         let host = target.config.host_identity.clone();

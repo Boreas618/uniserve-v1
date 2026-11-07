@@ -508,12 +508,10 @@ impl EpochPlan {
             .unwrap_or(1)
     }
 
-    /// Leading ranks of a deployment whose experts live on dedicated ranks, from its deployment page:
+    /// Leading ranks of a deployment whose experts live on dedicated ranks, from its worker groups:
     /// the ranks of every group that is not an expert group, and zero without one.
     fn attention_ranks(&self) -> Result<u32> {
-        let Some(groups) = self.deployment_groups()? else {
-            return Ok(0);
-        };
+        let groups = &self.build.parallel.worker_groups;
         let experts =
             |group: &&engine::WorkerGroupConfig| group.role == engine::WorkerGroupRole::Experts;
         if !groups.iter().any(|group| experts(&group)) {
@@ -626,9 +624,8 @@ impl EpochPlan {
                 ..ParallelShape::default()
             });
         }
-        let groups = self.deployment_groups()?;
         let (ulysses, tensor, tensor_rank, sequence_rank) = media_parallel(
-            groups.as_deref(),
+            self.capability_groups(),
             &self.group,
             self.rank,
             self.mapping.tensor_parallel,
@@ -1410,6 +1407,35 @@ impl EpochPlan {
         Ok(runners)
     }
 
+    /// The tasks this deployment serves: those of the checkpoint's networks its worker groups
+    /// place.
+    fn media_tasks(&self, config: &minimax_h3::Config) -> Result<Vec<nn::VideoTask>> {
+        served_tasks(
+            &config.serving(),
+            self.capability_groups(),
+            &self.checkpoint,
+        )
+    }
+
+    /// The epoch's worker groups when they partition the model by capability, that is when some
+    /// group places a block other than the whole model ([`proto::config::DEFAULT_BLOCK`]).
+    ///
+    /// The command-line shorthand places the whole model on every group, and a deployment file may
+    /// as well. Such a deployment states no block to split, so it states no sequence degree and
+    /// chooses no network of a checkpoint that holds two.
+    fn capability_groups(&self) -> Option<&[engine::WorkerGroupConfig]> {
+        let groups = &self.build.parallel.worker_groups;
+        groups
+            .iter()
+            .any(|group| {
+                group
+                    .blocks
+                    .keys()
+                    .any(|name| name != proto::config::DEFAULT_BLOCK)
+            })
+            .then_some(groups.as_slice())
+    }
+
     /// Loads the rank's model and opens the resident owners it leaves room for (§4.3, §8, 4.1).
     ///
     /// **This is the single match on model class in the tree**, and the arm loads the class it
@@ -1419,37 +1445,6 @@ impl EpochPlan {
     /// measures a device the weights are already mapped on - what is left, not what was there
     /// before the load - and returns both, so the caller holds no model class of its own and no
     /// knowledge of the order the two must be done in.
-    /// The deployment page this epoch runs, as the launcher placed it.
-    ///
-    /// The media class's parallel shape is the deployment's, and the page states it beside the
-    /// component it splits; the same reader the launcher used answers it here, so a rank and the
-    /// engine that started it cannot disagree about the group's degrees.
-    /// The tasks this deployment serves: those of the checkpoint's network the page places.
-    fn media_tasks(&self, config: &minimax_h3::Config) -> Result<Vec<nn::VideoTask>> {
-        let groups = self.deployment_groups()?;
-        served_tasks(&config.serving(), groups.as_deref(), &self.checkpoint)
-    }
-
-    fn deployment_groups(&self) -> Result<Option<Vec<engine::WorkerGroupConfig>>> {
-        let Some(path) = self.build.parallel.worker_groups.as_ref() else {
-            return Ok(None);
-        };
-        let text = path
-            .to_str()
-            .with_context(|| format!("the deployment file {} is not UTF-8", path.display()))?;
-        let deployment = std::fs::read_to_string(text)
-            .with_context(|| format!("reading the deployment file {}", path.display()))?;
-        let host = self
-            .build
-            .parallel
-            .engine_host
-            .clone()
-            .unwrap_or_else(|| "localhost".to_owned());
-        proto::config::WorkerGroupConfig::parse_file(&deployment, &host)
-            .map(Some)
-            .with_context(|| format!("placing the deployment file {} on {host}", path.display()))
-    }
-
     pub(crate) fn load_and_open(
         &self,
         weights: &mut dyn nn::RetainedWeights,
@@ -1512,11 +1507,10 @@ impl EpochPlan {
                 // is where it is stated.** The build config carries the tensor-parallel width and
                 // no sequence degree, so a rank that read its tensor place alone would either
                 // refuse every wider deployment or serve four whole denoisers. The page that
-                // placed this group states both beside the component they split, and this reads it
-                // through the same reader the launcher used.
-                let groups = self.deployment_groups()?;
+                // placed this group states both beside the block they split, and the epoch's worker
+                // groups carry that page as the daemon read it.
                 let (ulysses, tensor_parallel, tensor_rank, sequence_rank) = media_parallel(
-                    groups.as_deref(),
+                    self.capability_groups(),
                     &self.group,
                     self.rank,
                     mapping.tensor_parallel,
@@ -2788,7 +2782,8 @@ fn served_tasks(
             return Ok(stated.to_vec());
         }
         bail!(
-            "the checkpoint {} holds two networks and this deployment states no page to place one",
+            "the checkpoint {} holds two networks and this deployment places the whole model: a \
+             deployment file that places one of them chooses it",
             checkpoint.display()
         );
     };
@@ -2851,15 +2846,16 @@ fn media_parallel(
     let tensor_rank =
         usize::try_from(tensor_rank).context("a tensor rank the process addresses")?;
     let rank = usize::try_from(rank).context("a rank number the process addresses")?;
-    // A deployment that states no file places one rank per device, and with one rank there is no
-    // other rank for a shape to disagree with: the width the build config states is the whole of it.
+    // A deployment that places the whole model states no block to split. With one rank there is no
+    // other rank for a shape to disagree with, so the width the build config states is the whole of it.
     let Some(groups) = groups else {
         if world_size == 1 {
             return Ok((minimax_h3::partition::Ulysses::single(), 1, 0, 0));
         }
         bail!(
-            "this deployment states no worker-group file and serves {world_size} ranks, so no \
-             sequence degree is stated for them: a file is what places a rank's group and its split"
+            "this deployment places the whole model on its groups and serves {world_size} ranks, so \
+             no sequence degree is stated for them: a deployment file that places the {DENOISER_COMPONENT:?} \
+             block states a rank's group and its split"
         );
     };
     // **The name the launch states is the daemon's process group, not the page's id.** Every engine's
@@ -3277,10 +3273,10 @@ mod tests {
         );
     }
 
-    /// A deployment with no worker-group file serves one rank, and refuses to guess above one.
+    /// A deployment that places the whole model serves one rank, and refuses to guess above one.
     ///
-    /// The shorthand deployment (no `--worker-groups`) states a tensor-parallel width and no
-    /// sequence degree. With one rank no other rank can disagree with the shape, so one rank's
+    /// The shorthand deployment (no deployment file) places the whole model, so it states a
+    /// tensor-parallel width and no sequence degree. With one rank no other rank can disagree with the shape, so one rank's
     /// sequence is the whole of it; with several, a shape read from the width alone would be an
     /// assumption, and the refusal names the file that would state it.
     #[test]
@@ -3291,7 +3287,7 @@ mod tests {
         assert_eq!((tensor_parallel, tensor_rank, sequence_rank), (1, 0, 0));
         let error = media_parallel(None, "model", 2, 4, 2, 4).expect_err("four ranks need a file");
         assert!(
-            format!("{error:#}").contains("worker-group file"),
+            format!("{error:#}").contains("deployment file"),
             "the refusal names what would state the shape: {error:#}"
         );
     }

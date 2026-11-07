@@ -22,18 +22,13 @@
 //! until that crate lands.
 
 use std::collections::BTreeMap;
-use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::PathBuf;
 use std::sync::Mutex;
 
 pub use program_server::{PhaseKind, Program, ProgramSlot};
-use proto::request::ModelDtype;
-use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde::Serialize;
+use serde_json::Value;
 
-use crate::options::{
-    CudaGraphConfig, KvCacheConfig, LoadConfig, ServerArgs, VideoConfig, WorkerConfig,
-};
+use crate::options::ServerArgs;
 
 /// The operator names the epoch record keys its kernel programs by (§5.1,
 /// §5.2), of the operators whose backend a configuration selects. They are
@@ -253,8 +248,8 @@ pub enum UpdateState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Failure {
     /// A stable short name: `sticky`, `illegal_address`, `launch_failed`,
-    /// `out_of_memory`, `process_exit`, `stalled`, `non_finite_logits` or
-    /// `policy_reverted`.
+    /// `out_of_memory`, `process_exit`, `stalled`, `non_finite_logits`,
+    /// `policy_reverted` or `invalid_config`.
     pub kind: String,
     /// The account the main process gave, for the daemon's record.
     pub reason: String,
@@ -545,8 +540,7 @@ impl Epochs {
         let update = update.as_ref()?;
         let failure = update.unavailable()?;
         (update.target.programs == target.programs
-            && update.target.config.engine_config().build_hash()
-                == target.config.engine_config().build_hash())
+            && update.target.engine.build_hash() == target.engine.build_hash())
         .then(|| failure.clone())
     }
 
@@ -653,7 +647,7 @@ impl Epochs {
         self.record(
             epoch,
             EpochRecord {
-                config: deployment.config.engine_config(),
+                config: deployment.engine.clone(),
                 kernels: deployment.programs.kernels.clone(),
                 policy: deployment.programs.policy.clone(),
                 previous_kernels: BTreeMap::new(),
@@ -743,10 +737,14 @@ impl Epochs {
         commands: crate::supervision::ProcessCommands,
     ) -> Result<(), Failure> {
         let record = programs.clone();
-        let deployment = Deployment {
-            config: config.clone(),
-            programs: programs.clone(),
-        };
+        let deployment =
+            Deployment::with_programs(config.clone(), programs.clone()).map_err(|error| {
+                Failure {
+                    kind: "invalid_config".to_owned(),
+                    reason: format!("{error:#}"),
+                    device: None,
+                }
+            })?;
         let process = crate::engine::control::EpochProcess {
             host: host.to_owned(),
             engine,
@@ -1429,8 +1427,10 @@ pub enum Layer {
 /// fills.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Deployment {
-    /// The configuration; the engines are built from its `engine_config()`.
+    /// The configuration.
     pub config: ServerArgs,
+    /// What it builds the epoch's engines from, resolved once from `config`.
+    pub engine: proto::config::EngineConfig,
     /// The filled programs; the deployment a change is compared against
     /// carries the revisions `prepare` selected, and the target's are
     /// prepared before the comparison.
@@ -1440,11 +1440,27 @@ pub struct Deployment {
 impl Deployment {
     /// The deployment `config` describes, with the programs it fills and
     /// without the revisions `prepare` selects.
-    pub fn of(config: ServerArgs) -> Self {
-        Self {
-            programs: FilledPrograms::of(&config),
+    ///
+    /// # Errors
+    ///
+    /// Fails when the configuration does not resolve into an engine configuration
+    /// ([`ServerArgs::engine_config`]): its deployment file does not read or place.
+    pub fn of(config: ServerArgs) -> anyhow::Result<Self> {
+        let programs = FilledPrograms::of(&config);
+        Self::with_programs(config, programs)
+    }
+
+    /// The deployment `config` describes, with the programs `prepare` selected for it.
+    ///
+    /// # Errors
+    ///
+    /// Fails as [`Self::of`] does.
+    pub fn with_programs(config: ServerArgs, programs: FilledPrograms) -> anyhow::Result<Self> {
+        Ok(Self {
+            engine: config.engine_config()?,
             config,
-        }
+            programs,
+        })
     }
 }
 
@@ -1456,9 +1472,7 @@ impl Deployment {
 pub fn layer(previous: &Deployment, next: &Deployment) -> Layer {
     if host_layer_differ(&previous.config, &next.config) {
         Layer::Host
-    } else if previous.config.engine_config().build_hash()
-        != next.config.engine_config().build_hash()
-    {
+    } else if previous.engine.build_hash() != next.engine.build_hash() {
         Layer::Epoch
     } else if previous.programs != next.programs {
         Layer::Program
@@ -1480,7 +1494,7 @@ pub fn host_layer_differ(current: &ServerArgs, target: &ServerArgs) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::num::NonZeroU32;
+    use std::num::{NonZeroU32, NonZeroUsize};
 
     use super::*;
     use crate::engine::stand_in::Seen;
@@ -1499,7 +1513,7 @@ mod tests {
     fn record() -> EpochRecord {
         let config = ServerArgs::default();
         EpochRecord {
-            config: config.engine_config(),
+            config: config.engine_config().expect("the configuration resolves"),
             kernels: BTreeMap::from([(KernelKey::all("rms_norm"), program("triton"))]),
             policy: program("fcfs"),
             previous_kernels: BTreeMap::new(),
@@ -1566,10 +1580,16 @@ mod tests {
     /// the model's files that fell to the program layer would answer an update that moved nothing.
     #[test]
     fn a_change_of_the_models_files_is_an_epoch_change() {
-        let serving = Deployment::of(ServerArgs::default());
+        let serving = Deployment::of(ServerArgs::default()).expect("the configuration resolves");
         let mut other = ServerArgs::default();
         other.model = Some("/models/other".to_owned());
-        assert_eq!(layer(&serving, &Deployment::of(other)), Layer::Epoch);
+        assert_eq!(
+            layer(
+                &serving,
+                &Deployment::of(other).expect("the configuration resolves")
+            ),
+            Layer::Epoch
+        );
     }
 
     /// A program-layer update in flight is the epoch's probation: the record
@@ -1584,10 +1604,7 @@ mod tests {
             main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment {
-            config: config.clone(),
-            programs: FilledPrograms::of(&config),
-        };
+        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
         epochs.install(0, &serving, 3, &[10]);
         epochs.supervise(commands);
 
@@ -1665,10 +1682,7 @@ mod tests {
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment {
-            config: config.clone(),
-            programs: FilledPrograms::of(&config),
-        };
+        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
         epochs.install(0, &serving, 3, &[10]);
         epochs.supervise(commands);
 
@@ -1740,10 +1754,7 @@ mod tests {
         let (commands, _seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment {
-            config: config.clone(),
-            programs: FilledPrograms::of(&config),
-        };
+        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
         epochs.install(0, &serving, 3, &[10]);
         epochs.supervise(commands);
 
@@ -1808,10 +1819,7 @@ mod tests {
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment {
-            config: config.clone(),
-            programs: FilledPrograms::of(&config),
-        };
+        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
         epochs.install(0, &serving, 3, &[10]);
         epochs.supervise(commands);
 
@@ -1857,10 +1865,7 @@ mod tests {
         let (commands, _) = main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment {
-            config: config.clone(),
-            programs: FilledPrograms::of(&config),
-        };
+        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
         epochs.install(0, &serving, 3, &[10]);
         epochs.supervise(commands);
 
@@ -1899,8 +1904,10 @@ mod tests {
             refused.reason
         );
         assert!(epochs.program_update().is_none());
-        let mut another_build = target.clone();
-        another_build.config.model = Some("another checkpoint".to_owned());
+        let mut another_checkpoint = target.config.clone();
+        another_checkpoint.model = Some("another checkpoint".to_owned());
+        let another_build = Deployment::with_programs(another_checkpoint, target.programs.clone())
+            .expect("the configuration resolves");
         assert!(
             epochs.unavailable(&another_build).is_none(),
             "the same programs on another build are another change"
@@ -1925,10 +1932,7 @@ mod tests {
         )]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment {
-            config: config.clone(),
-            programs: FilledPrograms::of(&config),
-        };
+        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
         epochs.install(0, &serving, 3, &[10]);
         epochs.supervise(commands);
         assert!(!epochs.commit_programs().expect("nothing to commit"));
@@ -2212,11 +2216,11 @@ mod tests {
             ),
         ];
 
-        let base = Deployment::of(ServerArgs::default());
+        let base = Deployment::of(ServerArgs::default()).expect("the configuration resolves");
         assert_eq!(layer(&base, &base), Layer::None, "no change");
 
         for (what, change) in host_frontend.iter().chain(host_daemon.iter()) {
-            let next = Deployment::of(set(*change));
+            let next = Deployment::of(set(*change)).expect("the configuration resolves");
             assert_eq!(
                 layer(&base, &next),
                 Layer::Host,
@@ -2224,7 +2228,7 @@ mod tests {
             );
         }
         for (what, change) in &epoch {
-            let next = Deployment::of(set(*change));
+            let next = Deployment::of(set(*change)).expect("the configuration resolves");
             assert_eq!(
                 layer(&base, &next),
                 Layer::Epoch,
@@ -2232,7 +2236,7 @@ mod tests {
             );
         }
         for (what, change) in &program {
-            let next = Deployment::of(set(*change));
+            let next = Deployment::of(set(*change)).expect("the configuration resolves");
             assert_eq!(
                 layer(&base, &next),
                 Layer::Program,
@@ -2250,7 +2254,10 @@ mod tests {
             config.moe_config.exchange = proto::request::ExpertExchange::DeepEp
         });
         assert_eq!(
-            layer(&base, &Deployment::of(exchange_only.clone())),
+            layer(
+                &base,
+                &Deployment::of(exchange_only.clone()).expect("the configuration resolves")
+            ),
             Layer::None,
             "at one rank the exchange setting moves nothing"
         );
@@ -2259,7 +2266,10 @@ mod tests {
         let mut spread_exchanged = spread.clone();
         spread_exchanged.moe_config.exchange = proto::request::ExpertExchange::DeepEp;
         assert_eq!(
-            layer(&Deployment::of(spread), &Deployment::of(spread_exchanged)),
+            layer(
+                &Deployment::of(spread).expect("the configuration resolves"),
+                &Deployment::of(spread_exchanged).expect("the configuration resolves")
+            ),
             Layer::Program,
             "in an expert-parallel deployment the exchange moves the programs"
         );
@@ -2273,15 +2283,21 @@ mod tests {
             .chain(program.iter())
         {
             assert_eq!(
-                set(*change).engine_config().build_hash(),
-                base.config.engine_config().build_hash(),
+                set(*change)
+                    .engine_config()
+                    .expect("the configuration resolves")
+                    .build_hash(),
+                base.engine.build_hash(),
                 "{what} is not a build-config value"
             );
         }
         for (what, change) in &epoch {
             assert_ne!(
-                set(*change).engine_config().build_hash(),
-                base.config.engine_config().build_hash(),
+                set(*change)
+                    .engine_config()
+                    .expect("the configuration resolves")
+                    .build_hash(),
+                base.engine.build_hash(),
                 "{what} builds the main process"
             );
         }
@@ -2459,7 +2475,10 @@ mod tests {
     /// `force` afterwards.
     #[test]
     fn an_update_keeps_the_first_failure_and_is_unavailable_with_it() {
-        let mut update = Update::new(1, Deployment::of(ServerArgs::default()));
+        let mut update = Update::new(
+            1,
+            Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+        );
         update.commit();
         assert_eq!(
             update.unavailable(),
@@ -2467,7 +2486,10 @@ mod tests {
             "a committed update is available"
         );
 
-        let mut update = Update::new(2, Deployment::of(ServerArgs::default()));
+        let mut update = Update::new(
+            2,
+            Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+        );
         let first = Failure {
             kind: "illegal_address".to_owned(),
             reason: "an illegal memory access was encountered".to_owned(),
@@ -2717,7 +2739,7 @@ mod tests {
     #[test]
     fn an_engine_config_reads_back_what_it_wrote() {
         let config = ServerArgs::default();
-        let build = config.engine_config();
+        let build = config.engine_config().expect("the configuration resolves");
         assert!(build.cuda_graph.flow_shapes.is_none());
         let text = serde_json::to_string(&build).expect("an engine config is JSON");
         let read: proto::config::EngineConfig =

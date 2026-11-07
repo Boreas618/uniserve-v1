@@ -11,9 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use engine::{EngineConfig, SchedulerHandle};
-use executor::batch::{Batch, Batches, Inventory, PoolLayout, Submission};
-use ipc::{MainProcessEndpoint, MainProcessInfo};
-use proto::config::BlockConfig;
+use executor::batch::{Batch, Batches, Inventory, Submission};
 
 /// How long a command answer may take.
 ///

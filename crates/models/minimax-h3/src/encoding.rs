@@ -3930,7 +3930,7 @@ mod tests {
             "one row set serves every track length: the extent is a launch value"
         );
     }
-    use super::*;
+
     use crate::video_vae::tests::video_config;
 
     /// A video encoder over the fixture's config: the stack is all `latent_frames` needs, so no
