@@ -7940,7 +7940,7 @@ fn schedulers(
         .with_data_plane(Arc::clone(data));
     if host_cache {
         stated = stated.keeping_host_cache(executor::batch::HostCacheKeys {
-            fingerprints: vec![plan.page_fingerprint(); memory.cache_groups()],
+            fingerprints: vec![data.serving_identity()?; memory.cache_groups()],
             endpoint: None,
         });
     }

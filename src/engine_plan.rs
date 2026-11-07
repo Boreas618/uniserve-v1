@@ -661,17 +661,6 @@ impl EpochPlan {
             && self.build.kv_cache.prefix_caching
     }
 
-    /// What this rank's pages are computed from: an epoch of the same checkpoint and numerics finds
-    /// the pages another left in the host KV cache, and one of another computes other pages.
-    pub(crate) fn page_fingerprint(&self) -> String {
-        format!(
-            "{}|{:?}|{:?}",
-            self.checkpoint.display(),
-            self.build.dtype,
-            self.build.quantization
-        )
-    }
-
     pub(crate) fn rank_facts(&self, served: &Served) -> Result<engine::RankFacts> {
         let Served::Text(_) = served else {
             return self.media_rank_facts();

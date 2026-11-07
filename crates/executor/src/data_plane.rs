@@ -253,6 +253,38 @@ impl DataPlane {
         lock(&self.target).clone()
     }
 
+    /// The hexadecimal key seed of each of `rank`'s cache groups for weights of `identity`, when it
+    /// copies pages through a host KV cache; none when it keeps none, which keys nothing.
+    fn page_contents(rank: &Rank, identity: &str) -> Vec<String> {
+        let Some(cache) = rank.cache.as_ref().filter(|cache| lock(cache).copies_pages()) else {
+            return Vec::new();
+        };
+        let plan = Arc::clone(lock(cache).planes());
+        let plan = plan.plan();
+        crate::memory::prefix_cache::host::page_contents(
+            plan,
+            &vec![identity.to_owned(); plan.groups.len()],
+        )
+        .iter()
+        .map(|content| content.iter().map(|byte| format!("{byte:02x}")).collect())
+        .collect()
+    }
+
+    /// What the rank's pages are computed from, which keys them in the host KV cache: the identity
+    /// of the weights it serves. An epoch of the same weights finds the pages another left there,
+    /// and one of other weights, or this one after a weight update, keys its own.
+    ///
+    /// # Errors
+    ///
+    /// When this data plane holds no rank.
+    pub fn serving_identity(&self) -> Result<String> {
+        let rank = self
+            .ranks
+            .first()
+            .ok_or(Error::State("the data plane holds no rank"))?;
+        Ok(identity_of(&lock(rank).serving))
+    }
+
     fn planes_of(rank: &Rank) -> Option<Arc<CachePlanes>> {
         rank.cache
             .as_ref()
@@ -489,6 +521,9 @@ impl DataPlane {
             let identity = identity_of(&load.log);
             let groups = Self::planes_of(&rank).map_or(0, |planes| planes.plan().groups.len());
             let moved = load.pairs.len();
+            // The rank's pages in the host KV cache were computed from the weights this replaces,
+            // so its later pages are keyed by the new ones: a prompt no longer finds the old.
+            let page_contents = Self::page_contents(&rank, &identity);
             rank.serving = load.log;
             reports.push(
                 serde_json::json!({
@@ -496,7 +531,7 @@ impl DataPlane {
                     "rank": rank.storage.scope().rank,
                     "identity": identity,
                     "identities": vec![identity.clone(); groups],
-                    "page_contents": Vec::<String>::new(),
+                    "page_contents": page_contents,
                     "moved": moved,
                 })
                 .to_string(),
