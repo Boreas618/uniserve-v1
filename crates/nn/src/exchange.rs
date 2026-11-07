@@ -13,15 +13,17 @@
 //!
 //! [`Forward`]: crate::Forward
 
+use std::sync::Arc;
+
 use ops::TensorView;
 use ops::moe::exchange::ExchangeTransport;
 
 /// The received rows of one expert-parallel exchange, and the transport that moves them.
 ///
-/// The four views are the transport's own device buffers: the layer reads them to sort and compute
-/// its experts and writes the dispatched tiles back, and never allocates or frees them. `hidden` and
-/// `top` describe one row of the received layout; `ranks x capacity` rows exist, of which `counts[r]`
-/// hold the rows rank `r` sent.
+/// The views are the transport's own device buffers: the layer reads them to sort and compute its
+/// experts and writes its sums back, and never allocates or frees them. `hidden` and `top` describe
+/// one row of the received layout. `ranks x capacity` rows exist, and `live` states how many of them
+/// the running step holds, which the agreed capacity decides on the device.
 pub struct ExchangeViews {
     /// The package's transport for this device and group.
     ///
@@ -30,17 +32,36 @@ pub struct ExchangeViews {
     pub transport: ExchangeTransport,
     /// Ranks in the expert-parallel group; the leading axis of the received layout.
     pub ranks: u32,
+    /// Leading ranks of the group that hold no experts.
+    pub attention: u32,
     /// Rows one rank may exchange: the MoE plan's capacity, so the rows fit without a host read.
     pub capacity: u32,
-    /// `[ranks * capacity, hidden]` in the activation element type: the dispatched activations, and
-    /// the buffer the local experts' outputs are written back to.
+    /// `[ranks * capacity, hidden]` in the activation element type: the dispatched activations.
     pub states: TensorView,
-    /// `[ranks * capacity, top]` i32: the expert each received row is routed to.
+    /// `[ranks * capacity, top]` i32: the experts each received row is routed to.
     pub ids: TensorView,
-    /// `[ranks * capacity, top]` f32: the router weight of each received row.
+    /// `[ranks * capacity, top]` f32: the router weights of each received row.
     pub weights: TensorView,
-    /// `[ranks]` i32: the rows rank `r` sent.
-    pub counts: TensorView,
+    /// `[ranks * capacity, hidden]` in the activation element type: where this rank's experts leave
+    /// each received row's sum, for the combine to return.
+    pub combined: TensorView,
+    /// `[1]` i32: the leading rows of these views the running step holds.
+    pub live: TensorView,
+    /// `[capacity, hidden / 2]` u8: where a fused launch reads this rank's encoded rows.
+    pub packed: TensorView,
+    /// `[capacity, hidden / 16]` block scales of those rows.
+    pub packed_scales: TensorView,
+    /// One launch runs the whole expert layer, so the layer sorts and multiplies nothing itself.
+    pub fused: bool,
+    /// This rank holds no experts: it sends routes and takes sums back, and computes nothing.
+    pub source_only: bool,
+    /// Meets the group's other ranks on the host, during a warm walk only.
+    ///
+    /// The first use of a kernel takes a lock of the whole process and can wait on a device, and a
+    /// launch that waits for its peers holds its device until they arrive. The ranks of a host are
+    /// threads of one process, so a warm walk keeps every rank out of a waiting launch until every
+    /// rank has finished the first uses before it. A replay finds every kernel ready and passes.
+    pub meet: Arc<dyn Fn() -> crate::Result<()> + Send + Sync>,
 }
 
 impl ExchangeViews {
@@ -72,7 +93,8 @@ impl ExchangeViews {
             (&self.states, &[rows, hidden][..], "states"),
             (&self.ids, &[rows, top][..], "ids"),
             (&self.weights, &[rows, top][..], "weights"),
-            (&self.counts, &[u64::from(self.ranks)][..], "counts"),
+            (&self.combined, &[rows, hidden][..], "combined"),
+            (&self.live, &[1][..], "live"),
         ] {
             if view.shape.dims() != expected {
                 return Err(crate::Error::shape(
@@ -93,24 +115,9 @@ mod tests {
     use super::*;
     use crate::{DType, DevicePtr, Shape};
 
-    fn views(
-        ranks: u32,
-        capacity: u32,
-        hidden: u64,
-        top: u64,
-    ) -> (TensorView, TensorView, TensorView, TensorView) {
+    fn exchange(ranks: u32, capacity: u32, hidden: u64, top: u64) -> ExchangeViews {
         let rows = u64::from(ranks) * u64::from(capacity);
         let base = DevicePtr::new(0x1_0000);
-        (
-            TensorView::new(base, DType::BF16, Shape::new(&[rows, hidden])),
-            TensorView::new(base, DType::I32, Shape::new(&[rows, top])),
-            TensorView::new(base, DType::F32, Shape::new(&[rows, top])),
-            TensorView::new(base, DType::I32, Shape::new(&[u64::from(ranks)])),
-        )
-    }
-
-    fn exchange(ranks: u32, capacity: u32, hidden: u64, top: u64) -> ExchangeViews {
-        let (states, ids, weights, counts) = views(ranks, capacity, hidden, top);
         ExchangeViews {
             transport: {
                 // SAFETY: the transport is opaque and never dereferenced by these tests; the null
@@ -118,11 +125,22 @@ mod tests {
                 unsafe { ExchangeTransport::from_handle(core::ptr::null_mut()) }
             },
             ranks,
+            attention: 0,
             capacity,
-            states,
-            ids,
-            weights,
-            counts,
+            states: TensorView::new(base, DType::BF16, Shape::new(&[rows, hidden])),
+            ids: TensorView::new(base, DType::I32, Shape::new(&[rows, top])),
+            weights: TensorView::new(base, DType::F32, Shape::new(&[rows, top])),
+            combined: TensorView::new(base, DType::BF16, Shape::new(&[rows, hidden])),
+            live: TensorView::new(base, DType::I32, Shape::new(&[1])),
+            packed: TensorView::new(base, DType::U8, Shape::new(&[u64::from(capacity), hidden / 2])),
+            packed_scales: TensorView::new(
+                base,
+                DType::F8E4M3,
+                Shape::new(&[u64::from(capacity), hidden / 16]),
+            ),
+            fused: false,
+            source_only: false,
+            meet: Arc::new(|| Ok(())),
         }
     }
 
@@ -135,11 +153,10 @@ mod tests {
     }
 
     #[test]
-    fn a_count_view_of_the_wrong_rank_count_is_refused() {
-        let mut exchange = exchange(2, 64, 2048, 8);
-        let (_, _, _, counts) = views(4, 64, 2048, 8);
-        exchange.counts = counts;
-        assert!(exchange.require_extents("test").is_err());
+    fn a_combined_view_of_the_wrong_rank_count_is_refused() {
+        let mut views = exchange(2, 64, 2048, 8);
+        views.combined = exchange(4, 64, 2048, 8).combined;
+        assert!(views.require_extents("test").is_err());
     }
 
     #[test]

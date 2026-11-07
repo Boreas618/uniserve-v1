@@ -1,0 +1,122 @@
+# The expert_exchange operator's deepep backend: design 5.2's program package.
+#
+# DeepEP's elastic dispatch and combine, the kernels of `vendor/deep_ep` unchanged,
+# with the host code `src/exchange.cu` states in place of its Python extension and
+# its run-time compiler: a descriptor fixes every template argument, so a serving
+# host compiles nothing. `vendor/nccl` holds the headers of the NCCL this project
+# pins, whose device communicator the kernels are built against
+# (`tools/check_nccl.sh` holds the serving process to the same library).
+#
+# One native module per descriptor, with the entries of the operator's header. The
+# group is one NVLink domain, whose ranks may be threads of one process.
+
+op = "expert_exchange"
+backend = "deepep"
+
+[toolchain]
+kind = "nvcc"
+version = "13.0.48"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_expert_exchange_launch"
+create = "uniserve_expert_exchange_create"
+step = "uniserve_expert_exchange_step"
+suspend = "uniserve_expert_exchange_suspend"
+restore = "uniserve_expert_exchange_restore"
+release = "uniserve_expert_exchange_release"
+info = "uniserve_expert_exchange_info"
+
+[source]
+kind = "cuda"
+files = [
+    "include/uniserve_expert_exchange.h",
+    "src/exchange.cu",
+    "src/build.py",
+    "vendor/deep_ep/LICENSE",
+    "vendor/deep_ep/common/comm.cuh",
+    "vendor/deep_ep/common/compiled.cuh",
+    "vendor/deep_ep/common/exception.cuh",
+    "vendor/deep_ep/common/handle.cuh",
+    "vendor/deep_ep/common/layout.cuh",
+    "vendor/deep_ep/common/math.cuh",
+    "vendor/deep_ep/common/ptx.cuh",
+    "vendor/deep_ep/impls/barrier.cuh",
+    "vendor/deep_ep/impls/combine.cuh",
+    "vendor/deep_ep/impls/combine_reduce_epilogue.cuh",
+    "vendor/deep_ep/impls/combine_utils.cuh",
+    "vendor/deep_ep/impls/dispatch.cuh",
+    "vendor/deep_ep/impls/dispatch_copy_epilogue.cuh",
+    "vendor/deep_ep/impls/dispatch_deterministic_prologue.cuh",
+    "vendor/deep_ep/impls/engram_fetch.cuh",
+    "vendor/deep_ep/impls/hybrid_combine.cuh",
+    "vendor/deep_ep/impls/hybrid_dispatch.cuh",
+    "vendor/deep_ep/impls/pp_send_recv.cuh",
+    "vendor/nccl/nccl.h",
+    "vendor/nccl/nccl_device.h",
+    "vendor/nccl/nccl_device/barrier.h",
+    "vendor/nccl/nccl_device/comm.h",
+    "vendor/nccl/nccl_device/coop.h",
+    "vendor/nccl/nccl_device/core.h",
+    "vendor/nccl/nccl_device/gin.h",
+    "vendor/nccl/nccl_device/gin/gdaki/doca_gpunetio/common/doca_gpunetio_verbs_def.h",
+    "vendor/nccl/nccl_device/gin/gdaki/doca_gpunetio/common/doca_gpunetio_verbs_dev.h",
+    "vendor/nccl/nccl_device/gin/gdaki/doca_gpunetio/device/doca_gpunetio_dev_verbs_common.cuh",
+    "vendor/nccl/nccl_device/gin/gdaki/doca_gpunetio/device/doca_gpunetio_dev_verbs_counter.cuh",
+    "vendor/nccl/nccl_device/gin/gdaki/doca_gpunetio/device/doca_gpunetio_dev_verbs_cq.cuh",
+    "vendor/nccl/nccl_device/gin/gdaki/doca_gpunetio/device/doca_gpunetio_dev_verbs_onesided.cuh",
+    "vendor/nccl/nccl_device/gin/gdaki/doca_gpunetio/device/doca_gpunetio_dev_verbs_qp.cuh",
+    "vendor/nccl/nccl_device/gin/gdaki/doca_gpunetio/doca_gpunetio_device.h",
+    "vendor/nccl/nccl_device/gin/gdaki/gin_gdaki.h",
+    "vendor/nccl/nccl_device/gin/gdaki/gin_gdaki_device_host_common.h",
+    "vendor/nccl/nccl_device/gin/gin_device_api.h",
+    "vendor/nccl/nccl_device/gin/gin_device_common.h",
+    "vendor/nccl/nccl_device/gin/gin_device_host_common.h",
+    "vendor/nccl/nccl_device/gin/proxy/gin_proxy.h",
+    "vendor/nccl/nccl_device/gin/proxy/gin_proxy_device_host_common.h",
+    "vendor/nccl/nccl_device/gin_barrier.h",
+    "vendor/nccl/nccl_device/gin_win_stub.h",
+    "vendor/nccl/nccl_device/impl/barrier__funcs.h",
+    "vendor/nccl/nccl_device/impl/barrier__types.h",
+    "vendor/nccl/nccl_device/impl/comm__funcs.h",
+    "vendor/nccl/nccl_device/impl/comm__types.h",
+    "vendor/nccl/nccl_device/impl/core__funcs.h",
+    "vendor/nccl/nccl_device/impl/core__types.h",
+    "vendor/nccl/nccl_device/impl/gin__funcs.h",
+    "vendor/nccl/nccl_device/impl/gin__types.h",
+    "vendor/nccl/nccl_device/impl/gin_barrier__funcs.h",
+    "vendor/nccl/nccl_device/impl/gin_barrier__types.h",
+    "vendor/nccl/nccl_device/impl/ll_a2a__funcs.h",
+    "vendor/nccl/nccl_device/impl/ll_a2a__types.h",
+    "vendor/nccl/nccl_device/impl/lsa_barrier__funcs.h",
+    "vendor/nccl/nccl_device/impl/lsa_barrier__types.h",
+    "vendor/nccl/nccl_device/impl/multimem__funcs.h",
+    "vendor/nccl/nccl_device/impl/ptr__funcs.h",
+    "vendor/nccl/nccl_device/impl/ptr__types.h",
+    "vendor/nccl/nccl_device/impl/reduce_copy__funcs.h",
+    "vendor/nccl/nccl_device/impl/reduce_copy__impl.h",
+    "vendor/nccl/nccl_device/impl/reduce_copy__types.h",
+    "vendor/nccl/nccl_device/impl/vector__funcs.h",
+    "vendor/nccl/nccl_device/impl/vector__types.h",
+    "vendor/nccl/nccl_device/ll_a2a.h",
+    "vendor/nccl/nccl_device/lsa_barrier.h",
+    "vendor/nccl/nccl_device/net_device.h",
+    "vendor/nccl/nccl_device/ptr.h",
+    "vendor/nccl/nccl_device/reduce_copy.h",
+    "vendor/nccl/nccl_device/utility.h",
+    "vendor/nccl/nccl_device_wrapper.h",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a"]
+
+# `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_dtype_bf16`.
+[kernel.descriptors]
+dimensions = { mode = ["dispatch", "combine"], hidden = ["2048", "7168", "4096"], intermediate = ["768", "1536", "512"], top = ["8", "4", "2"], experts = ["128", "256", "64"], max_tokens = ["512", "8192", "4096", "16384"], ranks = ["2", "3", "4", "8"], attention = ["0", "1", "2"], dtype = ["bf16"] }
+
+[parameters]

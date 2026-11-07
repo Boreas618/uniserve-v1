@@ -1,22 +1,21 @@
 # The expert_exchange operator's alltoall backend: design 5.2's program package.
 #
-# One native module per descriptor: the expert-parallel transport's lifecycle
-# and the two directions of the exchange (`ops::moe::exchange`, the dispatch call
-# of 608 bytes and the combine call of 600 bytes, mirrored in the package's
-# header with their sizes and the error offsets asserted).
+# One native module per descriptor: the transport's lifecycle and the launch of
+# both directions of the exchange (`ops::moe::exchange`, the one call structure of
+# 632 bytes, mirrored in the package's header with its size and error offset
+# asserted). A module takes its direction from the call, so every descriptor of
+# this package compiles the same object.
 #
 # The transport is an execution resource: the executor creates it through this
-# package's `create` entry, suspends and restores it around a standby, and hands
-# the operator a borrowed handle, so the operator never allocates. The workspace
-# is mapped through the CUDA virtual-memory API, which is what lets `suspend`
-# return the storage while keeping the addresses a captured graph holds.
+# package's `create` entry, writes each step's agreed capacity through `step`,
+# suspends and restores it around a standby, and hands the operator a borrowed
+# handle, so the operator never allocates. The workspace is mapped through the
+# CUDA virtual-memory API, which is what lets `suspend` return the storage while
+# keeping the addresses a captured graph holds.
 #
-# The module serves a group of one rank — an expert-parallel deployment whose
-# experts all live on the launching rank (EP=1). Dispatch packs the rank's own
-# rows with the route ids and weights its experts read, combine sums the one
-# partial each row gets back, and both are exact. A group of several ranks needs
-# the peer-mapping transport (MNNVL/nvlink) whose handshake is this package's
-# host code; `create` refuses such a group instead of pretending to drive it.
+# Every rank maps every rank's workspace with a fabric handle on an NVLink domain,
+# or a file descriptor between the ranks of one process, and moves rows with plain
+# stores and loads: `src/exchange.cu` states the data flow.
 
 op = "expert_exchange"
 backend = "alltoall"
@@ -30,9 +29,9 @@ packages = []
 form = "native"
 
 [module.entries]
-launch = "uniserve_expert_exchange_dispatch"
-combine = "uniserve_expert_exchange_combine"
+launch = "uniserve_expert_exchange_launch"
 create = "uniserve_expert_exchange_create"
+step = "uniserve_expert_exchange_step"
 suspend = "uniserve_expert_exchange_suspend"
 restore = "uniserve_expert_exchange_restore"
 release = "uniserve_expert_exchange_release"
@@ -51,8 +50,8 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
-# `mode_dispatch_hidden_2048_top_8_experts_128_max_tokens_8192_ranks_1_dtype_bf16`.
+# `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_2_attention_0_dtype_bf16`.
 [kernel.descriptors]
-dimensions = { mode = ["dispatch", "combine"], hidden = ["2048", "7168", "4096"], top = ["8", "4", "2"], experts = ["128", "256", "64"], max_tokens = ["8192", "4096", "16384"], ranks = ["1"], dtype = ["bf16", "f16"] }
+dimensions = { mode = ["dispatch", "combine"], hidden = ["2048", "7168", "4096"], intermediate = ["768", "1536", "512"], top = ["8", "4", "2"], experts = ["128", "256", "64"], max_tokens = ["512", "8192", "4096", "16384"], ranks = ["1", "2", "4", "8"], attention = ["0"], dtype = ["bf16", "f16"] }
 
 [parameters]
