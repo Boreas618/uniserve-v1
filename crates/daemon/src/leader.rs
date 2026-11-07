@@ -2250,6 +2250,9 @@ impl Replica {
                 return;
             }
             drop(preparation);
+            // From here the switch owns both epochs' engines: the previous one is stopped when
+            // the trial begins, which may come before the hold names the target.
+            replica.following.store(true, Ordering::SeqCst);
             // The promotion restores the prefill budget the warming limited.
             if let Some(source) = source.take() {
                 restore_prefill(source).await;
@@ -2261,7 +2264,6 @@ impl Replica {
                 tokio::time::sleep(DRAIN_POLL).await;
             }
             spec.predecessor = None;
-            replica.following.store(true, Ordering::SeqCst);
             let world = spec.world;
             let before = locked(&replica.served).replace(spec);
             // The configuration is the one the target serves from here, as the spec is, and a

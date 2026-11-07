@@ -567,6 +567,22 @@ impl Leader {
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?
             .spec;
+        // Other model files serve the deployment's requests only when they are processed as the
+        // serving ones are: the same tokenizer, templates, generation defaults and model facts.
+        if current.model() != target.model() {
+            crate::leader::same_processing(current.model(), target.model())
+                .await
+                .map_err(UpdateError::Refused)?;
+            let served = locked(&replicas[0].served).clone();
+            if served.is_some_and(|served| served.model_facts != spec.model_facts) {
+                return Err(UpdateError::Refused(format!(
+                    "the model at {} has other generation limits, control tokens or context \
+                     length than the served model, which change how requests are processed: \
+                     deploy it instead",
+                    target.model()
+                )));
+            }
+        }
         spec.world = target_epoch;
         // §7.4 step 1: the target's main processes start as the serving
         // process's standby — they map the predecessor's cache read-only and
@@ -574,18 +590,23 @@ impl Leader {
         // The predecessor's segments are the ones it holds now, which only its
         // engine can state; without them the child would map nothing and the
         // launch would be a serving process's, claiming the same scopes
-        // writably. Its `world` is the predecessor's, which is what its
-        // segments are keyed by, and not the target's own `spec.world`: the
-        // successor reads one world while it serves the next.
+        // writably. Its `world` is the one that created them, which is what
+        // they are keyed by, and not the target's own `spec.world`: the
+        // successor reads one world while it serves the next, and an epoch
+        // that took storage over keys it as its creator did.
         let cache = serving_client.describe_cache().await.map_err(|reason| {
             UpdateError::Refused(format!(
                 "the serving epoch named no cache segments for its standby: {reason}"
             ))
         })?;
+        let storage_world = epochs.storage_world(serving.world);
         spec.predecessor = Some(wire::Predecessor {
-            world: serving.world,
+            world: storage_world,
             segments: cache,
         });
+        if !dry_run {
+            epochs.inherit_storage(target_epoch, storage_world);
+        }
         let joining = (!dry_run).then(|| spec.clone());
         let change = crate::updates::epoch::EpochChange {
             previous: previous_epoch,
