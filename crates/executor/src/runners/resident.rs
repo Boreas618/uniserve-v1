@@ -485,6 +485,14 @@ impl KvProvider for ResidentCache {
         let copy = cache.copy_stream().ok_or_else(|| {
             crate::Error::Invalid("a batch copies pages but the rank maps no page pool".into())
         })?;
+        // A load fills new units of the batch, which `apply_cache_units` reset on the batch's
+        // stream just before: the copy stream starts the loads after that work, or a reset could
+        // clear a page a load had already written.
+        if !loads.is_empty() {
+            let reset = platform::Event::new(platform::EventFlags::default());
+            reset.record(stream)?;
+            copy.wait_event(&reset)?;
+        }
         let issued = cache.issue_pages(loads, offloads, &copy)?;
         if let Some(fence) = &issued.loads {
             stream.wait_event(fence)?;
