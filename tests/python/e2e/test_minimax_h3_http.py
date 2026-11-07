@@ -23,17 +23,10 @@ from tests.python.e2e.http_helpers import (
     t2va_request,
     worker_executable,
 )
-from uniserve.models.minimax_h3.config import NAMED_CANVASES
+from uniserve_eval import video_rules
 from uniserve_eval.transport.video import inspect_video_bytes
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("minimax_h3")]
-
-# The base checkpoint's canvas of each named aspect ratio at 768p, as the
-# model package names them.
-CANVASES = {
-    ratio: (canvas.width, canvas.height)
-    for (_, ratio), canvas in NAMED_CANVASES.items()
-}
 
 
 def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
@@ -42,6 +35,12 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         pytest.fail(
             "UNISERVE_MINIMAX_H3_MODEL must name a MiniMax-H3 diffusers root"
         )
+    # The base checkpoint's canvas of each named aspect ratio at 768p, as the
+    # request rules answer them.
+    canvases = {
+        f"{width}:{height}": video_rules.canvas(width, height)
+        for width, height in video_rules.NAMED_ASPECT_RATIOS
+    }
     deployment = (
         Path(__file__).resolve().parents[3]
         / "configs"
@@ -65,7 +64,7 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         # Five seconds bound the layouts startup prepares: two frame counts
         # at each of the six canvases and one text capacity.
         "--set",
-        f"video_config.aspect_ratios={','.join(CANVASES)}",
+        f"video_config.aspect_ratios={','.join(canvases)}",
         "--set",
         "video_config.max_seconds=5",
         "--max-model-len",
@@ -94,10 +93,10 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
                 "width": width,
                 "height": height,
             }
-            for ratio, (width, height) in CANVASES.items()
+            for ratio, (width, height) in canvases.items()
         ]
         assert video["canvas"]["short_edges"] == [768]
-        assert video["canvas"]["aspect_ratios"] == list(CANVASES)
+        assert video["canvas"]["aspect_ratios"] == list(canvases)
 
         legacy = client.post(
             "/v1/videos/sync",
@@ -106,7 +105,7 @@ def test_base_text_to_video_on_every_named_canvas(tmp_path: Path) -> None:
         assert legacy.status_code == 400
         assert "task" in legacy.json()["error"]["message"]
 
-        for ratio, (width, height) in CANVASES.items():
+        for ratio, (width, height) in canvases.items():
             response = client.post(
                 "/v1/videos/sync",
                 json=t2va_request(
