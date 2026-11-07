@@ -1691,6 +1691,9 @@ pub struct CausalLmRunner<M: CausalLm> {
     enqueue_ms: f64,
     /// This rank's member of the expert union, on a deployment whose experts are split.
     experts: Option<super::experts::Member>,
+    /// The tensor group this rank's model is a member of: every forward issues the group's
+    /// collectives, the partial sums after the row-parallel products and the gathered logits.
+    tensor: Option<std::sync::Arc<nn::Group>>,
 }
 
 /// One model object shared by the runners of every device a rank serves.
@@ -1846,6 +1849,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             last_prefill: None,
             enqueue_ms: 0.0,
             experts: None,
+            tensor: None,
             encoded: Vec::new(),
             indices: Vec::new(),
             draws: Vec::new(),
@@ -1859,6 +1863,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
     #[must_use]
     pub fn in_union(mut self, member: super::experts::Member) -> Self {
         self.experts = Some(member);
+        self
+    }
+
+    /// Makes this runner a rank of a tensor group: its model holds this rank's block of every
+    /// layer, and every forward issues the group's collectives.
+    #[must_use]
+    pub fn in_tensor_group(mut self, group: std::sync::Arc<nn::Group>) -> Self {
+        self.tensor = Some(group);
         self
     }
 
@@ -2914,9 +2926,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let shadow = nn::forward::Shadow::new(operator, key, previous, twins);
         // The count bounds the MoE sort's padded rows: the paired forward gets the same column as
         // the served one, so the comparison sees one count (7.3).
-        let forward = Forward::new(&stream, next, &arena)
+        let tensor = self.tensor.clone();
+        let mut forward = Forward::new(&stream, next, &arena)
             .with_shadow(shadow)
             .with_live_tokens(self.columns.live_tokens.device);
+        if let Some(group) = tensor.as_deref() {
+            forward = forward.with_group(group);
+        }
         let hidden = arena.tensor(
             self.geometry.hidden_dtype,
             ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
@@ -4734,9 +4750,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // reused by the next layer, so any later reading is the last layer's whichever name it has.
         let probe = AttentionOutputs::default();
         let probes = crate::profiling::fences::capturing(&stream);
+        let tensor = self.tensor.clone();
         let mut forward = Forward::new(&stream, generation, &arena)
             .with_live_tokens(self.columns.live_tokens.device)
             .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence));
+        if let Some(group) = tensor.as_deref() {
+            forward = forward.with_group(group);
+        }
         // Never inside a recording: the probe copies and synchronises per layer, and a synchronise
         // inside a capture is refused by the driver - which is a measurement that breaks what it
         // measures, and one that no line of its own would ever explain.

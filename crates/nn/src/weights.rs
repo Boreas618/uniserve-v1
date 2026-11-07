@@ -236,7 +236,27 @@ pub enum WeightSource {
         parts: Vec<String>,
         /// The fused tensor's extents.
         shape: Shape,
+        /// The block each part contributes, or the whole part when absent.
+        ///
+        /// A tensor-parallel rank holds its block of every routed expert: the same rows of each
+        /// gate and up projection, and the same columns of each down projection. Every part gives
+        /// the same block, so the fused weight is the rank's shard of every part in order.
+        block: Option<PartBlock>,
     },
+}
+
+/// One block of a part: `rows` rows of `columns` elements, the first at element `start` of the
+/// part in its row-major order and each next one `row_stride` elements after it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PartBlock {
+    /// The block's first element in the part.
+    pub start: u64,
+    /// Rows in the block.
+    pub rows: u64,
+    /// Elements in one row of the block.
+    pub columns: u64,
+    /// Elements between the first elements of consecutive rows in the part.
+    pub row_stride: u64,
 }
 
 /// One weight the model asks the loader for.
@@ -314,7 +334,34 @@ impl WeightRequest {
     ) -> Self {
         Self {
             tensor: tensor.into(),
-            source: WeightSource::Parts { parts, shape },
+            source: WeightSource::Parts {
+                parts,
+                shape,
+                block: None,
+            },
+            layout,
+            shape,
+            pinned: None,
+            nonzero: false,
+        }
+    }
+
+    /// [`Self::parts`] of the same `block` of every part: a tensor-parallel rank's shard of each
+    /// part, fused in order and viewed as `shape`.
+    pub fn part_blocks(
+        tensor: impl Into<String>,
+        parts: Vec<String>,
+        shape: Shape,
+        layout: WeightLayout,
+        block: PartBlock,
+    ) -> Self {
+        Self {
+            tensor: tensor.into(),
+            source: WeightSource::Parts {
+                parts,
+                shape,
+                block: Some(block),
+            },
             layout,
             shape,
             pinned: None,
@@ -1042,7 +1089,18 @@ impl<'a> WeightLoader<'a> {
                 shape,
                 row_stride,
             } => (vec![tensor.clone()], *start, *shape, Some(*row_stride)),
-            WeightSource::Parts { parts, shape } => (parts.clone(), 0, *shape, None),
+            // A block's start and stride key the region: two ranks' blocks of one expert stack have
+            // one fused shape and must not share retained storage.
+            WeightSource::Parts {
+                parts,
+                shape,
+                block,
+            } => (
+                parts.clone(),
+                block.map_or(0, |block| block.start),
+                *shape,
+                block.map(|block| block.row_stride),
+            ),
         };
         if let WeightSource::Parts { shape, .. } = &request.source
             && !request.shape.matches(shape)
@@ -2323,6 +2381,58 @@ impl<'a> WeightLoader<'a> {
                     gathered.extend_from_slice(&bytes[from..to]);
                 }
                 Ok(gathered)
+            }
+            WeightSource::Parts {
+                parts,
+                block: Some(block),
+                ..
+            } => {
+                let mut fused = Vec::new();
+                for name in parts {
+                    let location = self
+                        .shards()?
+                        .tensor(name)
+                        .ok_or_else(|| Error::MissingTensor(name.clone()))?;
+                    let element = location.dtype.bytes().ok_or_else(|| {
+                        Error::weight(name, format!("{} has no whole-byte size", location.dtype))
+                    })?;
+                    if block.row_stride < block.columns {
+                        return Err(Error::weight(
+                            name,
+                            format!(
+                                "a stride of {} overlaps rows of {} elements",
+                                block.row_stride, block.columns
+                            ),
+                        ));
+                    }
+                    let bytes = self.shards()?.bytes(location)?;
+                    for row in 0..block.rows {
+                        let first = (block.start + row * block.row_stride) * element;
+                        let last = first + block.columns * element;
+                        let (Ok(from), Ok(to)) = (usize::try_from(first), usize::try_from(last))
+                        else {
+                            return Err(Error::weight(name, "a block row is past usize::MAX"));
+                        };
+                        if to > bytes.len() {
+                            return Err(Error::weight(
+                                name,
+                                format!(
+                                    "row {row} of the block (bytes {from}..{to}) reaches past the \
+                                     part's {} bytes",
+                                    bytes.len()
+                                ),
+                            ));
+                        }
+                        fused.extend_from_slice(&bytes[from..to]);
+                    }
+                }
+                if fused.is_empty() {
+                    return Err(Error::weight(
+                        &key.region.tensors.join("+"),
+                        "a fused weight has no part",
+                    ));
+                }
+                Ok(fused)
             }
             WeightSource::Parts { parts, .. } => {
                 let mut fused = Vec::new();

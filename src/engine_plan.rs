@@ -377,10 +377,43 @@ impl EpochPlan {
             _ => self.devices.len() as u32 - attention,
         };
         let union_ranks = expert_ranks + attention;
-        if text && union_ranks == 1 {
+        let tensor = self.placement.tensor_parallel;
+        if text && union_ranks == 1 && tensor == 1 {
             return Ok(vec![self.clone()]);
         }
         let count = self.devices.len();
+        // A tensor group splits every layer of one model over this process's devices: each device
+        // is a rank of its own, which loads its block of every weight on its own device and joins
+        // the group's collectives, and the one scheduler of the group submits each batch to all of
+        // them (`schedulers`).
+        if text && tensor > 1 {
+            if union_ranks > 1 {
+                bail!(
+                    "a deployment of {tensor} tensor ranks and {union_ranks} expert ranks in one \
+                     process: a tensor group and an expert union of one process's devices are not \
+                     served together"
+                );
+            }
+            if count != tensor as usize {
+                bail!(
+                    "this node serves {count} devices and the deployment's tensor group has \
+                     {tensor} ranks: a tensor group lives on one node's devices, one rank each"
+                );
+            }
+            return Ok(self
+                .devices
+                .iter()
+                .enumerate()
+                .map(|(index, device)| {
+                    let mut plan = self.clone();
+                    plan.devices = vec![*device];
+                    plan.rank = self.rank + index as u32;
+                    plan.world_size = count;
+                    plan.placement.tensor_rank = index as u32;
+                    plan
+                })
+                .collect());
+        }
         // The schedulers of an expert-parallel deployment each hold one rank: its own cache and
         // attention, its share of the experts, and a member of the union that runs their steps. A
         // deployment of dedicated expert ranks puts its attention ranks first in the union.
@@ -546,7 +579,13 @@ impl EpochPlan {
     /// place in each. A rank of a media deployment is in both; the text class joins neither here.
     pub(crate) fn parallel_shape(&self) -> Result<ParallelShape> {
         if matches!(ModelClass::of(&self.checkpoint)?, ModelClass::CausalLm) {
-            return Ok(ParallelShape::default());
+            // The tensor group is the text model's only collective group: an expert union
+            // exchanges over its own transport (`union_member`).
+            return Ok(ParallelShape {
+                tensor: self.placement.tensor_parallel as usize,
+                tensor_rank: self.placement.tensor_rank as usize,
+                ..ParallelShape::default()
+            });
         }
         let groups = self.deployment_groups()?;
         let (ulysses, tensor, tensor_rank, sequence_rank) = media_parallel(
@@ -1320,6 +1359,10 @@ impl EpochPlan {
                 )?;
                 let runner = match member {
                     Some(member) => runner.in_union(member),
+                    None => runner,
+                };
+                let runner = match &groups.tensor {
+                    Some(group) => runner.in_tensor_group(Arc::clone(group)),
                     None => runner,
                 };
                 runners.push(NamedRunner::new(RunnerId(0), Box::new(runner)));
@@ -2206,11 +2249,18 @@ pub(crate) fn target_of(device: &platform::Device) -> Target {
 }
 
 /// A seed for the runner's draws: the process's clock, so two runs differ.
+///
+/// One value for the whole process: the ranks of a tensor group each sample from the same gathered
+/// logits, and a rank that drew another token would feed its next step another input than its
+/// peers, whose sums it then joins.
 fn seed() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_nanos() as u64);
-    (nanos ^ u64::from(std::process::id())) | 1
+    static SEED: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SEED.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        (nanos ^ u64::from(std::process::id())) | 1
+    })
 }
 
 /// `value` as the protocol's width, or the name of the field that does not fit it.

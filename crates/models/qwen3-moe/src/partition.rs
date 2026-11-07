@@ -129,6 +129,18 @@ impl Partition {
         self.vocabulary_shard(vocab_size).1.next_multiple_of(8)
     }
 
+    /// The intermediate width of one routed expert on this rank: the tensor group splits every
+    /// expert's `moe_intermediate_size` and sums the partial outputs once after the experts, as
+    /// the Python worker's tensor-parallel binding does (`uniserve/nn/moe.py`, `FusedMoE`).
+    pub const fn local_expert_intermediate(&self, config: &crate::Config) -> usize {
+        config.moe_intermediate_size / self.tensor_parallel
+    }
+
+    /// The intermediate width of a dense feed-forward layer on this rank.
+    pub const fn local_intermediate(&self, config: &crate::Config) -> usize {
+        config.intermediate_size / self.tensor_parallel
+    }
+
     /// The experts this rank owns, as a half-open range of the checkpoint's expert ids.
     pub fn expert_range(&self, config: &crate::Config) -> std::ops::Range<usize> {
         let per_rank = config.num_experts / self.expert_parallel;
