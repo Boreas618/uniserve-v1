@@ -1852,6 +1852,9 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
             } => self
                 .rebind(*bucket, *generation)
                 .map(|()| BatchOutput::default()),
+            Job::Join { .. } => Err(Error::Invariant(
+                "a denoiser runner joins no expert step".into(),
+            )),
             Job::Shadow { operator, key, .. } => Err(Error::Invariant(format!(
                 "a denoiser runner compares no operator, and the device asked it to shadow \
                  {operator} {key}"

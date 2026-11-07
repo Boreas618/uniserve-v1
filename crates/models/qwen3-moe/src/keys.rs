@@ -383,10 +383,12 @@ pub fn keys(
         let dispatch = ops::moe::exchange::Descriptor {
             mode: Mode::Dispatch,
             hidden,
+            intermediate: width(config.moe_intermediate_size, "expert intermediate width")?,
             top: width(config.num_experts_per_tok, "routes per token")?,
             experts: width(config.num_experts, "expert count")?,
             max_tokens: capacity,
             ranks,
+            attention: 0,
             dtype,
         };
         for mode in [Mode::Dispatch, Mode::Combine] {

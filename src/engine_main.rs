@@ -794,6 +794,8 @@ pub(crate) struct MainProcess {
     /// owns the instance, so every call the control thread makes goes through the handle and the
     /// command channel carries the mutation (§2.4).
     schedulers: Vec<engine::SchedulerHandle>,
+    /// The expert union of this node's ranks, ended before their device threads are.
+    union: Option<Arc<executor::runners::experts::Union>>,
     /// One statistics reporter per scheduler, in the schedulers' order.
     ///
     /// A reporter keeps the cumulative baselines of the counters it has already
@@ -1065,6 +1067,10 @@ impl MainProcess {
             .first()
             .map(|rank| rank.plan.scheduled())
             .context("this process serves no rank")?;
+        // Each rank of an expert union is a scheduler's own; the ranks of a media group are one
+        // pool, which the first rank's plan describes.
+        let union = first_plan.union().map(|(union, _)| Arc::clone(union));
+        let mut scheduled = Vec::with_capacity(ranks.len());
         // The group's products, which every rank's runners reach through their own view of them.
         let group_products = GroupProducts::new(ranks.len());
         let rank_count = ranks.len() as u32;
@@ -1131,9 +1137,17 @@ impl MainProcess {
                 // which owns the stream a wake resets its units on, so the client is bound beside
                 // the cache handle rather than kept only here.
                 executor.bind_storage(Arc::clone(&client));
+                if let Some((union, member)) = rank_plan.union() {
+                    union.bind(
+                        member,
+                        Arc::clone(executor.queue()),
+                        executor::runner::RunnerId(0),
+                    )?;
+                }
                 executors.push(Arc::new(executor));
                 generations.push(generation);
             }
+            scheduled.push(rank_plan.scheduled());
             memories.push(memory);
             clients.push(client);
             models.push(model);
@@ -1144,15 +1158,35 @@ impl MainProcess {
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = schedulers(
-            &first_plan,
-            launch,
-            &memories[0],
-            &models[0],
-            &executors,
-            &inventories[0],
-            control.wake(),
-        )?;
+        let schedulers = if union.is_some() {
+            let mut handles = Vec::with_capacity(executors.len());
+            for (index, plan) in scheduled.iter().enumerate() {
+                // A dedicated expert rank takes no request: it joins the steps the others open.
+                if !plan.schedules() {
+                    continue;
+                }
+                handles.extend(schedulers(
+                    plan,
+                    launch,
+                    &memories[index],
+                    &models[index],
+                    &executors[index..=index],
+                    &inventories[index],
+                    control.wake(),
+                )?);
+            }
+            handles
+        } else {
+            schedulers(
+                &first_plan,
+                launch,
+                &memories[0],
+                &models[0],
+                &executors,
+                &inventories[0],
+                control.wake(),
+            )?
+        };
 
         let stats_reporters = (0..schedulers.len())
             .map(|_| engine::SchedulerStatsReporter::default())
@@ -1160,6 +1194,7 @@ impl MainProcess {
         let mut process = Self {
             control,
             schedulers,
+            union,
             stats_reporters,
             executors,
             memory: memories,
@@ -4013,14 +4048,18 @@ impl MainProcess {
         // The routing policy runs on the scheduler node; a request submitted to
         // a node that holds no scheduler belongs to this node's single rank.
         if self.schedulers.len() <= 1 {
-            0
-        } else {
-            // Several DP ranks on one node: the mechanism's policy instance
-            // picks the rank (§4.4). Until that call is published, the first
-            // scheduler takes it, which is the single-rank case and the
-            // identity of an unloaded deployment.
-            0
+            return 0;
         }
+        // Several DP ranks on one node: the mechanism's policy instance picks the rank (§4.4).
+        // Until that call is published the rank holding the fewest requests takes it, because a
+        // rank the requests never reach leaves its share of the batch empty.
+        let mut held = vec![0_usize; self.schedulers.len()];
+        for served in &self.streams {
+            if let Some(count) = held.get_mut(served.rank) {
+                *count += 1;
+            }
+        }
+        (0..held.len()).min_by_key(|rank| held[*rank]).unwrap_or(0)
     }
 
     /// Routes a per-request command to the scheduler that holds the request.
@@ -4797,6 +4836,10 @@ impl MainProcess {
                 served.front,
                 proto::request::wire::from_engine::Kind::Event(event),
             );
+        }
+        // A rank that waits for its peers inside a step stops waiting: the peers are ending too.
+        if let Some(union) = &self.union {
+            union.end();
         }
         // The schedulers go first: their `Batches` holds a clone of every executor, and a device
         // thread cannot be joined while a scheduler could still submit to it.

@@ -607,7 +607,8 @@ struct CommitColumns {
     /// `[rows]` i32 whether a row's token is valid, and whether its slot is active.
     valid: Column,
     active: Column,
-    /// `[1]` u8 continuation flag and `[1]` i32 accepted points: a plain decode's rows use neither.
+    /// `[rows]` u8 continuation flags and `[rows]` i32 accepted points, one per sampled task: a plain
+    /// decode's rows use neither, and the commit reads them at the row's task all the same.
     continuation: Column,
     points: Column,
     /// `[slots]` the per-slot next-input predicate, logical position, sampling position and
@@ -637,8 +638,8 @@ impl CommitColumns {
             table: Column::new(device, DType::I32, u64::from(ops::commit::COMMIT_FIELDS as u32) * capacity)?,
             valid: Column::new(device, DType::I32, capacity)?,
             active: Column::new(device, DType::I32, capacity)?,
-            continuation: Column::new(device, DType::U8, 1)?,
-            points: Column::new(device, DType::I32, 1)?,
+            continuation: Column::new(device, DType::U8, capacity)?,
+            points: Column::new(device, DType::I32, capacity)?,
             predicates: Column::new(device, DType::U8, u64::from(slots.max(1)))?,
             logical: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
             sampling: Column::new(device, DType::I32, u64::from(slots.max(1)))?,
@@ -664,10 +665,10 @@ impl CommitColumns {
         for column in [&mut columns.logical, &mut columns.sampling, &mut columns.verified, &mut columns.future] {
             column.write(&encoded)?;
         }
-        let zeros_i32 = vec![0_i32; 1];
+        let zeros_i32 = vec![0_i32; capacity as usize];
         encode_i32(&mut encoded, &zeros_i32);
         columns.points.write(&encoded)?;
-        let zeros_u8 = vec![0_u8; 1];
+        let zeros_u8 = vec![0_u8; capacity as usize];
         columns.continuation.write(&zeros_u8)?;
         let zeros_u8 = vec![0_u8; slots.max(1) as usize];
         columns.predicates.write(&zeros_u8)?;
@@ -1664,6 +1665,8 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// the device's work: a replay that is slow in its enqueue is a graph the driver cannot hand
     /// over quickly, and one that is slow after it is the kernels.
     enqueue_ms: f64,
+    /// This rank's member of the expert union, on a deployment whose experts are split.
+    experts: Option<super::experts::Member>,
 }
 
 /// One model object shared by the runners of every device a rank serves.
@@ -1719,6 +1722,10 @@ impl<M: CausalLm> CausalLm for Shared<M> {
         out: ops::TensorView,
     ) -> nn::Result<()> {
         self.0.logits(f, hidden, out)
+    }
+
+    fn join_expert_step(&self, f: &nn::Forward) -> nn::Result<()> {
+        self.0.join_expert_step(f)
     }
 }
 
@@ -1813,12 +1820,21 @@ impl<M: CausalLm> CausalLmRunner<M> {
             recaptured: false,
             last_prefill: None,
             enqueue_ms: 0.0,
+            experts: None,
             encoded: Vec::new(),
             indices: Vec::new(),
             draws: Vec::new(),
             kv,
             seed: std::cell::Cell::new(seed | 1),
         })
+    }
+
+    /// Makes this runner a member of an expert union: every step goes through the union, and the
+    /// model's expert layers run over the member's transport.
+    #[must_use]
+    pub fn in_union(mut self, member: super::experts::Member) -> Self {
+        self.experts = Some(member);
+        self
     }
 
     /// The runner's name in the executor.
@@ -2131,6 +2147,26 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
 
     fn serve(&mut self, job: &Job) -> Result<BatchOutput> {
         match job {
+            Job::Join { .. } => {
+                let stream = self.stream.clone();
+                let member = self.experts.as_mut().ok_or_else(|| {
+                    Error::Invariant("a join reached a runner outside an expert union".into())
+                })?;
+                if member.woken()? && member.step(0, &stream)?.is_some() {
+                    let generation = self.lifecycle.generation.number();
+                    let (_, captured) = self
+                        .lifecycle
+                        .graphs
+                        .captured_for(Bucket::expert_join(), generation)
+                        .ok_or_else(|| {
+                            Error::Invariant(format!(
+                                "no join graph in generation {generation} or one it replaces"
+                            ))
+                        })?;
+                    captured.launch(&stream)?;
+                }
+                Ok(BatchOutput::default())
+            }
             Job::Replay {
                 bucket,
                 generation,
@@ -2197,6 +2233,13 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                             tracing::warn!(bucket = %bucket, %error, "the sampler's sentinel fill failed");
                         }
                     }
+                }
+                // Every rank of an expert union runs this step: the graph's dispatches wait on their
+                // devices for the peers', so the union is entered before the launch.
+                if let Some(member) = self.experts.as_mut() {
+                    let live = u32::try_from(self.staging.live_tokens())
+                        .map_err(|_| Error::Invariant("a batch's tokens exceed u32".into()))?;
+                    member.step(live, &stream)?;
                 }
                 let launched = Instant::now();
                 // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
@@ -2444,7 +2487,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// executable are the same for every runner, so those live in [`Lifecycle`].
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
-        self.warm(bucket, &kernels)?;
+        // The first capture of the first generation is where the exchange's program exists, and
+        // every rank reaches it in step: their plans capture the same buckets in the same order.
+        if let Some(member) = self.experts.as_mut() {
+            let stream = self.stream.clone();
+            member.ensure(&kernels, &stream)?;
+            member.write(bucket.tokens, &stream)?;
+            member.set_warming(true);
+        }
+        let warmed = self.warm(bucket, &kernels);
+        if let Some(member) = self.experts.as_ref() {
+            member.set_warming(false);
+        }
+        warmed?;
         let stream = self.stream.clone();
         // The recording's own window: nothing that synchronises may run inside it.
         self.capturing = true;
@@ -2483,6 +2538,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // recording - which no capture can carry, because a cuBLASLt plan allocates its workspace.
 
         let began = std::time::Instant::now();
+        if self.joins_only(bucket) {
+            self.walk(bucket, kernels)?;
+            self.stream.synchronize()?;
+            return Ok(());
+        }
         // The pose, stated before the walk that can fault on it: a warm launch that dies names the
         // numbers it was given, and the table it read, rather than leaving them to be inferred from
         // the bucket. `stage_warm` is idempotent and `walk` reuses what it staged - which is how a
@@ -4622,6 +4682,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// The walk's own work, without the wrapper a throwaway capture needs.
     fn walk_body(&mut self, bucket: Bucket, generation: &Arc<Generation>) -> Result<()> {
         let stream = self.stream.clone();
+        if self.joins_only(bucket) {
+            return self.walk_join(bucket, generation);
+        }
         match self.staging.staged() {
             Some(staged) if staged == bucket => {}
             _ => {
@@ -4646,6 +4709,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // measures, and one that no line of its own would ever explain.
         if runner_dump() && !self.capturing {
             forward = forward.with_attention_probe(&probe);
+        }
+        if let Some(views) = self.experts.as_ref().and_then(super::experts::Member::views) {
+            forward = forward.with_exchange(views);
         }
         let hidden = arena.tensor(
             self.geometry.hidden_dtype,
@@ -4672,6 +4738,45 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 "attention outputs, each read at its own layer's launch"
             );
         }
+        if first {
+            self.pool()?.record(self.stream_id(), bucket, arena.used())?;
+        }
+        Ok(())
+    }
+
+    /// Whether a walk of `bucket` takes this rank's part in a step with no tokens of its own.
+    ///
+    /// A rank that only holds experts walks every bucket that way: its captures keep the ranks in
+    /// step through a warmup, because each warm walk of an attention rank needs it inside the same
+    /// exchanges.
+    fn joins_only(&self, bucket: Bucket) -> bool {
+        bucket.variant == crate::plan::Variant::ExpertJoin
+            || self
+                .experts
+                .as_ref()
+                .is_some_and(super::experts::Member::experts_only)
+    }
+
+    /// Walks every expert layer of a step with no tokens of this rank's own.
+    fn walk_join(&mut self, bucket: Bucket, generation: &Arc<Generation>) -> Result<()> {
+        let stream = self.stream.clone();
+        let first = self.pool()?.begin(self.stream_id(), bucket)?;
+        let base = self.pool()?.base(self.stream_id())?;
+        let arena = nn::Arena::new(
+            ops::DevicePtr::new(base.address()),
+            self.pool()?.reserved(),
+        );
+        let views = self
+            .experts
+            .as_ref()
+            .and_then(super::experts::Member::views)
+            .ok_or_else(|| {
+                Error::Invariant("a join walked with no expert transport".into())
+            })?;
+        let forward = Forward::new(&stream, generation, &arena).with_exchange(views);
+        self.model
+            .join_expert_step(&forward)
+            .map_err(Error::from)?;
         if first {
             self.pool()?.record(self.stream_id(), bucket, arena.used())?;
         }

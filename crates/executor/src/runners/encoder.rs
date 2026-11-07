@@ -908,6 +908,9 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
             } => self
                 .rebind(*bucket, *generation)
                 .map(|()| BatchOutput::default()),
+            Job::Join { .. } => Err(Error::Invariant(
+                "an encoder runner joins no expert step".into(),
+            )),
             Job::Shadow { operator, key, .. } => Err(Error::Invariant(format!(
                 "an encoder runner compares no operator, and the device asked it to shadow \
                  {operator} {key}"

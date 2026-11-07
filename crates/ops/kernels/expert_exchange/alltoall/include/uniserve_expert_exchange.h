@@ -1,125 +1,139 @@
 // SPDX-License-Identifier: Apache-2.0
 //
-// The C header of the expert_exchange module: the operator's two call
-// structures (`crates/ops/src/moe/exchange.rs`, DISPATCH_CALL_LAYOUT and
-// COMBINE_CALL_LAYOUT), the transport's lifecycle structures and the group
-// vtable they are handed (`notes/programs/attention_moe.md`, "Transport
-// lifecycle"), and the entries the package declares.
+// The C header of the expert_exchange operator's packages: the operator's one
+// call structure (`crates/ops/src/moe/exchange.rs`, CALL_LAYOUT), the transport's
+// lifecycle structures, the group vtable they are handed, and the entries a
+// package exports.
+//
+// Every backend of the operator includes this header unchanged, so the executor
+// drives any backend through the same seven entries.
 
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
 
-// A dispatch launch: the rank's live rows and the group's transport.
-struct uniserve_exchange_dispatch_call {
-  void* transport;
-  const void* states;
-  const int32_t* ids;
-  const float* weights;
-  int32_t* counts;
-  int64_t tokens;
-  int64_t top;
-  int64_t hidden;
-  int64_t experts;
-  int64_t max_tokens;
-  int64_t ranks;
-  int64_t dtype;
-  char error[512];
+// The directions of one launch, as the operator numbers them.
+enum uniserve_exchange_mode : int64_t {
+  UNISERVE_EXCHANGE_DISPATCH = 0,
+  UNISERVE_EXCHANGE_COMBINE = 1,
+  UNISERVE_EXCHANGE_FUSED = 2,
 };
 
-static_assert(offsetof(uniserve_exchange_dispatch_call, error) == 96,
-              "the call's error must sit where the operator's layout puts it");
-static_assert(sizeof(uniserve_exchange_dispatch_call) == 608,
-              "the call must be the size of the operator's layout");
-
-// A combine launch: the rows this rank received and processed, summed back into
-// its own rows.
-struct uniserve_exchange_combine_call {
-  void* transport;
-  const void* partials;
-  const int32_t* counts;
-  void* out;
-  int64_t tokens;
-  int64_t top;
-  int64_t hidden;
-  int64_t experts;
-  int64_t max_tokens;
-  int64_t ranks;
-  int64_t dtype;
-  char error[512];
+// What a fused launch reads of one layer: its experts, as the loader laid them out.
+// Each weight is `[local experts, rows, columns / 2]` packed values, read K-major,
+// with its block scales in a table of `scale_bytes` per expert.
+struct uniserve_fused_layer {
+  const void* up_gate;        // [local, 2 * intermediate, hidden / 2]
+  const void* up_gate_scales;
+  const void* down;           // [local, hidden, intermediate / 2]
+  const void* down_scales;
+  const float* up_gate_alpha;  // [local] dequantizes the first product
+  const float* down_alpha;     // [local] dequantizes the second product
+  const float* gated_scale;    // [local] encodes the gated rows
+  int64_t up_gate_scale_bytes;
+  int64_t down_scale_bytes;
 };
 
-static_assert(offsetof(uniserve_exchange_combine_call, error) == 88,
-              "the call's error must sit where the operator's layout puts it");
-static_assert(sizeof(uniserve_exchange_combine_call) == 600,
-              "the call must be the size of the operator's layout");
-
-// The executor's transport to the expert-parallel group, as a package sees it.
-// One instance per group: the executor creates it before the first transport
-// and destroys it after the last one is released. A package may cache neither
-// the pointer nor a copy of what it points at, and must never free it.
+// One launch of the exchange.
 //
-// Every entry is collective over the group and may be called from `create`
-// only, never from a launch: a collective issued inside a captured bucket would
-// put a second collective in the graph, and the exchange's own all-to-all is
-// already there.
+// Dispatch sends this rank's rows and leaves what the rank received in the
+// transport's views. Combine returns the rows the rank's experts computed, which
+// it wrote into the transport's `combined` view, and sums each token's partial
+// results into `out`.
+struct uniserve_exchange_call {
+  void* transport;
+  const void* states;      // dispatch: [tokens, hidden] rows to send
+  const int32_t* ids;      // dispatch: [tokens, top] expert ids
+  const float* weights;    // dispatch: [tokens, top] route weights
+  const int32_t* live;     // [1] device count of live rows, or null for all `tokens`
+  void* out;               // combine: [tokens, hidden] summed rows, written
+  const uniserve_fused_layer* layer;  // fused: this layer's expert operands
+  int64_t mode;            // uniserve_exchange_mode
+  int64_t tokens;          // rows of this launch's extent, the captured bucket's
+  int64_t top;
+  int64_t hidden;
+  int64_t experts;
+  int64_t max_tokens;
+  int64_t ranks;
+  int64_t dtype;
+  char error[512];
+};
+
+static_assert(offsetof(uniserve_exchange_call, error) == 120,
+              "the call's error must sit where the operator's layout puts it");
+static_assert(sizeof(uniserve_exchange_call) == 632,
+              "the call must be the size of the operator's layout");
+
+// The executor's host channel to the group, as a package sees it. One instance
+// per group: the executor creates it before the first transport and destroys it
+// after the last one is released. A package may cache neither the pointer nor a
+// copy of what it points at, and must never free it.
+//
+// Every function is collective over the group and is called from a lifecycle
+// entry only, never from a launch. The ranks of a host are threads of one
+// process, so a function blocks its caller's thread and no other's.
 struct UniserveGroup {
-  // The group's communicator (`ncclComm_t`), for a package that must call NCCL
-  // directly, and for nothing else.
+  // What the functions below take as their first argument.
   void* handle;
+  // The group's NCCL communicator (`ncclComm_t`), for a package that drives NCCL
+  // itself, or null when the deployment opened none.
+  void* communicator;
   int64_t ranks;   // ranks of the group
   int64_t rank;    // this rank's index in it
   int64_t device;  // the CUDA device this rank's transport lives on
 
-  // All-gather each rank's `mine` (`bytes` bytes) into `peers`
-  // (`[ranks][bytes]`, rank order), on `stream`. The exchange of peer handles
-  // goes through this: a fabric handle is 64 bytes, a POSIX-fd handle 4, and
-  // the caller states which by its byte count.
-  int32_t (*all_gather)(void* handle, const void* mine, void* peers, int64_t bytes,
-                        void* stream);
+  // Gathers each rank's `bytes` bytes of `mine` into `peers`, `[ranks][bytes]`
+  // in rank order. Peer handles and addresses travel through this.
+  int32_t (*all_gather)(void* handle, const void* mine, void* peers, int64_t bytes);
 
-  // Sum `elements` f32 of `data` across the group, in place, on `stream`.
-  int32_t (*all_reduce_sum_f32)(void* handle, void* data, int64_t elements, void* stream);
-
-  // `mine` from every rank, in rank order, into `out[ranks]`. Sizing exchanges
-  // and flags.
-  int32_t (*all_gather_i32)(void* handle, int32_t mine, int32_t* out, void* stream);
-
-  // Every rank reached this point. The executor implements it as a zero-byte
-  // collective on the group's communicator, so it costs one launch and works
-  // wherever all_gather does.
-  int32_t (*barrier)(void* handle, void* stream);
+  // Returns once every rank of the group has called it.
+  int32_t (*barrier)(void* handle);
 
   // Why the last call failed; empty after a successful one.
   char error[512];
 };
 
+static_assert(offsetof(UniserveGroup, error) == 56,
+              "the group vtable's error message must sit where the operator's mirror puts it");
+static_assert(sizeof(UniserveGroup) == 568,
+              "the group vtable must be the size of the operator's mirror");
+
 // The transport's lifecycle, as the executor drives it.
 struct uniserve_exchange_lifecycle {
   void* transport;
-  // The executor's transport to the group, created before this structure and
-  // alive for the whole package life.
+  // The executor's channel to the group, alive for the whole package life.
   const UniserveGroup* group;
   int64_t ranks;
   int64_t rank;
-  int64_t experts;
+  int64_t experts;       // experts in the router's vocabulary
   int64_t hidden;
-  int64_t max_tokens;
+  int64_t max_tokens;    // rows one rank sends in one step, at most
   int64_t top;
   int64_t dtype;
   int64_t device;
+  int64_t intermediate;  // an expert's gated width, for a backend that runs the experts
+  int64_t capacity;      // step entry: the rows per rank the group agreed for this step
+  int64_t attention_ranks;  // leading ranks that hold no experts; zero when every rank holds some
   char error[512];
 };
 
-// The views the transport holds, asked for once per transport (and again after
-// a restore, whose addresses it must agree with).
+static_assert(offsetof(uniserve_exchange_lifecycle, error) == 104,
+              "the lifecycle's error message must sit where the operator's mirror puts it");
+static_assert(sizeof(uniserve_exchange_lifecycle) == 616,
+              "the lifecycle must be the size of the operator's mirror");
+
+// The views the transport holds, asked for once per transport and again after a
+// restore, whose addresses it must agree with.
 struct uniserve_exchange_info {
   void* transport;
-  void* states;
-  void* ids;
-  void* weights;
-  void* counts;
+  void* states;    // [ranks * capacity, hidden] rows received, in the activation's type
+  void* ids;       // [ranks * capacity, top] i32
+  void* weights;   // [ranks * capacity, top] f32
+  void* combined;  // [ranks * capacity, hidden] rows the experts computed
+  void* live;      // [1] i32: how many leading rows of those views this step holds
+  void* packed;    // fused: [capacity, hidden / 2] the encoded rows a rank sends
+  void* packed_scales;  // fused: [capacity, scale columns] their block scales
   int64_t ranks;
   int64_t rank;
   int64_t capacity;
@@ -127,8 +141,14 @@ struct uniserve_exchange_info {
   int64_t top;
   int64_t dtype;
   int64_t device;
+  int64_t fused;   // nonzero when one launch runs the whole expert layer
   char error[512];
 };
+
+static_assert(offsetof(uniserve_exchange_info, error) == 128,
+              "the info's error message must sit where the operator's mirror puts it");
+static_assert(sizeof(uniserve_exchange_info) == 640,
+              "the info must be the size of the operator's mirror");
 
 // The operator crate's `DType::as_i64()` numbering.
 enum uniserve_dtype : int64_t {
@@ -143,13 +163,9 @@ enum uniserve_dtype : int64_t {
   UNISERVE_DTYPE_I16 = 8,
 };
 
-static_assert(offsetof(UniserveGroup, error) == 64,
-              "the group vtable's error message must sit where the executor's mirror puts it");
-static_assert(sizeof(UniserveGroup) == 576,
-              "the group vtable must be the size of the executor's mirror");
-
 extern "C" int32_t uniserve_expert_exchange_create(uniserve_exchange_lifecycle* call,
                                                    void* stream);
+extern "C" int32_t uniserve_expert_exchange_step(uniserve_exchange_lifecycle* call, void* stream);
 extern "C" int32_t uniserve_expert_exchange_suspend(uniserve_exchange_lifecycle* call,
                                                     void* stream);
 extern "C" int32_t uniserve_expert_exchange_restore(uniserve_exchange_lifecycle* call,
@@ -157,7 +173,4 @@ extern "C" int32_t uniserve_expert_exchange_restore(uniserve_exchange_lifecycle*
 extern "C" int32_t uniserve_expert_exchange_release(uniserve_exchange_lifecycle* call,
                                                     void* stream);
 extern "C" int32_t uniserve_expert_exchange_info(uniserve_exchange_info* call, void* stream);
-extern "C" int32_t uniserve_expert_exchange_dispatch(const uniserve_exchange_dispatch_call* call,
-                                                     void* stream);
-extern "C" int32_t uniserve_expert_exchange_combine(const uniserve_exchange_combine_call* call,
-                                                    void* stream);
+extern "C" int32_t uniserve_expert_exchange_launch(uniserve_exchange_call* call, void* stream);

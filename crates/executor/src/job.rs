@@ -394,6 +394,24 @@ impl JobQueue {
             .unwrap_or_default()
     }
 
+    /// Queues a join of `runner`, answered to nobody: the rank that opened the step waits for this
+    /// rank inside the step, not for this command.
+    pub(crate) fn join_step(&self, runner: crate::runner::RunnerId) -> Result<()> {
+        let id = crate::batch::SubmissionId(self.next_submission());
+        let (submission, _) = crate::batch::Submission::pending(id);
+        let jobs = vec![Job::Join { runner }];
+        self.submit(
+            Command::Steps {
+                generation: None,
+                jobs,
+            },
+            &submission,
+            crate::batch::JobKind::Replay,
+            None,
+        )
+        .map(|_| ())
+    }
+
     /// Stops the queue: no further command is taken, and a waiting executor thread returns.
     pub fn close(&self) {
         let mut state = lock(&self.state);
@@ -420,6 +438,7 @@ impl std::fmt::Debug for JobQueue {
 pub(crate) fn jobs_of(runner: crate::runner::RunnerId, jobs: crate::batch::Jobs) -> Vec<Job> {
     jobs.iter()
         .map(|job| match job {
+            Job::Join { .. } => Job::Join { runner },
             Job::Replay {
                 bucket,
                 generation,
