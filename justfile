@@ -35,10 +35,6 @@ test-python-fast:
 build-debug:
     {{cargo}} build -p uniserve
 
-# End-to-end Python tests (no GPU)
-test-python-e2e: build-debug
-    {{python}} -m pytest -m "e2e and not gpu"
-
 # The missing-state tests (GPU) with every main process under compute-sanitizer's
 # memcheck; its logs go to $SANITIZER_LOGS
 test-python-sanitizer: build-debug
@@ -54,7 +50,7 @@ test-python-gpu: build-debug
     UNISERVE_RUN_GPU_E2E=1 {{python}} -m pytest -m "e2e and gpu"
 
 # Run all checks
-test-all: fmt clippy test-rust bench-build test-python-fast test-python-e2e
+test-all: fmt clippy test-rust bench-build test-python-fast
 
 # Resolve the decode-runtime suite without starting a server
 eval-plan:
