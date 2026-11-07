@@ -93,6 +93,19 @@ pub(crate) fn segmented_units(num_units: u32, plane_bytes: u64, granularity: u64
     num_units / segments / granule * granule * segments
 }
 
+/// The fewest units of at least `num_units` that split into the segments [`segmented_units`] makes.
+pub(crate) fn segmented_units_above(num_units: u32, plane_bytes: u64, granularity: u64) -> u32 {
+    let Some(granule) = granule_units(plane_bytes, granularity) else {
+        return num_units;
+    };
+    let segments = SEGMENTS.min(num_units / granule);
+    if segments == 0 {
+        return num_units;
+    }
+    let step = granule * segments;
+    num_units.div_ceil(step) * step
+}
+
 /// The fewest units whose planes of `plane_bytes` fill whole granules.
 fn granule_units(plane_bytes: u64, granularity: u64) -> Option<u32> {
     if plane_bytes == 0 || granularity == 0 {
@@ -1761,6 +1774,23 @@ impl UnitColumn {
             start = end;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod segment_rounding_tests {
+    use super::*;
+
+    /// A plane of a sixteenth of a granule fills a granule every sixteen units. A cache fitted to a
+    /// capacity keeps what it was asked for, and one fitted to the storage rounds into it.
+    #[test]
+    fn a_capacity_rounds_up_to_whole_segments_and_a_grant_rounds_down() {
+        let (plane, granule) = (1 << 16, 1 << 20);
+        assert_eq!(segmented_units(640, plane, granule), 512);
+        assert_eq!(segmented_units_above(640, plane, granule), 640);
+        assert_eq!(segmented_units_above(641, plane, granule), 768);
+        // Too few units for a segment of whole granules stay as they are.
+        assert_eq!(segmented_units_above(7, plane, granule), 7);
     }
 }
 

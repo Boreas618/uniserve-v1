@@ -364,13 +364,12 @@ impl Leader {
         locked(&self.replicas.adapters).keys().cloned().collect()
     }
 
-    /// Loads the LoRA adapter `body` names (`lora_name`, and what the
-    /// plugin reads, such as `lora_path`) into a free slot of the workers'
-    /// adapter pool, as vLLM's `load_lora_adapter` does: every worker runs
-    /// the plugin hook `load_lora_adapter` with the body and the slot
-    /// (`adapter`), and requests naming the adapter as their model compute
-    /// with it from then on (`uniserve.adapters`). A new engine, after a hot
-    /// update or a relaunch, loads it again before it serves.
+    /// Loads the LoRA adapter `body` names (`lora_name`, and its `lora_path`)
+    /// into a free slot, as vLLM's `load_lora_adapter` does: every rank
+    /// publishes its tensors at the Storage Server under the slot (`adapter`).
+    /// A new engine, after a hot update or a relaunch, loads it again before
+    /// it serves. What computes with an adapter is a kernel program, so a
+    /// request naming it is refused until one serves (`docs/admin.md`).
     ///
     /// # Errors
     ///
@@ -444,8 +443,7 @@ impl Leader {
     }
 
     /// Unloads the LoRA adapter `body` names (`lora_name`): requests stop
-    /// naming it at once, and every worker runs the plugin hook
-    /// `unload_lora_adapter` with the body and the adapter's slot.
+    /// naming it at once, and every rank releases the adapter's slot.
     ///
     /// # Errors
     ///
@@ -3085,9 +3083,8 @@ impl Replica {
         Ok(results)
     }
 
-    /// Runs the worker hook `name` with the JSON `payload` on every worker
-    /// (`uniserve.hooks`), which a plugin implements, at the engine's next
-    /// step boundary, and returns each worker's JSON result.
+    /// Runs the data plane's operation `name` with the JSON `payload`, and
+    /// returns each rank's JSON result.
     ///
     /// # Errors
     ///
@@ -3120,7 +3117,7 @@ impl Replica {
     /// or model facts); fails when no engine serves, or with the reason a
     /// worker did not update, after which the weights are those of before.
     pub(crate) async fn update_weights(
-        &self,
+        self: &Arc<Self>,
         model_path: &str,
         in_flight: WeightsInFlight,
     ) -> Result<Vec<String>, UpdateError> {
@@ -3173,6 +3170,9 @@ impl Replica {
             }
         }
         *locked(&self.config) = config;
+        // A parked standby mapped the weights this update replaced, and a promotion would serve
+        // them: it starts again on the new ones (§2.5).
+        self.restart_standby();
         info!(
             model = model_path,
             elapsed_ms = started.elapsed().as_millis() as u64,

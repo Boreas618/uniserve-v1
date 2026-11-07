@@ -19,6 +19,7 @@
 //! measured device against the reported capacity, which is the capacity negotiation's own area
 //! (`executor::memory::Memory::new`'s caller).
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -108,6 +109,45 @@ pub(crate) enum Served {
     Media(Arc<minimax_h3::load::MinimaxH3>),
 }
 
+/// How the data plane loads this rank's model again (§7.6): the rank's plan, pointed at the target.
+pub(crate) struct RankModel {
+    plan: EpochPlan,
+}
+
+impl RankModel {
+    pub(crate) fn new(plan: EpochPlan) -> Self {
+        Self { plan }
+    }
+}
+
+impl executor::data_plane::ModelLoad for RankModel {
+    fn load(
+        &self,
+        target: &executor::data_plane::Target,
+        weights: &mut dyn nn::RetainedWeights,
+    ) -> std::result::Result<(), String> {
+        let mut plan = self.plan.clone();
+        plan.checkpoint = target.checkpoint.clone();
+        plan.load_model(weights, &target.experts)
+            .map(drop)
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn expert_layers(&self) -> BTreeMap<String, u32> {
+        let Ok(ModelClass::CausalLm) = ModelClass::of(&self.plan.checkpoint) else {
+            return BTreeMap::new();
+        };
+        let Ok(config) = qwen3_moe::Config::read(&self.plan.checkpoint) else {
+            return BTreeMap::new();
+        };
+        let experts = u32::try_from(config.num_experts).unwrap_or(0);
+        qwen3_moe::weights::expert_sources(&config)
+            .into_iter()
+            .map(|source| (source.module, experts))
+            .collect()
+    }
+}
+
 impl Served {
     /// The checkpoint-named class this value was loaded as.
     pub(crate) fn class(&self) -> ModelClass {
@@ -139,6 +179,9 @@ pub(crate) struct EpochPlan {
     rank: u32,
     /// The world the epoch executes, which keys the storage it creates.
     world: u64,
+    /// The world whose cache planes this rank maps, on a standby: it serves from the planes its
+    /// predecessor serves from, whose segments that world created.
+    cache_world: Option<u64>,
     /// Ranks in the deployment, whose minimum the cache plan's block size and slot count are
     /// agreed by (§4.1).
     world_size: usize,
@@ -302,6 +345,7 @@ impl EpochPlan {
             buckets,
             rank: launch.rank,
             world: launch.world,
+            cache_world: None,
             world_size: launch.world_size as usize,
             queue_depth: launch.queue_depth as usize,
             group: launch.group.clone(),
@@ -334,6 +378,12 @@ impl EpochPlan {
                 plan
             })
             .collect())
+    }
+
+    /// This plan on the cache planes of `world`, when this rank stands by for that world's process.
+    pub(crate) fn sharing_cache_of(mut self, world: Option<u64>) -> Self {
+        self.cache_world = world;
+        self
     }
 
     /// This rank as the one pool the scheduler plans against.
@@ -1173,7 +1223,21 @@ impl EpochPlan {
         weights: &mut dyn nn::RetainedWeights,
         storage: &mut dyn executor::memory::retained::ExclusiveStorage,
         host_group: &executor::parallel::host::HostGroup,
+        experts: &qwen3_moe::load::ExpertOrder,
     ) -> Result<(Served, Memory, ipc::MainProcessInfo, GraphStorage)> {
+        let served = self.load_model(weights, experts)?;
+        let (memory, info, graph) = self.open_memory(&served, storage, host_group)?;
+        Ok((served, memory, info, graph))
+    }
+
+    /// The model this plan's checkpoint holds, its weights reached through `weights` in the order
+    /// the model's load asks for them. An update walks the same code (§7.6), so what this function
+    /// reads is exactly what a load of another checkpoint or another expert order would.
+    pub(crate) fn load_model(
+        &self,
+        weights: &mut dyn nn::RetainedWeights,
+        experts: &qwen3_moe::load::ExpertOrder,
+    ) -> Result<Served> {
         let placement = &self.placement;
         match ModelClass::of(&self.checkpoint)? {
             ModelClass::CausalLm => {
@@ -1191,16 +1255,15 @@ impl EpochPlan {
                 )?;
                 // The checkpoint states its own representation: a calibrated export is read packed,
                 // and a dense one dense. The layout is the one the serving programs are built for.
-                let model = qwen3_moe::load::load_checkpoint(
+                let model = qwen3_moe::load::load_placed(
                     &self.checkpoint,
                     partition,
                     &mut loader,
                     placement.load_options,
                     ops::fp4::ScaleLayout::Linear,
+                    experts,
                 )?;
-                let served = Served::Text(Arc::new(model));
-                let (memory, info, graph) = self.open_memory(&served, storage, host_group)?;
-                Ok((served, memory, info, graph))
+                Ok(Served::Text(Arc::new(model)))
             }
             ModelClass::Media => {
                 // §8: the deployment's own representation, which the daemon resolved against the
@@ -1309,9 +1372,7 @@ impl EpochPlan {
                         );
                     }
                 }
-                let served = Served::Media(Arc::new(model));
-                let (memory, info, graph) = self.open_memory(&served, storage, host_group)?;
-                Ok((served, memory, info, graph))
+                Ok(Served::Media(Arc::new(model)))
             }
         }
     }
@@ -1373,7 +1434,7 @@ impl EpochPlan {
                 let facts = executor::capacity::RankFacts {
                     device: executor::config::Device::Cuda(device),
                     host: &host,
-                    world: self.world,
+                    world: self.cache_world.unwrap_or(self.world),
                     world_size: self.world_size,
                     queue_depth: self.queue_depth,
                     // The model's page is the preset: the plan returns it or fails, and a plan that
