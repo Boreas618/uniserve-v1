@@ -309,7 +309,10 @@ impl Plan {
         // over: the vocabulary's expert count, and the tile the permutation packs in.
         let geometry = nn::layers::MoeGeometry {
             hidden: element(config.hidden_size, "hidden_size")?,
-            intermediate: element(config.moe_intermediate_size, "moe_intermediate_size")?,
+            intermediate: element(
+                partition.local_expert_intermediate(config),
+                "moe_intermediate_size",
+            )?,
             top: element(config.num_experts_per_tok, "num_experts_per_tok")?,
             experts: element(config.num_experts, "num_experts")?,
             tile: u64::from(TILE_ROWS),
@@ -339,7 +342,7 @@ impl Plan {
             )?,
             factors: element(config.head_dim / 2, "head_dim / 2")?,
             feed_forward: if config.has_dense_layers() {
-                element(config.intermediate_size, "intermediate_size")?
+                element(partition.local_intermediate(config), "intermediate_size")?
             } else {
                 0
             },
@@ -1134,9 +1137,21 @@ impl DecoderLayer {
             return Ok(normalized);
         }
 
-        f.fenced(MOE, format_args!("layers.{layer}.mlp"), || match &self.mlp {
-            Mlp::Experts(moe) => moe.forward(f, normalized, update).map_err(Error::from),
-            Mlp::Dense(dense) => dense.forward(f, normalized, buffers, update),
+        f.fenced(MOE, format_args!("layers.{layer}.mlp"), || {
+            match &self.mlp {
+                Mlp::Experts(moe) => moe.forward(f, normalized, update).map_err(Error::from)?,
+                Mlp::Dense(dense) => dense.forward(f, normalized, buffers, update)?,
+            }
+            // A tensor group holds every rank's block of the intermediate width, so each rank's
+            // update is a partial sum, summed once after the experts as after the attention's
+            // output projection. An expert group's exchange returns the whole sum and runs with no
+            // tensor group.
+            if let Some(group) = f.group {
+                group
+                    .all_reduce_sum(update, f.stream()?)
+                    .map_err(Error::from)?;
+            }
+            Ok::<(), Error>(())
         })?;
         Ok(update)
     }

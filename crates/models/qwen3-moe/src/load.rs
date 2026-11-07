@@ -27,7 +27,9 @@ use nn::layers::{
     Attention, ENCODE_CHUNK, Embedding, Linear, Moe, Nvfp4Linear, ParallelLMHead, RmsNorm, Rotary,
     SwiGlu,
 };
-use nn::weights::{Nvfp4Names, QuantizedStack, Weight, WeightLayout, WeightLoader, WeightRequest};
+use nn::weights::{
+    Nvfp4Names, PartBlock, QuantizedStack, Weight, WeightLayout, WeightLoader, WeightRequest,
+};
 use nn::{DType, Shape};
 use ops::fp4::ScaleLayout;
 use ops::gemm::WeightOrder;
@@ -938,6 +940,16 @@ fn expert_block(
         )));
     }
     let intermediate = as_u64(config.moe_intermediate_size, "moe_intermediate_size")?;
+    let ranks = as_u64(partition.tensor_parallel, "the tensor parallel width")?;
+    let rank = as_u64(partition.tensor_rank, "the tensor rank")?;
+    if !intermediate.is_multiple_of(ranks) {
+        return Err(Error::Config(format!(
+            "{parameter}: a tensor group of {ranks} does not divide an expert's {intermediate} \
+             intermediate columns"
+        )));
+    }
+    // The rank's block of every expert: the tensor group splits the intermediate width.
+    let local_intermediate = intermediate / ranks;
 
     let router = Linear::new(
         region(
@@ -1099,20 +1111,41 @@ fn expert_block(
         up_gate_parts.push(tensors.gate);
         down_parts.push(tensors.down);
     }
+    // A gate or up projection is `[intermediate, hidden]`, so a rank's block is its rows; a down
+    // projection is `[hidden, intermediate]`, so a rank's block is its columns of every row.
+    let request = |name: String, parts: Vec<String>, shape: Shape, layout, block: PartBlock| {
+        if ranks == 1 {
+            WeightRequest::parts(name, parts, shape, layout)
+        } else {
+            WeightRequest::part_blocks(name, parts, shape, layout, block)
+        }
+    };
     let up_gate = loader
-        .load(&WeightRequest::parts(
+        .load(&request(
             format!("{parameter}.mlp.experts.up_gate"),
             up_gate_parts,
-            Shape::new(&[local, 2 * intermediate, hidden]),
+            Shape::new(&[local, 2 * local_intermediate, hidden]),
             WeightLayout::UP_GATE,
+            PartBlock {
+                start: rank * local_intermediate * hidden,
+                rows: local_intermediate,
+                columns: hidden,
+                row_stride: hidden,
+            },
         ))
         .map_err(Error::from)?;
     let down = loader
-        .load(&WeightRequest::parts(
+        .load(&request(
             format!("{parameter}.mlp.experts.down"),
             down_parts,
-            Shape::new(&[local, hidden, intermediate]),
+            Shape::new(&[local, hidden, local_intermediate]),
             WeightLayout::DOWN,
+            PartBlock {
+                start: rank * local_intermediate,
+                rows: hidden,
+                columns: local_intermediate,
+                row_stride: intermediate,
+            },
         ))
         .map_err(Error::from)?;
 
@@ -1198,7 +1231,9 @@ fn dense_block(
     declaration: &Representation,
     layout: ScaleLayout,
 ) -> Result<DenseMlp> {
-    let intermediate = as_u64(config.intermediate_size, "intermediate_size")?;
+    // Each projection helper reads this rank's block of `rows`, so the width it is handed is the
+    // rank's share of the intermediate.
+    let intermediate = as_u64(partition.local_intermediate(config), "intermediate_size")?;
     let gate_proj = projection(
         loader,
         sources,
@@ -1236,8 +1271,11 @@ fn dense_block(
         gate_proj,
         up_proj,
         down_proj,
-        activation: SwiGlu::new(as_u32(config.intermediate_size, "intermediate_size")?)
-            .map_err(Error::from)?,
+        activation: SwiGlu::new(as_u32(
+            partition.local_intermediate(config),
+            "intermediate_size",
+        )?)
+        .map_err(Error::from)?,
     })
 }
 
