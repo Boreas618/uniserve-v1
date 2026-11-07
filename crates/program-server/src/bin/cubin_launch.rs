@@ -312,7 +312,11 @@ mod tests {
     fn a_relative_fill_is_taken_from_the_recipes_directory() {
         let recipe = Path::new("/cases/topk/recipe.json");
         assert_eq!(
-            host_path(Path::new("logits.bin"), Path::new("/modules/none"), beside(recipe)),
+            host_path(
+                Path::new("logits.bin"),
+                Path::new("/modules/none"),
+                beside(recipe)
+            ),
             PathBuf::from("/cases/topk/logits.bin")
         );
         assert_eq!(beside(Path::new("recipe.json")), Path::new(""));
@@ -327,7 +331,11 @@ mod tests {
             module.path().join("table.bin")
         );
         assert_eq!(
-            host_path(Path::new("/data/table.bin"), module.path(), Path::new("/cases")),
+            host_path(
+                Path::new("/data/table.bin"),
+                module.path(),
+                Path::new("/cases")
+            ),
             PathBuf::from("/data/table.bin")
         );
     }

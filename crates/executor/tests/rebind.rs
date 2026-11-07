@@ -48,8 +48,8 @@ use ops::{
     Shape, TensorView, Tolerance, Twins, descriptor,
 };
 use platform::{
-    Allocator, Budget, Buffer, CaptureMode, Device, DeviceId, GraphNodeKind, PinnedBuffer, PoolKind,
-    Stream, memcpy_async, memset_d32,
+    Allocator, Budget, Buffer, CaptureMode, Device, DeviceId, GraphNodeKind, PinnedBuffer,
+    PoolKind, Stream, memcpy_async, memset_d32,
 };
 
 const DEVICE: DeviceId = DeviceId(0);
@@ -131,7 +131,8 @@ impl Op for Probe {
 fn cubin() -> PathBuf {
     let source =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/probe_generation.cu");
-    let output = std::env::temp_dir().join(format!("probe-generation-{}.cubin", std::process::id()));
+    let output =
+        std::env::temp_dir().join(format!("probe-generation-{}.cubin", std::process::id()));
     let arch = std::env::var("UNISERVE_PROBE_ARCH").unwrap_or_else(|_| "sm_100a".to_owned());
     let status = Command::new("nvcc")
         .arg("-cubin")
@@ -264,21 +265,31 @@ fn a_rebound_bucket_launches_the_walk_s_parameters() {
          to `ops::capture`, so this bucket can never be rebound"
     );
     for (operator, captured_key, launch) in &nodes {
-        assert_eq!(*operator, Probe::NAME, "the launch was recorded under its operator");
-        assert_eq!(*captured_key, key, "the launch was recorded under its descriptor key");
+        assert_eq!(
+            *operator,
+            Probe::NAME,
+            "the launch was recorded under its operator"
+        );
+        assert_eq!(
+            *captured_key, key,
+            "the launch was recorded under its descriptor key"
+        );
         assert!(
             !launch.is_empty(),
             "the launch added no graph node: the captured graph would have nothing to rebind"
         );
     }
 
-    let captured = Captured::new(template, nodes, vec![kernel("probe_exact")])
-        .expect("a captured bucket");
+    let captured =
+        Captured::new(template, nodes, vec![kernel("probe_exact")]).expect("a captured bucket");
     assert!(
         captured.kernel_nodes() > 0,
         "the captured graph has no kernel node: `kernel_nodes` is what a release's counters read"
     );
-    assert!(captured.uses(Probe::NAME), "the graph launches the operator");
+    assert!(
+        captured.uses(Probe::NAME),
+        "the graph launches the operator"
+    );
     assert_eq!(
         captured.descriptors(Probe::NAME),
         vec![key.as_str()],
@@ -318,7 +329,10 @@ fn a_rebound_bucket_launches_the_walk_s_parameters() {
             }
         }
     }
-    assert!(!params.is_empty(), "the walk launched no kernel to take parameters from");
+    assert!(
+        !params.is_empty(),
+        "the walk launched no kernel to take parameters from"
+    );
     let applied = captured
         .rebind_launch(Probe::NAME, 0, &params)
         .expect("the bucket is rebound");
@@ -417,12 +431,8 @@ fn a_revert_after_a_recapture_replays_the_serving_generation_bitwise() {
             value: CAPTURED,
         },
     );
-    let serving = Captured::new(
-        serving_template,
-        serving_nodes,
-        vec![kernel("probe_exact")],
-    )
-    .expect("the serving generation's bucket");
+    let serving = Captured::new(serving_template, serving_nodes, vec![kernel("probe_exact")])
+        .expect("the serving generation's bucket");
     let reference = replay(&serving, &serving_buffer);
     assert_eq!(
         reference,
@@ -516,7 +526,11 @@ fn a_revert_after_a_recapture_replays_the_serving_generation_bitwise() {
     let applied = rebound
         .rebind_launch(Probe::NAME, 0, &params)
         .expect("the prepared generation is rebound");
-    assert_eq!(applied, params.len(), "every kernel node of the launch is set");
+    assert_eq!(
+        applied,
+        params.len(),
+        "every kernel node of the launch is set"
+    );
     assert_eq!(
         replay(&rebound, &serving_buffer),
         vec![WALKED; WORDS],
@@ -582,11 +596,7 @@ fn a_commit_keeps_the_capture_an_unprepared_bucket_still_serves_from() {
             &stream,
             &Generation::new(
                 generation,
-                [KernelEntry::keyed(
-                    Probe::NAME,
-                    key.clone(),
-                    kernel(symbol),
-                )],
+                [KernelEntry::keyed(Probe::NAME, key.clone(), kernel(symbol))],
             ),
             &arena,
             &descriptor,
@@ -679,7 +689,10 @@ fn a_commit_keeps_the_capture_an_unprepared_bucket_still_serves_from() {
     let (bucket, served) = graphs
         .select(&untouched_shape, 2)
         .expect("the unprepared bucket still serves under the committed generation");
-    assert_eq!(bucket, untouched_bucket, "the smallest bucket that accepts the shape serves");
+    assert_eq!(
+        bucket, untouched_bucket,
+        "the smallest bucket that accepts the shape serves"
+    );
     // SAFETY: the fill lies inside the allocation the served graph addresses.
     unsafe { memset_d32(untouched_buffer.address(), 0, WORDS, &stream) }
         .expect("zero the activation");
@@ -751,11 +764,7 @@ fn a_revert_releases_the_whole_capture_set_of_the_failed_generation() {
             &stream,
             &Generation::new(
                 generation,
-                [KernelEntry::keyed(
-                    Probe::NAME,
-                    key.clone(),
-                    kernel(symbol),
-                )],
+                [KernelEntry::keyed(Probe::NAME, key.clone(), kernel(symbol))],
             ),
             &arena,
             &descriptor,

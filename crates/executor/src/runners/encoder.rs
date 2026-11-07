@@ -538,7 +538,12 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
     /// are written for this prompt alone, into pinned storage the device reads in place, and the
     /// walk reads them there. The arena is the stream's, whose bucket extents a graph of this runner
     /// addresses: nothing of a graph is live between its replays, so this walk may reuse it.
-    fn encode_vision(&mut self, bucket: Bucket, generation: u64, prompt: VisionPrompt) -> Result<()> {
+    fn encode_vision(
+        &mut self,
+        bucket: Bucket,
+        generation: u64,
+        prompt: VisionPrompt,
+    ) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
         let tokens = u32::try_from(self.ids.len())
@@ -555,8 +560,15 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         let tables = self.model.state_tables(&layout);
         let mut host = Vec::with_capacity(tables.len());
         for table in &tables {
-            host.push(vec![0_u8; usize::try_from(Tables::plan_bytes(std::slice::from_ref(table))?)
-                .map_err(|_| Error::Invalid("a table is larger than memory".into()))?]);
+            host.push(vec![
+                0_u8;
+                usize::try_from(Tables::plan_bytes(
+                    std::slice::from_ref(table)
+                )?)
+                .map_err(|_| Error::Invalid(
+                    "a table is larger than memory".into()
+                ))?
+            ]);
         }
         self.model
             .prepare_state(&EncoderPrompt { ids: &self.ids }, &layout, &mut host)
@@ -798,7 +810,12 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
         let generation = self.lifecycle.generation.number();
         let mut jobs = Vec::new();
         for bucket in self.capture_order() {
-            if self.lifecycle.graphs.captured_for(bucket, generation).is_none() {
+            if self
+                .lifecycle
+                .graphs
+                .captured_for(bucket, generation)
+                .is_none()
+            {
                 jobs.push(Job::Capture {
                     runner: self.id,
                     bucket,

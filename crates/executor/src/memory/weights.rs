@@ -391,7 +391,6 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
     }
 }
 
-
 /// `error` and every error that caused it, in the order they caused one another: a refusal of the
 /// Storage Server says why under the call that met it.
 fn with_causes(error: &dyn std::error::Error) -> String {

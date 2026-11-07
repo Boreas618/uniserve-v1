@@ -1394,7 +1394,12 @@ impl Cudnn {
         let mut exhausted = mode == HEURISTIC_MODE_B;
         if proposal.kept.is_empty() && !exhausted {
             exhausted = true;
-            proposal = self.configs(&operation.graph, MAX_ENGINE_CONFIGS, HEURISTIC_MODE_B, exact)?;
+            proposal = self.configs(
+                &operation.graph,
+                MAX_ENGINE_CONFIGS,
+                HEURISTIC_MODE_B,
+                exact,
+            )?;
         }
         if proposal.kept.is_empty() {
             let error = proposal.empty("this convolution");

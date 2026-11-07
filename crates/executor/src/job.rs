@@ -25,9 +25,7 @@ use ipc::PhaseId;
 use ops::Generation;
 use platform::DeviceId;
 
-use crate::batch::{
-    Batch, BatchOutput, Job, JobKind, Submission, SubmissionId, SubmissionState,
-};
+use crate::batch::{Batch, BatchOutput, Job, JobKind, Submission, SubmissionId, SubmissionState};
 use crate::completion::Outcome;
 use crate::stream::events::{EventPool, JobId};
 use crate::{Error, Result, lock};
@@ -62,7 +60,10 @@ pub(crate) enum Command {
     Warmup,
     /// One queued step of a multi-job command: the jobs not yet performed (4.5's capture pass and
     /// precopy run one job per queue turn, so serving batches interleave with them).
-    Steps { generation: Option<u64>, jobs: Vec<Job> },
+    Steps {
+        generation: Option<u64>,
+        jobs: Vec<Job>,
+    },
     /// Prepare the next generation (7.3 step 2).
     Precopy(Arc<Generation>),
     /// Run one shadow batch: the paired forwards a scheduler's `shadow` pass built against the
@@ -360,7 +361,10 @@ impl JobQueue {
 
     /// Whether a command other than a join is pending.
     pub(crate) fn has_pending_besides_joins(&self) -> bool {
-        lock(&self.state).pending.iter().any(|entry| !is_join(entry))
+        lock(&self.state)
+            .pending
+            .iter()
+            .any(|entry| !is_join(entry))
     }
 
     /// The first pending command that is not a join, when only joins are ahead of it and `wanted`
@@ -392,7 +396,12 @@ impl JobQueue {
     /// Reports that `entry` ended with `result`, and completes the submission that waited on it.
     ///
     /// A serving command hands over the step's output; every other command's output is empty.
-    pub(crate) fn complete(&self, entry: Entry, result: Result<BatchOutput>, detail: Option<String>) {
+    pub(crate) fn complete(
+        &self,
+        entry: Entry,
+        result: Result<BatchOutput>,
+        detail: Option<String>,
+    ) {
         {
             // The command in hand may already be the next one: a replay lands while the replay
             // launched behind it is the command the watchdog watches.
@@ -572,7 +581,10 @@ mod tests {
 
     fn queue() -> (Arc<JobQueue>, Arc<EventPool>) {
         let events = EventPool::new();
-        (JobQueue::new(platform::DeviceId(0), Arc::clone(&events)), events)
+        (
+            JobQueue::new(platform::DeviceId(0), Arc::clone(&events)),
+            events,
+        )
     }
 
     fn batch() -> Batch {
@@ -602,7 +614,9 @@ mod tests {
             .expect("a command is queued");
 
         assert!(submission.outcome().is_none(), "nothing performed yet");
-        let entry = queue.next(Some(Duration::from_millis(10))).expect("a command");
+        let entry = queue
+            .next(Some(Duration::from_millis(10)))
+            .expect("a command");
         assert_eq!(entry.kind, JobKind::Batch);
         assert!(queue.watchdog_is_running());
 
@@ -806,7 +820,9 @@ mod tests {
             .expect("queued");
 
         // The first capture succeeds and puts the rest of the command back at the tail.
-        let first = queue.next(Some(Duration::from_secs(1))).expect("the first step");
+        let first = queue
+            .next(Some(Duration::from_secs(1)))
+            .expect("the first step");
         let remaining = match first.command.clone() {
             Command::Steps { generation, jobs } => Command::Steps {
                 generation,
@@ -821,7 +837,9 @@ mod tests {
         );
 
         // The second one fails, and that is the whole command's answer.
-        let second = queue.next(Some(Duration::from_secs(1))).expect("the next step");
+        let second = queue
+            .next(Some(Duration::from_secs(1)))
+            .expect("the next step");
         assert_ne!(second.id, first.id, "the next step is the requeued one");
         queue.complete(second, Err(Error::State("the second capture failed")), None);
         assert!(
@@ -858,7 +876,9 @@ mod tests {
             )
             .expect("queued");
 
-        let first = queue.next(Some(Duration::from_secs(1))).expect("the first step");
+        let first = queue
+            .next(Some(Duration::from_secs(1)))
+            .expect("the first step");
         let remaining = match first.command.clone() {
             Command::Steps { generation, jobs } => Command::Steps {
                 generation,
@@ -869,7 +889,9 @@ mod tests {
         queue.requeue(&first, remaining).expect("the remainder");
 
         // The entry that ends the command arrived from a requeue, never from `submit`.
-        let last = queue.next(Some(Duration::from_secs(1))).expect("the last step");
+        let last = queue
+            .next(Some(Duration::from_secs(1)))
+            .expect("the last step");
         assert_ne!(last.id, first.id, "the last step is the requeued one");
         assert!(
             matches!(last.command, Command::Steps { ref jobs, .. } if jobs.len() == 1),
@@ -900,9 +922,10 @@ mod tests {
         queue.close();
         assert!(queue.next(Some(Duration::from_millis(10))).is_none());
         assert!(
-            queue.push(Command::Purge(3), None, JobKind::Purge, None).is_err(),
+            queue
+                .push(Command::Purge(3), None, JobKind::Purge, None)
+                .is_err(),
             "a closed queue takes no command"
         );
     }
 }
-

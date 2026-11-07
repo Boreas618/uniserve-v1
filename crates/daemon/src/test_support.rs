@@ -375,7 +375,10 @@ pub(crate) async fn send(
         use crate::http::stream::Opened;
         let opened = tokio::time::timeout(STALL, handed.stream.opened()).await;
         let opened = opened.unwrap_or_else(|_| {
-            panic!("{waited}'s document did not open within {} s", STALL.as_secs())
+            panic!(
+                "{waited}'s document did not open within {} s",
+                STALL.as_secs()
+            )
         });
         match opened {
             Opened::Frame(frame) => frame.to_vec(),

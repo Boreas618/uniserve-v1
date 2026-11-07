@@ -711,19 +711,13 @@ fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
         )
         .unwrap();
 
-        assert_eq!(
-            response.prompt_logprobs, !stream,
-            "stream={stream}"
-        );
+        assert_eq!(response.prompt_logprobs, !stream, "stream={stream}");
         assert_eq!(
             generation.sampling.prompt_logprobs_requested(),
             !stream,
             "stream={stream}"
         );
-        assert_eq!(
-            generation.cache.read, stream,
-            "stream={stream}"
-        );
+        assert_eq!(generation.cache.read, stream, "stream={stream}");
     }
 }
 
@@ -760,19 +754,26 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
 fn a_chat_request_for_image_output_is_refused_by_name() {
     let (_directory, _tokenizer, processor) = resolved_model(ModelDescription::Qwen3, "qwen3");
     for modalities in [vec!["image"], vec!["text", "image"]] {
-        let request: daemon::openai::ChatCompletionRequest = serde_json::from_value(
-            serde_json::json!({
+        let request: daemon::openai::ChatCompletionRequest =
+            serde_json::from_value(serde_json::json!({
                 "model": SERVED_MODEL,
                 "messages": [{"role": "user", "content": "draw a bird"}],
                 "modalities": modalities,
-            }),
+            }))
+            .unwrap();
+        let error = preprocess_chat(
+            &processor,
+            String::from("image-output"),
+            request,
+            Vec::new(),
         )
-        .unwrap();
-        let error = preprocess_chat(&processor, String::from("image-output"), request, Vec::new())
-            .err()
-            .unwrap_or_else(|| panic!("{modalities:?} was admitted"));
+        .err()
+        .unwrap_or_else(|| panic!("{modalities:?} was admitted"));
         let message = error.to_error_response().error.message;
-        assert!(message.contains("image_output"), "{modalities:?}: {message}");
+        assert!(
+            message.contains("image_output"),
+            "{modalities:?}: {message}"
+        );
     }
 }
 
@@ -829,9 +830,7 @@ fn negative_seeds_and_logprob_counts_are_reinterpreted() {
         let (request, _) = preprocess_chat(
             &model,
             String::from("sampling"),
-            chat_request(
-                serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1}),
-            ),
+            chat_request(serde_json::json!({"seed": seed, "logprobs": true, "top_logprobs": -1})),
             Vec::new(),
         )
         .unwrap();

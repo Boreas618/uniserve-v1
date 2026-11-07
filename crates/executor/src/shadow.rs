@@ -247,7 +247,8 @@ pub fn compare_buffers(
             // selected as the widest and named rather than dropped by a comparison that would
             // answer false for it.
             let difference = (reference - candidate).abs();
-            let wider = widest.is_none_or(|(_, _, _, widest)| difference.total_cmp(&widest).is_gt());
+            let wider =
+                widest.is_none_or(|(_, _, _, widest)| difference.total_cmp(&widest).is_gt());
             if wider {
                 widest = Some((index, reference, candidate, difference));
             }
@@ -278,7 +279,6 @@ fn missing(offset: usize, width: usize) -> Error {
         "a twin buffer has no element of {width} bytes at offset {offset}"
     ))
 }
-
 
 fn bf16_to_f32(bytes: &[u8]) -> f32 {
     f32::from_bits((u16::from_ne_bytes([bytes[0], bytes[1]]) as u32) << 16)
@@ -371,7 +371,6 @@ pub fn tolerance_of<O: ops::Op>(descriptor: &O::Descriptor) -> Tolerance {
 /// The harness's twin region, for a model that writes through it.
 pub type Region = Arc<Twins>;
 
-
 /// The cache slots a paired forward writes: the same tokens as the served batch, in the scratch
 /// set's own numbering.
 ///
@@ -407,7 +406,7 @@ pub fn scratch_slot_mapping(
         _ => {
             return Err(Error::Invariant(
                 "the batch's offsets, positions and slots describe different token counts".into(),
-            ))
+            ));
         }
     }
     let rows = query_offsets.len() - 1;
@@ -429,10 +428,7 @@ pub fn scratch_slot_mapping(
                     "token {token} writes cache page {position} of the batch, which is no position"
                 )));
             }
-            let (page, offset) = (
-                position as u32 / page_size,
-                position as u32 % page_size,
-            );
+            let (page, offset) = (position as u32 / page_size, position as u32 % page_size);
             if page >= pages {
                 return Err(Error::Invalid(format!(
                     "row {row} writes position {position}, which needs page {page} of a scratch \
@@ -499,7 +495,10 @@ mod tests {
     }
 
     fn f32s(values: &[f32]) -> Vec<u8> {
-        values.iter().flat_map(|value| value.to_ne_bytes()).collect()
+        values
+            .iter()
+            .flat_map(|value| value.to_ne_bytes())
+            .collect()
     }
 
     /// The old and the new kernel agreeing exactly is a passing comparison, and the count is the
@@ -532,14 +531,9 @@ mod tests {
     /// a page and none of them names a resident slot.
     #[test]
     fn a_paired_forward_writes_its_own_scratch_pages() {
-        let mapping = scratch_slot_mapping(
-            &[5, 6, 7, 0, 1],
-            &[0, 3, 5],
-            &[10, 11, 12, 20, 21],
-            2,
-            4,
-        )
-        .expect("every token fits the set");
+        let mapping =
+            scratch_slot_mapping(&[5, 6, 7, 0, 1], &[0, 3, 5], &[10, 11, 12, 20, 21], 2, 4)
+                .expect("every token fits the set");
         // Row 0: positions 5..8 are page 1, offsets 1..3. Row 1: positions 0..2, page 0.
         assert_eq!(mapping, vec![5, 6, 7, 8, 9]);
     }
@@ -565,7 +559,11 @@ mod tests {
         let mapping = scratch_column(&[0, 1, 2], &[0, 3], &[10, 11, 12], 3, 8, 2, 4)
             .expect("three tokens of an eight-token bucket");
         assert_eq!(mapping.len(), 8);
-        assert_eq!(&mapping[..3], &[0, 1, 2], "the batch's own tokens keep their pages");
+        assert_eq!(
+            &mapping[..3],
+            &[0, 1, 2],
+            "the batch's own tokens keep their pages"
+        );
         assert!(
             mapping[3..].iter().all(|slot| *slot < 0),
             "the bucket's tail names no page: {mapping:?}"
@@ -600,12 +598,17 @@ mod tests {
     #[test]
     fn nans_agree_only_with_nans() {
         let nans = f32s(&[f32::NAN, f32::NAN]);
-        compare_buffers(DType::F32, 2, &nans, &nans, tolerance(0.0, 0.0))
-            .expect("two NaNs agree");
+        compare_buffers(DType::F32, 2, &nans, &nans, tolerance(0.0, 0.0)).expect("two NaNs agree");
 
         let numbers = f32s(&[1.0, 1.0]);
-        compare_buffers(DType::F32, 2, &nans, &numbers, tolerance(f32::INFINITY, 1.0))
-            .expect_err("a NaN against a number differs");
+        compare_buffers(
+            DType::F32,
+            2,
+            &nans,
+            &numbers,
+            tolerance(f32::INFINITY, 1.0),
+        )
+        .expect_err("a NaN against a number differs");
     }
 
     /// Elements are compared in their own dtype's value domain: the same numerical value written as
@@ -616,14 +619,8 @@ mod tests {
         let ones = f32s(&[1.0]);
         let bf16_one = 0x3f80u16.to_ne_bytes().to_vec();
         compare_buffers(DType::F32, 1, &ones, &ones, tolerance(0.0, 0.0)).expect("f32 agrees");
-        compare_buffers(
-            DType::BF16,
-            1,
-            &bf16_one,
-            &bf16_one,
-            tolerance(0.0, 0.0),
-        )
-        .expect("bf16 agrees");
+        compare_buffers(DType::BF16, 1, &bf16_one, &bf16_one, tolerance(0.0, 0.0))
+            .expect("bf16 agrees");
 
         // The bf16 value next to 1.0 (one unit in the last place) differs from 1.0 by 2^-7.
         let next = 0x3f81u16.to_ne_bytes().to_vec();
@@ -641,5 +638,4 @@ mod tests {
         compare_buffers(DType::F32, 2, &real, &short, tolerance(0.0, 0.0))
             .expect_err("a short copy is refused");
     }
-
 }

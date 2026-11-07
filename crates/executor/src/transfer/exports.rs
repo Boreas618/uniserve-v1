@@ -232,7 +232,7 @@ pub fn release(locations: &[Location]) -> Result<()> {
 mod tests {
     use std::collections::HashSet;
 
-    use ipc::{TransferTransport, MainProcessEndpoint};
+    use ipc::{MainProcessEndpoint, TransferTransport};
 
     use super::*;
     use crate::memory::allocation::Backing;

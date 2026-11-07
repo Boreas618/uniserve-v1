@@ -165,7 +165,9 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
     let mut rejections = Vec::new();
     for index in 0..2 {
         let mut events = engine
-            .submit(proto::request::Request::Diffusion(video_request(10_000 + index)))
+            .submit(proto::request::Request::Diffusion(video_request(
+                10_000 + index,
+            )))
             .expect("the submission is accepted");
         let event = next(&mut events, "an unsupported media request");
         assert!(

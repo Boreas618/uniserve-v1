@@ -98,15 +98,15 @@ mod info;
 mod media;
 mod output;
 mod parallel;
-mod request;
-mod tensor;
-mod transfer;
 /// The first frame between main processes of one epoch (§2.3).
 pub mod peer;
 /// The scheduler's name for one phase (§4.5).
 pub mod phase;
 pub mod product;
 pub mod program;
+mod request;
+mod tensor;
+mod transfer;
 /// The vocabulary of a program-layer update (§7.3).
 pub mod update;
 
@@ -125,6 +125,9 @@ pub use parallel::{
     ComponentConfig, ComponentDistribution, ComponentWeights, HeadProjection, ParallelConfig,
     ParallelConfigError, SequenceParallel,
 };
+pub use peer::{PeerAccepted, PeerRegistration, VERSION};
+pub use phase::PhaseId;
+pub use program::ProgramCommand;
 pub use proto::report::{FENCE_BUCKETS_US, FenceHistogram, ForwardStats};
 pub use proto::request::{
     CanvasSampling, CfgRenorm, CfgRenormParseError, DiffusionSamplingParams, ImageParams,
@@ -135,6 +138,3 @@ pub use request::*;
 pub use tensor::*;
 pub use transfer::*;
 pub use update::{ProgramStatus, UpdateFailure};
-pub use peer::{PeerAccepted, PeerRegistration, VERSION};
-pub use phase::PhaseId;
-pub use program::ProgramCommand;

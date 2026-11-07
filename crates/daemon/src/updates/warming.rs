@@ -211,7 +211,9 @@ mod tests {
             vec![prefix(4200, 4160)],
         ];
         let (ask, budgets) = source(reads.clone());
-        let warming = warm(ask, None, Some(128), 0, LIMIT).await.expect("it warms");
+        let warming = warm(ask, None, Some(128), 0, LIMIT)
+            .await
+            .expect("it warms");
         assert_eq!(warming.rounds, 3);
         assert!(warming.prefill_limited);
         assert_eq!(*budgets.lock().expect("the budgets"), vec![Some(128)]);

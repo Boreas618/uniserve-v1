@@ -247,7 +247,11 @@ fn frame_rule(args: &Value) -> Result<FrameClips, Refusal> {
     let values = args
         .get("frame_rule")
         .and_then(Value::as_array)
-        .ok_or_else(|| Refusal::value("frame_rule is [min_frames, clip_frames, clip_latent_frames, tail_latent_frames]"))?;
+        .ok_or_else(|| {
+            Refusal::value(
+                "frame_rule is [min_frames, clip_frames, clip_latent_frames, tail_latent_frames]",
+            )
+        })?;
     if values.len() != counts.len() {
         return Err(Refusal::value(
             "frame_rule is [min_frames, clip_frames, clip_latent_frames, tail_latent_frames]",
@@ -270,7 +274,9 @@ fn served_canvases(args: &Value) -> Result<Vec<ServedCanvas>, Refusal> {
     let entries = args
         .get("canvases")
         .and_then(Value::as_array)
-        .ok_or_else(|| Refusal::value("canvases is [[short_edge, aspect_ratio, width, height], ...]"))?;
+        .ok_or_else(|| {
+            Refusal::value("canvases is [[short_edge, aspect_ratio, width, height], ...]")
+        })?;
     entries
         .iter()
         .map(|entry| {
@@ -314,11 +320,11 @@ fn number(args: &Value, name: &str) -> Result<f64, Refusal> {
 fn optional_number(args: &Value, name: &str) -> Result<Option<f64>, Refusal> {
     match args.get(name) {
         None | Some(Value::Null) => Ok(None),
-        Some(value) => Ok(Some(
-            value
-                .as_f64()
-                .ok_or_else(|| Refusal::value(format!("{name} is a number")))?,
-        )),
+        Some(value) => {
+            Ok(Some(value.as_f64().ok_or_else(|| {
+                Refusal::value(format!("{name} is a number"))
+            })?))
+        }
     }
 }
 

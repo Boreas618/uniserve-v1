@@ -203,12 +203,7 @@ impl HeadsToRows {
             Shape::new(&block),
             nn::Strides::new(&[local, members * local, local, 1]),
         );
-        let strides = [
-            local as i64,
-            (members * local) as i64,
-            local as i64,
-            1,
-        ];
+        let strides = [local as i64, (members * local) as i64, local as i64, 1];
         Ok(CopyBlock::new(out.dtype)?.forward_wide(f, source, destination, &strides)?)
     }
 }
@@ -475,7 +470,13 @@ impl Dense {
         .sectioned(Sections::new(rotated_axes)?)?;
 
         let head_projection = |loader: &mut WeightLoader<'_>, name: &str| {
-            HeadProjection::load(loader, &format!("{prefix}.{name}"), inner, hidden, partition)
+            HeadProjection::load(
+                loader,
+                &format!("{prefix}.{name}"),
+                inner,
+                hidden,
+                partition,
+            )
         };
         Ok(Self {
             query: head_projection(loader, "to_q.weight")?,
@@ -527,7 +528,13 @@ impl Dense {
         out: TensorView,
     ) -> Result<()> {
         let exchange = self.exchange.as_ref();
-        let rows = projected_rows(f, exchange, self.projection, normalized, scratch.gathered_rows)?;
+        let rows = projected_rows(
+            f,
+            exchange,
+            self.projection,
+            normalized,
+            scratch.gathered_rows,
+        )?;
         self.query
             .forward(f, exchange, rows, scratch.staging, scratch.query)?;
         self.key

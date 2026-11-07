@@ -686,20 +686,18 @@ fn read_conditions(
     let mut patches_at = 0_usize;
     let patch_bytes = usize::try_from(
         u64::from(format.patch_width())
-            * format
-                .patch_dtype()
-                .bytes()
-                .ok_or_else(|| crate::Error::Invalid("a patch row has no whole-byte size".into()))?,
+            * format.patch_dtype().bytes().ok_or_else(|| {
+                crate::Error::Invalid("a patch row has no whole-byte size".into())
+            })?,
     )
     .map_err(|_| crate::Error::Invalid("a patch row is larger than memory".into()))?;
     for (index, condition) in conditions.iter().enumerate() {
         let read = &reads[index];
         if let Some((frames, canvas)) = condition.media.pixels() {
             let source = &rgb[read.pixels.start * 3..read.pixels.end * 3];
-            let region = regions
-                .pixels
-                .as_mut()
-                .ok_or_else(|| crate::Error::Invalid("a condition's pixels have no region".into()))?;
+            let region = regions.pixels.as_mut().ok_or_else(|| {
+                crate::Error::Invalid("a condition's pixels have no region".into())
+            })?;
             // SAFETY: nothing reads the region before this call publishes it, and it was allocated
             // for this request alone.
             let floats = unsafe { region.as_mut_slice() };
@@ -726,8 +724,9 @@ fn read_conditions(
         }
         if let Some(vision) = &condition.vision {
             let grid = [vision.grid.t, vision.grid.h, vision.grid.w];
-            let rows = usize::try_from(vision.grid.patches())
-                .map_err(|_| crate::Error::Invalid("a vision block is larger than memory".into()))?;
+            let rows = usize::try_from(vision.grid.patches()).map_err(|_| {
+                crate::Error::Invalid("a vision block is larger than memory".into())
+            })?;
             let region = regions
                 .patches
                 .as_mut()
@@ -787,7 +786,13 @@ fn condition_rows(
     out: &mut [f32],
 ) -> Result<()> {
     format
-        .condition_pixels(rgb, frames, canvas.height, canvas.width, &mut out[..rgb.len()])
+        .condition_pixels(
+            rgb,
+            frames,
+            canvas.height,
+            canvas.width,
+            &mut out[..rgb.len()],
+        )
         .map_err(crate::Error::from)
 }
 
@@ -912,11 +917,9 @@ impl MediaStage {
             Ok(Some(platform::PinnedBuffer::new(self.device, bytes)?))
         };
         let row = u64::from(self.format.patch_width())
-            * self
-                .format
-                .patch_dtype()
-                .bytes()
-                .ok_or_else(|| crate::Error::Invalid("a patch row has no whole-byte size".into()))?;
+            * self.format.patch_dtype().bytes().ok_or_else(|| {
+                crate::Error::Invalid("a patch row has no whole-byte size".into())
+            })?;
         let float = ops::DType::F32
             .bytes()
             .ok_or_else(|| crate::Error::Invalid("an FP32 has no whole-byte size".into()))?;
@@ -956,9 +959,10 @@ impl MediaStage {
             let patch = |buffer: &platform::PinnedBuffer| -> Result<ops::TensorView> {
                 let dtype = format.patch_dtype();
                 let width = u64::from(format.patch_width());
-                let row = width * dtype.bytes().ok_or_else(|| {
-                    crate::Error::Invalid("a patch row has no whole-byte size".into())
-                })?;
+                let row = width
+                    * dtype.bytes().ok_or_else(|| {
+                        crate::Error::Invalid("a patch row has no whole-byte size".into())
+                    })?;
                 Ok(ops::TensorView::new(
                     ops::DevicePtr::new(buffer.address()),
                     dtype,
@@ -1048,10 +1052,7 @@ impl MediaStage {
                 forward_stats: None,
             });
         }
-        let regions = prepared
-            .read
-            .as_ref()
-            .map(|read| Arc::clone(&read.regions));
+        let regions = prepared.read.as_ref().map(|read| Arc::clone(&read.regions));
         let mut work = MediaWork::new(
             Arc::clone(&self.output),
             prepared.request,
@@ -1308,9 +1309,9 @@ impl Runner for MediaStage {
             Variant::MediaRead,
             Variant::ConditionEncode,
         ]
-            .into_iter()
-            .map(crate::plan::Bucket::host)
-            .collect()
+        .into_iter()
+        .map(crate::plan::Bucket::host)
+        .collect()
     }
 
     /// The store the request's products are read from (4.5's executor-owned storage).
@@ -1560,9 +1561,11 @@ mod tests {
             ],
             "the first request's first unit, and the second's second"
         );
-        assert!(staged_calls
-            .iter()
-            .all(|staged_call| matches!(staged_call.product, Some(Product::Video(_)))));
+        assert!(
+            staged_calls
+                .iter()
+                .all(|staged_call| matches!(staged_call.product, Some(Product::Video(_))))
+        );
     }
 
     #[test]

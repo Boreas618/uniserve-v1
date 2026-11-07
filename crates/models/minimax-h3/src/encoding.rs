@@ -141,7 +141,10 @@ impl nn::capability::MediaFormat for ConditionFormat {
         let table = &table;
         let workers = workers();
         let band = area.div_ceil(workers.div_ceil(frames.max(1))).max(1);
-        let mut planes: Vec<_> = out.chunks_mut(area).map(|plane| plane.chunks_mut(band)).collect();
+        let mut planes: Vec<_> = out
+            .chunks_mut(area)
+            .map(|plane| plane.chunks_mut(band))
+            .collect();
         let mut bands = Vec::new();
         for frame in 0..frames {
             let mut first = frame * area;
@@ -249,7 +252,8 @@ impl nn::capability::MediaFormat for ConditionFormat {
                                 for y in 0..patch {
                                     let line = plane + (top + y) * width + left;
                                     for x in 0..patch {
-                                        let bits = table[channel * 256 + usize::from(planes[line + x])];
+                                        let bits =
+                                            table[channel * 256 + usize::from(planes[line + x])];
                                         out[at] = bits[0];
                                         out[at + 1] = bits[1];
                                         at += 2;
@@ -3422,7 +3426,16 @@ mod tests {
         // The rows of the first block are pixels (0,0), (0,1), (1,0), (1,1); the second block's
         // first row is pixel (0,2). A row is channel-major with its two frames inside a channel, and
         // the one frame fills both.
-        let order = [(0, 0), (0, 1), (1, 0), (1, 1), (0, 2), (0, 3), (1, 2), (1, 3)];
+        let order = [
+            (0, 0),
+            (0, 1),
+            (1, 0),
+            (1, 1),
+            (0, 2),
+            (0, 3),
+            (1, 2),
+            (1, 3),
+        ];
         for (index, (y, x)) in order.iter().enumerate() {
             for channel in 0..3 {
                 let expected = rounded(pixel((8 * channel + 4 * y + x) as u8));
@@ -3454,7 +3467,8 @@ mod tests {
         format
             .patches(&planes, 3, [2, 2, 2], &mut out)
             .expect("three frames fill two temporal patches");
-        let pixel = |byte: u8| f32::from_bits(u32::from(bfloat16((f32::from(byte) - 127.5) / 127.5)) << 16);
+        let pixel =
+            |byte: u8| f32::from_bits(u32::from(bfloat16((f32::from(byte) - 127.5) / 127.5)) << 16);
         // Inside a channel the tubelet holds its frames in order, four pixels each.
         assert_eq!(row_value(&out, 0), pixel(10));
         assert_eq!(row_value(&out, 4), pixel(20));
@@ -3475,7 +3489,12 @@ mod tests {
             .expect("one frame of two pixels");
         let first = normalize([255, 0, 128]);
         let second = normalize([0, 255, 128]);
-        assert_eq!(out, [first[0], second[0], first[1], second[1], first[2], second[2]]);
+        assert_eq!(
+            out,
+            [
+                first[0], second[0], first[1], second[1], first[2], second[2]
+            ]
+        );
 
         assert_eq!(format.track_samples(801).expect("a whole frame"), 1600);
         let pcm = [1.0_f32, -1.0, 2.0, -2.0];
@@ -4093,7 +4112,10 @@ mod tests {
             let spans = clip.spans(frames).unwrap();
             let last = spans.last().unwrap();
             assert_eq!(last.first + last.frames, frames);
-            assert_eq!(last.latent + last.latents, clip.latent_frames(frames).unwrap());
+            assert_eq!(
+                last.latent + last.latents,
+                clip.latent_frames(frames).unwrap()
+            );
         }
     }
 

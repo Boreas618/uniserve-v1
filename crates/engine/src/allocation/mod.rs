@@ -15,7 +15,7 @@
 //! returns it to the right one. `CacheAllocation` has no `free`: its units return
 //! to the `BlockPool` when its tables drop.
 
-use ipc::{RequestKey, MainProcessInfo};
+use ipc::{MainProcessInfo, RequestKey};
 
 mod bytes;
 pub(crate) use bytes::ByteAllocator;

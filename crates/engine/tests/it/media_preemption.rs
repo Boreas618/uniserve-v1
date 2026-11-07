@@ -24,8 +24,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use engine::{
     BatchEvent, BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Executor,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, Request, SchedulerConfig, SimEngine,
-    SimExecutor, Trajectory, ExecutorGroupId,
+    ExecutorError, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, Request, SchedulerConfig,
+    SimEngine, SimExecutor, Trajectory,
 };
 use ipc::{
     CallKind, LatentPageCopy, LatentPoolInfo, LatentPoolRef, LatentRestore, MediaCall,

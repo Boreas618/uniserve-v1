@@ -753,12 +753,19 @@ mod tests {
     #[test]
     fn a_stream_reserves_what_its_runner_claimed() {
         let mut ledger = Ledger::new(100, 400);
-        ledger.claim(StreamId(1), 300).expect("a claim before the range maps");
+        ledger
+            .claim(StreamId(1), 300)
+            .expect("a claim before the range maps");
         assert_eq!(ledger.reservation_of(StreamId(1)), 300);
         assert_eq!(ledger.reservation_of(StreamId(2)), 100);
         ledger.open(StreamId(1)).expect("the claimed range fits");
-        ledger.open(StreamId(2)).expect("the even share fits beside it");
-        assert!(ledger.open(StreamId(3)).is_err(), "a third range passes the budget");
+        ledger
+            .open(StreamId(2))
+            .expect("the even share fits beside it");
+        assert!(
+            ledger.open(StreamId(3)).is_err(),
+            "a third range passes the budget"
+        );
         assert!(
             ledger.claim(StreamId(1), 301).is_err(),
             "a mapped range cannot grow"

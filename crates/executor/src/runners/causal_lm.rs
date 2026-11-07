@@ -48,12 +48,12 @@ fn draw_uniforms(seed: &std::cell::Cell<u64>, draws: &mut Vec<f32>, rows: usize)
     seed.set(state);
 }
 
+use crate::graph::Graphs;
 #[cfg(test)]
 use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
-use crate::runners::columns::{encode_f32, encode_i32, Column};
-use crate::graph::Graphs;
-use crate::runners::lifecycle::{walk_capture, Lifecycle};
+use crate::runners::columns::{Column, encode_f32, encode_i32};
+use crate::runners::lifecycle::{Lifecycle, walk_capture};
 
 /// The capture sink, at the path the device tests of the rebind mechanism import it from.
 pub use crate::runners::lifecycle::Recording;
@@ -102,7 +102,8 @@ impl Staging {
             .ok_or_else(|| Error::Invalid("the runner has no bucket to serve".into()))?;
         self.input_ids = vec![0; largest.tokens as usize];
         self.slots = vec![0; largest.rows as usize];
-        self.parameters = vec![0.0; largest.rows as usize * ops::sampler::PARAMETER_COLUMNS as usize];
+        self.parameters =
+            vec![0.0; largest.rows as usize * ops::sampler::PARAMETER_COLUMNS as usize];
         // The commit table's height is ops' business; `reserve` leaves it empty and `stage` sizes
         // it to whatever the mechanism wrote, which `check` has already validated.
         self.commit = Vec::new();
@@ -153,7 +154,9 @@ impl Staging {
             self.input_ids[index] = 0;
         }
         self.rows.clear();
-        self.rows.positions.extend_from_slice(&columns.rows.positions);
+        self.rows
+            .positions
+            .extend_from_slice(&columns.rows.positions);
         self.rows.positions.resize(bucket_tokens, 0);
         for index in tokens..bucket_tokens {
             self.rows.positions[index] = 0;
@@ -235,7 +238,12 @@ impl Staging {
                 .ok_or_else(|| Error::Invariant("the batch states no query offsets".into()))?;
             self.rows.query_offsets.push(end);
         }
-        let mut owned = self.rows.calls.last().map(|call| call.rows.end).unwrap_or(0);
+        let mut owned = self
+            .rows
+            .calls
+            .last()
+            .map(|call| call.rows.end)
+            .unwrap_or(0);
         while (owned as usize) < bucket_rows {
             let start = owned;
             owned += 1;
@@ -424,26 +432,66 @@ impl Columns {
     /// two addresses a captured copy states are comparable against these.
     fn named(&self) -> Vec<(&'static str, u64, usize)> {
         vec![
-            ("positions", self.positions.device.ptr.address(), self.positions.host.len()),
-            ("input_ids", self.input_ids.device.ptr.address(), self.input_ids.host.len()),
-            ("slot_mapping", self.slot_mapping.device.ptr.address(), self.slot_mapping.host.len()),
+            (
+                "positions",
+                self.positions.device.ptr.address(),
+                self.positions.host.len(),
+            ),
+            (
+                "input_ids",
+                self.input_ids.device.ptr.address(),
+                self.input_ids.host.len(),
+            ),
+            (
+                "slot_mapping",
+                self.slot_mapping.device.ptr.address(),
+                self.slot_mapping.host.len(),
+            ),
             (
                 "scratch_slots",
                 self.scratch_slots.device.ptr.address(),
                 self.scratch_slots.host.len(),
             ),
-            ("seq_lens", self.seq_lens.device.ptr.address(), self.seq_lens.host.len()),
+            (
+                "seq_lens",
+                self.seq_lens.device.ptr.address(),
+                self.seq_lens.host.len(),
+            ),
             (
                 "query_offsets",
                 self.query_offsets.device.ptr.address(),
                 self.query_offsets.host.len(),
             ),
-            ("logits_rows", self.logits_rows.device.ptr.address(), self.logits_rows.host.len()),
-            ("indices", self.indices.device.ptr.address(), self.indices.host.len()),
-            ("parameters", self.parameters.device.ptr.address(), self.parameters.host.len()),
-            ("slots", self.slots.device.ptr.address(), self.slots.host.len()),
-            ("draws", self.draws.device.ptr.address(), self.draws.host.len()),
-            ("live_tokens", self.live_tokens.device.ptr.address(), self.live_tokens.host.len()),
+            (
+                "logits_rows",
+                self.logits_rows.device.ptr.address(),
+                self.logits_rows.host.len(),
+            ),
+            (
+                "indices",
+                self.indices.device.ptr.address(),
+                self.indices.host.len(),
+            ),
+            (
+                "parameters",
+                self.parameters.device.ptr.address(),
+                self.parameters.host.len(),
+            ),
+            (
+                "slots",
+                self.slots.device.ptr.address(),
+                self.slots.host.len(),
+            ),
+            (
+                "draws",
+                self.draws.device.ptr.address(),
+                self.draws.host.len(),
+            ),
+            (
+                "live_tokens",
+                self.live_tokens.device.ptr.address(),
+                self.live_tokens.host.len(),
+            ),
         ]
     }
 
@@ -500,10 +548,7 @@ impl Columns {
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
                 platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
             ],
-            logits_row: platform::PinnedBuffer::new(
-                device,
-                (u64::from(vocabulary) * 4) as usize,
-            )?,
+            logits_row: platform::PinnedBuffer::new(device, (u64::from(vocabulary) * 4) as usize)?,
         })
     }
 }
@@ -529,11 +574,7 @@ fn inert_commit(rows: usize) -> Vec<i64> {
 /// `ops::commit` checks the table's leading stride against `stride`, every operand's type against
 /// `index`, and the block against `count`; the arithmetic is here, once, so a host test can state it
 /// without a device and the runner cannot drift from it.
-fn commit_descriptor(
-    capacity: u64,
-    block: u32,
-    vocabulary: u32,
-) -> ops::commit::CommitDescriptor {
+fn commit_descriptor(capacity: u64, block: u32, vocabulary: u32) -> ops::commit::CommitDescriptor {
     ops::commit::CommitDescriptor {
         // The table and the sampled ids are i32 end to end: `nn::Sampler` emits i32 tokens, and the
         // operator checks `tokens` against `index`.
@@ -670,7 +711,11 @@ impl CommitColumns {
     fn new(device: DeviceId, rows: u32, slots: u32) -> Result<Self> {
         let capacity = u64::from(rows.max(1));
         let mut columns = Self {
-            table: Column::new(device, DType::I32, u64::from(ops::commit::COMMIT_FIELDS as u32) * capacity)?,
+            table: Column::new(
+                device,
+                DType::I32,
+                u64::from(ops::commit::COMMIT_FIELDS as u32) * capacity,
+            )?,
             valid: Column::new(device, DType::I32, capacity)?,
             active: Column::new(device, DType::I32, capacity)?,
             continuation: Column::new(device, DType::U8, capacity)?,
@@ -703,7 +748,12 @@ impl CommitColumns {
         columns.active.write(&encoded)?;
         let zeros = vec![0_i32; slots.max(1) as usize];
         encode_i32(&mut encoded, &zeros);
-        for column in [&mut columns.logical, &mut columns.sampling, &mut columns.verified, &mut columns.future] {
+        for column in [
+            &mut columns.logical,
+            &mut columns.sampling,
+            &mut columns.verified,
+            &mut columns.future,
+        ] {
             column.write(&encoded)?;
         }
         let zeros_i32 = vec![0_i32; capacity as usize];
@@ -768,7 +818,6 @@ impl CommitColumns {
     fn logical_ptr(&self) -> ops::DevicePtr {
         self.logical.device.ptr
     }
-
 
     /// The bytes one readback buffer holds, which bounds what one copy may read.
     fn readback_len(&self) -> usize {
@@ -874,7 +923,10 @@ fn row_classes(rows: &nn::BatchRows) -> String {
             nn::RowKind::Decode => "decode",
             nn::RowKind::Verify => "verify",
         };
-        classes.push(format!("rows {}..{} {kind}", call.rows.start, call.rows.end));
+        classes.push(format!(
+            "rows {}..{} {kind}",
+            call.rows.start, call.rows.end
+        ));
     }
     let mixed = rows
         .calls
@@ -1133,7 +1185,12 @@ fn launch_difference(
             .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap_or([0; 8])))
             .unwrap_or(0)
     };
-    for (index, (replay, live)) in captured.parameters.iter().zip(&walked.parameters).enumerate() {
+    for (index, (replay, live)) in captured
+        .parameters
+        .iter()
+        .zip(&walked.parameters)
+        .enumerate()
+    {
         if replay.len() != live.len() {
             return Some(format!(
                 "argument {index}: replay={} bytes walk={} bytes",
@@ -1141,7 +1198,11 @@ fn launch_difference(
                 live.len()
             ));
         }
-        if let Some(at) = replay.iter().zip(live).position(|(left, right)| left != right) {
+        if let Some(at) = replay
+            .iter()
+            .zip(live)
+            .position(|(left, right)| left != right)
+        {
             return Some(format!(
                 "argument {index} byte {at}: replay={:#x} walk={:#x}",
                 word(replay, at),
@@ -1376,8 +1437,9 @@ impl Sampling {
         let bytes = u64::from(geometry.slots) * u64::from(geometry.vocabulary) * 4;
         let allocation = platform::DeviceAllocation::linear(
             device,
-            usize::try_from(bytes)
-                .map_err(|_| Error::Invalid("the sampler's count table is larger than memory".into()))?,
+            usize::try_from(bytes).map_err(|_| {
+                Error::Invalid("the sampler's count table is larger than memory".into())
+            })?,
         )?;
         // The table starts at zero: a slot has seen no token before its first call. Zeroing is a
         // bind-time copy, not a step's, so a chunked upload from pinned memory is enough.
@@ -1405,10 +1467,7 @@ impl Sampling {
         let counts = TensorView::new(
             ops::DevicePtr::new(allocation.address()),
             DType::I32,
-            ops::Shape::new(&[
-                u64::from(geometry.slots),
-                u64::from(geometry.vocabulary),
-            ]),
+            ops::Shape::new(&[u64::from(geometry.slots), u64::from(geometry.vocabulary)]),
         );
         Ok(Self {
             sampler,
@@ -1460,8 +1519,7 @@ fn apply_cache_units_unavailable(units: &[ipc::CacheUnitAllocation]) -> Result<(
 /// clamped: a read past the column leaves the driver's error on the runner's stream, and a read of
 /// the wrong type prints numbers that are not page indices.
 fn table_readback_fits(view: &ops::TensorView, bytes: usize) -> bool {
-    view.dtype == ops::DType::I32
-        && view.byte_len().is_ok_and(|length| length >= bytes as u64)
+    view.dtype == ops::DType::I32 && view.byte_len().is_ok_and(|length| length >= bytes as u64)
 }
 
 /// The bytes a page readback covers, or the reason there is none.
@@ -1477,7 +1535,9 @@ fn page_readback_range(
     bytes: usize,
 ) -> std::result::Result<u64, String> {
     if plane_bytes < bytes as i64 {
-        return Err(format!("plane holds {plane_bytes} bytes, a read wants {bytes}"));
+        return Err(format!(
+            "plane holds {plane_bytes} bytes, a read wants {bytes}"
+        ));
     }
     if unit < 0 || unit >= units {
         return Err(format!("unit {unit} outside {units}"));
@@ -1874,12 +1934,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .tables()
                 .width();
-            let pages = usize::try_from(
-                geometry
-                    .max_kv_len
-                    .div_ceil(kv.page_size().max(1)),
-            )
-            .unwrap_or(usize::MAX);
+            let pages = usize::try_from(geometry.max_kv_len.div_ceil(kv.page_size().max(1)))
+                .unwrap_or(usize::MAX);
             if width < pages {
                 return Err(Error::Invariant(format!(
                     "the cache's block-table rows are {width} pages wide and the attention \
@@ -2057,10 +2113,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     /// replay's state as it ends, so those wait. A union's ranks enter its steps in order on each
     /// device thread, so a step entered behind one in flight is the next step on every rank.
     fn overlaps_replays(&self) -> bool {
-        !runner_dump()
-            && !eager_replay()
-            && !recapture_real()
-            && !graph_diff()
+        !runner_dump() && !eager_replay() && !recapture_real() && !graph_diff()
     }
 
     /// A batch that keeps its logits answers its greedy rows on the host, and the next step reads
@@ -2143,7 +2196,8 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         let shape = batch.shape;
         batch.columns.check(&shape)?;
         let bucket = self.bucket_for(&shape)?;
-        self.staging.stage(&batch.columns, &batch.calls, &shape, bucket)?;
+        self.staging
+            .stage(&batch.columns, &batch.calls, &shape, bucket)?;
         // A shadow batch is a real batch: the same homogeneity rule applies to its rows.
         refuse_mixed_sampling(bucket.variant, self.staging.parameters(shape.rows as usize))?;
         // The operators whose kernel differs between the serving generation and the one the batch
@@ -2243,7 +2297,12 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
         // Largest first, so the smaller captures reuse the larger ones' pool blocks
         // (`specs/replaceable-processes.md` 9.3).
         for bucket in self.buckets.capture_order().copied().collect::<Vec<_>>() {
-            if self.lifecycle.graphs.captured_for(bucket, generation).is_none() {
+            if self
+                .lifecycle
+                .graphs
+                .captured_for(bucket, generation)
+                .is_none()
+            {
                 jobs.push(Job::Capture {
                     runner: self.id,
                     bucket,
@@ -2452,14 +2511,16 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         tracing::warn!(bucket = %bucket, %error, "the recapture of this batch failed");
                     }
                 }
-                let (served, captured) = self.lifecycle.graphs.captured_for(*bucket, *generation).ok_or_else(
-                    || {
-                        Error::Invariant(format!(
-                            "no graph of bucket {bucket} in generation {generation} or in a \
+                let (served, captured) = self
+                    .lifecycle
+                    .graphs
+                    .captured_for(*bucket, *generation)
+                    .ok_or_else(|| {
+                    Error::Invariant(format!(
+                        "no graph of bucket {bucket} in generation {generation} or in a \
                              generation it replaces"
-                        ))
-                    },
-                )?;
+                    ))
+                })?;
                 if served != *generation {
                     tracing::debug!(
                         bucket = %bucket,
@@ -2660,7 +2721,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             ))),
         }
     }
-
 }
 
 impl<M: CausalLm> CausalLmRunner<M> {
@@ -2681,7 +2741,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.capturing = true;
             let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
             self.capturing = false;
-            return self.lifecycle.capture(bucket, generation, walked?, &kernels);
+            return self
+                .lifecycle
+                .capture(bucket, generation, walked?, &kernels);
         }
         // The first capture of the first generation is where the exchange's program exists, and
         // every rank reaches it in step: their plans capture the same buckets in the same order.
@@ -2710,10 +2772,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
         if self.placed {
             return Ok(());
         }
-        let pools = self
-            .pools
-            .clone()
-            .ok_or(Error::State("a runner captures with the device's pools attached"))?;
+        let pools = self.pools.clone().ok_or(Error::State(
+            "a runner captures with the device's pools attached",
+        ))?;
         let device = self.device();
         let stream = self.stream.clone();
         let mut pools = pools
@@ -2855,7 +2916,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
         if let (Some(pose_blob), Some(real_blob)) =
             (pose.parameters.first(), real.parameters.first())
         {
-            differences.push(format!("pose_bytes={} real_bytes={}", pose_blob.len(), real_blob.len()));
+            differences.push(format!(
+                "pose_bytes={} real_bytes={}",
+                pose_blob.len(),
+                real_blob.len()
+            ));
             let words = pose_blob.len().min(real_blob.len()) / 8;
             for word in 0..words {
                 let at = word * 8;
@@ -2893,7 +2958,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .unwrap_or(0);
         let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
         let hidden = usize::try_from(self.geometry.hidden).unwrap_or(0);
-        let element = usize::try_from(self.geometry.hidden_dtype.bytes().unwrap_or(2).max(1)).unwrap_or(2);
+        let element =
+            usize::try_from(self.geometry.hidden_dtype.bytes().unwrap_or(2).max(1)).unwrap_or(2);
         let read = self.read_device(wrote, live.saturating_mul(hidden).saturating_mul(element));
         match read {
             Some(raw) if wrote != 0 => tracing::warn!(
@@ -3089,13 +3155,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         self.upload_scratch_slots(bucket, pages)?;
         let base = self.pool()?.base(self.stream_id())?;
-        let arena = nn::Arena::new(
-            ops::DevicePtr::new(base.address()),
-            self.pool()?.reserved(),
-        );
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), self.pool()?.reserved());
         let batch = self.token_batch_with(
             bucket,
-            self.columns.scratch_slots.extent(0..u64::from(bucket.tokens)),
+            self.columns
+                .scratch_slots
+                .extent(0..u64::from(bucket.tokens)),
         )?;
         let shadow = nn::forward::Shadow::new(operator, key, previous, twins);
         // The count bounds the MoE sort's padded rows: the paired forward gets the same column as
@@ -3189,7 +3254,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // the destination is this runner's pinned row buffer of that length, and the stream has
             // completed the launch that wrote it.
             unsafe {
-                platform::memcpy_async(self.columns.logits_row.address(), source, row_bytes, &self.stream)?;
+                platform::memcpy_async(
+                    self.columns.logits_row.address(),
+                    source,
+                    row_bytes,
+                    &self.stream,
+                )?;
             }
             self.stream.synchronize()?;
             // SAFETY: the copy above filled `width` f32 in the pinned row buffer, and the token
@@ -3215,13 +3285,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
             );
             // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
             unsafe {
-                *self.columns.readback[turn].as_ptr().cast::<i32>().add(row) =
-                    best as i32;
+                *self.columns.readback[turn].as_ptr().cast::<i32>().add(row) = best as i32;
             }
             // The graph committed its own draw as this slot's next input, and the next decode
             // embeds what the client was told.
             if let Ok(slot) = usize::try_from(slot) {
-                self.commit.set_next_input(slot, best as i32, &self.stream)?;
+                self.commit
+                    .set_next_input(slot, best as i32, &self.stream)?;
             }
         }
         Ok(())
@@ -3236,9 +3306,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // written with what is read.
         if let Some((page, line)) = self.pending_dump.take() {
             let bytes = self.dump_page_bytes(page);
-            let prefill = self.last_prefill.clone().unwrap_or_else(|| "none".to_owned());
+            let prefill = self
+                .last_prefill
+                .clone()
+                .unwrap_or_else(|| "none".to_owned());
             let arguments = self.dump_kernel_arguments(bucket);
-            let call = self.pending_attention.take().unwrap_or_else(|| "none".to_owned());
+            let call = self
+                .pending_attention
+                .take()
+                .unwrap_or_else(|| "none".to_owned());
             tracing::info!(
                 %line,
                 %arguments,
@@ -3371,7 +3447,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // turns a batch of nonsense tokens into a refusal at the first step that produced one.
         if let Some(row) = ids.iter().position(|id| {
             let id = *id;
-            id < 0 || u64::try_from(id).map(|id| id >= self.geometry.vocabulary as u64).unwrap_or(true)
+            id < 0
+                || u64::try_from(id)
+                    .map(|id| id >= self.geometry.vocabulary as u64)
+                    .unwrap_or(true)
         }) {
             // `-1` is the sentinel the dump fills the sampler's buffer with, so it says which of the
             // two things happened: no draw wrote this row, or a draw wrote a value outside the
@@ -3395,7 +3474,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
             logical,
             sampling,
         );
-        let calls = calls_output(ids, &flight.logits_rows, &flight.rows, &flight.calls, &states)?;
+        let calls = calls_output(
+            ids,
+            &flight.logits_rows,
+            &flight.rows,
+            &flight.calls,
+            &states,
+        )?;
         Ok(BatchOutput {
             calls,
             timing: TimingCounters {
@@ -3426,7 +3511,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
     ///
     /// The line is a string and the readback a page number, because the two are written on
     /// different threads: this runs at submit, on the scheduler's.
-    fn dump_batch(&mut self, bucket: Bucket, batch: &Batch, shape: &Shape, submit_ms: std::time::Duration) {
+    fn dump_batch(
+        &mut self,
+        bucket: Bucket,
+        batch: &Batch,
+        shape: &Shape,
+        submit_ms: std::time::Duration,
+    ) {
         let rows = shape.rows as usize;
         let tokens = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
         let page_of_slot = |slot: i32| -> Option<u32> {
@@ -3528,16 +3619,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
             return "no-cache".to_owned();
         };
         let planes = {
-            let cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let cache = cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             cache.views()
         };
         let Ok(planes) = planes else {
             return "no-views".to_owned();
         };
-        let Some((_, view)) = planes
-            .iter()
-            .find(|(name, _)| name == "key.values")
-        else {
+        let Some((_, view)) = planes.iter().find(|(name, _)| name == "key.values") else {
             let mut names = String::new();
             for (name, _) in &planes {
                 if !names.is_empty() {
@@ -3584,16 +3674,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // table names only the request's own pages, and the row's `seq_lens` bounds the read - so
         // a zero flag beside a wrong token says the page was never written, not that it was
         // masked.
-        match planes
-            .iter()
-            .find(|(name, _)| name == "key.initialized")
-        {
+        match planes.iter().find(|(name, _)| name == "key.initialized") {
             Some((_, flags)) => {
                 // The flag plane holds one byte per page, and the read is bounded by the plane's
                 // own extent for the reason every read here is.
                 let in_range = flags.dtype().to_ops() == Some(ops::DType::U8)
-                    && flags.shape().first().is_some_and(|&pages| pages > unit as i64)
-                    && flags.byte_len().is_ok_and(|length| length as u64 > unit as u64);
+                    && flags
+                        .shape()
+                        .first()
+                        .is_some_and(|&pages| pages > unit as i64)
+                    && flags
+                        .byte_len()
+                        .is_ok_and(|length| length as u64 > unit as u64);
                 if !in_range {
                     out.push_str(" init=out-of-range");
                     return out;
@@ -3642,11 +3734,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .and_then(|table| table.unit_ids.first())
             .map(|unit| u64::from(unit.0))
             .or(self.cache_page);
-        self.kv.install_block_tables(&install.tables, &self.stream)?;
+        self.kv
+            .install_block_tables(&install.tables, &self.stream)?;
         self.kv.apply_cache_units(&install.units, &self.stream)?;
-        self.offload_fence = self
-            .kv
-            .issue_pages(&install.loads, &install.offloads, &self.stream)?;
+        self.offload_fence =
+            self.kv
+                .issue_pages(&install.loads, &install.offloads, &self.stream)?;
         Ok(())
     }
 
@@ -3901,12 +3994,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 let pages_in_pool = at(LAYOUT.num_pages);
                 let bytes = (held * token_elements * element_bytes) as usize;
                 if base == 0 || pages as u64 >= pages_in_pool || bytes > (1 << 20) {
-                    digests.push_str(&format!(" {plane}={base:#x}/skipped(page {pages} of {pages_in_pool})"));
+                    digests.push_str(&format!(
+                        " {plane}={base:#x}/skipped(page {pages} of {pages_in_pool})"
+                    ));
                     continue;
                 }
                 let start = base + pages as u64 * page_elements * element_bytes;
-                let digest = match self.read_device(start, bytes)
-                {
+                let digest = match self.read_device(start, bytes) {
                     Some(raw) => format!("{:016x}", platform::fnv1a(&raw)),
                     None => "unreadable".to_owned(),
                 };
@@ -3942,7 +4036,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn decode_kernel_params(&self, bytes: &[u8]) -> String {
         const SIZE: usize = 1344;
         if bytes.len() < SIZE {
-            return format!("kparams blob={}B (not the {SIZE} of fmha::KernelParams)", bytes.len());
+            return format!(
+                "kparams blob={}B (not the {SIZE} of fmha::KernelParams)",
+                bytes.len()
+            );
         }
         let pointer = |at: usize| -> u64 {
             u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap_or([0; 8]))
@@ -4030,8 +4127,16 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 ));
             }
         }
-        out.push_str(&verdict("cum_q", pointer(936), self.columns.query_offsets.device.ptr.address()));
-        out.push_str(&verdict("seq_lens_kv", pointer(1096), self.columns.seq_lens.device.ptr.address()));
+        out.push_str(&verdict(
+            "cum_q",
+            pointer(936),
+            self.columns.query_offsets.device.ptr.address(),
+        ));
+        out.push_str(&verdict(
+            "seq_lens_kv",
+            pointer(1096),
+            self.columns.seq_lens.device.ptr.address(),
+        ));
         match self.kv.planes(0) {
             Ok(planes) => match planes.first() {
                 Some(first) => {
@@ -4104,19 +4209,28 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let mut out = String::from(" cache:");
         let first_elements = planes
             .first()
-            .map(|plane| plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3)))
+            .map(|plane| {
+                plane
+                    .key
+                    .shape
+                    .dim(2)
+                    .saturating_mul(plane.key.shape.dim(3))
+            })
             .unwrap_or(0);
         out.push_str(&format!(
             "(page {page}, {held} token(s), {} bytes each)",
             held.saturating_mul(first_elements).saturating_mul(element)
         ));
         for (layer, plane) in planes.iter().enumerate() {
-            let token_elements = plane.key.shape.dim(2).saturating_mul(plane.key.shape.dim(3));
+            let token_elements = plane
+                .key
+                .shape
+                .dim(2)
+                .saturating_mul(plane.key.shape.dim(3));
             let page_elements = page_size.saturating_mul(token_elements);
-            let bytes = usize::try_from(
-                held.saturating_mul(token_elements).saturating_mul(element),
-            )
-            .unwrap_or(0);
+            let bytes =
+                usize::try_from(held.saturating_mul(token_elements).saturating_mul(element))
+                    .unwrap_or(0);
             if bytes == 0 || token_elements == 0 {
                 continue;
             }
@@ -4130,8 +4244,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
             out.push_str(&format!(" layer{layer}="));
             for (name, view) in [("k", plane.key), ("v", plane.value)] {
-                let start = view.ptr.address()
-                    + page.saturating_mul(page_elements).saturating_mul(element);
+                let start =
+                    view.ptr.address() + page.saturating_mul(page_elements).saturating_mul(element);
                 match self.read_device(start, bytes) {
                     Some(raw) => out.push_str(&format!("{name}={:016x} ", platform::fnv1a(&raw))),
                     None => out.push_str(&format!("{name}=unreadable ")),
@@ -4150,11 +4264,19 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// device). The three are indistinguishable from the bound alone, and only the third faults.
     fn beyond_span(&self, live: u64, tokens: u64) -> String {
         let first = usize::try_from(live).unwrap_or(0);
-        let count = usize::try_from(tokens.saturating_sub(live)).unwrap_or(0).min(4096);
+        let count = usize::try_from(tokens.saturating_sub(live))
+            .unwrap_or(0)
+            .min(4096);
         if count == 0 {
             return "none".to_owned();
         }
-        let address = self.columns.slot_mapping.device.ptr.address().saturating_add((first as u64) * 4);
+        let address = self
+            .columns
+            .slot_mapping
+            .device
+            .ptr
+            .address()
+            .saturating_add((first as u64) * 4);
         let Some(raw) = self.read_device(address, count * 4) else {
             return "unreadable".to_owned();
         };
@@ -4202,7 +4324,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
         let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
         let hidden = usize::try_from(self.geometry.hidden).unwrap_or(0);
-        let element = usize::try_from(self.geometry.hidden_dtype.bytes().unwrap_or(2).max(1)).unwrap_or(2);
+        let element =
+            usize::try_from(self.geometry.hidden_dtype.bytes().unwrap_or(2).max(1)).unwrap_or(2);
         let width = live.saturating_mul(hidden).saturating_mul(element);
         if live == 0 || width == 0 {
             return " probes=none".to_owned();
@@ -4240,7 +4363,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
         };
         for (name, address, count) in [
-            ("cum_q", self.columns.query_offsets.device.ptr.address(), live + 1),
+            (
+                "cum_q",
+                self.columns.query_offsets.device.ptr.address(),
+                live + 1,
+            ),
             ("seq_lens", self.columns.seq_lens.device.ptr.address(), live),
         ] {
             let bytes = count.saturating_mul(4).min(4096);
@@ -4649,7 +4776,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 strides.push_str(&view.strides.get(axis).to_string());
             }
             strides.push(']');
-            format!("{:#x} {:?} shape={shape} strides={strides}", view.ptr.address(), view.dtype)
+            format!(
+                "{:#x} {:?} shape={shape} strides={strides}",
+                view.ptr.address(),
+                view.dtype
+            )
         };
         if self.kv.groups() == 0 {
             return "groups=0".to_owned();
@@ -4710,7 +4841,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
         match self.kv.planes(0) {
             Ok(layers) => match layers.first() {
                 Some(layer) => {
-                    out.push_str(&format!(" key={} value={}", spelled(&layer.key), spelled(&layer.value)));
+                    out.push_str(&format!(
+                        " key={} value={}",
+                        spelled(&layer.key),
+                        spelled(&layer.value)
+                    ));
                     let key = &layer.key;
                     if key.shape.rank() == 4 {
                         out.push_str(&format!(
@@ -4884,7 +5019,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 }
                 Some((pages, lengths)) => {
                     let (table, planes) =
-                        self.kv.scratch(group, slots, lengths, pages, &self.stream)?;
+                        self.kv
+                            .scratch(group, slots, lengths, pages, &self.stream)?;
                     layers.push(planes);
                     tables.push(table);
                 }
@@ -4928,10 +5064,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         self.upload(bucket)?;
         let base = self.pool()?.base(self.stream_id())?;
-        let arena = nn::Arena::new(
-            ops::DevicePtr::new(base.address()),
-            self.pool()?.reserved(),
-        );
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), self.pool()?.reserved());
         let batch = self.token_batch(bucket)?;
         // Under the dump, every layer's attended output is read at its own launch: the buffer is
         // reused by the next layer, so any later reading is the last layer's whichever name it has.
@@ -4985,7 +5118,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             );
         }
         if first {
-            self.pool()?.record(self.stream_id(), bucket, arena.used())?;
+            self.pool()?
+                .record(self.stream_id(), bucket, arena.used())?;
         }
         Ok(())
     }
@@ -5055,24 +5189,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let stream = self.stream.clone();
         let first = self.pool()?.begin(self.stream_id(), bucket)?;
         let base = self.pool()?.base(self.stream_id())?;
-        let arena = nn::Arena::new(
-            ops::DevicePtr::new(base.address()),
-            self.pool()?.reserved(),
-        );
+        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), self.pool()?.reserved());
         let views = self
             .experts
             .as_ref()
             .and_then(super::experts::Member::views)
-            .ok_or_else(|| {
-                Error::Invariant("a join walked with no expert transport".into())
-            })?
+            .ok_or_else(|| Error::Invariant("a join walked with no expert transport".into()))?
             .at_rows(bucket.capacity);
         let forward = Forward::new(&stream, generation, &arena).with_exchange(&views);
-        self.model
-            .join_expert_step(&forward)
-            .map_err(Error::from)?;
+        self.model.join_expert_step(&forward).map_err(Error::from)?;
         if first {
-            self.pool()?.record(self.stream_id(), bucket, arena.used())?;
+            self.pool()?
+                .record(self.stream_id(), bucket, arena.used())?;
         }
         Ok(())
     }
@@ -5162,12 +5290,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // is kept (the arena's buffer is live until the next `begin`, and `read_sampled` runs before
         // that); a greedy bucket's own launch already states every token it keeps.
         let logits = (bucket.variant == crate::plan::Variant::PrefillOutput).then_some(logits);
-        self.bucket_samples
-            .borrow_mut()
-            .insert(bucket, Sampled {
+        self.bucket_samples.borrow_mut().insert(
+            bucket,
+            Sampled {
                 tokens: samples.tokens,
                 logits,
-            });
+            },
+        );
         self.commit_step(forward, bucket, &samples)?;
         Ok(())
     }
@@ -5179,12 +5308,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// advances the state exactly once. A batch with no commit table (a shadow batch, a chunk that
     /// commits nothing) launches nothing, and the graph recorded for a bucket always carries the
     /// launch, because the warm pose stages an inert table rather than an empty one.
-    fn commit_step(
-        &self,
-        forward: &Forward<'_>,
-        bucket: Bucket,
-        samples: &Samples,
-    ) -> Result<()> {
+    fn commit_step(&self, forward: &Forward<'_>, bucket: Bucket, samples: &Samples) -> Result<()> {
         if self.staging.commit().is_empty() {
             return Ok(());
         }
@@ -5268,7 +5392,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.staging
             .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)
     }
-
 }
 
 /// The non-negative length a per-slot table column holds for `slot`, or zero when the table has no
@@ -5627,30 +5750,19 @@ mod tests {
         use super::page_readback_range;
 
         // Page 3 of a plane whose pages are 4096 bytes: the offset is the page's own start.
-        assert_eq!(
-            page_readback_range(
-                3, 8, 4096, 16
-            ),
-            Ok(3 * 4096)
-        );
+        assert_eq!(page_readback_range(3, 8, 4096, 16), Ok(3 * 4096));
         // A unit past the plane's count and a unit below zero are both refused by name.
         assert_eq!(
-            page_readback_range(
-                8, 8, 4096, 16
-            ),
+            page_readback_range(8, 8, 4096, 16),
             Err("unit 8 outside 8".to_owned())
         );
         assert_eq!(
-            page_readback_range(
-                -1, 8, 4096, 16
-            ),
+            page_readback_range(-1, 8, 4096, 16),
             Err("unit -1 outside 8".to_owned())
         );
         // A plane narrower than the read is refused rather than read past.
         assert_eq!(
-            page_readback_range(
-                0, 8, 8, 16
-            ),
+            page_readback_range(0, 8, 8, 16),
             Err("plane holds 8 bytes, a read wants 16".to_owned())
         );
     }
@@ -5660,13 +5772,9 @@ mod tests {
     #[test]
     fn a_table_readback_is_taken_only_from_a_column_that_holds_page_indices() {
         use super::table_readback_fits;
-        use ops::{DType, DevicePtr, Shape, TensorView, Strides};
+        use ops::{DType, DevicePtr, Shape, Strides, TensorView};
 
-        let table = TensorView::new(
-            DevicePtr::new(0),
-            DType::I32,
-            Shape::new(&[2, 640]),
-        );
+        let table = TensorView::new(DevicePtr::new(0), DType::I32, Shape::new(&[2, 640]));
         assert!(table_readback_fits(&table, 32));
         // Eight entries from a two-entry column is a read past it.
         let short = TensorView::new(DevicePtr::new(0), DType::I32, Shape::new(&[1, 2]));
@@ -6089,7 +6197,11 @@ mod tests {
             "the staged count is the batch's, not the {} of the bucket",
             512
         );
-        assert_eq!(staging.input_ids.len(), 512, "the bucket's tokens are staged");
+        assert_eq!(
+            staging.input_ids.len(),
+            512,
+            "the bucket's tokens are staged"
+        );
         // The padded tail is still a token whose output is discarded, and the count is the only
         // statement of where the batch ends.
         assert_eq!(staging.input_ids[count], 0);
@@ -6130,7 +6242,10 @@ mod tests {
         assert_eq!(staging.batch_rows().query_offsets.len(), rows + 1);
         assert_eq!(staging.slots(rows).len(), rows);
         // Rows 2..8 are empty sequences: length zero, no slot, no logits row, no sampling state.
-        assert_eq!(&staging.batch_rows().seq_lens[..], &[4, 9, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            &staging.batch_rows().seq_lens[..],
+            &[4, 9, 0, 0, 0, 0, 0, 0]
+        );
         assert_eq!(&staging.slots(rows)[2..], &[-1; 6]);
         assert_eq!(&staging.logits_rows()[2..], &[-1; 6]);
         assert!(
@@ -6141,7 +6256,10 @@ mod tests {
         );
         // The pack ends where the batch's last token ends and stays there: an empty row owns no
         // token, so every offset past the batch's rows repeats the end of the packed tokens.
-        assert_eq!(&staging.batch_rows().query_offsets[..], &[0, 1, 2, 2, 2, 2, 2, 2, 2]);
+        assert_eq!(
+            &staging.batch_rows().query_offsets[..],
+            &[0, 1, 2, 2, 2, 2, 2, 2, 2]
+        );
         Ok(())
     }
 
@@ -6180,7 +6298,8 @@ mod tests {
         }
         let table = commit_table(&staged, rows, capacity)?;
         assert_eq!(table.len(), ops::commit::COMMIT_FIELDS * capacity);
-        let slots = &table[ops::commit::column::SLOT * capacity..(ops::commit::column::SLOT + 1) * capacity];
+        let slots = &table
+            [ops::commit::column::SLOT * capacity..(ops::commit::column::SLOT + 1) * capacity];
         assert_eq!(&slots[..rows], &[7, 8, 9]);
         // The row past the batch is **inert**, not zero: a zero slot is slot 0, a real destination,
         // so a launch that ever ran over the whole capacity would commit phantom tokens into the
@@ -6199,7 +6318,10 @@ mod tests {
     fn the_commit_keys_are_one_per_block() {
         let buckets = Buckets::causal_lm(&[1, 2, 4, 8, 16, 32, 64, 128], &[64, 128], false);
         let descriptors = commit_descriptors(&buckets, 1_024);
-        let blocks: Vec<u32> = descriptors.iter().map(|descriptor| descriptor.block).collect();
+        let blocks: Vec<u32> = descriptors
+            .iter()
+            .map(|descriptor| descriptor.block)
+            .collect();
         assert_eq!(blocks, vec![1, 2, 4, 8, 16, 32, 64, 128]);
         // One capacity for all of them: the largest bucket's rows, which is the table's stride.
         for descriptor in &descriptors {
@@ -6228,7 +6350,10 @@ mod tests {
             if field == ops::commit::column::SLOT || field == ops::commit::column::TASK {
                 assert_eq!(column, &[-1_i64; 5], "field {field} names no destination");
             } else {
-                assert!(column.iter().all(|value| *value == 0), "field {field} is zero");
+                assert!(
+                    column.iter().all(|value| *value == 0),
+                    "field {field} is zero"
+                );
             }
         }
     }
@@ -6392,8 +6517,16 @@ mod sampled_output_tests {
             &batch,
             &[CallId(7), CallId(9)],
             &[
-                RowState { step_index: 3, cache_computed_len: 3, cache_visible_len: 3 },
-                RowState { step_index: 4, cache_computed_len: 4, cache_visible_len: 4 },
+                RowState {
+                    step_index: 3,
+                    cache_computed_len: 3,
+                    cache_visible_len: 3,
+                },
+                RowState {
+                    step_index: 4,
+                    cache_computed_len: 4,
+                    cache_visible_len: 4,
+                },
             ],
         )
         .expect("both rows belong to a call");
@@ -6403,12 +6536,20 @@ mod sampled_output_tests {
                 CallOutput::completed(
                     CallId(7),
                     vec![111],
-                    RowState { step_index: 3, cache_computed_len: 3, cache_visible_len: 3 },
+                    RowState {
+                        step_index: 3,
+                        cache_computed_len: 3,
+                        cache_visible_len: 3
+                    },
                 ),
                 CallOutput::completed(
                     CallId(9),
                     vec![222],
-                    RowState { step_index: 4, cache_computed_len: 4, cache_visible_len: 4 },
+                    RowState {
+                        step_index: 4,
+                        cache_computed_len: 4,
+                        cache_visible_len: 4
+                    },
                 ),
             ]
         );
@@ -6424,7 +6565,11 @@ mod sampled_output_tests {
             &[-1],
             &rows(&[(0, 0..4)]),
             &[CallId(1)],
-            &[RowState { step_index: 7, cache_computed_len: 4, cache_visible_len: 4 }],
+            &[RowState {
+                step_index: 7,
+                cache_computed_len: 4,
+                cache_visible_len: 4,
+            }],
         )
         .expect("no sampling rows");
         assert_eq!(
@@ -6432,7 +6577,11 @@ mod sampled_output_tests {
             vec![CallOutput::completed(
                 CallId(1),
                 Vec::new(),
-                RowState { step_index: 7, cache_computed_len: 4, cache_visible_len: 4 }
+                RowState {
+                    step_index: 7,
+                    cache_computed_len: 4,
+                    cache_visible_len: 4
+                }
             )]
         );
     }
@@ -6479,7 +6628,6 @@ mod sampled_output_tests {
             .expect_err("one call, no trajectory position");
     }
 
-
     /// A sampling bucket narrower than the largest reads its own rows: the state the sampler is
     /// handed is `[rows, PARAMETER_COLUMNS]` over the column's head, and `[rows]` for its slots and
     /// draws, never the column's flat extent. A captured graph addresses the column's base pointer,
@@ -6517,7 +6665,6 @@ mod sampled_output_tests {
         assert_eq!(gather.numel(), narrow, "the count the gather reads");
     }
 
-
     /// The warm pose of a sampled bucket states a draw the sampler can make: temperature 1, every
     /// candidate kept. A zeroed pose asks the forward to divide by a zero temperature - and it is
     /// the very input `refuse_mixed_sampling` refuses in a real batch, which is why a capture that
@@ -6536,15 +6683,11 @@ mod sampled_output_tests {
         refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &parameters)
             .expect("the pose of a sampled bucket is not a greedy row");
         assert!(
-            refuse_mixed_sampling(
-                crate::plan::Variant::DecodeSampled,
-                &vec![0.0; 2 * columns]
-            )
-            .is_err(),
+            refuse_mixed_sampling(crate::plan::Variant::DecodeSampled, &vec![0.0; 2 * columns])
+                .is_err(),
             "the zeroed pose the capture used to state is not a draw"
         );
     }
-
 
     /// A prompt ending's own token is one the batch committed, so the readback the greedy host path
     /// reads answers 1 for it and not 0. Refusing on that raw figure refused every deployment's
@@ -6555,7 +6698,11 @@ mod sampled_output_tests {
         assert_eq!(committed_before(1), 0, "a prompt ending's own token only");
         assert_eq!(committed_before(5), 4, "four tokens before this step's");
         assert_eq!(committed_before(0), 0, "an unread slot has none");
-        assert_eq!(committed_before(-1), 0, "a readback that never ran has none");
+        assert_eq!(
+            committed_before(-1),
+            0,
+            "a readback that never ran has none"
+        );
     }
 
     /// **A greedy prompt ending is argmaxed on the host.** The row is greedy (temperature zero), it
@@ -6588,7 +6735,8 @@ mod sampled_output_tests {
     fn a_sampled_prompt_ending_is_drawn_and_not_argmaxed() {
         for readback in [1, 9, -1] {
             assert_eq!(
-                prompt_token(false, 0.7, 3, readback).expect("a sampled row is decided by the draw"),
+                prompt_token(false, 0.7, 3, readback)
+                    .expect("a sampled row is decided by the draw"),
                 PromptToken::Draw,
                 "a sampled prompt ending was argmaxed on the host, which would answer the largest                  candidate instead of a token of its distribution"
             );
@@ -6620,5 +6768,4 @@ mod sampled_output_tests {
             "the refusal names neither the slot nor the history it found: {text}"
         );
     }
-
 }

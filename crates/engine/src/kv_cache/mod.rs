@@ -1163,10 +1163,9 @@ impl BlockPool {
             .iter()
             .copied()
             .filter(|unit| {
-                !inner
-                    .pages
-                    .values()
-                    .any(|page| page.host_key.is_some() && page.units.iter().any(|held| held.0 == *unit))
+                !inner.pages.values().any(|page| {
+                    page.host_key.is_some() && page.units.iter().any(|held| held.0 == *unit)
+                })
             })
             .collect()
     }

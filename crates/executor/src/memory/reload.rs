@@ -125,13 +125,21 @@ pub fn paired(
             .first()
             .map_or("a computed weight", String::as_str);
         if old.writable != new.writable {
-            return Err(format!("{tensor} is a table on one side and a weight on the other"));
+            return Err(format!(
+                "{tensor} is a table on one side and a weight on the other"
+            ));
         }
         if from.dtype != to.dtype {
-            return Err(format!("{tensor} is {} and the served {}", to.dtype, from.dtype));
+            return Err(format!(
+                "{tensor} is {} and the served {}",
+                to.dtype, from.dtype
+            ));
         }
         if from.layout != to.layout {
-            return Err(format!("{tensor} is laid out {} and the served {}", to.layout, from.layout));
+            return Err(format!(
+                "{tensor} is laid out {} and the served {}",
+                to.layout, from.layout
+            ));
         }
         if from.region.shape != to.region.shape
             || from.region.start != to.region.start
@@ -144,7 +152,9 @@ pub fn paired(
             ));
         }
         if from.provenance.is_some() != to.provenance.is_some() {
-            return Err(format!("{tensor} is computed on one side and read on the other"));
+            return Err(format!(
+                "{tensor} is computed on one side and read on the other"
+            ));
         }
         let same_tensors = match matching {
             Matching::SameTensors => from.region.tensors == to.region.tensors,
@@ -426,8 +436,18 @@ mod tests {
 
     #[test]
     fn a_rearranged_stack_names_the_slot_each_slot_came_from() {
-        let old = weight("a", &["e0.up", "e0.gate", "e1.up", "e1.gate"], WeightLayout::UP_GATE, 2);
-        let new = weight("a", &["e1.up", "e1.gate", "e0.up", "e0.gate"], WeightLayout::UP_GATE, 2);
+        let old = weight(
+            "a",
+            &["e0.up", "e0.gate", "e1.up", "e1.gate"],
+            WeightLayout::UP_GATE,
+            2,
+        );
+        let new = weight(
+            "a",
+            &["e1.up", "e1.gate", "e0.up", "e0.gate"],
+            WeightLayout::UP_GATE,
+            2,
+        );
         assert_eq!(slots_of(&old.key, &new.key), Some(vec![1, 0]));
         assert_eq!(
             paired(
@@ -456,8 +476,18 @@ mod tests {
     /// the new ones.
     #[test]
     fn a_stack_of_another_checkpoint_has_no_slots_on_the_device() {
-        let old = weight("a", &["e0.up", "e0.gate", "e1.up", "e1.gate"], WeightLayout::UP_GATE, 2);
-        let new = weight("b", &["e0.up", "e0.gate", "e1.up", "e1.gate"], WeightLayout::UP_GATE, 2);
+        let old = weight(
+            "a",
+            &["e0.up", "e0.gate", "e1.up", "e1.gate"],
+            WeightLayout::UP_GATE,
+            2,
+        );
+        let new = weight(
+            "b",
+            &["e0.up", "e0.gate", "e1.up", "e1.gate"],
+            WeightLayout::UP_GATE,
+            2,
+        );
         assert_eq!(slots_of(&old.key, &new.key), None);
     }
 

@@ -446,7 +446,12 @@ impl Member {
                 "the expert transport took more of the device than the capacity plan reserved"
             );
         } else {
-            tracing::info!(rank = self.rank, held, planned, "the expert transport's storage");
+            tracing::info!(
+                rank = self.rank,
+                held,
+                planned,
+                "the expert transport's storage"
+            );
         }
         let views = transport
             .views()
@@ -606,7 +611,10 @@ mod tests {
                     scope.spawn(move || union.gather(rank, vec![rank as u8]))
                 })
                 .collect();
-            handles.into_iter().map(|handle| handle.join().unwrap()).collect()
+            handles
+                .into_iter()
+                .map(|handle| handle.join().unwrap())
+                .collect()
         });
         for answer in answers {
             assert_eq!(*answer, vec![vec![0u8], vec![1], vec![2]]);

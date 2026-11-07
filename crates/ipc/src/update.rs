@@ -212,9 +212,6 @@ mod tests {
                 running_ms: 15_000,
             },
         };
-        assert_eq!(
-            failure.reason(),
-            "a job of batch Some(9) ran 15000 ms"
-        );
+        assert_eq!(failure.reason(), "a job of batch Some(9) ran 15000 ms");
     }
 }

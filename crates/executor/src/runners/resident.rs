@@ -81,8 +81,10 @@ impl Table {
         // SAFETY: the source is `indices`, `bytes` long, and the destination is this table's own
         // host buffer, allocated for exactly that length and not read concurrently.
         unsafe {
-            host.as_mut_slice()[..bytes]
-                .copy_from_slice(std::slice::from_raw_parts(indices.as_ptr().cast::<u8>(), bytes));
+            host.as_mut_slice()[..bytes].copy_from_slice(std::slice::from_raw_parts(
+                indices.as_ptr().cast::<u8>(),
+                bytes,
+            ));
             // SAFETY: both addresses are this table's device buffer and that host buffer, of the
             // same length; the copy is stream-ordered before the walk that reads the table.
             platform::memcpy_async(self.buffer.address(), host.address(), bytes, stream)?;
@@ -212,7 +214,10 @@ impl ResidentCache {
             }
             let units = cache.slot_pages(slot, group as u32)?;
             let count = length.div_ceil(self.page_size.max(1)) as usize;
-            held.push((row as u32, units.into_iter().take(count).collect::<Vec<_>>()));
+            held.push((
+                row as u32,
+                units.into_iter().take(count).collect::<Vec<_>>(),
+            ));
         }
         for layer in 0..cache.layers(group) {
             let resident = cache.layer_planes(group, layer)?;
@@ -355,7 +360,6 @@ impl ResidentCache {
         Ok(table.view_rows(rows))
     }
 }
-
 
 /// The slot each row of a group's table gathers from.
 ///
@@ -500,11 +504,7 @@ impl KvProvider for ResidentCache {
         Ok(issued.offloads)
     }
 
-    fn install_block_tables(
-        &mut self,
-        tables: &[ipc::BlockTable],
-        stream: &Stream,
-    ) -> Result<()> {
+    fn install_block_tables(&mut self, tables: &[ipc::BlockTable], stream: &Stream) -> Result<()> {
         if tables.is_empty() {
             return Ok(());
         }
@@ -737,10 +737,7 @@ impl KvProvider for ResidentCache {
                 table.fill(&indices, stream)?;
                 tables.push(table);
             }
-            *guard = Some(Scratch {
-                cache: set,
-                tables,
-            });
+            *guard = Some(Scratch { cache: set, tables });
         }
         let scratch = guard.as_ref().ok_or_else(|| {
             Error::Invariant("the scratch page set was allocated and is not held".into())
@@ -813,9 +810,10 @@ mod tests {
         );
         let error = row_count(0, 4, &[1, 2, 3, 4, 5]).expect_err("five rows of a four-row table");
         assert!(
-            error.to_string().contains("has 4 row slots and was handed 5"),
+            error
+                .to_string()
+                .contains("has 4 row slots and was handed 5"),
             "the refusal does not name both figures: {error}"
         );
     }
-
 }

@@ -2076,8 +2076,17 @@ mod tests {
         let plan = |start, end| {
             plan_prompt(&request, start, end, Vec::new(), 0, None, true).expect("a prompt range")
         };
-        assert!(plan(0, 512).token_output.is_none(), "a chunk before the end draws nothing");
-        assert!(plan(512, 700).token_output.is_some(), "the last chunk draws the first token");
-        assert!(plan(0, 700).token_output.is_some(), "a whole prompt is its own last chunk");
+        assert!(
+            plan(0, 512).token_output.is_none(),
+            "a chunk before the end draws nothing"
+        );
+        assert!(
+            plan(512, 700).token_output.is_some(),
+            "the last chunk draws the first token"
+        );
+        assert!(
+            plan(0, 700).token_output.is_some(),
+            "a whole prompt is its own last chunk"
+        );
     }
 }

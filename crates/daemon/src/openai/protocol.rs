@@ -788,5 +788,4 @@ mod tests {
         });
         assert!(serde_json::from_value::<ChatCompletionRequest>(value).is_err());
     }
-
 }

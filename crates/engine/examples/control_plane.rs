@@ -130,17 +130,29 @@ fn main() -> anyhow::Result<()> {
     // A scenario argument narrows the world to the kinds it names, so a
     // failure can be attributed to one kind of request rather than to the mix.
     let wanted = std::env::args().nth(1);
-    let wants = |kind: &str| wanted.as_deref().is_none_or(|only| only == kind || only == "all");
+    let wants = |kind: &str| {
+        wanted
+            .as_deref()
+            .is_none_or(|only| only == kind || only == "all")
+    };
     if wants("text") {
         for _ in 0..3 {
-            let (id, request) = mk(GenerationConstraint::UndOnly, Vec::new(), vec![1, 2, 3, 4, 5])?;
+            let (id, request) = mk(
+                GenerationConstraint::UndOnly,
+                Vec::new(),
+                vec![1, 2, 3, 4, 5],
+            )?;
             let rx = handle.submit(request)?;
             rxs.insert(id, ("text".to_string(), rx));
         }
     }
     if wants("image") {
         for _ in 0..2 {
-            let (id, request) = mk(GenerationConstraint::GenOnly, Vec::new(), vec![1, 2, 3, 4, 5])?;
+            let (id, request) = mk(
+                GenerationConstraint::GenOnly,
+                Vec::new(),
+                vec![1, 2, 3, 4, 5],
+            )?;
             let rx = handle.submit(request)?;
             rxs.insert(id, ("image".to_string(), rx));
         }
@@ -174,16 +186,29 @@ fn main() -> anyhow::Result<()> {
         let stats = handle.stats();
         println!(
             "prefix: query_tokens={} hit_tokens={} pages_stored={}",
-            stats.prefix.query_tokens.load(std::sync::atomic::Ordering::Relaxed),
-            stats.prefix.hit_tokens.load(std::sync::atomic::Ordering::Relaxed),
-            stats.prefix_cache.pages_stored.load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .prefix
+                .query_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .prefix
+                .hit_tokens
+                .load(std::sync::atomic::Ordering::Relaxed),
+            stats
+                .prefix_cache
+                .pages_stored
+                .load(std::sync::atomic::Ordering::Relaxed),
         );
         handle.shutdown();
         println!("\nRUST SIM CONTROL-PLANE: PASS");
         std::process::exit(0);
     }
     if wants("migrated") {
-        let (id, request) = mk(GenerationConstraint::UndOnly, vec![1_500, 1_501], vec![1, 2, 3, 4, 5])?;
+        let (id, request) = mk(
+            GenerationConstraint::UndOnly,
+            vec![1_500, 1_501],
+            vec![1, 2, 3, 4, 5],
+        )?;
         let rx = handle.submit(request)?;
         rxs.insert(id, ("migrated".to_string(), rx));
     }

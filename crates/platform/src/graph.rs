@@ -166,7 +166,11 @@ impl Graph {
                 "cuGraphMemcpyNodeGetParams",
             )?;
             copies.push(Copy {
-                source: Space::from(params.src_memory_type, params.src_host as u64, params.src_device),
+                source: Space::from(
+                    params.src_memory_type,
+                    params.src_host as u64,
+                    params.src_device,
+                ),
                 destination: Space::from(
                     params.dst_memory_type,
                     params.dst_host as u64,

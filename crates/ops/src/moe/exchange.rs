@@ -576,7 +576,11 @@ impl Transport {
             combined: view(info.combined, shape.dtype, &[rows, hidden]),
             live: view(info.live, DType::I32, &[1]),
             packed: view(info.packed, DType::U8, &[max_tokens, hidden / 2]),
-            packed_scales: view(info.packed_scales, DType::F8E4M3, &[max_tokens, hidden / 16]),
+            packed_scales: view(
+                info.packed_scales,
+                DType::F8E4M3,
+                &[max_tokens, hidden / 16],
+            ),
             fused: info.fused != 0,
         })
     }
@@ -724,9 +728,7 @@ impl Op for ExpertExchange {
                 address(live.ptr) as usize as *const i32
             }),
             out: address(args.out.ptr) as usize as *mut c_void,
-            layer: fused
-                .as_ref()
-                .map_or(std::ptr::null(), std::ptr::from_ref),
+            layer: fused.as_ref().map_or(std::ptr::null(), std::ptr::from_ref),
             mode: descriptor.mode.number(),
             tokens: to_i64(Self::NAME, tokens)?,
             top: to_i64(Self::NAME, top)?,
@@ -798,7 +800,10 @@ mod tests {
             (16384, 8, 6_108_804_608, 603_981_056),
         ] {
             let bound = measured(tokens, ranks, 0).device_bytes(true);
-            assert!(bound >= local + shared, "{tokens} rows of {ranks} ranks: {bound}");
+            assert!(
+                bound >= local + shared,
+                "{tokens} rows of {ranks} ranks: {bound}"
+            );
         }
         // Creating deepep's transport took 1.65 GB of the device at 512 rows over three ranks.
         assert!(measured(512, 3, 1).device_bytes(false) >= 1_654_652_928);
