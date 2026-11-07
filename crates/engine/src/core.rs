@@ -459,6 +459,10 @@ pub struct EngineConfig {
 pub struct RankFacts {
     /// The model's path or served name (*launch*: `model`).
     pub model: Option<String>,
+    /// The deployment the ranks belong to (*launch*: `deployment`), which keys its host KV cache.
+    pub deployment: Option<String>,
+    /// Whether the deployment keeps a host KV cache (*build config*: `kv_cache.host_tier`).
+    pub host_kv_cache: bool,
     /// The model's numerical dtype (*launch*: `worker_config.dtype`).
     pub dtype: Option<crate::ModelDtype>,
     /// The world the ranks execute (*launch*: `world`).
@@ -585,6 +589,8 @@ impl EngineConfig {
 
         let worker_process = ExecutorProcessArgs {
             model: model.clone(),
+            deployment: facts.deployment.clone().unwrap_or_default(),
+            host_kv_cache: facts.host_kv_cache,
             dtype,
             ranks: ranks.clone(),
             host: ranks

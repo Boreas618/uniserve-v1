@@ -391,6 +391,23 @@ impl Memory {
         }
     }
 
+    /// The bytes one token of this rank's pages takes in the host KV cache; zero on a rank that
+    /// keeps no paged cache.
+    pub fn host_token_bytes(&self) -> u64 {
+        self.prefix_cache.as_ref().map_or(0, |cache| {
+            prefix_cache::host::token_bytes(
+                lock(cache).plan(),
+            )
+        })
+    }
+
+    /// How many cache groups this rank's pages come in.
+    pub fn cache_groups(&self) -> usize {
+        self.prefix_cache
+            .as_ref()
+            .map_or(0, |cache| lock(cache).plan().groups.len())
+    }
+
     /// The device this rank's memory lives on.
     pub fn device(&self) -> crate::config::Device {
         self.device
