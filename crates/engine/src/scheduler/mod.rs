@@ -620,6 +620,9 @@ pub struct Scheduler {
     /// nothing more while it offloads its last pages to the host KV cache
     /// (`Scheduler::flush_offloads`).
     closing: bool,
+    /// Whether forming batches is held for a change of the device's storage
+    /// (`CacheChange::Hold`): nothing runs, and every request keeps its state.
+    held: bool,
     /// A shrink or sleep of the KV cache waiting for its units to be let go
     /// (`Scheduler::resize_cache`).
     resizing: Option<cache_storage::PendingResize>,

@@ -458,7 +458,10 @@ impl Submissions {
     pub(super) fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
             Path::MainProcess(executor) => executor.hook(name, payload),
-            Path::InProcess(_) => Ok(Vec::new()),
+            Path::InProcess(arm) => arm
+                .batches
+                .hook(name, payload)
+                .map_err(|error| anyhow::anyhow!(error)),
         }
     }
 
@@ -471,7 +474,22 @@ impl Submissions {
     ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
             Path::MainProcess(executor) => executor.hook_groups(name, payload),
-            Path::InProcess(_) => Ok(Vec::new()),
+            // This process's ranks are the one pool its inventory states, and its data plane
+            // answers for them in rank order.
+            Path::InProcess(arm) => {
+                let results = arm
+                    .batches
+                    .hook(name, payload)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                Ok(arm
+                    .info
+                    .workers
+                    .first()
+                    .filter(|_| !results.is_empty())
+                    .map(|(group, _)| (group.clone(), results))
+                    .into_iter()
+                    .collect())
+            }
         }
     }
 
@@ -482,9 +500,10 @@ impl Submissions {
     ) -> Result<Vec<String>, ExecutorError> {
         match &mut self.path {
             Path::MainProcess(executor) => executor.commit_experts(order),
-            // The expert allocation of a world this process serves is its own
-            // setup's (7.6), applied where the world is built.
-            Path::InProcess(_) => Ok(Vec::new()),
+            Path::InProcess(arm) => arm
+                .batches
+                .commit_experts(order)
+                .map_err(|error| anyhow::anyhow!(error)),
         }
     }
 }

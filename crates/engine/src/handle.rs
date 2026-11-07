@@ -824,6 +824,91 @@ pub enum Command {
     Shutdown,
 }
 
+impl CacheChange {
+    /// The change a `ResizeCache` command states.
+    ///
+    /// # Errors
+    ///
+    /// A command naming a change this build does not know, in a sentence.
+    pub fn from_wire(resize: &proto::request::wire::ResizeCache) -> Result<Self, String> {
+        use proto::request::wire;
+        let successor = crate::Successor {
+            loads_weights: resize.successor_loads_weights,
+            unmapped_cache: resize.successor_unmapped_cache,
+            host_cache: resize.successor_host_cache,
+            eager_source: resize.eager_source,
+            captures_graphs: resize.successor_captures_graphs,
+            // A malformed UUID names no GPU of this deployment.
+            rank_budgets: resize
+                .rank_budgets
+                .iter()
+                .filter_map(|weights| {
+                    <[u8; 16]>::try_from(weights.gpu.as_slice())
+                        .ok()
+                        .map(|gpu| {
+                            (
+                                gpu,
+                                storage::manifest::weights::RankBudget {
+                                    weights: weights.weights,
+                                    quota: weights.quota,
+                                    process: weights.process,
+                                    graphs: weights.graphs,
+                                    fixed: weights.fixed,
+                                    cache: weights.cache,
+                                    cache_capacity: weights.cache_capacity,
+                                    cache_segment: weights.cache_segment,
+                                    in_flight: weights.in_flight.as_ref().map(|cache| {
+                                        storage::manifest::weights::CacheReservation {
+                                            bytes: cache.bytes,
+                                            mapped: cache.mapped,
+                                        }
+                                    }),
+                                    pages: weights
+                                        .pages
+                                        .iter()
+                                        .map(|page| storage::manifest::weights::CachePage {
+                                            tokens: page.tokens,
+                                            bytes: page.bytes,
+                                            window: page.window,
+                                            state: page.state,
+                                        })
+                                        .collect(),
+                                },
+                            )
+                        })
+                })
+                .collect(),
+        };
+        match wire::CacheChange::try_from(resize.change) {
+            Ok(wire::CacheChange::Shrink) => Ok(Self::Shrink {
+                preempt_after: resize
+                    .preempt_after_ms
+                    .map(std::time::Duration::from_millis),
+                successor,
+            }),
+            Ok(wire::CacheChange::Grow) => Ok(Self::Grow),
+            Ok(wire::CacheChange::Plan) => Ok(Self::Plan(successor)),
+            Ok(wire::CacheChange::Evict) => Ok(Self::Evict),
+            Ok(wire::CacheChange::MakeRoom) => Ok(Self::MakeRoom {
+                bytes: resize.room_bytes,
+                devices: resize
+                    .device_bytes
+                    .iter()
+                    .filter_map(|device| {
+                        <[u8; 16]>::try_from(device.gpu.as_slice())
+                            .ok()
+                            .map(|gpu| (gpu, device.bytes))
+                    })
+                    .collect(),
+            }),
+            Ok(wire::CacheChange::Restore) => Ok(Self::Restore),
+            Ok(wire::CacheChange::Sleep) => Ok(Self::Sleep),
+            Ok(wire::CacheChange::Wake) => Ok(Self::Wake),
+            Err(_) => Err(format!("unknown KV cache change {}", resize.change)),
+        }
+    }
+}
+
 /// How the requests in flight continue through an in-place weight update
 /// (vLLM's `keep`, `abort` and SGLang's `in_place`, `retract`, `abort`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -882,6 +967,14 @@ pub enum CacheChange {
     /// weights, once no request runs; the scheduler admits nothing until
     /// it wakes.
     Sleep,
+    /// As [`Self::Sleep`], with every request the scheduler holds ending as
+    /// aborted first: a weight update's `abort` (`WeightsInFlight::Abort`).
+    SleepAborting,
+    /// Stops forming batches, or starts again, with every request keeping its
+    /// state: the answer comes once the batches in flight completed. What a
+    /// weight update's `keep` holds the device still with, while the graph
+    /// storage is given back for a load the free storage does not hold.
+    Hold { held: bool },
     /// Restores what a sleep gave back.
     Wake,
     /// Creates as many of the given-back segments as each device's storage

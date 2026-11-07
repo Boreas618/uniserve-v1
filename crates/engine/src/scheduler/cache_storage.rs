@@ -124,6 +124,14 @@ impl Scheduler {
                 return;
             }
             CacheChange::Sleep => Ok(self.start_sleep().ok_or_else(Vec::new)),
+            CacheChange::SleepAborting => {
+                self.abort_held_requests();
+                Ok(self.start_sleep().ok_or_else(Vec::new))
+            }
+            CacheChange::Hold { held } => {
+                let _ = answer.send(self.hold_batches(held));
+                return;
+            }
             CacheChange::Evict => self.start_evict(),
             CacheChange::Restore => {
                 let _ = answer.send(self.restore_cache(None));
@@ -214,10 +222,22 @@ impl Scheduler {
         self.poll_resize();
     }
 
+    /// Stops forming batches and waits for those in flight, or starts again.
+    /// Every request keeps its state, so a held scheduler serves on from the
+    /// step it stopped at.
+    fn hold_batches(&mut self, held: bool) -> Result<Vec<String>, String> {
+        self.held = held;
+        if held {
+            self.drain_batches()?;
+        }
+        Ok(Vec::new())
+    }
+
     /// Whether admission waits for a sleep or a weight update: the
     /// scheduler sleeps, or waits for its requests to finish.
     pub(super) fn admission_sleeps(&self) -> bool {
         self.asleep
+            || self.held
             || self.parks()
             || self
                 .resizing
