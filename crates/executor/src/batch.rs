@@ -825,6 +825,24 @@ pub trait Batches: Send + Sync {
     fn inventory(&self) -> &[Inventory] {
         &[]
     }
+
+    /// Runs the storage operation `name` with the JSON `payload` on every rank, while no batch runs
+    /// (7.6), and answers each rank's JSON result.
+    ///
+    /// An executor with no storage of its own has nothing to change and nothing to report, which
+    /// is an empty answer: the mechanism reads it as a cache that is not split into segments.
+    fn hook(&self, _name: &str, _payload: &str) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// Puts the prepared expert redistribution of `order` in place, while no batch runs (7.6), and
+    /// answers each rank's result.
+    fn commit_experts(
+        &self,
+        _order: &std::collections::BTreeMap<String, Vec<u32>>,
+    ) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
 }
 
 /// One pool of the deployment an executor serves (4.2, 7.3).
@@ -869,6 +887,8 @@ pub struct Executors {
     /// executor facts from this and refuses to start on an empty answer, so a rank states its pools
     /// before it is handed over rather than after the first batch finds none.
     inventory: Vec<Inventory>,
+    /// What the storage operations of 7.6 reach, on a rank that keeps storage at a Storage Server.
+    data: Option<Arc<crate::data_plane::DataPlane>>,
 }
 
 impl Executors {
@@ -887,7 +907,15 @@ impl Executors {
         Ok(Self {
             executors,
             inventory: Vec::new(),
+            data: None,
         })
+    }
+
+    /// States what the storage operations of 7.6 reach on this rank.
+    #[must_use]
+    pub fn with_data_plane(mut self, data: Arc<crate::data_plane::DataPlane>) -> Self {
+        self.data = Some(data);
+        self
     }
 
     /// States the pools this rank serves, which the scheduler's executor facts are built from.
@@ -1014,6 +1042,23 @@ impl Batches for Executors {
 
     fn shadow(&self, batch: Batch) -> Result<Submission> {
         self.on_every_device(batch, |executor, batch| executor.shadow(batch))
+    }
+
+    fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>> {
+        match &self.data {
+            Some(data) => data.operate(name, payload),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    fn commit_experts(
+        &self,
+        order: &std::collections::BTreeMap<String, Vec<u32>>,
+    ) -> Result<Vec<String>> {
+        match &self.data {
+            Some(data) => data.commit_experts(order),
+            None => Ok(Vec::new()),
+        }
     }
 }
 

@@ -1569,6 +1569,18 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
 }
 
 impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
+    /// The constants are folded from the weights, so they are folded again from the new ones. A
+    /// runner that has not filled them yet does so before its first capture anyway.
+    fn weights_changed(&mut self) -> Result<()> {
+        if !self.constants_filled {
+            return Ok(());
+        }
+        self.constants_filled = false;
+        let generation = self.lifecycle.generation.number();
+        let kernels = self.lifecycle.generation_named(generation)?;
+        self.fill_constants(&kernels)
+    }
+
     fn phases(&self) -> &[ipc::PhaseId] {
         &self.phases
     }
