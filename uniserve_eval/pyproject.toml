@@ -13,6 +13,8 @@ description = "UniServe benchmark and evaluation driver"
 requires-python = ">=3.11"
 dependencies = [
     "aiohttp>=3.9",
+    "av>=14",
+    "numpy",
     "pillow>=10.4",
 ]
 
@@ -20,7 +22,9 @@ dependencies = [
 # Hub-hosted evaluation datasets (MJHQ-30K, UEval, ShareGPT, PIE-Bench, Beans).
 datasets = [
     "datasets>=3",
+    "huggingface_hub",
     "pyarrow<20",
+    "transformers>=4.57.1",
 ]
 
 [project.scripts]

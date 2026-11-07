@@ -1,53 +1,35 @@
 [build-system]
-# The worker library links libtvm_ffi; its build script locates it through the
-# `tvm-ffi-config` script of the pinned apache-tvm-ffi release.
 requires = [
     "setuptools>=70",
     "wheel",
     "setuptools-rust>=1.7",
-    "apache-tvm-ffi==0.1.14.post1",
 ]
 build-backend = "setuptools.build_meta"
 
+# The repository holds no Python package of its own. This project is what
+# `uv sync` builds and installs: the `uniserve` executable, onto the
+# environment's `bin/`, with the development, test and evaluation tools beside
+# it. The Program Server keeps its own environment
+# (`crates/program-server/python`), the one place a compiler runs Python.
 [project]
 name = "uniserve"
 version = "2.0.0"
-description = "UniServe: Rust serving runtime with the uniserve numerical library."
+description = "UniServe: the Rust serving runtime."
 readme = "README.md"
 requires-python = ">=3.11"
-# Keep the CUDA-13 PyTorch and torchvision release lines aligned. The locked
-# Linux wheels bring their matching NCCL and NVSHMEM runtime dependencies.
-dependencies = [
-    # The Rust worker and the numerical library exchange functions and tensors
-    # only through TVM-FFI; the Rust crate pins the same release.
-    "apache-tvm-ffi==0.1.14.post1",
-    "torch>=2.13,<2.14",
-    "torchvision>=0.28,<0.29",
-    "transformers>=4.57.1",
-    "safetensors",
-    "numpy",
-    "pillow",
-    "packaging<=25.0",
-    "huggingface_hub",
-    "diffusers>=0.40",
-    "av>=14",
-    # The media reader resamples condition audio with torchaudio's resampler,
-    # the one the reference pipelines use. The 2.11 resampler runs on the
-    # pinned torch through torch's own operators.
-    "torchaudio>=2.11,<2.12",
-    # NVML's per-process device usage, which device storage grants charge.
-    "nvidia-ml-py",
-    # UniServe's own Triton and CuTe device kernels. Native extensions and
-    # their build tools are selected through the kernel package's extras.
-    "uniserve-kernels",
-]
+dependencies = []
 
 [project.optional-dependencies]
 test = [
-    # Extension build tests drive torch's C++ extension build.
-    "ninja>=1.13",
+    "httpx",
     "pytest>=8.1",
     "pytest-timeout>=2.3",
+    # The HTTP tests and the numeric diagnosis compare served tensors, and
+    # tokenize with the checkpoint's own tokenizer.
+    "numpy",
+    "safetensors",
+    "torch>=2.13,<2.14",
+    "transformers>=4.57.1",
 ]
 dev = [
     "build>=1.2",
@@ -59,26 +41,21 @@ dev = [
 bench = [
     "uniserve-eval[datasets]",
 ]
-# Optional accelerator kernels for GPU serving. Model bindings require their
-# declared native capabilities at startup. The extras of the `uniserve-kernels`
-# pack add its native extensions and FlashAttention-4 runtime. The dense,
-# sparse, and quantized providers these packages back are shared runtime
-# capabilities, so they are selected by hardware rather than by model; native
-# builds require a CUDA 13 toolkit.
+# The native libraries a GPU host takes from this environment: the NCCL
+# `crates/platform` opens by name (`tools/check_nccl.sh` states the directory)
+# and the CUPTI that sits beside the CUDA runtime.
 gpu = [
-    "flashinfer-python==0.6.18",
-    "ninja>=1.13",
-    "requests[socks]>=2",
-    "uniserve-kernels[host_storage,sparse_attention,flash_attn_4,megamoe]",
+    "nvidia-cuda-cupti; sys_platform == 'linux'",
+    "nvidia-nccl-cu13; sys_platform == 'linux'",
 ]
 
 [tool.uv.sources]
-uniserve-kernels = { path = "uniserve_kernels", editable = true }
 uniserve-eval = { path = "uniserve_eval", editable = true }
 
 [tool.uv]
-# DeepEP's elastic transport uses the GIN request and traffic-class APIs
-# supplied by NCCL 2.30.4. Keep one NCCL runtime for PyTorch and DeepEP.
+# `crates/platform` opens `libnccl.so.2` by name, and `tools/check_nccl.sh`
+# holds the library a host hands it to this pin: an older NCCL crashes on the
+# first replay of a graph that holds a collective.
 #
 # PyTorch's `cuda-toolkit` 13.0.3 pins CUPTI 13.0.85, whose software kernel
 # timestamps are written by the device into per-kernel host records that
@@ -92,20 +69,15 @@ override-dependencies = [
     "nvidia-cuda-cupti==13.4.92; sys_platform == 'linux'",
 ]
 
-[tool.setuptools.packages.find]
-# UniServe kernels and the benchmark driver are packaged independently
-# (`uniserve_kernels/pyproject.toml`, `uniserve_eval/pyproject.toml`) so the
-# root serving distribution cannot mask a missing kernel install and does not
-# ship a console script whose dependencies it never declares.
-include = ["uniserve", "uniserve.*"]
-
-[tool.setuptools.package-data]
-# Grouped-expert providers read this fixed tactic catalog at preparation.
-uniserve = ["backends/moe/tactics.json"]
+[tool.setuptools]
+# The benchmark driver is packaged independently
+# (`uniserve_eval/pyproject.toml`); this distribution ships the executable
+# alone.
+packages = []
 
 # The one executable of every UniServe process, installed onto PATH as
 # `uniserve`: `serve` (a node's daemon), `frontend` (the deployment's
-# application process), `engine` (the engine process), `storage` (a host's
+# application process), `engine` (a node's main process), `storage` (a host's
 # Storage Server) and `rules` (the model-family request rules a plan asks
 # for), plus the `program-server` entry a Program Server starts with. It is a
 # binary rather than a Python extension module, and serving runs it, so it
@@ -142,8 +114,6 @@ extend-exclude = [
     "refs",
     "target",
     ".venv",
-    # Preserve upstream style for the vendored FlashInfer MegaMoE sources.
-    "uniserve_kernels/src/uniserve_kernels/megamoe",
 ]
 
 [tool.ruff.lint]
@@ -167,7 +137,7 @@ convention = "google"
 
 [tool.mypy]
 # Use the invoking Python version so installed dependency stubs match CI's runtime.
-files = ["uniserve", "uniserve_eval"]
+files = ["uniserve_eval"]
 warn_unused_configs = true
 warn_redundant_casts = true
 warn_unused_ignores = true
@@ -178,6 +148,6 @@ ignore_missing_imports = true
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
-include = ["uniserve", "uniserve_eval"]
+include = ["uniserve_eval"]
 exclude = ["refs", "target", ".venv"]
 reportMissingImports = "warning"

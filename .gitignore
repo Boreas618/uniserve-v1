@@ -6,9 +6,6 @@ dist/
 wheels/
 *.egg-info
 
-# Compiled native extensions built in-tree by setuptools-rust (editable installs)
-uniserve/_worker*.so
-
 # Virtual environments
 .venv*
 
