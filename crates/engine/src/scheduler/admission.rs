@@ -1440,8 +1440,12 @@ impl Scheduler {
     /// refused.
     fn admit_tokens(&mut self, named: usize) {
         for _ in 0..named {
+            // A resident the last assembly could not grow takes the units that
+            // come free before any request is admitted: a request admitted
+            // into them would be the first one the reclaim gives up.
             if self.running_request_count() >= self.config.max_running_requests
                 || self.storage.request_pool.is_empty()
+                || !self.starved.is_empty()
             {
                 break;
             }
@@ -1569,12 +1573,14 @@ impl Scheduler {
 
                 // Hit pages that are currently unreferenced count as free
                 // until acquisition takes them, so they are subtracted from
-                // the free units. A resident keeps what it holds until it ends
-                // and is never preempted, and a host hit holds the units of all
-                // its pages from its admission, so the head's whole prompt fits
-                // beside what the residents' prompts still take: requests that
-                // hold every unit with none for their tails would wait for one
-                // another until the watchdog fails them.
+                // the free units. A host hit holds the units of all its pages
+                // from its admission, so the head's whole prompt fits beside
+                // what the residents' prompts still take: requests that hold
+                // every unit with none for their prompts' tails would wait for
+                // one another. What residents generate is not reserved: one
+                // that cannot grow in decode is relieved by the reclaim, which
+                // gives up the request admitted last to be computed again from
+                // its tokens (`Scheduler::reclaim_shortage`).
                 let head_units = cache
                     .coordinator
                     .units_after_prefix(cached_tokens, n)

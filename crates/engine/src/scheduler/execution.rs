@@ -515,6 +515,9 @@ impl Scheduler {
         // The plan's own page decisions then run, so a prefetch's pins are in
         // flight by the time the calls are built.
         self.reclaim_shortage();
+        // The assembly below notes the requests it cannot grow afresh, for the
+        // next step's admission and reclaim.
+        self.starved.clear();
         self.execute_plan_pages(&plan);
         let batches = self.assemble_plan(&plan);
         self.log_step(&plan, &batches);
@@ -529,6 +532,9 @@ impl Scheduler {
     /// policy decides what to give up. A victim list that does not validate is
     /// a policy failure, like any other invalid decision.
     fn reclaim_shortage(&mut self) {
+        // A request no victim could let grow is no shortage a policy can
+        // relieve: it ends at the length the cache holds.
+        self.finish_outgrown();
         let Some(shortage) = views::shortage_now(self) else {
             return;
         };

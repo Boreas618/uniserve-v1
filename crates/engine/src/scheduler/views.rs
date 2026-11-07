@@ -623,8 +623,9 @@ fn warming(scheduler: &Scheduler) -> Vec<WarmingView> {
 
 /// The storage the mechanism finds short right now, for `reclaim`.
 ///
-/// The mechanism knows the shortfall when executing a plan hits it; a step that
-/// hit none has nothing to reclaim.
+/// The mechanism knows the shortfall when executing a plan hits it: the last
+/// assembly noted each request it could not grow with the units its growth
+/// needed. A step after an assembly that hit none has nothing to reclaim.
 pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
     if scheduler.starved.is_empty() {
         return None;
@@ -632,28 +633,34 @@ pub(crate) fn shortage_now(scheduler: &Scheduler) -> Option<Shortage> {
     let Some(cache) = scheduler.storage.cache() else {
         return Some(shortage(Storage::KvUnits, 1));
     };
-    // What the starved requests' next calls need beyond what the pool holds: a
-    // policy sizing its victims by `need` frees enough for them to go on. Each
-    // contributes at least one unit, because a request the mechanism could not
-    // give units to needs some however small its next call is (a prefill chunk
-    // is sized by the policy, so its token count is not known here).
+    // What the starved requests still running need: a policy sizing its
+    // victims by `need` frees enough for them to go on.
     let wanted = scheduler
         .starved
         .iter()
-        .filter_map(|id| {
-            let state = scheduler.running.get(id)?;
-            Some((*id, state))
+        .filter(|(id, _)| {
+            scheduler
+                .running
+                .get(id)
+                .is_some_and(|state| !state.terminal_intent.is_terminal())
         })
-        .map(|(id, state)| {
-            let tokens = usize::try_from(next_tokens(scheduler, state, id)).unwrap_or(usize::MAX);
-            u64::try_from(cache.coordinator.units_for_tokens(tokens).max(1)).unwrap_or(u64::MAX)
-        })
+        .map(|(_, units)| u64::try_from(*units).unwrap_or(u64::MAX))
         .fold(0u64, u64::saturating_add);
+    // The units free now, which a request that ended since the assembly may
+    // have returned, and the units of the requests already leaving, which
+    // return once their calls drain: a victim named for those would be one
+    // too many.
     let free = u64::try_from(cache.block_pool.free_units()).unwrap_or(0);
-    Some(shortage(
-        Storage::KvUnits,
-        wanted.saturating_sub(free).max(1),
-    ))
+    let leaving = scheduler
+        .running
+        .values()
+        .filter(|state| state.terminal_intent.is_terminal())
+        .filter_map(|state| state.block_tables())
+        .flat_map(|tables| tables.iter().map(BlockTable::held_units))
+        .map(|units| u64::try_from(units).unwrap_or(u64::MAX))
+        .fold(0u64, u64::saturating_add);
+    let need = wanted.saturating_sub(free).saturating_sub(leaving);
+    (need > 0).then(|| shortage(Storage::KvUnits, need))
 }
 
 // ---------------------------------------------------------------------------
@@ -899,7 +906,10 @@ pub(crate) fn request(
                 .saturating_sub(state.num_generated_tokens),
         )
         .unwrap_or(u32::MAX),
-        migratable: state.req.is_migratable(),
+        // A request already leaving cannot be given up again
+        // (`Scheduler::migrate_running` skips it), so a policy does not
+        // name it.
+        migratable: state.req.is_migratable() && !state.terminal_intent.is_terminal(),
         cache_rank: recorded.cache_rank,
     })
 }

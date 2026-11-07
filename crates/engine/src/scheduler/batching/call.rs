@@ -610,11 +610,13 @@ impl Scheduler {
         read_start: usize,
         total_tokens: usize,
     ) -> bool {
-        let grown = self.grow_request_tables(id, read_start, total_tokens, Checkpoint::Boundary);
-        if !grown {
-            self.note_starved(id);
+        match self.grow_request_tables(id, read_start, total_tokens, Checkpoint::Boundary) {
+            Ok(()) => true,
+            Err(needed) => {
+                self.note_starved(id, needed);
+                false
+            }
         }
-        grown
     }
 
     /// Grows the request's cache tables for a decode call, as
@@ -628,11 +630,13 @@ impl Scheduler {
         total_tokens: usize,
     ) -> bool {
         let checkpoint = Checkpoint::Interval(self.state_interval);
-        let grown = self.grow_request_tables(id, read_start, total_tokens, checkpoint);
-        if !grown {
-            self.note_starved(id);
+        match self.grow_request_tables(id, read_start, total_tokens, checkpoint) {
+            Ok(()) => true,
+            Err(needed) => {
+                self.note_starved(id, needed);
+                false
+            }
         }
-        grown
     }
 
     /// Grows the request's tables over the positions `[read_start,
@@ -645,39 +649,44 @@ impl Scheduler {
         total_tokens: usize,
     ) -> bool {
         total_tokens <= read_start
-            || self.grow_request_tables(id, read_start, total_tokens, Checkpoint::Never)
+            || self
+                .grow_request_tables(id, read_start, total_tokens, Checkpoint::Never)
+                .is_ok()
     }
 
     /// Grows the request's tables; when the pool lacks the units the tables
     /// need, other requests' draft caches, optional state, release theirs
     /// first ([`Self::release_drafts`]).
+    ///
+    /// A refusal states the units the growth needed, one when the tables do
+    /// not say: what a reclaim must free for the request to go on.
     fn grow_request_tables(
         &mut self,
         id: RequestId,
         read_start: usize,
         total_tokens: usize,
         checkpoint: Checkpoint,
-    ) -> bool {
+    ) -> Result<(), usize> {
         let read_start = read_start.min(u32::MAX as usize) as u32;
         let total_tokens = total_tokens.min(u32::MAX as usize) as u32;
         let mut needed = None;
         for attempt in 0..2 {
             if attempt == 1 {
                 let Some(units) = needed else {
-                    return false;
+                    return Err(1);
                 };
                 if !self.release_drafts(units) {
-                    return false;
+                    return Err(units.max(1));
                 }
             }
             let Some(state) = self.running.get_mut(&id) else {
-                return false;
+                return Err(1);
             };
             let (Some(allocations), Some(cache)) =
                 (state.allocations_mut(), self.storage.cache.as_ref())
             else {
                 self.invariant_broken("a running token request is admitted with a prefix cache");
-                return false;
+                return Err(1);
             };
             if cache
                 .grow(
@@ -688,7 +697,7 @@ impl Scheduler {
                 )
                 .is_ok()
             {
-                return true;
+                return Ok(());
             }
             needed = cache.coordinator.units_needed(
                 &cache.block_pool,
@@ -698,7 +707,7 @@ impl Scheduler {
                 checkpoint,
             );
         }
-        false
+        Err(needed.unwrap_or(1).max(1))
     }
 
     /// Activates the cache tables reserved for a request.
