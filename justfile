@@ -22,21 +22,13 @@ bench-build:
 
 # Lint: fmt + clippy + ruff + mypy
 lint: fmt clippy
-    {{python}} -m ruff check uniserve uniserve_eval uniserve_kernels/src tests
-    {{python}} -m ruff format --check uniserve uniserve_eval uniserve_kernels/src tests
+    {{python}} -m ruff check uniserve_eval tests
+    {{python}} -m ruff format --check uniserve_eval tests
     {{python}} -m mypy
 
 # Fast Python tests (CPU only)
 test-python-fast:
     {{python}} -m pytest -m "unit and not gpu"
-
-# Integration Python tests (CPU only)
-test-python-integration:
-    {{python}} -m pytest -m "integration and not gpu"
-
-# Unit and integration Python tests that require a CUDA device
-test-python-cuda:
-    {{python}} -m pytest -m "(unit or integration) and gpu"
 
 # Build the debug binary if missing
 [private]
@@ -47,7 +39,7 @@ build-debug:
 test-python-e2e: build-debug
     {{python}} -m pytest -m "e2e and not gpu"
 
-# The missing-state tests (GPU) with every worker under compute-sanitizer's
+# The missing-state tests (GPU) with every main process under compute-sanitizer's
 # memcheck; its logs go to $SANITIZER_LOGS
 test-python-sanitizer: build-debug
     UNISERVE_RUN_GPU_E2E=1 \
@@ -62,7 +54,7 @@ test-python-gpu: build-debug
     UNISERVE_RUN_GPU_E2E=1 {{python}} -m pytest -m "e2e and gpu"
 
 # Run all checks
-test-all: fmt clippy test-rust bench-build test-python-fast test-python-integration test-python-e2e
+test-all: fmt clippy test-rust bench-build test-python-fast test-python-e2e
 
 # Resolve the decode-runtime suite without starting a server
 eval-plan:

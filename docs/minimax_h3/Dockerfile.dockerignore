@@ -10,10 +10,9 @@
 !configs/**
 !crates
 !crates/**
-!uniserve
-!uniserve/**
-!uniserve_kernels
-!uniserve_kernels/**
+!src
+!src/**
+!build.rs
 !uniserve_eval
 !uniserve_eval/**
 **/__pycache__
