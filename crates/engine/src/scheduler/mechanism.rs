@@ -1207,7 +1207,7 @@ impl Recorder {
     /// hit by.
     ///
     /// Neither is a view's to compute: the device hit is the answer of the
-    /// prefill worker admission probed (`admission::prefill_target`), and the
+    /// prefill executor admission probed (`admission::prefill_target`), and the
     /// host deepening is the boundary `KvOffloadManager::admission` answers,
     /// less the device hit. Both are known only where admission computes them,
     /// so they are recorded there and `views.rs` reads them back from

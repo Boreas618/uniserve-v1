@@ -4,7 +4,7 @@
 //! is full, preserving order without blocking the engine owner thread.
 //!
 //! This module also owns the semantic resolution of completed calls
-//! (`Scheduler::resolve`): it turns accepted worker results into public events
+//! (`Scheduler::resolve`): it turns accepted executor results into public events
 //! and the request's next generation phase, and it owns the termination of
 //! running token requests (`Scheduler::finish_with`), which releases scheduler
 //! resources and publishes the terminal `Finished` event.
@@ -108,7 +108,7 @@ pub(super) struct RequestOutput {
     pub(super) events: EventJournal,
     /// `TextToken` events accepted into the ordered output.
     pub(super) tokens_sent: usize,
-    /// Prompt score positions received from worker completions.
+    /// Prompt score positions received from executor completions.
     pub(super) prompt_logprobs_processed: usize,
     /// Prompt score positions published as `PromptLogprobs` events.
     pub(super) prompt_logprobs_emitted: usize,
@@ -761,7 +761,7 @@ impl Scheduler {
                 self.emit_image_steps(id, record.step_index.saturating_sub(1));
 
                 // The host planner enters commit after the configured step count;
-                // worker completion flags do not determine diffusion termination.
+                // executor completion flags do not determine diffusion termination.
             }
             CallKind::Media(
                 MediaCall::MediaReading
@@ -1543,7 +1543,7 @@ impl Scheduler {
     /// behind the step that stopped a block, and a request with a pending
     /// finish resolves none of their results, so its output is already
     /// final. Only retirement, which releases the request's resources and
-    /// sends the worker's `Finish`, waits for them to drain. A finish that
+    /// sends the executor's `Finish`, waits for them to drain. A finish that
     /// waits for a stop-string decision is published at retirement, since
     /// that decision may still end the request earlier.
     pub(super) fn finish_after_inflight(
@@ -1585,7 +1585,7 @@ impl Scheduler {
         );
     }
 
-    /// Fails a running token request whose worker result was rejected.
+    /// Fails a running token request whose executor result was rejected.
     ///
     /// The first cause recorded for the request becomes its terminal `Error`
     /// event, sent at once so the client's failure carries it, and appears
@@ -1625,7 +1625,7 @@ impl Scheduler {
     /// Applies to token requests in `running`; media requests terminate
     /// through `finish_media`. For a request that is not running, this only
     /// clears a pending finish. Allocations of a request registered with its
-    /// workers move to `retiring_requests` until the queued `Finish` command
+    /// executors move to `retiring_requests` until the queued `Finish` command
     /// is acknowledged; an unregistered request's allocations are freed here.
     pub(super) fn finish_with(
         &mut self,
@@ -1666,7 +1666,7 @@ impl Scheduler {
     /// Publishes `terminal` and releases every resource owned by one token
     /// request; see `finish_with`.
     fn retire_token_request(&mut self, id: RequestId, terminal: TokenTerminal) {
-        // A call of this request still queued behind a full worker queue can
+        // A call of this request still queued behind a full executor queue can
         // never be served nor state its layout once the request's allocation
         // goes, so it leaves the queue with the request.
         self.retire_queued_calls(id);
@@ -1719,7 +1719,7 @@ impl Scheduler {
             );
         }
 
-        // Registered requests retain their allocations until every worker pool
+        // Registered requests retain their allocations until every executor pool
         // acknowledges the ordered close command.
         let mut awaits_close = false;
         let mut allocations = None;
@@ -1783,7 +1783,7 @@ impl Scheduler {
             // Its encodings' lookups in the host encoder pools end, those of
             // its calls in flight once they complete; so do the pins of the
             // stored trajectory its image restores, and a store of its
-            // image's trajectory not yet carried to its workers is aborted.
+            // image's trajectory not yet carried to its executors is aborted.
             if let Some(store) = self.encoder_outputs.as_mut() {
                 store.forget(RequestKey::new(self.engine_id, id, st.request_epoch));
             }
@@ -1792,7 +1792,7 @@ impl Scheduler {
             }
 
             // Releasing the request's encoder pins may make cache products
-            // physically reclaimable by their owning worker.
+            // physically reclaimable by their owning executor.
             let mut free_encoder_products = std::mem::take(&mut st.transient_encoder_products);
             for pin in &st.encoder_cache_pins {
                 if let Some(product) = self.storage.encoder_cache.release(pin.key, &pin.product) {
@@ -1830,7 +1830,7 @@ impl Scheduler {
             }
         }
 
-        // Unregistered requests have no outstanding worker reference, so their
+        // Unregistered requests have no outstanding executor reference, so their
         // allocations can return to the scheduler immediately.
         if !awaits_close {
             for allocations in guidance_prefix
@@ -1851,17 +1851,17 @@ impl Scheduler {
     /// cache tables.
     ///
     /// First publishes the pages the request has now computed, keyed by the
-    /// loaded prefill worker that holds them, so every page of a
+    /// loaded prefill executor that holds them, so every page of a
     /// sliding-window group enters the prefix cache while its table still
     /// holds it: its prompt's, and for a request whose cache holds its
     /// prompt and the text it generates alone, the pages of the tokens it
     /// generated, which its migration's prompt finds. Then, when the host KV
-    /// cache serves the worker, reserves the pages to offload ([`offloads`])
+    /// cache serves the executor, reserves the pages to offload ([`offloads`])
     /// while the tables still hold them.
     /// Last retires the sliding-window pages no later reader needs: calls
     /// apply in submission order, so every earlier reader has completed, and
     /// later calls read no history before the accepted extent minus the
-    /// window. A request without its prefill worker or prefix cache breaks a
+    /// window. A request without its prefill executor or prefix cache breaks a
     /// scheduler invariant.
     /// `immutable` also publishes the last partial page, and requires all
     /// writes of this request to have drained permanently.
@@ -1897,7 +1897,7 @@ impl Scheduler {
             self.storage.cache.as_ref(),
         ) else {
             self.invariant_broken(
-                "a prefilled request keeps its loaded prefill worker and prefix cache",
+                "a prefilled request keeps its loaded prefill executor and prefix cache",
             );
             return;
         };

@@ -84,6 +84,13 @@ pub trait Runner: Send {
         None
     }
 
+    /// The rank's weights changed at their addresses (7.6): a runner fills again what it folded
+    /// from them. It runs on the device thread with nothing in flight, and its work completes
+    /// before a batch reads the weights. A runner that folds nothing has nothing to do.
+    fn weights_changed(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Hands the runner the device's record of the operators a program-layer update could not
     /// compare (7.3 step 2).
     ///

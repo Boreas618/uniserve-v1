@@ -25,22 +25,6 @@ use tokio::sync::{mpsc, oneshot, watch};
 /// the client closed.
 const READ_INTERVAL: Duration = Duration::from_millis(200);
 
-/// What a world succeeding an engine's on the same devices adds beside
-/// what it shares with it ([`EngineClient::make_room`]).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Successor {
-    /// It loads its weights from the model's files: their keys differ.
-    pub loads_weights: bool,
-    /// It maps none of the engine's KV cache, so copied or recomputed
-    /// in-flight state needs units of its own.
-    pub unmapped_cache: bool,
-    pub host_cache: bool,
-    /// The predecessor releases its graph pool during preparation.
-    pub eager_source: bool,
-    /// Its graph policy captures graphs.
-    pub captures_graphs: bool,
-}
-
 /// What a ready engine reported it serves.
 #[derive(Debug, Clone, PartialEq)]
 pub struct EngineInfo {
@@ -651,47 +635,6 @@ impl EngineClient {
             .collect()
     }
 
-    /// Grows the engine's KV cache as [`Self::resize_cache`] does, once the
-    /// worlds of `keep_weights` (a previous world kept as its weights, whose
-    /// processes exited) released every storage but their weights and the
-    /// completed rollback copies named by `cache_keys` on every
-    /// node, and with `to_host` moved those weights to host storage, so that
-    /// each GPU's ledger leaves the cache the rest. Returns each node's
-    /// report of the weights kept (JSON `{"host", "released", "moved_bytes",
-    /// "refused"}`), `refused` saying why a node kept them on its GPUs.
-    ///
-    /// # Errors
-    ///
-    /// Fails as [`Self::resize_cache`] does, or when a node keeps no
-    /// weights alone.
-    pub async fn grow_keeping_weights(
-        &self,
-        keep_weights: Vec<u64>,
-        to_host: bool,
-        cache_keys: Vec<Vec<u8>>,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        let results = self
-            .ask(|id| {
-                wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
-                    id,
-                    change: wire::CacheChange::Grow as i32,
-                    preempt_after_ms: None,
-                    keep_weights,
-                    keep_in_host_storage: to_host,
-                    cache_keys,
-                    ..wire::ResizeCache::default()
-                })
-            })
-            .await
-            .map(Answered::results)?;
-        // The nodes' reports come first, each as `{"kept": ...}`.
-        Ok(results
-            .iter()
-            .filter_map(|result| serde_json::from_str::<serde_json::Value>(result).ok())
-            .filter_map(|mut value| value.get_mut("kept").map(serde_json::Value::take))
-            .collect())
-    }
-
     /// The storage ledgers every node's Storage Server keeps for the
     /// deployment, one JSON result per node: `{"host": ..., "ledgers":
     /// [...], "host_storage": {...}}`. No worker is asked: each node's daemon
@@ -707,28 +650,8 @@ impl EngineClient {
             .map(Answered::results)
     }
 
-    /// Halves, or restores when not `halve`, the byte budgets of the links
-    /// the deployment's transfers use at every node's Transfer Server: a
-    /// halving takes every link a task of the deployment copies over now, a
-    /// restoration every link a halving reduced, which grows back gradually.
-    ///
-    /// Returns the hosts it throttled.
-    ///
-    /// # Errors
-    ///
-    /// Fails when a node's daemon cannot reach its Transfer Server, or when
-    /// the engine ends first.
-    pub async fn throttle_transfers(&self, halve: bool) -> Result<Vec<String>, String> {
-        self.ask(|id| {
-            wire::engine_command::Kind::ThrottleTransfers(wire::ThrottleTransfers { id, halve })
-        })
-        .await
-        .map(Answered::results)
-    }
-
-    /// Runs the worker hook `name` with the JSON `payload` on every worker
-    /// once the engine's batches in flight complete, and returns each
-    /// worker's JSON result.
+    /// Runs the data plane's operation `name` with the JSON `payload`, and
+    /// returns each rank's JSON result.
     ///
     /// # Errors
     ///
@@ -807,71 +730,6 @@ impl EngineClient {
             wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
                 id,
                 change: change as i32,
-                ..wire::ResizeCache::default()
-            })
-        })
-        .await
-        .map(Answered::results)
-    }
-
-    /// Plans (`Plan`) or makes (`Shrink`) the room a world succeeding the
-    /// engine's on the same devices needs beside what they share, by
-    /// `change`: what the successor adds is `successor`, with target rank
-    /// capacities and concrete transfer allocations in `budgets`. A shrink recomputes the requests
-    /// that still hold the tail once `preempt_after` passed, when given.
-    /// Returns each device's plan.
-    ///
-    /// # Errors
-    ///
-    /// Fails as [`Self::resize_cache`] does, and with every item of every
-    /// device and host when the successor does not fit.
-    pub async fn make_room(
-        &self,
-        change: wire::CacheChange,
-        successor: Successor,
-        preempt_after: Option<Duration>,
-        budgets: &BTreeMap<[u8; 16], storage::manifest::weights::RankBudget>,
-    ) -> Result<Vec<String>, String> {
-        let rank_budgets: Vec<wire::RankBudget> = budgets
-            .iter()
-            .map(|(gpu, budget)| wire::RankBudget {
-                gpu: gpu.to_vec(),
-                weights: budget.weights,
-                quota: budget.quota,
-                process: budget.process,
-                graphs: budget.graphs,
-                fixed: budget.fixed,
-                cache: budget.cache,
-                cache_capacity: budget.cache_capacity,
-                cache_segment: budget.cache_segment,
-                in_flight: budget.in_flight.map(|cache| wire::CacheReservation {
-                    bytes: cache.bytes,
-                    mapped: cache.mapped,
-                }),
-                pages: budget
-                    .pages
-                    .iter()
-                    .map(|page| wire::CachePageBudget {
-                        tokens: page.tokens,
-                        bytes: page.bytes,
-                        window: page.window,
-                        state: page.state,
-                    })
-                    .collect(),
-            })
-            .collect();
-        self.ask(|id| {
-            wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
-                id,
-                change: change as i32,
-                preempt_after_ms: preempt_after.map(|after| after.as_millis() as u64),
-                keep_weights: Vec::new(),
-                successor_loads_weights: successor.loads_weights,
-                successor_unmapped_cache: successor.unmapped_cache,
-                successor_host_cache: successor.host_cache,
-                eager_source: successor.eager_source,
-                successor_captures_graphs: successor.captures_graphs,
-                rank_budgets,
                 ..wire::ResizeCache::default()
             })
         })

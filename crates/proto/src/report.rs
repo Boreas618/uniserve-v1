@@ -156,6 +156,11 @@ pub struct SchedulerStats {
     /// `batch_roundtrip_us` in this interval.
     #[serde(default)]
     pub batch_count: u64,
+    /// Query tokens the `batch_count` batches computed. The scheduler counts them from the calls it
+    /// planned, so a report states the interval's throughput whatever its executor reports
+    /// (`worker_forward_stats` is empty for a main process).
+    #[serde(default)]
+    pub batch_tokens: u64,
     /// Calls whose forward produced non-finite logits in the interval.
     #[serde(default)]
     pub numerical_faults: u64,

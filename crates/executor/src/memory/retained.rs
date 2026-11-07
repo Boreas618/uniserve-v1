@@ -719,6 +719,21 @@ impl Retained {
             && entry.worlds == [self.world]
     }
 
+    /// States this world's quota of the GPU of `device`, `fraction` of the whole of it: every storage
+    /// retained there from now on fits it or is refused, and the cache's segments are given back
+    /// against it (`docs/admin.md`, The KV cache's storage and the weights). What this rank holds
+    /// already stays.
+    pub fn state_quota(&self, device: DeviceId, fraction: f64) -> Result<()> {
+        let total = device.memory_info()?.total;
+        self.book(
+            device,
+            total,
+            crate::capacity::quota(total, fraction),
+            Vec::new(),
+        )
+        .map(drop)
+    }
+
     /// The deployment's ledger of the GPU of `device`, and what the host
     /// admits of new host storage.
     pub(crate) fn ledger(&self, device: DeviceId) -> Result<(GpuLedger, ::storage::HostStorage)> {
@@ -1194,6 +1209,143 @@ impl Retained {
         Key(digest.finalize().into())
     }
 
+    /// The mapped storage of the weight retained under `key` on `device`, when the server holds it.
+    pub(crate) fn mapped_weight(&self, device: DeviceId, key: &[u8; 32]) -> Result<Option<Arc<Storage>>> {
+        let key = Self::device_key(key, &lock(&self.state).gpu(device)?);
+        self.weight(device, key)
+    }
+
+    /// Publishes a weight of `length` bytes whose bytes `fill` writes on the device, under `key`,
+    /// and answers the read-only region they are mapped at.
+    ///
+    /// [`WeightStorage::store`] is this with the bytes coming from the host. A rearrangement of
+    /// weights the device already holds has no host bytes to hand over: `fill` copies from the
+    /// region the rank serves from into the writable staging mapping, on a stream of its own
+    /// beside the serving one, and the record is published once the copy completed, so a reader
+    /// never maps a half-written weight.
+    ///
+    /// [`WeightStorage::store`]: crate::memory::weights::WeightStorage::store
+    pub(crate) fn store_on_device(
+        &self,
+        device: DeviceId,
+        key: &[u8; 32],
+        length: usize,
+        allocation: usize,
+        fill: impl FnOnce(u64, &platform::Stream) -> Result<()>,
+    ) -> Result<nn::Backing> {
+        let granularity = platform::HandleType::Descriptor.granularity(device)?;
+        if length == 0 || allocation < length || !allocation.is_multiple_of(granularity) {
+            return Err(Error::Invariant(format!(
+                "a weight of {length} bytes cannot be retained in an allocation of {allocation} \
+                 bytes, which is not a multiple of the {granularity}-byte granularity"
+            )));
+        }
+        let key = Self::device_key(key, &lock(&self.state).gpu(device)?);
+        // The copy runs with the client free: a storage operation of another owner of this rank
+        // waits for no device work of this one.
+        let (staging, descriptor) = Storage::retainable(device, allocation, &[])?;
+        let stream = platform::Stream::new(device)?;
+        fill(staging.address(), &stream)?;
+        stream.synchronize()?;
+        let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
+        let record = ::storage::StorageRecord {
+            placement: Placement::Device { gpu },
+            segment: None,
+            bytes: staging.bytes() as u64,
+            fabric: None,
+        };
+        let tensor = ::storage::TensorRecord {
+            key,
+            name: format!("weight-{}", hex_key(&key.0)),
+            storage: 0,
+            offset: 0,
+            dtype: "uint8".into(),
+            shape: vec![length as u64],
+            strides: vec![1],
+            access: Access::ReadOnly,
+        };
+        state
+            .client
+            .put(
+                vec![tensor],
+                &[(record, std::os::fd::AsFd::as_fd(&descriptor))],
+            )
+            .map_err(|error| storage_error("publishing a retained weight", error))?;
+        drop(state);
+        let Some(storage) = self.weight(device, key)? else {
+            return Err(Error::Interface(
+                "a published weight was not found under its own key".into(),
+            ));
+        };
+        Ok(nn::Backing::new(
+            ops::DevicePtr::new(storage.address()),
+            storage.bytes() as u64,
+        ))
+    }
+
+    /// Puts each pair's new weight at the old weight's address on `device`, and ends the rank's
+    /// retention of the old ones (§7.6).
+    ///
+    /// The address is what the rank's captured graphs and its model's views hold, so it stays; the
+    /// allocation behind it becomes the new key's, which the Storage Server retains under the name
+    /// a load of that checkpoint asks for. A relaunch therefore binds it without this rank saying
+    /// anything, and the mapping stays read-only throughout: no process ever writes a published
+    /// weight.
+    ///
+    /// No device work may read the old weights during the call. Returns how many weights moved. A
+    /// failure part of the way leaves the rank with weights of two checkpoints, and the caller
+    /// retires the rank.
+    pub(crate) fn rebind_weights(
+        &self,
+        device: DeviceId,
+        pairs: &[([u8; 32], [u8; 32])],
+    ) -> Result<usize> {
+        let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
+        let mut released = BTreeSet::new();
+        for (old, new) in pairs {
+            let old = Self::device_key(old, &gpu);
+            let new = Self::device_key(new, &gpu);
+            let target = state.weights.remove(&(device.0, old)).ok_or_else(|| {
+                Error::Invariant(format!(
+                    "the rank maps no weight {} to rebind",
+                    hex_key(&old.0)
+                ))
+            })?;
+            let source = state.weights.remove(&(device.0, new)).ok_or_else(|| {
+                Error::Invariant(format!(
+                    "the rank mapped no weight {} to rebind onto",
+                    hex_key(&new.0)
+                ))
+            })?;
+            target.rebind_retained(&source)?;
+            state.weights.insert((device.0, new), target);
+            state.used.remove(&old);
+            released.insert(old);
+            // The new key's second mapping ends with `source`: the address the load published at
+            // is one nothing reads, and the allocation lives on behind the old address.
+        }
+        let moved = released.len();
+        self.release_keys(&mut state, &released, "ending the retention of replaced weights")?;
+        Ok(moved)
+    }
+
+    /// Unmaps the weights of `keys` on `device` and ends the rank's retention of them: a load that
+    /// will not serve leaves no storage behind (§7.6).
+    pub(crate) fn forget_weights(&self, device: DeviceId, keys: &[[u8; 32]]) -> Result<()> {
+        let mut state = lock(&self.state);
+        let gpu = state.gpu(device)?;
+        let mut released = BTreeSet::new();
+        for key in keys {
+            let key = Self::device_key(key, &gpu);
+            state.weights.remove(&(device.0, key));
+            state.used.remove(&key);
+            released.insert(key);
+        }
+        self.release_keys(&mut state, &released, "releasing an abandoned weight load")
+    }
+
     /// Publishes a page of the state a model keeps per unit under `key` (design 4.5, 8): the
     /// publisher allocates the exportable device block, `write` fills it with the page's blocks in
     /// the layout the destination scatters, and the record names that allocation, so a reader maps
@@ -1356,6 +1508,16 @@ impl Retained {
                 }
                 found.insert(tensor.key, descriptor);
             }
+        }
+        // A standby maps the planes its predecessor serves from: one that finds none of them asked
+        // for another shape, and a cache of no storage would fault at its first warmup.
+        if standby && found.is_empty() {
+            return Err(Error::Invalid(format!(
+                "the standby worker found no {} of its predecessor's shape: its scope holds no \
+                 segment of these lengths in world {}",
+                spec.name,
+                spec.parts.first().map_or(self.world, |part| part.segment.world),
+            )));
         }
         let storage = Storage::segmented(spec.device, &spec.lengths(), spec.access)?;
         let mut created = vec![false; keys.len()];

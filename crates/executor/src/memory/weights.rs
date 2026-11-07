@@ -124,6 +124,21 @@ pub fn retained_key(weight: &WeightKey) -> [u8; 32] {
     digest.finalize().into()
 }
 
+/// One weight a model's load reached, in the load's order.
+///
+/// A load is deterministic in its order: the same code over a checkpoint of the same model asks for
+/// the same weights one after another. A position in this list is therefore the identity of a
+/// weight across two loads, which is what lets an update pair each serving weight with its
+/// replacement although every key differs (§7.6).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedWeight {
+    /// The weight's key.
+    pub key: WeightKey,
+    /// Whether the model writes this region after the load: it lives in this process alone, and
+    /// no update replaces it, because the model writes it again.
+    pub writable: bool,
+}
+
 /// The epoch's retained weights: the keys this rank has mapped, beside the storage that holds them.
 ///
 /// The store is the main process's, built once per rank and shared by every model load of the
@@ -142,6 +157,8 @@ pub struct WeightStore<S: WeightStorage> {
     /// How many weights this rank published to the storage, which is how many keys it added to a
     /// store that never releases one (§8: a content-addressed cache that outlives its epochs).
     published: usize,
+    /// Every weight the load reached, in its order, for the updates of §7.6.
+    log: Vec<LoadedWeight>,
 }
 
 impl<S: WeightStorage> WeightStore<S> {
@@ -153,7 +170,36 @@ impl<S: WeightStorage> WeightStore<S> {
             mapped: BTreeMap::new(),
             from_store: 0,
             published: 0,
+            log: Vec::new(),
         }
+    }
+
+    /// The weights the load reached, in its order, leaving the log empty.
+    pub fn take_log(&mut self) -> Vec<LoadedWeight> {
+        std::mem::take(&mut self.log)
+    }
+
+    /// How many weights the load reached so far: the position of the next one.
+    pub(crate) fn logged(&self) -> usize {
+        self.log.len()
+    }
+
+    /// Records a weight this load published by another path than [`RetainedWeights::publish`].
+    pub(crate) fn adopt(&mut self, key: &WeightKey, backing: Backing) {
+        self.log.push(LoadedWeight {
+            key: key.clone(),
+            writable: false,
+        });
+        self.mapped.insert(retained_key(key), backing);
+        self.published += 1;
+    }
+
+    /// Records a table the load reached and holds no storage for.
+    pub(crate) fn note_table(&mut self, key: &WeightKey) {
+        self.log.push(LoadedWeight {
+            key: key.clone(),
+            writable: true,
+        });
     }
 
     /// The device this store maps on.
@@ -256,8 +302,16 @@ impl<S: WeightStorage> Drop for WeightStore<S> {
 
 impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
     fn retained(&mut self, key: &WeightKey) -> nn::Result<Option<Backing>> {
-        self.backing(key)
-            .map_err(|error| nn::Error::Unsupported(error.to_string()))
+        let backing = self
+            .backing(key)
+            .map_err(|error| nn::Error::Unsupported(error.to_string()))?;
+        if backing.is_some() {
+            self.log.push(LoadedWeight {
+                key: key.clone(),
+                writable: false,
+            });
+        }
+        Ok(backing)
     }
 
     fn publish(
@@ -294,6 +348,10 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         }
 
         let storage_key = retained_key(key);
+        self.log.push(LoadedWeight {
+            key: key.clone(),
+            writable: false,
+        });
         // Publishing a key this rank already mapped answers the region it holds: the bytes are the
         // same weight, and the second publication would be the caller's error (§8, `publish`).
         if let Some(backing) = self.mapped.get(&storage_key) {
@@ -318,6 +376,10 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         _shape: Shape,
         bytes: &[u8],
     ) -> nn::Result<Backing> {
+        self.log.push(LoadedWeight {
+            key: key.clone(),
+            writable: true,
+        });
         let allocation = self
             .allocation_length(bytes.len())
             .map_err(|error| nn::Error::Unsupported(format!("sizing table {key}: {error}")))?;

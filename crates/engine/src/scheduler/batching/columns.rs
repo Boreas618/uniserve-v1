@@ -257,7 +257,7 @@ pub(crate) fn columns(
         let query = *forward.query_lens.last()?;
         // A call samples when it declares a sampled-token output: a decode and
         // a verification always do, and a prompt chunk does only when it is the
-        // chunk that ends the prompt. `consumer_slots` is the worker's, filled
+        // chunk that ends the prompt. `consumer_slots` is the executor's, filled
         // after this runs, so the mechanism's own answer is `token_output`.
         let sampled = call.token_output.is_some();
         if matches!(kind, RowKind::Decode | RowKind::Verify) && !sampled {
@@ -455,7 +455,7 @@ mod tests {
         );
         // A call that samples declares the output it samples into, which is
         // what the planner sets (`plan_decode`, `plan_verify`, a sampling
-        // `plan_prefill`); `consumer_slots` is the worker's, filled later.
+        // `plan_prefill`); `consumer_slots` is the executor's, filled later.
         call.token_output = Some(ipc::TensorRef {
             request_key: ipc::RequestKey::new(1, ipc::RequestId(1), 1),
             producer_call_id: ipc::CallId::new(1, 0),

@@ -64,7 +64,7 @@ pub(crate) struct Operation {
     /// `config`, `commit`, `rollback`, `update_weights`, `rebalance_experts`,
     /// `pause_generation`, `continue_generation`, `flush_cache`, `sleep`,
     /// `wake_up`, `load_lora_adapter`, `unload_lora_adapter`, `profile`,
-    /// `hook`, `restart` or `shutdown`.
+    /// `restart` or `shutdown`.
     pub kind: String,
     /// `running`, `succeeded` or `failed`.
     pub state: String,
@@ -409,7 +409,6 @@ pub(crate) fn router(state: AdminState) -> Router {
             "/admin/profile",
             get(profile_status).post(start_profile).delete(stop_profile),
         )
-        .route("/admin/hooks/{name}", post(named_hook))
         .with_state(state)
 }
 
@@ -727,7 +726,7 @@ async fn program_update(
         // No replica serves: the world path answers that account itself.
         return Ok(None);
     };
-    let Ok((target, _, _)) = crate::updates::change::resolve(&current, request) else {
+    let Ok((target, _, options)) = crate::updates::change::resolve(&current, request) else {
         // The change itself is refused; the world path answers it the same way.
         return Ok(None);
     };
@@ -747,7 +746,7 @@ async fn program_update(
     let epochs = leader.epochs();
     let number = admin.running_number();
     let planned = match leader
-        .apply_programs(number, &target, request.force, true)
+        .apply_programs(number, &target, &options, request.force, true)
         .await
     {
         Ok(Some(planned)) => planned,
@@ -763,7 +762,7 @@ async fn program_update(
     let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
     program_phase(admin, &epochs, Phase::Precopy, epoch, &planned);
     match leader
-        .apply_programs(number, &target, request.force, false)
+        .apply_programs(number, &target, &options, request.force, false)
         .await
     {
         Ok(Some(update)) => {
@@ -1187,48 +1186,6 @@ async fn stop_profile(State(state): State<AdminState>) -> Response {
                 format!("{:#}", anyhow::Error::from(error)),
             )
         })
-    })
-    .await
-}
-
-/// `POST /admin/hooks/{name}`: a worker hook a plugin adds under a name of
-/// its own. The engine's own hooks (`uniserve.*`) run through their
-/// endpoints alone.
-async fn named_hook(
-    State(state): State<AdminState>,
-    axum::extract::Path(name): axum::extract::Path<String>,
-    body: axum::body::Bytes,
-) -> Response {
-    if name.starts_with("uniserve.") {
-        return ApiError::invalid_request(
-            format!("the worker hook {name} is the engine's own: it runs through its endpoint"),
-            None,
-        )
-        .into_response();
-    }
-    run_hook(state, name, body).await
-}
-
-/// Runs the worker hook `name` as an operation, answering with every
-/// worker's result once it ends.
-async fn run_hook(state: AdminState, name: String, body: axum::body::Bytes) -> Response {
-    let payload = if body.is_empty() {
-        "null".to_owned()
-    } else {
-        match serde_json::from_slice::<serde_json::Value>(&body) {
-            Ok(value) => value.to_string(),
-            Err(error) => return ApiError::json_parse_error(error.to_string()).into_response(),
-        }
-    };
-    let leader = Arc::clone(&state.leader);
-    run(&state.admin, "hook", true, async move {
-        match leader.hook(&name, &payload).await {
-            Ok(results) => Ok(json!({ "hook": name, "results": json_results(&results) })),
-            Err(error) => Err((
-                update_status(&error),
-                format!("{:#}", anyhow::Error::from(error)),
-            )),
-        }
     })
     .await
 }

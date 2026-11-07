@@ -2218,7 +2218,7 @@ mod tests {
                 config.logging_config.log_requests = true
             }),
             ("update_config", |config: &mut ServeConfig| {
-                config.update_config.eager_prepare = !config.update_config.eager_prepare
+                config.update_config.transfer_slowdown += 1.0
             }),
         ];
         // The values that build a main process (§7.7 build-config row).

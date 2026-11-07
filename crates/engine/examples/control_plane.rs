@@ -1,7 +1,7 @@
 //! Demonstrates concurrent text and image requests through the simulated engine.
 //!
 //! The example exercises scheduling and lifecycle events without requiring a
-//! model worker or GPU. Three text-only and two image-only requests share one
+//! model executor or GPU. Three text-only and two image-only requests share one
 //! scheduler thread over `SimExecutor`; the run passes when every request
 //! finishes within the deadline, each text request emits at least one text
 //! token, and each image request emits at least one image. The process exits

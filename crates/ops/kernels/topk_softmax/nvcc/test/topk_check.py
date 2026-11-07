@@ -11,10 +11,10 @@ one says what it is.
 **Without a device** it checks the module against its own build: the constants in `baked.json`
 are the ones this run states and the ones the kernel derives from them (the iterations a lane
 walks are `ceil(experts / 32)` and the renormalizing butterfly is the top-k rounded up to a power
-of two), and the eleven words in `metadata.json`'s signature are the operator's, in order and by
-kind — the fourth pointer is the scale, and a `scale_none` module still declares it as one. A
-module built for another descriptor is refused here, which is the observable form of the kernel's
-`__trap()`.
+of two), and the twelve words in `metadata.json`'s signature are the operator's, in order and by
+kind — the fourth pointer is the scale, and a `scale_none` module still declares it as one, and the
+last is the expert map, which the operator passes null without one. A module built for another
+descriptor is refused here, which is the observable form of the kernel's `__trap()`.
 
 **With a device** the launch is the harness's, not this script's:
 
@@ -41,6 +41,11 @@ Renormalized, the weights are the picks' share of the picks' own sum, floored at
 The fixed input states both cases: one row whose second and third picks are exactly equal in
 `bf16`, and every row's padding past `experts` filled with a value that would win if it were
 ever read.
+
+**With `--mapped`** a device run also passes the logical-to-physical map, reversed, and turns the
+last row into a padding row of NaN scores, as a captured bucket's rows past the batch hold. The ids
+must be the map's entries of the same picks, and the padding row must keep the id that names no
+expert: it picks none, and a read of the map at that id is an illegal address.
 """
 
 import argparse
@@ -64,6 +69,7 @@ SIGNATURE = (
     ("scale_kind", "i32"),
     ("ids", "pointer"),
     ("weights", "pointer"),
+    ("map", "pointer"),
 )
 
 #: The storage kinds the kernel reads, as its `score_kind` and `scale_kind` take them.
@@ -229,10 +235,10 @@ def check_module(module, experts, top, dtype, row_stride):
     return problems
 
 
-def recipe_of(module, experts, top, rows, row_stride, dtype):
+def recipe_of(module, experts, top, rows, row_stride, dtype, mapped=False):
     """The harness's recipe for one launch of the module on the fixed input."""
     kind = {"f32": "i32", "bf16": "i32", "f16": "i32"}[dtype]
-    return {
+    recipe = {
         # Absolute: the harness resolves a recipe's relative module path against the recipe's own
         # directory, and a case written from the repo root is read from anywhere.
         "module": str(pathlib.Path(module).absolute()),
@@ -261,25 +267,58 @@ def recipe_of(module, experts, top, rows, row_stride, dtype):
             {"i32": KINDS["none"]},
             {"pointer": "ids"},
             {"pointer": "weights"},
+            {"i64": 0},
         ],
         "kinds": kind,
     }
+    if mapped:
+        recipe["buffers"]["map"] = {"bytes": experts * 4, "fill": "map.bin"}
+        recipe["parameters"][-1] = {"pointer": "map"}
+    return recipe
 
 
 def write_inputs(
-    directory, scores, module, experts, top, rows, row_stride, dtype
+    directory, scores, module, experts, top, rows, row_stride, dtype, mapped=False
 ):
     """Write the fixed input and the recipe a device run uses."""
     directory.mkdir(parents=True, exist_ok=True)
+    if mapped:
+        scores = scores.clone()
+        scores[-1, :] = float("nan")
+        (directory / "map.bin").write_bytes(
+            reversed_map(experts).to(torch.int32).numpy().tobytes()
+        )
     # The bytes of the stored dtype, in the order the kernel reads them: one row of `row_stride`.
     stored = scores.to(TORCH_TYPES[dtype]).contiguous()
     (directory / "scores.bin").write_bytes(
         stored.view(torch.uint8).numpy().tobytes()
     )
-    recipe = recipe_of(module, experts, top, rows, row_stride, dtype)
+    recipe = recipe_of(module, experts, top, rows, row_stride, dtype, mapped)
     recipe.pop("kinds", None)
     (directory / "recipe.json").write_text(json.dumps(recipe, indent=2) + "\n")
     print(f"wrote {directory}/scores.bin and {directory}/recipe.json")
+
+
+def reversed_map(experts):
+    """The map a `--mapped` run passes: logical expert `e` lies in slot `experts - 1 - e`."""
+    return torch.arange(experts - 1, -1, -1, dtype=torch.int64)
+
+
+def verify_mapped(directory, ids, experts, rows, top):
+    """Compare a `--mapped` device run's ids: slots for real picks, none for the padding row."""
+    path = directory / "ids.bin"
+    if not path.exists():
+        return [f"{path} is missing: the harness did not dump it"]
+    got = torch.from_file(str(path), dtype=torch.int32, size=rows * top).reshape(rows, top)
+    problems = []
+    expected = reversed_map(experts)[ids[:-1]]
+    wrong = (got[:-1].long() != expected).sum().item()
+    if wrong:
+        problems.append(f"{wrong} routes do not hold the slot the map names")
+    if ((got[-1].long() >= 0) & (got[-1].long() < experts)).any():
+        problems.append(f"the padding row names a slot: {got[-1].tolist()}")
+    print(f"verified: {(rows - 1) * top} mapped routes, {wrong} wrong; padding {got[-1].tolist()}")
+    return problems
 
 
 def verify(directory, ids, weights, experts, rows, top):
@@ -366,6 +405,11 @@ def main() -> int:
     )
     parser.add_argument("--write", type=pathlib.Path, default=None)
     parser.add_argument("--verify", type=pathlib.Path, default=None)
+    parser.add_argument(
+        "--mapped",
+        action="store_true",
+        help="pass the reversed expert map and a padding row of NaN scores",
+    )
     arguments = parser.parse_args()
 
     if arguments.module is None and arguments.verify is None:
@@ -451,9 +495,14 @@ def main() -> int:
             arguments.rows,
             arguments.row_stride,
             arguments.dtype,
+            arguments.mapped,
         )
 
-    if arguments.verify is not None:
+    if arguments.verify is not None and arguments.mapped:
+        problems += verify_mapped(
+            arguments.verify, ids, arguments.experts, arguments.rows, arguments.top
+        )
+    elif arguments.verify is not None:
         problems += verify(
             arguments.verify,
             ids,

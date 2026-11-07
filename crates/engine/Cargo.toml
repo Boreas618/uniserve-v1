@@ -8,7 +8,6 @@ publish = false
 [dependencies]
 anyhow.workspace = true
 base64.workspace = true
-bitflags.workspace = true
 crossbeam-channel.workspace = true
 executor.workspace = true
 fnv.workspace = true
@@ -22,7 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 storage.workspace = true
-tempfile.workspace = true
+tempfile = { workspace = true, optional = true }
 thiserror.workspace = true
 # A test-only policy module is written as WebAssembly text, so the `testing`
 # feature states it as text instead of shipping a compiled policy package.
@@ -32,23 +31,19 @@ toml.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
-[target.'cfg(target_os = "linux")'.dependencies]
-libc.workspace = true
-
 [features]
 # Exposes the GPU-free simulated executor to control-plane tests and examples.
 # It is never part of a serving build.
-testing = ["dep:png", "dep:wat"]
+testing = ["dep:png", "dep:tempfile", "dep:wat"]
 
 [dev-dependencies]
-daemon.workspace = true
 storage-server.workspace = true
 base64.workspace = true
 engine = { path = ".", features = ["testing"] }
+libc.workspace = true
 # Tests state video requests as the frontend plans them.
 models.workspace = true
 png.workspace = true
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

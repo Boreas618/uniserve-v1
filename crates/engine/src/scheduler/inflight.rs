@@ -72,14 +72,26 @@ pub(super) struct PendingBatch {
     /// Lifecycle commands other than `Start`, in batch order, so a position
     /// here is the executor's `CommandResult::command_index`.
     pub(super) commands: Vec<BatchCommand>,
-    /// Worker execution time accumulated across partial results, in
+    /// Executor execution time accumulated across partial results, in
     /// microseconds.
     pub(super) worker_exec_us: u64,
     /// Whether the batch carries a `BatchKind::Prefill` call, which the room
     /// reports as a prefill batch in flight.
     pub(super) prefill: bool,
-    /// The kind of step the batch's worker time measures, if any.
+    /// The query tokens of the batch's calls, which the once-a-second report
+    /// states beside its batch time.
+    pub(super) tokens: u64,
+    /// The kind of step the batch's executor time measures, if any.
     pub(super) measured: Option<speculation::MeasuredStep>,
+}
+
+/// The tokens `call`'s forward computes: its input tokens, or the one token a continuation reads
+/// from its predecessor on the device; none for a call that runs no token forward.
+fn query_tokens(call: &ipc::Call) -> u64 {
+    match call.kind {
+        ipc::CallKind::Forward(_) => call.input_token_ids.len().max(1) as u64,
+        ipc::CallKind::Media(_) | ipc::CallKind::Transfer(_) => 0,
+    }
 }
 
 /// Owns submitted identities and their lifetime through ordered reconciliation.
@@ -105,10 +117,10 @@ pub(super) struct Inflight {
     pub(super) pending_batches: HashMap<u64, PendingBatch>,
     /// `Finish` and `Free` commands awaiting a batch to carry them.
     pub(super) pending_commands: VecDeque<BatchCommand>,
-    /// Requests a worker refused whose calls were still in flight: their
+    /// Requests an executor refused whose calls were still in flight: their
     /// later calls, submitted before the refusal arrived, fail for want of
     /// the refused call's products, and such a failure is the refusal's,
-    /// not a worker fault (`Scheduler::on_executor_error`). A request
+    /// not an executor fault (`Scheduler::on_executor_error`). A request
     /// leaves once none of its calls is in flight.
     pub(super) refused: HashSet<RequestKey>,
 }
@@ -155,6 +167,7 @@ impl Inflight {
                     .requests
                     .iter()
                     .any(|(call, _)| batch_kind(call.kind) == BatchKind::Prefill),
+                tokens: batch.requests.iter().map(|(call, _)| query_tokens(call)).sum(),
                 measured: speculation::MeasuredStep::of(
                     batch.requests.iter().map(|(call, _)| call),
                 ),
@@ -295,11 +308,11 @@ impl Inflight {
         Some(inflight)
     }
 
-    /// Removes one call a worker failure retired, regardless of its queue
+    /// Removes one call an executor failure retired, regardless of its queue
     /// position, and releases its transfer reservation.
     ///
     /// Returns `None` when the batch is unknown or no longer owns the call, or
-    /// when the request's queue does not hold it; the worker-failure path
+    /// when the request's queue does not hold it; the executor-failure path
     /// treats that as engine-fatal. Once the call has left the batch's
     /// `calls`, a missing queue entry is reported without restoring it.
     pub(super) fn retire_call(
