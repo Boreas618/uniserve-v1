@@ -351,11 +351,9 @@ impl Leader {
         // applied with `force` (§7.2, §7.3 step 4), whichever layer would
         // apply it: the epoch layer's switch and the program layer both end
         // by recording the update here.
+        let resolved_target = crate::leader::deployment(&target)?;
         if !request.force
-            && let Some(failure) = self
-                .updates
-                .epochs()
-                .unavailable(&crate::epoch::Deployment::of(target.clone()))
+            && let Some(failure) = self.updates.epochs().unavailable(&resolved_target)
         {
             return Err(UpdateError::Refused(format!(
                 "the configuration reverted with a failure ({}); apply it again with force",
@@ -468,8 +466,8 @@ impl Leader {
         update: &crate::options::UpdateConfig,
         dry_run: bool,
     ) -> Result<Option<Applied>, UpdateError> {
-        let previous = crate::epoch::Deployment::of(current.clone());
-        let next = crate::epoch::Deployment::of(target.clone());
+        let previous = crate::leader::deployment(current)?;
+        let next = crate::leader::deployment(target)?;
         if crate::epoch::layer(&previous, &next) != crate::epoch::Layer::Epoch {
             return Ok(None);
         }
@@ -561,7 +559,7 @@ impl Leader {
         // every process of it reads names that path (§2.3). The world is the
         // epoch's identity, which the switch claims.
         control
-            .write_engine_config(target_epoch, &next.config.engine_config())
+            .write_engine_config(target_epoch, &next.engine)
             .map_err(UpdateError::Failed)?;
         // The target's spec is resolved as a deployment's start resolves it: the options state the
         // scheduler and the rank layout, and the model's files complete what they determine.

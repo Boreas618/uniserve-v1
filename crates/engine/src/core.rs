@@ -15,9 +15,8 @@
 
 use ipc::MediaCall;
 use proto::config::DEFAULT_BLOCK;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
@@ -38,9 +37,8 @@ use anyhow::Context as _;
 use executor::batch::Batches;
 use ipc::MainProcessInfo;
 use ipc::RequestId;
-use proto::config::BlockConfig;
 #[cfg(test)]
-use proto::config::BlockDistribution;
+use proto::config::{BlockConfig, BlockDistribution};
 pub use proto::config::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 use proto::request::ExpertExchange;
 

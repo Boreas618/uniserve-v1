@@ -1823,7 +1823,12 @@ mod tests {
         )
         .unwrap();
         control
-            .write_engine_config(3, &ServerArgs::default().engine_config())
+            .write_engine_config(
+                3,
+                &ServerArgs::default()
+                    .engine_config()
+                    .expect("the configuration resolves"),
+            )
             .unwrap();
         let own = std::env::current_exe().unwrap().display().to_string();
         // The deployment's own spec, as `ServeOptions` builds it: an epoch's
@@ -1883,7 +1888,11 @@ mod tests {
     /// An update of the default deployment's filled programs, for the switch to
     /// move.
     fn update() -> crate::epoch::Update {
-        crate::epoch::Update::new(1, crate::epoch::Deployment::of(ServerArgs::default()))
+        crate::epoch::Update::new(
+            1,
+            crate::epoch::Deployment::of(ServerArgs::default())
+                .expect("the configuration resolves"),
+        )
     }
 
     /// The program layer moves every main process through the generations each
@@ -1894,7 +1903,8 @@ mod tests {
     fn a_switch_moves_every_main_process_through_the_generations_they_numbered() {
         let (processes, seen) =
             main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
-        let target = crate::epoch::Deployment::of(ServerArgs::default());
+        let target = crate::epoch::Deployment::of(ServerArgs::default())
+            .expect("the configuration resolves");
         let mut switch = ProgramSwitch::new(
             &processes,
             vec![process("rank-0", 7), process("rank-1", 8)],
@@ -1962,7 +1972,8 @@ mod tests {
                 Answer::Refuses("the package has no module for this GPU".to_owned()),
             ),
         ]);
-        let target = crate::epoch::Deployment::of(ServerArgs::default());
+        let target = crate::epoch::Deployment::of(ServerArgs::default())
+            .expect("the configuration resolves");
         let mut switch = ProgramSwitch::new(
             &processes,
             vec![process("rank-0", 7), process("rank-1", 8)],
@@ -2004,7 +2015,8 @@ mod tests {
                 })),
             }),
         )]);
-        let target = crate::epoch::Deployment::of(ServerArgs::default());
+        let target = crate::epoch::Deployment::of(ServerArgs::default())
+            .expect("the configuration resolves");
         let mut switch = ProgramSwitch::new(&processes, vec![process("rank-0", 7)], update());
         let failure = switch
             .precopy(&target.programs.kernels, &target.programs.policy)
@@ -2037,7 +2049,8 @@ mod tests {
                 })),
             }),
         )]);
-        let target = crate::epoch::Deployment::of(ServerArgs::default());
+        let target = crate::epoch::Deployment::of(ServerArgs::default())
+            .expect("the configuration resolves");
         let mut switch = ProgramSwitch::new(&processes, vec![process("rank-0", 7)], update());
         let failure = switch
             .precopy(&target.programs.kernels, &target.programs.policy)

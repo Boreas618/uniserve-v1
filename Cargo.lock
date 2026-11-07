@@ -3178,6 +3178,7 @@ dependencies = [
 name = "proto"
 version = "2.0.0"
 dependencies = [
+ "anyhow",
  "bitflags",
  "humantime",
  "libc",

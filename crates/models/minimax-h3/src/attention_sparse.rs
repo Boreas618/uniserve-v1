@@ -5,7 +5,7 @@ use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
 
-use crate::attention::{Factors, HeadProjection, HeadsToRows, projected_rows};
+use crate::attention::{Factors, HeadProjection, HeadsToRows};
 use crate::config::TransformerConfig;
 use crate::partition::{Partition, Projection};
 use crate::{Error, Result};

@@ -17,12 +17,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::{
-    BatchCapacity, EngineConfig, Event, GenerationConstraint, GenerationRequest, SchedulerHandle,
-    Stage,
+    BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
 };
-use executor::batch::{Batch, Batches, Inventory, PoolLayout};
-use ipc::{ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams};
-use proto::config::BlockConfig;
+use executor::batch::{Batch, Batches};
+use ipc::{ImageParams, SamplingParams};
 
 use crate::support::SAMPLED;
 

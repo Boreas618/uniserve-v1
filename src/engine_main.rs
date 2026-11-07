@@ -92,7 +92,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
-use clap::Args;
 
 use crate::engine_plan::{EpochPlan, PrefillCatalogue};
 use engine::{PolicyProgram, PolicySource, ProgramSource};
@@ -116,7 +115,6 @@ use program_server::{
     Client, Descriptors, PhaseKind, PrepareRequest, Program, ProgramRequest, ProgramSlot, Selector,
     Target,
 };
-use proto::config::EngineConfig;
 
 /// The epoch as this node takes it at start.
 ///

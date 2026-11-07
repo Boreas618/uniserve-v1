@@ -734,11 +734,15 @@ async fn program_update(
     // and deciding that here keeps a host-layer change from needing a Program
     // Server at all: only `None` and `Program` reach the prepare below, the
     // first because a prepared program reveals what the config alone cannot.
+    let (Ok(previous), Ok(next)) = (
+        crate::epoch::Deployment::of(current.clone()),
+        crate::epoch::Deployment::of(target.clone()),
+    ) else {
+        // The configuration does not resolve; the world path refuses it with the reason.
+        return Ok(None);
+    };
     if matches!(
-        crate::epoch::layer(
-            &crate::epoch::Deployment::of(current.clone()),
-            &crate::epoch::Deployment::of(target.clone()),
-        ),
+        crate::epoch::layer(&previous, &next),
         crate::epoch::Layer::Epoch | crate::epoch::Layer::Host
     ) {
         return Ok(None);

@@ -20,9 +20,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use serde::{Deserialize, Serialize};
-
-use proto::config::{EngineArgs, EngineConfig};
+use proto::config::EngineArgs;
 
 /// The path of one engine process's launch file.
 pub(crate) fn launch_path(directory: &Path, engine: u64) -> PathBuf {
@@ -211,7 +209,9 @@ mod tests {
     #[test]
     fn the_engine_config_is_written_once_per_epoch() {
         let directory = scratch("build");
-        let config = ServerArgs::default().engine_config();
+        let config = ServerArgs::default()
+            .engine_config()
+            .expect("the configuration resolves");
         let path = write_engine_config(&directory, 12, &config).expect("the engine config");
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),

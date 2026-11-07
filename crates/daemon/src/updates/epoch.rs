@@ -154,7 +154,7 @@ fn record(
         ))
     })?;
     let mut record = serving.clone();
-    record.config = target.config.engine_config();
+    record.config = target.engine.clone();
     record.kernels = target.programs.kernels.clone();
     record.policy = target.programs.policy.clone();
     record.previous_kernels = serving.kernels;
@@ -232,7 +232,7 @@ mod tests {
     use crate::epoch::{FilledPrograms, Program};
     use crate::options::ServerArgs;
     use crate::updates::switch::{Event, Phase, Start};
-    use proto::config::EngineConfig;
+
     use proto::process::{self, Spawn};
 
     /// A roster that records what the switch asks of it and reports nothing
@@ -300,15 +300,16 @@ mod tests {
     }
 
     fn previous() -> Deployment {
-        Deployment::of(ServerArgs::default())
+        Deployment::of(ServerArgs::default()).expect("the configuration resolves")
     }
 
     /// The same deployment at another executable: a change of the build
     /// config, so the epoch layer's.
     fn epoch_target(base: &Deployment) -> Deployment {
-        let mut target = base.clone();
-        target.config.worker_config.executable = PathBuf::from("/opt/other-uniserve");
-        target
+        let mut config = base.config.clone();
+        config.worker_config.executable = PathBuf::from("/opt/other-uniserve");
+        Deployment::with_programs(config, base.programs.clone())
+            .expect("the configuration resolves")
     }
 
     /// The same deployment with one program revision changed: the program
@@ -326,7 +327,7 @@ mod tests {
 
     fn serving_record(deployment: &Deployment) -> EpochRecord {
         EpochRecord {
-            config: deployment.config.engine_config(),
+            config: deployment.engine.clone(),
             kernels: deployment.programs.kernels.clone(),
             policy: deployment.programs.policy.clone(),
             previous_kernels: BTreeMap::new(),
@@ -405,8 +406,10 @@ mod tests {
         let previous = previous();
         let epochs = Arc::new(Epochs::new());
 
-        let mut host = previous.clone();
-        host.config.logging_config.log_requests = true;
+        let mut logged = previous.config.clone();
+        logged.logging_config.log_requests = true;
+        let host = Deployment::with_programs(logged, previous.programs.clone())
+            .expect("the configuration resolves");
         let mut running = None;
         let mut roster = Fake::default();
         assert!(
@@ -470,7 +473,7 @@ mod tests {
         };
         assert_eq!(report["change"], "epoch");
         assert_eq!(report["phase"], "preparing");
-        assert_eq!(report["build"], target.config.engine_config().executable);
+        assert_eq!(report["build"], target.engine.executable.clone());
 
         let running = running.expect("the switch is kept for the caller");
         assert_eq!(running.phase(), Phase::Preparing);
@@ -481,7 +484,7 @@ mod tests {
 
         let record = epochs.get(12).expect("the target's record");
         assert_eq!(record.status, Status::Precopy);
-        assert_eq!(record.config, target.config.engine_config());
+        assert_eq!(record.config, target.engine);
         assert_eq!(record.kernels, target.programs.kernels);
         assert_eq!(record.previous_kernels, target.programs.kernels);
         assert_eq!(record.previous_policy, Some(target.programs.policy.clone()));

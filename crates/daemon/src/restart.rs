@@ -885,7 +885,7 @@ async fn prepared_successor(
     );
     // The successor adopts the epoch that serves (§2.5, §7.4, §7.5).
     {
-        let (record, process) = adopted_epoch(adopted_world, handed.engine, &options, programs);
+        let (record, process) = adopted_epoch(adopted_world, handed.engine, &options, programs)?;
         epoch_records.record(adopted_world, record);
         let mut processes = epoch_records.processes();
         processes.push(process);
@@ -1090,8 +1090,8 @@ fn adopted_epoch(
     engine: u64,
     options: &crate::options::ServerArgs,
     programs: Option<HandedPrograms>,
-) -> (crate::epoch::EpochRecord, crate::epoch::ManagedProcess) {
-    let deployment = crate::epoch::Deployment::of(options.clone());
+) -> anyhow::Result<(crate::epoch::EpochRecord, crate::epoch::ManagedProcess)> {
+    let deployment = crate::epoch::Deployment::of(options.clone())?;
     let (kernels, policy) = match programs {
         Some(programs) => (programs.kernels.into_iter().collect(), programs.policy),
         None => (
@@ -1100,7 +1100,7 @@ fn adopted_epoch(
         ),
     };
     let record = crate::epoch::EpochRecord {
-        config: deployment.config.engine_config(),
+        config: deployment.engine.clone(),
         kernels,
         policy,
         previous_kernels: std::collections::BTreeMap::new(),
@@ -1115,11 +1115,11 @@ fn adopted_epoch(
         rank: 0,
         pid: None,
         epoch: Some(world),
-        build: deployment.config.engine_config().executable,
+        build: deployment.engine.executable.clone(),
         generation: engine,
         state: crate::epoch::ProcessState::Serving,
     };
-    (record, process)
+    Ok((record, process))
 }
 
 /// How long a daemon that stopped serving waits for a restart in flight to
@@ -1139,14 +1139,18 @@ mod tests {
     #[test]
     fn an_adopted_epoch_records_the_build_it_serves_and_the_generation_it_runs_at() {
         let options = crate::options::ServerArgs::default();
-        let (record, process) = adopted_epoch(7, 12, &options, None);
+        let (record, process) =
+            adopted_epoch(7, 12, &options, None).expect("the configuration resolves");
         assert_eq!(record.status, crate::epoch::Status::Serving);
         assert_eq!(record.world, 7);
         assert_eq!(
             record.generation, None,
             "the model generation is not the launch generation the child reported"
         );
-        assert_eq!(record.config, options.engine_config());
+        assert_eq!(
+            record.config,
+            options.engine_config().expect("the configuration resolves")
+        );
         assert_eq!(process.generation, 12);
         assert_eq!(process.epoch, Some(7));
         assert_eq!(process.state, crate::epoch::ProcessState::Serving);

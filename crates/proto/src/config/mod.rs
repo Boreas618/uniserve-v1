@@ -810,6 +810,27 @@ pub struct ModelConfig {
     pub dtype: crate::request::ModelDtype,
     /// The checkpoint's quantization (`quantization`, SGLang's precision policy).
     pub quantization: serde_json::Map<String, Value>,
+    /// What the leader read from the checkpoint; unset until it has.
+    #[serde(default)]
+    pub facts: Option<ModelFacts>,
+}
+
+/// What the leader reads from a model's checkpoint and the engine would otherwise have to guess.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct ModelFacts {
+    /// The model's generation requirements, which the engine intersects with its workers'
+    /// capacities.
+    pub limits: crate::request::GenerationLimits,
+    pub bos: u32,
+    /// Every end-of-sequence token, the primary one first.
+    pub eos: Vec<u32>,
+    pub end_of_image: u32,
+    pub max_model_len: u32,
+    /// A block-diffusion model's canvas sampling; absent for other models.
+    pub canvas_sampling: Option<crate::request::CanvasSampling>,
+    /// Whether a prompt's prefill returns outputs, which only conditioning prefills of
+    /// block-diffusion models do not.
+    pub prefill_outputs: bool,
 }
 
 /// How an epoch's ranks divide the model and the requests.
@@ -819,10 +840,11 @@ pub struct ParallelConfig {
     pub tensor_parallel_size: NonZeroUsize,
     /// Schedulers, each with its own KV cache and worker groups.
     pub data_parallel_size: NonZeroUsize,
-    /// The deployment file that places worker groups and their blocks.
-    pub worker_groups: Option<PathBuf>,
-    /// The host whose engine processes serve requests.
-    pub engine_host: Option<String>,
+    /// The host whose engine processes serve requests, where a rank without a host runs.
+    pub engine_host: String,
+    /// The worker groups: the deployment file's, placed on their hosts, or the command line's
+    /// shorthand ([`WorkerGroupConfig::shorthand`]).
+    pub worker_groups: Vec<WorkerGroupConfig>,
 }
 
 /// Everything an epoch's engine processes are built from (§7.1, §7.7).
@@ -840,8 +862,23 @@ pub struct EngineConfig {
     pub model: ModelConfig,
     /// The ranks' division of the model and the requests.
     pub parallel: ParallelConfig,
+    /// The deployment: its served model name, under which the Storage Servers keep its claims
+    /// and pages.
+    pub deployment: String,
     /// Concurrently resident requests: the request slots every rank holds.
     pub max_running_requests: NonZeroUsize,
+    /// Token work admitted in one scheduling step; the engine's default when unset.
+    pub max_num_batched_tokens: Option<NonZeroUsize>,
+    /// The attention program's backend, and the ones that fill prompt processing and one decoding
+    /// token when they differ.
+    pub attention_backend: String,
+    pub prefill_attention_backend: Option<String>,
+    pub decode_attention_backend: Option<String>,
+    /// The grouped expert GEMM program's backend.
+    pub moe_runner_backend: Option<String>,
+    pub device: DeviceConfig,
+    pub scheduler: SchedulerConfig,
+    pub media: MediaConfig,
     /// Each rank's share of its device's storage.
     pub mem_fraction_static: f64,
     pub load: LoadConfig,
@@ -859,11 +896,19 @@ impl EngineConfig {
     /// need a new epoch, and two whose hashes agree differ at most in what the program layer
     /// changes in place (§7.7).
     ///
-    /// Every value enters it except those §7.7 assigns to the programs: the expert exchange, which
-    /// selects a program's backend; the speculative cost figures, which are the scheduling
-    /// policy's parameters; and the probes' switches, which change at a step boundary.
+    /// Every value enters it except those §7.7 assigns elsewhere: the program backends (attention,
+    /// the grouped expert GEMM, the expert exchange); the scheduling policy's parameters (the
+    /// scheduler section, the batched token budget, the speculative cost figures); the probes'
+    /// switches, which change at a step boundary; and the media section, which the frontend reads.
     pub fn build_hash(&self) -> String {
         let mut build = self.clone();
+        build.attention_backend = String::new();
+        build.prefill_attention_backend = None;
+        build.decode_attention_backend = None;
+        build.moe_runner_backend = None;
+        build.scheduler = SchedulerConfig::default();
+        build.max_num_batched_tokens = None;
+        build.media = MediaConfig::default();
         build.moe.exchange = MoeConfig::default().exchange;
         build.speculative.expected_speedup = None;
         build.speculative.refill_token_cost = None;

@@ -11,8 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::{
-    BatchCapacity, EngineConfig, Event, GenerationConstraint, GenerationRequest, SchedulerHandle,
-    Stage,
+    BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
 };
 use executor::batch::Batches;
 use ipc::{DiffusionSamplingParams, ImageParams, RequestId, SamplingParams};

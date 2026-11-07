@@ -10,8 +10,6 @@
 //! whichever place states it, and an error names the option's path.
 
 use std::collections::BTreeSet;
-use std::num::{NonZeroU32, NonZeroUsize};
-use std::path::PathBuf;
 
 use anyhow::{Context as _, anyhow};
 use toml::{Table, Value};
@@ -351,6 +349,7 @@ fn set(tree: &mut Table, path: &[String], value: Value) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use clap::{FromArgMatches, Parser};

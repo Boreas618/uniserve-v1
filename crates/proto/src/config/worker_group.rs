@@ -549,6 +549,78 @@ impl WorkerGroupConfig {
     }
 }
 
+impl WorkerGroupConfig {
+    /// The command line's shorthand: `data_parallel_size` groups of `tensor_parallel_size` ranks,
+    /// each running the default block over all its ranks, spread in blocks over `engine_host` and
+    /// the hosts after it (`device_config.worker_hosts`), on the devices `device` states.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `device.devices` orders the ranks but is not one CUDA device per rank, or puts two
+    /// ranks of a host on one device.
+    pub fn shorthand(
+        engine_host: &str,
+        device: &super::DeviceConfig,
+        tensor_parallel_size: usize,
+        data_parallel_size: usize,
+    ) -> anyhow::Result<Vec<Self>> {
+        // Leading with the leader's own host keeps rank zero and the other lowest ranks there; a
+        // repeat of it, or an empty name, places nothing.
+        let mut hosts = vec![engine_host.to_owned()];
+        hosts.extend(
+            device
+                .worker_hosts
+                .iter()
+                .filter(|host| !host.is_empty() && *host != engine_host)
+                .cloned(),
+        );
+        let tensor_parallel_size = tensor_parallel_size.max(1);
+        let mut groups = Self::data_parallel(
+            &hosts,
+            &device.device,
+            data_parallel_size.max(1),
+            tensor_parallel_size,
+            device.queue_depth.get(),
+            Self::single_component(DEFAULT_BLOCK, tensor_parallel_size),
+        );
+        if !device.devices.is_empty() {
+            order_devices(&mut groups, &device.device, &device.devices)?;
+        }
+        Ok(groups)
+    }
+}
+
+/// Puts the shorthand's ranks, in rank order across `groups`, on the CUDA devices `devices` names
+/// by their index on each rank's host (`device_config.devices`): a world whose ranks a daemon
+/// assigned to the GPUs that already hold most of their weights, or an operator's order.
+fn order_devices(
+    groups: &mut [WorkerGroupConfig],
+    device: &str,
+    devices: &[u32],
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(device, "cuda" | "gpu"),
+        "`device_config.devices` orders CUDA devices; `device_config.device` is {device:?}"
+    );
+    let ranks: usize = groups.iter().map(|group| group.ranks.len()).sum();
+    anyhow::ensure!(
+        devices.len() == ranks,
+        "`device_config.devices` names {} devices for {ranks} ranks",
+        devices.len()
+    );
+    let mut taken = BTreeSet::new();
+    let ranks = groups.iter_mut().flat_map(|group| group.ranks.iter_mut());
+    for (rank, index) in ranks.zip(devices) {
+        anyhow::ensure!(
+            taken.insert((rank.host.clone(), *index)),
+            "`device_config.devices` puts two ranks of host {} on device {index}",
+            rank.host
+        );
+        rank.device = format!("cuda:{index}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
