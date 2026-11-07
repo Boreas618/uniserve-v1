@@ -34,6 +34,6 @@ architectures = ["sm_100a", "sm_90a"]
 # smallest power of two covering a bucket's rows. `stride` is the *table capacity*
 # - the largest bucket's rows for every bucket - so a deployment with a wider
 # decode bucket declares its own value here.
-dimensions = { index = ["i32"], verified = ["i32"], penalties = ["i32"], stride = ["8"], future_stride = ["1"], vocab = ["151936", "248320"], block = ["1", "2", "4", "8"] }
+dimensions = { index = ["i32"], verified = ["i32"], penalties = ["i32"], stride = ["8", "64"], future_stride = ["1"], vocab = ["151936", "248320"], block = ["1", "2", "4", "8", "16", "32", "64"] }
 
 [parameters]

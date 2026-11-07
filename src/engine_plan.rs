@@ -2935,7 +2935,9 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
     let mut kinds: Vec<engine::PhaseKind> = buckets
         .iter()
         .map(|bucket| match bucket.variant {
-            Variant::PrefillWrite | Variant::PrefillOutput => engine::PhaseKind::Prefill,
+            Variant::PrefillWrite | Variant::PrefillOutput | Variant::PrefillGreedy => {
+                engine::PhaseKind::Prefill
+            }
             Variant::DecodeGreedy | Variant::DecodeSampled => engine::PhaseKind::Decode,
             Variant::Encode => engine::PhaseKind::TextEncoding,
             Variant::Denoise => engine::PhaseKind::Denoise,
