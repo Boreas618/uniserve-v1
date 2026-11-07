@@ -341,6 +341,9 @@ pub struct RankFacts<'a> {
     /// The rank's host endpoint, as it advertises itself.
     pub host: &'a str,
     pub world: u64,
+    /// The cache a standby maps as its predecessor holds it: the planes exist already, so the
+    /// rank's grant does not pay for them and its own figures do not size them.
+    pub segments: Option<ipc::CacheTable>,
     /// The deployment's rank count, which no peer list states.
     pub world_size: usize,
     /// Requests the scheduler may have in flight, which the daemon places.
@@ -704,7 +707,7 @@ fn plan(
         max_total_tokens: Some(facts.max_model_len),
         max_request_pool_size: facts.max_request_pool_size,
         encoder_cache_entries: 0,
-        segments: None,
+        segments: facts.segments.clone(),
         stage_cache: false,
         predecessor: None,
         world: facts.world,
@@ -1301,6 +1304,7 @@ mod tests {
             device: Device::Cuda(DeviceId(0)),
             host: "rank",
             world: 0,
+            segments: None,
             world_size: 1,
             queue_depth: 2,
             block_size: Some(64),

@@ -133,9 +133,33 @@ pub(crate) struct Epoch {
     pub host: String,
     /// The world of the epoch this process succeeds, whose storages it maps until it is promoted.
     pub predecessor_world: Option<u64>,
+    /// The cache of each group as that epoch holds it.
+    pub predecessor_cache: Vec<proto::request::wire::CacheSegments>,
     /// The routed experts' distribution this epoch loads (§7.6): what a redistribution committed,
     /// which a relaunch and a standby load again.
     pub experts: BTreeMap<String, Vec<u32>>,
+}
+
+impl Epoch {
+    /// The cache planes of `group` as the epoch this process succeeds holds them; none for a
+    /// process that succeeds no epoch, and for a group that keeps no segments.
+    fn predecessor_table(&self, group: &str) -> Option<ipc::CacheTable> {
+        self.predecessor_cache
+            .iter()
+            .find(|cache| cache.worker_group == group && !cache.segments.is_empty())
+            .map(|cache| ipc::CacheTable {
+                segments: cache
+                    .segments
+                    .iter()
+                    .map(|segment| ipc::CacheSegment {
+                        world: segment.world,
+                        ordinal: segment.ordinal,
+                        units: segment.units,
+                    })
+                    .collect(),
+                held: cache.held,
+            })
+    }
 }
 
 /// The options of `uniserve engine`: the launch file the daemon writes for this process (§2.3).
@@ -530,7 +554,10 @@ fn load_rank(
     launch: &Launch,
     epoch: &Epoch,
 ) -> Result<LoadedRank> {
-    let plan = plan.sharing_cache_of(epoch.predecessor_world.filter(|_| launch.standby));
+    let plan = plan.sharing_cache_of(
+        epoch.predecessor_world.filter(|_| launch.standby),
+        epoch.predecessor_table(&launch.group),
+    );
     let host = HostGroup::connect(rendezvous, index, count, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
     // §8: the rank's Storage Server and its claim are the node's, which the daemon answered for; the
@@ -7995,6 +8022,9 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
     Ok(Epoch {
         generation: 0,
         predecessor_world: spec.predecessor.as_ref().map(|predecessor| predecessor.world),
+        predecessor_cache: spec
+            .predecessor
+            .map_or_else(Vec::new, |predecessor| predecessor.segments),
         experts: spec
             .expert_order
             .into_iter()

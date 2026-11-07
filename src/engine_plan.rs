@@ -182,6 +182,8 @@ pub(crate) struct EpochPlan {
     /// The world whose cache planes this rank maps, on a standby: it serves from the planes its
     /// predecessor serves from, whose segments that world created.
     cache_world: Option<u64>,
+    /// Those planes as the predecessor holds them.
+    cache_table: Option<ipc::CacheTable>,
     /// Ranks in the deployment, whose minimum the cache plan's block size and slot count are
     /// agreed by (§4.1).
     world_size: usize,
@@ -346,6 +348,7 @@ impl EpochPlan {
             rank: launch.rank,
             world: launch.world,
             cache_world: None,
+            cache_table: None,
             world_size: launch.world_size as usize,
             queue_depth: launch.queue_depth as usize,
             group: launch.group.clone(),
@@ -380,9 +383,15 @@ impl EpochPlan {
             .collect())
     }
 
-    /// This plan on the cache planes of `world`, when this rank stands by for that world's process.
-    pub(crate) fn sharing_cache_of(mut self, world: Option<u64>) -> Self {
+    /// This plan on the cache planes of `world`, when this rank stands by for that world's process,
+    /// laid out as `table` states.
+    pub(crate) fn sharing_cache_of(
+        mut self,
+        world: Option<u64>,
+        table: Option<ipc::CacheTable>,
+    ) -> Self {
         self.cache_world = world;
+        self.cache_table = table.filter(|_| world.is_some());
         self
     }
 
@@ -1434,6 +1443,7 @@ impl EpochPlan {
                     device: executor::config::Device::Cuda(device),
                     host: &host,
                     world: self.cache_world.unwrap_or(self.world),
+                    segments: self.cache_table.clone(),
                     world_size: self.world_size,
                     queue_depth: self.queue_depth,
                     // The model's page is the preset: the plan returns it or fails, and a plan that
@@ -1454,6 +1464,7 @@ impl EpochPlan {
                     device: executor::config::Device::Cuda(device),
                     host: &host,
                     world: self.world,
+                    segments: None,
                     world_size: self.world_size,
                     queue_depth: self.queue_depth,
                     // No page and no cache: the media class addresses no paged request, so the
