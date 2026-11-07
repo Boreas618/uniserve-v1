@@ -52,6 +52,8 @@ pub struct Executor {
     uncompared: Arc<std::sync::Mutex<Vec<String>>>,
     /// The streams this device's runners compute on, which the counters record.
     streams: Vec<platform::Stream>,
+    /// The stream the device's page copies run on, which the counters record beside them.
+    copy_stream: platform::Stream,
     /// The rank's Storage Server client, bound after construction because the control thread builds
     /// it after the launch's claim while the executors exist before it: a sleep and a wake are the
     /// only calls that reach the ledger, and the device thread makes them (2.5).
@@ -256,10 +258,12 @@ impl Executor {
             .iter()
             .filter_map(|named| named.runner.stream().cloned())
             .collect();
+        let copy_stream = platform::Stream::new(device)?;
         let queue = JobQueue::new(device, Arc::clone(&events));
         let state = Device {
             device,
             runners,
+            copy_stream: copy_stream.clone(),
             queue: Arc::clone(&queue),
             scratch,
             shadow,
@@ -297,12 +301,18 @@ impl Executor {
             storage,
             uncompared,
             streams,
+            copy_stream,
         })
     }
 
     /// The streams this device's runners compute on.
     pub fn streams(&self) -> &[platform::Stream] {
         &self.streams
+    }
+
+    /// The stream the device's page copies run on.
+    pub fn copy_stream(&self) -> &platform::Stream {
+        &self.copy_stream
     }
 
     /// The operators the last program-layer update could not compare, each with its reason (7.3
@@ -765,6 +775,8 @@ struct Launched {
 struct Device {
     /// Whether a job's device work is waited for before the job answers.
     waits: bool,
+    /// The stream the device's page copies run on.
+    copy_stream: platform::Stream,
     /// The replay the command just served left running.
     pending_landing: Option<PendingLanding>,
     device: DeviceId,
@@ -1151,7 +1163,7 @@ impl Device {
                         fingerprint: keys.fingerprints.clone(),
                         endpoint: keys.endpoint.clone(),
                         device: self.device,
-                        copy: platform::Stream::new(self.device)?,
+                        copy: self.copy_stream.clone(),
                     };
                     let mut cache = cache
                         .lock()
