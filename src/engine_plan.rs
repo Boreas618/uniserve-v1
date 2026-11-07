@@ -3191,7 +3191,7 @@ mod tests {
             }
             files += 1;
         }
-        assert_eq!(files, 13, "every checked-in H3 deployment is checked");
+        assert_eq!(files, 14, "every checked-in H3 deployment is checked");
     }
 
     /// A deployment page as written, parsed and placed on this host.
@@ -3233,11 +3233,13 @@ mod tests {
 
         let two = page(
             "[[worker_groups]]\nid = \"text\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
-             [worker_groups.components.text_encoder]\n\
+             [worker_groups.components.text_encoder]\ntensor_parallel_size = 4\n\
              [[worker_groups]]\nid = \"flow\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
-             [worker_groups.components.transformer]\n\
+             [worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+             ulysses_degree = 4 }\n\
              [[worker_groups]]\nid = \"other\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n\
-             [worker_groups.components.transformer]\n",
+             [worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+             ulysses_degree = 4 }\n",
         );
         let error = media_parallel(Some(&two), "engine", 0, 1, 0, 1)
             .expect_err("two groups placing a denoiser is not one partition");
@@ -3299,35 +3301,40 @@ mod tests {
         );
     }
 
-    /// A page that states no split serves one rank's sequence, which is not a refusal.
+    /// A page that states no split serves one rank's sequence, which is not a refusal. The group is
+    /// one rank: a component without a split on several ranks would be several whole denoisers, and
+    /// the page's own validation refuses that.
     #[test]
     fn a_group_with_no_sequence_split_serves_one_rank() {
-        let placed = groups("[worker_groups.components.transformer]\n");
+        let placed = page(
+            "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0\"]\nqueue_depth = 2\n\
+             [worker_groups.components.transformer]\n",
+        );
         let (ulysses, _, _, sequence_rank) =
-            media_parallel(Some(&placed), "model", 1, 1, 0, 1).expect("one rank's sequence");
+            media_parallel(Some(&placed), "model", 0, 1, 0, 1).expect("one rank's sequence");
         assert_eq!(ulysses.degree, 1);
-        assert_eq!(sequence_rank, 1);
+        assert_eq!(sequence_rank, 0);
     }
 
-    /// The two refusals the page can earn, by name rather than served at degree one.
-    ///
-    /// A gathered projection would be served weights this stack does not load (it holds whole
-    /// attention projections on every rank and sends each member its head shard), and two
-    /// sequence-split components are two splits where a partition describes one.
+    /// A page with two sequence-split components is refused by name: a partition describes one split,
+    /// and serving the second at degree one would hold whole copies of it on every member. Both
+    /// projections are served (`7c6b75e9b` made the pages state Python's `gather`), so neither is a
+    /// refusal.
     #[test]
-    fn a_projection_or_a_second_split_the_stack_cannot_serve_is_refused_by_name() {
-        let gather = groups(
-            "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
-             ulysses_degree = 2, projection = \"gather\" }\n",
-        );
-        let error = media_parallel(Some(&gather), "model", 0, 2, 0, 2)
-            .expect_err("gather is unimplemented");
-        assert!(
-            format!("{error:#}").contains("exchange"),
-            "the refusal names the mode this stack implements: {error:#}"
-        );
-        let two = groups(
-            "[worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
+    fn a_second_sequence_split_is_refused_by_name() {
+        for projection in ["gather", "exchange"] {
+            let placed = page(&format!(
+                "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-1\"]\nqueue_depth = 2\n\
+                 [worker_groups.components.transformer]\nsequence_parallel = {{ kind = \"ulysses\", \
+                 ulysses_degree = 2, projection = \"{projection}\" }}\n"
+            ));
+            let (ulysses, _, _, _) = media_parallel(Some(&placed), "model", 0, 1, 0, 2)
+                .unwrap_or_else(|error| panic!("the {projection} projection is served: {error:#}"));
+            assert_eq!(ulysses.degree, 2);
+        }
+        let two = page(
+            "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-1\"]\nqueue_depth = 2\n\
+             [worker_groups.components.transformer]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 2 }\n\
              [worker_groups.components.text_encoder]\nsequence_parallel = { kind = \"ulysses\", \
              ulysses_degree = 2 }\n",

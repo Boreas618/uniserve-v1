@@ -9304,13 +9304,13 @@ mod tests {
             vec![
                 (
                     "paged_attention".to_owned(),
-                    Some(PhaseKind::Decode),
-                    "trtllm".to_owned()
+                    Some(PhaseKind::Prefill),
+                    "fa4".to_owned()
                 ),
                 (
                     "paged_attention".to_owned(),
-                    Some(PhaseKind::Prefill),
-                    "fa4".to_owned()
+                    Some(PhaseKind::Decode),
+                    "trtllm".to_owned()
                 ),
             ],
             "the deployment's own backend did not take the phase its keys cover"
@@ -9459,15 +9459,19 @@ mod tests {
         );
     }
 
-    /// The rest of the family after the same revert: a purge, a second revert and a second precopy
-    /// each name a generation no longer in flight, and the machine answers each without leaving the
-    /// generation that serves.
+    /// The rest of the family after the same revert. The reverted generation is released, so its
+    /// purge is the one command that applies (§7.3 step 6) and a second purge waits behind it; a
+    /// commit, a second revert and a second precopy each name a generation no longer in flight, and
+    /// the machine answers each without leaving the generation that serves.
     #[test]
     fn the_program_commands_after_a_revert_all_name_what_they_cannot_apply() {
         let mut update = update_on_probation_then_reverted();
+        update
+            .request_purge(2)
+            .expect("a revert releases its generation for the purge that frees its kernels");
         assert!(
             update.request_purge(2).is_err(),
-            "the reverted generation is still awaiting a purge, so this test proves nothing"
+            "a second purge of the generation applied while the first is pending"
         );
         assert!(update.commit(2).is_err());
         assert!(
