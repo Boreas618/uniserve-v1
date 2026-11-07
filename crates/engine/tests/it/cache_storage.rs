@@ -656,6 +656,35 @@ fn requests_that_wait_for_each_others_units_recompute_the_last_admitted() {
     thread.join().unwrap();
 }
 
+/// A request alone whose sequence grows past the whole cache ends where the
+/// cache is full, as it would at its token limit: giving up any request would
+/// not let it grow, so it is not left to starve until the watchdog fails it.
+#[test]
+fn a_request_longer_than_the_cache_ends_at_the_length_the_cache_holds() {
+    let (handle, _workers, thread) = start(SimExecutors::filling(0));
+    // 10 pages of prompt and up to 40 more of the 640 tokens it may generate:
+    // 50 pages, and the pool has 31 units past the sentinel.
+    let mut long = handle.submit(request(1, 10, 40 * BLOCK as usize)).unwrap();
+    match terminal(&mut long) {
+        Some(Event::Finished {
+            reason: FinishReason::MaxTokens,
+            completion_tokens,
+            ..
+        }) => {
+            // The 21 pages past the prompt hold what it generated.
+            let held = 21 * BLOCK as usize;
+            assert!(
+                (held - BLOCK as usize..=held + 1).contains(&completion_tokens),
+                "{completion_tokens} tokens"
+            );
+        }
+        other => panic!("the request ends at the length the cache holds: {other:?}"),
+    }
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
 /// A world parked for a successor that maps its cache lends it the
 /// segments past its first that hold no page a request in flight continues
 /// from, and allocates none of their units until a resume takes them back:

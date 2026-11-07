@@ -627,10 +627,11 @@ pub struct Scheduler {
     /// A shrink or sleep of the KV cache waiting for its units to be let go
     /// (`Scheduler::resize_cache`).
     resizing: Option<cache_storage::PendingResize>,
-    /// The running requests that could not get the cache units their next
-    /// call needs while the executor was last refilled
-    /// (`Scheduler::recompute_starved`).
-    starved: Vec<RequestId>,
+    /// The running requests the latest assembly could not grow, each with the
+    /// cache units its growth needed. The next step's reclaim reads them before
+    /// its assembly notes them again (`Scheduler::reclaim_shortage`,
+    /// `Scheduler::recompute_starved`), and admission waits while any is here.
+    starved: Vec<(RequestId, usize)>,
     /// The executors gave back the cache and graph storage: the scheduler
     /// admits and runs nothing until it wakes.
     asleep: bool,
