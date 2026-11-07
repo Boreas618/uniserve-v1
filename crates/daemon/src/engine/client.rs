@@ -758,7 +758,6 @@ impl EngineClient {
             wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
                 id,
                 change: wire::CacheChange::MakeRoom as i32,
-                preempt_after_ms: None,
                 room_bytes: bytes,
                 device_bytes: devices
                     .iter()
