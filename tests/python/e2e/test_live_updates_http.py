@@ -1207,7 +1207,7 @@ def _restart_while_streaming(
     with pytest.raises(httpx.ConnectError):
         httpx.get(f"{base_url}/health", timeout=5)
     status = httpx.get(f"{moved_url}/admin/config", timeout=10).json()
-    server = tomllib.loads(status["config"])["server_config"]
+    server = tomllib.loads(status["config"])["admin_config"]
     assert server["port"] == port, server
 
     # A change of both the daemon's options and what a world executes
