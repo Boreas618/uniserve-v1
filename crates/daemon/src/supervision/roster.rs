@@ -649,7 +649,7 @@ mod tests {
 
     fn launch() -> crate::engine::launch::Launch {
         crate::engine::launch::Launch {
-            build_config: "/run/build-config-1.json".into(),
+            engine_config: "/run/engine-config-1.json".into(),
             model: "/models/qwen3".into(),
             requests: "unix:/run/requests.sock".to_owned(),
             processes: "unix:/run/processes.sock".to_owned(),

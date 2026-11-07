@@ -4,7 +4,7 @@
 //! schedulers and the hot update. Everything it needs *before* it can start a thread comes from an
 //! epoch's configuration - which devices, which buckets are captured, how much of each device the
 //! graphs may map, which blocking pools exist, which Program Server socket and targets this rank
-//! speaks to - and none of that belongs in `daemon::epoch::BuildConfig`: the config fixes the epoch
+//! speaks to - and none of that belongs in `proto::config::EngineConfig`: the config fixes the epoch
 //! and must not learn how the executor assembles its devices, its buckets or its graphs. It also
 //! does not hold every input, because half of what the main process needs is a property of the node
 //! it runs on (`EngineArgs`) or of the devices it measured.
@@ -209,7 +209,7 @@ pub(crate) struct EpochPlan {
     /// The output and the media lane the ranks of this plan share, once the first rank made them.
     codec: Arc<std::sync::Mutex<Option<SharedCodec>>>,
     /// The epoch's build config, which the daemon wrote (§7.2).
-    build: daemon::epoch::BuildConfig,
+    build: proto::config::EngineConfig,
     /// The checkpoint this rank serves.
     checkpoint: PathBuf,
     /// This rank's devices, as the executor's names for them.
@@ -325,7 +325,7 @@ impl EpochPlan {
     /// starts every rank of a node with the ordinals that rank serves, and a main process that
     /// guessed its devices from the epoch's parallelism would capture graphs on another rank's
     /// device.
-    pub(crate) fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
+    pub(crate) fn of(launch: &Launch, build: &proto::config::EngineConfig) -> Result<Self> {
         let mapping = Mapping::of(launch, build)?;
         if launch.devices.is_empty() {
             bail!(
@@ -363,7 +363,7 @@ impl EpochPlan {
         // cannot exceed. A bucket above either would be captured and never filled.
         let rows_bound = u32::try_from(build.max_running_requests.get())
             .context("more request slots than the protocol addresses")?;
-        let tokens_bound = match build.max_model_len {
+        let tokens_bound = match build.model.max_model_len {
             Some(length) => length.get(),
             None => u32::MAX,
         };
@@ -371,7 +371,7 @@ impl EpochPlan {
         // catalogue is built and long before any weight is mapped; a stated decode tier above the
         // request bound is the clamp in `Scheduler::new`, not a refusal. `tier_refusal` is where
         // that asymmetry is stated and argued.
-        if let (Some(sizes), Some(length)) = (&tokens, build.max_model_len) {
+        if let (Some(sizes), Some(length)) = (&tokens, build.model.max_model_len) {
             if let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, length.get()) {
                 bail!("{refusal}");
             }
@@ -903,7 +903,7 @@ impl EpochPlan {
             deployment: None,
             host_kv_cache: false,
             model: Some(self.checkpoint.display().to_string()),
-            dtype: Some(self.build.dtype.clone()),
+            dtype: Some(self.build.model.dtype.clone()),
             world: Some(self.world),
             group: Some(self.group.clone()),
             rank: Some(self.rank as usize),
@@ -1003,7 +1003,7 @@ impl EpochPlan {
                 device.0
             );
         }
-        let longest = self.build.max_model_len.map(|length| length.get()).context(
+        let longest = self.build.model.max_model_len.map(|length| length.get()).context(
             "a deployment of the media class states no `max_model_len`, and its prompt capacities \
              are checked against it",
         )?;
@@ -1055,7 +1055,7 @@ impl EpochPlan {
         // The encoder writes its hidden states in the deployment's effective type, which the daemon
         // resolved against the checkpoint before it wrote this build config (a `dtype` of `auto`
         // never reaches a main process as `auto`).
-        let dtype = match self.build.dtype {
+        let dtype = match self.build.model.dtype {
             proto::request::ModelDtype::Float16 => DType::F16,
             proto::request::ModelDtype::BFloat16 => DType::BF16,
             proto::request::ModelDtype::Float32 => DType::F32,
@@ -1228,6 +1228,7 @@ impl EpochPlan {
     fn media_rank_facts(&self) -> Result<engine::RankFacts> {
         let longest = self
             .build
+            .model
             .max_model_len
             .map(|length| length.get())
             .context(
@@ -1240,7 +1241,7 @@ impl EpochPlan {
             deployment: None,
             host_kv_cache: false,
             model: Some(self.checkpoint.display().to_string()),
-            dtype: Some(self.build.dtype.clone()),
+            dtype: Some(self.build.model.dtype.clone()),
             world: Some(self.world),
             group: Some(self.group.clone()),
             rank: Some(self.rank as usize),
@@ -1430,7 +1431,7 @@ impl EpochPlan {
     }
 
     fn deployment_groups(&self) -> Result<Option<Vec<engine::ExecutorGroupConfig>>> {
-        let Some(path) = self.build.worker_groups.as_ref() else {
+        let Some(path) = self.build.parallel.worker_groups.as_ref() else {
             return Ok(None);
         };
         let text = path
@@ -1440,6 +1441,7 @@ impl EpochPlan {
             .with_context(|| format!("reading the deployment file {}", path.display()))?;
         let host = self
             .build
+            .parallel
             .engine_host
             .clone()
             .unwrap_or_else(|| "localhost".to_owned());
@@ -1542,6 +1544,7 @@ impl EpochPlan {
                 // `denoiser.py:411`).
                 let longest = self
                     .build
+                    .model
                     .max_model_len
                     .map(|length| length.get())
                     .context(
@@ -1583,7 +1586,7 @@ impl EpochPlan {
                         .blocks
                         .with(minimax_h3::Component::VideoPostprocessor),
                 );
-                let dtype = match self.build.dtype {
+                let dtype = match self.build.model.dtype {
                     proto::request::ModelDtype::Float16 => DType::F16,
                     proto::request::ModelDtype::BFloat16 => DType::BF16,
                     proto::request::ModelDtype::Float32 => DType::F32,
@@ -1639,7 +1642,7 @@ impl EpochPlan {
             match served {
                 Served::Text(_) => self.buckets.bounds(),
                 Served::Media(_) => {
-                    let longest = self.build.max_model_len.map(|length| length.get()).context(
+                    let longest = self.build.model.max_model_len.map(|length| length.get()).context(
                     "a deployment of the media class states no `max_model_len`, and its prompt \
                      capacities are checked against it",
                 )?;
@@ -1721,7 +1724,7 @@ impl EpochPlan {
                     // The media plan fits no cache, so this figure is never read: it states the
                     // element type the rank's states are held in, which is the deployment's own
                     // model type rather than a cache setting the deployment did not make.
-                    kv_dtype: match self.build.dtype {
+                    kv_dtype: match self.build.model.dtype {
                         proto::request::ModelDtype::Float16 => ipc::PrefixCacheDtype::Float16,
                         proto::request::ModelDtype::BFloat16 => ipc::PrefixCacheDtype::BFloat16,
                         proto::request::ModelDtype::Float32 => ipc::PrefixCacheDtype::Float32,
@@ -1829,7 +1832,7 @@ impl EpochPlan {
 
     /// The keys a row reads at most: the cache's bound, from the epoch's context length.
     pub(crate) fn max_kv_len(&self, served: &Served) -> Result<u32> {
-        if let Some(length) = self.build.max_model_len {
+        if let Some(length) = self.build.model.max_model_len {
             return Ok(length.get());
         }
         match served {
@@ -2996,15 +2999,15 @@ impl Mapping {
     /// routed experts of the deployment's schedulers. A rank's ordinal places it in both: its
     /// tensor rank is its position inside its scheduler's group, and its expert rank is which
     /// scheduler's share of the experts it keeps.
-    fn of(launch: &Launch, build: &daemon::epoch::BuildConfig) -> Result<Self> {
-        let tensor_parallel = u32::try_from(build.tensor_parallel_size.get())
+    fn of(launch: &Launch, build: &proto::config::EngineConfig) -> Result<Self> {
+        let tensor_parallel = u32::try_from(build.parallel.tensor_parallel_size.get())
             .context("a tensor-parallel degree larger than u32::MAX")?;
         if tensor_parallel == 0 {
             bail!("a tensor-parallel degree of zero splits nothing");
         }
-        let data_parallel = u32::try_from(build.data_parallel_size.get())
+        let data_parallel = u32::try_from(build.parallel.data_parallel_size.get())
             .context("a data-parallel degree larger than u32::MAX")?;
-        let expert_parallel = if build.expert_parallel {
+        let expert_parallel = if build.moe.expert_parallel {
             data_parallel
         } else {
             1

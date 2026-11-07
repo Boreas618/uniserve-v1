@@ -4,7 +4,7 @@
 //! An epoch is one configuration executed: its main processes on every node,
 //! their communicators, graphs and the storage they create
 //! (`specs/worker.md` §0). The leader's daemon keeps one [`EpochRecord`] per
-//! epoch: the [`BuildConfig`] it was built from, the programs that fill its
+//! epoch: the [`proto::config::EngineConfig`] it was built from, the programs that fill its
 //! operators and its scheduling interface, the programs a probation keeps as
 //! the previous generation, and its [`Status`].
 //!
@@ -120,100 +120,6 @@ pub fn kernel_to_wire(slot: &KernelKey, program: &Program) -> proto::process::Ke
     }
 }
 
-/// The values that build a main process: every one of them is a value a new
-/// epoch must be built for, and no other change is (§7.1, §7.7).
-///
-/// The projection keeps exactly what §7.7 assigns to the build config: what
-/// fixes the executable, the parallelism and block assignment, the numerical
-/// representation, the KV layout, the captured graph buckets, the request
-/// slots and the loading options. Values that only inform a decision are
-/// parameters of the programs that decide, and values that name an
-/// implementation select a program's backend; neither appears here, so two
-/// configurations that differ only in those compare equal.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct BuildConfig {
-    /// The build of the main process executable this epoch runs (§7.1): a
-    /// replaced executable is a new epoch even at the same configuration.
-    pub executable: String,
-    /// The model's files: their weights are other keys, so only a new epoch reads them.
-    pub model: String,
-    /// Longest sequence a request may reach, in tokens.
-    pub max_model_len: Option<NonZeroU32>,
-    /// Concurrently resident requests.
-    pub max_running_requests: NonZeroUsize,
-    /// Each rank's share of its device's storage.
-    pub mem_fraction_static: f64,
-    /// Element type of parameters and activations.
-    pub dtype: ModelDtype,
-    /// The checkpoint's quantization (§1).
-    pub quantization: Map<String, Value>,
-    /// Tensor-parallel workers of each scheduler.
-    pub tensor_parallel_size: NonZeroUsize,
-    /// Schedulers of the epoch.
-    pub data_parallel_size: NonZeroUsize,
-    /// The deployment file that places worker groups and their blocks; its
-    /// resolution is part of the epoch's parallelism and block assignment.
-    pub worker_groups: Option<PathBuf>,
-    /// The host whose main processes serve requests.
-    pub engine_host: Option<String>,
-    /// How the checkpoint is read and mapped.
-    pub load: LoadConfig,
-    /// The KV cache's layout and capacity.
-    pub kv_cache: KvCacheConfig,
-    /// Whether routed experts are sharded across ranks.
-    pub expert_parallel: bool,
-    /// Microbatches overlapping attention with dedicated expert workers.
-    pub moe_microbatches: NonZeroU32,
-    /// The captured graph buckets.
-    pub cuda_graph: CudaGraphConfig,
-    /// The worker configuration each rank runs under.
-    pub worker: WorkerConfig,
-    /// The draft tokens a verification carries; zero does not speculate.
-    pub num_draft_tokens: u32,
-    /// The video configuration the epoch's media work takes.
-    pub video: VideoConfig,
-    /// The components whose module instances carry fencing probes, which a
-    /// graph captures.
-    pub fence_components: Vec<String>,
-    /// Whether the workers sample PCs of graph kernels.
-    pub graph_pc_sampling: bool,
-}
-
-impl BuildConfig {
-    /// The build config `config` builds a main process from, as this
-    /// daemon's own executable constitutes it.
-    ///
-    /// The executable's identity is this crate's [`proto::BUILD`]: today the
-    /// daemon and the main process are one binary, so a deployment cannot
-    /// run them at different builds. A daemon that starts a main process of
-    /// another build compares that executable's identity instead (§7.4).
-    pub fn of(config: &ServerArgs) -> Self {
-        Self {
-            executable: proto::BUILD.to_owned(),
-            model: config.model().to_owned(),
-            max_model_len: config.max_model_len,
-            max_running_requests: config.max_running_requests,
-            mem_fraction_static: config.mem_fraction_static,
-            dtype: config.dtype,
-            quantization: config.quantization.clone(),
-            tensor_parallel_size: config.tensor_parallel_size,
-            data_parallel_size: config.data_parallel_size,
-            worker_groups: config.worker_groups.clone(),
-            engine_host: config.engine_host.clone(),
-            load: config.load_config.clone(),
-            kv_cache: config.kv_cache_config.clone(),
-            expert_parallel: config.moe_config.expert_parallel,
-            moe_microbatches: config.moe_config.microbatches,
-            cuda_graph: config.cuda_graph_config.clone(),
-            worker: config.worker_config.clone(),
-            num_draft_tokens: config.speculative_config.num_draft_tokens,
-            video: config.video_config.clone(),
-            fence_components: config.profiling_config.fence_components.clone(),
-            graph_pc_sampling: config.profiling_config.graph_pc_sampling,
-        }
-    }
-}
-
 /// Where an epoch is in its life (§7.3, §7.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -235,7 +141,7 @@ pub enum Status {
 #[derive(Debug, Clone, PartialEq)]
 pub struct EpochRecord {
     /// What built the epoch.
-    pub build_config: BuildConfig,
+    pub config: proto::config::EngineConfig,
     /// The kernel program that fills each operator, or each phase of one;
     /// a phase of `None` covers every phase of its operator (§5.2).
     pub kernels: BTreeMap<KernelKey, Program>,
@@ -639,8 +545,9 @@ impl Epochs {
         let update = update.as_ref()?;
         let failure = update.unavailable()?;
         (update.target.programs == target.programs
-            && update.target.build_config == target.build_config)
-            .then(|| failure.clone())
+            && update.target.config.engine_config().build_hash()
+                == target.config.engine_config().build_hash())
+        .then(|| failure.clone())
     }
 
     /// Records that epoch `epoch` now executes `programs`, keeping what it
@@ -746,7 +653,7 @@ impl Epochs {
         self.record(
             epoch,
             EpochRecord {
-                build_config: deployment.build_config.clone(),
+                config: deployment.config.engine_config(),
                 kernels: deployment.programs.kernels.clone(),
                 policy: deployment.programs.policy.clone(),
                 previous_kernels: BTreeMap::new(),
@@ -838,7 +745,6 @@ impl Epochs {
         let record = programs.clone();
         let deployment = Deployment {
             config: config.clone(),
-            build_config: crate::epoch::BuildConfig::of(config),
             programs: programs.clone(),
         };
         let process = crate::engine::control::EpochProcess {
@@ -1193,7 +1099,7 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
         .collect::<Vec<_>>();
     serde_json::json!({
         "epoch": epoch,
-        "build_config": serde_json::to_value(&record.build_config).unwrap_or(Value::Null),
+        "engine_config": serde_json::to_value(&record.config).unwrap_or(Value::Null),
         "kernels": kernels,
         "policy": program_report(&record.policy),
         "previous_kernels": previous,
@@ -1523,10 +1429,8 @@ pub enum Layer {
 /// fills.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Deployment {
-    /// The configuration.
+    /// The configuration; the engines are built from its `engine_config()`.
     pub config: ServerArgs,
-    /// The projection that builds a main process.
-    pub build_config: BuildConfig,
     /// The filled programs; the deployment a change is compared against
     /// carries the revisions `prepare` selected, and the target's are
     /// prepared before the comparison.
@@ -1538,7 +1442,6 @@ impl Deployment {
     /// without the revisions `prepare` selects.
     pub fn of(config: ServerArgs) -> Self {
         Self {
-            build_config: BuildConfig::of(&config),
             programs: FilledPrograms::of(&config),
             config,
         }
@@ -1553,7 +1456,9 @@ impl Deployment {
 pub fn layer(previous: &Deployment, next: &Deployment) -> Layer {
     if host_layer_differ(&previous.config, &next.config) {
         Layer::Host
-    } else if previous.build_config != next.build_config {
+    } else if previous.config.engine_config().build_hash()
+        != next.config.engine_config().build_hash()
+    {
         Layer::Epoch
     } else if previous.programs != next.programs {
         Layer::Program
@@ -1594,7 +1499,7 @@ mod tests {
     fn record() -> EpochRecord {
         let config = ServerArgs::default();
         EpochRecord {
-            build_config: BuildConfig::of(&config),
+            config: config.engine_config(),
             kernels: BTreeMap::from([(KernelKey::all("rms_norm"), program("triton"))]),
             policy: program("fcfs"),
             previous_kernels: BTreeMap::new(),
@@ -1681,7 +1586,6 @@ mod tests {
         let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
-            build_config: BuildConfig::of(&config),
             programs: FilledPrograms::of(&config),
         };
         epochs.install(0, &serving, 3, &[10]);
@@ -1763,7 +1667,6 @@ mod tests {
         let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
-            build_config: BuildConfig::of(&config),
             programs: FilledPrograms::of(&config),
         };
         epochs.install(0, &serving, 3, &[10]);
@@ -1839,7 +1742,6 @@ mod tests {
         let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
-            build_config: BuildConfig::of(&config),
             programs: FilledPrograms::of(&config),
         };
         epochs.install(0, &serving, 3, &[10]);
@@ -1908,7 +1810,6 @@ mod tests {
         let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
-            build_config: BuildConfig::of(&config),
             programs: FilledPrograms::of(&config),
         };
         epochs.install(0, &serving, 3, &[10]);
@@ -1958,7 +1859,6 @@ mod tests {
         let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
-            build_config: BuildConfig::of(&config),
             programs: FilledPrograms::of(&config),
         };
         epochs.install(0, &serving, 3, &[10]);
@@ -2000,7 +1900,7 @@ mod tests {
         );
         assert!(epochs.program_update().is_none());
         let mut another_build = target.clone();
-        another_build.build_config.model = "another checkpoint".to_owned();
+        another_build.config.model = Some("another checkpoint".to_owned());
         assert!(
             epochs.unavailable(&another_build).is_none(),
             "the same programs on another build are another change"
@@ -2027,7 +1927,6 @@ mod tests {
         let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
-            build_config: BuildConfig::of(&config),
             programs: FilledPrograms::of(&config),
         };
         epochs.install(0, &serving, 3, &[10]);
@@ -2212,7 +2111,7 @@ mod tests {
     /// parameters of the programs, nothing for no change.
     ///
     /// This test is also the rule's enforcement: a value that leaks from the
-    /// program layer's lists into [`BuildConfig::of`], or out of it, fails
+    /// program layer's lists into [`proto::config::EngineConfig::of`], or out of it, fails
     /// here by name.
     #[test]
     fn a_change_is_routed_by_what_it_moves() {
@@ -2374,15 +2273,15 @@ mod tests {
             .chain(program.iter())
         {
             assert_eq!(
-                BuildConfig::of(&set(*change)),
-                base.build_config,
+                set(*change).engine_config().build_hash(),
+                base.config.engine_config().build_hash(),
                 "{what} is not a build-config value"
             );
         }
         for (what, change) in &epoch {
             assert_ne!(
-                BuildConfig::of(&set(*change)),
-                base.build_config,
+                set(*change).engine_config().build_hash(),
+                base.config.engine_config().build_hash(),
                 "{what} builds the main process"
             );
         }
@@ -2816,13 +2715,13 @@ mod tests {
     /// back: an unset list is written as `null` and must be read as `None`,
     /// not refused.
     #[test]
-    fn a_build_config_reads_back_what_it_wrote() {
+    fn an_engine_config_reads_back_what_it_wrote() {
         let config = ServerArgs::default();
-        let build = BuildConfig::of(&config);
+        let build = config.engine_config();
         assert!(build.cuda_graph.flow_shapes.is_none());
-        let text = serde_json::to_string(&build).expect("a build config is JSON");
-        let read: BuildConfig =
-            serde_json::from_str(&text).expect("the build config reads back through its writer");
+        let text = serde_json::to_string(&build).expect("an engine config is JSON");
+        let read: proto::config::EngineConfig =
+            serde_json::from_str(&text).expect("the engine config reads back through its writer");
         assert_eq!(read, build);
     }
 }

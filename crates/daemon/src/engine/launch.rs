@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use crate::epoch::BuildConfig;
+use proto::config::EngineConfig;
 
 /// One engine process's launch, mirroring the engine's own `Launch` field for
 /// field (`src/engine_main.rs`): the same names, the same types, and no field
@@ -35,7 +35,7 @@ use crate::epoch::BuildConfig;
 #[serde(deny_unknown_fields)]
 pub(crate) struct Launch {
     /// The epoch's build config, as the daemon wrote it.
-    pub build_config: PathBuf,
+    pub engine_config: PathBuf,
     /// The checkpoint the epoch serves.
     pub model: PathBuf,
     /// The leader daemon's request interface, `unix:<path>` or
@@ -97,8 +97,8 @@ pub(crate) fn launch_path(directory: &Path, engine: u64) -> PathBuf {
 
 /// The path of one epoch's build config, which every process of that epoch
 /// reads.
-pub(crate) fn build_config_path(directory: &Path, world: u64) -> PathBuf {
-    directory.join(format!("build-config-{world}.json"))
+pub(crate) fn engine_config_path(directory: &Path, world: u64) -> PathBuf {
+    directory.join(format!("engine-config-{world}.json"))
 }
 
 /// Writes `launch` for the process `engine` and answers the path it was
@@ -124,12 +124,12 @@ pub(crate) fn write(directory: &Path, engine: u64, launch: &Launch) -> io::Resul
 /// # Errors
 ///
 /// Fails when the directory or the file cannot be written.
-pub(crate) fn write_build_config(
+pub(crate) fn write_engine_config(
     directory: &Path,
     world: u64,
-    config: &BuildConfig,
+    config: &proto::config::EngineConfig,
 ) -> io::Result<PathBuf> {
-    let path = build_config_path(directory, world);
+    let path = engine_config_path(directory, world);
     let bytes = serde_json::to_vec_pretty(config)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     write_atomically(&path, &bytes)?;
@@ -179,7 +179,7 @@ mod tests {
 
     fn launch() -> Launch {
         Launch {
-            build_config: PathBuf::from("/run/uniserve/build-config-12.json"),
+            engine_config: PathBuf::from("/run/uniserve/engine-config-12.json"),
             model: PathBuf::from("/models/qwen3"),
             requests: "unix:/run/uniserve/requests.sock".to_owned(),
             processes: "unix:/run/uniserve/processes.sock".to_owned(),
@@ -230,7 +230,7 @@ mod tests {
             .cloned()
             .collect::<BTreeSet<_>>();
         let expected = [
-            "build_config",
+            "engine_config",
             "model",
             "requests",
             "processes",
@@ -275,20 +275,20 @@ mod tests {
     /// The build config is one file per epoch, its bytes the epoch's, and it
     /// is written whole.
     #[test]
-    fn the_build_config_is_written_once_per_epoch() {
+    fn the_engine_config_is_written_once_per_epoch() {
         let directory = scratch("build");
-        let config = BuildConfig::of(&ServerArgs::default());
-        let path = write_build_config(&directory, 12, &config).expect("the build config");
+        let config = ServerArgs::default().engine_config();
+        let path = write_engine_config(&directory, 12, &config).expect("the engine config");
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),
-            Some("build-config-12.json")
+            Some("engine-config-12.json")
         );
-        let read: BuildConfig =
+        let read: proto::config::EngineConfig =
             serde_json::from_slice(&std::fs::read(&path).expect("the file")).expect("its JSON");
         assert_eq!(read, config);
 
         // A second engine of the same epoch finds the same file, unchanged.
-        let again = write_build_config(&directory, 12, &config).expect("the same file");
+        let again = write_engine_config(&directory, 12, &config).expect("the same file");
         assert_eq!(again, path);
         let _ = std::fs::remove_dir_all(&directory);
     }

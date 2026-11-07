@@ -986,7 +986,7 @@ impl Switch {
                 // Another executable's identity is known only once it
                 // connects; the epoch records what it says.
                 self.build = Some(build.clone());
-                self.record.build_config.executable = build;
+                self.record.config.executable = build;
                 self.epochs.record(self.target, self.record.clone());
             }
         }
@@ -1347,8 +1347,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::epoch::{BuildConfig, Deployment, Program, UpdateState};
+    use crate::epoch::{Deployment, Program, UpdateState};
     use crate::options::ServerArgs;
+    use proto::config::EngineConfig;
 
     /// A roster that records what the switch asks of it and replays the
     /// events a test scripts.
@@ -1469,7 +1470,7 @@ mod tests {
     fn record() -> EpochRecord {
         let config = ServerArgs::default();
         EpochRecord {
-            build_config: BuildConfig::of(&config),
+            config: config.engine_config(),
             kernels: BTreeMap::new(),
             policy: Program {
                 backend: "fcfs".to_owned(),
@@ -1504,7 +1505,7 @@ mod tests {
             executable: "/opt/uniserve".to_owned(),
             build: Some("2.0.0+new".to_owned()),
             launch: crate::engine::launch::Launch {
-                build_config: "/run/build-config-11.json".into(),
+                engine_config: "/run/engine-config-11.json".into(),
                 model: "/models/qwen3".into(),
                 requests: "unix:/run/requests.sock".to_owned(),
                 processes: "unix:/run/processes.sock".to_owned(),
@@ -2144,7 +2145,7 @@ mod tests {
         switch.advance(&mut roster);
         assert_eq!(switch.phase(), Phase::Preparing);
         assert_eq!(
-            epochs.get(12).map(|record| record.build_config.executable),
+            epochs.get(12).map(|record| record.config.executable),
             Some("3.0.0+theirs".to_owned())
         );
 

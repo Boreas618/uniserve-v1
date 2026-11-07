@@ -3,7 +3,7 @@
 //!
 //! A change is one of three kinds. What the main processes are built from —
 //! their executable, the parallel ranks, the deployment file, the model's
-//! files, the rank layout, the KV cache's options — is `BuildConfig`'s, and
+//! files, the rank layout, the KV cache's options — is `proto::config::EngineConfig`'s, and
 //! the epoch layer switches to a new epoch (§7.4, [`crate::updates::switch`]).
 //! What they execute — the programs — is the program layer's, prepared
 //! against every host's Program Server before the processes switch to them
@@ -561,7 +561,7 @@ impl Leader {
         // every process of it reads names that path (§2.3). The world is the
         // epoch's identity, which the switch claims.
         control
-            .write_build_config(target_epoch, &next.build_config)
+            .write_engine_config(target_epoch, &next.config.engine_config())
             .map_err(UpdateError::Failed)?;
         // The target's spec is resolved as a deployment's start resolves it: the options state the
         // scheduler and the rank layout, and the model's files complete what they determine.
@@ -990,7 +990,7 @@ impl Replica {
         // The layers above decide every change that reaches here: the epoch
         // layer owns what the main processes are built from (the executable,
         // the parallel ranks, the deployment file, the model's files, the
-        // rank layout and the KV cache's options, all of them `BuildConfig`),
+        // rank layout and the KV cache's options, all of them `proto::config::EngineConfig`),
         // the program layer what they execute, and this one the daemon's own
         // options and the scheduling limits, in place. A change that fits
         // none of them would have needed a successor world, which this

@@ -1100,7 +1100,7 @@ fn adopted_epoch(
         ),
     };
     let record = crate::epoch::EpochRecord {
-        build_config: deployment.build_config.clone(),
+        config: deployment.config.engine_config(),
         kernels,
         policy,
         previous_kernels: std::collections::BTreeMap::new(),
@@ -1115,7 +1115,7 @@ fn adopted_epoch(
         rank: 0,
         pid: None,
         epoch: Some(world),
-        build: deployment.build_config.executable.clone(),
+        build: deployment.config.engine_config().executable,
         generation: engine,
         state: crate::epoch::ProcessState::Serving,
     };
@@ -1146,7 +1146,7 @@ mod tests {
             record.generation, None,
             "the model generation is not the launch generation the child reported"
         );
-        assert_eq!(record.build_config, crate::epoch::BuildConfig::of(&options));
+        assert_eq!(record.config, options.engine_config());
         assert_eq!(process.generation, 12);
         assert_eq!(process.epoch, Some(7));
         assert_eq!(process.state, crate::epoch::ProcessState::Serving);

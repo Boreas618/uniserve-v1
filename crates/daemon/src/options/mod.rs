@@ -526,6 +526,40 @@ pub struct RollbackConfig {
 }
 
 impl ServerArgs {
+    /// The configuration this deployment's epoch engines are built from.
+    ///
+    /// The executable's identity is this crate's [`proto::BUILD`]: today the
+    /// daemon and the engine process are one binary, so a deployment cannot
+    /// run them at different builds. A daemon that starts an engine of
+    /// another build compares that executable's identity instead (§7.4).
+    pub fn engine_config(&self) -> proto::config::EngineConfig {
+        proto::config::EngineConfig {
+            executable: proto::BUILD.to_owned(),
+            model: proto::config::ModelConfig {
+                model: self.model().to_owned(),
+                max_model_len: self.max_model_len,
+                dtype: self.dtype,
+                quantization: self.quantization.clone(),
+            },
+            parallel: proto::config::ParallelConfig {
+                tensor_parallel_size: self.tensor_parallel_size,
+                data_parallel_size: self.data_parallel_size,
+                worker_groups: self.worker_groups.clone(),
+                engine_host: self.engine_host.clone(),
+            },
+            max_running_requests: self.max_running_requests,
+            mem_fraction_static: self.mem_fraction_static,
+            load: self.load_config.clone(),
+            kv_cache: self.kv_cache_config.clone(),
+            moe: self.moe_config.clone(),
+            cuda_graph: self.cuda_graph_config.clone(),
+            worker: self.worker_config.clone(),
+            speculative: self.speculative_config.clone(),
+            video: self.video_config.clone(),
+            profiling: self.profiling_config.clone(),
+        }
+    }
+
     /// The configured model: a local directory or a Hugging Face repository.
     ///
     /// Empty while unstated; [`ServerArgs::validate`] refuses that.

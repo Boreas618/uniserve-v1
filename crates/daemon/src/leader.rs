@@ -540,7 +540,7 @@ impl Leader {
         )?);
         let specs = engine::EngineConfig::replica_specs(&prepared.spec)?;
         // The epoch's build config: every main process of it reads these bytes.
-        let build = crate::epoch::BuildConfig::of(config);
+        let build = config.engine_config();
         let clients =
             futures::future::join_all(specs.into_iter().enumerate().map(|(index, mut spec)| {
                 let model = config.model().to_owned();
@@ -737,7 +737,6 @@ impl Leader {
         // the store never built.
         let deployment = crate::epoch::Deployment {
             config: config.clone(),
-            build_config: crate::epoch::BuildConfig::of(config),
             programs: prepared.clone(),
         };
         let processes: Vec<crate::engine::control::EpochProcess> = engines
@@ -805,7 +804,7 @@ impl Leader {
                 rank: 0,
                 pid: None,
                 epoch: Some(world),
-                build: deployment.build_config.executable.clone(),
+                build: deployment.config.engine_config().executable,
                 generation: engine,
                 state: crate::epoch::ProcessState::Serving,
             });
@@ -1655,8 +1654,7 @@ impl Leader {
         if crate::epoch::host_layer_differ(current, target) {
             return Ok(None);
         }
-        let previous_build_config = crate::epoch::BuildConfig::of(current);
-        if previous_build_config != crate::epoch::BuildConfig::of(target) {
+        if current.engine_config().build_hash() != target.engine_config().build_hash() {
             return Ok(None);
         }
         // From here only the programs can differ. The descriptors a
@@ -1725,7 +1723,6 @@ impl Leader {
         };
         let next = crate::epoch::Deployment {
             config: target.clone(),
-            build_config: previous_build_config,
             programs: prepared,
         };
         // Nothing the configuration states and no revision the Program
@@ -2519,7 +2516,7 @@ impl Replica {
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let build = crate::epoch::BuildConfig::of(config);
+        let build = config.engine_config();
         let starting = Arc::clone(control);
         let client = Arc::new(
             tokio::task::spawn_blocking(move || starting.start_at(spec, generation, &build, sink))
@@ -2571,7 +2568,7 @@ impl Replica {
             Arc::clone(&self.observer),
             self.ordinal,
         );
-        let build = crate::epoch::BuildConfig::of(&locked(&self.config));
+        let build = locked(&self.config).engine_config();
         let client = Arc::new(
             tokio::task::spawn_blocking(move || control.start(spec, &build, sink)).await??,
         );
@@ -2874,7 +2871,7 @@ impl Replica {
             }
         };
         spec.predecessor = Some(predecessor);
-        let build = crate::epoch::BuildConfig::of(&locked(&self.config));
+        let build = locked(&self.config).engine_config();
         let sink = stats_sink(
             self.model_name.clone(),
             Arc::clone(&self.observer),
