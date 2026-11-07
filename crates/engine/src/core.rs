@@ -7,8 +7,9 @@
 //!
 //! [`WorkerGroupConfig`] is the static deployment description: each group has
 //! an ordered list of physical [`WorkerRank`]s and named components whose
-//! `ranks` index into that list. [`EngineConfig`] adds the scheduler's budgets
-//! and the facts of what it serves. A main process builds one scheduler per
+//! `ranks` index into that list. A scheduler reads the engine configuration
+//! (`proto::config::EngineConfig`) as its process resolved it, the process's
+//! launch, and the mechanism's limits for its ranks ([`SchedulerConfig::of`]). A main process builds one scheduler per
 //! rank it holds with `SchedulerHandle::over_batches_telling`, over the
 //! devices of its own process; `SchedulerHandle::with_executor` takes the CPU
 //! simulation backend instead.
@@ -25,11 +26,9 @@ use std::thread::JoinHandle;
 use crate::executor::Executor;
 use crate::executor::WorkerGroupId;
 use crate::handle::{CommandSender, EventRx, SubmitError};
-use crate::scheduler::guidance_prefix_rows;
 #[cfg(feature = "testing")]
-use crate::scheduler::{
-    DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS,
-};
+use crate::scheduler::DEFAULT_MAX_RUNNING_REQUESTS;
+use crate::scheduler::guidance_prefix_rows;
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats};
 use crate::{CommandWaker, GenerationLimits, Request};
@@ -39,326 +38,150 @@ use ipc::MainProcessInfo;
 use ipc::RequestId;
 #[cfg(test)]
 use proto::config::{BlockConfig, BlockDistribution};
+use proto::config::{EngineArgs, EngineConfig};
 pub use proto::config::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
-use proto::request::ExpertExchange;
-
-/// Configuration of one deployment's schedulers: one per DP rank,
-/// `data_parallel_size` of them.
-#[derive(Debug, Clone)]
-pub struct EngineConfig {
-    /// Model generation requirements, intersected with loaded executor capacities.
-    pub generation_limits: GenerationLimits,
-    /// Maximum number of calls assembled into a single forward batch.
-    pub max_batch: usize,
-    /// Maximum number of tokens scheduled in one engine step.
-    pub max_num_batched_tokens: usize,
-    /// Maximum number of concurrently running requests.
-    pub max_running_requests: usize,
-    /// Most requests, waiting or finished with undelivered events, the
-    /// scheduler holds before it rejects a submission as overloaded; `None`
-    /// queues without bound.
-    pub max_queued_requests: Option<usize>,
-    /// When a request whose draft cache is missing has it refilled.
-    /// The captured graph sizes the deployment states, in tokens, ascending
-    /// and without duplicates (`Room.graph_tiers`). Empty when the deployment
-    /// states none; see `SchedulerConfig::graph_tiers`.
-    pub graph_tiers: Vec<u32>,
-    /// Per-request token ceiling for one prefill chunk.
-    pub chunked_prefill_size: usize,
-    /// Reuse and retain prompt cache prefixes across requests. Disabling this
-    /// does not remove the cache storage needed within an active request.
-    pub prefix_cache: bool,
-    /// The pages of the largest block size between the aligned boundaries
-    /// a long prompt offloads its sliding windows to the host KV cache
-    /// before.
-    pub boundary_interval: usize,
-    /// The decoded tokens between two checkpoints of a request's state
-    /// groups (`Scheduler::set_state_interval`).
-    pub state_interval: usize,
-    /// How large the world's host KV cache is (`kv_cache_config.host_ratio`
-    /// and `host_gib`).
-    pub host_cache: crate::kv_cache::HostCacheSize,
-    /// Static computation components and physical rank membership.
-    pub worker_groups: Vec<WorkerGroupConfig>,
-    /// Number of schedulers `worker_groups` forms, as equal consecutive
-    /// blocks of model groups. One means the groups form one scheduler.
-    pub data_parallel_size: usize,
-    /// Whether the schedulers shard the model's routed experts, and how
-    /// they exchange tokens: each scheduler's group is then one executor,
-    /// keeps its share of every expert layer and exchanges tokens with the
-    /// others at those layers, while attention and every other layer stay
-    /// data-parallel. `None` keeps every expert on every scheduler.
-    pub expert_parallel: Option<ExpertExchange>,
-    /// Model identifier or local model path.
-    pub model: String,
-    /// Numeric data type of the model's parameters and activations.
-    pub dtype: crate::ModelDtype,
-    /// The deployment the schedulers serve, which their storage scopes name:
-    /// the served model name.
-    pub deployment: String,
-    /// This process's own host identity.
-    pub host: String,
-    /// Whether the schedulers copy cache pages through the host KV cache
-    /// (`kv_cache_config.host_tier`).
-    pub host_kv_cache: bool,
-    /// Whether the host KV cache keeps committed pages in the KV storage
-    /// (`kv_cache_config.mooncake`).
-    pub kv_storage: bool,
-    /// Block-diffusion sampling of every canvas the deployment generates;
-    /// `None` when the served model generates no canvases.
-    pub canvas_sampling: Option<ipc::CanvasSampling>,
-    /// The most draft tokens a call proposes with the model's drafter; zero
-    /// when the deployment does not speculate.
-    pub draft_tokens: u32,
-    /// Beginning-of-sequence token identifier.
-    pub bos: u32,
-    /// Token identifiers that terminate generation.
-    pub eos: Vec<u32>,
-    /// Token identifier that terminates encoded image content.
-    pub end_of_image: u32,
-    /// The world the engine executes (`EngineArgs::world`): its storage is
-    /// keyed and retained under it.
-    pub world: u64,
-    /// Whether the schedulers start on trial, as a successor world's do: they
-    /// serve once promoted ([`SchedulerHandle::promote`]), and until the commit
-    /// ([`SchedulerHandle::commit`]) a fatal failure ends the world.
-    pub trial: bool,
-}
-
-/// The launch-file and build-config facts a main process holds about the ranks
-/// its schedulers run, and nothing else.
-///
-/// [`EngineConfig::of`] derives every other field of [`EngineConfig`] from
-/// these: from the model's own configuration where the launch file states it,
-/// from the build configuration's constants, or from the platform's defaults. A
-/// fact the derivation needs and these facts do not state is refused by name,
-/// never defaulted: a scheduler built on a guessed shape would decide on work
-/// it does not run.
-///
-/// Each field names its source: *launch* is the launch file the daemon writes
-/// for this process (`EngineArgs`, and the deployment it places), *model* is the
-/// model's own configuration the launcher reads at the model path and states in
-/// the launch file, and *build config* is what this build was compiled for.
-/// Nothing here is a scheduling decision: those belong to the policy program
-/// (§4.4).
-#[derive(Clone, Debug, Default)]
-pub struct RankFacts {
-    /// The model's path or served name (*launch*: `model`).
-    pub model: Option<String>,
-    /// The deployment the ranks belong to (*launch*: `deployment`), which keys its host KV cache.
-    pub deployment: Option<String>,
-    /// Whether the deployment keeps a host KV cache (*build config*: `kv_cache.host_tier`).
-    pub host_kv_cache: bool,
-    /// The model's numerical dtype (*launch*: `worker_config.dtype`).
-    pub dtype: Option<crate::ModelDtype>,
-    /// The world the ranks execute (*launch*: `world`).
-    pub world: Option<u64>,
-    /// The executor group's identity (*launch*: `device_config`).
-    pub group: Option<String>,
-    /// This process's rank within the group (*launch*: `device_config`).
-    pub rank: Option<usize>,
-    /// The group's rank count (*launch*: `device_config`).
-    pub world_size: Option<usize>,
-    /// The group's devices, in rank order (*launch*: `device_config`).
-    pub devices: Option<Vec<String>>,
-    /// The group's hosts, in rank order (*launch*: `device_config`).
-    pub hosts: Option<Vec<String>>,
-    /// Resident request slots per scheduler (*launch*:
-    /// `scheduling.max_running_requests`).
-    pub max_running_requests: Option<usize>,
-    /// Calls one step may assemble (*launch*: `scheduling.max_batch`).
-    pub max_batch: Option<usize>,
-    /// Tokens one step may carry (*launch*: `scheduling.max_num_batched_tokens`).
-    pub max_num_batched_tokens: Option<usize>,
-    /// The host KV cache's size (*launch*: `kv_cache_config.host_ratio` and
-    /// `host_bytes`); `None` for a deployment that states none.
-    pub host_cache: Option<crate::kv_cache::HostCacheSize>,
-    /// The captured graph sizes in tokens, ascending (*launch*:
-    /// `cuda_graphs.decode_batch_sizes` and `prefill_token_sizes`).
-    pub graph_tiers: Option<Vec<u32>>,
-    /// Beginning-of-sequence token (*model*: the tokenizer's).
-    pub bos: Option<u32>,
-    /// The tokens that terminate generation (*model*: the tokenizer's).
-    pub eos: Option<Vec<u32>>,
-    /// The token that ends encoded image content (*model*: the model's
-    /// configuration).
-    pub end_of_image: Option<u32>,
-    /// What one request may be given to generate (*model*: the model's own
-    /// generation limits).
-    pub generation_limits: Option<GenerationLimits>,
-}
-
-/// A fact the derivation needs, named with where it comes from.
-fn fact<'a, T>(value: &'a Option<T>, name: &str, source: &str) -> anyhow::Result<&'a T> {
-    value.as_ref().with_context(|| {
-        format!("the engine's facts state no {name}, which is the {source}'s to state")
-    })
-}
-
-impl EngineConfig {
-    /// Builds the configuration of the schedulers a main process runs over
-    /// its ranks, from the facts it holds ([`RankFacts`]).
-    ///
-    /// Everything not stated there is derived here: the KV cache's host size,
-    /// the page boundaries and the capture catalog's bounds. A fact the
-    /// derivation needs and the facts do not state fails with the fact's name
-    /// and its source.
-    pub fn of(facts: &RankFacts) -> anyhow::Result<Self> {
-        let model = fact(&facts.model, "model", "launch file")?.clone();
-        let dtype = *fact(&facts.dtype, "dtype", "launch file")?;
-        let world = *fact(&facts.world, "world", "launch file")?;
-        let group = fact(&facts.group, "executor group identity", "launch file")?.clone();
-        let rank = *fact(&facts.rank, "rank", "launch file")?;
-        let world_size = *fact(&facts.world_size, "world size", "launch file")?;
-        let devices = fact(&facts.devices, "devices", "launch file")?.clone();
-        let hosts = fact(&facts.hosts, "hosts", "launch file")?.clone();
-        anyhow::ensure!(
-            devices.len() == world_size && hosts.len() == world_size,
-            "the engine's facts state {world_size} ranks but {} devices and {} hosts: \
-             the launch file places every rank on one device of one host",
-            devices.len(),
-            hosts.len()
-        );
-        anyhow::ensure!(
-            rank < world_size,
-            "the engine's facts place rank {rank} of a group of {world_size}"
-        );
-        let max_running_requests = *fact(
-            &facts.max_running_requests,
-            "max_running_requests",
-            "launch file",
-        )?;
-        let max_batch = *fact(&facts.max_batch, "max_batch", "launch file")?;
-        let max_num_batched_tokens = *fact(
-            &facts.max_num_batched_tokens,
-            "max_num_batched_tokens",
-            "launch file",
-        )?;
-        anyhow::ensure!(
-            max_batch > 0 && max_num_batched_tokens > 0 && max_running_requests > 0,
-            "the engine's batch, token, and request budgets must be positive"
-        );
-
-        let ranks: Vec<WorkerRank> = hosts
-            .into_iter()
-            .zip(devices)
-            .map(|(host, device)| WorkerRank { host, device })
-            .collect();
-        let host = ranks
-            .get(rank)
-            .map(|rank| rank.host.clone())
-            .unwrap_or_default();
-        let group_config = WorkerGroupConfig {
-            replicas: 1,
-            id: WorkerGroupId(group),
-            role: crate::WorkerGroupRole::Model,
-            ranks,
-            blocks: WorkerGroupConfig::single_component(DEFAULT_BLOCK, world_size),
-            // The ranks are the executor's own jobs: no run is queued.
-            queue_depth: 1,
-            mem_fraction_static: None,
-        };
-        group_config.validate()?;
-
-        Ok(Self {
-            generation_limits: fact(
-                &facts.generation_limits,
-                "generation limits",
-                "model's own configuration",
-            )?
-            .clone(),
-            max_batch,
-            max_num_batched_tokens,
-            max_running_requests,
-            max_queued_requests: None,
-            graph_tiers: fact(&facts.graph_tiers, "graph tiers", "launch file")?.clone(),
-            chunked_prefill_size: crate::scheduler::DEFAULT_CHUNKED_PREFILL_SIZE,
-            prefix_cache: true,
-            boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
-            state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
-            host_cache: facts.host_cache.clone().unwrap_or_default(),
-            worker_groups: vec![group_config],
-            data_parallel_size: 1,
-            expert_parallel: None,
-            model,
-            dtype,
-            // A main process that names no deployment serves one of its own,
-            // so two of them never contest one storage scope.
-            deployment: facts.deployment.clone().unwrap_or_else(unnamed_deployment),
-            host,
-            host_kv_cache: facts.host_kv_cache,
-            kv_storage: false,
-            canvas_sampling: None,
-            draft_tokens: 0,
-            bos: *fact(&facts.bos, "bos token", "model's tokenizer")?,
-            eos: fact(&facts.eos, "eos tokens", "model's tokenizer")?.clone(),
-            end_of_image: *fact(
-                &facts.end_of_image,
-                "image end token",
-                "model's own configuration",
-            )?,
-            world,
-            trial: false,
-        })
-    }
-}
 
 /// A storage scope no other deployment names.
 pub(crate) fn unnamed_deployment() -> String {
     format!("deployment-{}", uuid::Uuid::new_v4().simple())
 }
 
-impl EngineConfig {
-    /// Builds a minimal configuration for the CPU simulation backend.
-    ///
-    /// Pair this with [`SchedulerHandle::with_executor`].
-    #[cfg(feature = "testing")]
-    pub fn sim(model: impl Into<String>) -> Self {
-        Self {
-            generation_limits: crate::sim::SimEngine::generation_limits(),
-            max_batch: DEFAULT_MAX_BATCH,
-            max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
-            max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
-            max_queued_requests: None,
-            chunked_prefill_size: crate::scheduler::DEFAULT_CHUNKED_PREFILL_SIZE,
-            graph_tiers: Vec::new(),
-            prefix_cache: true,
-            boundary_interval: crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL,
-            state_interval: crate::kv_cache::DEFAULT_STATE_INTERVAL,
-            host_cache: crate::kv_cache::HostCacheSize::default(),
-            worker_groups: vec![WorkerGroupConfig::placed(
-                &["localhost".to_owned()],
-                "cpu",
-                1,
-                2,
-                WorkerGroupConfig::single_component(DEFAULT_BLOCK, 1),
-            )],
-            data_parallel_size: 1,
-            expert_parallel: None,
+/// The arguments of an engine process of `model` on the CPU simulation backend: one pool of one
+/// rank on this host, named as its worker group, the simulator's generation limits and end of
+/// text, and every other section's default. Pair them with [`SchedulerHandle::with_executor`] and
+/// [`SchedulerConfig::default`].
+#[cfg(feature = "testing")]
+pub fn sim_args(model: impl Into<String>) -> EngineArgs {
+    use std::num::NonZeroUsize;
+    let group = WorkerGroupConfig::placed(
+        &["localhost".to_owned()],
+        "cpu",
+        1,
+        2,
+        WorkerGroupConfig::single_component(DEFAULT_BLOCK, 1),
+    );
+    let mut args = EngineArgs::new(EngineConfig {
+        executable: proto::BUILD.to_owned(),
+        model: proto::config::ModelConfig {
             model: model.into(),
+            max_model_len: None,
             dtype: crate::ModelDtype::BFloat16,
-            deployment: unnamed_deployment(),
-            host: "localhost".to_owned(),
-            host_kv_cache: false,
-            kv_storage: false,
-            canvas_sampling: None,
-            draft_tokens: 0,
-            bos: 0,
-            // `SimEngine` fabricates this fake EOS id after `text_len` tokens; the
-            // scheduler must recognize it to finish a sim request.
-            eos: vec![151645],
-            end_of_image: 0,
-            world: 0,
-            trial: false,
-        }
-    }
+            quantization: Default::default(),
+            facts: Some(proto::config::ModelFacts {
+                limits: crate::sim::SimEngine::generation_limits(),
+                bos: 0,
+                // `SimEngine` fabricates this end of text after `text_len` tokens; the
+                // scheduler must recognize it to finish a simulated request.
+                eos: vec![crate::sim::FAKE_EOS_TOKEN],
+                end_of_image: 0,
+                max_model_len: 0,
+                canvas_sampling: None,
+                prefill_outputs: true,
+            }),
+        },
+        parallel: proto::config::ParallelConfig {
+            tensor_parallel_size: NonZeroUsize::MIN,
+            data_parallel_size: NonZeroUsize::MIN,
+            engine_host: "localhost".to_owned(),
+            worker_groups: vec![group.clone()],
+        },
+        deployment: unnamed_deployment(),
+        max_running_requests: NonZeroUsize::new(DEFAULT_MAX_RUNNING_REQUESTS)
+            .expect("a positive default"),
+        max_num_batched_tokens: None,
+        attention_backend: String::new(),
+        prefill_attention_backend: None,
+        decode_attention_backend: None,
+        moe_runner_backend: None,
+        device: Default::default(),
+        scheduler: Default::default(),
+        media: Default::default(),
+        mem_fraction_static: 0.9,
+        load: Default::default(),
+        kv_cache: Default::default(),
+        moe: Default::default(),
+        cuda_graph: Default::default(),
+        worker: Default::default(),
+        speculative: Default::default(),
+        video: Default::default(),
+        profiling: Default::default(),
+    });
+    // The simulation keeps no host tier: it has no Storage Server to keep one in.
+    args.engine_config.kv_cache.host_tier = false;
+    args.host = "localhost".to_owned();
+    args.group = group.id.0.clone();
+    args.world_size = u32::try_from(group.ranks.len()).expect("one rank");
+    args.queue_depth = 2;
+    args
+}
 
-    /// Returns the control tokens for a scheduler request.
-    fn control_tokens(&self) -> SpecialTokenIds {
-        SpecialTokenIds {
-            bos: self.bos,
-            eos: self.eos.clone(),
-            end_of_image: self.end_of_image,
+/// The control tokens a scheduler's requests are finished and bounded by: the model's.
+fn control_tokens(facts: &proto::config::ModelFacts) -> SpecialTokenIds {
+    SpecialTokenIds {
+        bos: facts.bos,
+        eos: facts.eos.clone(),
+        end_of_image: facts.end_of_image,
+    }
+}
+
+/// The facts of the model `engine` serves, which a scheduler is built from.
+///
+/// # Errors
+///
+/// Fails when the configuration states none: the process resolves them from the checkpoint
+/// before it starts a scheduler.
+fn model_facts(engine: &EngineConfig) -> anyhow::Result<&proto::config::ModelFacts> {
+    engine.model.facts.as_ref().context(
+        "the engine configuration states no model facts: the process reads them from the \
+         checkpoint before it starts a scheduler",
+    )
+}
+
+/// The host KV cache's size `kv_cache` states (`kv_cache_config.host_ratio` and `host_gib`).
+fn host_cache(
+    kv_cache: &proto::config::KvCacheConfig,
+) -> anyhow::Result<crate::kv_cache::HostCacheSize> {
+    Ok(match (kv_cache.host_ratio, kv_cache.host_gib) {
+        // A deployment that states neither keeps no host tier of its own.
+        (None, None) => crate::kv_cache::HostCacheSize::default(),
+        (ratio, gib) => crate::kv_cache::HostCacheSize::new(ratio, gib.map(|gib| gib.get() << 30))?,
+    })
+}
+
+impl SchedulerConfig {
+    /// The mechanism's limits of a scheduler of `engine` whose ranks' captured catalog bounds a
+    /// step to `max_batch` calls and `max_num_batched_tokens` tokens, `graph_tiers` being the
+    /// catalog's sizes in tokens, ascending (§4.4, §4.5).
+    ///
+    /// The rest is the configuration's: its running requests, its waiting queue and its prefill
+    /// chunk, the model's canvas sampling, and the drafter's tokens.
+    pub fn of(
+        engine: &EngineConfig,
+        max_batch: usize,
+        max_num_batched_tokens: usize,
+        graph_tiers: Vec<u32>,
+    ) -> Self {
+        Self {
+            max_batch,
+            max_num_batched_tokens,
+            max_running_requests: engine.max_running_requests.get(),
+            chunked_prefill_size: engine
+                .scheduler
+                .chunked_prefill_size
+                .map_or(crate::scheduler::DEFAULT_CHUNKED_PREFILL_SIZE, |size| {
+                    size.get()
+                }),
+            max_queued_requests: engine
+                .scheduler
+                .max_queued_requests
+                .map(std::num::NonZeroUsize::get),
+            canvas: engine
+                .model
+                .facts
+                .as_ref()
+                .and_then(|facts| facts.canvas_sampling.clone()),
+            draft_tokens: engine.speculative.num_draft_tokens as usize,
+            graph_tiers,
         }
     }
 }
@@ -421,8 +244,12 @@ impl SchedulerHandle {
     ///
     /// Fails as [`Self::over_batches_telling`] does.
     #[cfg(feature = "testing")]
-    pub fn over_batches(config: EngineConfig, batches: Arc<dyn Batches>) -> anyhow::Result<Self> {
-        Self::over_batches_telling(config, batches, CommandWaker::noop())
+    pub fn over_batches(
+        args: &EngineArgs,
+        limits: SchedulerConfig,
+        batches: Arc<dyn Batches>,
+    ) -> anyhow::Result<Self> {
+        Self::over_batches_telling(args, limits, batches, CommandWaker::noop())
     }
 
     /// Starts one scheduler thread over the executor crate's batch path — the
@@ -430,62 +257,75 @@ impl SchedulerHandle {
     /// `progress` told whenever a step produced events or an answer: what the
     /// thread reading them waits on.
     ///
-    /// The pool's capabilities come from what the executor reports
-    /// (`Batches::inventory`), and the batches go to `batches` itself. The
-    /// scheduler decides nothing until a policy serves it: the daemon's first
-    /// `Precopy` and `Switchover` install one (§7.3), and until then a step
-    /// forms no batch.
+    /// The scheduler reads the process's arguments `args`: its world, its host
+    /// and its pool, and the engine configuration as the process resolved it
+    /// (the model and its facts, the KV cache, the worker groups' roles). It
+    /// takes `limits`, the mechanism's bounds for the ranks it drives
+    /// ([`SchedulerConfig::of`]). The pool's capabilities come from what the
+    /// executor reports (`Batches::inventory`), and the batches go to `batches`
+    /// itself. The scheduler decides nothing until a policy serves it: the
+    /// daemon's first `Precopy` and `Switchover` install one (§7.3), and until
+    /// then a step forms no batch.
     ///
-    /// Fails when the config names more than one rank, when the executor reports
-    /// no pool or pools that disagree about a component, when a pool serves fewer
-    /// request rows than `max_running_requests` running requests need, or when
-    /// the scheduler's thread cannot be started.
+    /// Fails when the configuration states no model facts, when the executor
+    /// reports no pool, pools that disagree about a component, or not the
+    /// launch's pool, when a pool serves fewer request rows than the running
+    /// requests need, or when the scheduler's thread cannot be started.
     pub fn over_batches_telling(
-        config: EngineConfig,
+        args: &EngineArgs,
+        limits: SchedulerConfig,
         batches: Arc<dyn Batches>,
         progress: CommandWaker,
     ) -> anyhow::Result<Self> {
-        anyhow::ensure!(
-            config.data_parallel_size == 1,
-            "one handle is one scheduler thread, but the config states {} ranks: start one \
-             handle per rank",
-            config.data_parallel_size
-        );
+        let engine = &args.engine_config;
+        let facts = model_facts(engine)?;
         let info = crate::executor::ExecutorInfo::from_inventory(batches.inventory())?;
-        Self::check_pools(&config, &info)?;
+        Self::check_pool(args, &info)?;
         let runtime = info.runtime_info()?;
-        Self::check_rows(&runtime, config.max_running_requests)?;
-        let tokens = config.control_tokens();
+        Self::check_rows(&runtime, limits.max_running_requests)?;
         let submissions = crate::scheduler::submissions_over(Arc::clone(&batches))?;
         let waker = submissions.waker();
         let scheduler = Scheduler::new(
             submissions,
-            tokens,
-            Self::scheduler_config(&config),
-            config.dtype,
-            config.generation_limits.clone(),
+            control_tokens(facts),
+            limits,
+            engine.model.dtype,
+            facts.limits.clone(),
         )?;
-        let mut scheduler = Self::configured(scheduler, &config)?;
+        let mut scheduler = Self::configured(scheduler, args)?;
         scheduler.set_progress(progress);
-        let mut handle = Self::spawn(scheduler, config.model.clone(), waker)?;
+        let mut handle = Self::spawn(scheduler, engine.model.model.clone(), waker)?;
         handle.batches = Some(batches);
         // The serving path's warm-up is the serving path's: it runs once the
         // epoch's first policy serves, on a thread of its own, and startup does
         // not wait for it.
-        crate::warmup::after_serving(&handle, &config);
+        crate::warmup::after_serving(&handle, args);
         Ok(handle)
     }
 
-    /// Runs a scheduler over a simulated executor.
+    /// Runs a scheduler over a simulated executor, as
+    /// [`Self::over_batches_telling`] reads `args` and `limits`.
     ///
     /// The command waker is a no-op, so a command does not interrupt the
-    /// scheduler's idle park. `config.worker_groups` is not read.
+    /// scheduler's idle park, and the executor's pools are not compared with
+    /// the launch's.
     #[cfg(feature = "testing")]
     pub fn with_executor(
-        config: EngineConfig,
+        args: &EngineArgs,
+        limits: SchedulerConfig,
         executor: Box<dyn Executor>,
     ) -> anyhow::Result<Self> {
-        Self::assemble(config, executor, CommandWaker::noop())
+        let engine = &args.engine_config;
+        let facts = model_facts(engine)?;
+        let scheduler = Scheduler::new(
+            crate::scheduler::submissions(executor),
+            control_tokens(facts),
+            limits,
+            engine.model.dtype,
+            facts.limits.clone(),
+        )?;
+        let scheduler = Self::configured(scheduler, args)?;
+        Self::spawn(scheduler, engine.model.model.clone(), CommandWaker::noop())
     }
 
     /// Refuses a token runtime whose executors hold fewer request rows than
@@ -507,93 +347,78 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Refuses a config whose pools are not the ones the executor reports.
+    /// Refuses an executor that does not serve the launch's pool: the process's
+    /// own group (`EngineArgs::group`), on its world's ranks.
     ///
-    /// A scheduler configured for a pool the executor does not serve, or for a
+    /// A scheduler started for a pool the executor does not serve, or for a
     /// rank count it does not serve, would place calls on ranks it does not
-    /// have; the config and the executor are two statements of one deployment,
+    /// have; the launch and the executor are two statements of one process,
     /// so they are compared before anything runs.
-    fn check_pools(
-        config: &EngineConfig,
-        info: &crate::executor::ExecutorInfo,
-    ) -> anyhow::Result<()> {
-        for group in &config.worker_groups {
-            anyhow::ensure!(
-                info.workers.iter().any(|(served, _)| *served == group.id),
-                "the config names the pool {}, which the executor does not serve",
-                group.id.0
-            );
-            // `from_inventory` states every pool's rank count; an executor
-            // that reports none places the pool on one rank.
-            let served = info.layouts.get(&group.id).map_or(1, |layout| layout.ranks);
-            anyhow::ensure!(
-                served as usize == group.ranks.len(),
-                "the config places {} ranks of pool {}, but the executor serves {served}",
-                group.ranks.len(),
-                group.id.0
-            );
-        }
+    fn check_pool(args: &EngineArgs, info: &crate::executor::ExecutorInfo) -> anyhow::Result<()> {
+        let group = WorkerGroupId(args.group.clone());
+        anyhow::ensure!(
+            info.workers.iter().any(|(served, _)| *served == group),
+            "the launch names the pool {}, which the executor does not serve",
+            group.0
+        );
+        // `from_inventory` states every pool's rank count; an executor
+        // that reports none places the pool on one rank.
+        let served = info.layouts.get(&group).map_or(1, |layout| layout.ranks);
+        anyhow::ensure!(
+            u32::try_from(served).is_ok_and(|served| served == args.world_size),
+            "the launch places {} ranks of pool {}, but the executor serves {served}",
+            args.world_size,
+            group.0
+        );
         Ok(())
     }
 
-    /// The scheduler configuration `config` states: its budgets, its capture
-    /// catalog and its generation sizes.
-    fn scheduler_config(config: &EngineConfig) -> SchedulerConfig {
-        SchedulerConfig {
-            max_batch: config.max_batch,
-            max_num_batched_tokens: config.max_num_batched_tokens.max(1),
-            max_running_requests: config.max_running_requests.max(1),
-            max_queued_requests: config.max_queued_requests,
-            chunked_prefill_size: config.chunked_prefill_size.max(1),
-            canvas: config.canvas_sampling,
-            draft_tokens: config.draft_tokens as usize,
-            graph_tiers: config.graph_tiers.clone(),
-        }
-    }
-
-    /// Builds the scheduler `config` states over `executor` and runs it.
-    #[cfg(feature = "testing")]
-    fn assemble(
-        config: EngineConfig,
-        executor: Box<dyn Executor>,
-        waker: CommandWaker,
-    ) -> anyhow::Result<Self> {
-        let tokens = config.control_tokens();
-        let scheduler = Scheduler::new(
-            crate::scheduler::submissions(executor),
-            tokens,
-            Self::scheduler_config(&config),
-            config.dtype,
-            config.generation_limits.clone(),
-        )?;
-        let scheduler = Self::configured(scheduler, &config)?;
-        Self::spawn(scheduler, config.model.clone(), waker)
-    }
-
-    /// Applies `config`'s per-world settings to a freshly built scheduler: its
-    /// world identity, its prefix reuse and state interval, its prefill groups,
-    /// and the host storages its ranks map.
-    fn configured(mut scheduler: Scheduler, config: &EngineConfig) -> anyhow::Result<Scheduler> {
-        scheduler.set_world(config.world);
-        scheduler.set_prefix_reuse(config.prefix_cache);
-        scheduler.set_state_interval(config.state_interval);
-        scheduler.set_trial(config.trial);
+    /// Applies the configuration's per-world settings to a freshly built
+    /// scheduler: its world identity, its prefix reuse and state interval, its
+    /// prefill groups, and the host storages its ranks map.
+    fn configured(mut scheduler: Scheduler, args: &EngineArgs) -> anyhow::Result<Scheduler> {
+        let engine = &args.engine_config;
+        let kv_cache = &engine.kv_cache;
+        scheduler.set_world(args.world);
+        scheduler.set_prefix_reuse(kv_cache.prefix_caching);
+        scheduler.set_state_interval(
+            kv_cache
+                .state_interval
+                .map_or(crate::kv_cache::DEFAULT_STATE_INTERVAL, |interval| {
+                    interval.get() as usize
+                }),
+        );
         scheduler.set_prefill_groups(
-            config
+            engine
+                .parallel
                 .worker_groups
                 .iter()
                 .filter(|group| group.role == WorkerGroupRole::Prefill)
                 .map(|group| group.id.clone()),
         );
-        if config.prefix_cache && config.host_kv_cache {
+        // A scheduler with a host tier keeps its storages under the
+        // deployment's name, where its claim is; one without keeps them in a
+        // scope of its own, so two engine processes of one deployment on a node
+        // never contest one scope.
+        let host_tier = kv_cache.prefix_caching && kv_cache.host_tier;
+        let scope = if host_tier {
+            engine.deployment.clone()
+        } else {
+            unnamed_deployment()
+        };
+        if host_tier {
             scheduler
                 .enable_kv_offload(
-                    &config.deployment,
-                    config.world,
-                    &config.host,
-                    config.boundary_interval,
-                    config.host_cache,
-                    config.kv_storage,
+                    &scope,
+                    args.world,
+                    &args.host,
+                    kv_cache
+                        .boundary_interval
+                        .map_or(crate::kv_cache::DEFAULT_BOUNDARY_INTERVAL, |interval| {
+                            interval.get() as usize
+                        }),
+                    host_cache(kv_cache)?,
+                    kv_cache.mooncake.is_some(),
                 )
                 .context("sizing the world's host KV cache")?;
         }
@@ -602,17 +427,17 @@ impl SchedulerHandle {
         // stored there.
         scheduler.enable_trajectory_store(
             &storage::socket::default_socket(),
-            &config.deployment,
-            config.world,
-            &config.host,
+            &scope,
+            args.world,
+            &args.host,
         );
         // Ranks executing video encoders that map host encoder pools report
         // them: a request's encoder outputs are stored and found there.
         scheduler.enable_encoder_store(
             &storage::socket::default_socket(),
-            &config.deployment,
-            config.world,
-            &config.host,
+            &scope,
+            args.world,
+            &args.host,
         );
         Ok(scheduler)
     }
@@ -1222,92 +1047,6 @@ impl Drop for SchedulerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The facts a launch file and the model's configuration state for one
-    /// rank of a one-rank group.
-    fn rank_facts() -> RankFacts {
-        RankFacts {
-            model: Some("Qwen/Qwen3-30B-A3B".to_owned()),
-            dtype: Some(crate::ModelDtype::BFloat16),
-            world: Some(7),
-            group: Some("model".to_owned()),
-            rank: Some(0),
-            world_size: Some(1),
-            devices: Some(vec!["cuda:0".to_owned()]),
-            hosts: Some(vec!["node-a".to_owned()]),
-            max_running_requests: Some(24),
-            max_batch: Some(32),
-            max_num_batched_tokens: Some(4096),
-            graph_tiers: Some(vec![16, 32]),
-            bos: Some(1),
-            eos: Some(vec![2, 3]),
-            end_of_image: Some(4),
-            generation_limits: Some(GenerationLimits::default()),
-            ..RankFacts::default()
-        }
-    }
-
-    /// What the facts state is the configuration, and what they do not state
-    /// comes from the build configuration and the platform's defaults.
-    #[test]
-    fn a_rank_of_facts_builds_its_schedulers_configuration() -> anyhow::Result<()> {
-        let config = EngineConfig::of(&rank_facts())?;
-        assert_eq!(config.max_batch, 32);
-        assert_eq!(config.max_num_batched_tokens, 4096);
-        assert_eq!(config.max_running_requests, 24);
-        assert_eq!(config.world, 7);
-        assert_eq!(config.bos, 1);
-        assert_eq!(config.eos, [2, 3]);
-        assert_eq!(config.graph_tiers, [16, 32]);
-        // One group, placed as the launch file places it, with the component
-        // the group's ranks divide.
-        let [group] = &config.worker_groups[..] else {
-            panic!("the facts name one group");
-        };
-        assert_eq!(group.id.0, "model");
-        assert_eq!(group.ranks.len(), 1);
-        assert_eq!(group.ranks[0].host, "node-a");
-        assert_eq!(group.ranks[0].device, "cuda:0");
-        assert_eq!(config.data_parallel_size, 1);
-        // Derived: the build configuration's prefill chunk and the platform's
-        // prefix cache.
-        assert_eq!(
-            config.chunked_prefill_size,
-            crate::scheduler::DEFAULT_CHUNKED_PREFILL_SIZE
-        );
-        assert!(config.prefix_cache);
-        assert_eq!(config.model, "Qwen/Qwen3-30B-A3B");
-        Ok(())
-    }
-
-    /// A fact the configuration needs and the facts do not state is refused by
-    /// name, with where it comes from: never defaulted to a guess.
-    #[test]
-    fn a_missing_fact_is_refused_by_name_and_source() {
-        let mut facts = rank_facts();
-        facts.generation_limits = None;
-        let refused = EngineConfig::of(&facts).expect_err("the limits are needed");
-        let refused = format!("{refused:#}");
-        assert!(refused.contains("generation limits"), "{refused}");
-        assert!(refused.contains("model's own configuration"), "{refused}");
-
-        let mut facts = rank_facts();
-        facts.world = None;
-        let refused = EngineConfig::of(&facts).expect_err("the world is needed");
-        let refused = format!("{refused:#}");
-        assert!(refused.contains("world"), "{refused}");
-        assert!(refused.contains("launch file"), "{refused}");
-    }
-
-    /// The rank layout must name one device and one host per rank.
-    #[test]
-    fn a_rank_layout_that_does_not_cover_every_rank_is_refused() {
-        let mut facts = rank_facts();
-        facts.world_size = Some(2);
-        let refused = EngineConfig::of(&facts).expect_err("two ranks need two devices");
-        let refused = format!("{refused:#}");
-        assert!(refused.contains("2 ranks"), "{refused}");
-    }
 
     /// A host takes a contiguous block of the ranks, the first hosts take the
     /// remainder, and a rank's device is its local index on its own host.

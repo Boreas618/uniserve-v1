@@ -118,7 +118,8 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
     )]));
     let batches: Arc<dyn Batches> = serving.clone();
     let handle = SchedulerHandle::over_batches(
-        crate::support::serving::config(&serving, "in-process-completion"),
+        &crate::support::serving::args("in-process-completion"),
+        crate::support::serving::limits(&serving),
         batches,
     )
     .expect("the pool serves");
@@ -207,9 +208,10 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
         "model",
     )]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let mut config = crate::support::serving::config(&serving, "in-process-completion");
-    config.max_running_requests = 1;
-    let handle = SchedulerHandle::over_batches(config, batches).expect("the pool serves");
+    let args = crate::support::serving::args("in-process-completion");
+    let mut limits = crate::support::serving::limits(&serving);
+    limits.max_running_requests = 1;
+    let handle = SchedulerHandle::over_batches(&args, limits, batches).expect("the pool serves");
     install(&handle, &serving);
 
     let mut first = handle
@@ -258,7 +260,8 @@ fn a_policy_stage_applies_after_a_request_ended() {
     )]));
     let batches: Arc<dyn Batches> = serving.clone();
     let handle = SchedulerHandle::over_batches(
-        crate::support::serving::config(&serving, "in-process-completion"),
+        &crate::support::serving::args("in-process-completion"),
+        crate::support::serving::limits(&serving),
         batches,
     )
     .expect("the pool serves");
@@ -308,7 +311,8 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
     )]));
     let batches: Arc<dyn Batches> = serving.clone();
     let handle = SchedulerHandle::over_batches(
-        crate::support::serving::config(&serving, "in-process-completion"),
+        &crate::support::serving::args("in-process-completion"),
+        crate::support::serving::limits(&serving),
         batches,
     )
     .expect("the pool serves");
@@ -359,7 +363,7 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
 /// head scores them alike; only the nucleus differs.
 #[test]
 fn logprobs_report_the_model_distribution_under_a_cutoff() {
-    use engine::{EngineConfig, Executor, SchedulerHandle, SimEngine, SimExecutor};
+    use engine::{Executor, SchedulerConfig, SchedulerHandle, SimEngine, SimExecutor};
     use std::thread;
 
     let candidates = |top_p: f32| -> Vec<ipc::TokenLogprob> {
@@ -370,9 +374,12 @@ fn logprobs_report_the_model_distribution_under_a_cutoff() {
             .info()
             .runtime_info()
             .expect("the sim states its rank");
-        let engine =
-            SchedulerHandle::with_executor(EngineConfig::sim("logprobs"), Box::new(executor))
-                .expect("the simulated executor serves");
+        let engine = SchedulerHandle::with_executor(
+            &engine::sim_args("logprobs"),
+            SchedulerConfig::default(),
+            Box::new(executor),
+        )
+        .expect("the simulated executor serves");
         crate::support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
 
         let mut request = text_request(1, 2, 7);

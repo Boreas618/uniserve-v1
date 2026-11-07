@@ -17,7 +17,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
-use engine::{EngineConfig, SchedulerHandle, SimEngine, SimExecutor};
+use engine::{SchedulerHandle, SimEngine, SimExecutor};
 use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
@@ -72,16 +72,20 @@ pub(crate) fn router_with(engine: Leader, server: &ServerConfig) -> Router {
 /// API's longest duration capacity, as a default video deployment does.
 pub(crate) fn sim_engine(parameters: ModelParameters) -> Leader {
     let model = sim_model(parameters);
-    let core = sim_core(EngineConfig::sim(SERVED_MODEL), SimEngine::new());
+    let core = sim_core(engine::sim_args(SERVED_MODEL), SimEngine::new());
     engine_over(model, configured_tokenizer(), vec![core])
 }
 
 /// Starts a scheduler under `config` that drives `worker` in process, with the
 /// epoch's policy installed ([`policy_on`]): a scheduler with no policy decides
 /// nothing, and a fixture's engine has no Program Server to give it one.
-pub(crate) fn sim_core(config: EngineConfig, worker: SimEngine) -> SchedulerHandle {
-    let core = SchedulerHandle::with_executor(config, Box::new(SimExecutor::new(worker)))
-        .expect("start a sim scheduler");
+pub(crate) fn sim_core(args: proto::config::EngineArgs, worker: SimEngine) -> SchedulerHandle {
+    let core = SchedulerHandle::with_executor(
+        &args,
+        engine::SchedulerConfig::default(),
+        Box::new(SimExecutor::new(worker)),
+    )
+    .expect("start a sim scheduler");
     policy_on(&core);
     core
 }

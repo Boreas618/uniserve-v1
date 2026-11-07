@@ -7,7 +7,8 @@
 
 use std::sync::Mutex;
 
-use engine::EngineConfig;
+use engine::SchedulerConfig;
+use proto::config::EngineArgs;
 
 use executor::batch::{
     Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
@@ -206,7 +207,17 @@ pub(crate) fn pool(group: &str) -> Inventory {
 /// the pool stripped its cache, and the row count it should have refused
 /// silently passed. The row count is read from the pool, so there is one
 /// authority for the number rather than a constant each case remembers.
-pub(crate) fn config(pool: &Serving, name: &str) -> EngineConfig {
+pub(crate) fn config(pool: &Serving, name: &str) -> (EngineArgs, SchedulerConfig) {
+    (args(name), limits(pool))
+}
+
+/// The simulation's arguments for a deployment named `name`.
+pub(crate) fn args(name: &str) -> EngineArgs {
+    engine::sim_args(name)
+}
+
+/// The mechanism's limits for `pool`: as many running requests as its ranks hold request rows.
+pub(crate) fn limits(pool: &Serving) -> SchedulerConfig {
     let rows: usize = pool
         .inventory()
         .iter()
@@ -218,7 +229,8 @@ pub(crate) fn config(pool: &Serving, name: &str) -> EngineConfig {
                 .sum::<usize>()
         })
         .sum();
-    let mut config = EngineConfig::sim(name);
-    config.max_running_requests = rows.max(1);
-    config
+    SchedulerConfig {
+        max_running_requests: rows.max(1),
+        ..SchedulerConfig::default()
+    }
 }

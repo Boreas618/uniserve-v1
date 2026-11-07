@@ -34,9 +34,9 @@ mod sim;
 mod trajectories;
 mod warmup;
 
-pub use crate::core::{
-    EngineConfig, RankFacts, SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank,
-};
+#[cfg(feature = "testing")]
+pub use crate::core::sim_args;
+pub use crate::core::{SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 #[cfg(feature = "testing")]
 pub use crate::executor::{BatchResult, CallResult, Executor};
 pub use crate::executor::{

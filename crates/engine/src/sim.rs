@@ -107,9 +107,9 @@ fn stall_failure(stall: &ipc::Stall) -> anyhow::Error {
 }
 
 /// Default EOS id the simulator samples after `text_len` tokens.
-/// `EngineConfig::sim` configures the same id so the scheduler finishes
-/// simulated requests.
-const FAKE_EOS_TOKEN: u32 = 151_645;
+/// `sim_args` configures the same id so the scheduler finishes simulated
+/// requests.
+pub(crate) const FAKE_EOS_TOKEN: u32 = 151_645;
 const SYNTH_VOCAB_SIZE: usize = FAKE_EOS_TOKEN as usize + 1;
 /// The longest sequence the simulated pool serves: the model's context length,
 /// which the attention descriptor bounds every row by.

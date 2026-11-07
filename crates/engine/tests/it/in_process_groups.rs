@@ -170,7 +170,7 @@ fn generate(
     groups: &[(&str, engine::WorkerGroupRole)],
     requests: Vec<GenerationRequest>,
 ) -> Vec<Vec<u32>> {
-    use engine::{EngineConfig, Executor, SchedulerHandle, WorkerGroupId};
+    use engine::{Executor, SchedulerConfig, SchedulerHandle, WorkerGroupId};
 
     let mut sim = SimEngine::new();
     sim.set_text_len(16);
@@ -183,11 +183,15 @@ fn generate(
         .info()
         .runtime_info()
         .expect("the sim states its rank");
-    let mut config = EngineConfig::sim("groups");
-    config.max_running_requests = 4;
+    let mut args = engine::sim_args("groups");
+    let limits = SchedulerConfig {
+        max_running_requests: 4,
+        ..SchedulerConfig::default()
+    };
     if !groups.is_empty() {
-        let base = config.worker_groups.remove(0);
-        config.worker_groups = groups
+        let worker_groups = &mut args.engine_config.parallel.worker_groups;
+        let base = worker_groups.remove(0);
+        *worker_groups = groups
             .iter()
             .map(|(name, role)| engine::WorkerGroupConfig {
                 id: WorkerGroupId((*name).to_owned()),
@@ -196,7 +200,7 @@ fn generate(
             })
             .collect();
     }
-    let engine = SchedulerHandle::with_executor(config, Box::new(executor))
+    let engine = SchedulerHandle::with_executor(&args, limits, Box::new(executor))
         .expect("the simulated executor serves");
     support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
 
@@ -235,7 +239,7 @@ fn generate(
 /// admitting work.
 #[test]
 fn losing_every_worker_stops_request_admission() {
-    use engine::{EngineConfig, Executor, SchedulerHandle, SubmitError, WorkerGroupId};
+    use engine::{Executor, SchedulerConfig, SchedulerHandle, SubmitError, WorkerGroupId};
 
     let mut sim = SimEngine::new();
     sim.set_text_len(4);
@@ -245,8 +249,12 @@ fn losing_every_worker_stops_request_admission() {
         .info()
         .runtime_info()
         .expect("the sim states its rank");
-    let engine = SchedulerHandle::with_executor(EngineConfig::sim("sim-model"), Box::new(executor))
-        .expect("the simulated executor serves");
+    let engine = SchedulerHandle::with_executor(
+        &engine::sim_args("sim-model"),
+        SchedulerConfig::default(),
+        Box::new(executor),
+    )
+    .expect("the simulated executor serves");
     support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
 
     // The engine serves while its group is live.

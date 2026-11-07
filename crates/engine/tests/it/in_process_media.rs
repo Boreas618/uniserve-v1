@@ -143,8 +143,8 @@ fn unsupported_media_is_rejected_without_stopping_the_engine() {
     // The configuration the green text case uses: a batch bound is not part
     // of what this case asserts, and a construct that differs from the one
     // known to serve text would make a refusal unattributable.
-    let config = support::config(&pool, "in-process-media");
-    let engine = SchedulerHandle::over_batches(config, pool.clone() as Arc<dyn Batches>)
+    let (args, limits) = support::config(&pool, "in-process-media");
+    let engine = SchedulerHandle::over_batches(&args, limits, pool.clone() as Arc<dyn Batches>)
         .expect("the text deployment serves");
     install(&engine, &pool);
 

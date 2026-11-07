@@ -1,6 +1,6 @@
-//! The in-process boot: a main process that holds its own devices reads the
-//! facts its launch states, derives its configuration from them
-//! (`EngineConfig::of`), and serves over the executor's own batch path
+//! The in-process boot: a main process that holds its own devices starts its
+//! scheduler from its launch arguments and the limits of its pool
+//! (`SchedulerConfig::of`), and serves over the executor's own batch path
 //! (`SchedulerHandle::over_batches`), here with no device.
 //!
 //! This test states what that composition has to produce: a handle the epoch's
@@ -16,8 +16,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use engine::{
-    BatchCapacity, Event, GenerationConstraint, GenerationRequest, RankFacts, SchedulerHandle,
-    Stage,
+    BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerConfig,
+    SchedulerHandle, Stage,
 };
 use executor::batch::{
     Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
@@ -100,33 +100,16 @@ fn pool() -> Inventory {
     }
 }
 
-/// The facts one main process's launch file states for a text deployment of one
-/// rank: the launch's own values, and the model's bounds for a tokenizer whose
-/// end of text is the simulation's.
-fn facts() -> RankFacts {
-    RankFacts {
-        model: Some("boot-model".to_owned()),
-        dtype: Some(engine::ModelDtype::BFloat16),
-        world: Some(0),
-        group: Some("model".to_owned()),
-        rank: Some(0),
-        world_size: Some(1),
-        devices: Some(vec!["cpu".to_owned()]),
-        hosts: Some(vec!["localhost".to_owned()]),
-        max_running_requests: Some(4),
-        // The budgets the pool below is built for, stated rather than left to a
-        // default: a plan may not exceed what the epoch was built for, so a
-        // budget tighter than the pool's would refuse the very batch a request
-        // needs and read as "the policy served nothing".
-        max_batch: Some(16),
-        max_num_batched_tokens: Some(512),
-        graph_tiers: Some(vec![1, 8]),
-        bos: Some(0),
-        eos: Some(vec![151645]),
-        end_of_image: Some(0),
-        generation_limits: Some(engine::EngineConfig::sim("boot").generation_limits.clone()),
-        ..RankFacts::default()
-    }
+/// The arguments one main process starts its scheduler with for a text deployment of one rank,
+/// and the mechanism's limits of its pool: a tokenizer whose end of text is the simulation's.
+fn launch() -> (proto::config::EngineArgs, SchedulerConfig) {
+    let mut args = engine::sim_args("boot-model");
+    args.engine_config.max_running_requests = std::num::NonZeroUsize::new(4).expect("positive");
+    // The budgets the pool below is built for, stated rather than left to a default: a plan may
+    // not exceed what the epoch was built for, so a budget tighter than the pool's would refuse
+    // the very batch a request needs and read as "the policy served nothing".
+    let limits = SchedulerConfig::of(&args.engine_config, 16, 512, vec![1, 8]);
+    (args, limits)
 }
 
 /// A greedy text request of `prompt` tokens that generates at most `max_tokens`.
@@ -271,9 +254,9 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
     let batches: Arc<dyn Batches> = serving.clone();
     // The boot's whole shape: the facts of a launch file, the executor's batch
     // path, one handle. Nothing is launched: the pool is the rank.
-    let config = engine::EngineConfig::of(&facts()).expect("the facts state a configuration");
-    let handle =
-        SchedulerHandle::over_batches(config, batches).expect("the facts boot a scheduler");
+    let (args, limits) = launch();
+    let handle = SchedulerHandle::over_batches(&args, limits, batches)
+        .expect("the launch boots a scheduler");
 
     // The handle is the launched path's: its commands answer, and a stage waits
     // for a boundary.

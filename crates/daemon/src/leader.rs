@@ -3562,7 +3562,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::metrics::METRICS;
-    use engine::{EngineConfig, Executor, SchedulerHandle, SimEngine, SimExecutor};
+    use engine::{Executor, SchedulerHandle, SimEngine, SimExecutor};
     use futures::{StreamExt as _, poll};
     use proto::request::{
         Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request,
@@ -3588,7 +3588,7 @@ mod tests {
     /// The scheduler's model name labels the process-wide request metrics,
     /// so a test that reads them names its own engine.
     fn qwen3_engine(worker: SimEngine, engine_model: &str) -> Leader {
-        let core = sim_core(EngineConfig::sim(engine_model), worker);
+        let core = sim_core(engine::sim_args(engine_model), worker);
         sim_engine_over(ModelParameters::Qwen3, vec![core])
     }
 
@@ -3664,7 +3664,7 @@ mod tests {
     /// loss.
     #[tokio::test]
     async fn a_lost_engine_fails_later_requests() {
-        let core = sim_core(EngineConfig::sim("lost-engine-model"), SimEngine::new());
+        let core = sim_core(engine::sim_args("lost-engine-model"), SimEngine::new());
         let client = Arc::new(sim_client(vec![core]));
         let engine = leader_over(
             sim_model(ModelParameters::Qwen3),
@@ -3702,7 +3702,7 @@ mod tests {
         // answers the leader never gave.
         let mut clients = Vec::new();
         for _ in 0..2 {
-            let core = sim_core(EngineConfig::sim("sim-model"), SimEngine::new());
+            let core = sim_core(engine::sim_args("sim-model"), SimEngine::new());
             clients.push(Arc::new(sim_client(vec![core])));
         }
         let engine = leader_over(
@@ -3845,7 +3845,8 @@ mod tests {
         let (release_tx, release) = std::sync::mpsc::channel();
         let released = Arc::new(AtomicBool::new(false));
         let core = SchedulerHandle::with_executor(
-            EngineConfig::sim("sim-model"),
+            &engine::sim_args("sim-model"),
+            engine::SchedulerConfig::default(),
             Box::new(GatedCloseExecutor {
                 inner: SimExecutor::new(SimEngine::new()),
                 release,
@@ -3985,7 +3986,7 @@ mod tests {
     async fn request_metrics_name_the_engine_core_that_served_each_request() {
         let engine_model = "core-metrics-model";
         let cores = (0..2)
-            .map(|_| sim_core(EngineConfig::sim(engine_model), SimEngine::new()))
+            .map(|_| sim_core(engine::sim_args(engine_model), SimEngine::new()))
             .collect();
         let engine = sim_engine_over(ModelParameters::Qwen3, cores);
 

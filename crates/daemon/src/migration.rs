@@ -744,7 +744,7 @@ impl Drop for RequestEvents {
 mod tests {
     use std::time::Duration;
 
-    use engine::{ContextLog, EngineConfig, SimEngine};
+    use engine::{ContextLog, SimEngine};
     use proto::request::{
         DiffusionSamplingParams, FeedbackNextToken, GenerationConstraint, GenerationRequest,
         ImageEncoder, ImageEncoderInput, ImageGenerationConfig, ImageParams, ImageTrigger,
@@ -788,7 +788,7 @@ mod tests {
         let mut sim = SimEngine::new();
         sim.set_text_len(100_000);
         Arc::new(sim_client(vec![sim_core(
-            EngineConfig::sim(SERVED_MODEL),
+            engine::sim_args(SERVED_MODEL),
             sim,
         )]))
     }
@@ -1081,7 +1081,7 @@ mod tests {
         let pace = paced.then(|| sim.pace());
         let log = sim.context_log();
         let client = Arc::new(sim_client(vec![sim_core(
-            EngineConfig::sim(SERVED_MODEL),
+            engine::sim_args(SERVED_MODEL),
             sim,
         )]));
         (client, pace, log)

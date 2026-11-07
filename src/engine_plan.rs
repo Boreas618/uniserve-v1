@@ -856,25 +856,6 @@ impl EpochPlan {
             .unwrap_or(self.build.worker.watchdog_timeout)
     }
 
-    /// The launch-file and build-config facts a scheduler derives an epoch's configuration from.
-    ///
-    /// Every fact this process can state is read from the source that owns it: the launch file the
-    /// daemon wrote (`group`, `rank`, `world`, `world_size`, `devices`), the epoch's build config
-    /// (`dtype`, `max_running_requests`, the host cache), and the captured catalog (`max_batch`,
-    /// `max_num_batched_tokens`, `graph_tiers`; a batch larger than the largest bucket is refused
-    /// before a kernel runs, so the catalog is the admission bound).
-    ///
-    /// Two facts are answered only as far as a launch file can answer them. `hosts` is one host
-    /// name per rank in rank order: a world of one states this node's own, because one node is one
-    /// host and the name is read from the machine rather than invented, while a world of more ranks
-    /// leaves the fact absent - the real names are the deployment's, and a launch file, which is per
-    /// node, does not carry them (`EngineArgs::peers` is this node's peer addresses).
-    ///
-    /// The rest stay `None`, and that is the answer rather than a gap to fill with a guess: `bos`,
-    /// `eos`, `end_of_image` and `generation_limits` are the checkpoint's tokenizer and generation
-    /// facts, which neither the launch file nor the model's configuration states.
-    /// `engine::EngineConfig::of` refuses each absent fact by name, so a deployment that needs one
-    /// fails with the fact it is missing rather than planning against a made-up value.
     /// Whether this rank keeps a host KV cache: a text rank of a deployment with a host tier.
     pub(crate) fn host_kv_cache(&self, served: &Served) -> bool {
         matches!(served, Served::Text(_))
@@ -882,74 +863,94 @@ impl EpochPlan {
             && self.build.kv_cache.prefix_caching
     }
 
-    pub(crate) fn rank_facts(&self, served: &Served) -> Result<engine::RankFacts> {
-        let Served::Text(_) = served else {
-            return self.media_rank_facts();
-        };
-        let (rows, tokens) = self.buckets.bounds();
-        let control = checkpoint_tokens(&self.checkpoint)?;
-        // The graph sizes this rank captures, which is the tier a plan's batch must fit (§4.5).
-        let graph_tiers = self
-            .buckets
-            .iter()
-            .map(|bucket| bucket.tokens)
-            .collect::<std::collections::BTreeSet<u32>>()
-            .into_iter()
-            .collect();
-        Ok(engine::RankFacts {
-            deployment: None,
-            host_kv_cache: false,
-            model: Some(self.checkpoint.display().to_string()),
-            dtype: Some(self.build.model.dtype.clone()),
-            world: Some(self.world),
-            group: Some(self.group.clone()),
-            rank: Some(self.rank as usize),
-            world_size: Some(self.world_size),
-            devices: Some(
-                self.devices
+    /// What this rank's scheduler starts with ([`engine::SchedulerHandle::over_batches_telling`]):
+    /// the process's arguments `launch`, with the engine configuration as this process resolves it,
+    /// and the mechanism's limits for this rank ([`engine::SchedulerConfig::of`]).
+    ///
+    /// The configuration takes the facts of the model this rank serves, read where they are
+    /// stated: the control tokens from the checkpoint (`checkpoint_tokens`), since a launch file
+    /// states where the checkpoint is and not what its vocabulary means, and what one request may
+    /// be given to generate from this class of model. It keeps the host KV tier only where
+    /// `host_kv_cache` says this scheduler keeps one.
+    ///
+    /// The limits are what this rank captured: a causal-language rank admits up to the largest
+    /// bucket of its catalog, whose sizes are the tiers a plan's batch must fit (§4.5), and a media
+    /// rank admits the deployment's requests, one computation each, at the widest prompt capacity it
+    /// captures, with no tiers, since its buckets are not sized by tokens.
+    pub(crate) fn scheduler_args(
+        &self,
+        launch: &EngineArgs,
+        served: &Served,
+        host_kv_cache: bool,
+    ) -> Result<(EngineArgs, engine::SchedulerConfig)> {
+        let running = self.build.max_running_requests.get();
+        let (facts, max_batch, max_num_batched_tokens, graph_tiers) = match served {
+            Served::Text(_) => {
+                let (rows, tokens) = self.buckets.bounds();
+                let control = checkpoint_tokens(&self.checkpoint)?;
+                let graph_tiers = self
+                    .buckets
                     .iter()
-                    .map(|device| device.0.to_string())
-                    .collect(),
-            ),
-            // The engine's facts want one host name per rank, and the launch file states the
-            // rank's devices but not which host each rank sits on - it cannot, a launch file is
-            // per node. A world of one therefore has exactly one host and this node is it; the
-            // name is the machine's own rather than an invented string, so a report, a log or a
-            // transfer that names the host names the host.
-            //
-            // A world of more ranks needs the real names for rank layout and for cross-host weight
-            // transfer, and a guess there would be worse than the refusal: the fact stays absent
-            // and `EngineConfig::of` names what the launch file owes it.
-            hosts: match self.world_size {
-                1 => Some(vec![host_name()?]),
-                _ => None,
-            },
-            max_running_requests: Some(self.build.max_running_requests.get()),
-            max_batch: Some(rows as usize),
-            max_num_batched_tokens: Some(tokens as usize),
-            host_cache: match (self.build.kv_cache.host_ratio, self.build.kv_cache.host_gib) {
-                // A deployment that states neither keeps no host tier of its own, which is what a
-                // storage grant of `None` means.
-                (None, None) => None,
-                (ratio, gib) => Some(engine::HostCacheSize::new(
-                    ratio,
-                    gib.map(|gib| gib.get() << 30),
-                )?),
-            },
-            graph_tiers: Some(graph_tiers),
-            // The tokenizer facts are the checkpoint's (`checkpoint_tokens`): a launch file states
-            // where the checkpoint is, not what its vocabulary means, and the engine schedules
-            // against the ids themselves.
-            bos: Some(control.bos),
-            eos: Some(control.eos),
-            // A causal LM encodes no image, so no token closes encoded image content. The wire
-            // field carries no presence bit: it is a plain `uint32`, and the daemon writes `0`
-            // for a profile that states no generation controls. So `0` stands for the absence of
-            // a token rather than for an invented one, and a reader must not take it as an id.
-            end_of_image: Some(0),
-            // What one request may be given to generate on this model; see `understanding_limits`.
-            generation_limits: Some(understanding_limits()),
-        })
+                    .map(|bucket| bucket.tokens)
+                    .collect::<std::collections::BTreeSet<u32>>()
+                    .into_iter()
+                    .collect();
+                let facts = proto::config::ModelFacts {
+                    // What one request may be given to generate on this model; see
+                    // `understanding_limits`.
+                    limits: understanding_limits(),
+                    bos: control.bos,
+                    eos: control.eos,
+                    // A causal LM encodes no image, so no token closes encoded image content, and
+                    // `0` stands for that absence rather than for an id.
+                    end_of_image: 0,
+                    max_model_len: self.max_kv_len(served)?,
+                    canvas_sampling: None,
+                    prefill_outputs: true,
+                };
+                (facts, rows as usize, tokens as usize, graph_tiers)
+            }
+            Served::Media(_) => {
+                let longest = self.build.model.max_model_len.map(|length| length.get()).context(
+                    "a deployment of the media class states no `max_model_len`: the pipeline keeps \
+                     no key/value cache, so no checkpoint figure implies one and the deployment's \
+                     own is what its prompt capacities are checked against",
+                )?;
+                let tokens = prompt_capacity(&self.build.video, longest)?;
+                let facts = proto::config::ModelFacts {
+                    // A media request generates a clip, not tokens, so no understanding feature is
+                    // served; the engine still needs the two lower bounds, as the frontend's arm
+                    // for this class states them (`crates/frontend/src/model/generation.rs`).
+                    limits: GenerationLimits {
+                        latent_downsample: 1,
+                        max_cfg_branches: 1,
+                        ..GenerationLimits::default()
+                    },
+                    // The media class decodes no tokens, so no tokenizer fact reaches a scheduler
+                    // call: `0` stands for the absence of a token, and the list of terminating
+                    // tokens is empty.
+                    bos: 0,
+                    eos: Vec::new(),
+                    end_of_image: 0,
+                    max_model_len: longest,
+                    canvas_sampling: None,
+                    prefill_outputs: true,
+                };
+                (facts, running, tokens as usize, Vec::new())
+            }
+        };
+        let mut args = launch.clone();
+        args.engine_config.model.facts = Some(facts);
+        if !host_kv_cache {
+            args.engine_config.kv_cache.host_tier = false;
+        }
+        let limits = engine::SchedulerConfig::of(
+            &args.engine_config,
+            max_batch,
+            max_num_batched_tokens,
+            graph_tiers,
+        );
+        Ok((args, limits))
     }
 
     /// The snapshot of the base revision this export continues, when it pins one.
@@ -1210,75 +1211,6 @@ impl EpochPlan {
         );
         runners.push(NamedRunner::new(RunnerId(4), Box::new(media)));
         Ok(runners)
-    }
-
-    /// What a media rank advertises of itself: the facts its scheduler is configured from.
-    ///
-    /// **A media rank keeps no paged key/value cache**, so the host tier is absent rather than
-    /// zero: stating one would make a scheduler plan against a pool that never exists. What
-    /// replaces it is the deployment's media statement: the widest batch it admits, the prompt
-    /// capacity its encoder captures, and the length it states.
-    ///
-    /// Every figure here is the deployment's, not a checkpoint's: a pipeline does not imply a
-    /// prompt capacity or a clip length, and a default invented here would be a second statement of
-    /// the deployment's own file.
-    fn media_rank_facts(&self) -> Result<engine::RankFacts> {
-        let longest = self
-            .build
-            .model
-            .max_model_len
-            .map(|length| length.get())
-            .context(
-                "a deployment of the media class states no `max_model_len`: the pipeline keeps no \
-                 key/value cache, so no checkpoint figure implies one and the deployment's own is \
-                 what its prompt capacities are checked against",
-            )?;
-        let tokens = prompt_capacity(&self.build.video, longest)?;
-        Ok(engine::RankFacts {
-            deployment: None,
-            host_kv_cache: false,
-            model: Some(self.checkpoint.display().to_string()),
-            dtype: Some(self.build.model.dtype.clone()),
-            world: Some(self.world),
-            group: Some(self.group.clone()),
-            rank: Some(self.rank as usize),
-            world_size: Some(self.world_size),
-            devices: Some(
-                self.devices
-                    .iter()
-                    .map(|device| device.0.to_string())
-                    .collect(),
-            ),
-            hosts: match self.world_size {
-                1 => Some(vec![host_name()?]),
-                _ => None,
-            },
-            max_running_requests: Some(self.build.max_running_requests.get()),
-            // One media computation per request: a batch's rows are the requests it carries, and
-            // the deployment's admission bound is the number of them.
-            max_batch: Some(self.build.max_running_requests.get()),
-            max_num_batched_tokens: Some(tokens as usize),
-            // No paged cache, so no host tier of one.
-            host_cache: None,
-            // A media rank captures graphs per bucket, and a bucket of this class is not sized by
-            // tokens: the tiers a policy is checked against do not exist here, which is what an
-            // empty list states (`SchedulerConfig::graph_tiers`).
-            graph_tiers: Some(Vec::new()),
-            // The media class decodes no tokens, so no tokenizer fact reaches a scheduler call: `0`
-            // stands for the absence of a token, as a causal LM's `end_of_image` does, and the list
-            // of terminating tokens is empty.
-            bos: Some(0),
-            eos: Some(Vec::new()),
-            end_of_image: Some(0),
-            // A media request generates a clip, not tokens, so no understanding feature is served;
-            // the engine still needs the two lower bounds, as the frontend's arm for this class
-            // states them (`crates/frontend/src/model/generation.rs`).
-            generation_limits: Some(GenerationLimits {
-                latent_downsample: 1,
-                max_cfg_branches: 1,
-                ..GenerationLimits::default()
-            }),
-        })
     }
 
     /// The Program Server's targets this rank resolves a module for (§5.3).
