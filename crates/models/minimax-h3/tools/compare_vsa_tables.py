@@ -1,5 +1,15 @@
 """Compare the sparse layout's tile and segment tables with the reference's own.
 
+**This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
+repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
+checkout of the last tree that held the package and that tree's interpreter, with the tree on the
+path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+
+    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
+        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+
+`UNISERVE_REFERENCE_TREE` names another checkout.
+
 The sparse attention's arithmetic runs on a device, but which key tiles a query tile reads is
 decided by host tables: ``variable_block_sizes`` (valid rows of each tile), ``tile_segments``
 (which segment a tile belongs to, ``-1`` for dense), ``segment_starts`` (where each segment's tiles
@@ -11,7 +21,7 @@ so a table that keeps one tile too many produces a plausible page rather than a 
 with the reference's ``packing.segment_tables`` for the same case, entry by entry.
 
     cargo run -q -p minimax-h3 --example vsa_tables -- --out artifacts/h3-vsa
-    .venv/bin/python crates/models/minimax-h3/tools/compare_vsa_tables.py \
+    python crates/models/minimax-h3/tools/compare_vsa_tables.py \
         --case artifacts/h3-vsa
 
 Exit codes: 0 equal, 1 differ, 2 a case the two sides cannot be compared at.
@@ -27,6 +37,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import os
 import pathlib
 import sys
 import types
@@ -81,7 +92,7 @@ def reference_modules():
     """
     import importlib.util
 
-    root = pathlib.Path().resolve()
+    root = pathlib.Path(os.environ.get("UNISERVE_REFERENCE_TREE", "/workspace/uniserve-v1"))
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     from uniserve.media import image

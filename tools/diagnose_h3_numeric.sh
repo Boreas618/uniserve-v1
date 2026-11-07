@@ -37,6 +37,10 @@ mkdir -p "$run"
 
 echo "commit $commit, checkpoint $root, out $run"
 
+# The reference half reads the retired Python tree; `UNISERVE_REFERENCE_TREE` names a checkout of it.
+reference=${UNISERVE_REFERENCE_TREE:-/workspace/uniserve-v1}
+reference_python="env PYTHONPATH=$reference:$reference/uniserve_kernels/src $reference/.venv/bin/python"
+
 # 1. Stage 3: the sampler's schedule. Host arithmetic on the checkpoint's own statement, so this
 #    half runs with no device and no weights.
 echo
@@ -46,7 +50,7 @@ cargo run -q -p minimax-h3 --example schedule_dump -- \
 
 echo
 echo "== stage 3: ours against the reference's own evaluation of the same statement"
-.venv/bin/python crates/models/minimax-h3/tools/compare_schedule.py \
+$reference_python crates/models/minimax-h3/tools/compare_schedule.py \
     --dump "$run/schedule" > "$run/schedule-compare.txt" 2>&1 || true
 tail -3 "$run/schedule-compare.txt" | sed 's/^/   /'
 
@@ -66,7 +70,7 @@ device. They produce two dump trees that tools/diagnosis/compare.py compares by 
       --device 0 --store <store> --out $run/rust
 
   # the reference's, for the same prompt and ids
-  .venv/bin/python crates/models/minimax-h3/tools/dump_encoder.py --root $root \\
+  $reference_python crates/models/minimax-h3/tools/dump_encoder.py --root $root \\
       --case <case.json> --probe prompt_hidden --out $run/ref
 
   # the comparison: per tensor relative L2, max abs, cosine, and whether the two are identical
@@ -84,7 +88,7 @@ sed 's/^/   /' "$run/stage1-commands.txt" | head -3
 #     is printed as the name check's is.
 echo
 echo "== the denoiser's blocks (stage 3's subject, no canon number of its own): the probes"
-.venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --list \
+$reference_python crates/models/minimax-h3/tools/dump_denoiser.py --list \
     > "$run/denoiser-probes.txt" 2>&1 || true
 sed 's/^/   /' "$run/denoiser-probes.txt" | head -7
 
@@ -94,7 +98,7 @@ sed 's/^/   /' "$run/denoiser-probes.txt" | head -7
 case_file=${H3_DIAGNOSIS_CASE:-}
 if [ -n "$case_file" ] && [ -f "$case_file" ]; then
     for probe in noise rows; do
-        .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint "$root" \
+        $reference_python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint "$root" \
             --case "$case_file" --probe "$probe" --out "$run/ref-$probe" \
             > "$run/ref-$probe.log" 2>&1 || true
         if [ -d "$run/ref-$probe" ] && [ -n "$(ls -A "$run/ref-$probe" 2>/dev/null)" ]; then
@@ -117,9 +121,9 @@ The denoiser's blocks (stage 3's subject, no canon number of their own) numeric 
 reference's probes, then ours against them.
 
   # the reference's host-only probes, on the host that can import its stack
-  .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint $root \\
+  $reference_python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint $root \\
       --case <case.json> --probe noise --out $run/ref-noise
-  .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint $root \\
+  $reference_python crates/models/minimax-h3/tools/dump_denoiser.py --checkpoint $root \\
       --case <case.json> --probe rows --out $run/ref-rows
 
   # ours against each of them, as a per-block report
@@ -127,7 +131,7 @@ reference's probes, then ours against them.
       --candidate <candidate dump dir> --out $run/report-noise.md
 
   # and the served forward's own trajectory, which a runner dumps under \$UNISERVE_DIAG_DIR
-  .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --probe trajectory \\
+  $reference_python crates/models/minimax-h3/tools/dump_denoiser.py --probe trajectory \\
       --checkpoint $root --case <case.json> --out $run/ref-trajectory
   python3 tools/diagnosis/compare.py --ref $run/ref-trajectory --got <diag dir> \\
       --out $run/report-denoiser.json
@@ -159,7 +163,7 @@ reference's probe compares them. Both run on the host that has the shards and a 
       --image 256 --frames 5 --text-tokens 15 --seed 0
 
   # the reference on the same pixels, compared against $run/stage5/latent_encoder/rows.h3t
-  .venv/bin/python crates/models/minimax-h3/tools/dump_vae_blocks.py --probe encode_rows \\
+  $reference_python crates/models/minimax-h3/tools/dump_vae_blocks.py --probe encode_rows \\
       --checkpoint $root --stack $run/stage5/latent_encoder --out $run/stage5
 
 The probe prints the relative L2 and the maximum absolute difference, or names the shape

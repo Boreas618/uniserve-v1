@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Dump the text encoder's host tables from today's implementation (specs/worker.md 10).
+"""Dump the text encoder's host tables from the reference implementation (specs/worker.md 10).
+
+**This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
+repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
+checkout of the last tree that held the package and that tree's interpreter, with the tree on the
+path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+
+    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
+        /workspace/uniserve-v1/.venv/bin/python <this file> ...
 
 The reference half of ``examples/compare_encoder_tables.rs``: this script reads the same
 ``case.json``, builds the same seven tables from the reference's own code
@@ -19,7 +27,7 @@ mistake (a wrong row, a wrong order, a wrong rotation axis) shows in first. This
 
 Usage::
 
-    .venv/bin/python crates/models/minimax-h3/tools/dump_encoder_tables.py \\
+    python crates/models/minimax-h3/tools/dump_encoder_tables.py \\
         --case case.json --out artifacts/diagnosis/<run>/ref \\
         [--text-encoder /opt/uv/models/MiniMax-H3/text_encoder]
 """

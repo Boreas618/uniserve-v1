@@ -1,5 +1,15 @@
 """Compare a prompt's text-encoder M-RoPE factors against the reference.
 
+**This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
+repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
+checkout of the last tree that held the package and that tree's interpreter, with the tree on the
+path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+
+    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
+        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+
+`UNISERVE_REFERENCE_TREE` names another checkout.
+
 `examples/encoder_rope.rs` writes the encode's own host tables for a prompt - the interleaved
 coordinates, the cosine and the sine - and this recomputes them from the ids alone, with the
 reference's `rope_index` and `RotaryEmbedding`, then prints the worst element of each. No device and
@@ -21,7 +31,7 @@ Usage:
 
     cargo run -q -p minimax-h3 --example encoder_rope -- --root <checkpoint> \\
         --prompt-ids <ids> --out artifacts/h3-stage4/rope
-    .venv/bin/python crates/models/minimax-h3/tools/compare_rope_factors.py \\
+    python crates/models/minimax-h3/tools/compare_rope_factors.py \\
         --case artifacts/h3-stage4/rope --checkpoint <checkpoint>
 
 The comparator has been seen to say no, three ways, and a check that has only ever been green is
@@ -51,6 +61,7 @@ import argparse
 import importlib
 import importlib.util
 import json
+import os
 import struct
 import sys
 import types
@@ -162,9 +173,9 @@ def install_kernel_stub() -> bool:
 
 def reference_factors(role: dict, case: Path, checkpoint: Path):
     """The reference's coordinates and factors for the case's prompt."""
-    python = Path(".").resolve()
+    python = Path(os.environ.get("UNISERVE_REFERENCE_TREE", "/workspace/uniserve-v1"))
     # `uniserve.nn.rope` reads one dataclass off `uniserve.tensors`, and importing the package
-    # itself pulls in the compiled kernels; the repository root goes on the path so that one import
+    # itself pulls in the compiled kernels; the reference tree goes on the path so that one import
     # resolves and nothing else is loaded.
     if str(python) not in sys.path:
         sys.path.insert(0, str(python))

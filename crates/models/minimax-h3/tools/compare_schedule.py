@@ -1,5 +1,13 @@
 """Compare one checkpoint's evaluated schedule with the reference's own evaluation of it.
 
+**This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
+repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
+checkout of the last tree that held the package and that tree's interpreter, with the tree on the
+path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+
+    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
+        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+
 The diagnosis design 10 asks for, on the schedule component: for every sigma point and every network
 time, both implementations' value, the absolute difference, and - when anything differs - the index
 where it is worst. A number with an index, never a summary word.
@@ -15,9 +23,9 @@ Both sides are produced by the code under comparison, not by this file:
 This is a **diagnosis and never an acceptance gate** (design 10): a differing row names the step the
 two implementations disagree about and blocks nothing.
 
-    .venv/bin/python crates/models/minimax-h3/tools/compare_schedule.py \
+    python crates/models/minimax-h3/tools/compare_schedule.py \
         --dump artifacts/diagnosis/minimax-h3/schedule
-    .venv/bin/python crates/models/minimax-h3/tools/compare_schedule.py --self-test
+    python crates/models/minimax-h3/tools/compare_schedule.py --self-test
 """
 
 from __future__ import annotations
