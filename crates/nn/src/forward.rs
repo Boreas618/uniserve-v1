@@ -348,6 +348,25 @@ impl<'a> Forward<'a> {
         self
     }
 
+    /// Waits for what this forward issued so far, when it is not being captured.
+    ///
+    /// A launch that waits on its device for the other ranks of a group holds that device until
+    /// they arrive, and the first use of a kernel takes a lock of the whole process and waits for
+    /// its device to drain. The ranks of a host are threads of one process, so a rank that walked
+    /// on past such a launch can hold that lock for a kernel that needs its peers, while the peers
+    /// queue on the lock in front of the same launch. A captured walk runs no kernel, and a replay
+    /// finds every kernel ready, so only an eager walk is held back here (`Group::settled` states
+    /// the same rule for a collective).
+    pub fn settled(&self) -> Result<()> {
+        let Some(stream) = self.stream else {
+            return Ok(());
+        };
+        if stream.capture_status().map_err(Error::Platform)? == ops::platform::CaptureStatus::None {
+            stream.synchronize().map_err(Error::Platform)?;
+        }
+        Ok(())
+    }
+
     /// The same forward over an expert exchange.
     pub fn with_exchange(mut self, exchange: &'a ExchangeViews) -> Self {
         self.exchange = Some(exchange);

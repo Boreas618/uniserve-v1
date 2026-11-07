@@ -1,0 +1,111 @@
+# The expert_exchange operator's megamoe backend: design 5.2's program package.
+#
+# FlashInfer's fused MegaMoE kernel (`vendor/megamoe`): one launch per layer exchanges
+# the tokens, runs the experts and combines. `src/build.py` compiles it with the CuTe DSL
+# for one group and one shape and exports it with its host launcher; `src/entry.cpp` and
+# `src/stage.cu` are the transport around it. The kernel's tuning table is in
+# `src/build.py`, so a revision of this package fixes it (design 5.4).
+#
+# One native module per descriptor, with the entries of the operator's header.
+
+op = "expert_exchange"
+backend = "megamoe"
+
+[toolchain]
+kind = "cute_dsl"
+version = "4.6.2"
+packages = []
+
+[module]
+form = "native"
+
+[module.entries]
+launch = "uniserve_expert_exchange_launch"
+create = "uniserve_expert_exchange_create"
+step = "uniserve_expert_exchange_step"
+suspend = "uniserve_expert_exchange_suspend"
+restore = "uniserve_expert_exchange_restore"
+release = "uniserve_expert_exchange_release"
+info = "uniserve_expert_exchange_info"
+
+[source]
+kind = "cute_dsl"
+files = [
+    "include/uniserve_expert_exchange.h",
+    "src/build.py",
+    "src/entry.cpp",
+    "src/stage.cu",
+    "vendor/megamoe/LICENSE",
+    "vendor/megamoe/__init__.py",
+    "vendor/megamoe/common/__init__.py",
+    "vendor/megamoe/common/__pycache__/__init__.cpython-312.pyc",
+    "vendor/megamoe/common/__pycache__/megamoe_constants.cpython-312.pyc",
+    "vendor/megamoe/common/__pycache__/moe_utils.cpython-312.pyc",
+    "vendor/megamoe/common/host_utils.py",
+    "vendor/megamoe/common/megamoe_constants.py",
+    "vendor/megamoe/common/moe_utils.py",
+    "vendor/megamoe/moe_nvfp4_swapab/__init__.py",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/__init__.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/contract.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/custom_ext.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/dynamic_mainloop.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/epilogue_refactor.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/fc1_fc2_fuse_sched.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/kernel_fc12.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/megamoe_kernel.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/moe_persistent_scheduler.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/moe_utils.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/runner_common.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/__pycache__/topk_reduce.cpython-312.pyc",
+    "vendor/megamoe/moe_nvfp4_swapab/benchmark_p2p.py",
+    "vendor/megamoe/moe_nvfp4_swapab/contract.py",
+    "vendor/megamoe/moe_nvfp4_swapab/custom_ext.py",
+    "vendor/megamoe/moe_nvfp4_swapab/dynamic_mainloop.py",
+    "vendor/megamoe/moe_nvfp4_swapab/epilogue.py",
+    "vendor/megamoe/moe_nvfp4_swapab/epilogue_refactor.py",
+    "vendor/megamoe/moe_nvfp4_swapab/fc1_fc2_fuse_sched.py",
+    "vendor/megamoe/moe_nvfp4_swapab/kernel_fc12.py",
+    "vendor/megamoe/moe_nvfp4_swapab/mega_reference.py",
+    "vendor/megamoe/moe_nvfp4_swapab/mega_runner.py",
+    "vendor/megamoe/moe_nvfp4_swapab/megamoe_kernel.py",
+    "vendor/megamoe/moe_nvfp4_swapab/moe_persistent_scheduler.py",
+    "vendor/megamoe/moe_nvfp4_swapab/moe_utils.py",
+    "vendor/megamoe/moe_nvfp4_swapab/runner_common.py",
+    "vendor/megamoe/moe_nvfp4_swapab/runner_fc12.py",
+    "vendor/megamoe/moe_nvfp4_swapab/runner_fc12_common.py",
+    "vendor/megamoe/moe_nvfp4_swapab/simulate_fc1_fc2_sched.py",
+    "vendor/megamoe/moe_nvfp4_swapab/topk_reduce.py",
+    "vendor/megamoe/src/__init__.py",
+    "vendor/megamoe/src/__pycache__/__init__.cpython-312.pyc",
+    "vendor/megamoe/src/__pycache__/flag_batch.cpython-312.pyc",
+    "vendor/megamoe/src/__pycache__/grid_sync.cpython-312.pyc",
+    "vendor/megamoe/src/__pycache__/iket_compat.cpython-312.pyc",
+    "vendor/megamoe/src/__pycache__/ptx_helpers.cpython-312.pyc",
+    "vendor/megamoe/src/__pycache__/sf_swizzle.cpython-312.pyc",
+    "vendor/megamoe/src/__pycache__/sym_buffer.cpython-312.pyc",
+    "vendor/megamoe/src/__pycache__/token_comm.cpython-312.pyc",
+    "vendor/megamoe/src/bootstrap.py",
+    "vendor/megamoe/src/cleanup_kernel.py",
+    "vendor/megamoe/src/config.py",
+    "vendor/megamoe/src/dispatch_kernel.py",
+    "vendor/megamoe/src/flag_batch.py",
+    "vendor/megamoe/src/grid_sync.py",
+    "vendor/megamoe/src/iket_compat.py",
+    "vendor/megamoe/src/inputs_process.py",
+    "vendor/megamoe/src/ptx_helpers.py",
+    "vendor/megamoe/src/reference.py",
+    "vendor/megamoe/src/sf_swizzle.py",
+    "vendor/megamoe/src/sym_buffer.py",
+    "vendor/megamoe/src/token_comm.py",
+]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a"]
+
+# `mode_fused_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_dtype_bf16`.
+[kernel.descriptors]
+dimensions = { mode = ["fused"], hidden = ["2048", "7168", "4096"], intermediate = ["768", "1536", "512"], top = ["8", "4", "2"], experts = ["128", "256", "64"], max_tokens = ["512", "8192", "4096", "16384"], ranks = ["2", "4", "8"], attention = ["0"], dtype = ["bf16"] }
+
+[parameters]

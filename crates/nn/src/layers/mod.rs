@@ -64,7 +64,7 @@ pub use frame::{FrameMoments, FrameNormPad, FramePad};
 pub use head::{ParallelLMHead, gather_rows, gather_rows_descriptor};
 pub use linear::{Linear, Nvfp4Linear, PACKED_M_CLASSES, packed_rows};
 pub use modulation::{GatedResidual, ModulatedRmsNorm};
-pub use moe::{
+pub use moe::{FusedTables, 
     Buffer, ENCODE_CHUNK, EncodedStep, Group, Launch, Moe, MoeGeometry, TILE_ROWS, dense_bytes,
     encoded_bytes, exchanged_bytes, exchanged_rows, router_bytes, routing_bytes, sort_bytes,
     step_bytes,

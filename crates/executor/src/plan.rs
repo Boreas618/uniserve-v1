@@ -93,6 +93,8 @@ pub enum Variant {
     /// denoiser's first step, whose conditioner writes their rows. So this call computes nothing:
     /// it is the mechanism's step between the media read and the call that consumes it.
     ConditionEncode,
+    /// A rank's part in an expert step it has no tokens for: every expert layer, and nothing else.
+    ExpertJoin,
 }
 
 impl Variant {
@@ -112,6 +114,7 @@ impl Variant {
             Self::LatentPrepare => "latent_preparation",
             Self::MediaRead => "media_reading",
             Self::ConditionEncode => "condition_encoding",
+            Self::ExpertJoin => "expert_join",
         }
     }
 
@@ -132,6 +135,7 @@ impl Variant {
             Self::LatentPrepare => "latent_prepare",
             Self::MediaRead => "media_read",
             Self::ConditionEncode => "condition_encode",
+            Self::ExpertJoin => "expert_join",
         }
     }
 
@@ -382,6 +386,11 @@ pub struct Bucket {
 }
 
 impl Bucket {
+    /// The bucket of a rank's join: the expert layers of one step, with no batch of its own.
+    pub const fn expert_join() -> Self {
+        Self::decode(1, Variant::ExpertJoin)
+    }
+
     /// A decode bucket of `rows` rows.
     pub const fn decode(rows: u32, variant: Variant) -> Self {
         Self {
