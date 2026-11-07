@@ -186,7 +186,7 @@ fn calls_of(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, ipc::Forward
         .iter()
         .flat_map(|batch| &batch.requests)
         .filter(|(call, _)| call.request_key.request_id == RequestId(request))
-        .map(|(call, placement)| (call.clone(), placement.forward.clone()))
+        .map(|(call, dispatch)| (call.clone(), dispatch.forward.clone()))
         .collect()
 }
 
@@ -610,7 +610,7 @@ fn image_contexts_respect_the_workers_staged_row_capacity() {
             .requests
             .iter()
             .filter(|(call, _)| call.kind == CallKind::Forward(ForwardMode::Prefill))
-            .map(|(_, placement)| placement.forward.query_lens.len())
+            .map(|(_, dispatch)| dispatch.forward.query_lens.len())
             .sum();
         assert!(rows <= 3, "prefill batch has {rows} numerical rows");
     }

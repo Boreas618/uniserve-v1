@@ -61,7 +61,7 @@ use crate::options::PreviousWorld;
 /// A node of the deployment the switch starts main processes on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Node {
-    /// The node's host identity, as placements name it.
+    /// The node's host identity, as rank layouts name it.
     pub(crate) host: String,
     /// The node's rank in the deployment.
     pub(crate) rank: u32,
@@ -180,7 +180,12 @@ pub(crate) trait Roster {
     /// Retains `world`'s weights on `host` once its processes exited, and
     /// releases the rest of its exclusive storage; with `to_host` the weights
     /// it alone retains move to host storage. Answers what the node did.
-    fn keep_weights(&mut self, host: &str, world: u64, to_host: bool) -> Result<KeptWeights, String> {
+    fn keep_weights(
+        &mut self,
+        host: &str,
+        world: u64,
+        to_host: bool,
+    ) -> Result<KeptWeights, String> {
         let _ = (host, world, to_host);
         Ok(KeptWeights::default())
     }
@@ -229,7 +234,12 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
         (**self).resume(host, generation, reason)
     }
 
-    fn keep_weights(&mut self, host: &str, world: u64, to_host: bool) -> Result<KeptWeights, String> {
+    fn keep_weights(
+        &mut self,
+        host: &str,
+        world: u64,
+        to_host: bool,
+    ) -> Result<KeptWeights, String> {
         (**self).keep_weights(host, world, to_host)
     }
 
@@ -628,7 +638,9 @@ impl Switch {
     /// Whether every node's target parked, so only what the daemon still gives it holds the
     /// switchover back.
     pub(crate) fn parked_everywhere(&self) -> bool {
-        self.nodes.iter().all(|node| self.parked.contains(&node.host))
+        self.nodes
+            .iter()
+            .all(|node| self.parked.contains(&node.host))
     }
 
     /// States that `hosts`' targets are given their programs by the daemon, so none of them is
@@ -2265,7 +2277,9 @@ mod tests {
         roster.scripted = vec![report_event(
             "n0",
             6,
-            report(process::report::Kind::Drained(process::Drained { epoch: 12 })),
+            report(process::report::Kind::Drained(process::Drained {
+                epoch: 12,
+            })),
         )];
         switch.advance(&mut roster);
 
@@ -2504,7 +2518,9 @@ mod tests {
         roster.scripted = vec![report_event(
             "n0",
             6,
-            report(process::report::Kind::Drained(process::Drained { epoch: 12 })),
+            report(process::report::Kind::Drained(process::Drained {
+                epoch: 12,
+            })),
         )];
         switch.advance(&mut roster);
 
@@ -2597,13 +2613,18 @@ mod tests {
             2,
             "every target drains"
         );
-        assert!(roster.resumes.is_empty(), "the target serves until it drained");
+        assert!(
+            roster.resumes.is_empty(),
+            "the target serves until it drained"
+        );
 
         for host in ["n0", "n1"] {
             roster.scripted = vec![report_event(
                 host,
                 6,
-                report(process::report::Kind::Drained(process::Drained { epoch: 12 })),
+                report(process::report::Kind::Drained(process::Drained {
+                    epoch: 12,
+                })),
             )];
             switch.advance(&mut roster);
         }
@@ -2626,7 +2647,10 @@ mod tests {
             vec![(11, "unix:/run/requests.sock".to_owned())]
         );
         assert_eq!(
-            switch.update().unavailable().map(|failure| failure.kind.as_str()),
+            switch
+                .update()
+                .unavailable()
+                .map(|failure| failure.kind.as_str()),
             Some("step_time_regression")
         );
     }
@@ -2694,10 +2718,7 @@ mod tests {
         switch.advance(&mut roster);
         assert_eq!(
             roster.kept,
-            vec![
-                ("n0".to_owned(), 11, false),
-                ("n1".to_owned(), 11, false)
-            ]
+            vec![("n0".to_owned(), 11, false), ("n1".to_owned(), 11, false)]
         );
         assert!(!switch.promotion_due(), "the exit is the trial's own");
         assert_eq!(switch.previous_kept(), PreviousWorld::Weights);
@@ -2735,7 +2756,9 @@ mod tests {
             roster.scripted = vec![report_event(
                 host,
                 6,
-                report(process::report::Kind::Drained(process::Drained { epoch: 12 })),
+                report(process::report::Kind::Drained(process::Drained {
+                    epoch: 12,
+                })),
             )];
             switch.advance(&mut roster);
         }
@@ -2752,7 +2775,10 @@ mod tests {
             "the target stops before the epoch starts on its storage"
         );
         assert!(
-            switch.epochs.get(12).is_some_and(|record| record.status == Status::Purged),
+            switch
+                .epochs
+                .get(12)
+                .is_some_and(|record| record.status == Status::Purged),
             "a process started now reads the previous epoch's programs"
         );
         switch.serving(&mut roster, "n0", 9);

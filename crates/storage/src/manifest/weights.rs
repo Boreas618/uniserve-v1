@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 use super::{Gpu, Rank, Storage, World};
 use crate::Key;
-use crate::protocol::{Access, LinkBandwidth, Listing, Placement};
+use crate::protocol::{Access, LinkBandwidth, Listing, Location};
 
 /// The name a rank's manifest is retained under, by which the manifests a
 /// world retains are found.
@@ -268,14 +268,14 @@ pub fn sources<E>(
     let mut held: HashMap<Key, BTreeSet<Gpu>> = HashMap::new();
     let mut manifests = BTreeSet::new();
     for tensor in listing.tensors.iter().filter(|tensor| retains(tensor)) {
-        match tensor.placement {
-            Placement::Device { gpu } => {
+        match tensor.location {
+            Location::Device { gpu } => {
                 held.entry(tensor.key).or_default().insert(gpu);
             }
-            Placement::Host { .. } if tensor.name == NAME => {
+            Location::Host { .. } if tensor.name == NAME => {
                 manifests.insert(tensor.key);
             }
-            Placement::Host { .. } => {}
+            Location::Host { .. } => {}
         }
     }
 

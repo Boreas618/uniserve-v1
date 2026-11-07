@@ -206,7 +206,7 @@ fn calls_of(batches: &[ExecutionBatch], request: u64) -> Vec<(Call, ForwardBatch
         .iter()
         .flat_map(|batch| &batch.requests)
         .filter(|(call, _)| call.request_key.request_id == RequestId(request))
-        .map(|(call, placement)| (call.clone(), placement.forward.clone()))
+        .map(|(call, dispatch)| (call.clone(), dispatch.forward.clone()))
         .collect()
 }
 

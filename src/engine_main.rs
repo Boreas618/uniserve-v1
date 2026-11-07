@@ -206,7 +206,7 @@ pub(crate) struct Launch {
     /// not judge it, so the field is read where the epoch is decided and not here.
     #[serde(default)]
     pub rollback_s: Option<u64>,
-    /// The placement's queue depth for this rank's executor groups: how many batches the rank's
+    /// The rank layout's queue depth for this rank's executor groups: how many batches the rank's
     /// schedulers keep in flight, which the capacity plan relays through (§4.1).
     ///
     /// Required, not defaulted: a zero depth plans a rank with no relay and silently halves the
@@ -551,10 +551,7 @@ fn load_rank(
                 .collect(),
             held: cache.held,
         });
-    let plan = plan.sharing_cache_of(
-        epoch.predecessor_world.filter(|_| launch.standby),
-        adopted,
-    );
+    let plan = plan.sharing_cache_of(epoch.predecessor_world.filter(|_| launch.standby), adopted);
     let host = HostGroup::connect(rendezvous, index, count, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
     // §8: the rank's Storage Server and its claim are the node's, which the daemon answered for; the
@@ -1100,7 +1097,13 @@ impl MainProcess {
         // §2.1: this process serves every rank of its node, each on its own device.
         let rank_plans = plan.ranks()?;
         let rank_numbers: Vec<u32> = rank_plans.iter().map(EpochPlan::rank).collect();
-        let storage = claim(&mut process, launch, &epoch.host, host_kv_cache, &rank_numbers)?;
+        let storage = claim(
+            &mut process,
+            launch,
+            &epoch.host,
+            host_kv_cache,
+            &rank_numbers,
+        )?;
         let ranks = load_ranks(rank_plans, &storage, launch, &epoch)?;
 
         // The owners of §4 are opened before any thread that borrows them, and
@@ -1190,9 +1193,8 @@ impl MainProcess {
             // The shadow region alone: the twins allocate it, and the reservation beside it holds
             // the state group's snapshot too (7.3, 4.5).
             let shadow = graph.shadow;
-            let products: Arc<dyn executor::runners::products::Products> = Arc::new(
-                RankProducts::new(Arc::clone(&group_products), rank_index),
-            );
+            let products: Arc<dyn executor::runners::products::Products> =
+                Arc::new(RankProducts::new(Arc::clone(&group_products), rank_index));
             for device in rank_plan.devices() {
                 let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
                 let runners = rank_plan.runners(
@@ -2390,7 +2392,11 @@ impl MainProcess {
                 continue;
             };
             return Ok(Some((
-                program_server::program::ProgramSlot { op, phase: None, part: None },
+                program_server::program::ProgramSlot {
+                    op,
+                    phase: None,
+                    part: None,
+                },
                 Program {
                     backend: backend.clone(),
                     revision: *revision,
@@ -2407,7 +2413,11 @@ impl MainProcess {
         // holds, which reads as a store defect and is not one.
         match declared_program(&self.listing()?.packages, operator) {
             Some((op, backend, revision)) => Ok(Some((
-                program_server::program::ProgramSlot { op, phase: None, part: None },
+                program_server::program::ProgramSlot {
+                    op,
+                    phase: None,
+                    part: None,
+                },
                 Program {
                     backend,
                     revision,
@@ -3595,7 +3605,11 @@ impl MainProcess {
         // waiting here would hold the acknowledgement the park is waiting for.
         self.draining = Some(Draining {
             epoch,
-            answers: self.schedulers.iter().map(|scheduler| scheduler.park(false)).collect(),
+            answers: self
+                .schedulers
+                .iter()
+                .map(|scheduler| scheduler.park(false))
+                .collect(),
             parked: Vec::with_capacity(self.schedulers.len()),
             since: Instant::now(),
         });
@@ -4390,9 +4404,7 @@ impl MainProcess {
                 let answers = self
                     .schedulers
                     .iter()
-                    .map(|scheduler| {
-                        scheduler.commit_experts(order.clone(), Arc::clone(&together))
-                    })
+                    .map(|scheduler| scheduler.commit_experts(order.clone(), Arc::clone(&together)))
                     .collect();
                 self.owe(front, commit.id, answers, Owing::Storage);
                 return Ok(None);
@@ -4519,7 +4531,10 @@ impl MainProcess {
     /// executor era's warming ran on its workers' hooks, and an epoch's pages reach a target through
     /// the host KV cache. The operations asked here take no fence, so a scheduler answers at its
     /// next pass; the bound is the one a scheduler that stopped answering is named by.
-    fn warm_cache(&mut self, warm: proto::request::wire::CacheWarm) -> proto::request::wire::Hooked {
+    fn warm_cache(
+        &mut self,
+        warm: proto::request::wire::CacheWarm,
+    ) -> proto::request::wire::Hooked {
         use storage::manifest::cache::Operation;
         let hooked = |results: Vec<String>, error: String| proto::request::wire::Hooked {
             id: warm.id,
@@ -5339,10 +5354,18 @@ impl MainProcess {
             }
         };
         if self.weights.is_some() {
-            self.refuse(front, update.id, "another weight update is in progress".to_owned());
+            self.refuse(
+                front,
+                update.id,
+                "another weight update is in progress".to_owned(),
+            );
             return;
         }
-        tracing::info!(model = update.model_path, ?in_flight, "updating the weights in place");
+        tracing::info!(
+            model = update.model_path,
+            ?in_flight,
+            "updating the weights in place"
+        );
         let mut target = self.data.target();
         target.checkpoint = PathBuf::from(&update.model_path);
         let (answer, answered) = crossbeam_channel::bounded(1);
@@ -5350,7 +5373,8 @@ impl MainProcess {
         let spawned = std::thread::Builder::new()
             .name("weight-plan".into())
             .spawn(move || {
-                let _ = answer.send(data.plan(target, executor::memory::reload::Matching::SameTensors));
+                let _ =
+                    answer.send(data.plan(target, executor::memory::reload::Matching::SameTensors));
             });
         if spawned.is_err() {
             self.refuse(
@@ -5498,7 +5522,12 @@ impl MainProcess {
                 let bytes = planned.bytes();
                 let rooms = self.data.room().map_err(|error| error.to_string())?;
                 let graphs = self.data.graph_bytes();
-                tracing::info!(bytes, graphs, ?rooms, "the room a `keep` load has beside the cache");
+                tracing::info!(
+                    bytes,
+                    graphs,
+                    ?rooms,
+                    "the room a `keep` load has beside the cache"
+                );
                 if rooms.iter().all(|room| room.holds(bytes, 0)) {
                     return Ok(Vec::new());
                 }
@@ -5524,7 +5553,11 @@ impl MainProcess {
     /// Starts publishing the new weights beside the ones that serve, after giving the graph storage
     /// up to them when `suspend` says so. A thread of its own: the load reads a checkpoint for
     /// minutes, and neither a scheduler nor this thread may wait for it.
-    fn load_weights(&mut self, planned: executor::data_plane::Planned, suspend: bool) -> WeightStage {
+    fn load_weights(
+        &mut self,
+        planned: executor::data_plane::Planned,
+        suspend: bool,
+    ) -> WeightStage {
         let (answer, answered) = crossbeam_channel::bounded(1);
         let data = Arc::clone(&self.data);
         let spawned = std::thread::Builder::new()
@@ -5785,8 +5818,8 @@ fn status_name(status: &ProgramStatus) -> &'static str {
 /// Writes the fence probes' device switch (`docs/profiling.md`): `{"enabled": bool, "off":
 /// [patterns]}`. A process without probes answers so.
 fn fence_switch(payload: &str) -> std::result::Result<Vec<String>, String> {
-    let payload: serde_json::Value = serde_json::from_str(payload)
-        .map_err(|error| format!("fence_switch: {error}"))?;
+    let payload: serde_json::Value =
+        serde_json::from_str(payload).map_err(|error| format!("fence_switch: {error}"))?;
     let enabled = payload["enabled"]
         .as_bool()
         .ok_or_else(|| "fence_switch states no enabled".to_owned())?;
@@ -6054,15 +6087,17 @@ fn announce(
 
 /// States to the daemon that launched this process why its start failed.
 fn state_failure(control: &mut Control, reason: &str) {
-    let sent = control.daemon_mut().send(&proto::request::wire::FromEngine {
-        kind: Some(proto::request::wire::from_engine::Kind::State(
-            proto::request::wire::State {
-                state: proto::request::wire::EngineState::Failed as i32,
-                info: None,
-                error: reason.to_owned(),
-            },
-        )),
-    });
+    let sent = control
+        .daemon_mut()
+        .send(&proto::request::wire::FromEngine {
+            kind: Some(proto::request::wire::from_engine::Kind::State(
+                proto::request::wire::State {
+                    state: proto::request::wire::EngineState::Failed as i32,
+                    info: None,
+                    error: reason.to_owned(),
+                },
+            )),
+        });
     if let Err(error) = sent {
         tracing::warn!(%error, "the daemon was not told why this process's start failed");
     }
@@ -8160,7 +8195,7 @@ fn schedulers(
     let inventory = executor::batch::Inventory {
         group: launch.group.clone(),
         ranks: vec![rank.clone()],
-        placement: executor::batch::Placement {
+        layout: executor::batch::PoolLayout {
             queue_depth: plan.queue_depth(),
             ranks: plan.world_size(),
             // Every component the rank reports is placed on the group's ranks. A text rank reports
@@ -8170,15 +8205,19 @@ fn schedulers(
                 .components
                 .iter()
                 .flat_map(|component| {
-                    engine::ExecutorGroupConfig::single_component(&component.name, plan.world_size())
+                    engine::ExecutorGroupConfig::single_component(
+                        &component.name,
+                        plan.world_size(),
+                    )
                 })
                 .collect(),
         },
         max_model_len: plan.max_kv_len(model)?,
     };
-    let mut stated = executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
-        .stating(vec![inventory])
-        .with_data_plane(Arc::clone(data));
+    let mut stated =
+        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
+            .stating(vec![inventory])
+            .with_data_plane(Arc::clone(data));
     if host_cache {
         stated = stated.keeping_host_cache(executor::batch::HostCacheKeys {
             fingerprints: vec![data.serving_identity()?; memory.cache_groups()],
@@ -8231,7 +8270,10 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
     }
     Ok(Epoch {
         generation: 0,
-        predecessor_world: spec.predecessor.as_ref().map(|predecessor| predecessor.world),
+        predecessor_world: spec
+            .predecessor
+            .as_ref()
+            .map(|predecessor| predecessor.world),
         predecessor_cache: spec
             .predecessor
             .as_ref()
@@ -8297,7 +8339,8 @@ mod tests {
                 },
             )),
         };
-        let kept: std::collections::VecDeque<_> = (1..=4).map(|at| (at, event(9, "e"), None)).collect();
+        let kept: std::collections::VecDeque<_> =
+            (1..=4).map(|at| (at, event(9, "e"), None)).collect();
 
         assert_eq!(replay_after(&kept, 0).len(), 4, "a takeover from the start");
         assert_eq!(

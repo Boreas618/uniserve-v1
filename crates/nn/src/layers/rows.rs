@@ -35,7 +35,7 @@ use crate::forward::Forward;
 /// Elements one thread block places.
 pub const BLOCK: u32 = 1024;
 
-/// Row placement over a `[rows, columns]` sequence.
+/// Row writes over a `[rows, columns]` sequence.
 #[derive(Clone, Copy)]
 pub struct Rows {
     datatype: DType,

@@ -1,10 +1,10 @@
-//! §4.4's periodic row: the mechanism asks the policy for an expert placement
+//! §4.4's periodic row: the mechanism asks the policy for an expert layout
 //! on its own interval, checks the answer, and hands it to the point that
 //! applies it.
 //!
 //! The load is the executor's to measure, so the test states it: the routed
 //! tokens per expert are published through the scheduler's handle, a step asks
-//! the policy about them, and the placement it answers is what
+//! the policy about them, and the layout it answers is what
 //! `take_expert_order` hands to the world setup (§7.6). The programs are toy
 //! policy modules written as WebAssembly text, as in the switch's tests, so the
 //! answer is whatever the test wants it to be.
@@ -181,9 +181,7 @@ fn eventually<T>(mut poll: impl FnMut() -> Option<T>) -> T {
 fn a_published_load_is_asked_about_and_the_order_reaches_the_handoff() {
     // Two experts, two ranks: placing them on opposite ranks is a legal answer
     // and the one the world setup would apply.
-    let world = World::start(ExpertOrder {
-        placement: vec![1, 0],
-    });
+    let world = World::start(ExpertOrder { layout: vec![1, 0] });
 
     // Until the executor publishes the routed tokens there is nothing to
     // decide, so no order is waiting.
@@ -194,31 +192,27 @@ fn a_published_load_is_asked_about_and_the_order_reaches_the_handoff() {
 
     world.handle.publish_expert_load(Some(load()));
 
-    // The next step asks, the answer is checked, and the placement is waiting
+    // The next step asks, the answer is checked, and the layout is waiting
     // at the handoff point.
     let order = eventually(|| world.handle.take_expert_order());
-    assert_eq!(order.placement, vec![1, 0]);
+    assert_eq!(order.layout, vec![1, 0]);
 
-    // Taken once: a placement is applied once.
+    // Taken once: a layout is applied once.
     assert!(
         world.handle.take_expert_order().is_none(),
-        "the handoff takes the placement once"
+        "the handoff takes the layout once"
     );
 }
 
 #[test]
 fn an_illegal_expert_order_fails_the_policy() {
-    // Both experts on rank 0 is not a placement: two ranks would leave one
+    // Both experts on rank 0 is not a layout: two ranks would leave one
     // holding every expert while the other idles, which `validate_experts`
     // refuses (§4.4: an illegal permutation is the policy's failure).
-    let world = World::start(ExpertOrder {
-        placement: vec![1, 0],
-    });
+    let world = World::start(ExpertOrder { layout: vec![1, 0] });
     // A policy that fails serves on under the one it replaced (§7.3), so the
     // illegal program is put in over a legal one.
-    world.replace(ExpertOrder {
-        placement: vec![0, 0],
-    });
+    world.replace(ExpertOrder { layout: vec![0, 0] });
 
     world.handle.publish_expert_load(Some(load()));
 

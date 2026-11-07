@@ -1,10 +1,10 @@
 //! The rank's cross-call tensor store over Rust-owned storage.
 //!
 //! [`ProductStore`] owns every value a call publishes for later calls on this
-//! rank or on other ranks (a *product*): its placement, its write state, its
+//! rank or on other ranks (a *product*): its dispatch, its write state, its
 //! read leases, its imports from other ranks and its exports to them.
 //!
-//! - **Placement.** A product with a scheduler buffer allocation is
+//! - **Dispatch.** A product with a scheduler buffer allocation is
 //!   *persistent*: a range of the device's [`BufferPool`] arena, which is an
 //!   exportable allocation so CUDA VMM exports stay in place. A scalar product
 //!   without one lives in a *relay entry*: one element of a per-(device, dtype,
@@ -40,7 +40,7 @@ mod write;
 pub use export::ProductExport;
 pub use product::{Metadata, ProductBuffer, ValueRange};
 pub use read::ProductRead;
-pub use write::OutputPlacement;
+pub use write::OutputDispatch;
 
 // The store's parts share their items through this module.
 use import::*;
@@ -114,7 +114,7 @@ impl State {
 impl State {
     /// Check the whole allocation group before any view is created: no
     /// output repeats or is registered already. The scheduler's buffer
-    /// placements bound persistent products; the store counts none.
+    /// dispatches bound persistent products; the store counts none.
     pub(crate) fn validate_bindings(&self, bindings: &[BufferId]) -> Result<()> {
         let mut seen = HashSet::new();
         for id in bindings {
@@ -371,7 +371,7 @@ impl ProductStore {
     /// A store of `byte_capacity` bytes of relay arenas, with features of at
     /// most `max_feature_bytes` on `devices`, `request_capacity` request slots
     /// of `relay_depth` relay entries each (both zero without relays).
-    /// Persistent products lie in `buffer_pool`, whose scheduler placements
+    /// Persistent products lie in `buffer_pool`, whose scheduler dispatches
     /// bound them.
     pub fn new(
         byte_capacity: usize,

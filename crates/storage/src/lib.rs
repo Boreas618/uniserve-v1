@@ -35,6 +35,6 @@ pub mod transport;
 
 pub use client::{Answer, Client, Error, Got, Result};
 pub use protocol::{
-    Access, Claim, GpuLedger, HostStorage, Item, Key, LedgerEntry, Listing, Mode, Placement, Role,
+    Access, Claim, GpuLedger, HostStorage, Item, Key, LedgerEntry, Listing, Location, Mode, Role,
     Scope, Segment, StorageRecord, TensorRecord,
 };

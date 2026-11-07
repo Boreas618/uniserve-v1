@@ -288,7 +288,7 @@ impl Scheduler {
             };
             let key = RequestKey::new(self.engine_id, id, state.request_epoch);
             let Some(worker) = self
-                .placement
+                .dispatch
                 .affinity
                 .get(&(key, DEFAULT_COMPONENT.to_owned()))
             else {

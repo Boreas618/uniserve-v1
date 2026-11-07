@@ -1,7 +1,7 @@
 //! Logical submissions.
 //!
 //! The scheduler builds an [`ExecutionBatch`] of calls, each paired with the
-//! [`RequestPlacement`] it chose, plus lifecycle commands, and hands it to
+//! [`RequestDispatch`] it chose, plus lifecycle commands, and hands it to
 //! `Submissions`, which describes it to the device executor or gives it to the
 //! simulated one.
 
@@ -41,16 +41,16 @@ impl RankBuffer {
     }
 }
 
-/// Physical placement selected by the scheduler for a call.
+/// Physical dispatch selected by the scheduler for a call.
 ///
 /// The call itself is the shared IPC `Call`. These fields describe
 /// its executor and allocations, which are gathered into physical batch arrays.
 #[derive(Debug, Clone, PartialEq)]
-pub struct RequestPlacement {
+pub struct RequestDispatch {
     /// Executor routing stays outside the call sent across IPC.
     pub worker: ExecutorGroupId,
     /// Executor-local request row when a replicated route owns its own address
-    /// space. Unset placements retain the admission's canonical row;
+    /// space. Unset dispatches retain the admission's canonical row;
     /// The executor applies the override to the request's `Start`.
     pub request_pool_idx: Option<u32>,
     /// Cache tables and newly acquired units used by this call.
@@ -82,8 +82,8 @@ pub struct RequestPlacement {
 pub struct ExecutionBatch {
     /// Logical batch identity used to correlate partial completions.
     pub id: u64,
-    /// Shared call kinds paired with physical placement in scheduler order.
-    pub requests: Vec<(Call, RequestPlacement)>,
+    /// Shared call kinds paired with physical dispatch in scheduler order.
+    pub requests: Vec<(Call, RequestDispatch)>,
     /// Ordered lifecycle and resource commands.
     pub commands: Vec<BatchCommand>,
     /// Published transfer descriptors supplied by an external storage owner.
@@ -149,7 +149,7 @@ impl ExecutionBatch {
     /// Constructs a logical executor submission.
     pub fn new(
         id: u64,
-        requests: Vec<(Call, RequestPlacement)>,
+        requests: Vec<(Call, RequestDispatch)>,
         commands: Vec<BatchCommand>,
         input_transfers: Vec<TensorExport>,
     ) -> Self {
@@ -180,13 +180,13 @@ impl ExecutionBatch {
     /// `requests`, then the input transfers and cache inputs no remaining call
     /// reads. The requests' `Finish` and `Free` commands stay, since they still
     /// retire physical state and reader obligations on the executors. Returns the
-    /// removed calls with the placements describing their resources. The batch
+    /// removed calls with the dispatches describing their resources. The batch
     /// may be left with neither calls nor commands; callers decide whether to
     /// discard it.
     pub(crate) fn retire_requests(
         &mut self,
         requests: &std::collections::HashSet<RequestKey>,
-    ) -> Vec<(Call, RequestPlacement)> {
+    ) -> Vec<(Call, RequestDispatch)> {
         let (retired, active): (Vec<_>, Vec<_>) = std::mem::take(&mut self.requests)
             .into_iter()
             .partition(|(call, _)| requests.contains(&call.request_key));
@@ -213,10 +213,10 @@ impl ExecutionBatch {
     }
 
     /// Validates the scheduler's own bookkeeping: call identities, execution
-    /// ownership and placement.
+    /// ownership and dispatch.
     ///
     /// Requires at least one call, command or page write; checks that call
-    /// identities are unique and belong to this batch, that each placement
+    /// identities are unique and belong to this batch, that each dispatch
     /// describes its own call, and that every `Start` is unique and names a
     /// request with a call in this batch.
     pub fn validate(&self) -> anyhow::Result<()> {
@@ -229,7 +229,7 @@ impl ExecutionBatch {
 
         let mut requests = std::collections::HashSet::with_capacity(self.requests.len());
         let mut identities = std::collections::HashSet::with_capacity(self.requests.len());
-        for (call, placement) in &self.requests {
+        for (call, dispatch) in &self.requests {
             anyhow::ensure!(
                 call.call_id.batch_id == self.id,
                 "call identity belongs to another logical batch"
@@ -237,29 +237,29 @@ impl ExecutionBatch {
             requests.insert(call.request_key);
             // `ExecutorGroupId`'s public field admits any string; only its
             // constructor checks the identifier syntax.
-            ExecutorGroupId::new(placement.worker.0.clone())?;
+            ExecutorGroupId::new(dispatch.worker.0.clone())?;
             anyhow::ensure!(!call.component.is_empty(), "call requires a component");
             anyhow::ensure!(
                 identities.insert(call.call_id),
                 "logical batch repeats a call identity"
             );
 
-            // A placement describes one call, so its forward rows may only
+            // A dispatch describes one call, so its forward rows may only
             // name local call index zero.
-            placement.forward.validate(1)?;
-            if let Some(latent) = &placement.latent {
+            dispatch.forward.validate(1)?;
+            if let Some(latent) = &dispatch.latent {
                 anyhow::ensure!(
                     (latent.request_key, latent.call_id) == (call.request_key, call.call_id),
                     "logical call carries another call's latent execution"
                 );
             }
-            if let Some(decode) = &placement.decode {
+            if let Some(decode) = &dispatch.decode {
                 anyhow::ensure!(
                     (decode.request_key, decode.call_id) == (call.request_key, call.call_id),
                     "logical call carries another call's decode execution"
                 );
             }
-            for buffer in &placement.buffers {
+            for buffer in &dispatch.buffers {
                 anyhow::ensure!(
                     call.buffer_inputs()
                         .chain(call.buffer_outputs())

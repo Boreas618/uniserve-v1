@@ -3,7 +3,7 @@
 //!
 //! A change is one of three kinds. What the main processes are built from —
 //! their executable, the parallel ranks, the deployment file, the model's
-//! files, the placement, the KV cache's options — is `BuildConfig`'s, and
+//! files, the rank layout, the KV cache's options — is `BuildConfig`'s, and
 //! the epoch layer switches to a new epoch (§7.4, [`crate::updates::switch`]).
 //! What they execute — the programs — is the program layer's, prepared
 //! against every host's Program Server before the processes switch to them
@@ -119,7 +119,7 @@ fn comparable(spec: &wire::EngineSpec) -> wire::EngineSpec {
         ..spec.clone()
     };
     // The file path is diagnostic; the resolved contents define the ranks.
-    if let Some(ranks) = comparable.placement.as_mut() {
+    if let Some(ranks) = comparable.rank_layout.as_mut() {
         ranks.worker_groups.clear();
     }
     comparable
@@ -143,7 +143,7 @@ fn devices(
 )]
 fn retain_devices(served: &wire::EngineSpec, target: &mut wire::EngineSpec) -> anyhow::Result<()> {
     if served
-        .placement
+        .rank_layout
         .as_ref()
         .is_some_and(|ranks| ranks.worker_groups_content.is_empty())
     {
@@ -161,7 +161,7 @@ fn retain_devices(served: &wire::EngineSpec, target: &mut wire::EngineSpec) -> a
             group.ranks.clone_from(&before.ranks);
         }
     }
-    target.placement.as_mut().unwrap().worker_groups_content =
+    target.rank_layout.as_mut().unwrap().worker_groups_content =
         engine::Deployment::snapshot(&destination.worker_groups)?;
     Ok(())
 }
@@ -210,7 +210,7 @@ fn assign_devices(
             rank.device = device;
         }
     }
-    target.placement.as_mut().unwrap().worker_groups_content =
+    target.rank_layout.as_mut().unwrap().worker_groups_content =
         engine::Deployment::snapshot(&config.worker_groups)?;
     Ok(())
 }
@@ -227,14 +227,14 @@ fn assign_devices(
 /// in flight compute their state again.
 fn parallel_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
     let ranks = |spec: &wire::EngineSpec| {
-        spec.placement.as_ref().map(|placement| {
+        spec.rank_layout.as_ref().map(|rank_layout| {
             (
-                placement.worker_groups_content.clone(),
-                placement.tensor_parallel_size,
-                placement.data_parallel_size,
-                placement.device.clone(),
-                placement.devices.clone(),
-                placement.worker_hosts.clone(),
+                rank_layout.worker_groups_content.clone(),
+                rank_layout.tensor_parallel_size,
+                rank_layout.data_parallel_size,
+                rank_layout.device.clone(),
+                rank_layout.devices.clone(),
+                rank_layout.worker_hosts.clone(),
             )
         })
     };
@@ -273,10 +273,7 @@ fn reloads(served: &wire::EngineSpec, target: &wire::EngineSpec) -> Vec<&'static
     if let (Some(old), Some(new)) = (&served.workers, &target.workers) {
         for (name, same) in [
             ("the dtype", old.dtype == new.dtype),
-            (
-                "the quantization",
-                old.quantization == new.quantization,
-            ),
+            ("the quantization", old.quantization == new.quantization),
             ("the load format", old.load_format == new.load_format),
             ("the weight source", old.weights == new.weights),
         ] {
@@ -320,7 +317,7 @@ fn kv_encoding_changes(served: &wire::EngineSpec, target: &wire::EngineSpec) -> 
 /// queue, cache or media configuration must not inherit a budget measured
 /// for the serving world's resources.
 fn resource_change(served: &wire::EngineSpec, target: &wire::EngineSpec) -> bool {
-    served.placement != target.placement
+    served.rank_layout != target.rank_layout
         || served.transfer != target.transfer
         || served.kv_cache != target.kv_cache
         || served.video != target.video
@@ -567,7 +564,7 @@ impl Leader {
             .write_build_config(target_epoch, &next.build_config)
             .map_err(UpdateError::Failed)?;
         // The target's spec is resolved as a deployment's start resolves it: the options state the
-        // scheduler and the placement, and the model's files complete what they determine.
+        // scheduler and the rank layout, and the model's files complete what they determine.
         let mut spec = Leader::prepare(&target, &crate::options::Stated::from_paths(Vec::new()))
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?
@@ -890,13 +887,12 @@ impl Replica {
             ..prepared_spec
         };
         let explicit_devices = target.worker_groups.is_some()
-            || (stated.contains("placement_config.device")
-                && target.placement_config.device != "cuda")
-            || !target.placement_config.devices.is_empty();
+            || (stated.contains("device_config.device") && target.device_config.device != "cuda")
+            || !target.device_config.devices.is_empty();
         if !explicit_devices
             && target.tensor_parallel_size == current.tensor_parallel_size
             && target.data_parallel_size == current.data_parallel_size
-            && target.placement_config.worker_hosts == current.placement_config.worker_hosts
+            && target.device_config.worker_hosts == current.device_config.worker_hosts
             && target_spec.host == served.host
         {
             retain_devices(&served, &mut target_spec)
@@ -994,7 +990,7 @@ impl Replica {
         // The layers above decide every change that reaches here: the epoch
         // layer owns what the main processes are built from (the executable,
         // the parallel ranks, the deployment file, the model's files, the
-        // placement and the KV cache's options, all of them `BuildConfig`),
+        // rank layout and the KV cache's options, all of them `BuildConfig`),
         // the program layer what they execute, and this one the daemon's own
         // options and the scheduling limits, in place. A change that fits
         // none of them would have needed a successor world, which this

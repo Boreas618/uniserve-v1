@@ -76,7 +76,7 @@ pub(crate) struct Launch {
     /// The probation an update must survive before the daemon commits it.
     #[serde(default)]
     pub rollback_s: Option<u64>,
-    /// The placement's queue depth for this rank's worker groups.
+    /// The rank layout's queue depth for this rank's worker groups.
     pub queue_depth: u32,
     /// The number of ranks in this process's world, of which this group's rank
     /// is one.

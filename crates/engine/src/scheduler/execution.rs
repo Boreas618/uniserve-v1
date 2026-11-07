@@ -80,7 +80,7 @@ impl Scheduler {
             let Some(batch) = self.inflight.pending_submissions.pop_front() else {
                 break;
             };
-            let targets = self.placement.batch_workers(&batch);
+            let targets = self.dispatch.batch_workers(&batch);
             let reads_held = batch.requests.iter().any(|(call, _)| {
                 call.input_buffers()
                     .any(|input| held_products.contains(&input))
@@ -384,7 +384,7 @@ impl Scheduler {
         let mut progressed = false;
         // Drop residency for requests that are no longer running or retiring.
         // A retiring request keeps its entries because
-        // `Placement::batch_workers` finds the destinations of its `Finish`
+        // `Dispatch::batch_workers` finds the destinations of its `Finish`
         // and `Free` commands through them.
         let running = &self.running;
         let running_media = &self.running_media;
@@ -394,10 +394,10 @@ impl Scheduler {
                 || running_media.contains_key(request)
                 || retiring.contains_key(request)
         };
-        self.placement
+        self.dispatch
             .affinity
             .retain(|(request, _), _| live(&request.request_id));
-        self.placement
+        self.dispatch
             .decode_affinity
             .retain(|(request, _), _| live(&request.request_id));
 
@@ -702,7 +702,7 @@ impl Scheduler {
     /// nothing. The slot is taken out of the scheduler for the calls and put
     /// back whatever they answer, so a failure can hand the mechanism's state
     /// to the switch without borrowing the scheduler the slot lives in.
-    /// How often the mechanism asks for an expert placement, in steps.
+    /// How often the mechanism asks for an expert layout, in steps.
     ///
     /// §4.4 calls the decision periodic and leaves the period to the mechanism:
     /// a fixed number of steps, not a clock, so the decision is a function of
@@ -956,8 +956,8 @@ impl Scheduler {
                 queued = self.waiting.len() + self.waiting_media.len(),
                 planned = plan.work.len() + plan.refill.len(),
                 admitted = plan.admit.len(),
-                in_flight = self.inflight.pending_batches.len()
-                    + self.inflight.pending_submissions.len(),
+                in_flight =
+                    self.inflight.pending_batches.len() + self.inflight.pending_submissions.len(),
                 "a scheduler step formed no batch"
             );
             return;
@@ -990,7 +990,11 @@ impl Scheduler {
     /// A starvation with a healthy device must never end a process without
     /// saying what was resident (§4.4), so the report is read by the failure
     /// itself and by the log line above it.
-    fn starvation_report(&self, live: &mechanism::Live<'_>, now: scheduling::guest::Nanos) -> String {
+    fn starvation_report(
+        &self,
+        live: &mechanism::Live<'_>,
+        now: scheduling::guest::Nanos,
+    ) -> String {
         let mut text = format!(
             "{} resident, {} queued, {} in flight, {} waiting to be submitted, {} of {} cache \
              units free",
@@ -1055,7 +1059,7 @@ impl Scheduler {
             room: self.room(),
             shortage: views::shortage_now(self),
             arrival: None,
-            call: views::placement(self),
+            call: views::dispatch(self),
             expert_load: views::expert_load_of(self),
         }
     }
@@ -1193,10 +1197,10 @@ impl Scheduler {
         self.expert_load = load;
     }
 
-    /// The expert placement the policy last answered, taken by the point that
+    /// The expert layout the policy last answered, taken by the point that
     /// applies it: the executor's world setup (§7.6), which commits it with
     /// `Executor::commit_experts` — the executor's own method for retaining an
-    /// expert order. Taking it once is the handoff, so a placement is applied
+    /// expert order. Taking it once is the handoff, so a layout is applied
     /// once; the mechanism keeps no second copy.
     pub(super) fn take_expert_order(&mut self) -> Option<scheduling::guest::ExpertOrder> {
         self.expert_order.take()

@@ -48,12 +48,12 @@ pub use values::{ChatTemplateContentFormatOption, ImageSize};
 const API_KEY_ENV: &str = "UNISERVE_API_KEY";
 
 /// Options that place ranks without a deployment file, refused beside one.
-const PLACEMENT_SHORTHAND: [&str; 5] = [
+const RANK_LAYOUT_SHORTHAND: [&str; 5] = [
     "tensor_parallel_size",
-    "placement_config.device",
-    "placement_config.devices",
-    "placement_config.worker_hosts",
-    "placement_config.queue_depth",
+    "device_config.device",
+    "device_config.devices",
+    "device_config.worker_hosts",
+    "device_config.queue_depth",
 ];
 
 /// The model families whose behavior some options configure, with those
@@ -230,7 +230,7 @@ pub struct ServeConfig {
     pub speculative_config: SpeculativeOptions,
     pub migration_config: MigrationOptions,
     pub update_config: UpdateOptions,
-    pub placement_config: PlacementOptions,
+    pub device_config: DeviceConfig,
     pub moe_config: MoeOptions,
     pub cuda_graph_config: CudaGraphOptions,
     pub flashinfer_config: FlashInferOptions,
@@ -278,7 +278,7 @@ impl Default for ServeConfig {
             speculative_config: SpeculativeOptions::default(),
             migration_config: MigrationOptions::default(),
             update_config: UpdateOptions::default(),
-            placement_config: PlacementOptions::default(),
+            device_config: DeviceConfig::default(),
             moe_config: MoeOptions::default(),
             cuda_graph_config: CudaGraphOptions::default(),
             flashinfer_config: FlashInferOptions::default(),
@@ -549,11 +549,11 @@ pub struct SpeculativeOptions {
     pub refill_token_cost: Option<f64>,
 }
 
-/// Rank placement without a deployment file, and product transport
-/// (`placement_config`).
+/// Rank layout without a deployment file, and product transport
+/// (`device_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct PlacementOptions {
+pub struct DeviceConfig {
     /// Device of every rank; `cuda` numbers each host's GPUs from zero.
     pub device: String,
     /// Each rank's CUDA device index on its host, in rank order; empty
@@ -572,7 +572,7 @@ pub struct PlacementOptions {
     pub transfer: Option<String>,
 }
 
-impl Default for PlacementOptions {
+impl Default for DeviceConfig {
     fn default() -> Self {
         Self {
             device: "cuda".to_owned(),
@@ -1144,7 +1144,7 @@ impl ServeConfig {
 
     /// Checks the rules the option types cannot express on their own.
     ///
-    /// `stated` records the paths the operator set, so the placement
+    /// `stated` records the paths the operator set, so the rank layout
     /// shorthand is refused beside a deployment file. Rules that need the
     /// served model's family run at startup instead
     /// ([`Stated::refuse_foreign_options`]).
@@ -1152,7 +1152,7 @@ impl ServeConfig {
     /// # Errors
     ///
     /// Fails when `model` is unset, `mem_fraction_static` lies outside
-    /// (0, 1], a placement-shorthand option is stated with `worker_groups`, the
+    /// (0, 1], a rank layout-shorthand option is stated with `worker_groups`, the
     /// server host or Unix socket path is blank, or
     /// `video_config.max_seconds` lies outside the durations the video API
     /// admits.
@@ -1264,17 +1264,17 @@ impl ServeConfig {
         }
         // The shorthand puts its ranks, in rank order, on the CUDA devices
         // the order names (the engine refuses two ranks of a host on one).
-        let devices = &self.placement_config.devices;
+        let devices = &self.device_config.devices;
         if !devices.is_empty() {
             let ranks = self.tensor_parallel_size.get() * self.data_parallel_size.get();
             anyhow::ensure!(
-                matches!(self.placement_config.device.as_str(), "cuda" | "gpu"),
-                "`placement_config.devices` orders CUDA devices: `placement_config.device` is {:?}",
-                self.placement_config.device
+                matches!(self.device_config.device.as_str(), "cuda" | "gpu"),
+                "`device_config.devices` orders CUDA devices: `device_config.device` is {:?}",
+                self.device_config.device
             );
             anyhow::ensure!(
                 devices.len() == ranks,
-                "`placement_config.devices` names {} devices for the {ranks} ranks of \
+                "`device_config.devices` names {} devices for the {ranks} ranks of \
                  `tensor_parallel_size` × `data_parallel_size`",
                 devices.len()
             );
@@ -1289,13 +1289,13 @@ impl ServeConfig {
             self.mem_fraction_static
         );
         if self.worker_groups.is_some()
-            && let Some(option) = PLACEMENT_SHORTHAND
+            && let Some(option) = RANK_LAYOUT_SHORTHAND
                 .iter()
                 .find(|option| stated.contains(option))
         {
             anyhow::bail!(
                 "`{option}` places ranks without a deployment file; the `worker_groups` file \
-                 states its own placement"
+                 states its own rank layout"
             );
         }
         let server = &self.server_config;
@@ -1367,7 +1367,7 @@ impl ServeConfig {
     /// which the leader resolves from the checkpoint.
     ///
     /// Values the options name by a word (a policy, a backend, an element
-    /// type) travel as that word, which the engine reads; the placement
+    /// type) travel as that word, which the engine reads; the rank layout
     /// travels as stated, which the engine places.
     ///
     /// # Errors
@@ -1417,7 +1417,7 @@ impl ServeConfig {
                 .as_ref()
                 .unwrap_or(&self.host_identity)
                 .clone(),
-            placement: Some(wire::Placement {
+            rank_layout: Some(wire::RankLayout {
                 worker_groups: text(&self.worker_groups),
                 worker_groups_content: self
                     .worker_groups
@@ -1434,16 +1434,16 @@ impl ServeConfig {
                     "tensor_parallel_size",
                 )?,
                 data_parallel_size: bounded(self.data_parallel_size.get(), "data_parallel_size")?,
-                device: self.placement_config.device.clone(),
-                devices: self.placement_config.devices.clone(),
+                device: self.device_config.device.clone(),
+                devices: self.device_config.devices.clone(),
                 queue_depth: bounded(
-                    self.placement_config.queue_depth.get(),
-                    "placement_config.queue_depth",
+                    self.device_config.queue_depth.get(),
+                    "device_config.queue_depth",
                 )?,
-                worker_hosts: self.placement_config.worker_hosts.clone(),
+                worker_hosts: self.device_config.worker_hosts.clone(),
                 mem_fraction_static: self.mem_fraction_static,
             }),
-            transfer: self.placement_config.transfer.clone().unwrap_or_default(),
+            transfer: self.device_config.transfer.clone().unwrap_or_default(),
             scheduling: Some(scheduling),
             kv_cache: Some(wire::KvCache {
                 max_tokens: kv_cache.max_tokens.map(NonZeroU64::get),

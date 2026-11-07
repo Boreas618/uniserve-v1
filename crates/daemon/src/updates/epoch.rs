@@ -177,7 +177,7 @@ fn record(
 }
 
 /// The nodes the epoch's main processes run on: this host at rank 0, and the
-/// placement's hosts for the other ranks.
+/// rank layout's hosts for the other ranks.
 fn nodes(config: &ServeConfig) -> Result<Vec<Node>, UpdateError> {
     let count = config.nnodes.get();
     let mut nodes = Vec::with_capacity(count as usize);
@@ -188,7 +188,7 @@ fn nodes(config: &ServeConfig) -> Result<Vec<Node>, UpdateError> {
     for rank in 1..count {
         let index = (rank - 1) as usize;
         let host = config
-            .placement_config
+            .device_config
             .worker_hosts
             .get(index)
             .ok_or_else(|| {

@@ -20,7 +20,7 @@
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use ipc::{CallStatus, ComponentConfig, ErrorCode, PhaseId, TimingCounters, MainProcessInfo};
+use ipc::{CallStatus, ComponentConfig, ErrorCode, MainProcessInfo, PhaseId, TimingCounters};
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};
@@ -899,7 +899,7 @@ pub struct Inventory {
     /// The pool's ranks in launch order, each with what it reported at handshake.
     pub ranks: Vec<MainProcessInfo>,
     /// What the deployment launched the pool with; the ranks' reports do not carry it back.
-    pub placement: Placement,
+    pub layout: PoolLayout,
     /// The longest sequence the pool's model was built for: the attention descriptor's static bound
     /// on the keys one row reads.
     pub max_model_len: u32,
@@ -907,7 +907,7 @@ pub struct Inventory {
 
 /// What a deployment launched one pool with (4.2).
 #[derive(Clone, Debug, Default)]
-pub struct Placement {
+pub struct PoolLayout {
     /// Unresolved physical batches the pool admits at once, counted as at least one.
     pub queue_depth: usize,
     /// Ranks the pool was launched with, counted as at least one.
@@ -1039,9 +1039,11 @@ impl Executors {
     ) -> Result<Submission> {
         let first = self.route(batch.phase)?;
         let mut peers = Vec::new();
-        for peer in self.executors.iter().filter(|executor| {
-            executor.serves(batch.phase) && !Arc::ptr_eq(executor, first)
-        }) {
+        for peer in self
+            .executors
+            .iter()
+            .filter(|executor| executor.serves(batch.phase) && !Arc::ptr_eq(executor, first))
+        {
             peers.push(submit(peer, batch.clone())?);
         }
         Ok(submit(first, batch)?.joined(peers))
@@ -1100,7 +1102,9 @@ impl Batches for Executors {
                     .position(|held| std::ptr::eq(held.as_ref(), executor))
                 {
                     batch.page_loads.retain(|copy| copy.rank as usize == rank);
-                    batch.page_offloads.retain(|copy| copy.rank as usize == rank);
+                    batch
+                        .page_offloads
+                        .retain(|copy| copy.rank as usize == rank);
                 }
                 executor.submit(batch)
             }),

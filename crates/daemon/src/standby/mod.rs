@@ -667,7 +667,7 @@ impl Roster {
     /// another node or replica helps. The rest of its domain is relaunched.
     ///
     /// The returned [`Action::Migrate`] names the node whose requests the
-    /// epoch layer moves; where its placement goes — another node or another
+    /// epoch layer moves; where its rank layout goes — another node or another
     /// replica — is the epoch layer's decision, and it must not leave the
     /// epoch short a node: a deployment that lost a node re-plans it, rather
     /// than serving with a domain's member missing.
@@ -696,7 +696,7 @@ impl Roster {
         }
         // The members that remain shared a world with the dead node: their
         // serving children are replaced, and the requests migrate off the
-        // node that cannot run. The epoch's placement loses the node, which
+        // node that cannot run. The epoch's rank layout loses the node, which
         // the caller decides.
         match self.relaunch_all(host, domain) {
             Some(relaunched) => actions.extend(relaunched),

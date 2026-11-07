@@ -4,7 +4,7 @@
 //! attention heads and every dense projection; expert parallelism shards the expert set, so each
 //! rank holds a subset and an exchange carries tokens to the experts that own them
 //! (specs/worker.md 4.3, 9). The partition is a *mathematical* description the layers apply; it is
-//! not a runner, a communicator or a placement, and it holds no runtime object (`AGENTS.md`, Model
+//! not a runner, a communicator or a rank layout, and it holds no runtime object (`AGENTS.md`, Model
 //! Library Boundary).
 
 use crate::{Error, Result};

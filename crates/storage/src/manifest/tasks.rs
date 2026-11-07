@@ -14,7 +14,7 @@
 
 use super::{Binding, Copy, Endpoint, Error, Gpu, Manifest, Request, Result, Side, Space, World};
 use crate::Key;
-use crate::protocol::{Placement, Region, Span};
+use crate::protocol::{Location, Region, Span};
 
 impl Manifest {
     /// The key a staging space of the manifest is retained under.
@@ -90,7 +90,7 @@ impl<'m> BoundManifest<'m> {
                 Ok((
                     Region::Tensor {
                         key: self.manifest.staging_key(staging),
-                        at: Some(Placement::Device { gpu }),
+                        at: Some(Location::Device { gpu }),
                     },
                     offset,
                     bytes.saturating_sub(offset),
@@ -125,7 +125,7 @@ impl Binding {
     /// Server. Remote regions are READ sources; targets must be local.
     pub fn region(&self, key: Key, gpu: Option<Gpu>) -> Result<Region> {
         let at = match self {
-            Self::Rank => Placement::Device {
+            Self::Rank => Location::Device {
                 gpu: gpu.ok_or_else(|| Error::Invalid("rank storage names no GPU".into()))?,
             },
             Self::Local { at } | Self::Remote { at, .. } => *at,

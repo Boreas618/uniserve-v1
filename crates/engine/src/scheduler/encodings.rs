@@ -280,7 +280,7 @@ impl Scheduler {
         // The replica the call runs on, which has no room for it now: the
         // encoding waits, as its call would.
         let Some(worker) = self
-            .placement
+            .dispatch
             .place(&self.executor, &self.info, request_key, kind)
         else {
             return false;

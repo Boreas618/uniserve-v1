@@ -15,7 +15,7 @@ impl Scheduler {
     /// latent inputs from the lengths its in-flight predecessors project,
     /// mints product identities, moves `reserved_buffers` into the request's
     /// allocations, selects the executing executor, registers the call in
-    /// flight, and appends it with its `RequestPlacement` to `batch`.
+    /// flight, and appends it with its `RequestDispatch` to `batch`.
     /// `admitted` marks a call whose batch carries the request's `Start`, so
     /// its complete cache tables are sent.
     ///
@@ -503,7 +503,7 @@ impl Scheduler {
                 self.invariant_broken("a request with latent work is admitted");
                 return None;
             };
-            let placement = LatentPlacement {
+            let dispatch = LatentDispatch {
                 page_table: allocations
                     .latent
                     .as_ref()
@@ -516,11 +516,7 @@ impl Scheduler {
                 height: state.req.image.height,
                 width: state.req.image.width,
             };
-            latent = Some(Denoising::params(
-                call.request_key,
-                call.call_id,
-                &placement,
-            ));
+            latent = Some(Denoising::params(call.request_key, call.call_id, &dispatch));
         }
 
         // Executor selection records the request's residency on that executor. A
@@ -531,7 +527,7 @@ impl Scheduler {
             return None;
         };
         let Some((worker, entry)) =
-            self.placement
+            self.dispatch
                 .select_worker(&self.executor, &self.info, &call, &choice)
         else {
             self.invariant_broken("a planned call retains an executable component");
@@ -571,7 +567,7 @@ impl Scheduler {
         );
         batch.requests.push((
             call,
-            RequestPlacement {
+            RequestDispatch {
                 worker,
                 request_pool_idx: None,
                 block_tables: call_block_tables,

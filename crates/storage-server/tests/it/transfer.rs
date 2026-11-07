@@ -822,7 +822,7 @@ pub(crate) mod device {
 
     use ::storage::Access;
     use ::storage::protocol::{
-        Event, Link, LinkEnd, Placement, Priority, Region, StorageRecord, Throttle, TransferEnd,
+        Event, Link, LinkEnd, Location, Priority, Region, StorageRecord, Throttle, TransferEnd,
     };
     use platform::{
         CopyBatch, DeviceAllocation, DeviceId, HandleType, Nvml, PinnedBuffer, ShareableHandle,
@@ -867,7 +867,7 @@ pub(crate) mod device {
 
     pub(crate) fn record(device: DeviceId, bytes: usize) -> StorageRecord {
         StorageRecord {
-            placement: Placement::Device {
+            location: Location::Device {
                 gpu: device.uuid().unwrap().0,
             },
             bytes: bytes as u64,
@@ -951,7 +951,7 @@ pub(crate) mod device {
             2,
             512,
             Binding::Local {
-                at: Placement::Host { numa_node: None },
+                at: Location::Host { numa_node: None },
             },
         );
         let device_target = storage(3, 1024, Binding::Rank);
@@ -1319,15 +1319,15 @@ pub(crate) mod device {
             assert_eq!(end_of(successor, task), (size, TransferEnd::Complete));
             read(&copy, 0, granularity)
         };
-        let placement = |head: &mut ::storage::Client| {
+        let location = |head: &mut ::storage::Client| {
             let listing = head.list().unwrap();
             let listed = listing.tensors.iter().find(|listed| listed.key == key(1));
-            listed.unwrap().placement
+            listed.unwrap().location
         };
 
         assert_eq!(head.move_weights(1, true).unwrap(), (1, size));
         assert_eq!(weights_on(&mut head, gpu), [(vec![1, 2], size)]);
-        assert!(matches!(placement(&mut head), Placement::Host { .. }));
+        assert!(matches!(location(&mut head), Location::Host { .. }));
         assert_eq!(own_weights(&mut successor), own_bytes);
 
         assert_eq!(head.move_weights(1, false).unwrap(), (1, size));
@@ -1335,7 +1335,7 @@ pub(crate) mod device {
             weights_on(&mut head, gpu),
             [(vec![1], size), (vec![1, 2], size)]
         );
-        assert_eq!(placement(&mut head), Placement::Device { gpu });
+        assert_eq!(location(&mut head), Location::Device { gpu });
         assert_eq!(own_weights(&mut successor), own_bytes);
     }
 

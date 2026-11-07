@@ -6,7 +6,7 @@ use std::sync::Arc;
 use super::{BlockTables, GroupTable};
 use crate::{Error, Result};
 
-/// Host lengths and placement of one numerical attention row.
+/// Host lengths and slot of one numerical attention row.
 pub(crate) struct AttentionRow {
     pub slot: u32,
     pub prefix: u32,

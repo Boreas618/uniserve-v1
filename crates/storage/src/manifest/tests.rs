@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::protocol::{Link, LinkEnd, Placement};
+use crate::protocol::{Link, LinkEnd, Location};
 
 use super::*;
 
@@ -519,7 +519,7 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
     let chunk = |region: &crate::protocol::Region, world: &World, gpus: &[Gpu]| {
         let crate::protocol::Region::Tensor {
             key,
-            at: Some(Placement::Device { gpu }),
+            at: Some(Location::Device { gpu }),
         } = region
         else {
             panic!("a span names a chunk at its GPU");
@@ -908,7 +908,7 @@ fn mixed_host_and_device_chunks_use_their_physical_links() {
     source = Storage::paged(source.layout, 256, &|_| Some([3; 32])).unwrap();
     let target = source.clone();
     source.chunks[0].binding = Binding::Local {
-        at: Placement::Host { numa_node: Some(0) },
+        at: Location::Host { numa_node: Some(0) },
     };
     let request = Request {
         source: world(vec![(Some(gpu(0)), vec![source])]),
@@ -957,11 +957,11 @@ fn mixed_host_and_device_chunks_use_their_physical_links() {
     assert!(spans.iter().any(|span| matches!(
         span.source,
         crate::protocol::Region::Tensor {
-            at: Some(Placement::Host { numa_node: Some(0) }),
+            at: Some(Location::Host { numa_node: Some(0) }),
             ..
         }
     )));
-    assert!(spans.iter().any(|span| matches!(span.source, crate::protocol::Region::Tensor { at: Some(Placement::Device { gpu: on }), .. } if on == gpu(0))));
+    assert!(spans.iter().any(|span| matches!(span.source, crate::protocol::Region::Tensor { at: Some(Location::Device { gpu: on }), .. } if on == gpu(0))));
 }
 
 #[test]
@@ -971,7 +971,7 @@ fn host_staging_round_trip_preserves_borrowed_region_offsets() {
     let mut host = device.clone();
     host.chunks[0].storage_offset = 512;
     host.chunks[0].binding = Binding::Local {
-        at: Placement::Host { numa_node: None },
+        at: Location::Host { numa_node: None },
     };
     for (source, target, from, into) in [
         (
@@ -1022,7 +1022,7 @@ fn host_staging_round_trip_preserves_borrowed_region_offsets() {
             matches!(
                 span.source,
                 crate::protocol::Region::Tensor {
-                    at: Some(Placement::Host { .. }),
+                    at: Some(Location::Host { .. }),
                     ..
                 }
             ),
@@ -1032,7 +1032,7 @@ fn host_staging_round_trip_preserves_borrowed_region_offsets() {
             matches!(
                 span.destination,
                 crate::protocol::Region::Tensor {
-                    at: Some(Placement::Host { .. }),
+                    at: Some(Location::Host { .. }),
                     ..
                 }
             ),
@@ -1050,7 +1050,7 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
         let mut source = page.clone();
         source.chunks[0].binding = Binding::Remote {
             endpoint: endpoint.into(),
-            at: Placement::Host { numa_node: None },
+            at: Location::Host { numa_node: None },
         };
         sources.push((None, vec![source]));
         measured.push(LinkBandwidth {
@@ -1092,7 +1092,7 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
         assert!(matches!(
             *region,
             crate::protocol::Region::Tensor {
-                at: Some(Placement::Host { .. }),
+                at: Some(Location::Host { .. }),
                 ..
             }
         ));
@@ -1109,7 +1109,7 @@ fn ranks_on_two_hosts_plan_from_the_sources_both_read() {
         for chunk in &mut storage.chunks {
             chunk.binding = Binding::Remote {
                 endpoint: "host-a:4100".into(),
-                at: Placement::Device { gpu },
+                at: Location::Device { gpu },
             };
         }
         storage
@@ -1152,7 +1152,7 @@ fn one_gpu_copy_plan_binds_to_each_submitting_host() {
     for chunk in &mut remote.ranks[0].storages[0].chunks {
         chunk.binding = Binding::Remote {
             endpoint: "source:4100".into(),
-            at: Placement::Device { gpu: gpu(0) },
+            at: Location::Device { gpu: gpu(0) },
         };
     }
     assert!(request.source.same_storage(&remote));
@@ -1278,7 +1278,7 @@ fn encoded_fields_move_in_canonical_form() {
 
 /// A tensor a listing lists: `key` at `location`, retained by `world` of
 /// deployment `model`.
-fn listed(key: Key, name: &str, location: Placement, world: u64) -> crate::protocol::ListedTensor {
+fn listed(key: Key, name: &str, location: Location, world: u64) -> crate::protocol::ListedTensor {
     let scope = crate::Scope {
         deployment: "model".into(),
         group: "model".into(),
@@ -1289,7 +1289,7 @@ fn listed(key: Key, name: &str, location: Placement, world: u64) -> crate::proto
         name: name.into(),
         scopes: vec![scope.clone()],
         retainers: vec![crate::protocol::Retainer { scope, world }],
-        placement: location,
+        location: location,
         storage_bytes: 0,
         dtype: "uint8".into(),
         shape: vec![0],
@@ -1342,8 +1342,8 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
     ]
     .into_iter()
     .collect();
-    let host = Placement::Host { numa_node: None };
-    let device = |index| Placement::Device { gpu: gpu(index) };
+    let host = Location::Host { numa_node: None };
+    let device = |index| Location::Device { gpu: gpu(index) };
     let mut tensors = vec![
         listed(Key([1; 32]), weights::NAME, host, 1),
         listed(Key([2; 32]), weights::NAME, host, 1),
@@ -1440,14 +1440,14 @@ fn unchanged_fields_of_a_packed_weight_storage_remain_transfer_sources() {
     let mut tensors = vec![listed(
         manifest_key,
         weights::NAME,
-        Placement::Host { numa_node: None },
+        Location::Host { numa_node: None },
         1,
     )];
     tensors.extend(
         packed
             .chunks
             .iter()
-            .map(|chunk| listed(chunk.key, "weights", Placement::Device { gpu: gpu(0) }, 1)),
+            .map(|chunk| listed(chunk.key, "weights", Location::Device { gpu: gpu(0) }, 1)),
     );
     let listing = crate::protocol::Listing {
         tensors,

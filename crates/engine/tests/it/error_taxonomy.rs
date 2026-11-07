@@ -104,10 +104,8 @@ impl Toy {
                 ..Limits::default()
             },
             plan: Plan::default(),
-            // A placement the previous program is recognizable by.
-            experts: ExpertOrder {
-                placement: vec![1, 0],
-            },
+            // A layout the previous program is recognizable by.
+            experts: ExpertOrder { layout: vec![1, 0] },
             observe: Observe::Answers,
             dispatch: Dispatch::Plan,
         }
@@ -342,7 +340,7 @@ impl World {
         eventually(|| self.handle.take_policy_report().recv().ok().flatten())
     }
 
-    /// The placement the serving program answers a published load with: after a
+    /// The layout the serving program answers a published load with: after a
     /// failure, the program that serves on is the one it reverted to.
     fn serving_order(&self) -> ExpertOrder {
         self.handle.publish_expert_load(Some(ExpertLoad {
@@ -400,8 +398,8 @@ fn a_trap_in_observe_fails_the_policy() {
         "the reason names the failed call: {reason}"
     );
     // The program before the trapping one answers the next decision: its
-    // placement is the one handed over, and the failed program's is not.
-    assert_eq!(world.serving_order().placement, vec![1, 0]);
+    // layout is the one handed over, and the failed program's is not.
+    assert_eq!(world.serving_order().layout, vec![1, 0]);
     assert!(
         world
             .handle
@@ -433,7 +431,7 @@ fn exhausted_fuel_in_dispatch_fails_the_policy() {
         reason.contains("fuel") && reason.contains("dispatch"),
         "the reason names the spent budget and the call it was spent in: {reason}"
     );
-    assert_eq!(world.serving_order().placement, vec![1, 0]);
+    assert_eq!(world.serving_order().layout, vec![1, 0]);
     world.no_failure();
 }
 
@@ -454,7 +452,7 @@ fn limits_over_the_build_ceiling_fail_the_policy() {
         reason.contains("limit") || reason.contains("ceiling"),
         "the reason names the limits: {reason}"
     );
-    assert_eq!(world.serving_order().placement, vec![1, 0]);
+    assert_eq!(world.serving_order().layout, vec![1, 0]);
     world.no_failure();
 }
 
@@ -505,7 +503,7 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     );
     // Nothing of the refused plan ran, and nothing of it serves: the program
     // that answers the next decision is the one that was already serving.
-    assert_eq!(world.serving_order().placement, vec![1, 0]);
+    assert_eq!(world.serving_order().layout, vec![1, 0]);
     world.no_failure();
 }
 
@@ -519,9 +517,7 @@ fn an_invalid_expert_order_fails_the_policy() {
     }));
     let reason = world
         .refuse(Toy {
-            experts: ExpertOrder {
-                placement: vec![0, 0],
-            },
+            experts: ExpertOrder { layout: vec![0, 0] },
             ..Toy::idle()
         })
         .to_lowercase();
@@ -529,7 +525,7 @@ fn an_invalid_expert_order_fails_the_policy() {
         reason.contains("expert"),
         "the reason names the order: {reason}"
     );
-    assert_eq!(world.serving_order().placement, vec![1, 0]);
+    assert_eq!(world.serving_order().layout, vec![1, 0]);
     world.no_failure();
 }
 
@@ -548,9 +544,7 @@ fn starving(admit: Vec<RequestId>, timeout: Nanos) -> Toy {
         },
         dispatch: Dispatch::PlanOnce,
         // Distinct from the previous program's, so the revert is visible.
-        experts: ExpertOrder {
-            placement: vec![0, 1],
-        },
+        experts: ExpertOrder { layout: vec![0, 1] },
         ..Toy::idle()
     }
 }
@@ -632,10 +626,7 @@ fn a_starved_request_fails_alone_while_the_epoch_serves() {
         .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))
         .expect("the starving program is instantiated before it serves");
     let terminal = eventually(|| starved.try_recv().ok().filter(|event| event.is_terminal()));
-    assert!(
-        terminal.is_terminal(),
-        "the starved request was not ended"
-    );
+    assert!(terminal.is_terminal(), "the starved request was not ended");
     // The epoch did not blame the program, and the other request is still the epoch's.
     world.no_failure();
     assert!(

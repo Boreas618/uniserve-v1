@@ -482,7 +482,7 @@ pub trait Validators {
     /// Whether every page named may be warmed.
     fn warm(&self, pages: &[PageId]) -> Result<(), PolicyError>;
 
-    /// Whether `order` is a legal placement of the experts of `load`.
+    /// Whether `order` is a legal layout of the experts of `load`.
     fn experts(&self, load: &ExpertLoad, order: &ExpertOrder) -> Result<(), PolicyError>;
 }
 
@@ -899,7 +899,7 @@ impl PolicySlot {
         cost.call(instance, |instance| instance.warm(room))
     }
 
-    /// `experts`: the placement of experts on ranks (§4.4).
+    /// `experts`: the layout of experts on ranks (§4.4).
     pub fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
         let (instance, cost) = (&mut self.instance, &mut self.cost);
         cost.call(instance, |instance| instance.experts(load))
@@ -916,7 +916,7 @@ impl PolicySlot {
     ///
     /// An answer that does not decode, a trap, fuel exhaustion, limits outside
     /// the build config, a decision that names something that does not exist or
-    /// cannot be chosen, and an expert order that is not a legal placement all
+    /// cannot be chosen, and an expert order that is not a legal layout all
     /// fail the precopy: no candidate is returned and the serving policy is
     /// untouched. `validators` are the mechanism's own, so the candidate is
     /// judged by what will judge it live.
@@ -1116,9 +1116,10 @@ impl PolicySlot {
             return Ok(());
         };
         let init = init_of(&candidate.program, state);
-        let instance = candidate
-            .module
-            .instantiate(&init.state, &init.parameters, &self.ceilings)?;
+        let instance =
+            candidate
+                .module
+                .instantiate(&init.state, &init.parameters, &self.ceilings)?;
         let replaced_program = std::mem::replace(&mut self.program, candidate.program);
         let replaced_module = std::mem::replace(&mut self.module, candidate.module);
         let replaced = std::mem::replace(&mut self.instance, instance);
@@ -1192,7 +1193,7 @@ fn init_of(program: &PolicyProgram, state: &TrialState) -> Instantiation {
 
 /// The mechanism's validation of the control thread's only decision.
 ///
-/// The route instance answers `route` alone: a plan, victims, a placement, a
+/// The route instance answers `route` alone: a plan, victims, a dispatch, a
 /// warm list and an expert order are a scheduler thread's decisions, judged
 /// there. A route decision must name a rank that is alive.
 pub struct RouteTrial;

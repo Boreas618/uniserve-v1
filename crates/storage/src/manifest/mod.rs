@@ -63,7 +63,7 @@ pub use region::Span;
 pub use tasks::{BoundManifest, Spans};
 
 use crate::Key;
-use crate::protocol::{LinkBandwidth, LinkEnd, Placement};
+use crate::protocol::{LinkBandwidth, LinkEnd, Location};
 
 /// Why a manifest cannot be computed or applied.
 #[derive(Debug, thiserror::Error)]
@@ -97,8 +97,8 @@ pub struct Chunk {
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum Binding {
     Rank,
-    Local { at: Placement },
-    Remote { endpoint: String, at: Placement },
+    Local { at: Location },
+    Remote { endpoint: String, at: Location },
 }
 
 impl Binding {
@@ -110,18 +110,18 @@ impl Binding {
                 .map(|gpu| LinkEnd::Device { gpu })
                 .ok_or_else(|| Error::Invalid("rank storage names no GPU".into())),
             Self::Local {
-                at: Placement::Host { .. },
+                at: Location::Host { .. },
             } => Ok(LinkEnd::Host),
             Self::Local {
-                at: Placement::Device { gpu },
+                at: Location::Device { gpu },
             } => Ok(LinkEnd::Device { gpu: *gpu }),
             Self::Remote {
-                at: Placement::Device { gpu },
+                at: Location::Device { gpu },
                 ..
             } => Ok(LinkEnd::Device { gpu: *gpu }),
             Self::Remote {
                 endpoint,
-                at: Placement::Host { .. },
+                at: Location::Host { .. },
             } => Ok(LinkEnd::Remote {
                 endpoint: endpoint.clone(),
                 gpu: None,
