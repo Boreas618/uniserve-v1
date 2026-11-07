@@ -375,6 +375,9 @@ pub(crate) fn columns(
 ///   asked for the largest candidate. One batch serves one variant, so a burst
 ///   that mixes greedy and sampling rows is sampled.
 ///
+/// A prefill's prompt endings choose the same way: a batch whose endings are all greedy takes no
+/// draw, because the draw is the expensive tail of the graph.
+///
 /// A verification's candidates are decode-class rows: they draw, so they are
 /// sampled too.
 pub(crate) fn batch_shape(columns: &BatchColumns) -> executor::plan::Shape {
@@ -388,10 +391,18 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> executor::plan::Shape {
         .iter()
         .any(|call| matches!(call.kind, RowKind::Prefill));
     let variant = if prefill {
-        if columns.rows.logits_rows.iter().any(|row| *row >= 0) {
-            Variant::PrefillOutput
-        } else {
+        let mut endings = columns
+            .parameters
+            .chunks_exact(SAMPLER_PARAMETERS)
+            .zip(&columns.rows.logits_rows)
+            .filter(|(_, row)| **row >= 0)
+            .peekable();
+        if endings.peek().is_none() {
             Variant::PrefillWrite
+        } else if endings.all(|(row, _)| row[TEMPERATURE_COLUMN] == 0.0) {
+            Variant::PrefillGreedy
+        } else {
+            Variant::PrefillOutput
         }
     } else if columns
         .parameters

@@ -31,6 +31,8 @@ def _logits_gather_kernel(
     row = offsets // columns
     column = offsets % columns
 
-    source = tl.load(rows_ptr + row, mask=mask, other=0).to(tl.int64)
+    # A negative index is a row that names nothing: it reads the first row, which is padding in
+    # every table gathered by a request's slot, and a hidden state's indices are never negative.
+    source = tl.maximum(tl.load(rows_ptr + row, mask=mask, other=0).to(tl.int64), 0)
     value = tl.load(hidden_ptr + source * columns + column, mask=mask)
     tl.store(out_ptr + offsets, value, mask=mask)

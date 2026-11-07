@@ -3,7 +3,7 @@
 # One module covers one descriptor of `[kernel.descriptors]` for one
 # architecture of `[kernel.architectures]`, built by `src/build.py`.
 #
-# One program normalizes and rotates every query and key head of `rows` tokens;
+# One program normalizes and rotates `rows` head rows of the query or the key;
 # the token count is a launch value and the head geometry is the descriptor's.
 # `block` is the head width the program loads in one tile, so a descriptor's
 # block must cover `head_dim`.
@@ -29,7 +29,7 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false`.
+# `dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_16_block_128_pdl_false`.
 # The operator prints `rotated` only when the rotation is narrower than the head, and `affine` only
 # for the form with no learned scale, so the fields a key holds differ by variant and each variant
 # is a key shape of its own: the full-width weighted form a text decoder compiles, the narrowed
@@ -37,21 +37,21 @@ architectures = ["sm_100a", "sm_90a"]
 # of each. `affine` has one value, because a learned scale is the form that prints no field. One
 # backend, because a deployment names a backend and not a key shape.
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["32", "24", "16", "8", "56", "64"], k_heads = ["2", "4", "8", "32", "56", "1"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["64", "128", "256"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["32", "24", "16", "8", "56", "64"], k_heads = ["2", "4", "8", "32", "56", "1"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8", "16"], block = ["64", "128", "256"], pdl = ["true", "false"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["32", "24", "16", "8", "56", "64"], k_heads = ["2", "4", "8", "32", "56", "1"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["64", "128", "256"], pdl = ["true", "false"], affine = ["false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["32", "24", "16", "8", "56", "64"], k_heads = ["2", "4", "8", "32", "56", "1"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8", "16"], block = ["64", "128", "256"], pdl = ["true", "false"], affine = ["false"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["16", "24", "28", "32", "56", "64", "8", "14"], k_heads = ["1", "2", "28", "32", "4", "56", "8", "14"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["64", "128", "256"], pdl = ["true", "false"], rotated = ["48", "64", "96", "128"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["16", "24", "28", "32", "56", "64", "8", "14"], k_heads = ["1", "2", "28", "32", "4", "56", "8", "14"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8", "16"], block = ["64", "128", "256"], pdl = ["true", "false"], rotated = ["48", "64", "96", "128"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["16", "24", "28", "32", "56", "64", "8", "14"], k_heads = ["1", "2", "28", "32", "4", "56", "8", "14"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["64", "128", "256"], pdl = ["true", "false"], affine = ["false"], rotated = ["48", "64", "96", "128"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["16", "24", "28", "32", "56", "64", "8", "14"], k_heads = ["1", "2", "28", "32", "4", "56", "8", "14"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8", "16"], block = ["64", "128", "256"], pdl = ["true", "false"], affine = ["false"], rotated = ["48", "64", "96", "128"] }
 
 # The strided form the video VAE's decoder launches: heads read through a row stride, a factor table
 # of the activation's type that repeats per tile. Named by `factors` and `strided`, and weightless:
 # the operator refuses the strided form a learned scale.
 [[kernel.descriptors]]
-dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["16", "24", "28", "32", "56", "64", "8", "14"], k_heads = ["1", "2", "28", "32", "4", "56", "8", "14"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8"], block = ["64", "128", "256"], pdl = ["true", "false"], affine = ["false"], rotated = ["48", "64", "96", "128"], factors = ["f16", "f32"], strided = ["true"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], output = ["bf16", "f16", "f32"], head_dim = ["128", "64", "256"], q_heads = ["16", "24", "28", "32", "56", "64", "8", "14"], k_heads = ["1", "2", "28", "32", "4", "56", "8", "14"], rotation = ["half", "interleaved"], epsilon = ["0x358637bd", "0x3727c5ac"], rows = ["1", "2", "4", "8", "16"], block = ["64", "128", "256"], pdl = ["true", "false"], affine = ["false"], rotated = ["48", "64", "96", "128"], factors = ["f16", "f32"], strided = ["true"] }
 
 [parameters]

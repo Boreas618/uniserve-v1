@@ -106,8 +106,9 @@ pub mod launch {
     /// Elements one `rotary_factors` program handles.
     pub const ROTARY_BLOCK: u32 = 256;
 
-    /// Tokens one `qk_norm_rope` program handles.
-    pub const QK_NORM_TOKENS: u32 = 1;
+    /// Head rows one `qk_norm_rope` program handles: a token holds one per head, so a step of few
+    /// tokens still spreads over the device.
+    pub const QK_NORM_ROWS: u32 = 16;
 
     /// The row width a row-wise kernel loads at a time: the width rounded up to a power of two.
     pub fn row_tile(columns: u32) -> u32 {
@@ -130,7 +131,7 @@ pub mod tiles {
     pub use super::activation::BLOCK as ELEMENTWISE_BLOCK;
     pub use super::bias::BLOCK as BIAS_BLOCK;
     pub use super::head::BLOCK as LOGITS_BLOCK;
-    pub use super::launch::{EMBEDDING_TOKENS, PDL, QK_NORM_TOKENS, ROTARY_BLOCK, row_tile};
+    pub use super::launch::{EMBEDDING_TOKENS, PDL, QK_NORM_ROWS, ROTARY_BLOCK, row_tile};
     pub use super::pool::BLOCK as POOL_BLOCK;
     pub use super::position::BLOCK as POSITION_BLOCK;
     pub use super::rotate::{BLOCK as ROTATE_BLOCK, ROWS as ROTATE_ROWS};
