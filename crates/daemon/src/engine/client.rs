@@ -527,6 +527,12 @@ impl EngineClient {
             .send(to_engine::Kind::Engine(wire::EngineCommand {
                 kind: Some(command(id)),
             }));
+        // The reader marks the engine closed before it drops the answers it holds, so an answer
+        // registered after that finds the mark here and no reader ever drops it.
+        if matches!(self.state(), EngineState::Closed | EngineState::Failed(_)) {
+            lock(&self.shared.answers).remove(&id);
+            return Err("the engine ended before it answered".to_owned());
+        }
         answered
             .await
             .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
@@ -1119,11 +1125,11 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             Some(from_engine::Kind::State(_)) | None => {}
         }
     }
-    // A hook or configure the lost engine did not answer fails.
-    lock(&shared.answers).clear();
     if !matches!(*shared.state.borrow(), EngineState::Failed(_)) {
         shared.state.send_replace(EngineState::Closed);
     }
+    // A hook or configure the lost engine did not answer fails.
+    lock(&shared.answers).clear();
     // Every request still in flight leaves with the lost engine as
     // migratable: the daemon submits one that resumes from its generated
     // tokens, or a video request, to the engine that serves next, and fails
