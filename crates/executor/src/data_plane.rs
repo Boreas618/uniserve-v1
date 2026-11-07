@@ -468,11 +468,22 @@ impl DataPlane {
     ///
     /// When this data plane holds no rank.
     pub fn serving_identity(&self) -> Result<String> {
-        let rank = self
+        if self.ranks.is_empty() {
+            return Err(Error::State("the data plane holds no rank"));
+        }
+        Ok(self.identity_of_ranks())
+    }
+
+    /// The identity of every rank's weights, in rank order. What a rank's pages hold follows from
+    /// all of them: an expert union's rank computes each token's experts on its peers, so a page is
+    /// another page once any rank's weights change, and every rank keys it alike.
+    fn identity_of_ranks(&self) -> String {
+        let identities: Vec<LoadedWeight> = self
             .ranks
-            .first()
-            .ok_or(Error::State("the data plane holds no rank"))?;
-        Ok(identity_of(&lock(rank).serving))
+            .iter()
+            .flat_map(|rank| lock(rank).serving.clone())
+            .collect();
+        identity_of(&identities)
     }
 
     fn planes_of(rank: &Rank) -> Option<Arc<CachePlanes>> {
@@ -705,16 +716,21 @@ impl DataPlane {
             *lock(&self.poisoned) = Some(failure.clone());
             return Err(Error::Interface(failure));
         }
-        let mut reports = Vec::with_capacity(ranks.len());
+        let mut moved_weights = Vec::with_capacity(ranks.len());
         for (rank, load) in self.ranks.iter().zip(ranks) {
             let mut rank = lock(rank);
             let identity = identity_of(&load.log);
-            let groups = Self::planes_of(&rank).map_or(0, |planes| planes.plan().groups.len());
-            let moved = load.pairs.len();
-            // The rank's pages in the host KV cache were computed from the weights this replaces,
-            // so its later pages are keyed by the new ones: a prompt no longer finds the old.
-            let page_contents = Self::page_contents(&rank, &identity);
+            moved_weights.push((identity, load.pairs.len()));
             rank.serving = load.log;
+        }
+        // The pages in the host KV cache were computed from the weights this replaces, so later
+        // pages are keyed by the new ones: a prompt no longer finds the old.
+        let contents_identity = self.identity_of_ranks();
+        let mut reports = Vec::with_capacity(moved_weights.len());
+        for (rank, (identity, moved)) in self.ranks.iter().zip(moved_weights) {
+            let rank = lock(rank);
+            let groups = Self::planes_of(&rank).map_or(0, |planes| planes.plan().groups.len());
+            let page_contents = Self::page_contents(&rank, &contents_identity);
             reports.push(
                 serde_json::json!({
                     "group": rank.storage.scope().group,
