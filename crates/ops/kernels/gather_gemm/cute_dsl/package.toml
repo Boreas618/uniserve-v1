@@ -31,7 +31,7 @@ architectures = ["sm_100a"]
 
 # `hidden_2048_intermediate_1536_experts_128_top_8_activation_silu_dtype_bf16_tile_128x128_cluster_1x1`.
 [kernel.descriptors]
-dimensions = { hidden = ["2048", "7168", "4096"], intermediate = ["1536", "768", "512"], experts = ["128", "256", "64"], top = ["8", "4", "2"], activation = ["silu", "gelu_tanh"], dtype = ["bf16"], tile = ["128x128", "256x128", "128x256", "256x256"], cluster = ["1x1", "2x1", "1x2", "2x2"] }
+dimensions = { hidden = ["2048", "7168", "4096"], intermediate = ["1536", "768", "512", "384", "192"], experts = ["128", "256", "64"], top = ["8", "4", "2"], activation = ["silu", "gelu_tanh"], dtype = ["bf16"], tile = ["128x128", "256x128", "128x256", "256x256"], cluster = ["1x1", "2x1", "1x2", "2x2"] }
 
 [parameters]
 # The representative problem the compile describes: the metadata and the output
