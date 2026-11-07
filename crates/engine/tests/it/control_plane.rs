@@ -2051,6 +2051,33 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
     let _ = jh.join();
 }
 
+/// A scheduler with no host KV cache has nothing to warm through: it names no
+/// request, so an epoch switch's warming waits for none of its requests.
+#[test]
+fn a_scheduler_without_a_host_cache_warms_nothing() {
+    let executor = Box::new(SimExecutor::new(SimEngine::new()));
+    let sched =
+        support::scheduler_with(executor, special_tokens(), SchedulerConfig::default()).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = CommandSender::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let answer = handle
+        .cache_warm(
+            storage::manifest::cache::Operation::Warmed,
+            engine::HookBarrier::new(1),
+        )
+        .recv()
+        .unwrap()
+        .unwrap();
+    let snapshot: storage::manifest::cache::Snapshot =
+        serde_json::from_str(&answer[0]).unwrap();
+    assert!(snapshot.prefixes.is_empty());
+
+    drop(handle);
+    jh.join().unwrap();
+}
+
 /// Under FCFS with a 256-token step budget and prefill chunks capped at 64
 /// tokens, a 1000-token prompt is prefilled in many chunks; it and a
 /// concurrent short request must both finish and emit text. The test observes

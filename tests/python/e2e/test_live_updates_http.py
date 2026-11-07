@@ -2179,3 +2179,341 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
                 "failed_requests": 0,
             },
         )
+
+
+def _update(base_url: str) -> dict:
+    """The update in flight or the last one, as ``GET /admin/config`` reports it."""
+    status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
+    return status.get("update") or {}
+
+
+# The span a trial's step time and throughput are averaged over.
+TRIAL_WINDOW_S = 5
+
+
+def _slower_executable(directory: Path) -> Path:
+    """An executable whose main process steps slower under the same stream.
+
+    It walks each batch operator by operator (``UNISERVE_EAGER_REPLAY``) where
+    the deployment launches a captured graph: the same tokens, later, as a
+    release that lost a fast path would serve them, with no fault to report.
+    """
+    path = directory / "uniserve-slower"
+    path.write_text(
+        "#!/bin/sh\n"
+        f'UNISERVE_EAGER_REPLAY=1 exec "{worker_executable()}" "$@"\n'
+    )
+    path.chmod(0o755)
+    return path
+
+
+def _metric(base_url: str, name: str) -> float:
+    """The sum of counter `name` over its label sets."""
+    text = httpx.get(f"{base_url}/metrics", timeout=10).text
+    return sum(
+        float(line.rsplit(" ", 1)[1])
+        for line in text.splitlines()
+        if line.startswith(name) and not line.startswith("#")
+    )
+
+
+def _start_count(base_url: str, name: str) -> tuple[threading.Thread, dict]:
+    """Starts streaming the count; returns its thread and what it reads."""
+    streamed: dict = {
+        "read": [],
+        "done": threading.Event(),
+        "errors": [],
+        "reasons": [],
+    }
+    streaming = threading.Thread(
+        target=_stream_count,
+        args=(base_url, name, streamed["read"], streamed["done"]),
+        kwargs={"reasons": streamed["reasons"], "errors": streamed["errors"]},
+    )
+    streaming.start()
+    _wait_until(
+        lambda: len(_numbers(streamed["read"])) >= 8,
+        300,
+        "the count did not stream",
+    )
+    return streaming, streamed
+
+
+def _assert_whole(streaming: threading.Thread, streamed: dict) -> int:
+    """Waits for the count's end; it lost and repeated nothing."""
+    streaming.join(timeout=1800)
+    assert streamed["done"].is_set(), "the count did not end"
+    assert not streamed["errors"], f"the count failed: {streamed['errors'][0]!r}"
+    numbers = _numbers(streamed["read"])
+    wrong = next(
+        (
+            index
+            for index, number in enumerate(numbers)
+            if number != index + 1
+        ),
+        None,
+    )
+    if wrong is not None:
+        pieces = streamed["read"]
+        text = "".join(pieces)
+        at = text.find(f"{wrong}, ")
+        pytest.fail(
+            f"the response lost or repeated a count at {wrong}: "
+            f"{text[max(at - 60, 0):at + 80]!r}, deltas "
+            f"{[piece for piece in pieces[3 * wrong - 12:3 * wrong + 12]]}"
+        )
+    assert len(streamed["reasons"]) == 1, f"the count ended {streamed['reasons']}"
+    return len(numbers)
+
+
+def _on_trial(base_url: str) -> dict:
+    """Waits until the update in flight stands on probation."""
+    _wait_until(
+        lambda: _update(base_url).get("phase") == "probation",
+        600,
+        "the update did not reach its trial",
+    )
+    return _update(base_url)
+
+
+def _artifact(case: str, evidence: dict) -> None:
+    """Writes one case's evidence under ``artifacts/update-options/``."""
+    directory = (
+        Path(__file__).resolve().parents[3] / "artifacts" / "update-options"
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{case}.json"
+    path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
+
+
+@pytest.mark.parametrize("previous_world", ["parked", "weights", "host"])
+def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
+    tmp_path: Path, runtime: Path, previous_world: str
+):
+    """A revert by hand ends the trial with no request lost.
+
+    The previous epoch is kept as ``update_config.previous_world`` states: its
+    drained processes stay alive through the trial, or they exit with its
+    weights kept, and the revert starts them again on those.
+    """
+    name = "qwen3-live-rollback"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        before = _pids(log, "Engine")
+        answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        successor = tmp_path / worker_executable().name
+        shutil.copy2(worker_executable(), successor)
+        streaming, streamed = _start_count(base_url, name)
+        result = _apply(
+            base_url,
+            f"worker_config.executable={successor}",
+            f"update_config.previous_world={previous_world}",
+        )
+        assert result["change"] == "epoch", result
+        trial = _on_trial(base_url)
+        if previous_world != "parked":
+            for pid in before:
+                _wait_until(
+                    lambda pid=pid: not _runs(pid),
+                    120,
+                    f"engine {pid} outlived the promotion",
+                )
+        else:
+            assert all(_runs(pid) for pid in before)
+        # A node that cannot move the weights keeps them on its GPUs, and says why.
+        _wait_until(
+            lambda: previous_world == "parked"
+            or _update(base_url)["moved_to_host_bytes"] > 0
+            or _update(base_url)["previous_world_kept"] == previous_world,
+            120,
+            "the previous epoch's storage was not kept",
+        )
+        trial = _update(base_url)
+        print("kept:", json.dumps(trial))
+        if not trial["host_refused"]:
+            assert trial["previous_world_kept"] == previous_world, trial
+        rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
+        assert rolled.status_code == 200, rolled.text
+        count = _assert_whole(streaming, streamed)
+        after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        assert (
+            after["choices"][0]["message"]["content"]
+            == answer["choices"][0]["message"]["content"]
+        )
+        update = _update(base_url)
+        assert update["phase"] == "abandoned", update
+        assert update["failure"]["reason"] == "the check", update
+        _artifact(
+            f"operator-rollback-{previous_world}",
+            {"numbers_across_the_switch": count, "update": update},
+        )
+
+
+def test_a_regression_of_the_epoch_on_trial_reverts_it(
+    tmp_path: Path, runtime: Path
+):
+    """A target that steps slower past the threshold reverts by itself.
+
+    The target's executable walks every batch instead of replaying a graph, so
+    the same stream steps slower on it with no fault. The stream crosses the
+    switch and the revert whole, the update ends unavailable with the
+    threshold's reason, and applying it again needs ``force``. Forced without
+    the threshold, the same slower target stands its trial: the threshold, and
+    nothing else, reverted it.
+    """
+    name = "qwen3-live-regression"
+    log = tmp_path / "server.log"
+    thresholds = (
+        "update_config.rollback.step_time_regression=0.2",
+        f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
+    )
+    with _serve(runtime, log, name) as base_url:
+        answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        slower = f"worker_config.executable={_slower_executable(tmp_path)}"
+        streaming, streamed = _start_count(base_url, name)
+        time.sleep(TRIAL_WINDOW_S + 2)
+        result = _apply(base_url, slower, *thresholds)
+        assert result["change"] == "epoch", result
+        _wait_until(
+            lambda: _update(base_url).get("phase") == "abandoned",
+            600,
+            "the slower epoch was not reverted",
+        )
+        update = _update(base_url)
+        assert update["failure"]["kind"] == "step_time_regression", update
+        print("reverted:", json.dumps(update))
+        (replica,) = update["trial"]["replicas"]
+        assert replica["baseline"]["tokens_per_second"] > 0, update
+        assert replica["rates"]["step_us"] > replica["baseline"]["step_us"], update
+        count = _assert_whole(streaming, streamed)
+        after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        assert (
+            after["choices"][0]["message"]["content"]
+            == answer["choices"][0]["message"]["content"]
+        )
+
+        again = httpx.put(
+            f"{base_url}/admin/config",
+            json={"set": [slower]},
+            timeout=1800,
+        )
+        assert again.status_code != 200, again.text
+        assert "force" in again.text, again.text
+
+        streaming, streamed = _start_count(base_url, name)
+        time.sleep(TRIAL_WINDOW_S + 2)
+        forced = httpx.put(
+            f"{base_url}/admin/config",
+            json={"set": [slower], "force": True},
+            timeout=1800,
+        )
+        assert forced.status_code == 200, forced.text
+        _on_trial(base_url)
+        time.sleep(2 * TRIAL_WINDOW_S)
+        unthresholded = _update(base_url)
+        assert unthresholded["phase"] == "probation", unthresholded
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        forced_count = _assert_whole(streaming, streamed)
+        _artifact(
+            "step-time-regression",
+            {
+                "numbers_across_the_revert": count,
+                "numbers_across_the_forced_commit": forced_count,
+                "update": update,
+                "without_the_threshold": unthresholded,
+            },
+        )
+
+
+def test_a_program_update_past_a_threshold_reverts_in_its_epoch(
+    tmp_path: Path, runtime: Path
+):
+    """A program-layer update stands the same trial as an epoch switch.
+
+    The serving epoch computes a stream before the update and a trickle after
+    it, so its token throughput falls past the threshold. The update reverts in
+    the same main process, with the threshold as its failure.
+    """
+    name = "qwen3-live-program-trial"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        streaming, streamed = _start_count(base_url, name)
+        time.sleep(TRIAL_WINDOW_S + 2)
+        result = _apply(
+            base_url,
+            "scheduler_config.max_batch=4",
+            "update_config.rollback.throughput_regression=0.5",
+            f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
+        )
+        assert result["change"] == "program", result
+        streaming.join(timeout=1800)
+        assert not streamed["errors"], streamed["errors"][0]
+
+        def reverted() -> bool:
+            _chat(base_url, name, RECOVERY_PROMPT, tokens=2)
+            time.sleep(1)
+            return bool(_update(base_url).get("failure"))
+
+        _wait_until(reverted, 120, "the update was not reverted")
+        update = _update(base_url)
+        print("reverted:", json.dumps(update))
+        assert update["failure"]["kind"] == "throughput_regression", update
+        _artifact("program-throughput-regression", {"update": update})
+
+
+@pytest.mark.xfail(
+    strict=True,
+    reason="a main process maps no host page pool, so no page reaches the host "
+    "(crates/engine/src/scheduler/submission.rs, map_host_cache)",
+)
+def test_the_requests_in_flight_warm_the_target_through_the_host_cache(
+    tmp_path: Path, runtime: Path
+):
+    """The switchover waits for the tail ``cache_tail_tokens`` states.
+
+    A request's pages reach the host KV cache as they complete, so the target's
+    admission finds all but its tail there: it computes that tail and not the
+    request. The prefix counters of the target say how much it read.
+    """
+    name = "qwen3-live-warming"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        successor = tmp_path / worker_executable().name
+        shutil.copy2(worker_executable(), successor)
+        streaming, streamed = _start_count(base_url, name)
+        _wait_until(
+            lambda: len(_numbers(streamed["read"])) >= 400,
+            300,
+            "the count did not grow",
+        )
+        hits = _metric(base_url, "uniserve:prefix_cache_host_hits")
+        result = _apply(
+            base_url,
+            f"worker_config.executable={successor}",
+            "update_config.cache_tail_tokens=64",
+            "update_config.cache_prefill_tokens=128",
+        )
+        assert result["change"] == "epoch", result
+        trial = _on_trial(base_url)
+        warming = trial["warming"]
+        print("warming:", json.dumps(warming))
+        assert warming["warmed_requests"] == 1, warming
+        assert warming["limit_tokens"] == 64, warming
+        assert warming["tail_tokens"] <= 64, warming
+        assert warming["warmed_tokens"] > 0, warming
+        time.sleep(3)
+        read = _metric(base_url, "uniserve:prefix_cache_host_hits") - hits
+        print("host hits since the switch:", read)
+        assert read >= warming["warmed_tokens"] - 64, (read, warming)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        count = _assert_whole(streaming, streamed)
+        _artifact(
+            "warming",
+            {
+                "numbers_across_the_switch": count,
+                "warming": warming,
+                "host_hit_tokens_on_the_target": read,
+            },
+        )

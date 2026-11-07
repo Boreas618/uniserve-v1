@@ -87,6 +87,8 @@ pub struct TimingStats {
     pub batch_roundtrip_us_total: AtomicU64,
     /// Number of completed batches represented by timing totals.
     pub batch_timing_count: AtomicU64,
+    /// Query tokens of the completed batches: what their forwards computed.
+    pub batch_tokens_total: AtomicU64,
     /// Number of requests with recorded admission queue latency.
     pub queue_wait_count: AtomicU64,
     /// Cumulative admission queue latency, in microseconds.
