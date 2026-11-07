@@ -2,23 +2,19 @@
 //!
 //! An executor splits its cache planes into segments of whole units
 //! (`uniserve.cache_storage` reports them), and gives back the tail from a
-//! segment on. A shrink makes room for a world that succeeds this one on the
-//! same devices: the scheduler withdraws the tail's units from allocation,
-//! revoking the cached pages they hold (whose host KV cache copies stay), and
-//! lets the requests that hold them run to their end, admitting new ones on
-//! the units left: the serving world's capacity drops, and nothing pauses.
-//! Once no request holds a withdrawn unit, the executors give the tail back.
-//! A shrink may name a bound after which the requests still holding the
-//! tail are recomputed instead (ended as migratable, and submitted again by
-//! the daemon with their generated tokens, as vLLM's recompute preemption
-//! does). A request holding the tail that cannot get a unit to continue,
-//! because the requests running hold every unit left to allocation, is
-//! recomputed at once: it could not run on to its end. Whenever every
-//! running request waits for units the others hold and nothing in flight
-//! will free any, none could end: the one of the lowest priority admitted
-//! last is recomputed, as vLLM's recompute preemption does, and its units
-//! go to the others. A restore creates the tail again, all of it or as many segments
-//! as the storage now holds. A sleep gives back every segment and the CUDA
+//! segment on. Making room for device storage beside the cache (a profiling
+//! session's) withdraws the tail's units from allocation, revoking the cached
+//! pages they hold (whose host KV cache copies stay), and lets the requests
+//! that hold them run to their end, admitting new ones on the units left: the
+//! serving world's capacity drops, and nothing pauses. Once no request holds a
+//! withdrawn unit, the executors give the tail back. A request holding the tail
+//! that cannot get a unit to continue, because the requests running hold every
+//! unit left to allocation, is recomputed at once: it could not run on to its
+//! end. Whenever every running request waits for units the others hold and
+//! nothing in flight will free any, none could end: the one of the lowest
+//! priority admitted last is recomputed, as vLLM's recompute preemption does,
+//! and its units go to the others. A growth creates as many segments of the
+//! tail as the storage now holds. A sleep gives back every segment and the CUDA
 //! graph storage once no request runs, and admits nothing until a wake
 //! restores both; it preempts video requests at their next denoising step
 //! boundary, which resume from the trajectories stored there once it wakes.
@@ -26,21 +22,18 @@
 //! rewrites the weights while the executors sleep, so that the cache's storage
 //! holds the new checkpoint as it loads.
 
-use super::ledger::{CacheStorage, Preparing, growable, preparing, room, room_refusal};
+use super::ledger::{CacheStorage, growable, room, room_refusal};
 use super::*;
 use crate::executor::ExecutorGroupId;
 use crate::handle::CacheChange;
 use crate::kv_cache::PageRef;
 
-/// A shrink, sleep or weight update that waits for the requests holding
-/// the withdrawn units to let them go (`Scheduler::resize_cache`,
+/// A change of the cache that waits for the requests holding the withdrawn
+/// units to let them go (`Scheduler::resize_cache`,
 /// `Scheduler::update_weights`).
 pub(super) struct PendingResize {
     change: Pending,
     answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
-    /// When a shrink recomputes the requests still holding withdrawn units;
-    /// `None` while it waits for them to end.
-    preempt_at: Option<std::time::Instant>,
     /// Requests holding withdrawn units that could not get the units their
     /// next call needs (`Scheduler::note_stuck_holder`): recomputed at the
     /// next poll.
@@ -49,9 +42,9 @@ pub(super) struct PendingResize {
 
 /// What a pending change does once its units are let go.
 enum Pending {
-    /// The executors give back the segments from this one on; the shrink
+    /// The executors give back the segments from this one on; the change
     /// answers with the plan of each device it made room on.
-    Shrink { from: u32, plan: Vec<String> },
+    Room { from: u32, plan: Vec<String> },
     /// The executors sleep, once no request runs.
     Sleep,
     /// The executors rewrite the weights from the checkpoint at this path,
@@ -66,16 +59,6 @@ struct StorageReports {
     beside: Vec<CacheStorage>,
 }
 
-/// The serving world's preparation for a world that succeeds it
-/// (`Scheduler::plan_preparation`).
-pub(super) struct Preparation {
-    /// The first segment every device gives back and its first unit;
-    /// `None` when each keeps all it holds.
-    tail: Option<(u32, u32)>,
-    /// Each device's plan, as JSON (`super::ledger::Preparing`).
-    plans: Vec<String>,
-}
-
 impl Pending {
     /// Whether the change waits until no request runs, admitting none.
     fn quiesces(&self) -> bool {
@@ -85,8 +68,8 @@ impl Pending {
 
 impl Scheduler {
     /// Applies `change` to the KV cache's device storage, and answers with
-    /// what each executor reported once it is done. A shrink or sleep whose
-    /// withdrawn units requests still hold answers once they let them go
+    /// what each executor reported once it is done. A change whose withdrawn
+    /// units requests still hold answers once they let them go
     /// (`Scheduler::poll_resize`).
     pub(super) fn resize_cache(
         &mut self,
@@ -97,31 +80,15 @@ impl Scheduler {
             let _ = answer.send(Err("another KV cache change is in progress".to_owned()));
             return;
         }
-        let started = match change.clone() {
-            CacheChange::Shrink { successor, .. } => {
-                self.start_shrink(&successor).map(|(from, plan)| {
-                    from.map(|from| Pending::Shrink {
-                        from,
-                        plan: plan.clone(),
-                    })
-                    .ok_or(plan)
-                })
-            }
+        let started = match change {
             CacheChange::MakeRoom { bytes, devices } => {
                 self.start_room(bytes, &devices).map(|(from, plan)| {
-                    from.map(|from| Pending::Shrink {
+                    from.map(|from| Pending::Room {
                         from,
                         plan: plan.clone(),
                     })
                     .ok_or(plan)
                 })
-            }
-            CacheChange::Plan(successor) => {
-                let _ = answer.send(
-                    self.plan_preparation(&successor)
-                        .map(|preparation| preparation.plans),
-                );
-                return;
             }
             CacheChange::Sleep => Ok(self.start_sleep().ok_or_else(Vec::new)),
             CacheChange::SleepAborting => {
@@ -130,11 +97,6 @@ impl Scheduler {
             }
             CacheChange::Hold { held } => {
                 let _ = answer.send(self.hold_batches(held));
-                return;
-            }
-            CacheChange::Evict => self.start_evict(),
-            CacheChange::Restore => {
-                let _ = answer.send(self.restore_cache(None));
                 return;
             }
             CacheChange::Grow => {
@@ -148,17 +110,9 @@ impl Scheduler {
         };
         match started {
             Ok(Ok(pending)) => {
-                let preempt_at = match change {
-                    CacheChange::Shrink {
-                        preempt_after: Some(after),
-                        ..
-                    } => Some(std::time::Instant::now() + after),
-                    _ => None,
-                };
                 self.resizing = Some(PendingResize {
                     change: pending,
                     answer,
-                    preempt_at,
                     stuck: Vec::new(),
                 });
                 self.poll_resize();
@@ -216,7 +170,6 @@ impl Scheduler {
         self.resizing = Some(PendingResize {
             change: Pending::Weights(model_path),
             answer,
-            preempt_at: None,
             stuck: Vec::new(),
         });
         self.poll_resize();
@@ -249,27 +202,9 @@ impl Scheduler {
     /// withdrawn unit, and a sleep once no request runs either: the executors
     /// give the storage back between batches.
     pub(super) fn poll_resize(&mut self) {
-        // A shrink past its bound recomputes the requests still holding the
-        // tail, once.
-        if let Some(resize) = self.resizing.as_mut()
-            && resize
-                .preempt_at
-                .is_some_and(|at| std::time::Instant::now() >= at)
-        {
-            resize.preempt_at = None;
-            let withdrawn = self
-                .storage
-                .cache()
-                .map_or(u32::MAX, |cache| cache.block_pool.withdrawn());
-            tracing::info!(
-                first = withdrawn,
-                "the shrink's bound passed: the requests holding the tail are recomputed"
-            );
-            self.migrate_holders(withdrawn);
-        }
         // A request holding the tail that could not get a unit to continue
-        // cannot run on to its end, which the shrink waits for: it is
-        // recomputed now, as the shrink's bound would recompute it.
+        // cannot run on to its end, which the change waits for: it is
+        // recomputed now.
         if let Some(resize) = self.resizing.as_mut()
             && !resize.stuck.is_empty()
         {
@@ -299,8 +234,8 @@ impl Scheduler {
             return;
         };
         // A change that fails part of the way leaves the units withdrawn and
-        // a sleeping scheduler asleep: a restore or a wake creates whatever
-        // the executors gave back.
+        // a sleeping scheduler asleep: a growth or a wake creates whatever the
+        // executors gave back.
         let result = match resize.change {
             Pending::Sleep => {
                 self.asleep = true;
@@ -310,7 +245,7 @@ impl Scheduler {
                     );
                 })
             }
-            Pending::Shrink { from, plan } => {
+            Pending::Room { from, plan } => {
                 let payload = serde_json::json!({ "from": from }).to_string();
                 self.run_hook("uniserve.release_cache", &payload).map(|_| {
                     tracing::info!(
@@ -550,103 +485,6 @@ impl Scheduler {
         Ok(Some(StorageReports { cache, beside }))
     }
 
-    /// The serving world's preparation for a world that succeeds it on the
-    /// same devices (`super::ledger::preparing`): for each executor that holds
-    /// the cache, its device's KV cache limit from the GPU's ledger, beside
-    /// everything else the deployment and the Transfer Server hold there
-    /// and what the successor adds, and the segments the cache keeps within
-    /// it. A cache of a configured token capacity also keeps no more than
-    /// leaves the successor's head room within that capacity beside the
-    /// segments it inherits, so that a world change never grows the cache
-    /// past it. Returns the first segment every device gives back with its
-    /// first unit (`None` when each keeps all it holds), and each device's
-    /// plan as JSON. The first segment, which holds the padding and warmup
-    /// units, stays, as do the segments the world inherited and does not
-    /// own yet.
-    ///
-    /// The devices of the executors that hold no cache (an expert executor's)
-    /// are planned too: their successor's graph pool and fixed part must
-    /// fit beside everything the ledger books there.
-    ///
-    /// Fails, changing nothing, when a device's limit cannot hold the
-    /// segments the cache keeps in any case: the error names every item of
-    /// every device and host.
-    pub(super) fn plan_preparation(
-        &mut self,
-        successor: &crate::Successor,
-    ) -> Result<Preparation, String> {
-        let (in_flight_units, prefixes) = self.migrating_cache();
-        let in_flight_tokens: Vec<u32> = prefixes.iter().map(|prefix| prefix.tokens).collect();
-        let partial_units = if successor.unmapped_cache {
-            0
-        } else {
-            self.partial_tail_units()
-        };
-        let Some(StorageReports {
-            cache: reports,
-            beside,
-        }) = self.storage_reports()?
-        else {
-            return Ok(Preparation {
-                tail: None,
-                plans: Vec::new(),
-            });
-        };
-        let first = &reports[0];
-        let held = first.held;
-        let floor = self.kept_floor(first);
-        let mut keep = held;
-        let mut plans: Vec<Preparing> = Vec::new();
-        for report in &reports {
-            let mut plan = preparing(report, floor, successor, in_flight_units, &in_flight_tokens)?;
-            let mut kept = plan.segments_kept;
-            // A configured capacity holds the successor's cache: the
-            // segments it inherits from this one and its head. A successor
-            // that maps none of this cache inherits none, and its own
-            // capacity sizes the cache it lays out.
-            if let Some(capacity) = report.capacity_units.filter(|_| !successor.unmapped_cache) {
-                let head_units = report.head_bytes.div_ceil(report.unit_bytes.max(1));
-                while kept > floor && u64::from(report.first_unit(kept)) + head_units > capacity {
-                    kept -= 1;
-                }
-                if u64::from(report.first_unit(kept)) + head_units > capacity {
-                    return Err(format!(
-                        "the KV cache's configured capacity of {capacity} units cannot hold a \
-                         successor world's {head_units}-unit head segment beside the cache's \
-                         first segment"
-                    ));
-                }
-            }
-            plan.segments_kept = kept;
-            plan.kv_kept = (0..kept as usize)
-                .map(|index| report.segment_bytes(index))
-                .sum();
-            plan.idle_cached_tail = self.storage.cache().map_or(0, |cache| {
-                u64::from(cache.block_pool.cached_from(report.first_unit(kept))) * report.unit_bytes
-            });
-            plan.partial_tail_kv = u64::from(partial_units) * report.unit_bytes;
-            keep = keep.min(kept);
-            plans.push(plan);
-        }
-        // An executor without a cache that keeps its storage at the Storage
-        // Server: its successor adds beside it what it holds, and the limit
-        // left (of no cache) must not be negative.
-        for report in beside.iter().filter(|report| report.ledger.is_some()) {
-            plans.push(preparing(report, 0, successor, 0, &in_flight_tokens)?);
-        }
-        if plans.iter().any(|plan| !plan.feasible) {
-            return Err(super::ledger::refusal(&plans));
-        }
-        let plans = plans
-            .iter()
-            .map(|plan| serde_json::to_string(plan).unwrap_or_default())
-            .collect();
-        Ok(Preparation {
-            tail: (keep < held).then(|| (keep, first.first_unit(keep))),
-            plans,
-        })
-    }
-
     /// The segments of a cache split as `first` reports that it cannot give
     /// back: the first, which holds the padding and warmup units, and every
     /// segment it inherited and does not own yet.
@@ -724,71 +562,6 @@ impl Scheduler {
         self.offload_idle_from(unit);
         self.withdraw_from(unit, false);
         Ok((Some(keep), plans))
-    }
-
-    /// Withdraws the tail past what each device's limit keeps
-    /// ([`Self::plan_preparation`]); the requests holding it run on.
-    /// Returns the first segment to give back, `None` when every device
-    /// keeps all its cache, and each device's plan.
-    fn start_shrink(
-        &mut self,
-        successor: &crate::Successor,
-    ) -> Result<(Option<u32>, Vec<String>), String> {
-        let Preparation { tail, plans } = self.plan_preparation(successor)?;
-        let Some((segment, unit)) = tail else {
-            return Ok((None, plans));
-        };
-        // The idle cached pages of the tail reach the host KV cache before
-        // the tail is given back (step 1 of `specs/online-operations.md`
-        // §6.5): a later prompt reads them back from there.
-        self.offload_idle_from(unit);
-        self.withdraw_from(unit, false);
-        Ok((Some(segment), plans))
-    }
-
-    /// Withdraws every segment of a parked world's cache past its first
-    /// (and past those it inherited and does not own yet), once the idle
-    /// cached pages they hold reached the host KV cache (step 5 of
-    /// `specs/online-operations.md` §6.5): its successor maps none of them
-    /// and grows into their storage, and a rollback that resumes this world
-    /// creates them again and reads the pages back from the host KV cache.
-    /// No request runs on a parked world. Answers, once the executors gave the
-    /// segments back, with what it evicted.
-    fn start_evict(&mut self) -> Result<Result<Pending, Vec<String>>, String> {
-        if !self.parks() {
-            return Err("only a parked world evicts its KV cache".to_owned());
-        }
-        let Some(reports) = self.cache_storage()? else {
-            return Ok(Err(Vec::new()));
-        };
-        let first = &reports[0];
-        let inherited = self
-            .storage
-            .cache()
-            .map_or(0..0, |cache| cache.block_pool.inherited());
-        let floor = (1..first.held)
-            .rev()
-            .find(|&index| first.first_unit(index) < inherited.end)
-            .map_or(1, |index| index + 1);
-        if floor >= first.held {
-            return Ok(Err(Vec::new()));
-        }
-        let unit = first.first_unit(floor);
-        let bytes: u64 = (floor as usize..first.held as usize)
-            .map(|index| first.segment_bytes(index))
-            .sum();
-        let pages = self.offload_idle_from(unit);
-        self.withdraw_from(unit, false);
-        let evicted = serde_json::json!({
-            "evicted_segments": first.held - floor,
-            "evicted_bytes": bytes,
-            "offloaded_pages": pages,
-        });
-        tracing::info!(%evicted, "a parked world evicts its KV cache past its first segment");
-        Ok(Ok(Pending::Shrink {
-            from: floor,
-            plan: vec![evicted.to_string()],
-        }))
     }
 
     /// Holds every idle cached page a withdrawal from `unit` evicts and has
@@ -919,8 +692,8 @@ impl Scheduler {
     }
 
     /// Notes that the running request `id` could not get the units its next
-    /// call needs, for [`Self::recompute_starved`] and, while a shrink is
-    /// pending, [`Self::note_stuck_holder`].
+    /// call needs, for [`Self::recompute_starved`] and, while the tail is
+    /// given back, [`Self::note_stuck_holder`].
     pub(super) fn note_starved(&mut self, id: RequestId) {
         if !self.starved.contains(&id) {
             self.starved.push(id);
@@ -978,16 +751,16 @@ impl Scheduler {
         self.migrate_running(MigrationCause::Drain, |id| id == victim);
     }
 
-    /// While a shrink waits for the requests holding withdrawn units to let
+    /// While a change waits for the requests holding withdrawn units to let
     /// them go, a running request that holds one and could not get the
     /// units its next call needs cannot run on: only the units left to
     /// allocation can grow it. `Self::poll_resize` recomputes it.
     pub(super) fn note_stuck_holder(&mut self, id: RequestId) {
-        let shrinking = self
+        let withdrawing = self
             .resizing
             .as_ref()
-            .is_some_and(|resize| matches!(resize.change, Pending::Shrink { .. }));
-        if !shrinking {
+            .is_some_and(|resize| matches!(resize.change, Pending::Room { .. }));
+        if !withdrawing {
             return;
         }
         let Some(first) = self
@@ -1021,9 +794,9 @@ impl Scheduler {
         self.migrate_running(MigrationCause::Drain, |id| holders.contains(&id));
     }
 
-    /// Creates the given-back segments again, the first `limit` of them or
-    /// all, and returns their units to allocation.
-    fn restore_cache(&mut self, limit: Option<u32>) -> Result<Vec<String>, String> {
+    /// Creates the first `segments` of the given-back segments again, and
+    /// returns their units to allocation.
+    fn restore_cache(&mut self, segments: u32) -> Result<Vec<String>, String> {
         if self.asleep {
             return Err("the scheduler sleeps: wake it instead".to_owned());
         }
@@ -1033,22 +806,13 @@ impl Scheduler {
         if !cache.block_pool.has_withdrawn() {
             return Ok(Vec::new());
         }
-        let payload = match limit {
-            Some(segments) => serde_json::json!({ "segments": segments }).to_string(),
-            None => String::new(),
-        };
+        let payload = serde_json::json!({ "segments": segments }).to_string();
         let results = self.run_hook("uniserve.restore_cache", &payload)?;
-        let end = match limit {
-            Some(_) => self
-                .cache_storage()?
-                .map(|reports| reports[0].first_unit(reports[0].held)),
-            None => None,
-        };
-        if let Some(cache) = self.storage.cache() {
-            match end {
-                Some(end) => cache.block_pool.restore_to(end),
-                None => cache.block_pool.restore(),
-            }
+        let end = self
+            .cache_storage()?
+            .map(|reports| reports[0].first_unit(reports[0].held));
+        if let (Some(cache), Some(end)) = (self.storage.cache(), end) {
+            cache.block_pool.restore_to(end);
         }
         tracing::info!(units = self.storage.usable_units(), "restored the KV cache");
         Ok(results)
@@ -1076,7 +840,7 @@ impl Scheduler {
             segments = fit,
             "growing the KV cache into the storage freed"
         );
-        self.restore_cache(Some(fit))
+        self.restore_cache(fit)
     }
 
     /// Restores the graph storage and the cache a sleep gave back, and admits
