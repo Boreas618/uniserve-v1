@@ -135,6 +135,8 @@ pub struct BuildConfig {
     /// The build of the main process executable this epoch runs (§7.1): a
     /// replaced executable is a new epoch even at the same configuration.
     pub executable: String,
+    /// The model's files: their weights are other keys, so only a new epoch reads them.
+    pub model: String,
     /// Longest sequence a request may reach, in tokens.
     pub max_model_len: Option<NonZeroU32>,
     /// Concurrently resident requests.
@@ -188,6 +190,7 @@ impl BuildConfig {
     pub fn of(config: &ServeConfig) -> Self {
         Self {
             executable: proto::BUILD.to_owned(),
+            model: config.model().to_owned(),
             max_model_len: config.max_model_len,
             max_running_requests: config.max_running_requests,
             mem_fraction_static: config.mem_fraction_static,
@@ -560,6 +563,8 @@ pub struct Epochs {
     /// The epoch the frontend was last told to serve (§7.4): a daemon that holds its frontend in
     /// this process follows it by moving its hold onto the target's engine.
     served: tokio::sync::watch::Sender<u64>,
+    /// The world each epoch's exclusive storage was created in, when not its own.
+    storage_worlds: Mutex<BTreeMap<u64, u64>>,
 }
 
 impl Epochs {
@@ -1100,6 +1105,21 @@ impl Epochs {
     /// Every epoch the daemon keeps, by number.
     pub fn records(&self) -> BTreeMap<u64, EpochRecord> {
         locked(&self.records).clone()
+    }
+
+    /// The world whose name keys the exclusive storage `world` executes on: its own, or, for an
+    /// epoch that took a predecessor's storage over, the world that created that storage. A
+    /// process keys a storage by its creating world (`Retained`), and a commit does not rename it.
+    pub fn storage_world(&self, world: u64) -> u64 {
+        locked(&self.storage_worlds)
+            .get(&world)
+            .copied()
+            .unwrap_or(world)
+    }
+
+    /// `world` executes on the storage `storage_world` created.
+    pub fn inherit_storage(&self, world: u64, storage_world: u64) {
+        locked(&self.storage_worlds).insert(world, storage_world);
     }
 
     /// The epoch that serves requests: the highest numbered one that is
@@ -1646,6 +1666,27 @@ mod tests {
             .hand_to("node-0", 9, &config)
             .expect_err("a daemon with no epoch hands nothing over");
         assert_eq!(failure.kind, "no_epoch");
+    }
+
+    /// Another checkpoint's weights are other keys, so only a new epoch reads them: a change of
+    /// the model's files that fell to the program layer would answer an update that moved nothing.
+    #[test]
+    fn a_change_of_the_models_files_is_an_epoch_change() {
+        let serving = Deployment::of(ServeConfig::default());
+        let mut other = ServeConfig::default();
+        other.model = Some("/models/other".to_owned());
+        assert_eq!(layer(&serving, &Deployment::of(other)), Layer::Epoch);
+    }
+
+    /// A target maps its predecessor's storage under the world that created it, and a commit does
+    /// not rename it, so the epoch after names the same creator.
+    #[test]
+    fn storage_keeps_the_world_that_created_it_across_epochs() {
+        let epochs = Epochs::new();
+        assert_eq!(epochs.storage_world(1), 1, "a first epoch's own");
+        epochs.inherit_storage(2, epochs.storage_world(1));
+        epochs.inherit_storage(3, epochs.storage_world(2));
+        assert_eq!(epochs.storage_world(3), 1);
     }
 
     /// A program-layer update in flight is the epoch's probation: the record
