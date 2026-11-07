@@ -1661,7 +1661,11 @@ impl EpochPlan {
                 let config = model.config();
                 let cache = executor::capacity::CacheGeometry {
                     layers: narrow(config.num_hidden_layers, "num_hidden_layers")?,
-                    kv_heads: narrow(config.num_key_value_heads, "num_key_value_heads")?,
+                    // A tensor rank stores the heads its attention holds.
+                    kv_heads: narrow(
+                        model.partition().local_key_value_heads(config),
+                        "num_key_value_heads",
+                    )?,
                     head_dim: narrow(config.head_dim, "head_dim")?,
                 };
                 let facts = executor::capacity::RankFacts {
