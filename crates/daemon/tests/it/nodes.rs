@@ -78,6 +78,7 @@ fn the_leader_routes_each_node_s_requests_to_its_daemon() {
             rank: 1,
             generation: 2,
             status: "exit status: 1".into(),
+            last_line: String::new(),
         }
     );
 
