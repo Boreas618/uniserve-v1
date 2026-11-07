@@ -363,7 +363,9 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
         let backing = self
             .storage
             .store(self.device, &storage_key, bytes, allocation)
-            .map_err(|error| nn::Error::Unsupported(format!("publishing weight {key}: {error}")))?;
+            .map_err(|error| {
+                nn::Error::Unsupported(format!("publishing weight {key}: {}", with_causes(&error)))
+            })?;
         self.mapped.insert(storage_key, backing);
         self.published += 1;
         Ok(backing)
@@ -387,6 +389,20 @@ impl<S: WeightStorage> RetainedWeights for WeightStore<S> {
             .writable(self.device, &retained_key(key), bytes, allocation)
             .map_err(|error| nn::Error::Unsupported(format!("allocating table {key}: {error}")))
     }
+}
+
+
+/// `error` and every error that caused it, in the order they caused one another: a refusal of the
+/// Storage Server says why under the call that met it.
+fn with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut cause = error.source();
+    while let Some(next) = cause {
+        text.push_str(": ");
+        text.push_str(&next.to_string());
+        cause = next.source();
+    }
+    text
 }
 
 #[cfg(test)]
