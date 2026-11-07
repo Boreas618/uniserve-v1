@@ -69,7 +69,7 @@ use serde_json::{Value, json};
 
 use crate::input::ServeError;
 use crate::input::media::{FetchedMedia, MediaConnector};
-use crate::options::MediaOptions;
+use crate::options::MediaConfig;
 use crate::tokenizer::DynTokenizer;
 
 use probe::{MediaProber, ProbeConfig};
@@ -178,7 +178,7 @@ pub struct PublishedMedia {
 pub struct VideoService {
     denoiser: DenoiserInfo,
     /// The media policy, which `capabilities` reports.
-    media: MediaOptions,
+    media: MediaConfig,
     connector: MediaConnector,
     prober: MediaProber,
     /// What plans and presents a request, shared with the blocking pool.
@@ -236,7 +236,7 @@ impl VideoService {
         vision: ProcessorConfig,
         max_video_seconds: f64,
         latent_encoding_units: u32,
-        media: &MediaOptions,
+        media: &MediaConfig,
         references: ReferenceConfig,
         tokenizer: DynTokenizer,
     ) -> anyhow::Result<Self> {
@@ -619,7 +619,7 @@ mod tests {
     use crate::input::ServeError;
     use crate::input::processor::pipeline_tokenizer;
     use crate::model::assets::PipelineCheckpoint;
-    use crate::options::MediaOptions;
+    use crate::options::MediaConfig;
     use crate::tokenizer::HuggingFaceTokenizer;
 
     /// The planning vectors the request rules are tested against.
@@ -766,7 +766,7 @@ mod tests {
             vision(),
             15.0,
             latent_encoding_units,
-            &MediaOptions::default(),
+            &MediaConfig::default(),
             references,
             Arc::new(character_tokenizer()),
         )

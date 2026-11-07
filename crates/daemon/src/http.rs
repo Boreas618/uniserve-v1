@@ -42,7 +42,7 @@ use crate::http::middleware::ConcurrencyLimit;
 use crate::leader::{Leader, Task};
 use crate::openai::video_jobs::VideoJobs;
 use crate::openai::{self, ApiError, chat_completions, videos};
-use crate::options::{MediaOptions, ServeConfig, ServerOptions, Stated};
+use crate::options::{MediaConfig, ServeConfig, ServerConfig, Stated};
 
 /// HTTP body limit of every route but the video submission routes, in bytes.
 pub(crate) const BODY_LIMIT: usize = 64 << 20;
@@ -52,7 +52,7 @@ pub(crate) const BODY_LIMIT: usize = 64 << 20;
 /// A `data:` URI carries its media base64 encoded, four bytes per three, so
 /// a body holding `media.max_request_bytes` of media plus the request's own
 /// fields fits; it never falls below the server-wide body limit.
-pub(crate) fn video_body_limit(media: &MediaOptions) -> usize {
+pub(crate) fn video_body_limit(media: &MediaConfig) -> usize {
     let encoded = media.max_request_bytes.div_ceil(3) * 4 + (1 << 20);
     usize::try_from(encoded)
         .unwrap_or(usize::MAX)
@@ -450,7 +450,7 @@ async fn serve_on(
 pub(crate) fn router(
     engine: Arc<Leader>,
     jobs: Arc<VideoJobs>,
-    server: &ServerOptions,
+    server: &ServerConfig,
     video_body_limit: usize,
     admin: Arc<admin::Admin>,
     restarter: Option<Arc<crate::restart::Restarter>>,
@@ -942,10 +942,10 @@ mod tests {
     async fn the_api_key_guards_every_route_but_health_and_metrics() {
         let router = router_with(
             sim_engine(ModelParameters::Qwen3),
-            &ServerOptions {
+            &ServerConfig {
                 api_key: Some("secret".to_owned()),
                 request_id_headers: true,
-                ..ServerOptions::default()
+                ..ServerConfig::default()
             },
         );
 
@@ -975,9 +975,9 @@ mod tests {
     async fn a_request_past_the_timeout_answers_504() {
         let router = router_with(
             sim_engine(ModelParameters::Qwen3),
-            &ServerOptions {
+            &ServerConfig {
                 request_timeout: Some(Duration::ZERO),
-                ..ServerOptions::default()
+                ..ServerConfig::default()
             },
         );
 
@@ -997,9 +997,9 @@ mod tests {
     async fn a_full_server_sheds_requests_until_a_stream_ends() {
         let router = router_with(
             sim_engine(ModelParameters::Qwen3),
-            &ServerOptions {
+            &ServerConfig {
                 max_concurrent_requests: NonZeroU64::new(1),
-                ..ServerOptions::default()
+                ..ServerConfig::default()
             },
         );
         let streaming = router
@@ -1059,10 +1059,10 @@ mod tests {
     /// Binds a loopback listener on an ephemeral port and returns it with
     /// its address.
     async fn loopback() -> (Listener, String) {
-        let listener = Listener::bind(&ServerOptions {
+        let listener = Listener::bind(&ServerConfig {
             host: "127.0.0.1".to_owned(),
             port: 0,
-            ..ServerOptions::default()
+            ..ServerConfig::default()
         })
         .await
         .unwrap();

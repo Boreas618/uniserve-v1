@@ -491,7 +491,7 @@ mod tests {
 
     use super::*;
     use crate::model::ModelParameters;
-    use crate::options::VideoJobOptions;
+    use crate::options::VideoJobConfig;
     use crate::test_support::{configured_tokenizer, leader_over, sim_client, sim_core, sim_model};
 
     /// A pause that ends without answering its responses — the successor gave
@@ -613,7 +613,7 @@ mod tests {
             vec![client],
         ));
         let jobs = std::sync::Arc::new(VideoJobs::new(
-            VideoJobOptions::default(),
+            VideoJobConfig::default(),
             CancellationToken::new(),
         ));
 
@@ -654,7 +654,7 @@ mod tests {
             vec![client],
         ));
         let jobs = std::sync::Arc::new(VideoJobs::new(
-            VideoJobOptions::default(),
+            VideoJobConfig::default(),
             CancellationToken::new(),
         ));
         let state = StreamHandoff {

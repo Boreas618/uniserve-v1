@@ -33,7 +33,7 @@ use super::{middleware, retire_deployment, router, video_body_limit};
 use crate::leader::Leader;
 use crate::openai::ApiError;
 use crate::openai::video_jobs::VideoJobs;
-use crate::options::{AdminOptions, ServeConfig, ServerOptions, resolve_text};
+use crate::options::{AdminConfig, ServeConfig, ServerConfig, resolve_text};
 use crate::supervision::Daemon;
 
 /// How often a deployment that is brought down checks for requests in
@@ -59,7 +59,7 @@ struct Node {
     last_error: Mutex<Option<String>>,
     /// The token that brings the current deployment down.
     current: Mutex<Option<CancellationToken>>,
-    server: ServerOptions,
+    server: ServerConfig,
     /// The host's Program Server, which a deployment that names none resolves its programs at.
     program_server: Option<std::path::PathBuf>,
 }
@@ -76,8 +76,8 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 ///
 /// Fails when the listener cannot be bound or the server fails.
 pub async fn node(
-    admin: AdminOptions,
-    server: ServerOptions,
+    admin: AdminConfig,
+    server: ServerConfig,
     program_server: Option<std::path::PathBuf>,
     shutdown: CancellationToken,
 ) -> Result<()> {

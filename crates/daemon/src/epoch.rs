@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::options::{
-    CudaGraphOptions, KvCacheOptions, LoadOptions, ServeConfig, VideoOptions, WorkerOptions,
+    CudaGraphConfig, KvCacheConfig, LoadConfig, ServeConfig, VideoConfig, WorkerConfig,
 };
 
 /// The operator names the epoch record keys its kernel programs by (§5.1,
@@ -157,21 +157,21 @@ pub struct BuildConfig {
     /// The host whose main processes serve requests.
     pub engine_host: Option<String>,
     /// How the checkpoint is read and mapped.
-    pub load: LoadOptions,
+    pub load: LoadConfig,
     /// The KV cache's layout and capacity.
-    pub kv_cache: KvCacheOptions,
+    pub kv_cache: KvCacheConfig,
     /// Whether routed experts are sharded across ranks.
     pub expert_parallel: bool,
     /// Microbatches overlapping attention with dedicated expert workers.
     pub moe_microbatches: NonZeroU32,
     /// The captured graph buckets.
-    pub cuda_graph: CudaGraphOptions,
+    pub cuda_graph: CudaGraphConfig,
     /// The worker configuration each rank runs under.
-    pub worker: WorkerOptions,
+    pub worker: WorkerConfig,
     /// The draft tokens a verification carries; zero does not speculate.
     pub num_draft_tokens: u32,
     /// The video configuration the epoch's media work takes.
-    pub video: VideoOptions,
+    pub video: VideoConfig,
     /// The components whose module instances carry fencing probes, which a
     /// graph captures.
     pub fence_components: Vec<String>,
@@ -1579,7 +1579,7 @@ mod tests {
 
     use super::*;
     use crate::engine::stand_in::Seen;
-    use crate::options::SchedulerOptions;
+    use crate::options::SchedulerConfig;
 
     /// A program of backend `backend` at revision 1 with no parameters.
     fn program(backend: &str) -> Program {
@@ -2443,10 +2443,10 @@ mod tests {
             programs.policy.arguments["max_batch"],
             toml::Value::Integer(128)
         );
-        let scheduler = SchedulerOptions {
+        let scheduler = SchedulerConfig {
             max_queued_requests: NonZeroUsize::new(16),
             chunked_prefill_size: NonZeroUsize::new(2048),
-            ..SchedulerOptions::default()
+            ..SchedulerConfig::default()
         };
         let mut stated = ServeConfig::default();
         stated.scheduler_config = scheduler;

@@ -35,7 +35,7 @@ use serde_json::{Value, json};
 
 use crate::epoch::Failure;
 use crate::observe::{Observer, Rates};
-use crate::options::RollbackOptions;
+use crate::options::RollbackConfig;
 
 /// How often a trial reads its thresholds and its switch's end: a report
 /// arrives once a second, and a revert waits for the hold to name the epoch
@@ -74,7 +74,7 @@ impl Observed {
 
 /// An update on probation, as far as its thresholds read it.
 pub(crate) struct Trial {
-    thresholds: RollbackOptions,
+    thresholds: RollbackConfig,
     observed: Vec<Observed>,
     /// When the trial began: reports and outcomes count from here.
     began: Instant,
@@ -86,7 +86,7 @@ impl Trial {
     /// A trial of `thresholds` over `observed`, beginning now with `outcomes`
     /// counted so far.
     pub(crate) fn begin(
-        thresholds: RollbackOptions,
+        thresholds: RollbackConfig,
         observed: Vec<Observed>,
         outcomes: (u64, u64),
     ) -> Self {
@@ -234,7 +234,7 @@ mod tests {
 
     /// A trial of `thresholds` whose world 2 is compared with world 1's steps
     /// of 1000 us at 100 tokens a batch, and a whole window of it already past.
-    fn trial(thresholds: RollbackOptions, observer: &Arc<Observer>) -> Trial {
+    fn trial(thresholds: RollbackConfig, observer: &Arc<Observer>) -> Trial {
         observer.record(1, 0, &stats(1_000, 100, 10_000));
         let observed = Observed::new(
             Arc::clone(observer),
@@ -248,8 +248,8 @@ mod tests {
         trial
     }
 
-    fn regressions(step: Option<f64>, throughput: Option<f64>) -> RollbackOptions {
-        RollbackOptions {
+    fn regressions(step: Option<f64>, throughput: Option<f64>) -> RollbackConfig {
+        RollbackConfig {
             step_time_regression: step,
             throughput_regression: throughput,
             window: Some(WINDOW),
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn no_threshold_decides_nothing() {
         let observer = Arc::new(Observer::default());
-        let trial = trial(RollbackOptions::default(), &observer);
+        let trial = trial(RollbackConfig::default(), &observer);
         observer.record(2, 0, &stats(9_000, 100, 10));
         assert_eq!(trial.breach((1_000, 1_000)), None);
     }
@@ -316,7 +316,7 @@ mod tests {
     #[test]
     fn failed_requests_past_the_rate_breach_it() {
         let observer = Arc::new(Observer::default());
-        let thresholds = RollbackOptions {
+        let thresholds = RollbackConfig {
             failure_rate: Some(0.25),
             ..Default::default()
         };
@@ -337,7 +337,7 @@ mod tests {
     #[tokio::test]
     async fn the_watch_reverts_once_and_ends_with_its_update() {
         let observer = Arc::new(Observer::default());
-        let thresholds = RollbackOptions {
+        let thresholds = RollbackConfig {
             failure_rate: Some(0.5),
             ..Default::default()
         };
@@ -373,7 +373,7 @@ mod tests {
     fn a_window_decides_only_once_it_passed() {
         let observer = Arc::new(Observer::default());
         observer.record(1, 0, &stats(1_000, 100, 10_000));
-        let thresholds = RollbackOptions {
+        let thresholds = RollbackConfig {
             step_time_regression: Some(0.1),
             window: Some(Duration::from_secs(3600)),
             ..Default::default()

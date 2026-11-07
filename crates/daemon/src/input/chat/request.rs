@@ -358,7 +358,7 @@ pub enum ReasoningEffort {
 ///
 /// The options are exposed to prompt templates before tokenization.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct ChatOptions {
+pub struct ChatConfig {
     /// Controls whether rendering starts a new assistant turn, continues the
     /// final assistant message, or emits no trailing generation prompt at
     /// all.
@@ -370,12 +370,12 @@ pub struct ChatOptions {
     /// The request's own template variables, such as `enable_thinking`. They
     /// replace the server's default template kwargs of the same name, and
     /// never name a variable the renderer sets itself
-    /// ([`ChatOptions::RESERVED_TEMPLATE_KWARGS`]).
+    /// ([`ChatConfig::RESERVED_TEMPLATE_KWARGS`]).
     #[serde(default)]
     pub template_kwargs: std::collections::HashMap<String, serde_json::Value>,
 }
 
-impl Default for ChatOptions {
+impl Default for ChatConfig {
     /// Returns the default value.
     fn default() -> Self {
         Self {
@@ -386,7 +386,7 @@ impl Default for ChatOptions {
     }
 }
 
-impl ChatOptions {
+impl ChatConfig {
     /// Template variables the renderer sets from the request itself, which
     /// request template kwargs cannot replace.
     pub const RESERVED_TEMPLATE_KWARGS: [&'static str; 5] = [
@@ -441,7 +441,7 @@ pub struct ChatRequest {
     /// Ordered chat history to render.
     pub messages: Vec<ChatMessage>,
     /// Chat-specific rendering options.
-    pub chat_options: ChatOptions,
+    pub chat_options: ChatConfig,
     /// Function tools made available to the model for this request.
     pub tools: Vec<Tool>,
     /// Tool-choice behavior for this request.
@@ -453,7 +453,7 @@ impl ChatRequest {
     pub fn for_test() -> Self {
         Self {
             messages: vec![ChatMessage::text(ChatRole::User, "test")],
-            chat_options: ChatOptions::default(),
+            chat_options: ChatConfig::default(),
             tools: Vec::new(),
             tool_choice: ChatToolChoice::None,
         }

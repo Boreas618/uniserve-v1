@@ -23,10 +23,9 @@ use std::time::Duration;
 
 use serde::de::{self, DeserializeOwned, IntoDeserializer, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_with::{DeserializeFromStr, SerializeDisplay};
 
 /// Parses a duration: whole seconds or a value with units.
-pub(super) fn parse_duration(text: &str) -> Result<Duration, String> {
+pub fn parse_duration(text: &str) -> Result<Duration, String> {
     let text = text.trim();
     if let Ok(seconds) = text.parse::<u64>() {
         return Ok(Duration::from_secs(seconds));
@@ -39,7 +38,7 @@ pub(super) fn parse_duration(text: &str) -> Result<Duration, String> {
 /// Parses a positive byte size: whole bytes or an integer with a decimal
 /// (`kB`, `MB`, `GB`, `TB`) or binary (`KiB`, `MiB`, `GiB`, `TiB`) unit,
 /// case-insensitively.
-pub(super) fn parse_bytes(text: &str) -> Result<u64, String> {
+pub fn parse_bytes(text: &str) -> Result<u64, String> {
     let text = text.trim();
     let split = text
         .find(|character: char| !character.is_ascii_digit())
@@ -107,21 +106,16 @@ enum NumberOrText {
 }
 
 /// The serde form of a [`Duration`].
-pub(super) mod duration {
+pub mod duration {
     use super::*;
 
-    pub(in crate::options) fn serialize<S: Serializer>(
-        value: &Duration,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(value: &Duration, serializer: S) -> Result<S::Ok, S::Error> {
         humantime::format_duration(*value)
             .to_string()
             .serialize(serializer)
     }
 
-    pub(in crate::options) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<Duration, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Duration, D::Error> {
         match NumberOrText::deserialize(deserializer)? {
             NumberOrText::Number(seconds) => Ok(Duration::from_secs(seconds)),
             NumberOrText::Text(text) => parse_duration(&text).map_err(de::Error::custom),
@@ -130,10 +124,10 @@ pub(super) mod duration {
 }
 
 /// The serde form of an optional [`Duration`].
-pub(super) mod optional_duration {
+pub mod optional_duration {
     use super::*;
 
-    pub(in crate::options) fn serialize<S: Serializer>(
+    pub fn serialize<S: Serializer>(
         value: &Option<Duration>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
@@ -142,7 +136,7 @@ pub(super) mod optional_duration {
             .serialize(serializer)
     }
 
-    pub(in crate::options) fn deserialize<'de, D: Deserializer<'de>>(
+    pub fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
     ) -> Result<Option<Duration>, D::Error> {
         duration::deserialize(deserializer).map(Some)
@@ -150,19 +144,14 @@ pub(super) mod optional_duration {
 }
 
 /// The serde form of a positive byte size.
-pub(super) mod bytes {
+pub mod bytes {
     use super::*;
 
-    pub(in crate::options) fn serialize<S: Serializer>(
-        value: &u64,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(value: &u64, serializer: S) -> Result<S::Ok, S::Error> {
         serialize_bytes(*value, serializer)
     }
 
-    pub(in crate::options) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<u64, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
         match NumberOrText::deserialize(deserializer)? {
             NumberOrText::Number(0) => Err(de::Error::custom("a byte size must be positive")),
             NumberOrText::Number(bytes) => Ok(bytes),
@@ -172,19 +161,14 @@ pub(super) mod bytes {
 }
 
 /// The serde form of a positive byte size held as a `usize`.
-pub(super) mod byte_count {
+pub mod byte_count {
     use super::*;
 
-    pub(in crate::options) fn serialize<S: Serializer>(
-        value: &usize,
-        serializer: S,
-    ) -> Result<S::Ok, S::Error> {
+    pub fn serialize<S: Serializer>(value: &usize, serializer: S) -> Result<S::Ok, S::Error> {
         serialize_bytes(*value as u64, serializer)
     }
 
-    pub(in crate::options) fn deserialize<'de, D: Deserializer<'de>>(
-        deserializer: D,
-    ) -> Result<usize, D::Error> {
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<usize, D::Error> {
         let bytes = bytes::deserialize(deserializer)?;
         usize::try_from(bytes).map_err(|_| {
             de::Error::custom(format!(
@@ -237,10 +221,10 @@ where
 }
 
 /// The serde form of a list.
-pub(super) mod list {
+pub mod list {
     use super::*;
 
-    pub(in crate::options) fn deserialize<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
     where
         D: Deserializer<'de>,
         T: DeserializeOwned + FromStr,
@@ -251,7 +235,7 @@ pub(super) mod list {
 }
 
 /// The serde form of an optional list.
-pub(super) mod optional_list {
+pub mod optional_list {
     use super::*;
 
     /// Reads an optional list from every form [`ListVisitor`] takes, and from
@@ -305,9 +289,7 @@ pub(super) mod optional_list {
         }
     }
 
-    pub(in crate::options) fn deserialize<'de, D, T>(
-        deserializer: D,
-    ) -> Result<Option<Vec<T>>, D::Error>
+    pub fn deserialize<'de, D, T>(deserializer: D) -> Result<Option<Vec<T>>, D::Error>
     where
         D: Deserializer<'de>,
         T: DeserializeOwned + FromStr,
@@ -428,62 +410,5 @@ mod tests {
         );
         assert!(lists("sizes = \"1024,0\"\nshapes = []").is_err());
         assert!(lists("sizes = []\nshapes = \"1152\"").is_err());
-    }
-}
-
-/// Configurable chat-template content format selection.
-///
-/// `FromStr` accepts the `*_LITERAL` constants case-insensitively.
-/// `ChatTemplateContentFormat::Preserve` has no option; only `Auto` detection
-/// selects it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, DeserializeFromStr, SerializeDisplay)]
-pub enum ChatTemplateContentFormatOption {
-    /// Detect the format from the template source.
-    #[default]
-    Auto,
-    /// Always flatten content into plain strings before rendering.
-    String,
-    /// Always pass content through in OpenAI-compatible structured form.
-    OpenAi,
-}
-
-impl ChatTemplateContentFormatOption {
-    /// Configuration literal for automatic content-shape detection.
-    pub const AUTO_LITERAL: &str = "auto";
-    /// Configuration literal for structured OpenAI content parts.
-    pub const OPENAI_LITERAL: &str = "openai";
-    /// Configuration literal for flattened string content.
-    pub const STRING_LITERAL: &str = "string";
-}
-
-impl FromStr for ChatTemplateContentFormatOption {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.eq_ignore_ascii_case(Self::AUTO_LITERAL) {
-            Ok(Self::Auto)
-        } else if value.eq_ignore_ascii_case(Self::STRING_LITERAL) {
-            Ok(Self::String)
-        } else if value.eq_ignore_ascii_case(Self::OPENAI_LITERAL) {
-            Ok(Self::OpenAi)
-        } else {
-            Err(format!(
-                "invalid content format `{value}`; expected one of: {}, {}, {}",
-                Self::AUTO_LITERAL,
-                Self::STRING_LITERAL,
-                Self::OPENAI_LITERAL
-            ))
-        }
-    }
-}
-
-impl fmt::Display for ChatTemplateContentFormatOption {
-    /// Writes the lowercase configuration literal.
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Auto => f.write_str(Self::AUTO_LITERAL),
-            Self::String => f.write_str(Self::STRING_LITERAL),
-            Self::OpenAi => f.write_str(Self::OPENAI_LITERAL),
-        }
     }
 }

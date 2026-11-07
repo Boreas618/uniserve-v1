@@ -285,19 +285,38 @@ impl ServeArgs {
     }
 }
 
+/// A TOML tree of options as `T`, refusing a key no option takes.
+///
+/// The configuration sections do not refuse unknown fields themselves: the same types travel to
+/// the frontend and the engine processes, which may be of another build than this daemon
+/// (`proto::config`). The file is where a key nothing reads is a mistake, so it is refused here,
+/// by its path.
+fn deserialize_options<T: serde::de::DeserializeOwned>(tree: Table) -> anyhow::Result<T> {
+    let mut unknown = Vec::new();
+    let mut record = |path: serde_ignored::Path<'_>| unknown.push(path.to_string());
+    let parsed: Result<T, _> = serde_path_to_error::deserialize(serde_ignored::Deserializer::new(
+        Value::Table(tree),
+        &mut record,
+    ));
+    let parsed = parsed.map_err(|error| {
+        let path = error.path().to_string();
+        let cause = error.into_inner();
+        if path == "." {
+            anyhow!("invalid configuration: {cause}")
+        } else {
+            anyhow!("invalid option `{path}`: {cause}")
+        }
+    })?;
+    if let Some(path) = unknown.first() {
+        return Err(anyhow!("unknown option `{path}`: no option takes it"));
+    }
+    Ok(parsed)
+}
+
 /// The configuration of a TOML tree of options, with the paths it states.
 fn configured(tree: Table) -> anyhow::Result<(ServeConfig, Stated)> {
     let stated = Stated::of(&tree);
-    let mut config: ServeConfig =
-        serde_path_to_error::deserialize(Value::Table(tree)).map_err(|error| {
-            let path = error.path().to_string();
-            let cause = error.into_inner();
-            if path == "." {
-                anyhow!("invalid configuration: {cause}")
-            } else {
-                anyhow!("invalid option `{path}`: {cause}")
-            }
-        })?;
+    let mut config: ServeConfig = deserialize_options(tree)?;
     // A retired option's name is refused here, with the configuration, rather
     // than left unknown: an unknown field names the mistake but not the way
     // out, and a table nothing reads would be silent. The field that parses it
@@ -381,11 +400,7 @@ pub fn overridden(
         paths.push(path.join("."));
         set(&mut tree, &path, value)?;
     }
-    let mut overridden: ServeConfig = serde_path_to_error::deserialize(Value::Table(tree))
-        .map_err(|error| {
-            let path = error.path().to_string();
-            anyhow!("invalid option `{path}`: {}", error.into_inner())
-        })?;
+    let mut overridden: ServeConfig = deserialize_options(tree)?;
     overridden.server_config.api_key = config.server_config.api_key.clone();
     Ok((overridden, paths))
 }

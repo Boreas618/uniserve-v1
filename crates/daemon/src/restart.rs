@@ -338,7 +338,7 @@ impl Restarter {
         // The listener binds the daemon's own address (`admin_config`): a
         // change of it is the rebind this successor makes before the
         // handover, and the previous daemon keeps serving if the bind fails.
-        let address = |admin: &crate::options::AdminOptions| {
+        let address = |admin: &crate::options::AdminConfig| {
             (admin.host.clone(), admin.port, admin.uds.clone())
         };
         let rebind = address(&options.admin_config) != address(&handoff[0].config.admin_config);

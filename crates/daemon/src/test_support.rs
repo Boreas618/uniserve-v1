@@ -31,9 +31,7 @@ use crate::leader::Leader;
 use crate::model::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::openai::video_jobs::VideoJobs;
 use crate::options::ChatTemplateContentFormatOption;
-use crate::options::{
-    ImageFetchOptions, LoggingOptions, ServeConfig, ServerOptions, VideoJobOptions,
-};
+use crate::options::{ImageFetchConfig, LoggingConfig, ServeConfig, ServerConfig, VideoJobConfig};
 use crate::tokenizer::DynTokenizer;
 
 /// Served model name the simulated engines answer to.
@@ -45,13 +43,13 @@ pub(crate) use frontend::test_support::{configured_tokenizer, load_tokenizer};
 
 /// The server's router over `engine` under the default server options.
 pub(crate) fn router(engine: Leader) -> Router {
-    router_with(engine, &ServerOptions::default())
+    router_with(engine, &ServerConfig::default())
 }
 
 /// The daemon's router over `engine` under `server`, with the HTTP body limit
 /// for the video submission routes and default video job options.
-pub(crate) fn router_with(engine: Leader, server: &ServerOptions) -> Router {
-    let jobs = VideoJobs::new(VideoJobOptions::default(), CancellationToken::new());
+pub(crate) fn router_with(engine: Leader, server: &ServerConfig) -> Router {
+    let jobs = VideoJobs::new(VideoJobConfig::default(), CancellationToken::new());
     crate::http::router(
         Arc::new(engine),
         Arc::new(jobs),
@@ -277,9 +275,9 @@ pub(crate) fn leader_over(
         false,
     )
     .unwrap();
-    let images = MediaConnector::from_image_options(&ImageFetchOptions::default()).unwrap();
+    let images = MediaConnector::from_image_options(&ImageFetchConfig::default()).unwrap();
     let options = ServeConfig {
-        logging_config: LoggingOptions {
+        logging_config: LoggingConfig {
             log_requests: false,
             log_stats: false,
         },
@@ -336,7 +334,7 @@ pub(crate) fn sim_video_service(max_video_seconds: f64) -> VideoService {
         },
         max_video_seconds,
         1,
-        &crate::options::MediaOptions::default(),
+        &crate::options::MediaConfig::default(),
         // A text-to-video denoiser takes no references to size.
         models::video::plan::ReferenceConfig::new(&models::video::ReferenceLimits::default()),
         configured_tokenizer(),

@@ -931,6 +931,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde-json-fmt",
+ "serde_ignored",
  "serde_json",
  "serde_path_to_error",
  "serde_with",
@@ -3178,6 +3179,7 @@ name = "proto"
 version = "2.0.0"
 dependencies = [
  "bitflags",
+ "humantime",
  "libc",
  "prost",
  "prost-build",
@@ -3185,8 +3187,10 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "serde_with",
  "sha2",
  "thiserror",
+ "toml",
 ]
 
 [[package]]
@@ -3824,6 +3828,16 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.118",
+]
+
+[[package]]
+name = "serde_ignored"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "115dffd5f3853e06e746965a20dcbae6ee747ae30b543d91b0e089668bb07798"
+dependencies = [
+ "serde",
+ "serde_core",
 ]
 
 [[package]]

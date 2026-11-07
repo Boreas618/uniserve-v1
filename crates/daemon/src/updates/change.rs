@@ -127,7 +127,7 @@ pub(crate) fn resolve(
     (
         ServeConfig,
         crate::options::Stated,
-        crate::options::UpdateOptions,
+        crate::options::UpdateConfig,
     ),
     UpdateError,
 > {
