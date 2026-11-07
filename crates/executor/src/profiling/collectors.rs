@@ -182,6 +182,11 @@ fn join_timeline(device: DeviceId, graphs: GraphTrace, rows: &Rows) -> platform:
         GraphTrace::Whole => timeline::GraphTrace::Whole,
         GraphTrace::Nodes => timeline::GraphTrace::Nodes,
     };
+    // A timeline of a graph's nodes needs the counters' whole-graph record out of the way.
+    let by_default = super::graphs_whole_by_default();
+    if graphs == GraphTrace::Nodes && by_default {
+        platform::cupti::activity::hold_graph_trace(false)?;
+    }
     let sink: timeline::Sink = Arc::new(deliver);
     match Timeline::start(traced, sink) {
         Ok(started) => {
@@ -194,6 +199,9 @@ fn join_timeline(device: DeviceId, graphs: GraphTrace, rows: &Rows) -> platform:
         }
         Err(error) => {
             crate::lock(&TIMELINE_RANKS).remove(&ordinal);
+            if by_default {
+                platform::cupti::activity::hold_graph_trace(true)?;
+            }
             Err(error)
         }
     }
@@ -215,7 +223,13 @@ fn leave_timeline(device: DeviceId) {
         timeline::flush();
     } else if let Some(running) = shared.running.take() {
         drop(running);
-        super::set_graph_trace(false);
+        let by_default = super::graphs_whole_by_default();
+        if by_default
+            && let Err(error) = platform::cupti::activity::hold_graph_trace(true)
+        {
+            tracing::warn!("the counters' whole-graph record did not resume: {error}");
+        }
+        super::set_graph_trace(by_default);
         shared.graphs = None;
         if let Some(before) = shared.nvtx_before.take() {
             super::ranges::set_enabled(before);

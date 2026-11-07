@@ -110,9 +110,10 @@ pub struct Counters {
 }
 
 impl Counters {
-    /// Start the counters, recording the device time of `streams` by name (`device`, `copy`); `None`
-    /// when the process is not subscribed.
-    pub fn start(streams: &[(&'static str, Stream)]) -> Option<Self> {
+    /// Start the counters, recording the device time of `streams` by name (`device`, `copy`), a
+    /// graph's launch as one record unless the deployment keeps PC sampling enabled, which refuses
+    /// that record; `None` when the process is not subscribed.
+    pub fn start(streams: &[(&'static str, Stream)], whole_graphs: bool) -> Option<Self> {
         if !platform::cupti::subscriber::subscribed() {
             return None;
         }
@@ -121,11 +122,17 @@ impl Counters {
                 tracing::warn!("the blocking driver calls are not counted: {error}");
             })
             .ok()?;
-        let activity = StreamActivity::start(streams.iter().map(|(name, stream)| (*name, stream)))
-            .inspect_err(|error| {
-                tracing::warn!("the device time of the process's streams is not recorded: {error}");
-            })
-            .ok();
+        let activity = StreamActivity::start(
+            streams.iter().map(|(name, stream)| (*name, stream)),
+            whole_graphs,
+        )
+        .inspect_err(|error| {
+            tracing::warn!("the device time of the process's streams is not recorded: {error}");
+        })
+        .ok();
+        if activity.is_some() && whole_graphs {
+            super::trace_whole_graphs();
+        }
         Some(Self {
             _activity: activity,
             _watch: watch,

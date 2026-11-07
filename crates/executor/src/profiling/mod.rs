@@ -25,6 +25,9 @@ pub use ranges::{enabled, range, set_enabled};
 /// Whether CUPTI records whole graphs now, which the executables replayed must be instantiated for.
 static WHOLE_GRAPHS: AtomicBool = AtomicBool::new(false);
 
+/// Whether it does so between timelines: the counters' record of a graph's launch.
+static WHOLE_BY_DEFAULT: AtomicBool = AtomicBool::new(false);
+
 /// How many times every graph executable of the process was declared stale.
 static GRAPH_RENEWALS: AtomicU64 = AtomicU64::new(0);
 
@@ -35,6 +38,17 @@ pub(crate) fn set_graph_trace(whole: bool) {
     if WHOLE_GRAPHS.swap(whole, Ordering::AcqRel) != whole {
         GRAPH_RENEWALS.fetch_add(1, Ordering::AcqRel);
     }
+}
+
+/// The counters record a graph's launch whole for as long as the process serves.
+fn trace_whole_graphs() {
+    WHOLE_BY_DEFAULT.store(true, Ordering::Release);
+    set_graph_trace(true);
+}
+
+/// How CUPTI records a graph's launch with no timeline running.
+pub(crate) fn graphs_whole_by_default() -> bool {
+    WHOLE_BY_DEFAULT.load(Ordering::Acquire)
 }
 
 /// Storage graphs address was unmapped or mapped again.
