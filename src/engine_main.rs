@@ -590,6 +590,7 @@ fn load_rank(
     let (model, memory, inventory, graph) = plan
         .load_and_open(&mut weights, &mut &*client, &host, &epoch.experts)
         .context("loading the epoch's model")?;
+    tracing::info!(rank = plan.rank(), "the rank loaded its model");
     let weights = weights.take_log();
     Ok(LoadedRank {
         plan,
@@ -1256,7 +1257,10 @@ impl MainProcess {
             .flat_map(|executor| executor.streams().iter().cloned())
             .map(|stream| ("device", stream))
             .collect();
-        let counters = executor::profiling::counters::Counters::start(&observed);
+        let counters = executor::profiling::counters::Counters::start(
+            &observed,
+            !epoch.profiling.graph_pc_sampling,
+        );
         let stats_reporters = (0..schedulers.len())
             .map(|_| engine::SchedulerStatsReporter::default())
             .collect();
