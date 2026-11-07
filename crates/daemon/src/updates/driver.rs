@@ -189,6 +189,13 @@ impl Driver {
         self.lock().warming = Some(warming);
     }
 
+    /// The Program Servers selected what the running switch's target executes.
+    pub(crate) fn pin(&self, programs: &crate::epoch::FilledPrograms) {
+        if let Some(running) = self.lock().switch.as_mut() {
+            running.pin(programs);
+        }
+    }
+
     /// The running switch's target on `host` took its programs.
     pub(crate) fn handed(&self, host: &str) {
         let mut state = self.lock();
