@@ -15,8 +15,8 @@
 //! `k / columns`, and a homogeneous model's planes equal the classic
 //! `[layers, blocks, block_size, heads, dim]` stack.
 //!
-//! Scattered unit resets (recycle, zero, mark-initialized) are bound Python
-//! functions over a Rust-owned device column of unit ids: an indexed fill
+//! Scattered unit resets (recycle, zero, mark-initialized) run over a
+//! Rust-owned device column of unit ids: an indexed fill
 //! costs a constant few kernels however the units are scattered, while
 //! native fills would cost one or more driver calls per run of consecutive
 //! units. Contiguous resets (startup scratch) are native fills.

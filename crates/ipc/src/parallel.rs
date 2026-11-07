@@ -7,7 +7,7 @@
 //! every rank and deals independent units among them.
 //!
 //! [`ComponentConfig::validate`] checks membership and parallel degrees for
-//! launch, worker registration and Python callers. Process-world bounds belong
+//! launch and worker registration. Process-world bounds belong
 //! to the owner of that world. The same configuration crosses worker IPC in
 //! the worker's capability message.
 

@@ -27,7 +27,7 @@ type Descriptors = Arc<Mutex<Option<HashMap<String, Arc<OwnedFd>>>>>;
 ///
 /// Registration duplicates the descriptor. Revocation removes that owned
 /// reference, while an in-flight reply retains its own borrow until sendmsg
-/// has passed a reference to the receiver. No Python callbacks are involved.
+/// has passed a reference to the receiver.
 pub(crate) struct DescriptorGrants {
     descriptors: Descriptors,
     worker: Mutex<Option<(UnixStream, JoinHandle<io::Result<()>>)>>,

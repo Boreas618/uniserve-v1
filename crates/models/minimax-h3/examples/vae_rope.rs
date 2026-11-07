@@ -21,7 +21,7 @@
 //! ```text
 //! cargo run -q -p minimax-h3 --example vae_rope -- --root /workspace/models/MiniMax-H3 \
 //!     --out artifacts/h3-vae-rope
-//! .venv/bin/python crates/models/minimax-h3/tools/compare_rope_factors.py --vae artifacts/h3-vae-rope \
+//! python crates/models/minimax-h3/tools/compare_rope_factors.py --vae artifacts/h3-vae-rope \
 //!     --checkpoint /workspace/models/MiniMax-H3
 //! ```
 

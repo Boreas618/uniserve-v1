@@ -161,8 +161,7 @@ impl Event {
                 if self.flags.interprocess {
                     // A process exits by `exit` only once its threads are
                     // done with the devices: a test harness after its last
-                    // test, a Python interpreter after its finalization. A
-                    // rank never does. An unregistered handler only leaves
+                    // test. A rank never does. An unregistered handler only leaves
                     // the storage behind, so the event is not failed for it.
                     // SAFETY: as above.
                     let _ = unsafe { PrimaryContext::reset_all_at_exit() };

@@ -202,8 +202,8 @@ impl SharedBuffer {
 
     /// Announce bytes after their last write: behind the copies `issue`
     /// issued on the producer's stream, or in the order of its host writes
-    /// for a CPU copy. The callback touches only host storage; it neither
-    /// enters Python nor calls CUDA.
+    /// for a CPU copy. The callback touches only host storage and does
+    /// not call CUDA.
     /// The caller issues exactly one copy sequence per buffer, to `issue`,
     /// and must not modify its payload after announcing readiness.
     pub(crate) fn mark_ready(&mut self, issue: impl Issue) -> Result<()> {

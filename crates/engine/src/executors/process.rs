@@ -213,9 +213,7 @@ impl PendingWorker {
             sockets.experts.map(|(_, descriptor)| descriptor),
         )?;
 
-        // The executor runs the engine's build: the executable imports the
-        // `uniserve` package of the Python environment it is installed in,
-        // which holds the executor library of that build.
+        // The executor runs the engine's build.
         let executable = args
             .executable
             .to_str()
@@ -922,7 +920,7 @@ pub(super) fn finish_startup(ranks: &mut [&mut ExecutorProcess]) -> anyhow::Resu
 /// Retires the ranks of one executor group together, absorbing every failure.
 ///
 /// A rank's orderly teardown retires the communicators and process groups it
-/// shares with the group's other ranks (`Executor.close` on the Python side),
+/// shares with the group's other ranks,
 /// and that retirement completes on any rank only once every rank has
 /// reached it. Every rank is therefore asked to shut down, after draining its
 /// outstanding calls, before any is waited for, and all of them then share

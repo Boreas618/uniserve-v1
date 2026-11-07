@@ -367,7 +367,7 @@ impl Stream {
     /// completes, and before any later work starts.
     ///
     /// The action must not call CUDA and must not block on anything that waits
-    /// for this stream (including the Python GIL): the driver serializes host
+    /// for this stream: the driver serializes host
     /// functions, and either can deadlock outstanding device work. A host
     /// function captured into a graph would run once per replay, so this
     /// rejects capturing streams. If submission fails, the action is dropped
