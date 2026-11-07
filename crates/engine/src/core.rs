@@ -123,7 +123,7 @@ impl ExecutorGroupConfig {
         Self::validate_members(&self.ranks, &self.components)?;
         anyhow::ensure!(
             self.components.is_empty() != self.role.serves_requests(),
-            "model workers require components; expert executors have no request components"
+            "model executors require components; expert executors have no request components"
         );
         Ok(())
     }

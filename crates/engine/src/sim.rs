@@ -688,7 +688,7 @@ impl Executor for SimExecutor {
         for (_, placement) in &batch.requests {
             if !self.is_ready(&placement.worker) {
                 return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
-                    "Worker cannot accept this request"
+                    "Executor cannot accept this request"
                 )));
             }
         }

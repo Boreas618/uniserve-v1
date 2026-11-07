@@ -244,7 +244,7 @@ impl Submissions {
         }
     }
 
-    /// The pool's capabilities: its workers, components, pools, and limits.
+    /// The pool's capabilities: its executors, components, pools, and limits.
     pub(super) fn info(&self) -> &ExecutorInfo {
         match &self.path {
             #[cfg(feature = "testing")]

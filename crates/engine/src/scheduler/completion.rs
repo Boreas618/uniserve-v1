@@ -113,7 +113,7 @@ impl CallCompletion {
     /// it, and that name is claimed here — the mapping is what the mechanism
     /// delivers, and claiming it is what unlinks the name.
     ///
-    /// Two things the device reports differently from a worker, both stated
+    /// Two things the device reports differently from an executor, both stated
     /// rather than filled in: a call has no timing of its own (the batch
     /// measures the step, and `BatchReport::timing` carries it), and a token's
     /// log-probability arrives as one number per accepted token, not as ranked
@@ -195,7 +195,7 @@ pub(crate) struct BatchReport {
     /// The batch's own measurements: the execution time the report is measured
     /// by.
     pub timing: TimingCounters,
-    /// Per-worker model-forward statistics.
+    /// Per-executor model-forward statistics.
     pub forward_stats: Vec<ForwardStats>,
 }
 
@@ -212,7 +212,7 @@ impl BatchReport {
                 .collect(),
             command_results: result.command_results,
             done: result.done,
-            // The wire states a duration per worker; the mechanism measures a
+            // The wire states a duration per executor; the mechanism measures a
             // step by the device work it waited for, which is their sum.
             timing: TimingCounters {
                 device_us: result
@@ -301,7 +301,7 @@ impl BatchReport {
             // batch's calls together, never a part of one.
             done: true,
             timing: output.timing,
-            // Device-side forward statistics are a worker's readout, not a
+            // Device-side forward statistics are an executor's readout, not a
             // rank's own (`crate::executors`); a process reports none here.
             forward_stats: Vec::new(),
         })

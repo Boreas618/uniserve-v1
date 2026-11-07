@@ -1,13 +1,13 @@
 //! Giving back and restoring the KV cache's device storage.
 //!
-//! A worker splits its cache planes into segments of whole units
+//! An executor splits its cache planes into segments of whole units
 //! (`uniserve.cache_storage` reports them), and gives back the tail from a
 //! segment on. A shrink makes room for a world that succeeds this one on the
 //! same devices: the scheduler withdraws the tail's units from allocation,
 //! revoking the cached pages they hold (whose host KV cache copies stay), and
 //! lets the requests that hold them run to their end, admitting new ones on
 //! the units left: the serving world's capacity drops, and nothing pauses.
-//! Once no request holds a withdrawn unit, the workers give the tail back.
+//! Once no request holds a withdrawn unit, the executors give the tail back.
 //! A shrink may name a bound after which the requests still holding the
 //! tail are recomputed instead (ended as migratable, and submitted again by
 //! the daemon with their generated tokens, as vLLM's recompute preemption
@@ -23,7 +23,7 @@
 //! restores both; it preempts video requests at their next denoising step
 //! boundary, which resume from the trajectories stored there once it wakes.
 //! An in-place weight update recomputes the requests as a sleep does and
-//! rewrites the weights while the workers sleep, so that the cache's storage
+//! rewrites the weights while the executors sleep, so that the cache's storage
 //! holds the new checkpoint as it loads.
 
 use super::ledger::{CacheStorage, Preparing, growable, preparing, room, room_refusal};
@@ -49,17 +49,17 @@ pub(super) struct PendingResize {
 
 /// What a pending change does once its units are let go.
 enum Pending {
-    /// The workers give back the segments from this one on; the shrink
+    /// The executors give back the segments from this one on; the shrink
     /// answers with the plan of each device it made room on.
     Shrink { from: u32, plan: Vec<String> },
-    /// The workers sleep, once no request runs.
+    /// The executors sleep, once no request runs.
     Sleep,
-    /// The workers rewrite the weights from the checkpoint at this path,
+    /// The executors rewrite the weights from the checkpoint at this path,
     /// once no request runs.
     Weights(String),
 }
 
-/// Every worker's `uniserve.cache_storage` report: of the workers that hold
+/// Every executor's `uniserve.cache_storage` report: of the executors that hold
 /// the cache, and of the others (`Scheduler::storage_reports`).
 struct StorageReports {
     cache: Vec<CacheStorage>,
@@ -85,7 +85,7 @@ impl Pending {
 
 impl Scheduler {
     /// Applies `change` to the KV cache's device storage, and answers with
-    /// what each worker reported once it is done. A shrink or sleep whose
+    /// what each executor reported once it is done. A shrink or sleep whose
     /// withdrawn units requests still hold answers once they let them go
     /// (`Scheduler::poll_resize`).
     pub(super) fn resize_cache(
@@ -166,18 +166,18 @@ impl Scheduler {
     }
 
     /// Rewrites the weights in place from the checkpoint at `model_path`,
-    /// and answers with what each worker reported. The requests in flight
+    /// and answers with what each executor reported. The requests in flight
     /// continue as `in_flight` says:
     ///
-    /// - `Keep`: once the batches in flight complete, the workers rewrite
+    /// - `Keep`: once the batches in flight complete, the executors rewrite
     ///   the weights beside the KV cache, and every request in flight
     ///   continues on the new weights with the cache it reached. The state
     ///   it computes afterwards follows neither the old weights nor the new
     ///   ones, so it publishes no page from then on.
     /// - `Recompute`: the requests running are recomputed and the others
-    ///   wait; the workers sleep while they rewrite, as for a sleep.
+    ///   wait; the executors sleep while they rewrite, as for a sleep.
     /// - `Abort`: every request the scheduler holds ends, aborted, before
-    ///   the workers sleep and rewrite.
+    ///   the executors sleep and rewrite.
     pub(super) fn update_weights(
         &mut self,
         model_path: String,
@@ -226,7 +226,7 @@ impl Scheduler {
     }
 
     /// Completes a pending shrink or sleep once no request holds a
-    /// withdrawn unit, and a sleep once no request runs either: the workers
+    /// withdrawn unit, and a sleep once no request runs either: the executors
     /// give the storage back between batches.
     pub(super) fn poll_resize(&mut self) {
         // A shrink past its bound recomputes the requests still holding the
@@ -280,7 +280,7 @@ impl Scheduler {
         };
         // A change that fails part of the way leaves the units withdrawn and
         // a sleeping scheduler asleep: a restore or a wake creates whatever
-        // the workers gave back.
+        // the executors gave back.
         let result = match resize.change {
             Pending::Sleep => {
                 self.asleep = true;
@@ -307,7 +307,7 @@ impl Scheduler {
     }
 
     /// Rewrites the weights from the checkpoint at `path` while no request
-    /// runs. The workers sleep for it unless they sleep already, so that
+    /// runs. The executors sleep for it unless they sleep already, so that
     /// the cache's storage holds the new checkpoint as it loads, and wake
     /// after, whether or not the update succeeded. Every cached prefix page
     /// was computed with the old weights: the prefix cache is flushed, and
@@ -322,8 +322,8 @@ impl Scheduler {
         let updated = self.run_hook("uniserve.update_weights", &payload);
         if slept && let Err(waking) = self.wake() {
             return Err(match updated {
-                Ok(_) => format!("the workers did not wake after the weight update: {waking}"),
-                Err(error) => format!("{error}; the workers did not wake after: {waking}"),
+                Ok(_) => format!("the executors did not wake after the weight update: {waking}"),
+                Err(error) => format!("{error}; the executors did not wake after: {waking}"),
             });
         }
         let results = updated?;
@@ -334,7 +334,7 @@ impl Scheduler {
     }
 
     /// Rewrites the weights from the checkpoint at `path` while the requests
-    /// in flight hold their KV cache (`WeightsInFlight::Keep`): the workers
+    /// in flight hold their KV cache (`WeightsInFlight::Keep`): the executors
     /// load the checkpoint beside the cache once the batches in flight
     /// complete. Every request in flight then publishes no page, and every
     /// cached prefix page is revoked, as the new weights key pages anew.
@@ -390,8 +390,8 @@ impl Scheduler {
     }
 
     /// Roots the prefix hash chains at the identity the weight update
-    /// `results` report (one per worker), and gives the host KV cache each
-    /// worker group's page key seeds they report, which the ranks of a group
+    /// `results` report (one per executor), and gives the host KV cache each
+    /// executor group's page key seeds they report, which the ranks of a group
     /// agree on.
     fn reseed_pages(&mut self, results: &[String]) -> Result<(), String> {
         if let Some(cache) = self.storage.cache.as_mut() {
@@ -456,7 +456,7 @@ impl Scheduler {
         let mut seeds: BTreeMap<String, Vec<[u8; 32]>> = BTreeMap::new();
         for result in results {
             let value: serde_json::Value = serde_json::from_str(result)
-                .map_err(|error| format!("a worker's weight update report: {error}"))?;
+                .map_err(|error| format!("an executor's weight update report: {error}"))?;
             let (Some(group), Some(contents)) =
                 (value["group"].as_str(), value["page_contents"].as_array())
             else {
@@ -477,7 +477,7 @@ impl Scheduler {
             match seeds.get(group) {
                 Some(agreed) if *agreed != contents => {
                     return Err(format!(
-                        "the ranks of worker group {group} report other page key seeds"
+                        "the ranks of executor group {group} report other page key seeds"
                     ));
                 }
                 Some(_) => {}
@@ -492,18 +492,18 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The segments each worker that holds the cache reports, which agree
+    /// The segments each executor that holds the cache reports, which agree
     /// on their segments and the ones they hold, with its device's ledger;
-    /// `None` when the cache is not split into segments. A worker that
-    /// holds no cache, such as an expert worker, reports none and is left
+    /// `None` when the cache is not split into segments. An executor that
+    /// holds no cache, such as an expert executor, reports none and is left
     /// out.
     pub(super) fn cache_storage(&mut self) -> Result<Option<Vec<CacheStorage>>, String> {
         Ok(self.storage_reports()?.map(|reports| reports.cache))
     }
 
-    /// Every worker's storage report: those of the workers that hold the
+    /// Every executor's storage report: those of the executors that hold the
     /// cache, which agree on their segments and the ones they hold, and
-    /// those of the others (an expert worker's, with its GPU's ledger when
+    /// those of the others (an expert executor's, with its GPU's ledger when
     /// it keeps storage at the Storage Server). `None` when the cache is not
     /// split into segments.
     fn storage_reports(&mut self) -> Result<Option<StorageReports>, String> {
@@ -515,7 +515,7 @@ impl Scheduler {
             .iter()
             .map(|report| serde_json::from_str::<CacheStorage>(report))
             .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("a worker's cache storage report: {error}"))?
+            .map_err(|error| format!("an executor's cache storage report: {error}"))?
             .into_iter()
             .partition(|report| !report.segments.is_empty());
         let Some(first) = cache.first() else {
@@ -525,13 +525,13 @@ impl Scheduler {
             .iter()
             .any(|report| (&report.segments, report.held) != (&first.segments, first.held))
         {
-            return Err("the workers split the KV cache into different segments".to_owned());
+            return Err("the executors split the KV cache into different segments".to_owned());
         }
         Ok(Some(StorageReports { cache, beside }))
     }
 
     /// The serving world's preparation for a world that succeeds it on the
-    /// same devices (`super::ledger::preparing`): for each worker that holds
+    /// same devices (`super::ledger::preparing`): for each executor that holds
     /// the cache, its device's KV cache limit from the GPU's ledger, beside
     /// everything else the deployment and the Transfer Server hold there
     /// and what the successor adds, and the segments the cache keeps within
@@ -544,7 +544,7 @@ impl Scheduler {
     /// units, stays, as do the segments the world inherited and does not
     /// own yet.
     ///
-    /// The devices of the workers that hold no cache (an expert worker's)
+    /// The devices of the executors that hold no cache (an expert executor's)
     /// are planned too: their successor's graph pool and fixed part must
     /// fit beside everything the ledger books there.
     ///
@@ -608,7 +608,7 @@ impl Scheduler {
             keep = keep.min(kept);
             plans.push(plan);
         }
-        // A worker without a cache that keeps its storage at the Storage
+        // An executor without a cache that keeps its storage at the Storage
         // Server: its successor adds beside it what it holds, and the limit
         // left (of no cache) must not be negative.
         for report in beside.iter().filter(|report| report.ledger.is_some()) {
@@ -732,7 +732,7 @@ impl Scheduler {
     /// `specs/online-operations.md` §6.5): its successor maps none of them
     /// and grows into their storage, and a rollback that resumes this world
     /// creates them again and reads the pages back from the host KV cache.
-    /// No request runs on a parked world. Answers, once the workers gave the
+    /// No request runs on a parked world. Answers, once the executors gave the
     /// segments back, with what it evicted.
     fn start_evict(&mut self) -> Result<Result<Pending, Vec<String>>, String> {
         if !self.parks() {
@@ -775,7 +775,7 @@ impl Scheduler {
     /// the host KV cache verify or make its copy under the key it was
     /// offloaded with: a page the pool holds already is released at once,
     /// another once its copy commits. Pages of a sliding-window group, and
-    /// pages never offloaded (no host KV cache serves their worker), are
+    /// pages never offloaded (no host KV cache serves their executor), are
     /// evicted without a copy: a later prompt computes them again. Returns
     /// how many pages wait for their copies.
     fn offload_idle_from(&mut self, unit: u32) -> usize {
@@ -799,10 +799,10 @@ impl Scheduler {
         self.offload_pages(idle)
     }
 
-    /// Hands idle pages to the host KV cache, grouped by the worker group and
+    /// Hands idle pages to the host KV cache, grouped by the executor group and
     /// group index they belong to. Returns how many pages went.
     ///
-    /// A page whose worker group does not serve it, or whose group is not
+    /// A page whose executor group does not serve it, or whose group is not
     /// full-attention, is dropped uncopied: the withdrawal that owns it evicts
     /// it then.
     fn offload_pages(&mut self, idle: Vec<crate::kv_cache::IdlePage>) -> usize {
@@ -870,7 +870,7 @@ impl Scheduler {
         }
         self.withdraw_from(0, true);
         // Video requests are preempted at their next denoising step boundary
-        // and resume once the workers wake.
+        // and resume once the executors wake.
         self.preempt_media(MigrationCause::Drain, |_| true);
         Some(Pending::Sleep)
     }
