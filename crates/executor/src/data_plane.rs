@@ -135,10 +135,10 @@ pub struct Room {
 
 impl Room {
     /// Whether a load of `bytes` fits here once `given_back` bytes of the device leave. The graph
-    /// pools a process gives back free the device and no quota, because the ledger books what the
-    /// Storage Server retains and not what a process maps of its own.
+    /// pools a process gives back free the device and the quota alike, because a rank that serves
+    /// books them in the ledger and a suspension takes them out of it.
     pub fn holds(self, bytes: u64, given_back: u64) -> bool {
-        bytes <= self.quota.min(self.free.saturating_add(given_back))
+        bytes <= self.quota.min(self.free).saturating_add(given_back)
     }
 }
 
@@ -1153,9 +1153,9 @@ mod tests {
         };
         assert!(room.holds(60, 0));
         assert!(!room.holds(61, 0));
-        // The graph storage gives back device storage and no quota.
+        // The graph storage gives back device storage and quota alike.
         assert!(room.holds(100, 40));
-        assert!(!room.holds(101, 1_000));
+        assert!(!room.holds(101, 40));
     }
 
     #[test]
