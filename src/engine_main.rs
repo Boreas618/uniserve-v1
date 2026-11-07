@@ -1058,6 +1058,28 @@ impl MainProcess {
             proto::request::wire::EngineState::Starting,
             None,
         )?;
+        // The daemon waits for what this process became, so a start that fails says why: the
+        // process ends and its connection closes, which says only that it went.
+        let mut control = Some(control);
+        let started = Self::load(&mut control, plan, epoch, launch, build);
+        if let (Err(error), Some(control)) = (&started, control.as_mut()) {
+            state_failure(control, &format!("{error:#}"));
+        }
+        started
+    }
+
+    /// Everything of a start past the handshake. It takes `control` for the process it builds, and
+    /// leaves it to the caller when it fails before that.
+    fn load(
+        control: &mut Option<Control>,
+        plan: EpochPlan,
+        epoch: Epoch,
+        launch: &Launch,
+        build: &BuildConfig,
+    ) -> Result<Self> {
+        let connected = control
+            .as_mut()
+            .context("a main process starts on the connection it opened")?;
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
@@ -1065,7 +1087,7 @@ impl MainProcess {
             ProcessInterface::connect(&launch.processes, &launch.deployment, launch.engine)?;
         // Every command of the program layer arrives on this socket, and a stage waits for the
         // command before it: the control thread sleeps on it as it does on the request socket.
-        control.watch_process(Some(process.connection.descriptor()));
+        connected.watch_process(Some(process.connection.descriptor()));
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
@@ -1269,7 +1291,7 @@ impl MainProcess {
                     &executors[index..=index],
                     &inventories[index],
                     &memories[index],
-                    control.wake(),
+                    connected.wake(),
                     &data,
                 )?);
             }
@@ -1282,7 +1304,7 @@ impl MainProcess {
                 &executors,
                 &inventories[0],
                 &memories[0],
-                control.wake(),
+                connected.wake(),
                 &data,
             )?
         };
@@ -1307,7 +1329,9 @@ impl MainProcess {
             .map(|_| engine::SchedulerStatsReporter::default())
             .collect();
         let mut process = Self {
-            control,
+            control: control
+                .take()
+                .context("a main process starts on the connection it opened")?,
             schedulers,
             union,
             stats_reporters,
@@ -6025,6 +6049,22 @@ fn announce(
             Err(error).context("stating what this process is to the daemon")
         }
         _ => Ok(()),
+    }
+}
+
+/// States to the daemon that launched this process why its start failed.
+fn state_failure(control: &mut Control, reason: &str) {
+    let sent = control.daemon_mut().send(&proto::request::wire::FromEngine {
+        kind: Some(proto::request::wire::from_engine::Kind::State(
+            proto::request::wire::State {
+                state: proto::request::wire::EngineState::Failed as i32,
+                info: None,
+                error: reason.to_owned(),
+            },
+        )),
+    });
+    if let Err(error) = sent {
+        tracing::warn!(%error, "the daemon was not told why this process's start failed");
     }
 }
 
