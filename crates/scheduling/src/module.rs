@@ -15,9 +15,9 @@ use scheduling_guest::limits::{Limits, Parameters};
 use scheduling_guest::view::Snapshot;
 use wasmtime::{Module, Precompiled};
 
+use crate::Engine;
 use crate::error::PolicyError;
 use crate::instance::PolicyInstance;
-use crate::Engine;
 
 /// A loaded policy module: the compiled wasm32 module of one policy backend and
 /// revision (§5.1), ready to be instantiated.

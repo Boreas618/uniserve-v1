@@ -218,7 +218,7 @@ pub enum Welcome {
 /// Where a storage's physical storage is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum Placement {
+pub enum Location {
     /// A CUDA VMM allocation on the GPU with this UUID, held through a POSIX
     /// file descriptor handle.
     Device { gpu: [u8; 16] },
@@ -230,7 +230,7 @@ pub enum Placement {
 /// names it, in the order the message lists its storages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageRecord {
-    pub placement: Placement,
+    pub location: Location,
     /// The allocation's size, a multiple of the device's allocation
     /// granularity for device storage.
     pub bytes: u64,
@@ -613,7 +613,7 @@ pub enum Region {
     Tensor {
         key: Key,
         #[serde(default)]
-        at: Option<Placement>,
+        at: Option<Location>,
     },
     /// A live page pool of the caller's deployment; offsets count from slot
     /// 0, at `slot × page_bytes`.
@@ -888,7 +888,7 @@ pub enum Request {
     Retain {
         keys: Vec<Key>,
         #[serde(default)]
-        at: Vec<Placement>,
+        at: Vec<Location>,
     },
     /// Worlds in the head's deployment retain their weights and the exact
     /// `cache_keys` holding completed rollback copies. Their retention of
@@ -926,7 +926,7 @@ pub enum Request {
         keys: Vec<Key>,
         mode: Mode,
         #[serde(default)]
-        at: Vec<Placement>,
+        at: Vec<Location>,
     },
     /// Allocate an exclusive byte tensor in host storage after host
     /// admission. Returns its retained storage through `Got`, with write
@@ -959,7 +959,7 @@ pub enum Request {
     Rekey {
         moves: Vec<(Key, Key)>,
         #[serde(default)]
-        at: Vec<Placement>,
+        at: Vec<Location>,
     },
     /// Every tensor, storage and claim the server holds.
     List,
@@ -1410,7 +1410,7 @@ pub struct ListedTensor {
     /// The `(scope, world)` pairs that retain the tensor.
     #[serde(default)]
     pub retainers: Vec<Retainer>,
-    pub placement: Placement,
+    pub location: Location,
     /// Bytes of the tensor's storage.
     pub storage_bytes: u64,
     pub dtype: String,
@@ -1421,7 +1421,7 @@ pub struct ListedTensor {
     pub writer: Option<i32>,
 }
 
-/// Storage bytes one scope of one world holds on one placement.
+/// Storage bytes one scope of one world holds on one location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeBytes {
     /// The GPU's UUID for device bytes; `None` for host bytes.

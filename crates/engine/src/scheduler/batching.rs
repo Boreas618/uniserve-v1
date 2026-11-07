@@ -90,13 +90,13 @@ impl Scheduler {
     /// an index becomes an executor without two candidate lists that could
     /// disagree. A policy that fails here fails as any decision does: the call
     /// waits this step and the previous policy decides the next one.
-    fn place_call(&mut self, call: &Call) -> Option<placement::Choice> {
-        if self.placement.resident(call.request_key) {
-            return Some(placement::Choice::Existing);
+    fn place_call(&mut self, call: &Call) -> Option<dispatch::Choice> {
+        if self.dispatch.resident(call.request_key) {
+            return Some(dispatch::Choice::Existing);
         }
         let replicas = views::replicas(self, call.request_key, call.kind);
         if replicas.is_empty() {
-            return Some(placement::Choice::Existing);
+            return Some(dispatch::Choice::Existing);
         }
         let targets = views::replica_targets(self, call.request_key, call.kind);
         let view = views::call_view(call.request_key, call.kind);
@@ -114,7 +114,7 @@ impl Scheduler {
             }
         };
         self.policy = Some(policy);
-        target.map(placement::Choice::Target)
+        target.map(dispatch::Choice::Target)
     }
 
     /// Charges actual token work, including each CFG branch of a denoising step.
@@ -143,7 +143,7 @@ impl Scheduler {
     /// Returns the call's output buffer spans, in `Call::buffer_outputs`
     /// order, or `None` when the call cannot run now: the guidance prefix of a
     /// denoising call cannot be allocated, transfer capacity is exhausted,
-    /// the request is not running, `Placement::worker_target` finds no executor,
+    /// the request is not running, `Dispatch::worker_target` finds no executor,
     /// a buffer or latent-page allocation fails, or (after latching
     /// engine-fatal) the request holds no allocations.
     ///
@@ -166,12 +166,12 @@ impl Scheduler {
             .running
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
-        self.placement.worker_target(
+        self.dispatch.worker_target(
             &self.executor,
             &self.info,
             request_key,
             call.kind,
-            &placement::Choice::Existing,
+            &dispatch::Choice::Existing,
         )?;
 
         let mut buffer_allocations = Vec::new();
@@ -733,7 +733,7 @@ impl Scheduler {
         let mut sampling = Vec::with_capacity(batch.requests.len());
         let mut draws = Vec::with_capacity(batch.requests.len());
         let mut tables = Vec::with_capacity(batch.requests.len());
-        // Mutable, because the resolved table is written back to the placement: the executor
+        // Mutable, because the resolved table is written back to the dispatch: the executor
         // installs the table the batch states, so a batch that stated only the wire's delta left a
         // decode's row uninstalled and its gather read whatever the slot held before. One value,
         // one statement - the table this batch addresses.
@@ -790,7 +790,7 @@ impl Scheduler {
             } else {
                 declared
             };
-            // The placement now states the table this batch addresses, so the executor installs it
+            // The dispatch now states the table this batch addresses, so the executor installs it
             // and the columns address it: a decode that declared nothing no longer travels with an
             // empty statement while its rows read the request's pages.
             placed.block_tables = resolved.clone();
@@ -973,9 +973,7 @@ impl Scheduler {
             let state = self.running_media.get(&call.request_key.request_id)?;
             let prompt = &state.request.prompt_token_ids;
             let length = i32::try_from(prompt.len()).ok()?;
-            columns
-                .input_ids
-                .extend(prompt.iter().map(|id| *id as i32));
+            columns.input_ids.extend(prompt.iter().map(|id| *id as i32));
             columns.rows.positions.extend(0..length);
             columns.rows.seq_lens.push(length);
             let end = i32::try_from(columns.input_ids.len()).ok()?;
@@ -1096,8 +1094,8 @@ impl Scheduler {
         // its copy stream beside its forward, and its output settles them.
         if let Some(kv_offload) = self.kv_offload.as_mut()
             && let Some((_, first)) = batch.requests.first()
-            && batch.requests.iter().all(|(call, placement)| {
-                placement.worker == first.worker
+            && batch.requests.iter().all(|(call, dispatch)| {
+                dispatch.worker == first.worker
                     && call.component == DEFAULT_COMPONENT
                     && matches!(
                         call.kind,

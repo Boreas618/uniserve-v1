@@ -239,7 +239,7 @@ The default, 0.1, comes from a measurement on GB200 (`crates/storage-server/exam
 
 Each entry is the median over the point's reports of the step time over its run's median without copies (the three runs agree within 0.04). Without copies, a report's step time departs from the median by at most 4.4% in 99% of reports, and one report of 354 exceeds it by more than 10% (15%). Read as the leader decides, one report at a time, a tolerance of 0.1 is exceeded by 0.3% of the reports without copies, by every report of copies within the GPU at budgets down to 1/16 and by 98% of those from host storage at its whole budget, which slow the steps by 14% or more, and by 10% of the reports of copies from another GPU at its whole budget, which slow them by 8%. A tolerance of 0.05 would be exceeded by 0.8% of the reports without copies and by up to 20% of those of copies that slow the steps by 3% or less (within the GPU at 1/64 of its budget), which 0.1 exceeds in at most 5%; one of 0.15 would let copies within the GPU at 1/16 of their budget (14%) through in 59% of the reports. Other hardware, models and loads are measured the same way before the value is changed.
 
-### `placement_config`
+### `device_config`
 
 **Destination: build config** — it decides where ranks run, by the rule that places `worker_groups` and `engine_host` there. §7.7's table does not list this section; the destination is stated here so no option is without one, and it is the one destination in this file that asks for confirmation rather than quoting the table.
 

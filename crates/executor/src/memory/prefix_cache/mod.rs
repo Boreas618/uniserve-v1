@@ -339,9 +339,9 @@ impl PrefixCache {
     /// Copies `offloads` to their host slots and waits for the copies, with no batch to order them
     /// behind: what the engine published has been computed, and it holds the units meanwhile.
     pub(crate) fn copy_pages(&mut self, offloads: &[PageCopy]) -> Result<()> {
-        let stream = self
-            .copy_stream()
-            .ok_or_else(|| Error::Invalid("a batch copies pages but the rank maps no page pool".into()))?;
+        let stream = self.copy_stream().ok_or_else(|| {
+            Error::Invalid("a batch copies pages but the rank maps no page pool".into())
+        })?;
         self.issue_pages(&[], offloads, &stream)?;
         stream.synchronize()?;
         Ok(())

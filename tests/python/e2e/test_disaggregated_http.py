@@ -1,7 +1,7 @@
 """Generation and cancellation through an independently launched AFD server.
 
 Set UNISERVE_AFD_URL and UNISERVE_AFD_MODEL for the running deployment. The
-deployment fixes its role placement, precision and graph policy before these
+deployment fixes its role layout, precision and graph policy before these
 client-side checks; tests never change them or start another measurement.
 """
 

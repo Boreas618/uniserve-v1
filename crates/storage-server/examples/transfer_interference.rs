@@ -70,7 +70,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ::storage::protocol::{Event, Link, LinkEnd, Priority, Region, Span, Throttle, TransferEnd};
 use ::storage::{
-    Access, Client, GpuLedger, Key, Placement, Role, Scope, StorageRecord, TensorRecord,
+    Access, Client, GpuLedger, Key, Location, Role, Scope, StorageRecord, TensorRecord,
 };
 use anyhow::{Context, bail, ensure};
 use platform::{DeviceAllocation, DeviceAttribute, DeviceId};
@@ -738,7 +738,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
             .context("a retainable allocation exports a descriptor")
     };
     let on_device = |gpu: [u8; 16], allocation: &DeviceAllocation| StorageRecord {
-        placement: Placement::Device { gpu },
+        location: Location::Device { gpu },
         bytes: allocation.len() as u64,
         segment: None,
         fabric: None,
@@ -760,7 +760,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
             (on_device(gpu_b, &source_b), source_b_fd.as_fd()),
             (
                 StorageRecord {
-                    placement: Placement::Host { numa_node },
+                    location: Location::Host { numa_node },
                     bytes: task_bytes,
                     segment: None,
                     fabric: None,

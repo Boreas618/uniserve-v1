@@ -144,7 +144,7 @@ pub trait Products: Send + Sync {
     /// rather than issued unordered.
     ///
     /// The ids and not the stream itself is what keeps this call free of a device: the store's rules
-    /// — which placements may borrow, which must copy, what a mismatch says — are then testable
+    /// — which device and stream may borrow, which must copy, what a mismatch says — are then testable
     /// where no GPU exists.
     ///
     /// A product already published by this request is replaced: a trajectory is published step by
@@ -162,7 +162,7 @@ pub trait Products: Send + Sync {
     /// Borrows `request`'s `kind` product as a view a call on `stream` may read **directly**.
     ///
     /// This is the zero-copy answer, and it is only given where the producer's write is already
-    /// ordered before the reader's work - the same device and the same stream. Any other placement
+    /// ordered before the reader's work - the same device and the same stream. Any other device or stream
     /// is refused by name, and [`Products::copy_into`] is the call for it: a caller that wants the
     /// bytes somewhere else asks for a copy it can order, rather than a view whose ordering it
     /// cannot see.
@@ -172,7 +172,7 @@ pub trait Products: Send + Sync {
     ///
     /// **No production caller today, and it stays for two reasons.** Both crossings a runner makes go
     /// through [`Products::copy_into`] - the trajectory and the clip each land on their reader's
-    /// device - so this answers the case a same-stream placement would take; and the placement rules
+    /// device - so this answers the case a same-stream read would take; and the borrowing rules
     /// it states (same device *and* same stream, else refused by name) are the only ones asserted
     /// without a device. A caller arriving later gets the zero-copy read the moment its two calls are
     /// on one stream, and nothing else in the store decides that.
@@ -206,7 +206,7 @@ pub trait Products: Send + Sync {
 
     /// Whether `request` has a `kind` product, **whatever device and stream it lives on**.
     ///
-    /// Presence is a fact about the store; placement is a fact about where a reader wants it. A
+    /// Presence is a fact about the store; the device and stream are facts about where a reader wants it. A
     /// runner's step check asks the first and only the copy answers the second, so a product on
     /// another device is *held* - a deployment that puts the text encoder on its own GPU would
     /// otherwise refuse every denoising step with "nothing produced it".
@@ -478,7 +478,8 @@ impl Products for RankProducts {
         destination: &TensorView,
         stream: &platform::Stream,
     ) -> Result<bool> {
-        self.store(kind).copy_into(request, kind, destination, stream)
+        self.store(kind)
+            .copy_into(request, kind, destination, stream)
     }
 
     fn lent(
@@ -555,7 +556,7 @@ fn copyable(from: ops::DType, to: ops::DType, request: RequestKey, kind: Product
     )))
 }
 
-/// Which route a read of a product takes from the placement it was written on to the reader's.
+/// Which route a read of a product takes from the writer's device and stream to the reader's.
 ///
 /// One function for the decision, over ids rather than a stream, so the table is testable where no
 /// device exists - and so the two facts cannot be read one at a time by different code: **a second
@@ -922,7 +923,7 @@ mod tests {
     /// rule that compared only one of the two would pass on a single-GPU deployment and read
     /// unordered bytes on the one that ships.
     #[test]
-    fn only_the_writers_own_placement_copies_without_waiting() {
+    fn only_the_writers_own_stream_copies_without_waiting() {
         let written = (DeviceId(0), StreamId(7));
         assert_eq!(route(written, (DeviceId(0), StreamId(7))), Route::Ordered);
         assert_eq!(
@@ -1086,7 +1087,12 @@ mod tests {
             .expect("a store accepts a view");
 
         let refusal = store
-            .borrow(request(1), Product::ConditionPixels, DeviceId(0), StreamId(4))
+            .borrow(
+                request(1),
+                Product::ConditionPixels,
+                DeviceId(0),
+                StreamId(4),
+            )
             .expect_err("another stream needs the writer's event")
             .to_string();
         assert!(refusal.contains("stream 4"), "names the reader: {refusal}");
@@ -1100,7 +1106,12 @@ mod tests {
         let store = Held::new();
         assert!(
             store
-                .borrow(request(1), Product::ConditionSamples, DeviceId(0), StreamId(1))
+                .borrow(
+                    request(1),
+                    Product::ConditionSamples,
+                    DeviceId(0),
+                    StreamId(1)
+                )
                 .expect("an absent product is not an error")
                 .is_none(),
             "nothing wrote this kind"

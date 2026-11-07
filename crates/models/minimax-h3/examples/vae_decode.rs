@@ -621,7 +621,7 @@ fn stage_decode(args: &Args) -> Result<()> {
     );
 
     // **Where each buffer will land.** A stop inside the arena names a size and an offset, and an
-    // offset is only readable against the placement that produced it - the harness's two buffers
+    // offset is only readable against the layout that produced it - the harness's two buffers
     // first, then the plan's entries at the arena's alignment. Printing it costs sixteen lines and
     // turns "an arena that cannot give out" into a name and a number the moment it happens.
     {

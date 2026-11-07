@@ -117,9 +117,9 @@ impl Scheduler {
                 // placed on them, not a component list a rank reports.
                 let components = submissions
                     .info()
-                    .placements
+                    .layouts
                     .get(id)
-                    .map(|placement| placement.components.clone())
+                    .map(|layout| layout.components.clone())
                     .unwrap_or_default();
                 (
                     id.clone(),
@@ -219,7 +219,7 @@ impl Scheduler {
         Ok(Self {
             executor: submissions,
             inflight: inflight::Inflight::new(),
-            placement: placement::Placement::default(),
+            dispatch: dispatch::Dispatch::default(),
             storage: allocation::Storage {
                 cache,
                 encoder_cache: crate::kv_cache::EncoderCacheManager::new(
@@ -393,7 +393,7 @@ impl Scheduler {
     /// The executor groups that prefill only (`ExecutorGroupRole::Prefill`),
     /// whose requests hand their KV cache to a decode group.
     pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::ExecutorGroupId>) {
-        self.placement.prefill_groups = groups.into_iter().collect();
+        self.dispatch.prefill_groups = groups.into_iter().collect();
     }
 
     /// Sets the world that owns new requests' private cache continuations.
@@ -985,7 +985,11 @@ impl Scheduler {
             .executor
             .hook(name, payload)
             .map_err(|error| format!("{error:#}"))?;
-        tracing::info!(hook = name, workers = results.len(), "ran the executor hook");
+        tracing::info!(
+            hook = name,
+            workers = results.len(),
+            "ran the executor hook"
+        );
         Ok(results)
     }
 
@@ -1043,7 +1047,6 @@ impl Scheduler {
     }
 }
 
-
 /// Names what a drain that stopped progressing still holds: each batch with its
 /// age and the requests it carries, and the submissions the executor never
 /// accepted.
@@ -1057,7 +1060,11 @@ fn abandoned_drain(inflight: &super::inflight::Inflight, held: (usize, usize)) -
     let batches: Vec<String> = batches
         .into_iter()
         .map(|(id, batch)| {
-            let mut requests: Vec<_> = batch.calls.iter().map(|(key, _)| key.request_id.0).collect();
+            let mut requests: Vec<_> = batch
+                .calls
+                .iter()
+                .map(|(key, _)| key.request_id.0)
+                .collect();
             requests.sort_unstable();
             requests.dedup();
             format!(
@@ -1119,9 +1126,13 @@ mod tests {
             7,
             PendingBatch {
                 started: Instant::now(),
-                calls: [(key(3), CallId::new(7, 0)), (key(3), CallId::new(7, 1)), (key(9), CallId::new(7, 2))]
-                    .into_iter()
-                    .collect(),
+                calls: [
+                    (key(3), CallId::new(7, 0)),
+                    (key(3), CallId::new(7, 1)),
+                    (key(9), CallId::new(7, 2)),
+                ]
+                .into_iter()
+                .collect(),
                 commands: Vec::new(),
                 worker_exec_us: 0,
                 prefill: true,

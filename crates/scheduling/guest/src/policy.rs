@@ -65,7 +65,7 @@ pub trait Policy {
     /// During an epoch's precopy: which pages to warm, in order.
     fn warm(&mut self, room: &Room) -> Vec<PageId>;
 
-    /// Periodically: the placement of experts on ranks.
+    /// Periodically: the layout of experts on ranks.
     fn experts(&mut self, load: &ExpertLoad) -> ExpertOrder;
 
     /// Once at instantiation: the policy's limits, from its parameters, within

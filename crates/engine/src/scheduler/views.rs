@@ -76,8 +76,8 @@ use scheduling::guest::view::{
 };
 
 use super::*;
+use crate::scheduler::dispatch::Dispatch;
 use crate::scheduler::mechanism::Live;
-use crate::scheduler::placement::Placement;
 use crate::scheduler::policy::TrialState;
 
 // ---------------------------------------------------------------------------
@@ -1134,14 +1134,14 @@ pub(crate) fn encodings(scheduler: &Scheduler) -> Vec<EncodingView> {
 
 /// The distinct requests resident on one executor, by the request affinity the
 /// mechanism records when it places a call.
-fn resident_requests(placement: &Placement, worker: &crate::ExecutorGroupId) -> u32 {
+fn resident_requests(dispatch: &Dispatch, worker: &crate::ExecutorGroupId) -> u32 {
     let mut requests = HashSet::new();
-    for ((key, _), owner) in &placement.affinity {
+    for ((key, _), owner) in &dispatch.affinity {
         if owner == worker {
             requests.insert(*key);
         }
     }
-    for ((key, _), owner) in &placement.decode_affinity {
+    for ((key, _), owner) in &dispatch.decode_affinity {
         if owner == worker {
             requests.insert(*key);
         }
@@ -1151,30 +1151,30 @@ fn resident_requests(placement: &Placement, worker: &crate::ExecutorGroupId) -> 
 
 /// Whether a replica already holds another component of `request`.
 fn holds_component(
-    placement: &Placement,
+    dispatch: &Dispatch,
     request: RequestKey,
     worker: &crate::ExecutorGroupId,
 ) -> bool {
-    placement
+    dispatch
         .affinity
         .iter()
-        .chain(&placement.decode_affinity)
+        .chain(&dispatch.decode_affinity)
         .any(|((key, _), owner)| *key == request && owner == worker)
 }
 
 /// Whether a replica holds this request's state for the component the call
 /// binds.
 fn holds_request(
-    placement: &Placement,
+    dispatch: &Dispatch,
     request: RequestKey,
     bound: &str,
     decode_stage: bool,
     worker: &crate::ExecutorGroupId,
 ) -> bool {
     let pinned = if decode_stage {
-        &placement.decode_affinity
+        &dispatch.decode_affinity
     } else {
-        &placement.affinity
+        &dispatch.affinity
     };
     pinned
         .get(&(request, bound.to_owned()))
@@ -1199,7 +1199,7 @@ fn worker_phases(info: &MainProcessInfo) -> Vec<PhaseKind> {
 ///
 /// The candidates are the executors that serve the call's component, minus the
 /// prefill-only executors for a decode-stage call: today's
-/// `Placement::component_target` rule, presented instead of decided.
+/// `Dispatch::component_target` rule, presented instead of decided.
 pub(crate) fn replicas(
     scheduler: &Scheduler,
     request: RequestKey,
@@ -1212,13 +1212,13 @@ pub(crate) fn replicas(
 }
 
 /// The executors [`replicas`] offers, in the same order and of the same length:
-/// the mechanism's half of a placement decision.
+/// the mechanism's half of a dispatch decision.
 ///
 /// A policy's `place` answers an index into [`replicas`]; the mechanism turns
 /// that index into the executor it binds. Both come from [`replica_facts`], so the
 /// filter that decides which replicas are candidates cannot differ between the
 /// view a policy saw and the executor the mechanism picks. The second element is
-/// the component the executor binds for the call, which a placement records with
+/// the component the executor binds for the call, which a dispatch records with
 /// the executor.
 pub(crate) fn replica_targets(
     scheduler: &Scheduler,
@@ -1244,7 +1244,7 @@ fn replica_facts(
         request,
         kind,
         scheduler
-            .placement
+            .dispatch
             .worker_candidates(&scheduler.executor, &scheduler.info, kind),
     )
 }
@@ -1269,26 +1269,26 @@ fn candidate_facts<'a>(
             | CallKind::Transfer(TransferMode::CacheInstall)
     );
     candidates
-        .filter(|(id, _, _)| !decode_stage || !scheduler.placement.prefill_groups.contains(*id))
+        .filter(|(id, _, _)| !decode_stage || !scheduler.dispatch.prefill_groups.contains(*id))
         .enumerate()
         .map(|(index, (worker, bound, main_process_info))| {
             let view = replica_view(ReplicaFacts {
                 index,
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(main_process_info),
-                resident_requests: resident_requests(&scheduler.placement, worker),
+                resident_requests: resident_requests(&scheduler.dispatch, worker),
                 // The executor reports whether an executor's queue has room, not
                 // how many rows that is; a plan may submit one call's worth.
                 capacity: u32::from(world.has_capacity(worker)),
                 holds_request: holds_request(
-                    &scheduler.placement,
+                    &scheduler.dispatch,
                     request,
                     bound,
                     decode_stage,
                     worker,
                 ),
-                prefills_only: scheduler.placement.prefill_groups.contains(worker),
-                holds_component: holds_component(&scheduler.placement, request, worker),
+                prefills_only: scheduler.dispatch.prefill_groups.contains(worker),
+                holds_component: holds_component(&scheduler.dispatch, request, worker),
             });
             (view, worker.clone(), bound.to_owned())
         })
@@ -1332,10 +1332,10 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
                 index,
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(info),
-                resident_requests: resident_requests(&scheduler.placement, worker),
+                resident_requests: resident_requests(&scheduler.dispatch, worker),
                 capacity: u32::from(world.has_capacity(worker)),
                 holds_request: false,
-                prefills_only: scheduler.placement.prefill_groups.contains(worker),
+                prefills_only: scheduler.dispatch.prefill_groups.contains(worker),
                 holds_component: false,
             })
         })
@@ -1512,7 +1512,7 @@ pub(crate) fn arrival(
 
 /// A resident request's next call on a block and the replicas that may run it,
 /// for `place`: the first resident request that has a next call and a replica.
-pub(crate) fn placement(scheduler: &Scheduler) -> Option<(CallView, Vec<ReplicaView>)> {
+pub(crate) fn dispatch(scheduler: &Scheduler) -> Option<(CallView, Vec<ReplicaView>)> {
     for id in &scheduler.running_order {
         let Some(state) = scheduler.running.get(id) else {
             continue;
@@ -1545,7 +1545,7 @@ pub(crate) fn trial_state(
         room: room(scheduler, step),
         shortage: shortage_now(scheduler),
         arrival: None,
-        call: placement(scheduler),
+        call: dispatch(scheduler),
         expert_load: expert_load_of(scheduler),
     }
 }
@@ -1558,7 +1558,7 @@ pub(crate) fn trial_state_with_ranks(
     recorded: &RecordedTable,
     ranks: Vec<RankView>,
 ) -> TrialState {
-    let call = placement(scheduler);
+    let call = dispatch(scheduler);
     let arrival = arrival(scheduler, ranks.clone());
     let mut snapshot = snapshot(scheduler, step, recorded);
     snapshot.ranks = ranks;

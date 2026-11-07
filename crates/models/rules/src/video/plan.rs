@@ -43,7 +43,9 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use super::{Canvas, VideoTask};
-use super::{ConditionMedia, ConditionPacking, ConditionVision, FrameClips, ImageFit, MediaLocator};
+use super::{
+    ConditionMedia, ConditionPacking, ConditionVision, FrameClips, ImageFit, MediaLocator,
+};
 use super::{ReferenceLimits, ServedCanvas, VideoCondition, VisionGrid};
 
 /// Short edge of the adapt_shape_v1 canvas rule, in pixels.

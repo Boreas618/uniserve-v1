@@ -406,9 +406,9 @@ impl ClipEncoder {
         // request's first step: a tile is independent of every other, and only the stitch reads two
         // of them. So a rank encodes its share into its own blocks, the blocks are gathered, and
         // every rank stitches all of them, which is what its rows of the prefix read.
-        let (rank, ranks) = f
-            .group
-            .map_or((0, 1), |group| (group.rank() as usize, group.ranks() as usize));
+        let (rank, ranks) = f.group.map_or((0, 1), |group| {
+            (group.rank() as usize, group.ranks() as usize)
+        });
         let share = plan.tiles.len().div_ceil(ranks);
         let block = Shape::new(&[
             raster.shape.dim(0),

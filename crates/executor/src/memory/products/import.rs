@@ -112,7 +112,7 @@ impl ProductStore {
         tensor: &TensorTransfer,
         device: MemoryKind,
         transports: &Transports,
-        placement: OutputPlacement<'_>,
+        dispatch: OutputDispatch<'_>,
         metadata: Option<Metadata>,
         stream: impl Issue,
     ) -> Result<Arc<ProductRead>> {
@@ -209,18 +209,18 @@ impl ProductStore {
             }
             None => {
                 let shapes = HashMap::from([(id, shape.clone())]);
-                let placement = OutputPlacement {
+                let dispatch = OutputDispatch {
                     shapes: Some(&shapes),
-                    ..placement
+                    ..dispatch
                 };
                 let bound = [(reference.clone(), device)];
                 let buffers = if matches!(metadata, Some(Metadata::Feature { .. })) {
-                    let allocations = placement.allocations.ok_or_else(|| {
+                    let allocations = dispatch.allocations.ok_or_else(|| {
                         Error::Invalid("persistent output has no buffer allocation".into())
                     })?;
-                    self.bind_persistent(&mut state, &bound, allocations, placement, true)?
+                    self.bind_persistent(&mut state, &bound, allocations, dispatch, true)?
                 } else {
-                    self.bind_group(&mut state, &bound, placement)?
+                    self.bind_group(&mut state, &bound, dispatch)?
                 };
                 let buffer = buffers.into_iter().next().ok_or_else(|| {
                     Error::Invariant("import destination was not reserved".into())

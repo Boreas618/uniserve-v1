@@ -24,7 +24,7 @@ use std::os::unix::process::CommandExt as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use ::storage::protocol::{Access, Claim, Key, Placement, Role, Scope, StorageRecord};
+use ::storage::protocol::{Access, Claim, Key, Location, Role, Scope, StorageRecord};
 use ::storage::transport::{Connection, Socket};
 use serde::{Deserialize, Serialize};
 
@@ -544,13 +544,13 @@ impl Server {
             })
         };
         // A tensor lies where its storage lies.
-        let locations: HashMap<u64, Placement> = handed
+        let locations: HashMap<u64, Location> = handed
             .storages
             .iter()
-            .map(|(id, record, _)| (*id, record.placement))
+            .map(|(id, record, _)| (*id, record.location))
             .collect();
         let mut tensors = HashMap::with_capacity(handed.tensors.len());
-        let mut copies: HashMap<Key, Vec<Placement>> = HashMap::new();
+        let mut copies: HashMap<Key, Vec<Location>> = HashMap::new();
         for (key, tensor) in handed.tensors {
             let location = *locations.get(&tensor.storage).ok_or_else(|| {
                 io::Error::new(
@@ -705,7 +705,7 @@ mod tests {
     use std::os::fd::IntoRawFd as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use ::storage::protocol::{Item, Mode, Placement, TensorRecord};
+    use ::storage::protocol::{Item, Location, Mode, TensorRecord};
     use ::storage::{Client, socket};
 
     use super::*;
@@ -780,7 +780,7 @@ mod tests {
                 }],
                 &[(
                     StorageRecord {
-                        placement: Placement::Host { numa_node: None },
+                        location: Location::Host { numa_node: None },
                         bytes: 4,
                         segment: None,
                         fabric: None,
@@ -823,7 +823,7 @@ mod tests {
                     }],
                     &[(
                         StorageRecord {
-                            placement: Placement::Host { numa_node: None },
+                            location: Location::Host { numa_node: None },
                             bytes: 4,
                             segment: None,
                             fabric: None,

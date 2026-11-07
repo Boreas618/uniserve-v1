@@ -20,7 +20,8 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use ipc::{
-    CallKind, ComponentInfo, MediaCall, OutputInfo, VideoDenoiserInfo, MainProcessEndpoint, MainProcessInfo,
+    CallKind, ComponentInfo, MainProcessEndpoint, MainProcessInfo, MediaCall, OutputInfo,
+    VideoDenoiserInfo,
 };
 
 use super::{
@@ -1567,7 +1568,7 @@ mod tests {
     ///
     /// The figures are the caller's deployment, not a made-up device: `E2E_TOTAL` is the device the
     /// runs plan into, the graph range is the two pools the run logged, and `mem_fraction_static`
-    /// is 0.7 as the run's own placement stated.
+    /// is 0.7 as the run's own rank layout stated.
     ///
     /// What this case models is a plan whose grant binds - no token capacity, so the pool is sized
     /// by the storage left rather than by the model's context. The served deployment is not that

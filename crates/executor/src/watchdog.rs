@@ -168,8 +168,11 @@ impl Watchdog {
     /// Forgets the reports of ranks that no longer run a job, so that the map
     /// does not grow with every job a long-serving process performs.
     pub fn settled(&mut self, running: &[Running]) {
-        self.reported
-            .retain(|rank, since| running.iter().any(|job| job.rank == *rank && job.since == *since));
+        self.reported.retain(|rank, since| {
+            running
+                .iter()
+                .any(|job| job.rank == *rank && job.since == *since)
+        });
     }
 }
 
@@ -191,8 +194,14 @@ mod tests {
 
     #[test]
     fn the_stall_bound_is_half_the_watchdog_timeout() {
-        assert_eq!(stall_bound(Duration::from_secs(30)), Duration::from_secs(15));
-        assert_eq!(stall_bound(Duration::from_secs(1)), Duration::from_millis(500));
+        assert_eq!(
+            stall_bound(Duration::from_secs(30)),
+            Duration::from_secs(15)
+        );
+        assert_eq!(
+            stall_bound(Duration::from_secs(1)),
+            Duration::from_millis(500)
+        );
     }
 
     #[test]
@@ -240,7 +249,10 @@ mod tests {
         let watchdog = watchdog();
         let now = Instant::now();
         let job = never_shadowed(0, 1, now);
-        assert_eq!(watchdog.deadline(Some(job)), Some(now + Duration::from_secs(15)));
+        assert_eq!(
+            watchdog.deadline(Some(job)),
+            Some(now + Duration::from_secs(15))
+        );
     }
 
     #[test]

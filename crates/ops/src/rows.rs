@@ -101,7 +101,7 @@ pub struct Args {
     pub indices: TensorView,
 }
 
-/// Row placement and accumulation.
+/// Row writes and accumulation.
 pub struct Rows;
 
 impl Op for Rows {

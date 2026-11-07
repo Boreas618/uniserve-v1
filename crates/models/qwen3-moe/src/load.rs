@@ -130,7 +130,14 @@ pub fn load_checkpoint(
     options: LoadOptions,
     layout: ScaleLayout,
 ) -> Result<Qwen3Moe> {
-    load_placed(root, partition, loader, options, layout, &ExpertOrder::new())
+    load_placed(
+        root,
+        partition,
+        loader,
+        options,
+        layout,
+        &ExpertOrder::new(),
+    )
 }
 
 /// Each routed layer's logical expert ids in physical slot order, by the module path
@@ -204,9 +211,9 @@ fn slot_row(module: &str, order: &[u32], experts: usize) -> Result<Vec<u32>> {
     }
     let mut row = vec![u32::MAX; experts];
     for (slot, expert) in order.iter().enumerate() {
-        let entry = row.get_mut(*expert as usize).ok_or_else(|| {
-            Error::Config(format!("the order of {module} names expert {expert}"))
-        })?;
+        let entry = row
+            .get_mut(*expert as usize)
+            .ok_or_else(|| Error::Config(format!("the order of {module} names expert {expert}")))?;
         *entry = as_u32(slot, "an expert slot")?;
     }
     if row.contains(&u32::MAX) {
@@ -1433,7 +1440,10 @@ mod tests {
         for order in [&[0, 0, 1][..], &[0, 1][..], &[0, 1, 3][..]] {
             let error = super::slot_row("layers.0.mlp.experts", order, 3)
                 .expect_err("no permutation of three experts");
-            assert!(error.to_string().contains("layers.0.mlp.experts"), "{error}");
+            assert!(
+                error.to_string().contains("layers.0.mlp.experts"),
+                "{error}"
+            );
         }
     }
 

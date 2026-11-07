@@ -213,7 +213,7 @@ impl Ledgers {
 
         // Each retained storage once per deployment that retains it.
         for storage in held {
-            let ::storage::protocol::Placement::Device { gpu } = storage.record.placement else {
+            let ::storage::protocol::Location::Device { gpu } = storage.record.location else {
                 continue;
             };
             if !gpus(&gpu) {

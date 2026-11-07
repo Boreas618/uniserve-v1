@@ -23,7 +23,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use ::storage::protocol::Access;
-use ::storage::{Claim, Client, GpuLedger, Item, Key, Mode, Placement, Role, Scope, StorageRecord};
+use ::storage::{Claim, Client, GpuLedger, Item, Key, Location, Mode, Role, Scope, StorageRecord};
 use ipc::StorageLaunch;
 use platform::{DeviceId, Protection};
 use sha2::{Digest, Sha256};
@@ -283,11 +283,11 @@ impl State {
     /// host storage. A key has a copy at each location that holds it, so
     /// the worker retains, renames and releases the copies at its own
     /// locations and leaves other workers' copies to them.
-    fn locations(&self) -> Vec<Placement> {
+    fn locations(&self) -> Vec<Location> {
         self.gpus
             .values()
-            .map(|gpu| Placement::Device { gpu: *gpu })
-            .chain(std::iter::once(Placement::Host { numa_node: None }))
+            .map(|gpu| Location::Device { gpu: *gpu })
+            .chain(std::iter::once(Location::Host { numa_node: None }))
             .collect()
     }
 }
@@ -393,7 +393,7 @@ impl Retained {
         let part = &spec.parts[index];
         let bytes = part.length as u64;
         let record = StorageRecord {
-            placement: Placement::Device { gpu },
+            location: Location::Device { gpu },
             bytes,
             // The ledgers book the segment's storages together, as the cache's.
             segment: Some(::storage::Segment {
@@ -561,22 +561,22 @@ impl Retained {
             .ok_or_else(|| Error::Interface("a retained weight names no storage".into()))?;
         // A weight is the Storage Server's retained storage, mapped read-only by its shareable
         // handle: the publisher allocates an exportable device block, copies the bytes in, exports
-        // it and records `Placement::Device`, and a kernel then reads the weight at a device
+        // it and records `Location::Device`, and a kernel then reads the weight at a device
         // address with no copy at load time (4.1).
         //
-        // A record that states Host placement is refused rather than mapped: host storage
+        // A record that states Host location is refused rather than mapped: host storage
         // registered with the device is addressable from a kernel, but every forward would read the
         // model's bytes across the CPU link - which is the defect this path exists to remove, and a
         // silent fallback would hide it behind a slow run instead of naming it.
-        let storage = match record.placement {
-            ::storage::Placement::Host { .. } => {
+        let storage = match record.location {
+            ::storage::Location::Host { .. } => {
                 return Err(Error::Interface(format!(
                     "the weight {} is published as host storage; a weight is retained as a device \
-                     block (Placement::Device) and mapped by handle, so it must be republished",
+                     block (Location::Device) and mapped by handle, so it must be republished",
                     String::from_utf8_lossy(&key.0)
                 )));
             }
-            ::storage::Placement::Device { .. } => Storage::import(
+            ::storage::Location::Device { .. } => Storage::import(
                 descriptor,
                 record.bytes as usize,
                 device,
@@ -645,7 +645,7 @@ impl Retained {
             .iter()
             .filter(|tensor| {
                 tensor.access == Access::Exclusive
-                    && tensor.placement == Placement::Device { gpu }
+                    && tensor.location == Location::Device { gpu }
                     && self.retains(tensor)
                     && tensor
                         .retainers
@@ -944,7 +944,7 @@ impl ExclusiveStorage for &Retained {
                             (!worlds.is_empty()).then(|| {
                                 format!(
                                     "{} bytes on {:?} in worlds {worlds:?}",
-                                    tensor.storage_bytes, tensor.placement
+                                    tensor.storage_bytes, tensor.location
                                 )
                             })
                         })
@@ -983,11 +983,11 @@ impl ExclusiveStorage for &Retained {
         for (spec, (name, key, gpu)) in specs.iter().zip(&keyed) {
             let created = !found.contains_key(key);
             let storage = match found.remove(key) {
-                Some((record, descriptor)) => match record.placement {
-                    ::storage::Placement::Host { .. } => {
+                Some((record, descriptor)) => match record.location {
+                    ::storage::Location::Host { .. } => {
                         Storage::map_host(descriptor, record.bytes as usize, spec.device, true)?
                     }
-                    ::storage::Placement::Device { .. } => Storage::import(
+                    ::storage::Location::Device { .. } => Storage::import(
                         descriptor,
                         record.bytes as usize,
                         spec.device,
@@ -1000,7 +1000,7 @@ impl ExclusiveStorage for &Retained {
                         Storage::retainable(spec.device, spec.bytes, spec.access)?;
                     let bytes = storage.bytes() as u64;
                     let record = StorageRecord {
-                        placement: Placement::Device { gpu: *gpu },
+                        location: Location::Device { gpu: *gpu },
                         segment: None,
                         bytes,
                         fabric: None,
@@ -1165,7 +1165,7 @@ impl crate::memory::weights::WeightStorage for Retained {
         // tensor states the weight's true length, and the tail of the last granule
         // is never read.
         let record = ::storage::StorageRecord {
-            placement: Placement::Device { gpu },
+            location: Location::Device { gpu },
             segment: None,
             bytes: staging.bytes() as u64,
             fabric: None,
@@ -1215,7 +1215,11 @@ impl Retained {
     }
 
     /// The mapped storage of the weight retained under `key` on `device`, when the server holds it.
-    pub(crate) fn mapped_weight(&self, device: DeviceId, key: &[u8; 32]) -> Result<Option<Arc<Storage>>> {
+    pub(crate) fn mapped_weight(
+        &self,
+        device: DeviceId,
+        key: &[u8; 32],
+    ) -> Result<Option<Arc<Storage>>> {
         let key = Self::device_key(key, &lock(&self.state).gpu(device)?);
         self.weight(device, key)
     }
@@ -1255,7 +1259,7 @@ impl Retained {
         let mut state = lock(&self.state);
         let gpu = state.gpu(device)?;
         let record = ::storage::StorageRecord {
-            placement: Placement::Device { gpu },
+            location: Location::Device { gpu },
             segment: None,
             bytes: staging.bytes() as u64,
             fabric: None,
@@ -1332,7 +1336,11 @@ impl Retained {
             // is one nothing reads, and the allocation lives on behind the old address.
         }
         let moved = released.len();
-        self.release_keys(&mut state, &released, "ending the retention of replaced weights")?;
+        self.release_keys(
+            &mut state,
+            &released,
+            "ending the retention of replaced weights",
+        )?;
         Ok(moved)
     }
 
@@ -1387,7 +1395,7 @@ impl Retained {
         // published: a half-written page would be read as a valid one.
         stream.synchronize()?;
         let record = ::storage::StorageRecord {
-            placement: Placement::Device { gpu },
+            location: Location::Device { gpu },
             segment: None,
             bytes: staging.bytes() as u64,
             fabric: None,
@@ -1521,7 +1529,9 @@ impl Retained {
                 "the standby worker found no {} of its predecessor's shape: its scope holds no \
                  segment of these lengths in world {}",
                 spec.name,
-                spec.parts.first().map_or(self.world, |part| part.segment.world),
+                spec.parts
+                    .first()
+                    .map_or(self.world, |part| part.segment.world),
             )));
         }
         let storage = Storage::segmented(spec.device, &spec.lengths(), spec.access)?;
@@ -1651,11 +1661,11 @@ impl Retained {
                 .position(|key| *key == tensor.key)
                 .ok_or_else(|| Error::Interface("an unasked storage was found".into()))?;
             let spec = &specs[index];
-            let mapped_storage = match record.placement {
-                ::storage::Placement::Host { .. } => {
+            let mapped_storage = match record.location {
+                ::storage::Location::Host { .. } => {
                     Storage::import_host(descriptor, record.bytes as usize, spec.device)?
                 }
-                ::storage::Placement::Device { .. } => Storage::import(
+                ::storage::Location::Device { .. } => Storage::import(
                     descriptor,
                     record.bytes as usize,
                     spec.device,

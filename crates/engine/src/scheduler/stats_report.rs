@@ -568,7 +568,9 @@ mod tests {
         assert_eq!(snapshot.max_queue_wait_us, 9_000);
         assert_eq!(snapshot.prefix_cache_stats.base.queries, 2_560);
         assert_eq!(snapshot.prefix_cache_stats.base.hits, 512);
-        let worker = snapshot.worker_forward_stats.expect("executor stats present");
+        let worker = snapshot
+            .worker_forward_stats
+            .expect("executor stats present");
         assert_eq!(worker.component_us.get("text_model_forward"), Some(&42));
         assert_eq!(worker.flashinfer_decode_plan_calls, 5);
         assert_eq!(worker.flashinfer_decode_plan_reuses, 120);
@@ -638,7 +640,9 @@ mod tests {
         let mut reporter = SchedulerStatsReporter::default();
         let snapshot = reporter.snapshot(&stats);
 
-        let worker = snapshot.worker_forward_stats.expect("executor stats present");
+        let worker = snapshot
+            .worker_forward_stats
+            .expect("executor stats present");
         assert_eq!(worker.attention_backend_counts.get("flashinfer"), Some(&9));
         assert_eq!(worker.cuda_graph_runtime_mode_counts.get("graph"), Some(&5));
 

@@ -20,7 +20,7 @@ use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use ipc::{Locator, TransferTransport, MainProcessEndpoint};
+use ipc::{Locator, MainProcessEndpoint, TransferTransport};
 use platform::{
     DeviceGuard, DeviceId, Event, IpcEventHandle, PeerMapping, ShareableHandle, SourceOrder,
     Stream, memset_d32,
@@ -570,7 +570,7 @@ struct ExportState {
     submitted: bool,
 }
 
-/// Span placement of an export inside its allocation.
+/// Span position of an export inside its allocation.
 struct Layout {
     offsets: Vec<u64>,
     lengths: Vec<u64>,

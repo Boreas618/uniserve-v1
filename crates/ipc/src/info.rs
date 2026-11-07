@@ -4,7 +4,7 @@
 //! the loaded rank knows (its endpoint, supported calls, capacities and
 //! component outputs). The engine launched the rank and keeps what it launched
 //! it with (world, devices, transfer mechanisms, queue depth and component
-//! placement), so the report does not echo those back. The engine requires
+//! layout), so the report does not echo those back. The engine requires
 //! every rank of a group to describe the group alike and a replacement rank to
 //! report an identical description apart from its endpoint; the executor then
 //! derives the capacity view the scheduler plans against from the
@@ -297,7 +297,7 @@ impl PrefixCacheInfo {
     }
 
     /// Validates the pool size, page shapes and each group's layer and head
-    /// placement.
+    /// layout.
     ///
     /// Every block size must be a power of two that divides the largest one,
     /// so page-aligned prefix lengths agree across groups. A layer belongs to
@@ -345,7 +345,7 @@ impl PrefixCacheInfo {
     /// Combines the pools of two cache stages that one request may traverse.
     ///
     /// Stages must agree on dtype and on every group's retention policy and
-    /// page shape; their rank-local layer ids and head placement may differ.
+    /// page shape; their rank-local layer ids and head layout may differ.
     /// The combined pool has the smaller unit count, because the scheduler
     /// assigns one set of unit ids valid in both, and per group the union of both stages' layers, which bounds exports.
     pub fn merge(&self, other: &Self) -> ValidationResult<Self> {
@@ -674,7 +674,7 @@ pub struct CapturedImage {
 /// on the report it builds, and the engine takes the report as sent. Launch
 /// values
 /// (world size, devices, transfer mechanisms, queue depth and component
-/// placement) are the engine's and are not reported.
+/// layout) are the engine's and are not reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MainProcessInfo {
     /// Model-declared finite terminal-media computation, when supported.

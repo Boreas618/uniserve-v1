@@ -12,7 +12,7 @@
 //! decision are found by the mechanism and reported through the same type: a
 //! decision naming an object that does not exist, does not fit or cannot be
 //! chosen, work that breaks a hard limit, an expert order that is not a legal
-//! placement, and a resident request starved past `limits().timeout`.
+//! dispatch, and a resident request starved past `limits().timeout`.
 //!
 //! Nothing here is recoverable inside the instance: a policy that trapped is
 //! not called again.

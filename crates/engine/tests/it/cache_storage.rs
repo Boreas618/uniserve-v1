@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 
 use engine::{
     BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Executor,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, FinishReason, SchedulerConfig, SimEngine,
-    SimExecutor, WeightsInFlight, ExecutorGroupId,
+    ExecutorError, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, FinishReason,
+    SchedulerConfig, SimEngine, SimExecutor, WeightsInFlight,
 };
 use engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 use ipc::{BatchCommand, ImageParams, RequestId, SamplingParams};
@@ -295,7 +295,9 @@ impl Executor for Segmented {
                 transfer_context: 0,
             });
             // The device has free what its total leaves beside the process.
-            let free = executors.expert_process.map_or(0, |process| 2_000 - process);
+            let free = executors
+                .expert_process
+                .map_or(0, |process| 2_000 - process);
             results.push(
                 serde_json::json!({
                     "free_bytes": free,
@@ -313,7 +315,13 @@ impl Executor for Segmented {
 
 /// A scheduler over the simulator whose `executors` serve a cache of
 /// segmented planes of 32 units of `BLOCK` tokens.
-fn start(executors: SimExecutors) -> (CommandSender, Arc<Mutex<SimExecutors>>, thread::JoinHandle<()>) {
+fn start(
+    executors: SimExecutors,
+) -> (
+    CommandSender,
+    Arc<Mutex<SimExecutors>>,
+    thread::JoinHandle<()>,
+) {
     start_split(executors, None)
 }
 
@@ -322,7 +330,11 @@ fn start(executors: SimExecutors) -> (CommandSender, Arc<Mutex<SimExecutors>>, t
 fn start_split(
     executors: SimExecutors,
     split: Option<u32>,
-) -> (CommandSender, Arc<Mutex<SimExecutors>>, thread::JoinHandle<()>) {
+) -> (
+    CommandSender,
+    Arc<Mutex<SimExecutors>>,
+    thread::JoinHandle<()>,
+) {
     let mut sim = SimEngine::new();
     sim.set_text_len(10_000);
     sim.set_num_units(SEGMENTS * SEGMENT_UNITS);

@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 
 use ::storage::protocol::{
-    Access, Allocation, ErrorKind, Event, LinkEnd, Placement, Reply, StorageRecord, TransferEnd,
+    Access, Allocation, ErrorKind, Event, LinkEnd, Location, Reply, StorageRecord, TransferEnd,
 };
 
 use crate::{ClientId, Outcome, Server, StorageEntry, StorageId, invalid};
@@ -114,9 +114,9 @@ impl Server {
             let Some(entry) = self.storages.get(&storage) else {
                 continue;
             };
-            let gpu = match (to_host, entry.record.placement, entry.moved_from) {
-                (true, Placement::Device { gpu }, _) if alone => gpu,
-                (false, Placement::Host { .. }, Some(gpu)) if alone => gpu,
+            let gpu = match (to_host, entry.record.location, entry.moved_from) {
+                (true, Location::Device { gpu }, _) if alone => gpu,
+                (false, Location::Host { .. }, Some(gpu)) if alone => gpu,
                 _ => continue,
             };
             items.push(Item {
@@ -193,7 +193,7 @@ impl Server {
                     Ok(descriptor) => {
                         let target = self.add_storage(
                             StorageRecord {
-                                placement: Placement::Host { numa_node: None },
+                                location: Location::Host { numa_node: None },
                                 bytes,
                                 segment: None,
                                 fabric: None,
@@ -254,7 +254,7 @@ impl Server {
             (None, Some(descriptor)) => {
                 let target = self.add_storage(
                     StorageRecord {
-                        placement: Placement::Device { gpu },
+                        location: Location::Device { gpu },
                         bytes,
                         segment: None,
                         fabric: None,
@@ -413,7 +413,7 @@ impl Server {
         let Some(location) = self
             .storages
             .get(&target)
-            .map(|entry| entry.record.placement)
+            .map(|entry| entry.record.location)
         else {
             return 0;
         };
@@ -480,8 +480,8 @@ impl Server {
 /// The storages a move's copy reads and writes, as the Transfer Server maps
 /// them: a device storage on its GPU, a host storage in host storage.
 pub(crate) fn storage_of(record: &StorageRecord) -> LinkEnd {
-    match record.placement {
-        Placement::Device { gpu } => LinkEnd::Device { gpu },
-        Placement::Host { .. } => LinkEnd::Host,
+    match record.location {
+        Location::Device { gpu } => LinkEnd::Device { gpu },
+        Location::Host { .. } => LinkEnd::Host,
     }
 }

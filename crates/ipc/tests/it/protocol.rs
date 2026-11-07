@@ -1556,7 +1556,7 @@ fn a_component_round_trips_with_and_without_a_distribution() {
     }
 }
 
-/// A component's placement reaches its ranks in the launch descriptor with
+/// A component's layout reaches its ranks in the launch descriptor with
 /// every sequence-parallel strategy, a Ulysses group's head projection
 /// included.
 #[test]
@@ -1860,7 +1860,11 @@ fn request_fixtures() -> Vec<MainProcessRequest> {
             .expect("one batch per call kind"),
     );
     submit.set_message_id(Some(91));
-    vec![MainProcessRequest::info(), submit, MainProcessRequest::close()]
+    vec![
+        MainProcessRequest::info(),
+        submit,
+        MainProcessRequest::close(),
+    ]
 }
 
 fn full_caps() -> MainProcessInfo {
@@ -2149,7 +2153,9 @@ fn a_frame_decodes_only_as_the_message_it_carries() {
     // A message cut short, as a frame of another build may be, is refused:
     // the frame's length field counts the shortened message, so a channel
     // receives it whole and its decoding fails.
-    let mut cut = Frame::encode(&MainProcessResponse::ok()).unwrap().into_bytes();
+    let mut cut = Frame::encode(&MainProcessResponse::ok())
+        .unwrap()
+        .into_bytes();
     cut.pop();
     let length = u32::try_from(cut.len() - Frame::LENGTH_BYTES).unwrap();
     cut[..Frame::LENGTH_BYTES].copy_from_slice(&length.to_le_bytes());

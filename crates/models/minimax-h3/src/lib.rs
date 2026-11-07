@@ -25,7 +25,7 @@
 //!
 //! [`partition::Partition`] is the deployment's *mathematical* split - the denoiser's Ulysses
 //! sequence degree and the text encoder's tensor-parallel position - not a runner, a communicator
-//! or a placement. The layers apply it; the executor owns every runtime object.
+//! or a rank layout. The layers apply it; the executor owns every runtime object.
 //!
 //! ## The model
 //!

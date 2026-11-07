@@ -51,10 +51,7 @@ enum Action {
 #[derive(Clone)]
 pub enum Change {
     /// Start a session on the rank.
-    Start {
-        start: Box<SessionStart>,
-        rank: u32,
-    },
+    Start { start: Box<SessionStart>, rank: u32 },
     /// End session `session` for `reason`.
     Stop {
         session: u64,

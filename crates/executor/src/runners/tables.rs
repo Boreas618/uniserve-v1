@@ -62,10 +62,9 @@ impl Tables {
             .iter()
             .map(|table| {
                 let elements = table.shape.dims().iter().product::<u64>();
-                let width = table
-                    .dtype
-                    .bytes()
-                    .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", table.dtype)))?;
+                let width = table.dtype.bytes().ok_or_else(|| {
+                    Error::Invalid(format!("{} has no whole-byte size", table.dtype))
+                })?;
                 width
                     .checked_mul(elements)
                     .ok_or_else(|| Error::Invalid("a state table's extent overflows".into()))
@@ -115,12 +114,9 @@ impl Tables {
         if missing.is_empty() {
             return Ok(());
         }
-        let allocator = self
-            .allocator
-            .as_ref()
-            .ok_or(Error::State(
-                "the runner has no pools to allocate its model's tables from",
-            ))?;
+        let allocator = self.allocator.as_ref().ok_or(Error::State(
+            "the runner has no pools to allocate its model's tables from",
+        ))?;
         let allocator = Arc::clone(allocator);
         let mut host: Vec<Vec<u8>> = Vec::with_capacity(missing.len());
         for table in &missing {
@@ -248,7 +244,6 @@ impl Tables {
             })
             .collect()
     }
-
 }
 
 #[cfg(test)]

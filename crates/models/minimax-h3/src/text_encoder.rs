@@ -1307,7 +1307,11 @@ impl TextEncoder {
             .collect::<Vec<_>>();
         let plan = self.plan(layout.tokens, &grids)?;
         let mut buffers = Buffers::plan(&plan, self.dtype);
-        let largest = plan.images.iter().enumerate().max_by_key(|(_, patches)| **patches);
+        let largest = plan
+            .images
+            .iter()
+            .enumerate()
+            .max_by_key(|(_, patches)| **patches);
         if let Some((index, &patches)) = largest {
             for buffer in Buffers::tower_plan(&self.config.vision, patches, self.dtype) {
                 buffers.push(Buffer {

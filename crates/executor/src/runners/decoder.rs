@@ -988,7 +988,9 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 },
             )
             .map_err(Error::from)?;
-        self.keep_tail(forward, request, index, &clip, channels, height, width, successor)?;
+        self.keep_tail(
+            forward, request, index, &clip, channels, height, width, successor,
+        )?;
         self.staged_keep = Some(splice.keep);
         self.staged_first = splice.first;
         Ok(())
@@ -1236,7 +1238,12 @@ impl<M: Decoder + Send + Sync> Runner for DecoderRunner<M> {
         let generation = self.lifecycle.generation.number();
         let mut jobs = Vec::new();
         for bucket in self.capture_order() {
-            if self.lifecycle.graphs.captured_for(bucket, generation).is_none() {
+            if self
+                .lifecycle
+                .graphs
+                .captured_for(bucket, generation)
+                .is_none()
+            {
                 jobs.push(Job::Capture {
                     runner: self.id,
                     bucket,

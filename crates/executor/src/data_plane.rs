@@ -24,9 +24,8 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use crate::capacity::device::{DeviceBooking, DeviceBudget};
-use crate::profiling::session::Change;
 use crate::batch::Submission;
+use crate::capacity::device::{DeviceBooking, DeviceBudget};
 use crate::completion::Outcome;
 use crate::device::Executor;
 use crate::memory::allocation::Backing as _;
@@ -35,6 +34,7 @@ use crate::memory::prefix_cache::planes::CachePlanes;
 use crate::memory::reload::{Matching, Reloading, Walk, WeightPair, paired};
 use crate::memory::retained::Retained;
 use crate::memory::weights::{LoadedWeight, WeightStore, retained_key};
+use crate::profiling::session::Change;
 use crate::{Error, Result, lock};
 
 /// What a load of the served model reads: which checkpoint, and which expert sits in which slot.
@@ -408,8 +408,9 @@ impl DataPlane {
         let session = value["session"]
             .as_u64()
             .ok_or_else(|| Error::Invalid("profile_release names no session".into()))?;
-        let collector: proto::profile::Collector = serde_json::from_value(value["collector"].clone())
-            .map_err(|error| rejected("profile_release", error))?;
+        let collector: proto::profile::Collector =
+            serde_json::from_value(value["collector"].clone())
+                .map_err(|error| rejected("profile_release", error))?;
         let reason = value["reason"].as_str().unwrap_or("released").to_owned();
         let mut answers = Vec::with_capacity(self.ranks.len());
         for rank in &self.ranks {
@@ -446,7 +447,11 @@ impl DataPlane {
     /// The hexadecimal key seed of each of `rank`'s cache groups for weights of `identity`, when it
     /// copies pages through a host KV cache; none when it keeps none, which keys nothing.
     fn page_contents(rank: &Rank, identity: &str) -> Vec<String> {
-        let Some(cache) = rank.cache.as_ref().filter(|cache| lock(cache).copies_pages()) else {
+        let Some(cache) = rank
+            .cache
+            .as_ref()
+            .filter(|cache| lock(cache).copies_pages())
+        else {
             return Vec::new();
         };
         let plan = Arc::clone(lock(cache).planes());
@@ -580,22 +585,27 @@ impl DataPlane {
     /// on as they did.
     pub fn load(&self, mut planned: Planned) -> Result<Planned> {
         let target = planned.target.clone();
-        let loads: Vec<(Arc<dyn ModelLoad>, Arc<Retained>, platform::DeviceId, Vec<LoadedWeight>)> =
-            self.ranks
-                .iter()
-                .map(|rank| {
-                    let rank = lock(rank);
-                    (
-                        Arc::clone(&rank.model),
-                        Arc::clone(&rank.storage),
-                        rank.device,
-                        rank.serving.clone(),
-                    )
-                })
-                .collect();
+        let loads: Vec<(
+            Arc<dyn ModelLoad>,
+            Arc<Retained>,
+            platform::DeviceId,
+            Vec<LoadedWeight>,
+        )> = self
+            .ranks
+            .iter()
+            .map(|rank| {
+                let rank = lock(rank);
+                (
+                    Arc::clone(&rank.model),
+                    Arc::clone(&rank.storage),
+                    rank.device,
+                    rank.serving.clone(),
+                )
+            })
+            .collect();
         planned.loaded = true;
-        let results: Vec<std::result::Result<Vec<LoadedWeight>, String>> =
-            std::thread::scope(|scope| {
+        let results: Vec<std::result::Result<Vec<LoadedWeight>, String>> = std::thread::scope(
+            |scope| {
                 let handles: Vec<_> = loads
                     .iter()
                     .map(|(model, storage, device, serving)| {
@@ -623,7 +633,8 @@ impl DataPlane {
                             .unwrap_or_else(|_| Err("a rank's weight load panicked".to_owned()))
                     })
                     .collect()
-            });
+            },
+        );
         let mut failure = None;
         for (rank, result) in planned.ranks.iter().zip(results) {
             match result {
@@ -867,7 +878,8 @@ impl DataPlane {
         let value: serde_json::Value = if payload.is_empty() {
             serde_json::Value::Null
         } else {
-            serde_json::from_str(payload).map_err(|error| rejected("an operation's payload", error))?
+            serde_json::from_str(payload)
+                .map_err(|error| rejected("an operation's payload", error))?
         };
         match name {
             "uniserve.cache_storage" => self.cache_storage(),
@@ -910,7 +922,10 @@ impl DataPlane {
             return Err(Error::State("an expert redistribution is already prepared"));
         }
         let layers = {
-            let rank = self.ranks.first().ok_or(Error::State("no rank is served"))?;
+            let rank = self
+                .ranks
+                .first()
+                .ok_or(Error::State("no rank is served"))?;
             lock(rank).model.expert_layers()
         };
         for (layer, order) in &orders {
@@ -1057,8 +1072,8 @@ impl DataPlane {
     ///
     /// When the payload names no path or slot, or the path holds no adapter; nothing stays loaded.
     pub fn load_adapter(&self, payload: &str) -> Result<Vec<String>> {
-        let body: serde_json::Value =
-            serde_json::from_str(payload).map_err(|error| rejected("an adapter's payload", error))?;
+        let body: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|error| rejected("an adapter's payload", error))?;
         let slot = body["adapter"]
             .as_u64()
             .and_then(|slot| u32::try_from(slot).ok())
@@ -1109,12 +1124,16 @@ impl DataPlane {
                 self.unload_slot(slot, &mut adapters);
                 return Err(error);
             }
-            results.push(
-                serde_json::json!({ "adapter": slot, "tensors": regions.len() }).to_string(),
-            );
+            results
+                .push(serde_json::json!({ "adapter": slot, "tensors": regions.len() }).to_string());
             adapters.push(Adapter { keys, regions });
         }
-        tracing::info!(slot, path, tensors = names.len(), "loaded an adapter's tensors");
+        tracing::info!(
+            slot,
+            path,
+            tensors = names.len(),
+            "loaded an adapter's tensors"
+        );
         lock(&self.adapters).insert(slot, adapters);
         Ok(results)
     }
@@ -1122,10 +1141,7 @@ impl DataPlane {
     fn unload_slot(&self, slot: u32, adapters: &mut Vec<Adapter>) {
         for (rank, adapter) in self.ranks.iter().zip(adapters.drain(..)) {
             let rank = lock(rank);
-            if let Err(error) = rank
-                .storage
-                .forget_weights(rank.device, &adapter.keys)
-            {
+            if let Err(error) = rank.storage.forget_weights(rank.device, &adapter.keys) {
                 tracing::warn!(%error, slot, "an adapter's storage was not released");
             }
             drop(adapter.regions);
@@ -1138,8 +1154,8 @@ impl DataPlane {
     ///
     /// When the payload names no slot.
     pub fn unload_adapter(&self, payload: &str) -> Result<Vec<String>> {
-        let body: serde_json::Value =
-            serde_json::from_str(payload).map_err(|error| rejected("an adapter's payload", error))?;
+        let body: serde_json::Value = serde_json::from_str(payload)
+            .map_err(|error| rejected("an adapter's payload", error))?;
         let slot = body["adapter"]
             .as_u64()
             .and_then(|slot| u32::try_from(slot).ok())

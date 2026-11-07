@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crate::protocol::{
     Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage, Item, Key, Link,
-    Listing, Mode, Placement, Priority, Region, Registered, Reply, Request, Role, Scope,
+    Listing, Location, Mode, Priority, Region, Registered, Reply, Request, Role, Scope,
     ServerMessage, Span, StorageRecord, TensorRecord, Throttle, TransferTotal, VERSION, Welcome,
 };
 use crate::transport::Connection;
@@ -325,7 +325,7 @@ impl Client {
     /// See [`Request::Retain`]: retain the copies of `keys` at the
     /// locations `at` (every copy when empty). Returns how many tensors
     /// were released.
-    pub fn retain(&mut self, keys: Vec<Key>, at: Vec<Placement>) -> Result<u64> {
+    pub fn retain(&mut self, keys: Vec<Key>, at: Vec<Location>) -> Result<u64> {
         match Self::expect(self.call(&Request::Retain { keys, at }, &[])?)?.reply {
             Reply::Retained { released } => Ok(released),
             other => Err(unexpected("retain", &other)),
@@ -334,7 +334,7 @@ impl Client {
 
     /// See [`Request::Get`]: the copies of `keys` at the locations `at`
     /// (every copy when empty).
-    pub fn get(&mut self, keys: Vec<Key>, mode: Mode, at: Vec<Placement>) -> Result<Got> {
+    pub fn get(&mut self, keys: Vec<Key>, mode: Mode, at: Vec<Location>) -> Result<Got> {
         let answer = Self::expect(self.call(&Request::Get { keys, mode, at }, &[])?)?;
         Self::got(answer)
     }
@@ -408,7 +408,7 @@ impl Client {
 
     /// See [`Request::Rekey`]: move the copies at the locations `at`
     /// (every copy when empty).
-    pub fn rekey(&mut self, moves: Vec<(Key, Key)>, at: Vec<Placement>) -> Result<()> {
+    pub fn rekey(&mut self, moves: Vec<(Key, Key)>, at: Vec<Location>) -> Result<()> {
         match Self::expect(self.call(&Request::Rekey { moves, at }, &[])?)?.reply {
             Reply::Rekeyed => Ok(()),
             other => Err(unexpected("rekey", &other)),

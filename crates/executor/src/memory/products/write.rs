@@ -12,9 +12,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
-/// Scheduler placement of a group of outputs. Maps are keyed by buffer id.
+/// Scheduler dispatch of a group of outputs. Maps are keyed by buffer id.
 #[derive(Clone, Copy, Default)]
-pub struct OutputPlacement<'a> {
+pub struct OutputDispatch<'a> {
     /// Request slots of the owning requests, for relay outputs.
     pub request_slots: Option<&'a HashMap<RequestKey, usize>>,
     /// Buffer-pool allocations of persistent outputs.
@@ -46,13 +46,13 @@ impl ProductStore {
     pub fn bind_output_groups(
         &self,
         groups: &[Vec<(TensorRef, MemoryKind)>],
-        placement: OutputPlacement<'_>,
+        dispatch: OutputDispatch<'_>,
     ) -> Result<Vec<Vec<ProductBuffer>>> {
         let mut state = lock(&self.state);
         let mut outputs = Vec::new();
         let mut acquired = Vec::new();
         for group in groups.iter().filter(|group| !group.is_empty()) {
-            match self.bind_group(&mut state, group, placement) {
+            match self.bind_group(&mut state, group, dispatch) {
                 Ok(buffers) => {
                     acquired.extend(buffers.iter().cloned());
                     outputs.push(buffers);
@@ -71,10 +71,10 @@ impl ProductStore {
     pub fn bind_outputs(
         &self,
         bindings: &[(TensorRef, MemoryKind)],
-        placement: OutputPlacement<'_>,
+        dispatch: OutputDispatch<'_>,
     ) -> Result<Vec<ProductBuffer>> {
         let mut state = lock(&self.state);
-        self.bind_group(&mut state, bindings, placement)
+        self.bind_group(&mut state, bindings, dispatch)
     }
 
     /// Reserve encoder features in their pool allocations.
@@ -82,14 +82,14 @@ impl ProductStore {
         &self,
         bindings: &[(TensorRef, MemoryKind)],
         allocations: &HashMap<BufferId, BufferAllocation>,
-        placement: OutputPlacement<'_>,
+        dispatch: OutputDispatch<'_>,
     ) -> Result<Vec<ProductBuffer>> {
         let mut state = lock(&self.state);
-        self.bind_persistent(&mut state, bindings, allocations, placement, true)
+        self.bind_persistent(&mut state, bindings, allocations, dispatch, true)
     }
 
-    pub(super) fn logical_shape(reference: &TensorRef, placement: OutputPlacement<'_>) -> Vec<u64> {
-        placement
+    pub(super) fn logical_shape(reference: &TensorRef, dispatch: OutputDispatch<'_>) -> Vec<u64> {
+        dispatch
             .shapes
             .and_then(|shapes| shapes.get(&reference.buffer_id()))
             .cloned()
@@ -100,20 +100,20 @@ impl ProductStore {
         &self,
         state: &mut State,
         bindings: &[(TensorRef, MemoryKind)],
-        placement: OutputPlacement<'_>,
+        dispatch: OutputDispatch<'_>,
     ) -> Result<Vec<ProductBuffer>> {
         if bindings.is_empty() {
             return Ok(Vec::new());
         }
         let mut persistent = 0;
         for (reference, _) in bindings {
-            let shape = Self::logical_shape(reference, placement);
+            let shape = Self::logical_shape(reference, dispatch);
             if !reference.shape_bound.contains_shape(&shape) {
                 return Err(Error::Invalid(
                     "tensor binding shape disagrees with its logical bounds".into(),
                 ));
             }
-            if let Some(region) = placement
+            if let Some(region) = dispatch
                 .regions
                 .and_then(|regions| regions.get(&reference.buffer_id()))
                 && !within(region, &shape)
@@ -122,7 +122,7 @@ impl ProductStore {
                     "tensor binding region disagrees with its logical bounds".into(),
                 ));
             }
-            if placement
+            if dispatch
                 .allocations
                 .is_some_and(|allocations| allocations.contains_key(&reference.buffer_id()))
             {
@@ -135,12 +135,12 @@ impl ProductStore {
                     "persistent-buffer bindings cannot share a generic group".into(),
                 ));
             }
-            let allocations = placement.allocations.ok_or_else(|| {
-                Error::Invariant("persistent buffers lost their placement".into())
-            })?;
-            return self.bind_persistent(state, bindings, allocations, placement, false);
+            let allocations = dispatch
+                .allocations
+                .ok_or_else(|| Error::Invariant("persistent buffers lost their dispatch".into()))?;
+            return self.bind_persistent(state, bindings, allocations, dispatch, false);
         }
-        if let Some(request_slots) = placement.request_slots {
+        if let Some(request_slots) = dispatch.request_slots {
             return self.bind_relays(state, bindings, request_slots);
         }
         Err(Error::Invalid(
@@ -153,7 +153,7 @@ impl ProductStore {
         state: &mut State,
         bindings: &[(TensorRef, MemoryKind)],
         allocations: &HashMap<BufferId, BufferAllocation>,
-        placement: OutputPlacement<'_>,
+        dispatch: OutputDispatch<'_>,
         feature: bool,
     ) -> Result<Vec<ProductBuffer>> {
         self.reclaim(state)?;
@@ -194,8 +194,8 @@ impl ProductStore {
         let result = (|| -> Result<()> {
             for (reference, device, allocation) in candidates {
                 let dtype = product_dtype(reference.dtype)?;
-                let shape = Self::logical_shape(reference, placement);
-                let region = placement
+                let shape = Self::logical_shape(reference, dispatch);
+                let region = dispatch
                     .regions
                     .and_then(|regions| regions.get(&reference.buffer_id()))
                     .filter(|region| **region != full(&shape))

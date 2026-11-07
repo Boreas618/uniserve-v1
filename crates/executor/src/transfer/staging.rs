@@ -3,7 +3,7 @@
 use ::storage::Key;
 use ::storage::manifest::cache::Page;
 use ::storage::manifest::{Binding, Chunk, Rank};
-use ::storage::protocol::Placement;
+use ::storage::protocol::Location;
 
 use crate::memory::retained::{ExclusiveSpec, Retained};
 use crate::{Error, Result};
@@ -66,7 +66,7 @@ impl Staging {
                 key,
                 storage_offset: offset,
                 binding: Binding::Local {
-                    at: Placement::Host { numa_node: None },
+                    at: Location::Host { numa_node: None },
                 },
             }];
             offset += storage.layout.bytes;

@@ -58,10 +58,7 @@ pub trait Runner: Send {
 
     /// Turns `output`, the answer a replay gave when it launched, into its answer now that its work
     /// has landed.
-    fn landed(
-        &mut self,
-        output: crate::batch::BatchOutput,
-    ) -> Result<crate::batch::BatchOutput> {
+    fn landed(&mut self, output: crate::batch::BatchOutput) -> Result<crate::batch::BatchOutput> {
         Ok(output)
     }
 

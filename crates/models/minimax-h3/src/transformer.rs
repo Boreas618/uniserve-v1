@@ -276,7 +276,9 @@ impl Layer {
     /// The normalization of this layer's attention input, under its `modulation` table.
     fn attention_norm(&self, modulation: TensorView, width: u64) -> Result<ModulatedRmsNorm> {
         let (shift, scale, _) = chunks(modulation, width, 0)?;
-        Ok(ModulatedRmsNorm::new(self.norm1, shift, scale, None, self.eps)?)
+        Ok(ModulatedRmsNorm::new(
+            self.norm1, shift, scale, None, self.eps,
+        )?)
     }
 
     /// The block after attention, over any rows of the layer: `update` is the attention's output
@@ -786,9 +788,9 @@ impl Transformer {
         }
         // A Ulysses group sets each member's heads side by side once its rows are back.
         if partition.ulysses_degree > 1 {
-            programs.launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::wide_descriptor_of(
-                dtype,
-            ));
+            programs.launch::<ops::copy_block::CopyBlock>(
+                &nn::layers::CopyBlock::wide_descriptor_of(dtype),
+            );
         }
 
         // Every projection of the stack: the video and audio entrances, the four of each block's

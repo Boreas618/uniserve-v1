@@ -109,9 +109,9 @@ fn answer<T>(
     what: &str,
     receiver: crossbeam_channel::Receiver<Result<T, String>>,
 ) -> Result<T, String> {
-    receiver
-        .recv_timeout(ANSWER)
-        .unwrap_or_else(|error| panic!("the scheduler did not answer {what} within {ANSWER:?}: {error}"))
+    receiver.recv_timeout(ANSWER).unwrap_or_else(|error| {
+        panic!("the scheduler did not answer {what} within {ANSWER:?}: {error}")
+    })
 }
 
 /// Collects a request's terminal event, answering what ended it.

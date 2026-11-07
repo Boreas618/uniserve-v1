@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, Weak};
 
-use ipc::{Locator, TransferTransport, Wake, MainProcessEndpoint};
+use ipc::{Locator, MainProcessEndpoint, TransferTransport, Wake};
 use platform::{DeviceId, Event, Stream};
 
 use super::backing::TransportBuffer;
@@ -151,7 +151,11 @@ impl<'a> ExportView<'a> {
         })
     }
 
-    pub(super) fn locator(&self, source: &MainProcessEndpoint, transport: TransferTransport) -> Locator {
+    pub(super) fn locator(
+        &self,
+        source: &MainProcessEndpoint,
+        transport: TransferTransport,
+    ) -> Locator {
         Locator {
             source: source.clone(),
             transport,
@@ -643,7 +647,7 @@ pub(super) fn row_span(locator: &Locator, region: Option<&[Range<u64>]>) -> Resu
 ///
 /// Every configured mechanism reads other ranks' exports; a rank publishes
 /// its own products only over its export mechanisms (the outgoing edges of
-/// its placement), which default to all of them.
+/// its rank layout), which default to all of them.
 pub struct Transports {
     transports: BTreeMap<TransportKind, Arc<Transport>>,
     exports: BTreeSet<TransportKind>,

@@ -785,8 +785,8 @@ async fn prepared_successor(
     // Each step of the successor names itself in the reason it gives the predecessor: a
     // failure here is reported as `the successor took the service and gave up: <reason>`,
     // and a transport error alone says what happened but not where.
-    let handed = Listener::resume(listener, next()?)
-        .context("resuming the handed-over HTTP listener")?;
+    let handed =
+        Listener::resume(listener, next()?).context("resuming the handed-over HTTP listener")?;
     let listener = match rebound {
         Some(rebound) => {
             drop(handed);

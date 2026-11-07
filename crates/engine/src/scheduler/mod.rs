@@ -28,7 +28,7 @@
 //! - `inflight`: submitted batches and calls, and request-local completion
 //!   ordering.
 //! - `output`: public events, semantic result resolution, and termination.
-//! - `allocation` and `placement`: storage ownership and executor placement.
+//! - `allocation` and `dispatch`: storage ownership and executor dispatch.
 //! - `control`: cancellation and frontend lifecycle commands.
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
 //! - `image_artifact`: metadata of executor-produced PNG artifacts.
@@ -51,17 +51,17 @@ pub use policy::{
     RoutePolicy, RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
 pub(crate) use run::guidance_prefix_rows;
-pub use stats::{
-    DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, PrefixCacheUsage, PrefixStats,
-    SchedulerStats, TimingStats, ExecutorStats,
-};
-pub use stats_report::SchedulerStatsReporter;
-pub use world::{GroupCache, ParkedCache};
 /// The phases the scheduler plans with, and the id each is numbered with: a rank's plan, a policy's
 /// `Plan` and a batch's phase must all use this table, so it is exported from where the scheduler
 /// keeps it rather than restated by whoever needs a phase id.
 pub use scheduling::guest::view::PhaseKind;
+pub use stats::{
+    DomainStats, EncoderStats, ExecutionDomainStats, ExecutorStats, GeneralStats, PrefixCacheUsage,
+    PrefixStats, SchedulerStats, TimingStats,
+};
+pub use stats_report::SchedulerStatsReporter;
 pub use views::phase_id;
+pub use world::{GroupCache, ParkedCache};
 
 mod admission;
 mod allocation;
@@ -69,6 +69,7 @@ mod batching;
 mod cache_storage;
 mod control;
 mod denoising;
+mod dispatch;
 pub(crate) mod encodings;
 mod execution;
 pub(crate) mod generation;
@@ -78,7 +79,6 @@ mod inflight;
 mod ledger;
 mod mechanism;
 pub(crate) mod output;
-mod placement;
 mod policy;
 mod preemption;
 mod run;
@@ -108,7 +108,7 @@ mod world;
 
 #[cfg(feature = "testing")]
 pub(crate) use crate::executor::Executor;
-pub(crate) use crate::executor::{ExecutionBatch, ExecutorSubmitError, RequestPlacement};
+pub(crate) use crate::executor::{ExecutionBatch, ExecutorSubmitError, RequestDispatch};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -139,19 +139,19 @@ use ipc::UnitId;
 use ipc::{
     BatchCommand, BlockTable as IpcBlockTable, BufferAllocation, BufferId, CacheUnitAllocation,
     Call, CallId, CallKind, CallStatus, DEFAULT_COMPONENT, DType, DecodeRange, DimBound,
-    ForwardBatch, ForwardStats, GenerationParams, NewRequest, RequestKey, SamplingState,
-    ShapeBound, TensorRef, TimingCounters, MainProcessInfo,
+    ForwardBatch, ForwardStats, GenerationParams, MainProcessInfo, NewRequest, RequestKey,
+    SamplingState, ShapeBound, TensorRef, TimingCounters,
 };
 use ipc::{SharedMedia, TokenLogprob};
 use proto::request::MigrationCause;
 
-use crate::executor::{RankBuffer, ExecutorFailure};
+use crate::executor::{ExecutorFailure, RankBuffer};
 use crate::scheduler::image_artifact::png_artifact_info;
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
     UnknownMediaGroup,
 };
-use denoising::{Denoising, LatentPlacement};
+use denoising::{Denoising, LatentDispatch};
 use generation::RequestState;
 use graph::{VideoGraph, product};
 use inflight::{InflightCall, InflightInput, PendingCompletion, PendingFinish};
@@ -479,7 +479,7 @@ pub struct Scheduler {
     inflight: inflight::Inflight,
     /// Resident resource ownership and reservation accounting.
     storage: allocation::Storage,
-    placement: placement::Placement,
+    dispatch: dispatch::Dispatch,
     /// Aggregate capacity view of the loaded executors.
     info: MainProcessInfo,
     generation_limits: crate::GenerationLimits,
@@ -511,10 +511,10 @@ pub struct Scheduler {
     /// `experts`): the one fact the mechanism cannot measure. `None` until the
     /// executor publishes it, so the periodic call asks nothing it cannot state.
     expert_load: Option<scheduling::guest::ExpertLoad>,
-    /// The expert placement the policy last answered, validated and waiting for
+    /// The expert layout the policy last answered, validated and waiting for
     /// the executor's world setup, which applies it (§7.6).
     expert_order: Option<scheduling::guest::ExpertOrder>,
-    /// The step the policy last answered an expert placement on, so the
+    /// The step the policy last answered an expert layout on, so the
     /// mechanism's interval is measured from the decision, not from step zero.
     expert_asked: Option<u64>,
     /// A load the executor published since the last decision: a new load is

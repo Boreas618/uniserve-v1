@@ -368,11 +368,11 @@ pub struct ReplicaView {
     #[serde(default)]
     pub holds_request: bool,
     /// Whether it runs prefill only, so a decode-stage call never lands on it
-    /// (today `placement.rs`'s prefill-only groups).
+    /// (today `dispatch.rs`'s prefill-only groups).
     #[serde(default)]
     pub prefills_only: bool,
     /// Whether it already holds another component of this request, which a
-    /// placement prefers to a replica that holds none of it.
+    /// dispatch prefers to a replica that holds none of it.
     #[serde(default)]
     pub holds_component: bool,
 }
@@ -401,11 +401,11 @@ pub struct ExpertLoad {
     pub tokens: Vec<u64>,
 }
 
-/// An expert-to-rank placement: `placement[expert]` is the rank of that
+/// An expert-to-rank layout: `layout[expert]` is the rank of that
 /// expert, and it must be a permutation of the ranks in the sense the existing
 /// expert rearrangement requires (design §7.6).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ExpertOrder {
     #[serde(default)]
-    pub placement: Vec<usize>,
+    pub layout: Vec<usize>,
 }

@@ -15,9 +15,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::ExecutorGroupId;
+use crate::executor::ExecutionBatch;
 #[cfg(feature = "testing")]
 use crate::executor::Executor;
-use crate::executor::ExecutionBatch;
 use crate::executor::{ExecutorError, ExecutorInfo, ExecutorSubmitError};
 use crate::scheduler::completion::BatchReport;
 use executor::batch::{
@@ -26,12 +26,12 @@ use executor::batch::{
 use executor::completion::Outcome;
 use ipc::BatchCommand;
 
-/// What placement and the views ask of the world: the pools it serves, and
+/// What dispatch and the views ask of the world: the pools it serves, and
 /// which of them can take a submission now.
 ///
 /// The step places calls on every path — a planned call, a media call, a
 /// request's first call, a prefill target — and none of that submits anything.
-/// Stating it as this trait is what lets one placement serve the in-process
+/// Stating it as this trait is what lets one dispatch serve the in-process
 /// executor and a simulated one: what differs between them is who answers, not
 /// what the step asks.
 pub(super) trait World {
@@ -131,7 +131,10 @@ struct Pending {
 
 #[cfg_attr(
     not(feature = "testing"),
-    allow(unused_variables, reason = "the arms that read them are a supplied executor's")
+    allow(
+        unused_variables,
+        reason = "the arms that read them are a supplied executor's"
+    )
 )]
 impl Submissions {
     /// The mechanism over an executor a test supplies.
@@ -610,9 +613,9 @@ impl InProcess {
         }
         let depth = self
             .info
-            .placements
+            .layouts
             .get(worker)
-            .map_or(1, |placement| placement.queue_depth.max(1));
+            .map_or(1, |layout| layout.queue_depth.max(1));
         self.occupied.get(worker).copied().unwrap_or(0) < depth
     }
 
@@ -621,8 +624,13 @@ impl InProcess {
         let mut pools: Vec<ExecutorGroupId> = batch
             .requests
             .iter()
-            .map(|(_, placement)| placement.worker.clone())
-            .chain(batch.page_offloads.iter().map(|offloads| offloads.worker.clone()))
+            .map(|(_, dispatch)| dispatch.worker.clone())
+            .chain(
+                batch
+                    .page_offloads
+                    .iter()
+                    .map(|offloads| offloads.worker.clone()),
+            )
             .collect();
         pools.sort();
         pools.dedup();
@@ -923,7 +931,7 @@ impl InProcess {
             cache_units: batch
                 .requests
                 .iter()
-                .flat_map(|(_, placement)| placement.new_cache_units.iter().cloned())
+                .flat_map(|(_, dispatch)| dispatch.new_cache_units.iter().cloned())
                 .collect(),
             // Every call's tables, flattened: the executor installs these into the cache's pooled
             // table before the replay, because the gather reads row `slot` of that table and a row
@@ -931,14 +939,14 @@ impl InProcess {
             block_tables: batch
                 .requests
                 .iter()
-                .flat_map(|(_, placement)| placement.block_tables.iter().cloned())
+                .flat_map(|(_, dispatch)| dispatch.block_tables.iter().cloned())
                 .collect(),
             // The host KV cache's copies, which the runner issues on its copy stream: what the
             // batch's new units load before the forward, and what it publishes beside it.
             page_loads: batch
                 .requests
                 .iter()
-                .flat_map(|(_, placement)| placement.page_loads.iter().cloned())
+                .flat_map(|(_, dispatch)| dispatch.page_loads.iter().cloned())
                 .collect(),
             page_offloads: batch
                 .page_offloads
@@ -970,7 +978,7 @@ mod tests {
 
     use super::*;
     use executor::batch::SubmissionId;
-    use executor::batch::{BatchOutput, Inventory, MediaColumns, Placement, StagedRequest};
+    use executor::batch::{BatchOutput, Inventory, MediaColumns, PoolLayout, StagedRequest};
     use executor::plan::{Bucket, Computation, Extent, Variant};
     use ipc::{Call, CallKind, MediaCall};
 
@@ -996,9 +1004,9 @@ mod tests {
             let inventory = Inventory {
                 group: "gpu".to_owned(),
                 ranks: vec![ipc::MainProcessInfo::default()],
-                placement: Placement {
+                layout: PoolLayout {
                     queue_depth: 2,
-                    ..Placement::default()
+                    ..PoolLayout::default()
                 },
                 max_model_len: 4096,
             };
@@ -1083,12 +1091,12 @@ mod tests {
     }
 
     /// One call as the plan hands it to the mechanism.
-    fn call(kind: CallKind, request_id: u64) -> (Call, crate::executor::RequestPlacement) {
+    fn call(kind: CallKind, request_id: u64) -> (Call, crate::executor::RequestDispatch) {
         let key = ipc::RequestKey::new(1, ipc::RequestId(request_id), 0);
         let call = Call::new(key, ipc::CallId::new(0, 0), kind);
         (
             call,
-            crate::executor::RequestPlacement {
+            crate::executor::RequestDispatch {
                 worker: ExecutorGroupId("gpu".to_owned()),
                 request_pool_idx: None,
                 block_tables: Vec::new(),
@@ -1211,7 +1219,10 @@ mod tests {
             "a batch past the depth waits for a slot"
         );
         assert_eq!(
-            delivered.lock().expect("the recorder is not poisoned").len(),
+            delivered
+                .lock()
+                .expect("the recorder is not poisoned")
+                .len(),
             2,
             "a batch that waits reaches no device"
         );

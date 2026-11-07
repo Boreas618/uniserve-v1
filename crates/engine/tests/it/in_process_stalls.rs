@@ -13,7 +13,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use engine::{SimEngine, SimExecutor, SpecialTokenIds, ExecutorGroupId};
+use engine::{ExecutorGroupId, SimEngine, SimExecutor, SpecialTokenIds};
 use ipc::{CallId, ErrorCallIdentity, RequestKey, Stall};
 
 use crate::support;

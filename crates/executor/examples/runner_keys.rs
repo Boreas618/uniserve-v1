@@ -51,8 +51,13 @@ fn main() -> Result<(), String> {
     let buckets = Buckets::causal_lm(&rows, &tokens, sampled);
     let descriptors = commit_descriptors(&buckets, vocabulary);
 
-    println!("# slot_commit keys for rows={rows:?} tokens={tokens:?} sampled={sampled} vocabulary={vocabulary}");
-    println!("# {} keys, one per distinct launch block", descriptors.len());
+    println!(
+        "# slot_commit keys for rows={rows:?} tokens={tokens:?} sampled={sampled} vocabulary={vocabulary}"
+    );
+    println!(
+        "# {} keys, one per distinct launch block",
+        descriptors.len()
+    );
     for descriptor in descriptors {
         println!("slot_commit\t{descriptor}");
     }

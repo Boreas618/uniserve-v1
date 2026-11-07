@@ -22,11 +22,11 @@ use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use nixl::{Access, Agent, Region, Segment, Span};
 use platform::{
     DeviceAllocation, DeviceId, PeerMapping, PinnedBuffer, Protection, SegmentedMapping, Stream,
     memcpy_async,
 };
-use nixl::{Access, Agent, Region, Segment, Span};
 
 const DEVICE: DeviceId = DeviceId(0);
 

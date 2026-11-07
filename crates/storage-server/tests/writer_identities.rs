@@ -124,7 +124,7 @@ fn memfd(bytes: &[u8]) -> std::fs::File {
 
 fn host(bytes: u64) -> StorageRecord {
     StorageRecord {
-        placement: storage::Placement::Host { numa_node: None },
+        location: storage::Location::Host { numa_node: None },
         bytes,
         segment: None,
         fabric: None,

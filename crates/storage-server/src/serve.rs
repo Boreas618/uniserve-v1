@@ -134,7 +134,7 @@ pub fn list(socket: &Path) -> ::storage::Result<()> {
         println!(
             "{} {:?} {} bytes {:?} {} [{}]{}",
             tensor.key.hex(),
-            tensor.placement,
+            tensor.location,
             tensor.storage_bytes,
             tensor.access,
             tensor.name,

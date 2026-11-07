@@ -130,10 +130,10 @@ impl Scheduler {
             .get(&MediaCall::Denoising)
             .map_or(DEFAULT_COMPONENT, String::as_str);
         let (_, bound, _) = self
-            .placement
+            .dispatch
             .component_candidates(&self.executor, kind, component)
             .next()?;
-        self.placement
+        self.dispatch
             .affinity
             .get(&(request_key, bound.to_owned()))
             .cloned()
@@ -477,7 +477,7 @@ impl Scheduler {
         let request_key = RequestKey::new(self.engine_id, id, state.request_epoch);
         let stored = state.req.trajectory.clone();
         let trajectory = image_trajectory(stored.id, state.image_id);
-        let worker = self.placement.place(
+        let worker = self.dispatch.place(
             &self.executor,
             &self.info,
             request_key,

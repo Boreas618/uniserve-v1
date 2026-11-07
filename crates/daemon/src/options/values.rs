@@ -487,4 +487,3 @@ impl fmt::Display for ChatTemplateContentFormatOption {
         }
     }
 }
-

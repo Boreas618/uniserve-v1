@@ -9,7 +9,7 @@
 //! --stage weights  no device: what the `fl2va` deployment places, the two encoder key lists against
 //!                  the export's indexes, and where the case's rows come from
 //! --stage encode   one image on a device: the encoder's tile walk, the posterior, the anchoring and
-//!                  the projection, then the rows read back through the packing's own placement -
+//!                  the projection, then the rows read back through the packing's own layout -
 //!                  `<out>/latent_encoder/condition_rows.h3t` with `case.json`, `walk.txt` and
 //!                  `readback.txt`
 //! ```
@@ -70,7 +70,7 @@ fn usage() -> String {
      \x20          [--frames <n>] [--text-tokens <n>] [--dtype auto|bf16|f16|f32]\n\
      \x20          [--device <n>] [--seed <n>] [--place deployment|conditioner] [--diag <dir>]\n\
      \x20          [--out <dir>] [--commit <revision>]\n\n\
-     --stage weights reads the checkpoint's own placement, `plan` the encoder's tile walk without a\n\
+     --stage weights reads the checkpoint's own layout, `plan` the encoder's tile walk without a\n\
      device, and `encode` one image on a device (which needs `--store`, or `UNISERVE_STORE`).\n"
         .to_owned()
 }
@@ -202,7 +202,7 @@ impl Args {
                         "conditioner" => Place::Conditioner,
                         other => {
                             return Err(format!(
-                                "`{other}` is not a placement; write deployment (every block this \
+                                "`{other}` is not a block selection; write deployment (every block this \
                                  stage serves) or conditioner (the blocks a conditioned encode \
                                  reads)"
                             ));
@@ -502,7 +502,7 @@ fn weights(args: &Args) -> Result<(), String> {
     }
     println!(
         "case: the rows a condition contributes are the model's answer - the segments it packs and \
-         the placement the packing gathers them from - so they need the loaded block and are printed \
+         the positions the packing gathers them from - so they need the loaded block and are printed \
          by `--stage encode`. The case is {}x{} with a {} px image and {} prompt tokens.",
         args.width, args.height, args.image, args.text_tokens
     );

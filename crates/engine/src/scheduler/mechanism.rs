@@ -44,14 +44,14 @@
 //!   mechanism may not have. The owner is the storage side's host page report,
 //!   and the acceptance is: the pages a `Warming` entry names become `on_host`,
 //!   and a `warm` order that names them is performed in the policy's order.
-//! - `experts(load)` answers a placement of experts on ranks. **The mechanism's
+//! - `experts(load)` answers a layout of experts on ranks. **The mechanism's
 //!   half is done:** it is called on the mechanism's own interval
 //!   (`Scheduler::EXPERT_REBALANCE_STEPS` steps, so a program never reads time), the
-//!   placement is validated against the ranks the load states
+//!   layout is validated against the ranks the load states
 //!   ([`validate_experts`]), and the order is handed over with
 //!   `Command::TakeExpertOrder` — `SchedulerHandle::take_expert_order` is that
 //!   hand-off. **The application is the executor's**, and it is deferred on
-//!   that side with a named owner (§7.6): applying a placement moves weights
+//!   that side with a named owner (§7.6): applying a layout moves weights
 //!   across ranks and pools, which is device and world state, and the mechanism
 //!   owns none of it; `Executor::commit_experts` is the method that retains an
 //!   order. Nothing in this tree takes the order yet, so until the executor
@@ -244,7 +244,7 @@ fn invalid(call: Call, message: impl Into<String>) -> PolicyError {
 }
 
 /// Whether a phase kind is a decode-stage call, which never lands on a replica
-/// that runs prefill only (today's `placement.rs`, prefill-only groups).
+/// that runs prefill only (today's `dispatch.rs`, prefill-only groups).
 fn decodes(kind: PhaseKind) -> bool {
     matches!(
         kind,
@@ -872,7 +872,7 @@ pub(crate) fn validate_route(
     }
 }
 
-/// Checks a placement decision against the replicas the mechanism offered.
+/// Checks a dispatch decision against the replicas the mechanism offered.
 ///
 /// The replica must be in the list, run the call's kind, and not run prefill
 /// only when the call is a decode-stage one (today's `component_target` rules
@@ -944,7 +944,7 @@ pub(crate) fn validate_warm(room: &Room, pages: &[PageId]) -> Result<(), PolicyE
     Ok(())
 }
 
-/// Checks an expert order: a placement of every expert on a rank, balanced so
+/// Checks an expert order: a layout of every expert on a rank, balanced so
 /// that no rank carries more than one expert more than another (design §7.6).
 ///
 /// The load is the input the order is meant to balance; an order that is legal
@@ -956,18 +956,18 @@ pub(crate) fn validate_experts(load: &ExpertLoad, order: &ExpertOrder) -> Result
             "the mechanism asked for an expert order with no ranks or no experts",
         ));
     }
-    if order.placement.len() != load.experts {
+    if order.layout.len() != load.experts {
         return Err(invalid(
             Call::Experts,
             format!(
                 "the order places {} experts, the model has {}",
-                order.placement.len(),
+                order.layout.len(),
                 load.experts
             ),
         ));
     }
     let mut per_rank = vec![0usize; load.ranks];
-    for (expert, rank) in order.placement.iter().enumerate() {
+    for (expert, rank) in order.layout.iter().enumerate() {
         if *rank >= load.ranks {
             return Err(invalid(
                 Call::Experts,
@@ -1481,7 +1481,7 @@ mod tests {
 
         fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
             Ok(ExpertOrder {
-                placement: (0..load.experts)
+                layout: (0..load.experts)
                     .map(|expert| expert % load.ranks.max(1))
                     .collect(),
             })
@@ -1551,7 +1551,7 @@ mod tests {
                 .is_none()
         );
 
-        // The routing and placement answers are checked the same way.
+        // The routing and dispatch answers are checked the same way.
         let ranks = vec![RankView {
             index: 0,
             in_flight: 0,
@@ -2012,14 +2012,14 @@ mod tests {
         validate_experts(
             &load,
             &ExpertOrder {
-                placement: vec![0, 0, 1, 1],
+                layout: vec![0, 0, 1, 1],
             },
         )
         .expect("balanced");
         let error = validate_experts(
             &load,
             &ExpertOrder {
-                placement: vec![0, 0, 0, 0],
+                layout: vec![0, 0, 0, 0],
             },
         )
         .expect_err("unbalanced");
@@ -2027,7 +2027,7 @@ mod tests {
         let error = validate_experts(
             &load,
             &ExpertOrder {
-                placement: vec![0, 1, 0],
+                layout: vec![0, 1, 0],
             },
         )
         .expect_err("short");
@@ -2035,7 +2035,7 @@ mod tests {
         let error = validate_experts(
             &load,
             &ExpertOrder {
-                placement: vec![0, 0, 2, 2],
+                layout: vec![0, 0, 2, 2],
             },
         )
         .expect_err("no such rank");

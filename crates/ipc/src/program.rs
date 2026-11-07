@@ -127,7 +127,9 @@ impl ProgramCommand {
         use proto::process::command::Kind;
 
         let kind = match self {
-            Self::Precopy { programs, policy, .. } => Kind::Precopy(proto::process::Precopy {
+            Self::Precopy {
+                programs, policy, ..
+            } => Kind::Precopy(proto::process::Precopy {
                 kernels: programs
                     .iter()
                     .map(|(slot, program)| proto::process::KernelProgram {
@@ -138,11 +140,9 @@ impl ProgramCommand {
                     .collect(),
                 policy: Some(program_to_wire(policy)),
             }),
-            Self::Switchover { generation, .. } => {
-                Kind::Switchover(proto::process::Switchover {
-                    generation: *generation,
-                })
-            }
+            Self::Switchover { generation, .. } => Kind::Switchover(proto::process::Switchover {
+                generation: *generation,
+            }),
             Self::Commit { .. } => Kind::Commit(proto::process::Commit {}),
             Self::Revert { .. } => Kind::Revert(proto::process::Revert {
                 reason: String::new(),
@@ -178,11 +178,7 @@ impl ProgramCommand {
                     let program = kernel
                         .program
                         .ok_or_else(|| program_error("a precopy's kernel states no program"))?;
-                    let phase = kernel
-                        .phase
-                        .map(phase_from_wire)
-                        .transpose()?
-                        .flatten();
+                    let phase = kernel.phase.map(phase_from_wire).transpose()?.flatten();
                     let slot = program_server::ProgramSlot {
                         op: kernel.op,
                         phase,
@@ -206,8 +202,12 @@ impl ProgramCommand {
                 generation: switchover.generation,
                 step: None,
             },
-            Kind::Commit(_) => Self::Commit { generation: current },
-            Kind::Revert(_) => Self::Revert { generation: current },
+            Kind::Commit(_) => Self::Commit {
+                generation: current,
+            },
+            Kind::Revert(_) => Self::Revert {
+                generation: current,
+            },
             Kind::Purge(purge) => Self::Purge {
                 generation: purge.generation,
             },
@@ -264,9 +264,7 @@ fn phase_to_wire(phase: program_server::PhaseKind) -> proto::process::PhaseKind 
 
 /// The wire's enum as `ops::PhaseKind`; `Ok(None)` for the unspecified value,
 /// which means the program fills every phase of its operator.
-fn phase_from_wire(
-    phase: i32,
-) -> Result<Option<program_server::PhaseKind>, crate::IpcError> {
+fn phase_from_wire(phase: i32) -> Result<Option<program_server::PhaseKind>, crate::IpcError> {
     use proto::process::PhaseKind;
     Ok(match PhaseKind::try_from(phase) {
         Ok(PhaseKind::Prefill) => Some(program_server::PhaseKind::Prefill),
@@ -309,10 +307,7 @@ mod tests {
             },
         );
         programs.insert(
-            program_server::ProgramSlot::phase(
-                "rms_norm",
-                program_server::PhaseKind::Prefill,
-            ),
+            program_server::ProgramSlot::phase("rms_norm", program_server::PhaseKind::Prefill),
             program_server::Program {
                 backend: "triton".to_owned(),
                 revision: 2,
@@ -325,7 +320,9 @@ mod tests {
             policy: program_server::Program {
                 backend: "fcfs".to_owned(),
                 revision: 1,
-                arguments: "chunked_prefill_size = 4096".parse().expect("the policy's arguments"),
+                arguments: "chunked_prefill_size = 4096"
+                    .parse()
+                    .expect("the policy's arguments"),
             },
         };
 
@@ -349,7 +346,10 @@ mod tests {
             panic!("a precopy decoded as {}", decoded.stage());
         };
         assert_eq!(generation, 5);
-        assert_eq!(programs[&program_server::ProgramSlot::all("decode_attention")].revision, 3);
+        assert_eq!(
+            programs[&program_server::ProgramSlot::all("decode_attention")].revision,
+            3
+        );
         assert_eq!(policy.backend, "fcfs");
     }
 
@@ -365,8 +365,7 @@ mod tests {
             ProgramCommand::Purge { generation: 4 },
         ] {
             let encoded = rmp_serde::to_vec(&command).expect("a program command encodes");
-            let decoded: ProgramCommand =
-                rmp_serde::from_slice(&encoded).expect("and decodes");
+            let decoded: ProgramCommand = rmp_serde::from_slice(&encoded).expect("and decodes");
             assert_eq!(decoded, command);
         }
     }
@@ -388,7 +387,9 @@ mod tests {
             policy: program_server::Program {
                 backend: "fcfs".to_owned(),
                 revision: 4,
-                arguments: "chunked_prefill_size = 4096".parse().expect("the policy's arguments"),
+                arguments: "chunked_prefill_size = 4096"
+                    .parse()
+                    .expect("the policy's arguments"),
             },
         };
 
@@ -407,7 +408,9 @@ mod tests {
             policy: program_server::Program {
                 backend: "fcfs".to_owned(),
                 revision: 4,
-                arguments: "chunked_prefill_size = 4096".parse().expect("the policy's arguments"),
+                arguments: "chunked_prefill_size = 4096"
+                    .parse()
+                    .expect("the policy's arguments"),
             },
         };
         assert_eq!(back, expected);
@@ -435,9 +438,10 @@ mod tests {
                 reason: String::new(),
             }),
         ] {
-            let command = ProgramCommand::from_command(proto::process::Command { kind: Some(kind) }, 7)
-                .expect("the wire form states a program command")
-                .expect("and it is the program layer's");
+            let command =
+                ProgramCommand::from_command(proto::process::Command { kind: Some(kind) }, 7)
+                    .expect("the wire form states a program command")
+                    .expect("and it is the program layer's");
             assert_eq!(command.generation(), 7);
         }
     }
@@ -452,10 +456,10 @@ mod tests {
             Kind::Drain(proto::process::Drain { epoch: 2 }),
             Kind::Pause(proto::process::Pause { paused: true }),
         ] {
-            let command = ProgramCommand::from_command(proto::process::Command { kind: Some(kind) }, 1)
-                .expect("the command is well formed");
+            let command =
+                ProgramCommand::from_command(proto::process::Command { kind: Some(kind) }, 1)
+                    .expect("the command is well formed");
             assert!(command.is_none());
         }
     }
-
 }

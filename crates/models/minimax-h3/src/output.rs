@@ -162,7 +162,7 @@ pub const VIDEO_DTYPE: &str = "u8";
 /// The element type of the audio raster the media stage reads.
 pub const AUDIO_DTYPE: &str = "i16";
 
-/// One clip's placement in the timeline, as the output stage reads it.
+/// One clip's position in the timeline, as the output stage reads it.
 ///
 /// The body is the frames the timeline keeps from this clip; the overlap is the tail the next clip
 /// cross-fades against. Both index the clip's own decoded frames, not the timeline's.

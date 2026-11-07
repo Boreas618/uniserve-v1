@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use engine::{EngineConfig, SchedulerHandle};
-use executor::batch::{Batch, Batches, Inventory, Placement, Submission};
+use executor::batch::{Batch, Batches, Inventory, PoolLayout, Submission};
 use ipc::{ComponentConfig, MainProcessEndpoint, MainProcessInfo};
 
 /// How long a command answer may take.
