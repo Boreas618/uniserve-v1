@@ -385,8 +385,8 @@ struct Columns {
     /// `[1]` i32 the tokens the batch really holds, which a kernel bounds its work by: the bucket's
     /// own token count is a constant inside a captured graph and cannot bound anything.
     live_tokens: Column,
-    /// `[rows]` the sampled ids, read back after a replay.
-    readback: platform::PinnedBuffer,
+    /// `[rows]` the sampled ids, read back after a replay: two, as the commit's positions are.
+    readback: [platform::PinnedBuffer; 2],
     /// One row of logits, `[vocabulary]`, read back for a greedy request whose first token is taken
     /// on the host (see `read_sampled`): a bucket is homogeneous in its sampling path, so a prefill
     /// bucket that ends a greedy prompt cannot argmax in its graph - the graph draws.
@@ -447,6 +447,37 @@ impl Columns {
         ]
     }
 
+    /// Moves every column a batch rewrites to device storage, so a batch can be staged behind a
+    /// replay that still reads the batch before it.
+    fn place(
+        &mut self,
+        device: DeviceId,
+        pools: &mut crate::arena::Pools,
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        for column in self.staged() {
+            column.place(device, pools, stream)?;
+        }
+        Ok(())
+    }
+
+    /// The columns every batch rewrites.
+    fn staged(&mut self) -> [&mut Column; 11] {
+        [
+            &mut self.positions,
+            &mut self.input_ids,
+            &mut self.slot_mapping,
+            &mut self.seq_lens,
+            &mut self.query_offsets,
+            &mut self.logits_rows,
+            &mut self.indices,
+            &mut self.parameters,
+            &mut self.slots,
+            &mut self.draws,
+            &mut self.live_tokens,
+        ]
+    }
+
     /// Allocates the columns over the widest token count and row count `buckets` hold, with
     /// `vocabulary` as the width of the logits row the greedy first token is taken from.
     fn new(device: DeviceId, buckets: &Buckets, vocabulary: u32) -> Result<Self> {
@@ -465,7 +496,10 @@ impl Columns {
             slots: Column::new(device, DType::I32, rows)?,
             draws: Column::new(device, DType::F32, rows)?,
             live_tokens: Column::new(device, DType::I32, 1)?,
-            readback: platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+            readback: [
+                platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+                platform::PinnedBuffer::new(device, (rows * 4) as usize)?,
+            ],
             logits_row: platform::PinnedBuffer::new(
                 device,
                 (u64::from(vocabulary) * 4) as usize,
@@ -626,8 +660,9 @@ struct CommitColumns {
     /// The slots the per-slot state columns address.
     slots: u32,
     /// `[slots]` i32 the per-slot trajectory positions, read back after a replay: the commit kernel
-    /// advances them, so only the device knows where a call's slot stands.
-    readback: platform::PinnedBuffer,
+    /// advances them, so only the device knows where a call's slot stands. Two, because a replay's
+    /// positions are read while the next replay's copy is on its way.
+    readback: [platform::PinnedBuffer; 2],
 }
 
 impl CommitColumns {
@@ -648,10 +683,16 @@ impl CommitColumns {
             capacity,
             block: commit_block(rows),
             slots: slots.max(1),
-            readback: platform::PinnedBuffer::new(
-                device,
-                2 * slots.max(1) as usize * std::mem::size_of::<i32>(),
-            )?,
+            readback: [
+                platform::PinnedBuffer::new(
+                    device,
+                    2 * slots.max(1) as usize * std::mem::size_of::<i32>(),
+                )?,
+                platform::PinnedBuffer::new(
+                    device,
+                    2 * slots.max(1) as usize * std::mem::size_of::<i32>(),
+                )?,
+            ],
         };
         // The roles a decode step leaves inert hold their starting values; only `table` is written
         // again per batch.
@@ -680,19 +721,41 @@ impl CommitColumns {
         self.slots as usize
     }
 
-    /// The token slot `slot` feeds its next decode, as `slot_commit` last wrote it.
-    ///
-    /// The column is one mapped allocation, and the device thread reads this between batches, after
-    /// the batch that wrote it has completed.
-    fn next_input(&self, slot: usize) -> i32 {
-        // SAFETY: the column holds one i32 per slot and the caller's slot is inside it.
-        unsafe { *self.future.host.as_ptr().cast::<i32>().add(slot) }
+    /// States slot `slot`'s next input, for a token the host chose after the graph drew another.
+    fn set_next_input(&self, slot: usize, token: i32, stream: &platform::Stream) -> Result<()> {
+        let offset = (slot * std::mem::size_of::<i32>()) as u64;
+        // SAFETY: the column holds one i32 per slot and the caller's slot is inside it; no launch
+        // that reads the column is in flight, and the wait below ends the copy's use of the source.
+        unsafe {
+            *self.future.host.as_ptr().cast::<i32>().add(slot) = token;
+            platform::memcpy_async(
+                self.future.device.ptr.address() + offset,
+                self.future.host.address() + offset,
+                std::mem::size_of::<i32>(),
+                stream,
+            )?;
+        }
+        stream.synchronize()?;
+        Ok(())
     }
 
-    /// States slot `slot`'s next input, for a token the host chose after the graph drew another.
-    fn set_next_input(&self, slot: usize, token: i32) {
-        // SAFETY: as in `next_input`, and no launch that reads this column is in flight.
-        unsafe { *self.future.host.as_ptr().cast::<i32>().add(slot) = token };
+    /// Moves the columns the host rewrites or reads to device storage. The others hold values no
+    /// step changes, or values only the kernel touches, and stay where they are.
+    fn place(
+        &mut self,
+        device: DeviceId,
+        pools: &mut crate::arena::Pools,
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        for column in [
+            &mut self.table,
+            &mut self.logical,
+            &mut self.sampling,
+            &mut self.future,
+        ] {
+            column.place(device, pools, stream)?;
+        }
+        Ok(())
     }
 
     /// The device address of the per-slot trajectory positions.
@@ -707,19 +770,19 @@ impl CommitColumns {
     }
 
 
-    /// The bytes the readback buffer holds, which bounds what one copy may read.
+    /// The bytes one readback buffer holds, which bounds what one copy may read.
     fn readback_len(&self) -> usize {
-        self.readback.len()
+        self.readback[0].len()
     }
 
     /// The host address a readback copies the trajectory positions into.
-    fn readback_address(&self) -> u64 {
-        self.readback.address()
+    fn readback_address(&self, turn: usize) -> u64 {
+        self.readback[turn].address()
     }
 
     /// The host side of the readback, as the positions the copy filled.
-    fn readback_ptr(&self) -> *const u8 {
-        self.readback.as_ptr()
+    fn readback_ptr(&self, turn: usize) -> *const u8 {
+        self.readback[turn].as_ptr()
     }
 
     /// Writes the staged commit table - `[COMMIT_FIELDS, rows]` i64, column-major - as the i32 table
@@ -745,24 +808,28 @@ impl CommitColumns {
         )
     }
 
-    /// Copies every operand the batch rewrote into its device buffer.
-    fn upload(&self, stream: &platform::Stream) -> Result<()> {
-        for column in [
-            &self.table,
-            &self.valid,
-            &self.active,
-            &self.continuation,
-            &self.points,
-            &self.predicates,
-            &self.logical,
-            &self.sampling,
-            &self.verified,
-            &self.future,
-        ] {
-            column.upload(stream)?;
-        }
-        Ok(())
+    /// Copies the one operand a batch rewrites into its device buffer.
+    fn upload(&mut self, stream: &platform::Stream) -> Result<()> {
+        self.table.push(stream)
     }
+}
+
+/// Elements one program of a step's gather copies.
+const GATHER_BLOCK: u32 = 1024;
+
+/// A replay on its way: what its answer reads once its copies land.
+struct Flight {
+    bucket: Bucket,
+    /// Where its sampler wrote; `None` for a bucket that samples nothing.
+    sampled: Option<Sampled>,
+    /// The instant the device segment is measured from.
+    launched: Instant,
+    /// The readback buffers its copies fill.
+    turn: usize,
+    slots: Vec<i32>,
+    logits_rows: Vec<i32>,
+    rows: nn::BatchRows,
+    calls: Vec<CallId>,
 }
 
 /// Where one bucket's sampler wrote its ids: the first `rows` i32 of the plan's sampler block.
@@ -1434,6 +1501,13 @@ pub trait KvProvider: Send + Sync {
         Ok(())
     }
 
+    /// Where a graph gathers `rows` rows of `group`'s block table: the pooled table, indexed by
+    /// slot, and the table attention reads. `None` from a provider whose table needs no gathering.
+    fn table_source(&self, group: usize, rows: u32) -> Result<Option<(TensorView, TensorView)>> {
+        let _ = (group, rows);
+        Ok(None)
+    }
+
     /// The cache this provider reads, when it reads one: the handle a sleep gives back and a wake
     /// maps again (2.5).
     ///
@@ -1682,6 +1756,14 @@ pub struct CausalLmRunner<M: CausalLm> {
     pending_dump: Option<(u32, String)>,
     /// Whether a batch has been captured again beside the pose it serves (see `recapture_real`).
     recaptured: bool,
+    /// The replays launched and not yet answered, oldest first.
+    flights: std::collections::VecDeque<Flight>,
+    /// The readback buffers the next replay fills.
+    turn: usize,
+    /// Whether the columns were moved to device storage, which the first capture does.
+    placed: bool,
+    /// The bucket the last warm walk made ready, without its expert step size.
+    warmed: Option<Bucket>,
     /// The last prefill batch's dump line and the page bytes it left behind, so a decode's line is
     /// read beside the write that should have fed it.
     last_prefill: Option<String>,
@@ -1846,6 +1928,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             offload_fence: None,
             pending_dump: None,
             recaptured: false,
+            flights: std::collections::VecDeque::new(),
+            turn: 0,
+            placed: false,
+            warmed: None,
             last_prefill: None,
             enqueue_ms: 0.0,
             experts: None,
@@ -1964,6 +2050,34 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
 
     fn stream(&self) -> Option<&platform::Stream> {
         Some(&self.stream)
+    }
+
+    /// A replay is launched behind the one before it, because the driver takes the device idle for
+    /// as long as a launch lasts when it waits for that replay to end. Every diagnosis reads a
+    /// replay's state as it ends, so those wait. A union's ranks enter its steps in order on each
+    /// device thread, so a step entered behind one in flight is the next step on every rank.
+    fn overlaps_replays(&self) -> bool {
+        !runner_dump()
+            && !eager_replay()
+            && !recapture_real()
+            && !graph_diff()
+    }
+
+    /// A batch that keeps its logits answers its greedy rows on the host, and the next step reads
+    /// what the host chose.
+    fn overlaps_staged(&self) -> bool {
+        self.overlaps_replays()
+            && self
+                .staging
+                .staged()
+                .is_none_or(|bucket| bucket.variant != crate::plan::Variant::PrefillOutput)
+    }
+
+    fn landed(&mut self, output: BatchOutput) -> Result<BatchOutput> {
+        match self.flights.pop_front() {
+            Some(flight) => self.finish(flight),
+            None => Ok(output),
+        }
     }
 
     fn submit(&mut self, batch: Batch) -> Result<Jobs> {
@@ -2191,12 +2305,23 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 let member = self.experts.as_mut().ok_or_else(|| {
                     Error::Invariant("a join reached a runner outside an expert union".into())
                 })?;
-                if member.woken()? && member.step(0, &stream)?.is_some() {
+                if member.woken()?
+                    && let Some(step) = member.step(0, &stream)?
+                {
                     let generation = self.lifecycle.generation.number();
+                    let join = self
+                        .buckets
+                        .at_capacity(Bucket::expert_join(), step.capacity)
+                        .ok_or_else(|| {
+                            Error::Invariant(format!(
+                                "no join graph holds a step of {} rows per rank",
+                                step.capacity
+                            ))
+                        })?;
                     let (_, captured) = self
                         .lifecycle
                         .graphs
-                        .captured_for(Bucket::expert_join(), generation)
+                        .captured_for(join, generation)
                         .ok_or_else(|| {
                             Error::Invariant(format!(
                                 "no join graph in generation {generation} or one it replaces"
@@ -2244,12 +2369,6 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 // stages and uploads it, so a replay that skipped the upload would serve the pose
                 // the bucket was captured with.
                 self.upload(*bucket)?;
-                // The graph holds no gather: the table it reads is filled here, on the stream the
-                // launch follows, from this batch's own slots.
-                let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
-                for group in 0..self.kv.groups() {
-                    self.kv.block_table(group, &slots, &self.stream)?;
-                }
                 // A draw that never ran and a draw that ran wrongly are the same reading afterwards,
                 // because the sampler's output lives in arena memory nothing has initialised. `-1` is
                 // outside every vocabulary and outside every sampled id, so filling the buffer with it
@@ -2275,11 +2394,24 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 }
                 // Every rank of an expert union runs this step: the graph's dispatches wait on their
                 // devices for the peers', so the union is entered before the launch.
+                let mut expert_bucket = None;
                 if let Some(member) = self.experts.as_mut() {
                     let live = u32::try_from(self.staging.live_tokens())
                         .map_err(|_| Error::Invariant("a batch's tokens exceed u32".into()))?;
-                    member.step(live, &stream)?;
+                    // The step's rows decide which of the bucket's graphs holds its expert work.
+                    if let Some(step) = member.step(live, &stream)? {
+                        expert_bucket = Some(
+                            self.buckets.at_capacity(*bucket, step.capacity).ok_or_else(|| {
+                                Error::Invariant(format!(
+                                    "no graph of bucket {bucket} holds a step of {} rows per rank",
+                                    step.capacity
+                                ))
+                            })?,
+                        );
+                    }
                 }
+                let chosen = expert_bucket.unwrap_or(*bucket);
+                let bucket = &chosen;
                 let launched = Instant::now();
                 // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
                 // same model, launched operator by operator instead of as one graph. It splits every
@@ -2309,7 +2441,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     && !self.recaptured
                     && matches!(
                         bucket.variant,
-                        crate::plan::Variant::PrefillWrite | crate::plan::Variant::PrefillOutput
+                        crate::plan::Variant::PrefillWrite
+                            | crate::plan::Variant::PrefillOutput
+                            | crate::plan::Variant::PrefillGreedy
                     )
                     && self.staging.live_tokens() > 0
                 {
@@ -2487,11 +2621,17 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         "a replay issued its graph"
                     );
                 }
-                // The sampled tokens are read back now, before the submission completes: the
-                // mechanism builds the next step's input ids from them (4.4). The wait covers the
+                // The sampled tokens are read back behind the replay. A replay that overlaps the
+                // next one answers when it lands; any other waits here, and the wait covers the
                 // replay as well, which is why the launch's instant is what the device segment is
                 // measured from.
-                self.read_sampled(*bucket, launched)
+                let flight = self.read_sampled(*bucket, launched)?;
+                if self.overlaps_staged() {
+                    self.flights.push_back(flight);
+                    return Ok(BatchOutput::default());
+                }
+                self.stream.synchronize()?;
+                self.finish(flight)
             }
             Job::Capture {
                 bucket, generation, ..
@@ -2531,6 +2671,18 @@ impl<M: CausalLm> CausalLmRunner<M> {
     /// executable are the same for every runner, so those live in [`Lifecycle`].
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
+        self.place_columns()?;
+        // The same bucket for another expert step size runs the same operators over the same
+        // tokens, which the walk before it already made ready: its capture needs no warm walk.
+        let twin = self.warmed == Some(bucket.at_capacity(0));
+        self.warmed = Some(bucket.at_capacity(0));
+        if twin {
+            let stream = self.stream.clone();
+            self.capturing = true;
+            let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
+            self.capturing = false;
+            return self.lifecycle.capture(bucket, generation, walked?, &kernels);
+        }
         // The first capture of the first generation is where the exchange's program exists, and
         // every rank reaches it in step: their plans capture the same buckets in the same order.
         if let Some(member) = self.experts.as_mut() {
@@ -2551,6 +2703,28 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.capturing = false;
         let walked = walked?;
         self.lifecycle.capture(bucket, generation, walked, &kernels)
+    }
+
+    /// Moves the batch columns to device storage, before any graph addresses them.
+    fn place_columns(&mut self) -> Result<()> {
+        if self.placed {
+            return Ok(());
+        }
+        let pools = self
+            .pools
+            .clone()
+            .ok_or(Error::State("a runner captures with the device's pools attached"))?;
+        let device = self.device();
+        let stream = self.stream.clone();
+        let mut pools = pools
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.columns.place(device, &mut pools, &stream)?;
+        self.commit.place(device, &mut pools, &stream)?;
+        drop(pools);
+        stream.synchronize()?;
+        self.placed = true;
+        Ok(())
     }
 
     /// Walks a bucket's pose once *before* it is captured, so every operator's first-use host work
@@ -2976,6 +3150,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         logits: TensorView,
         rows: usize,
         sampling: &[i32],
+        turn: usize,
     ) -> Result<()> {
         if logits.dtype != DType::F32 {
             return Err(Error::Invalid(format!(
@@ -3040,12 +3215,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
             );
             // SAFETY: the readback buffer holds `rows` i32 and `row` is inside it.
             unsafe {
-                *self.columns.readback.as_ptr().cast::<i32>().add(row) = best as i32;
+                *self.columns.readback[turn].as_ptr().cast::<i32>().add(row) =
+                    best as i32;
             }
             // The graph committed its own draw as this slot's next input, and the next decode
             // embeds what the client was told.
             if let Ok(slot) = usize::try_from(slot) {
-                self.commit.set_next_input(slot, best as i32);
+                self.commit.set_next_input(slot, best as i32, &self.stream)?;
             }
         }
         Ok(())
@@ -3053,7 +3229,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
     /// A bucket that samples nothing answers with an empty output: nothing was measured and no call
     /// produced a token.
-    fn read_sampled(&mut self, bucket: Bucket, launched: Instant) -> Result<BatchOutput> {
+    fn read_sampled(&mut self, bucket: Bucket, launched: Instant) -> Result<Flight> {
         // The dump's readback, on the thread that owns this runner's stream and after the launch
         // that wrote the page: the batch's own line, the page's first bytes, and - when this batch
         // is a decode - the prefill's line and bytes beside them, so one reading compares what was
@@ -3083,12 +3259,25 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 ));
             }
         }
-        let Some(samples) = self.bucket_samples.borrow().get(&bucket).copied() else {
-            return Ok(BatchOutput::default());
+        let turn = self.turn;
+        let sampled = self.bucket_samples.borrow().get(&bucket).copied();
+        let mut flight = Flight {
+            bucket,
+            sampled,
+            launched,
+            turn,
+            slots: Vec::new(),
+            logits_rows: Vec::new(),
+            rows: nn::BatchRows::default(),
+            calls: Vec::new(),
         };
+        let Some(samples) = sampled else {
+            return Ok(flight);
+        };
+        self.turn = 1 - turn;
         let rows = bucket.rows as usize;
         let bytes = rows * std::mem::size_of::<i32>();
-        if bytes > self.columns.readback.len() {
+        if bytes > self.columns.readback[turn].len() {
             return Err(Error::Invariant(
                 "the sampler's readback buffer is smaller than the bucket".into(),
             ));
@@ -3104,7 +3293,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // stream has completed.
         unsafe {
             platform::memcpy_async(
-                self.columns.readback.address(),
+                self.columns.readback[turn].address(),
                 samples.tokens.ptr.address(),
                 bytes,
                 &self.stream,
@@ -3112,32 +3301,53 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // The two per-slot lengths the completion reports: the logical position execution
             // initialized and the sampling position a successor may read.
             platform::memcpy_async(
-                self.commit.readback_address(),
+                self.commit.readback_address(turn),
                 self.commit.logical_ptr().address(),
                 slots * std::mem::size_of::<i32>(),
                 &self.stream,
             )?;
             platform::memcpy_async(
-                self.commit.readback_address() + (slots * std::mem::size_of::<i32>()) as u64,
+                self.commit.readback_address(turn) + (slots * std::mem::size_of::<i32>()) as u64,
                 self.commit.sampling_ptr().address(),
                 slots * std::mem::size_of::<i32>(),
                 &self.stream,
             )?;
         }
-        // The one synchronization of a step's host boundary: the replay and the copies are ordered
-        // on the runner's stream, so this wait covers all of them, and it is what the mechanism
-        // waits on to build the next step's input ids.
-        self.stream.synchronize()?;
+        // What the answer reads of the batch, because the next batch is staged before this one
+        // lands.
+        flight.slots = self.staging.slots(rows).to_vec();
+        flight.logits_rows = self.staging.logits_rows().to_vec();
+        flight.rows = self.staging.batch_rows().clone();
+        flight.calls = self.staging.calls().to_vec();
+        Ok(flight)
+    }
+
+    /// The answer of a replay whose copies have landed.
+    fn finish(&mut self, flight: Flight) -> Result<BatchOutput> {
+        let Some(samples) = flight.sampled else {
+            return Ok(BatchOutput::default());
+        };
+        let Flight {
+            bucket,
+            launched,
+            turn,
+            ..
+        } = flight;
+        let rows = bucket.rows as usize;
+        let slots = self.commit.slots();
         let device_us = launched.elapsed().as_micros() as u64;
         let host_start = Instant::now();
         // SAFETY: the copies above filled `rows` i32 with the sampled ids and `slots` i32 with the
         // table's trajectory positions.
         let (ids, logical, sampling) = unsafe {
             (
-                std::slice::from_raw_parts(self.columns.readback.as_ptr().cast::<i32>(), rows),
-                std::slice::from_raw_parts(self.commit.readback_ptr().cast::<i32>(), slots),
                 std::slice::from_raw_parts(
-                    (self.commit.readback_ptr() as usize + slots * std::mem::size_of::<i32>())
+                    self.columns.readback[turn].as_ptr().cast::<i32>(),
+                    rows,
+                ),
+                std::slice::from_raw_parts(self.commit.readback_ptr(turn).cast::<i32>(), slots),
+                std::slice::from_raw_parts(
+                    (self.commit.readback_ptr(turn) as usize + slots * std::mem::size_of::<i32>())
                         as *const i32,
                     slots,
                 ),
@@ -3152,7 +3362,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         if let Some(logits) = samples.logits
             && !bucket.variant.is_decode()
         {
-            self.greedy_first_tokens(logits, rows, sampling)?;
+            self.greedy_first_tokens(logits, rows, sampling, turn)?;
         }
         // A sampled id is an INDEX into the vocabulary, so it is below `vocabulary` by contract:
         // a kernel that answers the width instead of the last index is a defect and not a token,
@@ -3179,19 +3389,13 @@ impl<M: CausalLm> CausalLmRunner<M> {
             )));
         }
         let states = states_of(
-            self.staging.slots(rows),
-            self.staging.batch_rows(),
-            self.staging.calls().len(),
+            &flight.slots,
+            &flight.rows,
+            flight.calls.len(),
             logical,
             sampling,
         );
-        let calls = calls_output(
-            ids,
-            self.staging.logits_rows(),
-            self.staging.batch_rows(),
-            self.staging.calls(),
-            &states,
-        )?;
+        let calls = calls_output(ids, &flight.logits_rows, &flight.rows, &flight.calls, &states)?;
         Ok(BatchOutput {
             calls,
             timing: TimingCounters {
@@ -4536,20 +4740,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         encode_i32(&mut self.encoded, &batch.positions[..tokens]);
         self.columns.positions.write(&self.encoded)?;
         // The ids travel with the batch: `nn::CausalLm::forward` runs the stack over hidden states
-        // the model already holds, so embedding them is the runner's step, not the model's.
-        // A decode row's token is the slot's next input, which the step before it wrote. The
-        // mechanism plans a step ahead of its results, so the token it states lags by one: it is a
-        // stale value on every step and nothing at all on the first.
-        let mut ids = self.staging.input_ids(tokens).to_vec();
-        if bucket.variant.is_decode() {
-            let slots = self.staging.slots(rows);
-            for (row, id) in ids.iter_mut().enumerate().take(rows) {
-                if let Ok(slot) = usize::try_from(slots[row]) {
-                    *id = self.commit.next_input(slot);
-                }
-            }
-        }
-        encode_i32(&mut self.encoded, &ids);
+        // the model already holds, so embedding them is the runner's step, not the model's. A
+        // decode row's token is the slot's next input, which the graph reads for itself: the step
+        // before it may still be running, and the mechanism plans ahead of its results anyway.
+        encode_i32(&mut self.encoded, self.staging.input_ids(tokens));
         self.columns.input_ids.write(&self.encoded)?;
         encode_i32(&mut self.encoded, &batch.slot_mapping[..tokens]);
         self.columns.slot_mapping.write(&self.encoded)?;
@@ -4596,22 +4790,15 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.commit
             .stage(self.staging.commit(), rows, self.commit.capacity as usize)?;
 
-        for column in [
-            &self.columns.positions,
-            &self.columns.input_ids,
-            &self.columns.slot_mapping,
-            &self.columns.seq_lens,
-            &self.columns.query_offsets,
-            &self.columns.logits_rows,
-            &self.columns.indices,
-            &self.columns.parameters,
-            &self.columns.slots,
-            &self.columns.draws,
-            &self.columns.live_tokens,
-        ] {
-            column.upload(&self.stream)?;
+        // A copy issued inside a recording would be part of the graph, and replay the warm pose.
+        if self.capturing {
+            return Ok(());
         }
-        self.commit.upload(&self.stream)?;
+        let stream = self.stream.clone();
+        for column in self.columns.staged() {
+            column.push(&stream)?;
+        }
+        self.commit.upload(&stream)?;
         Ok(())
     }
 
@@ -4763,7 +4950,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
         if runner_dump() && !self.capturing {
             forward = forward.with_attention_probe(&probe);
         }
-        if let Some(views) = self.experts.as_ref().and_then(super::experts::Member::views) {
+        let shaped = self
+            .experts
+            .as_ref()
+            .and_then(super::experts::Member::views)
+            .map(|views| views.at_rows(bucket.capacity));
+        if let Some(views) = shaped.as_ref() {
             forward = forward.with_exchange(views);
         }
         let hidden = arena.tensor(
@@ -4772,6 +4964,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         )?;
         let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
         let ids = self.input_ids(bucket);
+        self.gather_step(&forward, bucket)?;
         self.with_kv(&slots, None, |cache| {
             self.model
                 .embed_input_ids(&forward, ids, hidden)
@@ -4793,6 +4986,53 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         if first {
             self.pool()?.record(self.stream_id(), bucket, arena.used())?;
+        }
+        Ok(())
+    }
+
+    /// What a step reads through its slots, gathered on the device.
+    ///
+    /// The block tables of the batch's rows, and a decode row's input token: the token the step
+    /// before it wrote, which the host need not have seen, so a step can be launched behind the one
+    /// it continues.
+    fn gather_step(&self, forward: &Forward<'_>, bucket: Bucket) -> Result<()> {
+        let rows = u64::from(bucket.rows);
+        let slots = self.columns.slots.shaped(&[rows]);
+        let gather = |columns: u32| ops::logits::GatherDescriptor {
+            dtype: DType::I32,
+            columns,
+            block: GATHER_BLOCK,
+            pdl: nn::layers::launch::PDL,
+        };
+        for group in 0..self.kv.groups() {
+            let Some((pooled, gathered)) = self.kv.table_source(group, bucket.rows)? else {
+                continue;
+            };
+            let width = u32::try_from(pooled.shape.last())
+                .map_err(|_| Error::Invalid("a block table wider than a launch states".into()))?;
+            forward
+                .operate::<ops::logits::LogitsGather>(
+                    &gather(width),
+                    ops::logits::GatherArgs {
+                        hidden: pooled,
+                        rows: slots,
+                        out: gathered,
+                    },
+                )
+                .map_err(Error::from)?;
+        }
+        if bucket.variant.is_decode() {
+            let future = u64::from(self.commit.slots);
+            forward
+                .operate::<ops::logits::LogitsGather>(
+                    &gather(1),
+                    ops::logits::GatherArgs {
+                        hidden: self.commit.future.shaped(&[future, 1]),
+                        rows: slots,
+                        out: self.columns.input_ids.shaped(&[rows, 1]),
+                    },
+                )
+                .map_err(Error::from)?;
         }
         Ok(())
     }
@@ -4825,8 +5065,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .and_then(super::experts::Member::views)
             .ok_or_else(|| {
                 Error::Invariant("a join walked with no expert transport".into())
-            })?;
-        let forward = Forward::new(&stream, generation, &arena).with_exchange(views);
+            })?
+            .at_rows(bucket.capacity);
+        let forward = Forward::new(&stream, generation, &arena).with_exchange(&views);
         self.model
             .join_expert_step(&forward)
             .map_err(Error::from)?;
@@ -4916,11 +5157,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 )
                 .map_err(Error::from)?;
         }
-        // A prefill bucket may end a greedy request's prompt, whose first token is the argmax of the
-        // row - a decision the graph cannot make for one row of a bucket that draws. The view is kept
-        // (the arena's buffer is live until the next `begin`, and `read_sampled` runs before that);
-        // a decode bucket's variant already states its path.
-        let logits = (!bucket.variant.is_decode()).then_some(logits);
+        // A bucket that draws may end a greedy request's prompt, whose first token is the argmax of
+        // the row - a decision the graph cannot make for one row of a bucket that draws. The view
+        // is kept (the arena's buffer is live until the next `begin`, and `read_sampled` runs before
+        // that); a greedy bucket's own launch already states every token it keeps.
+        let logits = (bucket.variant == crate::plan::Variant::PrefillOutput).then_some(logits);
         self.bucket_samples
             .borrow_mut()
             .insert(bucket, Sampled {

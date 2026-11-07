@@ -328,7 +328,7 @@ pub struct QkNormRopeDescriptor {
     /// `head_dim / 2`, and the program copies the trailing channels through. The key names this
     /// only when it is narrower than the head, so every full-width key is unchanged.
     pub rotated: u32,
-    /// Tokens one program handles.
+    /// Head rows one program handles: a token holds one per head.
     pub rows: u32,
     /// The head tile one program loads at a time.
     pub block: u32,
@@ -601,7 +601,10 @@ impl Op for QkNormRope {
             ));
         }
 
-        let programs = tokens.div_ceil(u64::from(descriptor.rows));
+        // The query rows' programs come first, then the key rows': each side rounds up alone.
+        let rows = u64::from(descriptor.rows);
+        let programs = (tokens * u64::from(descriptor.q_heads)).div_ceil(rows)
+            + (tokens * u64::from(descriptor.k_heads)).div_ceil(rows);
         let mut arguments = Arguments::new();
         arguments.view(args.query).view(args.key);
         if let Some((q_weight, k_weight)) = weights {

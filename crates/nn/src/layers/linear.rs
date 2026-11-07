@@ -218,10 +218,10 @@ pub struct Nvfp4Linear {
 /// request's rows**, and the caller pads its buffers to that class — the same division the sparse
 /// attention states for a partial tile: the padding belongs to the caller, the tile to the module.
 ///
-/// The four classes are the set `nvfp4_gemm/cute_dsl/package.toml` declares. A class here without
-/// a cell there is a launch with no program, and a cell there without a class here is a program no
-/// launch states.
-pub const PACKED_M_CLASSES: [u32; 4] = [128, 256, 1024, 4096];
+/// The five classes are the set `nvfp4_gemm/cute_dsl/package.toml` declares, and the last holds the
+/// longest prefill chunk a build admits. A class here without a cell there is a launch with no
+/// program, and a cell there without a class here is a program no launch states.
+pub const PACKED_M_CLASSES: [u32; 5] = [128, 256, 1024, 4096, 16384];
 
 /// The packed product's row class for `rows` activation rows: the smallest declared class that
 /// holds them.
@@ -827,16 +827,18 @@ mod tests {
             (1024, 1024),
             (1025, 4096),
             (4096, 4096),
+            (4097, 16384),
+            (16384, 16384),
         ] {
             assert_eq!(packed_rows(rows).unwrap(), class, "{rows} rows");
         }
-        assert_eq!(PACKED_M_CLASSES, [128, 256, 1024, 4096]);
+        assert_eq!(PACKED_M_CLASSES, [128, 256, 1024, 4096, 16384]);
         // Above the largest class no program exists, so it is refused by name with both numbers
-        // rather than clamped: a 4 096-row module serving 5 000 rows is the same defect one size
+        // rather than clamped: a 16 384-row module serving 20 000 rows is the same defect one size
         // up, and it would run.
-        let error = packed_rows(4097).unwrap_err().to_string();
-        assert!(error.contains("4097"), "{error}");
-        assert!(error.contains("4096"), "{error}");
+        let error = packed_rows(16385).unwrap_err().to_string();
+        assert!(error.contains("16385"), "{error}");
+        assert!(error.contains("16384"), "{error}");
     }
 
     #[test]

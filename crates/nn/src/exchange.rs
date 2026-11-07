@@ -36,6 +36,9 @@ pub struct ExchangeViews {
     pub attention: u32,
     /// Rows one rank may exchange: the MoE plan's capacity, so the rows fit without a host read.
     pub capacity: u32,
+    /// Rows per rank the expert work of this walk is shaped for: the step's graph holds at most
+    /// this many, so the received views are read to `ranks * step_rows` rows. At most `capacity`.
+    pub step_rows: u32,
     /// `[ranks * capacity, hidden]` in the activation element type: the dispatched activations.
     pub states: TensorView,
     /// `[ranks * capacity, top]` i32: the experts each received row is routed to.
@@ -65,6 +68,45 @@ pub struct ExchangeViews {
 }
 
 impl ExchangeViews {
+    /// These views for a walk whose expert work holds `rows` rows per rank; zero keeps the whole
+    /// capacity.
+    #[must_use]
+    pub fn at_rows(&self, rows: u32) -> Self {
+        let step_rows = if rows == 0 { self.capacity } else { rows.min(self.capacity) };
+        Self {
+            transport: self.transport,
+            ranks: self.ranks,
+            attention: self.attention,
+            capacity: self.capacity,
+            step_rows,
+            states: self.states,
+            ids: self.ids,
+            weights: self.weights,
+            combined: self.combined,
+            live: self.live,
+            packed: self.packed,
+            packed_scales: self.packed_scales,
+            fused: self.fused,
+            source_only: self.source_only,
+            meet: Arc::clone(&self.meet),
+        }
+    }
+
+    /// The received views, read to the rows the walk's expert work holds.
+    #[must_use]
+    pub fn narrowed(&self) -> Self {
+        let rows = u64::from(self.ranks) * u64::from(self.step_rows);
+        let head = |view: TensorView| {
+            TensorView::new(view.ptr, view.dtype, crate::Shape::new(&[rows, view.shape.last()]))
+        };
+        let mut narrowed = self.at_rows(self.step_rows);
+        narrowed.states = head(self.states);
+        narrowed.ids = head(self.ids);
+        narrowed.weights = head(self.weights);
+        narrowed.combined = head(self.combined);
+        narrowed
+    }
+
     /// Elements per received row.
     pub fn hidden(&self) -> u64 {
         self.states.shape.last()
@@ -127,6 +169,7 @@ mod tests {
             ranks,
             attention: 0,
             capacity,
+            step_rows: capacity,
             states: TensorView::new(base, DType::BF16, Shape::new(&[rows, hidden])),
             ids: TensorView::new(base, DType::I32, Shape::new(&[rows, top])),
             weights: TensorView::new(base, DType::F32, Shape::new(&[rows, top])),

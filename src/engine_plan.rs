@@ -49,6 +49,51 @@ type SharedCodec = (
     executor::host::Lane<executor::runners::media::MediaWork>,
 );
 
+/// The buckets of a member of an expert union: each causal bucket, and the join, captured for the
+/// step sizes it meets.
+///
+/// A union's ranks agree a step's rows per rank before they launch, and the expert work of a graph
+/// is shaped for the rows it holds. Every rank decoding agrees at most the largest decode bucket's
+/// rows, which the smallest graph holds; a decode beside a peer's prefill of a few prompts takes a
+/// middle one, and a step a peer fills with a large prefill takes the graph of the whole capacity.
+/// One graph for every step would shape each decode's expert work for the largest prefill any rank
+/// could send.
+fn expert_classes(buckets: &Buckets, capacity: u64) -> Buckets {
+    let capacity = u32::try_from(capacity).unwrap_or(u32::MAX);
+    let decode = buckets
+        .iter()
+        .filter(|bucket| bucket.variant.is_decode())
+        .map(|bucket| bucket.rows)
+        .max()
+        .unwrap_or(1);
+    Buckets::new(
+        buckets
+            .iter()
+            .copied()
+            .chain(std::iter::once(executor::plan::Bucket::expert_join()))
+            .flat_map(|bucket| {
+                // A step this graph would serve is within a quarter of the whole capacity, where the
+                // smaller shape saves little and the capture still costs its warmup's time.
+                let small = bucket.tokens.max(decode).min(capacity);
+                let mut classes = vec![bucket.at_capacity(capacity)];
+                if small.saturating_mul(4) <= capacity {
+                    classes.push(bucket.at_capacity(small));
+                }
+                // A decode beside a peer's prefill of a few prompts: the step is that prefill's
+                // rows, which a graph of the whole capacity would shape every expert layer for.
+                let beside = bucket.variant.is_decode()
+                    || bucket.variant == executor::plan::Variant::ExpertJoin;
+                if beside && small < PREFILL_BESIDE && PREFILL_BESIDE.saturating_mul(4) <= capacity {
+                    classes.push(bucket.at_capacity(PREFILL_BESIDE));
+                }
+                classes.into_iter()
+            }),
+    )
+}
+
+/// The rows per rank of a step in which a peer prefills a few prompts while this rank decodes.
+const PREFILL_BESIDE: u32 = 1024;
+
 /// One epoch's build config, resolved against the node the main process runs on.
 /// The catalogue of prefill buckets a rank captures, and where its bound came from (§4.5).
 ///
@@ -446,12 +491,7 @@ impl EpochPlan {
                     plan.placement.load_options.exchange_capacity = capacity;
                     plan.placement.load_options.exchange_attention = attention;
                     plan.union.clone_from(&union);
-                    plan.buckets = Buckets::new(
-                        plan.buckets
-                            .iter()
-                            .copied()
-                            .chain(std::iter::once(executor::plan::Bucket::expert_join())),
-                    );
+                    plan.buckets = expert_classes(&plan.buckets, capacity);
                 }
                 plan
             })
@@ -3015,7 +3055,9 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
     let mut kinds: Vec<engine::PhaseKind> = buckets
         .iter()
         .map(|bucket| match bucket.variant {
-            Variant::PrefillWrite | Variant::PrefillOutput => engine::PhaseKind::Prefill,
+            Variant::PrefillWrite | Variant::PrefillOutput | Variant::PrefillGreedy => {
+                engine::PhaseKind::Prefill
+            }
             Variant::DecodeGreedy | Variant::DecodeSampled => engine::PhaseKind::Decode,
             Variant::Encode => engine::PhaseKind::TextEncoding,
             Variant::Denoise => engine::PhaseKind::Denoise,

@@ -60,8 +60,8 @@ const EMBEDDING_TOKENS: u32 = 8;
 /// Elements one `rotary_factors` program handles (`launch::ROTARY_BLOCK`).
 const ROTARY_BLOCK: u32 = 256;
 
-/// Tokens one `qk_norm_rope` program handles (`launch::QK_NORM_TOKENS`).
-const QK_NORM_TOKENS: u32 = 1;
+/// Head rows one `qk_norm_rope` program handles (`launch::QK_NORM_ROWS`).
+const QK_NORM_ROWS: u32 = 16;
 
 /// The row width a row-wise kernel loads at a time (`launch::row_tile`).
 fn row_tile(columns: u32) -> u32 {
@@ -328,7 +328,7 @@ fn main() {
             // The checkpoint's rms_norm_eps, by bit pattern.
             epsilon: Float::from(1e-6_f32),
             rotated: HEAD_DIM,
-            rows: QK_NORM_TOKENS,
+            rows: QK_NORM_ROWS,
             block: row_tile(HEAD_DIM).min(1024),
             affine: true,
             pdl: PDL,
