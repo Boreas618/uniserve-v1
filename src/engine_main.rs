@@ -4338,6 +4338,10 @@ impl MainProcess {
                         id: describe.id,
                         error,
                         segments,
+                        storage_world: self
+                            .storage
+                            .first()
+                            .map_or(0, |storage| storage.storage_world()),
                     },
                 ))
             }

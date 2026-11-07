@@ -563,8 +563,6 @@ pub struct Epochs {
     /// The epoch the frontend was last told to serve (§7.4): a daemon that holds its frontend in
     /// this process follows it by moving its hold onto the target's engine.
     served: tokio::sync::watch::Sender<u64>,
-    /// The world each epoch's exclusive storage was created in, when not its own.
-    storage_worlds: Mutex<BTreeMap<u64, u64>>,
 }
 
 impl Epochs {
@@ -1105,21 +1103,6 @@ impl Epochs {
     /// Every epoch the daemon keeps, by number.
     pub fn records(&self) -> BTreeMap<u64, EpochRecord> {
         locked(&self.records).clone()
-    }
-
-    /// The world whose name keys the exclusive storage `world` executes on: its own, or, for an
-    /// epoch that took a predecessor's storage over, the world that created that storage. A
-    /// process keys a storage by its creating world (`Retained`), and a commit does not rename it.
-    pub fn storage_world(&self, world: u64) -> u64 {
-        locked(&self.storage_worlds)
-            .get(&world)
-            .copied()
-            .unwrap_or(world)
-    }
-
-    /// `world` executes on the storage `storage_world` created.
-    pub fn inherit_storage(&self, world: u64, storage_world: u64) {
-        locked(&self.storage_worlds).insert(world, storage_world);
     }
 
     /// The epoch that serves requests: the highest numbered one that is
@@ -1676,17 +1659,6 @@ mod tests {
         let mut other = ServeConfig::default();
         other.model = Some("/models/other".to_owned());
         assert_eq!(layer(&serving, &Deployment::of(other)), Layer::Epoch);
-    }
-
-    /// A target maps its predecessor's storage under the world that created it, and a commit does
-    /// not rename it, so the epoch after names the same creator.
-    #[test]
-    fn storage_keeps_the_world_that_created_it_across_epochs() {
-        let epochs = Epochs::new();
-        assert_eq!(epochs.storage_world(1), 1, "a first epoch's own");
-        epochs.inherit_storage(2, epochs.storage_world(1));
-        epochs.inherit_storage(3, epochs.storage_world(2));
-        assert_eq!(epochs.storage_world(3), 1);
     }
 
     /// A program-layer update in flight is the epoch's probation: the record
