@@ -199,7 +199,12 @@ def launch(module, case, output, interleaved):
     # `build.py`'s own lane count: a lane count is a power of two, and 96 turned channels are 48
     # pairs, so the block is 64 lanes wide and the last 16 are masked off.
     entry = getattr(module, ENTRIES[(affine, rotated != head_dim)])
-    entry[((case["tokens"] + case["rows"] - 1) // case["rows"], 1, 1)](
+    entry[(
+        (case["tokens"] * case["q_heads"] + case["rows"] - 1) // case["rows"]
+        + (case["tokens"] * case["k_heads"] + case["rows"] - 1) // case["rows"],
+        1,
+        1,
+    )](
         *words,
         Q_HEADS=case["q_heads"], K_HEADS=case["k_heads"], DIM=head_dim, ROTATED=rotated,
         PAIRS=1 << (rotated // 2 - 1).bit_length(), ROWS=case["rows"],
