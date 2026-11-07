@@ -515,6 +515,27 @@ impl Kernel {
         Ok(Self::Native { library, entry })
     }
 
+    /// A further C entry of this native kernel's library, by the name its header gives it.
+    ///
+    /// A package's launch entry is the one [`Self::native`] calls; a lifecycle entry around it is
+    /// resolved here, and the library stays loaded while the kernel is held.
+    ///
+    /// # Safety
+    ///
+    /// `F` is the signature the package's header declares for `symbol`.
+    pub unsafe fn native_symbol<F: Copy>(&self, symbol: &str) -> Result<F> {
+        let Self::Native { library, .. } = self else {
+            return Err(Error::KernelForm {
+                operator: "native_symbol",
+                kernel: self.name().to_owned(),
+                expected: "native",
+                actual: "cubin",
+            });
+        };
+        // SAFETY: forwarded from the caller.
+        unsafe { platform::native_entry::<F>(library, symbol) }.map_err(Error::Platform)
+    }
+
     /// What this kernel is called, for diagnostics and for a capture's node table.
     pub fn name(&self) -> &str {
         match self {

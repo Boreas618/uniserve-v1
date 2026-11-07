@@ -182,8 +182,9 @@ pub(crate) struct EpochPlan {
     /// The world whose cache planes this rank maps, on a standby: it serves from the planes its
     /// predecessor serves from, whose segments that world created.
     cache_world: Option<u64>,
-    /// Those planes as the predecessor holds them.
-    cache_table: Option<ipc::CacheTable>,
+    /// The planes of the world `cache_world` names, as that world laid them out: what a standby
+    /// maps is the serving rank's cache, which only that rank sized.
+    adopted_cache: Option<ipc::CacheTable>,
     /// Ranks in the deployment, whose minimum the cache plan's block size and slot count are
     /// agreed by (§4.1).
     world_size: usize,
@@ -195,6 +196,8 @@ pub(crate) struct EpochPlan {
     watchdog_override: Option<Duration>,
     /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the plan.
     placement: Placement,
+    /// The expert union of this node's ranks, on a deployment whose experts are split.
+    union: Option<Arc<executor::runners::experts::Union>>,
 }
 
 /// A rank's places in its deployment's parallel groups.
@@ -348,13 +351,14 @@ impl EpochPlan {
             rank: launch.rank,
             world: launch.world,
             cache_world: None,
-            cache_table: None,
+            adopted_cache: None,
             world_size: launch.world_size as usize,
             queue_depth: launch.queue_depth as usize,
             group: launch.group.clone(),
             codec: Arc::default(),
             watchdog_override: launch.watchdog_timeout_s.map(Duration::from_secs),
             placement,
+            union: None,
         })
     }
 
@@ -365,10 +369,31 @@ impl EpochPlan {
     /// its own device, so each is planned, loaded and opened as a rank of its own. The text class
     /// keeps one plan, whose second device is refused where its runner is built.
     pub(crate) fn ranks(&self) -> Result<Vec<Self>> {
-        if matches!(ModelClass::of(&self.checkpoint)?, ModelClass::CausalLm) {
+        let text = matches!(ModelClass::of(&self.checkpoint)?, ModelClass::CausalLm);
+        let attention = self.attention_ranks()?;
+        // Dedicated expert ranks hold the experts between them, whatever the schedulers number.
+        let expert_ranks = match attention {
+            0 => self.placement.expert_parallel,
+            _ => self.devices.len() as u32 - attention,
+        };
+        let union_ranks = expert_ranks + attention;
+        if text && union_ranks == 1 {
             return Ok(vec![self.clone()]);
         }
         let count = self.devices.len();
+        // The schedulers of an expert-parallel deployment each hold one rank: its own cache and
+        // attention, its share of the experts, and a member of the union that runs their steps. A
+        // deployment of dedicated expert ranks puts its attention ranks first in the union.
+        let union = text.then(|| {
+            executor::runners::experts::Union::new(usize::try_from(union_ranks).unwrap_or(0))
+        });
+        if text && count != union_ranks as usize {
+            bail!(
+                "this node serves {count} devices and the deployment's experts are exchanged over \
+                 {union_ranks} ranks: an expert union lives on one node's devices, one rank each"
+            );
+        }
+        let capacity = self.exchange_capacity();
         Ok(self
             .devices
             .iter()
@@ -378,20 +403,128 @@ impl EpochPlan {
                 plan.devices = vec![*device];
                 plan.rank = self.rank + index as u32;
                 plan.world_size = count;
+                if text {
+                    // An attention rank holds the first rank's window and computes nothing with
+                    // it; `ExchangeViews::source_only` keeps it out of its forward.
+                    plan.placement.union_rank = index as u32;
+                    plan.placement.attention_ranks = attention;
+                    plan.placement.expert_parallel = expert_ranks;
+                    plan.placement.expert_rank = (index as u32).saturating_sub(attention);
+                    plan.placement.load_options.exchange_capacity = capacity;
+                    plan.placement.load_options.exchange_attention = attention;
+                    plan.union.clone_from(&union);
+                    plan.buckets = Buckets::new(
+                        plan.buckets
+                            .iter()
+                            .copied()
+                            .chain(std::iter::once(executor::plan::Bucket::expert_join())),
+                    );
+                }
                 plan
             })
             .collect())
     }
 
-    /// This plan on the cache planes of `world`, when this rank stands by for that world's process,
-    /// laid out as `table` states.
+    /// The rows one rank's exchange carries at most: the largest batch its buckets hold.
+    fn exchange_capacity(&self) -> u64 {
+        self.buckets
+            .iter()
+            .map(|bucket| u64::from(bucket.tokens))
+            .max()
+            .unwrap_or(1)
+    }
+
+    /// Leading ranks of a deployment whose experts live on dedicated ranks, from its deployment page:
+    /// the ranks of every group that is not an expert group, and zero without one.
+    fn attention_ranks(&self) -> Result<u32> {
+        let Some(groups) = self.deployment_groups()? else {
+            return Ok(0);
+        };
+        let experts = |group: &&engine::ExecutorGroupConfig| {
+            group.role == engine::ExecutorGroupRole::Experts
+        };
+        if !groups.iter().any(|group| experts(&group)) {
+            return Ok(0);
+        }
+        let attention = groups.iter().filter(|group| !experts(group));
+        u32::try_from(attention.map(|group| group.ranks.len()).sum::<usize>())
+            .context("more attention ranks than the exchange addresses")
+    }
+
+    /// Whether this rank holds a scheduler: every rank but a dedicated expert rank does.
+    pub(crate) fn schedules(&self) -> bool {
+        self.placement.attention_ranks == 0
+            || self.placement.union_rank < self.placement.attention_ranks
+    }
+
+    /// The expert union this rank is a member of, with its transport's shape.
+    pub(crate) fn union_member(
+        &self,
+        device: DeviceId,
+        model: &qwen3_moe::Qwen3Moe,
+    ) -> Result<Option<executor::runners::experts::Member>> {
+        let Some(union) = &self.union else {
+            return Ok(None);
+        };
+        let member = executor::runners::experts::Member::new(
+            Arc::clone(union),
+            self.transport_shape(device, model)?,
+        );
+        // An encoded block runs in the exchange's one fused launch.
+        Ok(Some(if model.experts_encoded() {
+            member.fused()
+        } else {
+            member
+        }))
+    }
+
+    /// The shape of the transport a member of an expert union creates on `device`.
+    fn transport_shape(
+        &self,
+        device: DeviceId,
+        model: &qwen3_moe::Qwen3Moe,
+    ) -> Result<ops::moe::exchange::TransportShape> {
+        let config = model.config();
+        Ok(ops::moe::exchange::TransportShape {
+            ranks: self.placement.expert_parallel + self.placement.attention_ranks,
+            rank: self.placement.union_rank,
+            experts: narrow(config.num_experts, "num_experts")?,
+            hidden: narrow(config.hidden_size, "hidden_size")?,
+            intermediate: narrow(config.moe_intermediate_size, "moe_intermediate_size")?,
+            max_tokens: u32::try_from(self.exchange_capacity())
+                .context("more rows per rank than the exchange addresses")?,
+            top: narrow(config.num_experts_per_tok, "num_experts_per_tok")?,
+            dtype: model.dtype(),
+            device: device.0,
+            attention_ranks: self.placement.attention_ranks,
+        })
+    }
+
+    /// What this rank's expert transport takes of its device, for the capacity plan.
+    fn transport_bytes(&self, device: DeviceId, model: &qwen3_moe::Qwen3Moe) -> Result<u64> {
+        if self.union.is_none() {
+            return Ok(0);
+        }
+        Ok(self
+            .transport_shape(device, model)?
+            .device_bytes(model.experts_encoded()))
+    }
+
+    /// The expert union this rank's executor answers wakes for.
+    pub(crate) fn union(&self) -> Option<(&Arc<executor::runners::experts::Union>, usize)> {
+        self.union
+            .as_ref()
+            .map(|union| (union, self.placement.union_rank as usize))
+    }
+
+    /// This plan on the cache planes of `world`, when this rank stands by for that world's process.
     pub(crate) fn sharing_cache_of(
         mut self,
         world: Option<u64>,
         table: Option<ipc::CacheTable>,
     ) -> Self {
         self.cache_world = world;
-        self.cache_table = table.filter(|_| world.is_some());
+        self.adopted_cache = table;
         self
     }
 
@@ -402,6 +535,10 @@ impl EpochPlan {
     pub(crate) fn scheduled(&self) -> Self {
         let mut plan = self.clone();
         plan.world_size = 1;
+        // A scheduler of an expert union plans its one rank as a pool of its own.
+        if plan.union.is_some() {
+            plan.rank = 0;
+        }
         plan
     }
 
@@ -1164,6 +1301,7 @@ impl EpochPlan {
                 )?;
                 let provider: Box<dyn KvProvider> =
                     Box::new(ResidentCache::new(cache, device, rows)?);
+                let member = self.union_member(device, model)?;
                 let runner = CausalLmRunner::new(
                     Binding {
                         id: RunnerId(0),
@@ -1180,6 +1318,10 @@ impl EpochPlan {
                     // the same run.
                     seed(),
                 )?;
+                let runner = match member {
+                    Some(member) => runner.in_union(member),
+                    None => runner,
+                };
                 runners.push(NamedRunner::new(RunnerId(0), Box::new(runner)));
             }
         }
@@ -1443,7 +1585,6 @@ impl EpochPlan {
                     device: executor::config::Device::Cuda(device),
                     host: &host,
                     world: self.cache_world.unwrap_or(self.world),
-                    segments: self.cache_table.clone(),
                     world_size: self.world_size,
                     queue_depth: self.queue_depth,
                     // The model's page is the preset: the plan returns it or fails, and a plan that
@@ -1453,9 +1594,18 @@ impl EpochPlan {
                     max_batch_tokens: tokens as usize,
                     max_request_pool_size: self.build.max_running_requests.get(),
                     max_model_len: self.max_kv_len(served)? as usize,
+                    max_total_tokens: self
+                        .build
+                        .kv_cache
+                        .max_tokens
+                        .map(|tokens| usize::try_from(tokens.get()))
+                        .transpose()
+                        .context("kv_cache_config.max_tokens")?,
+                    segments: self.adopted_cache.clone(),
                     mem_fraction_static: self.build.mem_fraction_static,
                     cache: Some(cache),
                     kv_dtype: cache_dtype(model, self.build.kv_cache.dtype)?,
+                    transport_bytes: self.transport_bytes(device, model)?,
                 };
                 (facts, rank_report(device, &host)?)
             }
@@ -1464,7 +1614,6 @@ impl EpochPlan {
                     device: executor::config::Device::Cuda(device),
                     host: &host,
                     world: self.world,
-                    segments: None,
                     world_size: self.world_size,
                     queue_depth: self.queue_depth,
                     // No page and no cache: the media class addresses no paged request, so the
@@ -1476,6 +1625,8 @@ impl EpochPlan {
                     max_batch_tokens: tokens as usize,
                     max_request_pool_size: self.build.max_running_requests.get(),
                     max_model_len: self.max_kv_len(served)? as usize,
+                    max_total_tokens: None,
+                    segments: None,
                     mem_fraction_static: self.build.mem_fraction_static,
                     cache: None,
                     // The media plan fits no cache, so this figure is never read: it states the
@@ -1486,6 +1637,7 @@ impl EpochPlan {
                         proto::request::ModelDtype::BFloat16 => ipc::PrefixCacheDtype::BFloat16,
                         proto::request::ModelDtype::Float32 => ipc::PrefixCacheDtype::Float32,
                     },
+                    transport_bytes: 0,
                 };
                 let clips = frame_clips()?;
                 let frames = (self.build.video.max_seconds * f64::from(minimax_h3::FPS)).round();
@@ -2505,6 +2657,10 @@ pub(crate) struct Placement {
     tensor_rank: u32,
     expert_parallel: u32,
     expert_rank: u32,
+    /// This rank's place in the expert union, attention ranks first.
+    union_rank: u32,
+    /// Leading ranks of the union that hold no experts.
+    attention_ranks: u32,
     load_options: qwen3_moe::LoadOptions,
 }
 
@@ -2750,6 +2906,8 @@ impl Placement {
             tensor_rank: launch.rank % tensor_parallel,
             expert_parallel,
             expert_rank: (launch.rank / tensor_parallel) % expert_parallel,
+            union_rank: 0,
+            attention_ranks: 0,
             // The deployment's page size is the cache's (`kv_cache_config.block_size`), and the
             // attention program's workspace is the load config's; neither is ours to guess, so the
             // model's own defaults stand until the loader takes them from the build config.
@@ -2826,6 +2984,9 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
             // The two encoders whose work a later call computes are answered as they arrive, under
             // the phase of either: a bucket of this variant names no one of them.
             Variant::ConditionEncode => engine::PhaseKind::VisionEncoding,
+            // A join is no phase a scheduler plans: a peer opens the step, and the union wakes
+            // this rank for it.
+            Variant::ExpertJoin => engine::PhaseKind::Decode,
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill

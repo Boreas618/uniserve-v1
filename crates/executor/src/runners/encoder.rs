@@ -686,8 +686,10 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let batch = self.token_batch(bucket)?;
         let group = self.group.clone();
+        let probes = crate::profiling::fences::capturing(&stream);
         let forward = crate::runners::denoiser::grouped(
-            nn::Forward::new(&stream, generation, &arena),
+            nn::Forward::new(&stream, generation, &arena)
+                .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
             group.as_deref(),
         );
         let layout = self.layout(bucket);
@@ -859,6 +861,7 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                             device_us: launched.elapsed().as_micros() as u64,
                             ..Default::default()
                         },
+                        forward_stats: None,
                     });
                 }
                 let stream = self.stream.clone();
@@ -896,6 +899,7 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()
                     },
+                    forward_stats: None,
                 })
             }
             Job::Capture {
@@ -908,6 +912,9 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
             } => self
                 .rebind(*bucket, *generation)
                 .map(|()| BatchOutput::default()),
+            Job::Join { .. } => Err(Error::Invariant(
+                "an encoder runner joins no expert step".into(),
+            )),
             Job::Shadow { operator, key, .. } => Err(Error::Invariant(format!(
                 "an encoder runner compares no operator, and the device asked it to shadow \
                  {operator} {key}"

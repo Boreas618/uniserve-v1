@@ -57,6 +57,10 @@ use crate::positions::{self, Mrope};
 use crate::vision::{BlockRows, ImageTables, Outputs, ROPE_THETA, VisionTower, ones};
 use crate::{Error, Result};
 
+/// The component a deployment's fence probes name (`profiling_config.fence_components`): one layer
+/// of the text encoder's stack.
+const TRANSFORMER_LAYER: &str = "models.minimax_h3.text_encoder.TransformerLayer";
+
 /// The language layers' gate: the checkpoint states `hidden_act: "silu"` and H3 fixes it.
 const ACTIVATION: Activation = Activation::Silu;
 
@@ -1243,17 +1247,19 @@ impl TextEncoder {
         let mut carried = None;
         let mut next = 0;
         for (index, layer) in self.layers.iter().enumerate() {
-            layer.forward(
-                self,
-                f,
-                &attention,
-                offsets,
-                &buffers,
-                carried,
-                hidden,
-                buffers.cosine,
-                buffers.sine,
-            )?;
+            f.fenced(TRANSFORMER_LAYER, format_args!("layers.{index}"), || {
+                layer.forward(
+                    self,
+                    f,
+                    &attention,
+                    offsets,
+                    &buffers,
+                    carried,
+                    hidden,
+                    buffers.cosine,
+                    buffers.sine,
+                )
+            })?;
             carried = Some(buffers.down);
             if self
                 .deepstack_layers

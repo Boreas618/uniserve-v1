@@ -623,6 +623,11 @@ impl Leader {
         let programs = next.programs.clone();
         let servers = self.program_servers(&target);
         let leader = self.program_leader_host(&target, &servers);
+        // A session does not cross epochs (`docs/profiling.md`): its ranks write their files while
+        // the epoch still executes, before the switch parks it.
+        if !dry_run {
+            self.end_profiles("world change").await;
+        }
         let applied = self.updates.apply(&previous, &next, change, dry_run);
         if let (Ok(_), Some(spec)) = (&applied, joining) {
             self.updates.await_programs(&target.host_identity);
@@ -660,10 +665,19 @@ impl Leader {
         Ok(serde_json::json!({ "commit": "no update in flight" }))
     }
 
+    /// Ends every replica's running profiling session, because its epoch stops executing.
+    async fn end_profiles(&self, reason: &str) {
+        for replica in self.replicas() {
+            let client = replica.hold().client();
+            crate::profiling::end_for_world(&replica, client.as_deref(), reason).await;
+        }
+    }
+
     /// Restores the previous epoch of the update in flight.
     pub async fn rollback(&self, reason: String) -> Result<serde_json::Value, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
         if self.updates.running() {
+            self.end_profiles("rollback").await;
             if self.updates.rollback(&reason) {
                 return Ok(self
                     .updates
@@ -685,9 +699,25 @@ impl Leader {
             .iter()
             .filter_map(|replica| replica.hold().client())
             .find(|client| matches!(client.state(), EngineState::Ready | EngineState::Parked));
+        // Each node's daemon reads its ledgers over its claim; an engine this daemon did not launch
+        // (a simulated one) answers for itself.
+        let control = replicas
+            .iter()
+            .find_map(|replica| replica.control.get().cloned());
         let ledgers = match client {
             Some(client) => {
-                match tokio::time::timeout(LEDGER_READ, client.describe_storage()).await {
+                let read = async {
+                    match control {
+                        Some(control) => {
+                            tokio::task::spawn_blocking(move || control.storage_reports())
+                                .await
+                                .map_err(|error| error.to_string())?
+                                .map_err(|error| format!("{error:#}"))
+                        }
+                        None => client.describe_storage().await,
+                    }
+                };
+                match tokio::time::timeout(LEDGER_READ, read).await {
                     Ok(Ok(nodes)) => serde_json::Value::Array(
                         nodes
                             .iter()

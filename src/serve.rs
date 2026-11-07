@@ -51,6 +51,7 @@ async fn serve(args: daemon::options::ServeArgs) -> Result<()> {
         return daemon::node(
             config.admin_config,
             config.server_config,
+            config.program_server,
             crate::shutdown_signal(),
         )
         .await;

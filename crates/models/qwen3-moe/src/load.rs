@@ -956,15 +956,86 @@ fn expert_block(
     // each; the dense path names one tensor per projection. Both are fused expert-major, in the
     // reading order the layouts name: up before gate.
     if let Quantization::Nvfp4(layout) = quantization {
-        // The encoded block is colocated by construction: its stacks hold every expert the router
-        // names, so a rank holding only a window cannot be served from them.
+        // An encoded block over a group runs in the exchange's one fused launch, which reads its
+        // own arrangement of the same bytes: each gate block before its up block, and the block
+        // scales in the swizzled table.
         if partition.expert_parallel != 1 {
-            return Err(Error::Unsupported(format!(
-                "{parameter} is encoded, and an encoded expert block is colocated: this rank holds \
-                 {} of {} experts",
-                range.len(),
-                config.num_experts
-            )));
+            let first = as_u32(range.start, "the first local expert")?;
+            let last = as_u32(range.end, "the last local expert")?;
+            let vocabulary = as_u32(config.num_experts, "num_experts")?;
+            let (up_gate, up_scales): (QuantizedStack, Vec<f32>) = loader
+                .nvfp4_window(
+                    &format!("{parameter}.mlp.experts.up_gate"),
+                    &expert_source.checkpoint_prefix,
+                    &["up", "gate"],
+                    &slots[range.clone()],
+                    vocabulary,
+                    Nvfp4Names::vllm(),
+                    nn::weights::ValueLayout::GateFirst,
+                    ScaleLayout::Swizzled128X4,
+                    true,
+                )
+                .map_err(Error::from)?;
+            let (down, down_scales): (QuantizedStack, Vec<f32>) = loader
+                .nvfp4_window(
+                    &format!("{parameter}.mlp.experts.down"),
+                    &expert_source.checkpoint_prefix,
+                    &["down"],
+                    &slots[range.clone()],
+                    vocabulary,
+                    Nvfp4Names::vllm(),
+                    nn::weights::ValueLayout::Plain,
+                    ScaleLayout::Swizzled128X4,
+                    true,
+                )
+                .map_err(Error::from)?;
+            // The kernel's three scalars per expert, as the Python provider computed them: each
+            // product dequantizes with the weight's tensor scale times its rows' activation scale,
+            // and the gated rows encode with the second activation scale's reciprocal. A fused
+            // first projection carries one tensor scale per expert, which up and gate share.
+            let tables = |bytes: Vec<f32>| -> Vec<u8> {
+                bytes.iter().flat_map(|value| value.to_ne_bytes()).collect()
+            };
+            let local = u64::try_from(range.len()).unwrap_or(0);
+            let table = |loader: &mut WeightLoader<'_>, what: &str, values: Vec<f32>| {
+                loader
+                    .constant(
+                        &format!("{parameter}.mlp.experts.{what}"),
+                        DType::F32,
+                        Shape::new(&[local]),
+                        &tables(values),
+                        "qwen3-moe",
+                    )
+                    .map_err(Error::from)
+            };
+            let up_alpha: Vec<f32> = up_scales
+                .chunks(2)
+                .map(|scales| scales[0] * up_gate.activation_scale)
+                .collect();
+            let down_alpha: Vec<f32> = down_scales
+                .iter()
+                .map(|scale| scale * down.activation_scale)
+                .collect();
+            let gated = vec![down.activation_scale.recip(); range.len()];
+            let tables = nn::layers::FusedTables {
+                up_gate_alpha: table(loader, "up_gate_alpha", up_alpha)?,
+                down_alpha: table(loader, "down_alpha", down_alpha)?,
+                gated_scale: table(loader, "gated_scale", gated)?,
+            };
+            return Moe::fused_expert_parallel(
+                router,
+                up_gate,
+                down,
+                tables,
+                Some(map),
+                vocabulary,
+                last - first,
+                first,
+                as_u32(config.num_experts_per_tok, "num_experts_per_tok")?,
+                activation(config.hidden_act)?,
+                config.norm_topk_prob,
+            )
+            .map_err(Error::from);
         }
         let vocabulary = as_u32(config.num_experts, "num_experts")?;
         // The shard's block scales are the export's own — linear, one per sixteen elements — and a

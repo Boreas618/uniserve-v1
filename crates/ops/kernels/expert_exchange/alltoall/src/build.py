@@ -1,13 +1,11 @@
 """The expert_exchange package's compile script: one descriptor -> one module.
 
 The module is this package's exchange: the transport's lifecycle over the CUDA
-virtual-memory API and the two directions of the exchange for one expert group,
-exporting the five lifecycle entries and the two the operator calls. A
-descriptor is the direction, the hidden width, the routes per token, the expert
-count, the transport's capacity, the group size and the activation type; the
-kernels read them at launch, so every descriptor of this package compiles the
-same object. A group of several ranks is a descriptor this module refuses at
-launch, not a different compilation.
+virtual-memory API and both directions of the exchange for one expert group,
+exporting the six lifecycle entries and the one the operator calls. A descriptor
+is the direction, the hidden width, the routes per token, the expert count, the
+transport's capacity, the group size and the activation type; the kernels read
+them at launch, so every descriptor of this package compiles the same object.
 
 The Program Server runs this script with its own Python environment, its working
 directory the package root, and `UNISERVE_OP`, `UNISERVE_BACKEND`,
@@ -23,15 +21,14 @@ import shutil
 import subprocess
 import sys
 
-#: The translation unit of the module: every entry and both kernels.
+#: The translation unit of the module: every entry and the kernels.
 SOURCES = ["src/exchange.cu"]
 
-#: The entries the module exports; the package's `[module.entries]` names the
-#: launch role, the harness asks the transport's views through `info`.
+#: The entries the module exports, the ones `[module.entries]` names.
 ENTRIES = [
-    "uniserve_expert_exchange_dispatch",
-    "uniserve_expert_exchange_combine",
+    "uniserve_expert_exchange_launch",
     "uniserve_expert_exchange_create",
+    "uniserve_expert_exchange_step",
     "uniserve_expert_exchange_suspend",
     "uniserve_expert_exchange_restore",
     "uniserve_expert_exchange_release",

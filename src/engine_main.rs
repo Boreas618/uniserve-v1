@@ -133,33 +133,13 @@ pub(crate) struct Epoch {
     pub host: String,
     /// The world of the epoch this process succeeds, whose storages it maps until it is promoted.
     pub predecessor_world: Option<u64>,
-    /// The cache of each group as that epoch holds it.
-    pub predecessor_cache: Vec<proto::request::wire::CacheSegments>,
     /// The routed experts' distribution this epoch loads (§7.6): what a redistribution committed,
     /// which a relaunch and a standby load again.
     pub experts: BTreeMap<String, Vec<u32>>,
-}
-
-impl Epoch {
-    /// The cache planes of `group` as the epoch this process succeeds holds them; none for a
-    /// process that succeeds no epoch, and for a group that keeps no segments.
-    fn predecessor_table(&self, group: &str) -> Option<ipc::CacheTable> {
-        self.predecessor_cache
-            .iter()
-            .find(|cache| cache.worker_group == group && !cache.segments.is_empty())
-            .map(|cache| ipc::CacheTable {
-                segments: cache
-                    .segments
-                    .iter()
-                    .map(|segment| ipc::CacheSegment {
-                        world: segment.world,
-                        ordinal: segment.ordinal,
-                        units: segment.units,
-                    })
-                    .collect(),
-                held: cache.held,
-            })
-    }
+    /// The deployment's always-on profiling (`profiling_config`).
+    pub profiling: proto::request::wire::Profiling,
+    /// The KV cache the world this process succeeds holds, by worker group.
+    pub predecessor_cache: Vec<proto::request::wire::CacheSegments>,
 }
 
 /// The options of `uniserve engine`: the launch file the daemon writes for this process (§2.3).
@@ -554,9 +534,26 @@ fn load_rank(
     launch: &Launch,
     epoch: &Epoch,
 ) -> Result<LoadedRank> {
+    let adopted = epoch
+        .predecessor_cache
+        .iter()
+        .find(|cache| cache.worker_group == launch.group)
+        .filter(|_| launch.standby)
+        .map(|cache| ipc::CacheTable {
+            segments: cache
+                .segments
+                .iter()
+                .map(|segment| ipc::CacheSegment {
+                    world: segment.world,
+                    ordinal: segment.ordinal,
+                    units: segment.units,
+                })
+                .collect(),
+            held: cache.held,
+        });
     let plan = plan.sharing_cache_of(
         epoch.predecessor_world.filter(|_| launch.standby),
-        epoch.predecessor_table(&launch.group),
+        adopted,
     );
     let host = HostGroup::connect(rendezvous, index, count, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
@@ -593,6 +590,7 @@ fn load_rank(
     let (model, memory, inventory, graph) = plan
         .load_and_open(&mut weights, &mut &*client, &host, &epoch.experts)
         .context("loading the epoch's model")?;
+    tracing::info!(rank = plan.rank(), "the rank loaded its model");
     let weights = weights.take_log();
     Ok(LoadedRank {
         plan,
@@ -720,6 +718,8 @@ pub(crate) fn run(
     log: &crate::cli::LogLevels,
 ) -> Result<ExitCode> {
     crate::follow_lifeline(lifeline);
+    // Before any thread reads the environment and before the first NVTX call.
+    executor::profiling::counters::inject();
     crate::logging::init_tracing(
         "Engine",
         log.log_level.as_deref(),
@@ -829,6 +829,8 @@ pub(crate) struct MainProcess {
     /// owns the instance, so every call the control thread makes goes through the handle and the
     /// command channel carries the mutation (§2.4).
     schedulers: Vec<engine::SchedulerHandle>,
+    /// The expert union of this node's ranks, ended before their device threads are.
+    union: Option<Arc<executor::runners::experts::Union>>,
     /// One statistics reporter per scheduler, in the schedulers' order.
     ///
     /// A reporter keeps the cumulative baselines of the counters it has already
@@ -836,6 +838,10 @@ pub(crate) struct MainProcess {
     /// reporter must see every pass (§2.3's `/metrics`, `uniserve:num_requests_running`
     /// and its kind).
     stats_reporters: Vec<engine::SchedulerStatsReporter>,
+    /// CUPTI's always-on counters, for as long as the process serves.
+    _counters: Option<executor::profiling::counters::Counters>,
+    /// The control thread's driver calls that waited for the device, as of its last report.
+    control_calls: platform::cupti::blocking::Calls,
     /// This node's device executors, shared with the schedulers that submit through them: one
     /// executor thread per device, reached both by this process's own verbs (`precopy`,
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
@@ -1066,6 +1072,9 @@ impl MainProcess {
         // the model loads, and keeps what it maps for the epoch's life.
         // A host tier is the build config's, and it needs prefix caching to have pages to keep.
         let host_kv_cache = build.kv_cache.host_tier && build.kv_cache.prefix_caching;
+        // CUPTI accepts one subscriber per process, and what it observes begins at the subscription,
+        // so the process subscribes before it loads a module (`docs/profiling.md`).
+        executor::profiling::counters::subscribe();
         // §2.1: this process serves every rank of its node, each on its own device.
         let rank_plans = plan.ranks()?;
         let rank_numbers: Vec<u32> = rank_plans.iter().map(EpochPlan::rank).collect();
@@ -1098,6 +1107,26 @@ impl MainProcess {
         if plan.devices().is_empty() {
             bail!("this rank serves no device");
         }
+        // Every capture of this process carries the probes the deployment names, and the graphs
+        // keep them for good: only their switch changes while the process serves.
+        if !epoch.profiling.fence_components.is_empty() {
+            executor::profiling::fences::Fences::install(
+                plan.devices(),
+                epoch.profiling.fence_components.clone(),
+                epoch.profiling.fence_probes,
+                &epoch.profiling.fence_probes_off,
+            )
+            .context("installing the fence probes")?;
+        }
+        // CUPTI attributes a graph kernel's PC samples only when sampling was enabled before the
+        // graph was captured.
+        if epoch.profiling.graph_pc_sampling {
+            for device in plan.devices() {
+                let context = platform::PrimaryContext::retain(*device)?;
+                executor::profiling::pc_sampling::enable(&context)
+                    .context("enabling PC sampling for this rank's graphs")?;
+            }
+        }
         let mut memories = Vec::with_capacity(ranks.len());
         let mut clients = Vec::with_capacity(ranks.len());
         let mut models = Vec::with_capacity(ranks.len());
@@ -1107,6 +1136,10 @@ impl MainProcess {
             .first()
             .map(|rank| rank.plan.scheduled())
             .context("this process serves no rank")?;
+        // Each rank of an expert union is a scheduler's own; the ranks of a media group are one
+        // pool, which the first rank's plan describes.
+        let union = first_plan.union().map(|(union, _)| Arc::clone(union));
+        let mut scheduled = Vec::with_capacity(ranks.len());
         // The group's products, which every rank's runners reach through their own view of them.
         let group_products = GroupProducts::new(ranks.len());
         let rank_count = ranks.len() as u32;
@@ -1174,8 +1207,16 @@ impl MainProcess {
                 // which owns the stream a wake resets its units on, so the client is bound beside
                 // the cache handle rather than kept only here.
                 executor.bind_storage(Arc::clone(&client));
+                if let Some((union, member)) = rank_plan.union() {
+                    union.bind(
+                        member,
+                        Arc::clone(executor.queue()),
+                        executor::runner::RunnerId(0),
+                    )?;
+                }
                 let executor = Arc::new(executor);
                 data_ranks.push(executor::data_plane::Rank {
+                    rank: rank_plan.rank(),
                     executor: Arc::downgrade(&executor),
                     device: *device,
                     storage: Arc::clone(&client),
@@ -1187,6 +1228,7 @@ impl MainProcess {
                 executors.push(executor);
                 generations.push(generation);
             }
+            scheduled.push(rank_plan.scheduled());
             memories.push(memory);
             clients.push(client);
             models.push(model);
@@ -1207,31 +1249,64 @@ impl MainProcess {
                 checkpoint: launch.model.clone(),
                 experts: epoch.experts.clone(),
             },
-            build.kv_cache.max_tokens.map(std::num::NonZeroU64::get),
-            build.max_running_requests.get() as u64,
+            build.mem_fraction_static,
         ));
         // This node's schedulers, one thread per DP rank, each handing its batches to the executors
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
-        let schedulers = schedulers(
-            &first_plan,
-            launch,
-            &models[0],
-            &executors,
-            &inventories[0],
-            &memories[0],
-            control.wake(),
-            &data,
-        )?;
+        let schedulers = if union.is_some() {
+            let mut handles = Vec::with_capacity(executors.len());
+            for (index, plan) in scheduled.iter().enumerate() {
+                // A dedicated expert rank takes no request: it joins the steps the others open.
+                if !plan.schedules() {
+                    continue;
+                }
+                handles.extend(schedulers(
+                    plan,
+                    launch,
+                    &models[index],
+                    &executors[index..=index],
+                    &inventories[index],
+                    &memories[index],
+                    control.wake(),
+                    &data,
+                )?);
+            }
+            handles
+        } else {
+            schedulers(
+                &first_plan,
+                launch,
+                &models[0],
+                &executors,
+                &inventories[0],
+                &memories[0],
+                control.wake(),
+                &data,
+            )?
+        };
 
+        // The always-on counters: every stream a runner computes on is `device`.
+        let observed: Vec<(&'static str, platform::Stream)> = executors
+            .iter()
+            .flat_map(|executor| executor.streams().iter().cloned())
+            .map(|stream| ("device", stream))
+            .collect();
+        let counters = executor::profiling::counters::Counters::start(
+            &observed,
+            !epoch.profiling.graph_pc_sampling,
+        );
         let stats_reporters = (0..schedulers.len())
             .map(|_| engine::SchedulerStatsReporter::default())
             .collect();
         let mut process = Self {
             control,
             schedulers,
+            union,
             stats_reporters,
+            _counters: counters,
+            control_calls: platform::cupti::blocking::Calls::default(),
             executors,
             memory: memories,
             storage: clients,
@@ -1355,6 +1430,8 @@ impl MainProcess {
     fn serve(&mut self) -> Result<Option<UpdateFailure>> {
         let mut running = Vec::new();
         let mut reported = Instant::now();
+        // This thread must not wait for a device (§2.4): the count says whether it ever did.
+        let _watched = platform::cupti::blocking::Watched::enter();
         loop {
             let pass = Instant::now();
             if self.stopping {
@@ -3716,6 +3793,11 @@ impl MainProcess {
         // An early `Serve` is honoured here rather than at its arrival: this is the pass that
         // admits, so the request waiting in the frontend is exactly what it was waiting for.
         self.pending_serve = false;
+        // What the ranks hold to serve is warm by now, so the ledger hears of it before any request
+        // can ask for more (§7.6). A rank past its quota does not serve.
+        self.data
+            .book_serving()
+            .context("booking what the ranks hold in their devices' ledgers")?;
         self.resume_schedulers()
     }
 
@@ -4043,14 +4125,18 @@ impl MainProcess {
         // The routing policy runs on the scheduler node; a request submitted to
         // a node that holds no scheduler belongs to this node's single rank.
         if self.schedulers.len() <= 1 {
-            0
-        } else {
-            // Several DP ranks on one node: the mechanism's policy instance
-            // picks the rank (§4.4). Until that call is published, the first
-            // scheduler takes it, which is the single-rank case and the
-            // identity of an unloaded deployment.
-            0
+            return 0;
         }
+        // Several DP ranks on one node: the mechanism's policy instance picks the rank (§4.4).
+        // Until that call is published the rank holding the fewest requests takes it, because a
+        // rank the requests never reach leaves its share of the batch empty.
+        let mut held = vec![0_usize; self.schedulers.len()];
+        for served in &self.streams {
+            if let Some(count) = held.get_mut(served.rank) {
+                *count += 1;
+            }
+        }
+        (0..held.len()).min_by_key(|rank| held[*rank]).unwrap_or(0)
     }
 
     /// Routes a per-request command to the scheduler that holds the request.
@@ -4450,6 +4536,14 @@ impl MainProcess {
     /// policy's fuel and calls) come from the schedulers' handle and stay zero
     /// until it exists.
     fn send_metrics(&mut self) {
+        // The driver calls this thread waited in, and the fence records an idle device left unread,
+        // reach the next batch result.
+        let current = platform::cupti::blocking::Calls::current();
+        executor::profiling::counters::add_blocking("control", &current.since(&self.control_calls));
+        self.control_calls = current;
+        if let Some(fences) = executor::profiling::fences::Fences::installed() {
+            fences.poll(false);
+        }
         let mut kernel_launches = 0_u64;
         let mut device_ns = 0_u64;
         let mut queue = Vec::with_capacity(self.executors.len());
@@ -4884,6 +4978,10 @@ impl MainProcess {
                 proto::request::wire::from_engine::Kind::Event(event),
             );
         }
+        // A rank that waits for its peers inside a step stops waiting: the peers are ending too.
+        if let Some(union) = &self.union {
+            union.end();
+        }
         // The schedulers go first: their `Batches` holds a clone of every executor, and a device
         // thread cannot be joined while a scheduler could still submit to it.
         self.schedulers.clear();
@@ -5112,6 +5210,25 @@ impl MainProcess {
                 let payload = hook.payload;
                 self.data_work(front, id, move |data| data.unload_adapter(&payload));
             }
+            // A session's collectors begin and end between two batches, which each rank's device
+            // thread alone knows: the work thread waits for it, and the control thread does not.
+            "uniserve.profile_start" => {
+                let payload = hook.payload;
+                self.data_work(front, id, move |data| data.start_profile(&payload));
+            }
+            "uniserve.profile_stop" => {
+                let payload = hook.payload;
+                self.data_work(front, id, move |data| data.stop_profile(&payload));
+            }
+            "uniserve.profile_release" => {
+                let payload = hook.payload;
+                self.data_work(front, id, move |data| data.release_profile(&payload));
+            }
+            // The probes read the switch in device storage, and writing it waits for nothing.
+            "uniserve.fence_switch" => match fence_switch(&hook.payload) {
+                Ok(results) => self.answer_now(front, id, results),
+                Err(error) => self.refuse(front, id, error),
+            },
             other => {
                 self.refuse(
                     front,
@@ -5633,6 +5750,33 @@ fn status_name(status: &ProgramStatus) -> &'static str {
         ProgramStatus::PolicyReverted { .. } => "policy_reverted",
         ProgramStatus::Failed { .. } => "failed",
     }
+}
+
+/// Writes the fence probes' device switch (`docs/profiling.md`): `{"enabled": bool, "off":
+/// [patterns]}`. A process without probes answers so.
+fn fence_switch(payload: &str) -> std::result::Result<Vec<String>, String> {
+    let payload: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error| format!("fence_switch: {error}"))?;
+    let enabled = payload["enabled"]
+        .as_bool()
+        .ok_or_else(|| "fence_switch states no enabled".to_owned())?;
+    let off: Vec<String> = match payload.get("off") {
+        Some(off) if !off.is_null() => serde_json::from_value(off.clone())
+            .map_err(|error| format!("fence_switch off: {error}"))?,
+        _ => Vec::new(),
+    };
+    let switched = executor::profiling::fences::Fences::installed()
+        .map(|fences| fences.switch(enabled, &off))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    Ok(vec![
+        serde_json::json!({
+            "probes": switched.is_some(),
+            "enabled": enabled,
+            "off": switched.unwrap_or_default(),
+        })
+        .to_string(),
+    ])
 }
 
 fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
@@ -8041,13 +8185,16 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
         predecessor_world: spec.predecessor.as_ref().map(|predecessor| predecessor.world),
         predecessor_cache: spec
             .predecessor
-            .map_or_else(Vec::new, |predecessor| predecessor.segments),
+            .as_ref()
+            .map(|predecessor| predecessor.segments.clone())
+            .unwrap_or_default(),
         experts: spec
             .expert_order
             .into_iter()
             .map(|(module, order)| (module, order.experts))
             .collect(),
         host: spec.host,
+        profiling: spec.profiling.unwrap_or_default(),
     })
 }
 

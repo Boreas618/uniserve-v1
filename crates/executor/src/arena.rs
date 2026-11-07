@@ -654,6 +654,11 @@ impl Pools {
         Ok(())
     }
 
+    /// Whether the pools are suspended: nothing maps their ranges until a restore.
+    pub fn suspended(&self) -> bool {
+        self.suspended_at.is_some()
+    }
+
     /// Maps storage at the addresses the pools held when they were suspended, with their saved
     /// contents, and refuses a layout the captured graphs do not address.
     ///

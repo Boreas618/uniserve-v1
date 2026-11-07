@@ -764,63 +764,8 @@ impl CacheChange {
     /// A command naming a change this build does not know, in a sentence.
     pub fn from_wire(resize: &proto::request::wire::ResizeCache) -> Result<Self, String> {
         use proto::request::wire;
-        let successor = crate::Successor {
-            loads_weights: resize.successor_loads_weights,
-            unmapped_cache: resize.successor_unmapped_cache,
-            host_cache: resize.successor_host_cache,
-            eager_source: resize.eager_source,
-            captures_graphs: resize.successor_captures_graphs,
-            // A malformed UUID names no GPU of this deployment.
-            rank_budgets: resize
-                .rank_budgets
-                .iter()
-                .filter_map(|weights| {
-                    <[u8; 16]>::try_from(weights.gpu.as_slice())
-                        .ok()
-                        .map(|gpu| {
-                            (
-                                gpu,
-                                storage::manifest::weights::RankBudget {
-                                    weights: weights.weights,
-                                    quota: weights.quota,
-                                    process: weights.process,
-                                    graphs: weights.graphs,
-                                    fixed: weights.fixed,
-                                    cache: weights.cache,
-                                    cache_capacity: weights.cache_capacity,
-                                    cache_segment: weights.cache_segment,
-                                    in_flight: weights.in_flight.as_ref().map(|cache| {
-                                        storage::manifest::weights::CacheReservation {
-                                            bytes: cache.bytes,
-                                            mapped: cache.mapped,
-                                        }
-                                    }),
-                                    pages: weights
-                                        .pages
-                                        .iter()
-                                        .map(|page| storage::manifest::weights::CachePage {
-                                            tokens: page.tokens,
-                                            bytes: page.bytes,
-                                            window: page.window,
-                                            state: page.state,
-                                        })
-                                        .collect(),
-                                },
-                            )
-                        })
-                })
-                .collect(),
-        };
         match wire::CacheChange::try_from(resize.change) {
-            Ok(wire::CacheChange::Shrink) => Ok(Self::Shrink {
-                preempt_after: resize
-                    .preempt_after_ms
-                    .map(std::time::Duration::from_millis),
-                successor,
-            }),
             Ok(wire::CacheChange::Grow) => Ok(Self::Grow),
-            Ok(wire::CacheChange::Plan) => Ok(Self::Plan(successor)),
-            Ok(wire::CacheChange::Evict) => Ok(Self::Evict),
             Ok(wire::CacheChange::MakeRoom) => Ok(Self::MakeRoom {
                 bytes: resize.room_bytes,
                 devices: resize
@@ -833,10 +778,11 @@ impl CacheChange {
                     })
                     .collect(),
             }),
-            Ok(wire::CacheChange::Restore) => Ok(Self::Restore),
             Ok(wire::CacheChange::Sleep) => Ok(Self::Sleep),
             Ok(wire::CacheChange::Wake) => Ok(Self::Wake),
-            Err(_) => Err(format!("unknown KV cache change {}", resize.change)),
+            Ok(wire::CacheChange::Unspecified) | Err(_) => {
+                Err(format!("unknown KV cache change {}", resize.change))
+            }
         }
     }
 }
@@ -855,46 +801,9 @@ pub enum WeightsInFlight {
     Abort,
 }
 
-/// Target rank resources by GPU UUID, including the concrete weight chunks
-/// created beside retained source chunks.
-pub type RankBudgets = std::collections::BTreeMap<[u8; 16], storage::manifest::weights::RankBudget>;
-
-/// What a world succeeding this one on the same devices adds beside what it
-/// shares with it, which a shrink makes room for.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct Successor {
-    /// It loads its weights from the model's files (their keys differ), so
-    /// it holds as many beside the serving world's.
-    pub loads_weights: bool,
-    /// It maps none of the serving world's KV cache, so copied or
-    /// recomputed in-flight state needs units of its own.
-    pub unmapped_cache: bool,
-    /// Its copied pages reside in admitted host storage during preparation.
-    pub host_cache: bool,
-    /// The predecessor releases its graph pool during preparation.
-    pub eager_source: bool,
-    /// Its graph policy captures graphs (`cuda_graph_config.policy` is not
-    /// `off`), so its warmup takes a graph share where its model can be
-    /// captured.
-    pub captures_graphs: bool,
-    /// Its target numerical capacity and concrete transfer allocations.
-    pub rank_budgets: RankBudgets,
-}
-
 /// A change to the device storage of a scheduler's KV cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CacheChange {
-    /// Gives back the tail of the cache until each device has the storage a
-    /// world succeeding this one needs beside the storage they share, the
-    /// weights it creates included; the requests that hold the tail run
-    /// on, and are recomputed once `preempt_after` passed, when given, or
-    /// once one cannot get a unit to continue.
-    Shrink {
-        preempt_after: Option<std::time::Duration>,
-        successor: Successor,
-    },
-    /// Creates the given-back tail again.
-    Restore,
     /// Gives back the whole cache and the CUDA graph storage, keeping the
     /// weights, once no request runs; the scheduler admits nothing until
     /// it wakes.
@@ -912,15 +821,6 @@ pub enum CacheChange {
     /// Creates as many of the given-back segments as each device's storage
     /// ledger has room for.
     Grow,
-    /// Plans a shrink without withdrawing anything: answers with each
-    /// device's storage beside a world succeeding this one, or fails with
-    /// why such a world does not fit.
-    Plan(Successor),
-    /// For a parked world whose successor maps none of its cache: gives
-    /// back every segment past the first, once the idle cached pages they
-    /// hold reached the host KV cache, so that the successor's cache grows
-    /// into them. A resume creates them again.
-    Evict,
     /// Gives back the tail of the cache until each device's storage ledger
     /// has room for `bytes` beside everything it books, with per-GPU values
     /// from `devices` overriding that amount; tail holders continue running.

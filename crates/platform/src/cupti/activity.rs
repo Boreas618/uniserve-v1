@@ -4,10 +4,13 @@
 //! ([`super::subscriber`]), CUPTI's records of kernels
 //! (`CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL`), copies (`MEMCPY`, and
 //! `MEMCPY2` for peer copies) and fills (`MEMSET`), and registers the
-//! streams to account by name. A graph launch is recorded by its nodes,
-//! under the stream it was launched on, unless a collector enabled CUPTI's
-//! graph-level records (`GRAPH_TRACE`, a timeline that traces whole graphs):
-//! the launch is then one record, whose interval is accounted the same way.
+//! streams to account by name. A graph launch is one record of CUPTI's
+//! graph-level kind (`GRAPH_TRACE`), which the recording holds enabled, and
+//! whose interval is accounted the same way: recording each of a graph's
+//! nodes instead costs every kernel timestamps, 11% of a Qwen3-30B-A3B decode
+//! step on GB200, which an always-on counter cannot pay. A timeline that
+//! traces nodes has the hold given up while it runs ([`hold_graph_trace`]), and
+//! a process whose PC sampling refuses the kind records nodes throughout.
 //! The device timestamps each operation's start and end, and CUPTI collects
 //! the records in buffers, which the subscription's flush thread has CUPTI
 //! deliver every [`FLUSH_PERIOD`]; the delivery merges each registered
@@ -310,6 +313,29 @@ impl Drop for KindsHold {
     }
 }
 
+/// Whether the recording holds `GRAPH_TRACE` enabled now.
+static GRAPH_HELD: AtomicBool = AtomicBool::new(false);
+
+/// Has the recording hold `GRAPH_TRACE` enabled, or give it up for a collector
+/// that needs a graph's nodes recorded. Executables replayed afterwards are to
+/// be instantiated for the mode this leaves.
+///
+/// # Errors
+///
+/// When CUPTI refuses the kind.
+pub fn hold_graph_trace(hold: bool) -> Result<()> {
+    if GRAPH_HELD.load(Ordering::Acquire) == hold {
+        return Ok(());
+    }
+    if hold {
+        subscriber::enable_kind(GRAPH_TRACE)?;
+    } else {
+        subscriber::disable_kind(GRAPH_TRACE);
+    }
+    GRAPH_HELD.store(hold, Ordering::Release);
+    Ok(())
+}
+
 /// The process's recording of its registered streams' device activity;
 /// stops on drop. One records at a time.
 pub struct StreamActivity {
@@ -319,10 +345,14 @@ pub struct StreamActivity {
 
 impl StreamActivity {
     /// Record the device activity of `streams`, each under its name, which
-    /// [`take`] reports. Fails when the process could not subscribe to
-    /// CUPTI ([`subscriber::subscribe`]), CUPTI refuses a record kind, or
-    /// another recording is active.
-    pub fn start<'a>(streams: impl IntoIterator<Item = (&'a str, &'a Stream)>) -> Result<Self> {
+    /// [`take`] reports, a graph's launch as one record when `whole_graphs`.
+    /// Fails when the process could not subscribe to CUPTI
+    /// ([`subscriber::subscribe`]), CUPTI refuses a record kind, or another
+    /// recording is active.
+    pub fn start<'a>(
+        streams: impl IntoIterator<Item = (&'a str, &'a Stream)>,
+        whole_graphs: bool,
+    ) -> Result<Self> {
         subscriber::subscribe()?;
         let cupti = cupti()?;
         if RECORDING.swap(true, Ordering::AcqRel) {
@@ -359,12 +389,16 @@ impl StreamActivity {
             subscriber::enable_kind(kind)?;
             recording.enabled.push(kind);
         }
+        if whole_graphs {
+            hold_graph_trace(true)?;
+        }
         Ok(recording)
     }
 }
 
 impl Drop for StreamActivity {
     fn drop(&mut self) {
+        let _ = hold_graph_trace(false);
         for &kind in &self.enabled {
             subscriber::disable_kind(kind);
         }
@@ -578,7 +612,7 @@ pub(crate) mod tests {
             let storage = DeviceAllocation::linear(device, FILL_BYTES)?;
             let graph = captured(&storage, &stream, 16)?;
             let pause = Duration::from_millis(50);
-            let activity = StreamActivity::start([("device", &stream)])?;
+            let activity = StreamActivity::start([("device", &stream)], false)?;
 
             let first = fills(&storage, &stream, 16)?;
             stream.synchronize()?;

@@ -60,6 +60,8 @@ struct Node {
     /// The token that brings the current deployment down.
     current: Mutex<Option<CancellationToken>>,
     server: ServerOptions,
+    /// The host's Program Server, which a deployment that names none resolves its programs at.
+    program_server: Option<std::path::PathBuf>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -76,6 +78,7 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub async fn node(
     admin: AdminOptions,
     server: ServerOptions,
+    program_server: Option<std::path::PathBuf>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let listener = Listener::bind(&admin)
@@ -87,6 +90,7 @@ pub async fn node(
         last_error: Mutex::new(None),
         current: Mutex::new(None),
         server: server.clone(),
+        program_server,
     });
     let mut app = Router::new()
         .route("/admin/config", put(deploy).get(idle_config))
@@ -101,10 +105,16 @@ pub async fn node(
         }));
     }
     info!(%address, "the node serves no deployment yet");
-    let served = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-        .await
-        .context("the node's HTTP server failed");
+    // The connection writer is what takes a response's body out of its extensions (`conn`), so a
+    // deployment's routes answer nothing through any other server.
+    let served = super::conn::serve(
+        listener,
+        app,
+        shutdown.clone(),
+        super::handoff::Admissions::default(),
+    )
+    .await
+    .context("the node's HTTP server failed");
     // The deployment serving now comes down with the node.
     let current = locked(&node.current).take();
     if let Some(token) = current {
@@ -198,6 +208,9 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
     }
     // The node's server serves the deployment's routes.
     config.server_config = node.server.clone();
+    if config.program_server.is_none() {
+        config.program_server = node.program_server.clone();
+    }
     if let Err(error) = config.validate(&stated) {
         return ApiError::invalid_request(format!("{error:#}"), Some("config")).into_response();
     }

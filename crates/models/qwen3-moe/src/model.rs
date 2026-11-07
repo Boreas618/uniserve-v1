@@ -49,6 +49,13 @@ use std::sync::Arc;
 
 use crate::{Config, Error, Partition, Result};
 
+/// The components a deployment's fence probes name (`profiling_config.fence_components`): the
+/// decoder stack, one decoder layer, and a layer's two sublayers.
+const TRANSFORMER: &str = "models.qwen3.transformer.Transformer";
+const TRANSFORMER_LAYER: &str = "models.qwen3.transformer.TransformerLayer";
+const ATTENTION: &str = "models.qwen3.transformer.Attention";
+const MOE: &str = "models.qwen3.transformer.MoE";
+
 /// Bytes at the head of the attention workspace that can hold the decode's arrival count: four
 /// bytes per row and query head, at least one per multiprocessor, for any bucket this serves.
 const ATTENTION_COUNTER_BYTES: u64 = 1 << 20;
@@ -75,6 +82,9 @@ pub struct LoadOptions {
     /// is admitted within it; a batch larger than it is a deployment error rather than a buffer that
     /// grows.
     pub exchange_capacity: u64,
+    /// Leading ranks of the exchange that hold no experts: the attention ranks of a deployment whose
+    /// experts live on dedicated ranks, and zero when every rank holds its share.
+    pub exchange_attention: u32,
 }
 
 impl Default for LoadOptions {
@@ -86,6 +96,7 @@ impl Default for LoadOptions {
             page_tokens: 64,
             experts_encoded: false,
             exchange_capacity: 0,
+            exchange_attention: 0,
         }
     }
 }
@@ -290,6 +301,7 @@ impl Plan {
                         Error::Config(format!("{ranks} ranks exceed a plan's row counts"))
                     })?,
                     capacity: options.exchange_capacity,
+                    attention: u64::from(options.exchange_attention),
                 })
             }
         };
@@ -934,20 +946,22 @@ impl Qwen3Moe {
             // deep and the next layer is handed the same addresses, which is what a replayed graph
             // expects. The layer-independent buffers above were reserved before this mark.
             let mark = f.arena.mark();
-            let out = layer.forward(
-                f,
-                batch,
-                cache,
-                index,
-                offset == 0,
-                &buffers,
-                residual,
-                buffers.residual,
-                cosine,
-                sine,
-                input,
-                if index == last { stage } else { None },
-            )?;
+            let out = f.fenced(TRANSFORMER_LAYER, format_args!("layers.{index}"), || {
+                layer.forward(
+                    f,
+                    batch,
+                    cache,
+                    index,
+                    offset == 0,
+                    &buffers,
+                    residual,
+                    buffers.residual,
+                    cosine,
+                    sine,
+                    input,
+                    if index == last { stage } else { None },
+                )
+            })?;
             f.arena.release(mark);
             // The first layer read the embedding in `hidden` and wrote the first sum into the
             // plan's residual region; from here on the stream lives there and every layer
@@ -1101,9 +1115,11 @@ impl DecoderLayer {
             return Ok(normalized);
         }
 
-        let projected = self.attention.forward(
-            f, batch, cache, layer, buffers, normalized, cosine, sine, update, stop,
-        )?;
+        let projected = f.fenced(ATTENTION, format_args!("layers.{layer}.self_attn"), || {
+            self.attention.forward(
+                f, batch, cache, layer, buffers, normalized, cosine, sine, update, stop,
+            )
+        })?;
         if stop == Some(Substage::Projected) {
             return Ok(projected);
         }
@@ -1118,10 +1134,10 @@ impl DecoderLayer {
             return Ok(normalized);
         }
 
-        match &self.mlp {
+        f.fenced(MOE, format_args!("layers.{layer}.mlp"), || match &self.mlp {
             Mlp::Experts(moe) => moe.forward(f, normalized, update).map_err(Error::from),
             Mlp::Dense(dense) => dense.forward(f, normalized, buffers, update),
-        }?;
+        })?;
         Ok(update)
     }
 }
@@ -1359,6 +1375,15 @@ impl Substage {
 }
 
 impl CausalLm for Qwen3Moe {
+    fn join_expert_step(&self, f: &Forward) -> nn::Result<()> {
+        for layer in &self.layers {
+            if let Mlp::Experts(moe) = &layer.mlp {
+                moe.join_expert_step(f)?;
+            }
+        }
+        Ok(())
+    }
+
     fn embed_input_ids(&self, f: &Forward, ids: TensorView, out: TensorView) -> nn::Result<()> {
         self.embedding
             .forward(f, ids, out)
@@ -1398,27 +1423,30 @@ impl CausalLm for Qwen3Moe {
             self.layers.len().checked_sub(1).ok_or_else(|| {
                 capability(Error::Config("the model has no decoder layer".into()))
             })?;
-        let (input, residual, _) = self
-            .walk(
-                f,
-                batch,
-                cache,
-                hidden,
-                Run {
-                    start: 0,
-                    last,
-                    stage: None,
-                },
-            )
-            .map_err(capability)?;
+        f.fenced(TRANSFORMER, format_args!("model"), || {
+            let (input, residual, _) = self
+                .walk(
+                    f,
+                    batch,
+                    cache,
+                    hidden,
+                    Run {
+                        start: 0,
+                        last,
+                        stage: None,
+                    },
+                )
+                .map_err(capability)?;
 
-        // The output norm: the last layer's output added into the residual stream and normalized.
-        // The sum lands back in the stream, which is the last thing this forward needs from it, and
-        // `add_rms_norm` loads a whole row before storing any of it, so the alias is safe.
-        self.norm
-            .forward_with_residual(f, input, residual, residual, hidden)
-            .map_err(Error::from)
-            .map_err(capability)
+            // The output norm: the last layer's output added into the residual stream and
+            // normalized. The sum lands back in the stream, which is the last thing this forward
+            // needs from it, and `add_rms_norm` loads a whole row before storing any of it, so the
+            // alias is safe.
+            self.norm
+                .forward_with_residual(f, input, residual, residual, hidden)
+                .map_err(Error::from)
+                .map_err(capability)
+        })
     }
 
     fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> nn::Result<()> {

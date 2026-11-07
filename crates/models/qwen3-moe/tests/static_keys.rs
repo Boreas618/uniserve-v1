@@ -1,21 +1,37 @@
 //! The walk with no weights and no device: a configuration and a partition state every program.
 //!
-//! The checkpoint this model serves is `Qwen3-30B-A3B`; this file reads its `config.json` when the
-//! metadata is present and otherwise states the same architecture by hand, so the test runs on a
-//! machine that holds no shards — which is exactly what the static walk exists for.
+//! The checkpoint this model serves is `Qwen3-30B-A3B`; this file states its architecture by hand,
+//! so the test runs on a machine that holds no shards — which is exactly what the static walk
+//! exists for.
 
 use nn::DType;
 use qwen3_moe::keys::keys;
-use qwen3_moe::{Config, Partition};
+use qwen3_moe::{Activation, Config, Partition};
 
 /// Qwen3-30B-A3B's architecture, as its `config.json` states it.
 fn config() -> Config {
-    let path = std::path::Path::new("/opt/uv/models/Qwen3-30B-A3B");
-    if path.join("config.json").is_file() {
-        return Config::read(path)
-            .unwrap_or_else(|error| panic!("the checkpoint's metadata: {error}"));
+    Config {
+        vocab_size: 151936,
+        hidden_size: 2048,
+        intermediate_size: 6144,
+        num_hidden_layers: 48,
+        num_attention_heads: 32,
+        num_key_value_heads: 4,
+        head_dim: 128,
+        hidden_act: Activation::Silu,
+        rms_norm_eps: 1e-6,
+        rope_theta: 1_000_000.0,
+        rope_scaling: None,
+        max_position_embeddings: 40960,
+        attention_bias: false,
+        tie_word_embeddings: false,
+        num_experts: 128,
+        num_experts_per_tok: 8,
+        moe_intermediate_size: 768,
+        norm_topk_prob: true,
+        decoder_sparse_step: 1,
+        mlp_only_layers: Vec::new(),
     }
-    panic!("Qwen3-30B-A3B's config.json")
 }
 
 fn partition() -> Partition {
@@ -132,15 +148,23 @@ fn the_encoded_experts_add_the_encoder_and_their_two_products_and_no_bucket_rows
 }
 
 #[test]
-fn a_packed_projection_costs_one_product_per_bucket_and_refuses_an_empty_list() {
+fn a_packed_projection_costs_one_product_per_row_class_and_refuses_an_empty_list() {
     let one = walk(DType::BF16, DType::BF16, &[8], false, true);
-    let three = walk(DType::BF16, DType::BF16, &[1, 8, 64], false, true);
+    // Every count here rounds up to the same row class, so it costs what one count costs.
+    let same_class = walk(DType::BF16, DType::BF16, &[1, 8, 64], false, true);
+    // Each count here rounds up to a different row class.
+    let three = walk(DType::BF16, DType::BF16, &[1, 200, 2000], false, true);
     let products =
         |rows: &[(String, String)]| rows.iter().filter(|(name, _)| name == "nvfp4_gemm").count();
     assert_eq!(
+        products(&one),
+        products(&same_class),
+        "counts in one row class share a product"
+    );
+    assert_eq!(
         products(&one) * 3,
         products(&three),
-        "one product per bucket per geometry"
+        "one product per row class per geometry"
     );
 
     let refused = keys(

@@ -1542,7 +1542,12 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let group = self.group.clone();
-        let forward = grouped(nn::Forward::new(&stream, generation, &arena), group.as_deref());
+        let probes = crate::profiling::fences::capturing(&stream);
+        let forward = grouped(
+            nn::Forward::new(&stream, generation, &arena)
+                .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
+            group.as_deref(),
+        );
         let layout = layout_of(bucket)?;
         let tables = self.model.state_tables(&layout);
         let key = Self::key(bucket);
@@ -1852,6 +1857,7 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()
                     },
+                    forward_stats: None,
                 })
             }
             Job::Capture {
@@ -1864,6 +1870,9 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
             } => self
                 .rebind(*bucket, *generation)
                 .map(|()| BatchOutput::default()),
+            Job::Join { .. } => Err(Error::Invariant(
+                "a denoiser runner joins no expert step".into(),
+            )),
             Job::Shadow { operator, key, .. } => Err(Error::Invariant(format!(
                 "a denoiser runner compares no operator, and the device asked it to shadow \
                  {operator} {key}"
