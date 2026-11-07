@@ -62,11 +62,7 @@ pub const MAX_ASPECT_RATIO: f64 = 4.0;
 /// The ratio `auto` means for `t2va` and `ref2va`.
 const DEFAULT_ASPECT_RATIO: (u32, u32) = (16, 9);
 
-/// Shortest explicit video duration, in seconds, the MiniMax-H3 API admits.
-pub const MIN_VIDEO_SECONDS: f64 = 4.0;
-/// Longest explicit video duration, in seconds, the MiniMax-H3 API admits. A
-/// deployment may serve a lower maximum, never a higher one.
-pub const MAX_VIDEO_SECONDS: f64 = 15.0;
+pub use proto::config::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
 
 /// The audio VAE's sample rate and hop: 40 latents per second.
 pub const AUDIO_SAMPLE_RATE: u32 = 32_000;

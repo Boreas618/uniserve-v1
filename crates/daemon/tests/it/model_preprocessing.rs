@@ -13,7 +13,7 @@ use daemon::model::ModelConfig;
 use daemon::model::assets::ResolvedModelFiles;
 use daemon::openai::ApiError;
 use daemon::options::ChatTemplateContentFormatOption;
-use daemon::options::MediaOptions;
+use daemon::options::MediaConfig;
 use daemon::output::OutputParams;
 use daemon::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
 use models::ModelDescription;
@@ -96,7 +96,7 @@ fn video_service(
         },
         max_video_seconds,
         1,
-        &MediaOptions::default(),
+        &MediaConfig::default(),
         // A text-to-video denoiser takes no references to size.
         models::video::plan::ReferenceConfig::new(&models::video::ReferenceLimits::default()),
         Arc::clone(tokenizer),

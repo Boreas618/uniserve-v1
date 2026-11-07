@@ -465,7 +465,7 @@ impl Leader {
         &self,
         current: &ServeConfig,
         target: &ServeConfig,
-        update: &crate::options::UpdateOptions,
+        update: &crate::options::UpdateConfig,
         dry_run: bool,
     ) -> Result<Option<Applied>, UpdateError> {
         let previous = crate::epoch::Deployment::of(current.clone());

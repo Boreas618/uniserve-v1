@@ -59,7 +59,7 @@ use reqwest::{StatusCode, Url};
 use thiserror::Error;
 use tokio::sync::Semaphore;
 
-use crate::options::{ImageFetchOptions, MediaOptions};
+use crate::options::{ImageFetchConfig, MediaConfig};
 
 /// Failure to resolve one media reference.
 ///
@@ -303,7 +303,7 @@ impl MediaConnector {
     ///
     /// Fails when the HTTP client cannot be initialized, for example when the
     /// TLS backend cannot load its configuration.
-    pub fn from_image_options(options: &ImageFetchOptions) -> anyhow::Result<Self> {
+    pub fn from_image_options(options: &ImageFetchConfig) -> anyhow::Result<Self> {
         Self::new(
             None,
             true,
@@ -324,7 +324,7 @@ impl MediaConnector {
     ///
     /// Fails when the media directory cannot be resolved or the HTTP client
     /// cannot be initialized.
-    pub fn from_media_options(options: &MediaOptions) -> anyhow::Result<Self> {
+    pub fn from_media_options(options: &MediaConfig) -> anyhow::Result<Self> {
         Self::new(
             options.directory.as_deref(),
             options.allow_remote,
@@ -1042,14 +1042,14 @@ mod tests {
 
     /// Default image limits with loopback destinations allowed, which the
     /// local test server needs.
-    fn loopback_policy() -> ImageFetchOptions {
-        ImageFetchOptions {
+    fn loopback_policy() -> ImageFetchConfig {
+        ImageFetchConfig {
             allow_private: true,
-            ..ImageFetchOptions::default()
+            ..ImageFetchConfig::default()
         }
     }
 
-    fn image_connector(options: &ImageFetchOptions) -> MediaConnector {
+    fn image_connector(options: &ImageFetchConfig) -> MediaConnector {
         MediaConnector::from_image_options(options).unwrap()
     }
 
@@ -1085,10 +1085,10 @@ mod tests {
 
     /// A condition-media connector whose request total is `max_request_bytes`.
     fn condition_connector(directory: Option<&Path>, max_request_bytes: u64) -> MediaConnector {
-        MediaConnector::from_media_options(&MediaOptions {
+        MediaConnector::from_media_options(&MediaConfig {
             directory: directory.map(Path::to_path_buf),
             max_request_bytes,
-            ..MediaOptions::default()
+            ..MediaConfig::default()
         })
         .unwrap()
     }
@@ -1431,7 +1431,7 @@ mod tests {
         .await;
         let paths = ["/declared", "/close-delimited", "/chunked"];
 
-        let exact = image_connector(&ImageFetchOptions {
+        let exact = image_connector(&ImageFetchConfig {
             max_bytes: png.len() as u64,
             ..loopback_policy()
         });
@@ -1441,7 +1441,7 @@ mod tests {
         }
 
         let limit = png.len() as u64 - 1;
-        let smaller = image_connector(&ImageFetchOptions {
+        let smaller = image_connector(&ImageFetchConfig {
             max_bytes: limit,
             ..loopback_policy()
         });
@@ -1466,7 +1466,7 @@ mod tests {
             )
         })
         .await;
-        let connector = image_connector(&ImageFetchOptions {
+        let connector = image_connector(&ImageFetchConfig {
             max_bytes: 1000,
             ..loopback_policy()
         });
@@ -1490,7 +1490,7 @@ mod tests {
         })
         .await;
         let timeout = Duration::from_millis(200);
-        let connector = image_connector(&ImageFetchOptions {
+        let connector = image_connector(&ImageFetchConfig {
             timeout,
             ..loopback_policy()
         });
@@ -1509,9 +1509,9 @@ mod tests {
     /// data URLs, and data URLs over the size limit are refused.
     #[tokio::test]
     async fn unsupported_references_are_refused() {
-        let connector = image_connector(&ImageFetchOptions {
+        let connector = image_connector(&ImageFetchConfig {
             max_bytes: 256,
-            ..ImageFetchOptions::default()
+            ..ImageFetchConfig::default()
         });
         let fetch = |reference: &str| {
             let reference = reference.to_owned();
@@ -1765,7 +1765,7 @@ mod tests {
         let server = TestServer::start(move |_| ok("image/png", &png)).await;
         let port = server.address.port();
         let public_only = [
-            image_connector(&ImageFetchOptions::default()),
+            image_connector(&ImageFetchConfig::default()),
             condition_connector(None, 64),
         ];
 
@@ -1787,9 +1787,9 @@ mod tests {
                 );
             }
         }
-        let remote_disabled = MediaConnector::from_media_options(&MediaOptions {
+        let remote_disabled = MediaConnector::from_media_options(&MediaConfig {
             allow_remote: false,
-            ..MediaOptions::default()
+            ..MediaConfig::default()
         })
         .unwrap();
         assert!(matches!(

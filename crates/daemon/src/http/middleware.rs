@@ -338,7 +338,7 @@ mod tests {
     use axum::http::StatusCode;
 
     use crate::model::ModelParameters;
-    use crate::options::ServerOptions;
+    use crate::options::ServerConfig;
     use crate::test_support::{SERVED_MODEL, post_json, router_with, send, sim_engine};
 
     /// Sends a two-token chat completion with `request_id` as its
@@ -347,9 +347,9 @@ mod tests {
     async fn chat(request_id: Option<&str>) -> (String, String) {
         let router = router_with(
             sim_engine(ModelParameters::Qwen3),
-            &ServerOptions {
+            &ServerConfig {
                 request_id_headers: true,
-                ..ServerOptions::default()
+                ..ServerConfig::default()
             },
         );
         let mut request = post_json(

@@ -61,10 +61,8 @@ async fn serve(
 /// The frontend's options, from the deployment's resolved configuration.
 ///
 /// The deployment file is the daemon's schema and its one parser
-/// (`daemon::options`); the frontend reads the values its application uses as
-/// its own plain data (§7.7). This is the only place the two representations
-/// meet, so a value either side adds shows up here as a compile error rather
-/// than as a silent default.
+/// (`daemon::options`); the sections the frontend reads are the same types the
+/// daemon parses (`proto::config`), so each is handed over whole.
 fn options(config: &daemon::options::ServeConfig) -> Result<frontend::options::Options> {
     let model = config
         .model
@@ -79,86 +77,17 @@ fn options(config: &daemon::options::ServeConfig) -> Result<frontend::options::O
         host_identity: config.host_identity.clone(),
         nnodes: config.nnodes,
         node_rank: config.node_rank,
-        load_config: frontend::options::LoadOptions {
-            format: config.load_config.format,
-            download_dir: config.load_config.download_dir.clone(),
-            threads: config.load_config.threads,
-            weights: config.load_config.weights.clone(),
-            parallel_degrees: config.load_config.parallel_degrees.clone(),
-        },
-        server_config: frontend::options::ServerOptions {
-            host: config.server_config.host.clone(),
-            port: config.server_config.port,
-            uds: config.server_config.uds.clone(),
-            api_key: config.server_config.api_key.clone(),
-            request_timeout: config.server_config.request_timeout,
-            max_concurrent_requests: config.server_config.max_concurrent_requests,
-            shutdown_timeout: config.server_config.shutdown_timeout,
-            request_id_headers: config.server_config.request_id_headers,
-        },
-        logging_config: frontend::options::LoggingOptions {
-            log_requests: config.logging_config.log_requests,
-            log_stats: config.logging_config.log_stats,
-        },
-        chat_config: frontend::options::ChatOptions {
-            template: config.chat_config.template.clone(),
-            template_kwargs: config.chat_config.template_kwargs.clone(),
-            template_content_format: content_format(config.chat_config.template_content_format),
-            reasoning_parser: reasoning_parser(config.chat_config.reasoning_parser),
-        },
-        image_fetch_config: frontend::options::ImageFetchOptions {
-            timeout: config.image_fetch_config.timeout,
-            max_bytes: config.image_fetch_config.max_bytes,
-            allow_private: config.image_fetch_config.allow_private,
-        },
-        video_config: frontend::options::VideoOptions {
-            max_seconds: config.video_config.max_seconds,
-            resolutions: config.video_config.resolutions.clone(),
-            aspect_ratios: config.video_config.aspect_ratios.clone(),
-            text_capacities: config.video_config.text_capacities.clone(),
-            max_condition_rows: config.video_config.max_condition_rows,
-        },
-        media_config: frontend::options::MediaOptions {
-            directory: config.media_config.directory.clone(),
-            allow_remote: config.media_config.allow_remote,
-            max_request_bytes: config.media_config.max_request_bytes,
-            ffprobe: config.media_config.ffprobe.clone(),
-            ffmpeg: config.media_config.ffmpeg.clone(),
-        },
-        video_job_config: frontend::options::VideoJobOptions {
-            retention: config.video_job_config.retention,
-            max_bytes: config.video_job_config.max_bytes,
-        },
-        migration_config: frontend::options::MigrationOptions {
-            max_migrations: config.migration_config.max_migrations,
-        },
+        load_config: config.load_config.clone(),
+        server_config: config.server_config.clone(),
+        logging_config: config.logging_config.clone(),
+        chat_config: config.chat_config.clone(),
+        image_fetch_config: config.image_fetch_config.clone(),
+        video_config: config.video_config.clone(),
+        media_config: config.media_config.clone(),
+        video_job_config: config.video_job_config.clone(),
+        migration_config: config.migration_config.clone(),
         ..Default::default()
     })
-}
-
-/// The chat template's content format, which the file spells the same way.
-fn content_format(
-    format: daemon::options::ChatTemplateContentFormatOption,
-) -> frontend::options::ChatTemplateContentFormatOption {
-    use daemon::options::ChatTemplateContentFormatOption as File;
-    use frontend::options::ChatTemplateContentFormatOption as Owned;
-    match format {
-        File::Auto => Owned::Auto,
-        File::String => Owned::String,
-        File::OpenAi => Owned::OpenAi,
-    }
-}
-
-/// Which reasoning parser splits model output.
-fn reasoning_parser(
-    parser: daemon::options::ReasoningParser,
-) -> frontend::options::ReasoningParser {
-    use daemon::options::ReasoningParser as File;
-    use frontend::options::ReasoningParser as Owned;
-    match parser {
-        File::Auto => Owned::Auto,
-        File::None => Owned::None,
-    }
 }
 
 #[cfg(test)]

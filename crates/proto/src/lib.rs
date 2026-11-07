@@ -19,6 +19,7 @@
 //! one frame each, over a Unix socket on one node or TCP between nodes.
 
 pub mod catalog;
+pub mod config;
 mod connection;
 mod media;
 pub mod profile;

@@ -1623,7 +1623,7 @@ pub fn lower_chat_request(
     // Template kwargs may not replace the variables the renderer derives
     // from the request itself.
     let template_kwargs = request.chat_template_kwargs.unwrap_or_default();
-    if let Some(name) = crate::input::chat::ChatOptions::RESERVED_TEMPLATE_KWARGS
+    if let Some(name) = crate::input::chat::ChatConfig::RESERVED_TEMPLATE_KWARGS
         .into_iter()
         .find(|name| template_kwargs.contains_key(*name))
     {
@@ -1650,7 +1650,7 @@ pub fn lower_chat_request(
             tools: convert_tools(request.tools)?,
             // An absent choice lets the model decide, as OpenAI's default does.
             tool_choice: request.tool_choice.unwrap_or(ChatToolChoice::Auto),
-            chat_options: crate::input::chat::ChatOptions {
+            chat_options: crate::input::chat::ChatConfig {
                 reasoning_effort: request.reasoning_effort,
                 template_kwargs,
                 ..Default::default()

@@ -28,7 +28,7 @@ use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use tokio_util::either::Either;
 use tracing::trace;
 
-use crate::options::{AdminOptions, ServerOptions};
+use crate::options::{AdminConfig, ServerConfig};
 
 /// Runtime listener type used by the OpenAI-compatible HTTP server, which is
 /// either a TCP listener or a Unix-domain listener.
@@ -93,8 +93,8 @@ pub(crate) struct BindAddress<'a> {
     pub(crate) uds: Option<&'a str>,
 }
 
-impl<'a> From<&'a ServerOptions> for BindAddress<'a> {
-    fn from(server: &'a ServerOptions) -> Self {
+impl<'a> From<&'a ServerConfig> for BindAddress<'a> {
+    fn from(server: &'a ServerConfig) -> Self {
         Self {
             host: &server.host,
             port: server.port,
@@ -103,8 +103,8 @@ impl<'a> From<&'a ServerOptions> for BindAddress<'a> {
     }
 }
 
-impl<'a> From<&'a AdminOptions> for BindAddress<'a> {
-    fn from(admin: &'a AdminOptions) -> Self {
+impl<'a> From<&'a AdminConfig> for BindAddress<'a> {
+    fn from(admin: &'a AdminConfig) -> Self {
         Self {
             host: &admin.host,
             port: admin.port,
@@ -270,13 +270,13 @@ impl axum::serve::Listener for Listener {
 #[cfg(test)]
 mod tests {
     use super::Listener;
-    use crate::options::ServerOptions;
+    use crate::options::ServerConfig;
 
     /// The server options of a Unix-domain socket at `path`.
-    fn uds(path: &std::path::Path) -> ServerOptions {
-        ServerOptions {
+    fn uds(path: &std::path::Path) -> ServerConfig {
+        ServerConfig {
             uds: Some(path.to_str().unwrap().to_owned()),
-            ..ServerOptions::default()
+            ..ServerConfig::default()
         }
     }
 

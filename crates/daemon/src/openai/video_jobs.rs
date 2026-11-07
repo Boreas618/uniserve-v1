@@ -31,7 +31,7 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::options::VideoJobOptions;
+use crate::options::VideoJobConfig;
 use crate::output::RequestOutput;
 use crate::output::video::VideoStreamError;
 
@@ -227,7 +227,7 @@ pub(crate) struct VideoJobs {
     /// One permit per retained artifact byte, up to the configured budget.
     bytes: Arc<Semaphore>,
     /// The configured retention and byte budget.
-    settings: VideoJobOptions,
+    settings: VideoJobConfig,
     /// Cancelled at server shutdown; every job's token is its child.
     shutdown: CancellationToken,
     /// The generation tasks and expiry timers of the jobs.
@@ -237,7 +237,7 @@ pub(crate) struct VideoJobs {
 impl VideoJobs {
     /// Creates an empty store under `settings` whose jobs stop when
     /// `shutdown` is cancelled.
-    pub(crate) fn new(settings: VideoJobOptions, shutdown: CancellationToken) -> Self {
+    pub(crate) fn new(settings: VideoJobConfig, shutdown: CancellationToken) -> Self {
         Self {
             entries: Mutex::default(),
             relay: Mutex::new(None),
@@ -249,7 +249,7 @@ impl VideoJobs {
     }
 
     /// The retention and byte budget the store was created with.
-    pub(crate) fn settings(&self) -> &VideoJobOptions {
+    pub(crate) fn settings(&self) -> &VideoJobConfig {
         &self.settings
     }
 
@@ -516,7 +516,7 @@ mod tests {
 
     fn store() -> Arc<VideoJobs> {
         Arc::new(VideoJobs::new(
-            VideoJobOptions::default(),
+            VideoJobConfig::default(),
             CancellationToken::new(),
         ))
     }
@@ -561,9 +561,9 @@ mod tests {
     #[tokio::test]
     async fn a_failed_job_expires_after_the_configured_retention() {
         let jobs = Arc::new(VideoJobs::new(
-            VideoJobOptions {
+            VideoJobConfig {
                 retention: Duration::from_secs(90),
-                ..VideoJobOptions::default()
+                ..VideoJobConfig::default()
             },
             CancellationToken::new(),
         ));
@@ -594,7 +594,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_stops_every_job() {
         let shutdown = CancellationToken::new();
-        let jobs = VideoJobs::new(VideoJobOptions::default(), shutdown.clone());
+        let jobs = VideoJobs::new(VideoJobConfig::default(), shutdown.clone());
         let first = start(&jobs, "video-a");
         let second = start(&jobs, "video-b");
 

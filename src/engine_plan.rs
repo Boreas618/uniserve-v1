@@ -2321,7 +2321,7 @@ fn narrow(value: usize, name: &str) -> Result<u32> {
 /// The deployment's `text_capacities`, when stated, must be strictly increasing and below the
 /// length it admits - a capacity above it would capture an encoder graph no request can fill. The
 /// default is the one its options document states: `1024`, then steps of `2048`, below the length.
-fn prompt_capacities(video: &daemon::options::VideoOptions, longest: u32) -> Result<Vec<u32>> {
+fn prompt_capacities(video: &daemon::options::VideoConfig, longest: u32) -> Result<Vec<u32>> {
     let stated: Vec<u32> = match &video.text_capacities {
         Some(capacities) => capacities.iter().map(|value| value.get()).collect(),
         None => {
@@ -2364,7 +2364,7 @@ fn prompt_capacities(video: &daemon::options::VideoOptions, longest: u32) -> Res
 }
 
 /// The widest prompt capacity a deployment captures: what one media batch may present.
-fn prompt_capacity(video: &daemon::options::VideoOptions, longest: u32) -> Result<u32> {
+fn prompt_capacity(video: &daemon::options::VideoConfig, longest: u32) -> Result<u32> {
     prompt_capacities(video, longest)?
         .into_iter()
         .max()
@@ -2424,7 +2424,7 @@ fn snap_frames(frames: u32) -> Result<u32> {
 /// snaps them to a legal count itself, which is why the request states the plain figure.
 fn media_candidates(
     tasks: &[nn::VideoTask],
-    video: &daemon::options::VideoOptions,
+    video: &daemon::options::VideoConfig,
     capacities: &[u32],
     ladder: &[u32],
 ) -> Result<Vec<executor::runners::denoiser::WarmRequest>> {
@@ -2533,7 +2533,7 @@ fn media_candidates(
 /// row, the rotary frequencies) - the same for every canvas, so a canvas of the set is a lookup and
 /// costs no device storage. The one per-canvas figure is the attention block's row bound, taken as
 /// the largest.
-fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32, u32)>> {
+fn deployment_canvases(video: &daemon::options::VideoConfig) -> Result<Vec<(u32, u32)>> {
     let mut canvases: Vec<(u32, u32)> = Vec::new();
     for canvas in named_canvases(video)? {
         if !canvases.contains(&(canvas.width, canvas.height)) {
@@ -2550,7 +2550,7 @@ fn deployment_canvases(video: &daemon::options::VideoOptions) -> Result<Vec<(u32
 /// rates are the model's output clock, and the canvases are the ones this deployment prepares.
 fn denoiser_report(
     pipeline: &minimax_h3::load::MinimaxH3,
-    video: &daemon::options::VideoOptions,
+    video: &daemon::options::VideoConfig,
     checkpoint_tasks: &[nn::VideoTask],
 ) -> Result<ipc::VideoDenoiserInfo> {
     use minimax_h3::{AUDIO_SAMPLE_RATE, FPS};
@@ -2663,7 +2663,7 @@ fn frame_clips() -> Result<models::video::FrameClips> {
 
 /// The named canvases this deployment prepares, each resolution class at each aspect ratio.
 fn named_canvases(
-    video: &daemon::options::VideoOptions,
+    video: &daemon::options::VideoConfig,
 ) -> Result<Vec<&'static minimax_h3::Canvas>> {
     use minimax_h3::config::NAMED_CANVASES;
     let mut canvases: Vec<&'static minimax_h3::Canvas> = Vec::new();

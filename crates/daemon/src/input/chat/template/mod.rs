@@ -29,10 +29,10 @@ use self::format::ChatTemplateContentFormat;
 use self::jinja::{CompiledChatTemplate, TemplateContext};
 use self::value::{TemplateValue, to_template_value};
 use crate::input::chat::{
-    ChatContent, ChatContentPart, ChatMessage, ChatOptions as RequestChatOptions, ChatRequest,
+    ChatConfig as RequestChatOptions, ChatContent, ChatContentPart, ChatMessage, ChatRequest,
     ChatRole, ChatToolChoice,
 };
-use crate::options::ChatOptions;
+use crate::options::ChatConfig;
 use crate::options::ChatTemplateContentFormatOption;
 use crate::output::chat::Error;
 use crate::output::chat::Result;
@@ -127,7 +127,7 @@ impl HfChatRenderer {
     /// template does not compile.
     pub fn load(
         files: &ResolvedModelFiles,
-        options: &ChatOptions,
+        options: &ChatConfig,
         multimodal: Option<MultimodalRenderInfo>,
     ) -> Result<Self> {
         let HfTokenizerConfig {

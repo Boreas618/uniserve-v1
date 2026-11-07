@@ -5,7 +5,7 @@
 //! The template comes from the model files or `chat_config.template`.
 
 pub use request::{
-    ChatContent, ChatContentPart, ChatMessage, ChatOptions, ChatRequest, ChatRole, ChatToolChoice,
+    ChatConfig, ChatContent, ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatToolChoice,
     GenerationPromptMode, ReasoningEffort,
 };
 pub use template::HfChatRenderer;

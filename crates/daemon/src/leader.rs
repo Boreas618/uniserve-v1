@@ -151,7 +151,7 @@ pub(crate) struct SwitchTarget {
     /// The epoch the target serves.
     pub(crate) epoch: u64,
     /// The options that govern this update (`update_config`, with what its own `set` stated).
-    pub(crate) update: crate::options::UpdateOptions,
+    pub(crate) update: crate::options::UpdateConfig,
 }
 
 /// Records each scheduler's statistics under `model_name`, and with
@@ -1427,7 +1427,7 @@ impl Leader {
         &self,
         number: u64,
         target: &ServeConfig,
-        options: &crate::options::UpdateOptions,
+        options: &crate::options::UpdateConfig,
         force: bool,
         dry_run: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
@@ -1499,7 +1499,7 @@ impl Leader {
     fn watch_program_trial(
         &self,
         number: u64,
-        options: &crate::options::UpdateOptions,
+        options: &crate::options::UpdateConfig,
         promotion: std::time::Instant,
     ) {
         let window = options.rollback.window;
@@ -2443,7 +2443,7 @@ impl Replica {
     async fn warm_target(
         self: &Arc<Self>,
         updates: &Arc<crate::updates::driver::Driver>,
-        update: &crate::options::UpdateOptions,
+        update: &crate::options::UpdateConfig,
         target_page: u32,
     ) -> Option<Arc<EngineClient>> {
         let source = self.hold.client()?;

@@ -2,9 +2,9 @@
 //!
 //! The deployment file has one parser, `daemon::options` in the process that
 //! owns the file and starts the other processes (`specs/worker.md` §2.3,
-//! §7.7). This module is the frontend's side of that boundary: plain data,
-//! no parser and no TOML, filled by the root package's `src/frontend.rs` from
-//! the daemon's resolved `ServeConfig` and handed to [`crate::serve`].
+//! §7.7). The sections the frontend reads are the types that parser fills
+//! (`proto::config`), so the root package's `src/frontend.rs` hands each over
+//! whole from the daemon's resolved `ServeConfig` to [`crate::serve`].
 //!
 //! It carries the groups §7.7 gives the frontend (`server_config`,
 //! `chat_config`, `image_fetch_config`, `media_config`, `video_job_config`,
@@ -17,12 +17,13 @@
 //! needs, so a value's update layer and the application's use of it are
 //! independent.
 
-use std::collections::HashMap;
-use std::num::{NonZeroU32, NonZeroU64};
-use std::path::PathBuf;
-use std::time::Duration;
+pub use proto::config::{
+    ChatConfig, ChatTemplateContentFormatOption, ImageFetchConfig, LoadConfig, LoggingConfig,
+    MediaConfig, MigrationConfig, ReasoningParser, ServerConfig, VideoConfig, VideoJobConfig,
+};
+use std::num::NonZeroU32;
 
-use proto::request::{LoadFormat, ModelDtype};
+use proto::request::ModelDtype;
 use serde_json::Value;
 
 /// Everything the frontend reads from the deployment file.
@@ -48,23 +49,23 @@ pub struct Options {
     /// serves the API.
     pub node_rank: u32,
     /// The checkpoint reader (`load_config`).
-    pub load_config: LoadOptions,
+    pub load_config: LoadConfig,
     /// The HTTP server (`server_config`).
-    pub server_config: ServerOptions,
+    pub server_config: ServerConfig,
     /// What the frontend logs about serving (`logging_config`).
-    pub logging_config: LoggingOptions,
-    /// ChatOptions models (`chat_config`).
-    pub chat_config: ChatOptions,
+    pub logging_config: LoggingConfig,
+    /// ChatConfig models (`chat_config`).
+    pub chat_config: ChatConfig,
     /// Fetching input images of chat requests (`image_fetch_config`).
-    pub image_fetch_config: ImageFetchOptions,
+    pub image_fetch_config: ImageFetchConfig,
     /// MiniMax-H3 video generation (`video_config`).
-    pub video_config: VideoOptions,
+    pub video_config: VideoConfig,
     /// Condition media of video requests (`media_config`).
-    pub media_config: MediaOptions,
+    pub media_config: MediaConfig,
     /// Finished video jobs (`video_job_config`).
-    pub video_job_config: VideoJobOptions,
+    pub video_job_config: VideoJobConfig,
     /// Movement of token requests between epochs (`migration_config`).
-    pub migration_config: MigrationOptions,
+    pub migration_config: MigrationConfig,
 }
 
 impl Default for Options {
@@ -78,15 +79,15 @@ impl Default for Options {
             host_identity: "localhost".to_owned(),
             nnodes: NonZeroU32::MIN,
             node_rank: 0,
-            load_config: LoadOptions::default(),
-            server_config: ServerOptions::default(),
-            logging_config: LoggingOptions::default(),
-            chat_config: ChatOptions::default(),
-            image_fetch_config: ImageFetchOptions::default(),
-            video_config: VideoOptions::default(),
-            media_config: MediaOptions::default(),
-            video_job_config: VideoJobOptions::default(),
-            migration_config: MigrationOptions::default(),
+            load_config: LoadConfig::default(),
+            server_config: ServerConfig::default(),
+            logging_config: LoggingConfig::default(),
+            chat_config: ChatConfig::default(),
+            image_fetch_config: ImageFetchConfig::default(),
+            video_config: VideoConfig::default(),
+            media_config: MediaConfig::default(),
+            video_job_config: VideoJobConfig::default(),
+            migration_config: MigrationConfig::default(),
         }
     }
 }
@@ -110,241 +111,6 @@ impl Options {
     /// the API.
     pub fn leads(&self) -> bool {
         self.node_rank == 0
-    }
-}
-
-/// The checkpoint reader (`load_config`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct LoadOptions {
-    /// Checkpoint reader: `auto`, `safetensors`, `pt`, `layered` or `dummy`.
-    pub format: LoadFormat,
-    /// Hugging Face cache root for repository models.
-    pub download_dir: Option<PathBuf>,
-    /// Concurrent checkpoint file readers.
-    pub threads: Option<NonZeroU32>,
-    /// A plugin's weight source that streams the checkpoint's tensors in
-    /// place of its files; the files when unset.
-    pub weights: Option<String>,
-    /// The tensor- and expert-parallel degrees the deployment's
-    /// configurations use, which retained weight storage is chunked for.
-    pub parallel_degrees: Vec<NonZeroU32>,
-}
-
-impl Default for LoadOptions {
-    fn default() -> Self {
-        Self {
-            format: LoadFormat::Auto,
-            download_dir: None,
-            threads: None,
-            weights: None,
-            parallel_degrees: Vec::new(),
-        }
-    }
-}
-
-/// The HTTP server (`server_config`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ServerOptions {
-    /// TCP address the server listens on.
-    pub host: String,
-    /// TCP port the server listens on.
-    pub port: u16,
-    /// Unix domain socket to listen on instead of TCP; a stale socket file
-    /// is replaced and the socket file is removed at shutdown.
-    pub uds: Option<String>,
-    /// Bearer token every route but `/health` and `/metrics` requires.
-    pub api_key: Option<String>,
-    /// Time until a response head is sent, answered with 504 when it
-    /// expires; streamed bodies are not bounded.
-    pub request_timeout: Option<Duration>,
-    /// In-flight generation requests above which requests are shed with 503.
-    pub max_concurrent_requests: Option<NonZeroU64>,
-    /// Longest drain of in-flight requests at shutdown; zero stops at once.
-    pub shutdown_timeout: Duration,
-    /// Add an `X-Request-Id` response header with the ID the request ran
-    /// under.
-    pub request_id_headers: bool,
-}
-
-impl Default for ServerOptions {
-    fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_owned(),
-            port: 8000,
-            uds: None,
-            api_key: None,
-            request_timeout: None,
-            max_concurrent_requests: None,
-            shutdown_timeout: Duration::from_secs(30),
-            request_id_headers: false,
-        }
-    }
-}
-
-/// What the frontend logs about serving (`logging_config`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct LoggingOptions {
-    /// Log a summary line for each completed request.
-    pub log_requests: bool,
-    /// Log scheduler statistics periodically.
-    pub log_stats: bool,
-}
-
-impl Default for LoggingOptions {
-    fn default() -> Self {
-        Self {
-            log_requests: false,
-            log_stats: true,
-        }
-    }
-}
-
-/// ChatOptions models (`chat_config`).
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct ChatOptions {
-    /// ChatOptions template, as a file path or the template itself.
-    pub template: Option<String>,
-    /// Keyword arguments bound into every chat-template render.
-    pub template_kwargs: Option<HashMap<String, Value>>,
-    /// How message content renders.
-    pub template_content_format: ChatTemplateContentFormatOption,
-    /// How reasoning is split from content.
-    pub reasoning_parser: ReasoningParser,
-}
-
-/// How a chat message's content renders into the template
-/// (`chat_config.template_content_format`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ChatTemplateContentFormatOption {
-    /// Decide from the template.
-    #[default]
-    Auto,
-    /// One string.
-    String,
-    /// OpenAI's list of typed parts.
-    OpenAi,
-}
-
-/// Which reasoning parser splits model output (`chat_config.reasoning_parser`).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ReasoningParser {
-    /// The model description's parser splits `reasoning_content` from
-    /// `content`.
-    #[default]
-    Auto,
-    /// Reasoning delimiter tokens stream verbatim as content.
-    None,
-}
-
-/// Fetching input images of chat requests (`image_fetch_config`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct ImageFetchOptions {
-    /// Time to fetch one `http(s)` image URL, redirects and body included.
-    pub timeout: Duration,
-    /// Largest input image, fetched or `data:`.
-    pub max_bytes: u64,
-    /// Allow image URLs resolving to loopback, private, link-local,
-    /// unique-local or cloud metadata addresses.
-    pub allow_private: bool,
-}
-
-impl Default for ImageFetchOptions {
-    fn default() -> Self {
-        Self {
-            timeout: Duration::from_secs(20),
-            // 20 MB.
-            max_bytes: 20_000_000,
-            allow_private: false,
-        }
-    }
-}
-
-/// MiniMax-H3 video generation (`video_config`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct VideoOptions {
-    /// Longest admitted clip, 4 to 15 seconds.
-    pub max_seconds: f64,
-    /// Resolution classes startup prepares, each at every aspect ratio.
-    pub resolutions: Vec<String>,
-    /// Aspect ratios startup prepares.
-    pub aspect_ratios: Vec<String>,
-    /// Prompt capacities below the prompt limit, strictly increasing.
-    pub text_capacities: Option<Vec<NonZeroU32>>,
-    /// Denoiser rows one request's conditions may take.
-    pub max_condition_rows: Option<u32>,
-}
-
-impl Default for VideoOptions {
-    fn default() -> Self {
-        Self {
-            max_seconds: models::video::plan::MAX_VIDEO_SECONDS,
-            resolutions: vec!["768p".to_owned()],
-            aspect_ratios: vec!["16:9".to_owned(), "9:16".to_owned()],
-            text_capacities: None,
-            max_condition_rows: None,
-        }
-    }
-}
-
-/// Condition media of video requests (`media_config`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct MediaOptions {
-    /// Directory `file://` condition media resolves under; `file://` is
-    /// refused when unset.
-    pub directory: Option<PathBuf>,
-    /// Fetch `http(s)://` condition media.
-    pub allow_remote: bool,
-    /// Condition media one request may carry in total.
-    pub max_request_bytes: u64,
-    /// Executable that probes video and audio condition media.
-    pub ffprobe: PathBuf,
-    /// Executable the media reader decodes reference videos with.
-    pub ffmpeg: PathBuf,
-}
-
-impl Default for MediaOptions {
-    fn default() -> Self {
-        Self {
-            directory: None,
-            allow_remote: true,
-            // 256 MiB.
-            max_request_bytes: 256 << 20,
-            ffprobe: PathBuf::from("ffprobe"),
-            ffmpeg: PathBuf::from("ffmpeg"),
-        }
-    }
-}
-
-/// Finished video jobs (`video_job_config`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct VideoJobOptions {
-    /// Time a finished job stays retrievable.
-    pub retention: Duration,
-    /// Generated video the jobs keep in shared memory.
-    pub max_bytes: usize,
-}
-
-impl Default for VideoJobOptions {
-    fn default() -> Self {
-        Self {
-            retention: Duration::from_secs(3600),
-            // 1 GiB.
-            max_bytes: 1 << 30,
-        }
-    }
-}
-
-/// Movement of token requests between epochs (`migration_config`).
-#[derive(Debug, Clone, PartialEq)]
-pub struct MigrationOptions {
-    /// Migrations caused by lost workers or a failed epoch that a request
-    /// survives; it fails on the next.
-    pub max_migrations: u32,
-}
-
-impl Default for MigrationOptions {
-    fn default() -> Self {
-        Self { max_migrations: 3 }
     }
 }
 
