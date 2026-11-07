@@ -1532,13 +1532,8 @@ impl Scheduler {
                 match host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0) {
                     HostHit::Serving(boundary) => host_tokens = boundary - cached_tokens,
                     // The host is looking up this request's pages: the head
-                    // waits for the pins. The requests behind it start their
-                    // lookups now, so that the step their pins arrive in admits
-                    // them together rather than one per step.
-                    HostHit::Pending => {
-                        self.start_host_lookups();
-                        break;
-                    }
+                    // waits for the pins.
+                    HostHit::Pending => break,
                     HostHit::Nothing => {}
                 }
                 // The two facts of the hit that no view can compute, recorded
@@ -1659,40 +1654,6 @@ impl Scheduler {
     /// endpoint (prefix-cache residency is keyed by endpoint). The hit is an
     /// estimate; `acquire_cached_prefix` takes the actual prefix. Returns
     /// `None` when the runtime has no prefix cache or no prefill executor is ready.
-    /// Starts the host KV cache's lookups for the requests queued behind the head, as many as the
-    /// free request slots could admit.
-    ///
-    /// A lookup is a round trip to the host's Storage Server, and admission waits for the head's
-    /// answer. Asked only for the head, every queued request waited a step of its own for its
-    /// answer, so a burst of prompts was admitted one per step: a GSM8K run at 64 slots took 1320
-    /// prefill batches with the host tier on against 1101 with it off. A lookup asked again with
-    /// the same bounds answers from the pins it already holds, so admission later reads these.
-    fn start_host_lookups(&mut self) {
-        let free = self
-            .config
-            .max_running_requests
-            .saturating_sub(self.running_request_count());
-        let queued: Vec<(RequestId, (crate::ExecutorGroupId, String), usize, usize)> = self
-            .waiting
-            .iter()
-            .skip(1)
-            .take(free)
-            .filter(|state| !state.reserve_worstcase)
-            .filter_map(|state| {
-                let (target, hit) = self.prefill_target(state)?;
-                let n = state.req.prompt_token_ids.len();
-                Some((state.req.request_id, target, hit.cached_tokens.min(n), n))
-            })
-            .collect();
-        for (request, target, cached, n) in queued {
-            let Some(state) = self.waiting.iter().find(|state| state.req.request_id == request)
-            else {
-                continue;
-            };
-            let _ = host_prefix(&mut self.kv_offload, state, &target, cached, n, 0);
-        }
-    }
-
     pub(super) fn prefill_target(
         &self,
         state: &RequestState,
