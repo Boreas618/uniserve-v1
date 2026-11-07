@@ -2447,8 +2447,7 @@ def test_a_program_update_past_a_threshold_reverts_in_its_epoch(
             f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
         )
         assert result["change"] == "program", result
-        streaming.join(timeout=1800)
-        assert not streamed["errors"], streamed["errors"][0]
+        _assert_whole(streaming, streamed)
 
         def reverted() -> bool:
             _chat(base_url, name, RECOVERY_PROMPT, tokens=2)
@@ -2462,11 +2461,6 @@ def test_a_program_update_past_a_threshold_reverts_in_its_epoch(
         _artifact("program-throughput-regression", {"update": update})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a main process maps no host page pool, so no page reaches the host "
-    "(crates/engine/src/scheduler/submission.rs, map_host_cache)",
-)
 def test_the_requests_in_flight_warm_the_target_through_the_host_cache(
     tmp_path: Path, runtime: Path
 ):
@@ -2517,3 +2511,167 @@ def test_the_requests_in_flight_warm_the_target_through_the_host_cache(
                 "host_hit_tokens_on_the_target": read,
             },
         )
+
+
+def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
+    tmp_path: Path, runtime: Path
+):
+    """The two warming options change what a switch does.
+
+    A tail of two tokens is reached only at a page boundary, so it takes rounds a
+    page's tail does not. Prompts in their prefill run past a tail of one token, so
+    a round limits the source's prefill, and the wait still ends: a tail that stays
+    past the limit costs the requests a recomputation and no failure.
+    """
+    name = "qwen3-live-warming-options"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        first = tmp_path / "first"
+        first.mkdir()
+        second = tmp_path / "second"
+        second.mkdir()
+        for directory in (first, second):
+            shutil.copy2(worker_executable(), directory / "uniserve")
+
+        streaming, streamed = _start_count(base_url, name)
+        _wait_until(
+            lambda: len(_numbers(streamed["read"])) >= 200,
+            300,
+            "the count did not grow",
+        )
+        _apply(
+            base_url,
+            f"worker_config.executable={first / 'uniserve'}",
+            "update_config.cache_tail_tokens=2",
+        )
+        tight = _on_trial(base_url)["warming"]
+        print("a tail of two tokens:", json.dumps(tight))
+        assert tight["limit_tokens"] == 2, tight
+        assert tight["tail_tokens"] <= 2, tight
+        assert tight["rounds"] > 1, tight
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        _assert_whole(streaming, streamed)
+        _wait_until(
+            lambda: _update(base_url).get("phase") == "purged",
+            120,
+            "the update did not end",
+        )
+
+        # Prompts that never repeat keep a prefill running under the switch.
+        prompts = threading.Event()
+
+        def prefills() -> None:
+            turn = 0
+            while not prompts.is_set():
+                turn += 1
+                words = " ".join(f"{turn}-{word}" for word in range(2500))
+                try:
+                    _chat(base_url, name, words, tokens=1, timeout_s=120)
+                except httpx.HTTPError:
+                    time.sleep(0.2)
+
+        running = [threading.Thread(target=prefills) for _ in range(4)]
+        for thread in running:
+            thread.start()
+        try:
+            _apply(
+                base_url,
+                f"worker_config.executable={second / 'uniserve'}",
+                "update_config.cache_tail_tokens=1",
+                "update_config.cache_prefill_tokens=128",
+            )
+            limited = _on_trial(base_url)["warming"]
+        finally:
+            prompts.set()
+            for thread in running:
+                thread.join(timeout=300)
+        print("under prefills:", json.dumps(limited))
+        assert limited["prefill_limited"], limited
+        _admin(base_url, "config/commit")
+        answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        assert _numbers([answer["choices"][0]["message"]["content"]])[:3] == [1, 2, 3]
+        _artifact("warming-options", {"tight": tight, "under_prefills": limited})
+
+
+def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
+    tmp_path: Path, runtime: Path
+):
+    """``previous_world = "host"`` moves bytes, and a revert brings them back.
+
+    A target of other model files maps none of the serving epoch's weights, so the
+    weights that epoch alone retains leave its GPU for host storage while the
+    target serves. The revert returns them and starts the epoch on them, under a
+    stream that crosses both moves whole, and it answers as it did.
+    """
+    other = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL")
+    if not other:
+        pytest.skip("UNISERVE_QWEN3_UPDATED_MODEL names no other checkpoint")
+    name = "qwen3-live-host-weights"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        streaming, streamed = _start_count(base_url, name)
+        result = _apply(
+            base_url, f"model={other}", "update_config.previous_world=host"
+        )
+        assert result["change"] == "epoch", result
+        _on_trial(base_url)
+        _wait_until(
+            lambda: _update(base_url)["moved_to_host_bytes"] > 0
+            or _update(base_url)["host_refused"],
+            300,
+            "the previous epoch's weights did not move",
+        )
+        trial = _update(base_url)
+        print("kept:", json.dumps(trial))
+        assert not trial["host_refused"], trial
+        assert trial["previous_world_kept"] == "host", trial
+        rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
+        assert rolled.status_code == 200, rolled.text
+        count = _assert_whole(streaming, streamed)
+        after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        assert (
+            after["choices"][0]["message"]["content"]
+            == answer["choices"][0]["message"]["content"]
+        )
+        update = _update(base_url)
+        assert update["phase"] == "abandoned", update
+        _artifact(
+            "host-weights",
+            {
+                "numbers_across_the_switch": count,
+                "moved_to_host_bytes": trial["moved_to_host_bytes"],
+                "update": update,
+            },
+        )
+
+
+def test_program_updates_under_a_request_keep_its_stream_whole(
+    tmp_path: Path, runtime: Path
+):
+    """In-place switches under a request leave its stream as a run without them.
+
+    A program update reaches a process that serves: its switchover captures
+    nothing a batch of the running request can be mistaken for, so every token
+    the request computes is the one its stream delivers. The count crosses as
+    many switches as fit under it, each one committed.
+    """
+    name = "qwen3-live-switches"
+    log = tmp_path / "server.log"
+    switches = 0
+    with _serve(runtime, log, name) as base_url:
+        for _ in range(2):
+            streaming, streamed = _start_count(base_url, name)
+            while not streamed["done"].is_set():
+                switches += 1
+                size = 4 if switches % 2 else 8
+                result = _apply(base_url, f"scheduler_config.max_batch={size}")
+                assert result["change"] == "program", result
+                committed = _admin(base_url, "config/commit")
+                assert committed.status_code == 200, committed.text
+                time.sleep(0.5)
+            _assert_whole(streaming, streamed)
+    print("switches:", switches)
+    assert switches >= 20, switches
+    _artifact("program-switches", {"switches": switches})
