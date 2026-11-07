@@ -164,10 +164,10 @@ The `justfile` exposes the canonical repository checks:
 just lint
 just test-rust
 just test-python-fast
-just test-python-e2e
+just test-python-gpu
 ```
 
-`test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start a real server; those that need a GPU carry the `gpu` marker and run with `UNISERVE_RUN_GPU_E2E=1`. The FastH3 GPU test loads a complete checkpoint on four GPUs:
+`test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start a real server on a GPU, and `test-python-gpu` runs them with `UNISERVE_RUN_GPU_E2E=1`. The FastH3 GPU test loads a complete checkpoint on four GPUs:
 
 ```bash
 UNISERVE_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2 \
