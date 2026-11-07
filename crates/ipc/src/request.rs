@@ -205,10 +205,8 @@ pub struct MainProcessResponseError {
 }
 
 /// A job the rank's builder thread has performed for at least the rank's
-/// stall bound, half the engine's watchdog timeout
-/// ([`LaunchDescriptor::watchdog_timeout_ms`](crate::LaunchDescriptor)),
-/// as the rank's control thread observes it: the job was submitted and its
-/// completion has not arrived.
+/// stall bound, as the rank's control thread observes it: the job was
+/// submitted and its completion has not arrived.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Stall {
     /// The batch the job belongs to: the one whose forward, input

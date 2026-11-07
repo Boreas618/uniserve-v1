@@ -1229,11 +1229,6 @@ impl BlockPool {
             .map(|page| page.units.iter().map(|unit| unit.0).collect())
     }
 
-    /// Whether a published page exists whose first unit is `head`.
-    pub(crate) fn holds_page(&self, head: u32) -> bool {
-        lock(&self.inner).pages.contains_key(&head)
-    }
-
     /// Returns the number of published prefix pages, referenced or not.
     pub(crate) fn cached_pages(&self) -> usize {
         lock(&self.inner).pages.len()

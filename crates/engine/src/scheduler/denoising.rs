@@ -4,25 +4,25 @@
 //! own lifecycles, but both advance a trajectory the same way: latent
 //! preparation opens it at step zero, or at the stored step a resumed
 //! request restores, each denoising call covers the next step of its fixed
-//! schedule, and the worker reports the steps it has accepted.
+//! schedule, and the executor reports the steps it has accepted.
 //! [`Denoising`] owns that progress for both.
 
 use ipc::{CallId, LatentParams, MediaCall, RequestKey, TensorRef};
 
-/// Where an image request's latent lives on its worker and the raster it
+/// Where an image request's latent lives on its executor and the raster it
 /// describes.
 ///
-/// The scheduler's latent allocator assigns the pages from the worker's pool,
-/// so the worker learns them from the calls that name them; the raster is the
+/// The scheduler's latent allocator assigns the pages from the executor's pool,
+/// so the executor learns them from the calls that name them; the raster is the
 /// image the samples decode to. A standalone video denoiser's request slot
-/// fixes its own pages, which the worker derives from its pool geometry, so
+/// fixes its own pages, which the executor derives from its pool geometry, so
 /// a video request has no placement.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct LatentPlacement {
-    /// Pages the request owns in its worker's latent pool.
+    /// Pages the request owns in its executor's latent pool.
     pub(crate) page_table: Vec<u32>,
     /// Latent units the trajectory occupies in those pages, in the
-    /// model-defined unit the worker sizes pages by (`latent_page_units`).
+    /// model-defined unit the executor sizes pages by (`latent_page_units`).
     pub(crate) latent_units: u32,
     /// Raster height in pixels: the requested image height.
     pub(crate) height: u32,
@@ -39,9 +39,9 @@ pub(crate) struct LatentPlacement {
 pub(crate) struct Denoising {
     /// Steps in the trajectory's fixed schedule.
     steps: u32,
-    /// Steps the worker has accepted.
+    /// Steps the executor has accepted.
     completed: u32,
-    /// The latest accepted latent product, when the worker publishes one per
+    /// The latest accepted latent product, when the executor publishes one per
     /// call.
     latent: Option<TensorRef>,
 }
@@ -61,7 +61,7 @@ impl Denoising {
         self.steps
     }
 
-    /// Returns the steps the worker has accepted.
+    /// Returns the steps the executor has accepted.
     pub(crate) const fn completed(&self) -> u32 {
         self.completed
     }
@@ -100,7 +100,7 @@ impl Denoising {
     }
 
     /// Returns the latent pages and raster one call on an image trajectory
-    /// addresses. The worker's latent pool keeps the trajectory's step
+    /// addresses. The executor's latent pool keeps the trajectory's step
     /// ledger, so the call states no step.
     pub(crate) fn params(
         request_key: RequestKey,
@@ -134,7 +134,7 @@ impl Denoising {
 
     /// Accepts a completed denoising call and its successor latent.
     ///
-    /// The worker owns the trajectory's step ledger and reports the steps it
+    /// The executor owns the trajectory's step ledger and reports the steps it
     /// has completed; the report becomes the request's progress. Returns
     /// `false`, leaving progress unchanged, when the report does not advance
     /// it, since a denoising call that makes no progress would be scheduled

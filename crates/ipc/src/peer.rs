@@ -14,6 +14,18 @@
 
 use serde::{Deserialize, Serialize};
 
+/// The version of this build, which a registration states: the package
+/// version, then `+` and a digest of the workspace sources the build is
+/// compiled from (computed by this crate's build script), for example
+/// `2.0.0+1f3c9a0d5e7b2c48`.
+///
+/// The message types are the only definition of the protocol and their
+/// encoding is positional, so the two ends of a connection must be the same
+/// build: a message type reordered or retyped between two builds would fail
+/// to decode or, worse, decode into other fields. The digest tells apart two
+/// builds of one package version.
+pub const VERSION: &str = proto::BUILD;
+
 /// The first frame a main process sends a peer of its epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,7 +38,7 @@ pub struct PeerRegistration {
     /// with: a channel whose number differs belongs to another epoch and is
     /// refused.
     pub engine: u64,
-    /// [`crate::VERSION`] of the build the peer runs.
+    /// [`VERSION`] of the build the peer runs.
     pub version: String,
 }
 
@@ -34,7 +46,7 @@ impl PeerRegistration {
     /// Whether this registration belongs to `engine` and was built as this
     /// process was.
     pub fn accepted_by(&self, engine: u64) -> bool {
-        self.engine == engine && self.version == crate::VERSION
+        self.engine == engine && self.version == VERSION
     }
 }
 

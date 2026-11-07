@@ -18,7 +18,7 @@ use ipc::MainProcessInfo;
 
 use crate::ExecutorGroupId;
 use crate::executor::{ExecutorInfo, PoolPlacement, RankEncoderPools};
-use crate::executors::dispatch::codecs::video_unit_codecs;
+use crate::executor::codecs::video_unit_codecs;
 
 impl ExecutorInfo {
     /// The capability information of the pools `pools` describes, as the mechanism reads it.

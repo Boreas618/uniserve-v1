@@ -1,5 +1,5 @@
-//! The engine's integration tests: its scheduler over the simulator, and
-//! real CPU executor processes over the channel.
+//! The engine's integration tests: its scheduler over the simulator, and over
+//! an in-process stand-in for the executor's batch path.
 
 #![cfg(test)]
 // A case that loses its `#[test]` compiles as a private function and runs nothing;
@@ -25,9 +25,7 @@ mod in_process_worlds;
 mod media_occupancy;
 mod media_preemption;
 mod migration;
-mod multiproc_ipc;
 mod policy_switch;
-mod process_link;
 mod readout;
 mod speculation;
 mod support;

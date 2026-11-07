@@ -302,7 +302,7 @@ message EngineCommand {
     Promote promote = 3;
     // Revoke every cached prefix page; requests in flight keep theirs.
     FlushCache flush_cache = 4;
-    // Run a worker hook on every worker; answered with `Hooked`.
+    // Run a named operation of the data plane; answered with `Hooked`.
     Hook hook = 5;
     // Take other scheduling limits and policy from each scheduler's next
     // step; answered with `Configured`.
@@ -389,7 +389,8 @@ message ThrottleTransfers {
   bool halve = 2;
 }
 
-// A worker hook (`uniserve.hooks`), which a plugin implements.
+// A named operation of the data plane: an expert redistribution's stages, a
+// LoRA adapter's load and unload.
 message Hook {
   // Matches the `Hooked` answer.
   uint64 id = 1;
@@ -398,11 +399,12 @@ message Hook {
   string payload = 3;
 }
 
-// The answer to a `Hook`: each worker's JSON result, or why it failed.
+// The answer to a `Hook` and to the data plane's other commands: each rank's
+// JSON result, or why it failed.
 message Hooked {
   uint64 id = 1;
   repeated string results = 2;
-  // Empty when every worker ran the hook.
+  // Empty when every rank ran the operation.
   string error = 3;
 }
 

@@ -1,20 +1,16 @@
 //! Logical execution batches, physical execution, and executor contracts.
 //!
-//! The scheduler submits logical calls through [`Executor`]. Physical
-//! executors lower those calls into executor protocol batches while retaining
-//! the request and product identities needed to correlate completions. The
-//! implementations are `Dispatcher` (`crate::executors::executor`), which
-//! drives executor processes, and `SimExecutor` (`crate::sim`).
+//! A serving scheduler submits its batches through the executor crate's
+//! `Batches` (`Submissions::over_batches`). [`Executor`] is the same boundary
+//! for a simulated pool: `SimExecutor` (`crate::sim`) is its implementation,
+//! and a scheduler test plugs it in through `SchedulerHandle::with_executor`.
 //!
 //! Besides the trait, this module owns the values that cross that boundary:
 //! [`ExecutorInfo`], which merges the pools' reported capabilities, beside
-//! the placement the engine launched them with, into the single capacity view
-//! the scheduler plans against; the result types a poll
-//! returns; and [`TransferConfig`], the directed transfer edges between executor
-//! ranks and the placement they resolve against, from which the engine derives
-//! each rank's launch descriptor fields (transfer mechanisms, acknowledgment
-//! slot, same-host slots, and whether products cross hosts) and the consumer
-//! slots stated on each producing call.
+//! their placement, into the single capacity view the scheduler plans against;
+//! the result types a poll returns; and [`TransferConfig`], the directed
+//! transfer edges a deployment names between its executor groups, which a
+//! replica's spec keeps for its own groups (`EngineConfig::replica_specs`).
 
 pub use ipc::{ComponentConfig, ComponentDistribution, ParallelConfig, SequenceParallel};
 
@@ -23,29 +19,34 @@ use ipc::VideoDenoiserInfo;
 use ipc::{ForwardMode, MediaCall};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::str::FromStr;
+#[cfg(feature = "testing")]
 use std::sync::Arc;
+#[cfg(feature = "testing")]
 use std::time::Duration;
 
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
-use ipc::{BatchCommand, BatchOutput, CallId, CallKind, RequestKey, TensorExport, MainProcessInfo};
+#[cfg(feature = "testing")]
+use ipc::BatchCommand;
+use ipc::{CallId, CallKind, MainProcessInfo, RequestKey};
 
 mod batch;
+mod codecs;
 pub(crate) mod inventory;
 
 pub use batch::{ExecutionBatch, PageOffloads, RankBuffer, RequestPlacement};
 
-/// What the engine launched one pool with.
+/// How one pool is placed.
 ///
-/// The engine decides these values and hands them to the pool's ranks at
-/// launch, so the ranks' reports do not carry them back.
+/// The deployment decides these values, so the ranks' reports do not carry
+/// them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PoolPlacement {
     /// Unresolved physical batches the pool admits at once, counted as at
     /// least one.
     pub queue_depth: usize,
-    /// Ranks the pool was launched with, counted as at least one.
+    /// Ranks the pool holds, counted as at least one.
     pub ranks: usize,
     /// The pool's components by name, each with its member ranks, parallel
     /// degrees and distribution.
@@ -58,21 +59,21 @@ pub struct ExecutorInfo {
     /// Physical pool identities and their reported capabilities.
     pub workers: Vec<(ExecutorGroupId, MainProcessInfo)>,
     /// The longest sequence the model was built for: the attention
-    /// descriptor's static bound on the keys one row reads, from the launch
-    /// arguments every group was started with. Zero when not stated.
+    /// descriptor's static bound on the keys one row reads. Zero when not
+    /// stated.
     pub max_model_len: u32,
-    /// For each pool, what the engine launched it with. A pool absent from
-    /// the map is placed with no components and a queue depth of one.
+    /// For each pool, how it is placed. A pool absent from the map is placed
+    /// with no components and a queue depth of one.
     ///
-    /// `Dispatcher::try_new` and `SimExecutor` fill this from their
-    /// launch; `from_workers` leaves it empty.
+    /// `from_inventory` and `SimExecutor` fill this; `from_workers` leaves it
+    /// empty.
     pub placements: BTreeMap<ExecutorGroupId, PoolPlacement>,
     /// For each executor that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `Dispatcher::try_new` fills this from the placement;
-    /// `from_workers` and `SimExecutor` leave it empty. Scheduler admission restricts a video
+    /// `from_inventory` fills this from the placement; `from_workers` and
+    /// `SimExecutor` leave it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the executor chosen to decode.
     pub video_codecs: BTreeMap<ExecutorGroupId, BTreeSet<ExecutorGroupId>>,
     /// For each pool, the persistent buffer bytes each of its ranks backs,
@@ -81,24 +82,24 @@ pub struct ExecutorInfo {
     /// of the components that read them, so the engine places a pool's
     /// media buffers rank by rank.
     ///
-    /// `Dispatcher::try_new` fills this from its ranks; a pool absent
-    /// from it, as `from_workers` and `SimExecutor` leave every pool, has
-    /// its launched ranks (`PoolPlacement::ranks`, one when it has no
-    /// placement), each backing its reported `buffer_pool_bytes`.
+    /// `from_inventory` fills this from its ranks; a pool absent from it, as
+    /// `from_workers` and `SimExecutor` leave every pool, has its placed ranks
+    /// (`PoolPlacement::ranks`, one when it has no placement), each backing
+    /// its reported `buffer_pool_bytes`.
     pub rank_buffer_bytes: BTreeMap<ExecutorGroupId, Vec<u64>>,
     /// For each pool, each rank's prefix cache as the rank reported it, with
     /// the host page pools it maps, and the rank's host, in rank order.
     ///
-    /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
-    /// and `SimExecutor` leave it empty, which serves no pool through the
-    /// host KV cache.
+    /// `from_inventory` fills this from its ranks; `from_workers` and
+    /// `SimExecutor` leave it empty, which serves no pool through the host KV
+    /// cache.
     pub rank_caches: BTreeMap<ExecutorGroupId, Vec<(String, Option<ipc::PrefixCacheInfo>)>>,
     /// For each pool, each rank's host latent pool as the rank reported it,
     /// and the rank's host, in rank order: the video denoising ranks report
     /// one, every other rank none (`ipc::MainProcessInfo::latent_pool`).
     ///
-    /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
-    /// leaves it empty, which stores no preempted trajectory, and a
+    /// `from_inventory` fills this from its ranks; `from_workers` leaves it
+    /// empty, which stores no preempted trajectory, and a
     /// simulated executor states its own (`SimEngine::set_latent_pools`).
     pub rank_latents: BTreeMap<ExecutorGroupId, Vec<(String, Option<ipc::LatentPoolInfo>)>>,
     /// For each pool, each rank's host encoder pool as the rank reported it,
@@ -106,8 +107,8 @@ pub struct ExecutorInfo {
     /// encoder calls report one, every other rank none
     /// (`ipc::MainProcessInfo::encoder_pool`).
     ///
-    /// `Dispatcher::try_new` fills this from its ranks; `from_workers`
-    /// leaves it empty, which stores no encoder output, and a simulated
+    /// `from_inventory` fills this from its ranks; `from_workers` leaves it
+    /// empty, which stores no encoder output, and a simulated
     /// executor states its own (`SimEngine::set_encoder_pools`).
     pub rank_encoders: BTreeMap<ExecutorGroupId, RankEncoderPools>,
 }
@@ -150,7 +151,7 @@ impl ExecutorInfo {
     }
 
     /// Returns the configuration the engine placed component `name` with on
-    /// `executor`, or `None` when the pool was launched with no such component.
+    /// `executor`, or `None` when the pool holds no such component.
     pub fn component_config(&self, worker: &ExecutorGroupId, name: &str) -> Option<&ComponentConfig> {
         self.placements.get(worker)?.components.get(name)
     }
@@ -387,7 +388,7 @@ impl ExecutorInfo {
             .unwrap_or(0);
         merged.request_slots = if merged.media_components.contains_key(&MediaCall::Muxing) {
             // A replicated media route owns an independent request-row bank in
-            // every ExecutorGroup. End-to-end concurrency is the narrowest sum
+            // every group. End-to-end concurrency is the narrowest sum
             // of replica capacities among the graph's components. Each
             // component is keyed to the first call it serves; its replicas are
             // the pools that support that call and bind the component.
@@ -532,63 +533,14 @@ fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One call result returned from an executor-owned batch.
+/// One call result returned from a simulated batch.
+#[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 pub struct CallResult {
     /// Validated completion values; media storage is carried by `media` below.
     pub output: ipc::CallOutput,
     /// Claimed immutable output storage, or its request-local acquisition error.
     pub media: Result<Option<Arc<ipc::SharedMedia>>, ipc::SharedMediaError>,
-}
-
-/// A decoded physical result that owns media before routing or rank validation.
-#[derive(Debug)]
-pub struct ExecutorResult {
-    pub batch_id: u64,
-    /// Every participating rank has retired this batch, including command-only ranks.
-    pub done: bool,
-    pub results: Vec<CallResult>,
-    /// Tensor exports remain owned by the executor's transfer consumers.
-    pub products: Vec<TensorExport>,
-    /// Executor-reported execution duration in microseconds, when reported.
-    pub worker_exec_us: Option<u64>,
-    /// Model-forward statistics, when reported.
-    pub forward_stats: Option<ipc::ForwardStats>,
-}
-
-impl ExecutorResult {
-    /// Claims all media before any fallible correlation or aggregation step.
-    /// Acquisition failure belongs to the call; independent results remain usable.
-    ///
-    /// The returned value always sets `done`; `ExecutorGroup::try_join`, which
-    /// joins rank reports, decides `done` for the joined result itself.
-    pub(crate) fn receive(report: BatchOutput) -> Self {
-        let results = report
-            .completions
-            .into_iter()
-            .map(|mut output| {
-                let media = output
-                    .media_output
-                    .take()
-                    .map(|media| {
-                        let ipc::ArtifactHandle::PosixShm { name } = media.handle;
-                        // SAFETY: export transfers immutable storage after the writer closes.
-                        // The mapping owns the bytes even if this result is rejected downstream.
-                        unsafe { ipc::SharedMedia::open(&name, media.bytes) }.map(Arc::new)
-                    })
-                    .transpose();
-                CallResult { output, media }
-            })
-            .collect();
-        Self {
-            batch_id: report.batch_id,
-            done: true,
-            results,
-            products: report.products,
-            worker_exec_us: report.worker_exec_us,
-            forward_stats: report.forward_stats,
-        }
-    }
 }
 
 /// Distinguishes applied control from physical retirement and unacknowledged failure.
@@ -616,7 +568,9 @@ pub struct CommandResult {
     pub outcome: CommandOutcome,
 }
 
-/// One independently ready subset of a logical batch.
+/// One independently ready subset of a logical batch, as a simulated pool
+/// reports it.
+#[cfg(feature = "testing")]
 #[derive(Debug, Clone)]
 pub struct BatchResult {
     /// Logical batch identity assigned at submission.
@@ -633,58 +587,13 @@ pub struct BatchResult {
     pub forward_stats: Vec<ipc::ForwardStats>,
 }
 
-/// Converts one physical result into the scheduler-facing [`BatchResult`].
-///
-/// `done` comes from the caller, not from `report.done`. A terminal result
-/// carries one `Applied` receipt per lifecycle command in `commands`,
-/// numbered with `Start` admissions skipped, so `commands` may be given with
-/// or without them; callers that track other outcomes overwrite the receipts.
-/// A partial result carries no receipts. `report.products` is not carried
-/// into the result: exports stay with the executor, and
-/// `Dispatcher` records them before converting.
-pub(crate) fn logical_result(
-    report: ExecutorResult,
-    done: bool,
-    commands: &[BatchCommand],
-) -> BatchResult {
-    let mut worker_exec_us = Vec::new();
-    let mut forward_stats = Vec::new();
-    if let Some(value) = report.worker_exec_us {
-        worker_exec_us.push(value);
-    }
-    if let Some(value) = report.forward_stats {
-        forward_stats.push(value);
-    }
-    BatchResult {
-        batch_id: report.batch_id,
-        results: report.results,
-        command_results: if done {
-            commands
-                .iter()
-                .filter(|command| !matches!(command, BatchCommand::Start { .. }))
-                .enumerate()
-                .map(|(index, command)| CommandResult {
-                    command_index: index as u32,
-                    request_key: command.request_key(),
-                    outcome: CommandOutcome::Applied,
-                })
-                .collect()
-        } else {
-            Vec::new()
-        },
-        done,
-        worker_exec_us,
-        forward_stats,
-    }
-}
-
 /// Dynamic error returned while polling or administering an executor.
 ///
 /// Callers report executor failures rather than match them: the scheduler
 /// fails the affected calls and logs the error chain. The failures it acts
-/// on travel inside as typed errors and are recovered by downcasting: a
-/// executor's loss (`ExecutorFailure`), a rank's execution error
-/// (`ExecuteError`) and inputs no executor can route (`UnroutableInputs`).
+/// on travel inside as typed errors and are recovered by downcasting: an
+/// executor's loss (`ExecutorFailure`) and a rank's execution error
+/// (`ExecuteError`).
 pub type ExecutorError = anyhow::Error;
 
 /// Backpressure and terminal failures returned by logical batch submission.
@@ -732,7 +641,7 @@ impl std::fmt::Display for ExecutorGroupId {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TransferBackend {
-    /// Keeps products within one executor process.
+    /// Keeps products within one address space.
     #[default]
     Local,
     /// Publishes products through POSIX shared storage.
@@ -789,8 +698,7 @@ impl FromStr for TransferBackend {
 /// product's location decides which carries it: a device product travels on
 /// the edge's device mechanism, a host product on its host mechanism. An edge
 /// may name only one of the two, in which case products of the other
-/// location have no way across it: `TransferConfig::bind_inputs` refuses them
-/// where they are bound, and `Dispatcher` fails the requests reading them.
+/// location have no way across it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferEdge {
     /// Pool that produces the transferred product.
@@ -813,10 +721,6 @@ impl TransferEdge {
         self.device.into_iter().chain(self.host)
     }
 
-    /// Whether this edge carries products on `backend`.
-    pub fn carries(&self, backend: TransferBackend) -> bool {
-        self.device == Some(backend) || self.host == Some(backend)
-    }
 }
 
 /// Per-edge data-plane transfer selection (`placement_config.transfer`) and the placement it
@@ -825,19 +729,6 @@ impl TransferEdge {
 pub struct TransferConfig {
     /// Explicit directed transfer edges.
     pub edges: Vec<TransferEdge>,
-    /// Rank count of each executor an edge may name.
-    ///
-    /// An edge that omits a rank names every rank of its executor, so counting
-    /// a product's consumers needs the membership the placement gave each.
-    #[serde(default)]
-    pub worker_ranks: std::collections::BTreeMap<String, u32>,
-    /// Host of each rank of each executor an edge may name.
-    ///
-    /// An export's readiness mechanism depends on where it is read: an
-    /// interprocess event reaches another process on this host and no further.
-    /// Only the placement knows where a consumer runs.
-    #[serde(default)]
-    pub worker_hosts: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 impl std::fmt::Display for TransferConfig {
@@ -873,379 +764,6 @@ impl std::fmt::Display for TransferConfig {
 }
 
 impl TransferConfig {
-    /// Records the placement's rank counts and hosts, and binds a default edge
-    /// for every ordered pair of ranks, within and across executors, that no
-    /// configured edge covers.
-    ///
-    /// Each rank is a separate process. Its self-edge uses local storage for
-    /// both locations. Between two ranks, device products move over CUDA VMM
-    /// where both hold a CUDA device, which reaches another host where both
-    /// devices export a fabric handle; host products move over shared storage
-    /// on one host and over the rank channel across hosts, because a
-    /// shared-memory segment is named in one host's namespace. Explicit
-    /// bindings take precedence. `Dispatcher::try_new` validates each
-    /// edge against the initialized endpoints and backends before the
-    /// executor accepts work, and refuses by name an edge that would have to
-    /// cross hosts without fabric handles.
-    ///
-    /// # Errors
-    ///
-    /// Fails when `ExecutorGroupConfig::validate_all` rejects `executors`.
-    pub fn with_worker_defaults(
-        mut self,
-        workers: &[crate::ExecutorGroupConfig],
-    ) -> anyhow::Result<Self> {
-        crate::ExecutorGroupConfig::validate_all(workers)?;
-        for worker in workers {
-            self.worker_ranks
-                .insert(worker.id.0.clone(), worker.ranks.len() as u32);
-            self.worker_hosts.insert(
-                worker.id.0.clone(),
-                worker.ranks.iter().map(|rank| rank.host.clone()).collect(),
-            );
-        }
-        // Products flow between the components of one executor and between
-        // executors, a model executor's decoded media units to a host executor's
-        // encoders, so every ordered pair of ranks gets an edge derived from
-        // its coordinates unless the configuration named one.
-        for worker in workers {
-            for peer in workers {
-                for (source_rank, source) in worker.ranks.iter().enumerate() {
-                    for (destination_rank, destination) in peer.ranks.iter().enumerate() {
-                        let source_rank = source_rank as u32;
-                        let destination_rank = destination_rank as u32;
-                        if self.edges.iter().any(|edge| {
-                            edge.source_worker == worker.id
-                                && edge.destination_worker == peer.id
-                                && edge.source_rank.is_none_or(|rank| rank == source_rank)
-                                && edge
-                                    .destination_rank
-                                    .is_none_or(|rank| rank == destination_rank)
-                        }) {
-                            continue;
-                        }
-                        let (device, host) =
-                            if worker.id == peer.id && source_rank == destination_rank {
-                                (Some(TransferBackend::Local), Some(TransferBackend::Local))
-                            } else {
-                                // A fabric handle reaches another host; where the
-                                // devices export a process descriptor instead, the
-                                // physical edge check refuses this edge by name.
-                                let device = (source.device.starts_with("cuda:")
-                                    && destination.device.starts_with("cuda:"))
-                                .then_some(TransferBackend::CudaVmm);
-                                // A shared-memory segment is named in one host's
-                                // namespace, so a host product that leaves its host
-                                // travels on the rank channel's data path.
-                                let host = if source.host == destination.host {
-                                    TransferBackend::PosixShm
-                                } else {
-                                    TransferBackend::Channel
-                                };
-                                (device, Some(host))
-                            };
-                        self.edges.push(TransferEdge {
-                            source_worker: worker.id.clone(),
-                            source_rank: Some(source_rank),
-                            destination_worker: peer.id.clone(),
-                            destination_rank: Some(destination_rank),
-                            device,
-                            host,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(self)
-    }
-
-    /// Resolve only mechanisms incident to one physical rank, with local access
-    /// available for products that stay in its own address space.
-    ///
-    /// Returns `(transfer, publish)`: `transfer` is every mechanism on an edge
-    /// the rank produces or consumes on, plus `Local`; `publish` is the
-    /// mechanisms on edges the rank produces on, or only `Local` when it
-    /// produces on none. The launch descriptor carries them as
-    /// `transfer_backends` and `export_backends`.
-    pub fn rank_backends(
-        &self,
-        worker: &str,
-        rank: u32,
-    ) -> (
-        std::collections::BTreeSet<TransferBackend>,
-        std::collections::BTreeSet<TransferBackend>,
-    ) {
-        let mut backends = std::collections::BTreeSet::from([TransferBackend::Local]);
-        let mut exports = std::collections::BTreeSet::new();
-        for edge in &self.edges {
-            if edge.source_worker.0 == worker
-                && edge.source_rank.is_none_or(|source| source == rank)
-            {
-                backends.extend(edge.mechanisms());
-                exports.extend(edge.mechanisms());
-            }
-            if edge.destination_worker.0 == worker
-                && edge
-                    .destination_rank
-                    .is_none_or(|destination| destination == rank)
-            {
-                backends.extend(edge.mechanisms());
-            }
-        }
-        if exports.is_empty() {
-            exports.insert(TransferBackend::Local);
-        }
-        (backends, exports)
-    }
-
-    /// Returns the acknowledgment slot of one rank across the scheduler's groups.
-    ///
-    /// Each published chunk or segment carries one acknowledgment word per
-    /// rank of the scheduler's groups. A consumer claims the word at its own slot when it
-    /// begins reading and acknowledges it once its reads are done, so the
-    /// producer can tell a consumer still reading from one that has finished
-    /// or never began. Slots are dense across the groups. An executor group absent
-    /// from `worker_ranks` yields a slot past every placed executor's run.
-    pub fn acknowledgment_slot(&self, worker: &str, rank: u32) -> u32 {
-        // Executors are keyed in a BTreeMap, so their order is the same in every
-        // process that derives a slot. Each executor owns a contiguous run of
-        // slots, and a rank takes its offset within that run.
-        let mut base = 0;
-        for (name, ranks) in &self.worker_ranks {
-            if name == worker {
-                return base + rank;
-            }
-            base += ranks;
-        }
-        base + rank
-    }
-
-    /// Acknowledgment slots of every rank placed on the same host as one
-    /// rank, across executors, this rank's own included.
-    ///
-    /// A host product is published over the mechanism that reaches the
-    /// consumers its producing call names: shared storage for a consumer on
-    /// the host, the rank channel for one elsewhere. The producing rank is
-    /// told which slots share its host so it can tell the two apart; an
-    /// unplaced rank shares a host with no one.
-    pub fn host_slots(&self, worker: &str, rank: u32) -> Vec<u32> {
-        let Some(host) = self
-            .worker_hosts
-            .get(worker)
-            .and_then(|hosts| hosts.get(rank as usize))
-        else {
-            return Vec::new();
-        };
-        let mut slots = Vec::new();
-        for (name, hosts) in &self.worker_hosts {
-            for (member, placed) in hosts.iter().enumerate() {
-                if placed == host {
-                    slots.push(self.acknowledgment_slot(name, member as u32));
-                }
-            }
-        }
-        slots
-    }
-
-    /// Whether any rank that reads this rank's products is on another host.
-    ///
-    /// The consumers are the destinations of the edges leaving this rank,
-    /// excluding the rank itself. The answer is `true` when this rank or any
-    /// consumer has no recorded host, because a shared host cannot then be
-    /// established. A rank cannot derive this itself: the mapping lives in the
-    /// transfer edges and the placement, which only the engine holds.
-    ///
-    /// Readiness is a producer synchronize only where it has to be. Within a
-    /// host an interprocess event carries it at no cost to the producing
-    /// stream, and stalling the producer for a consumer that could have waited
-    /// on the device is a bubble the placement does not require.
-    pub fn products_cross_hosts(&self, worker: &str, rank: u32) -> bool {
-        let host = |name: &str, rank: u32| -> Option<&String> {
-            self.worker_hosts
-                .get(name)
-                .and_then(|hosts| hosts.get(rank as usize))
-        };
-        let Some(source_host) = host(worker, rank) else {
-            // An unplaced producer cannot be shown to stay on one host.
-            return true;
-        };
-        for edge in &self.edges {
-            if edge.source_worker.0 != worker
-                || !edge.source_rank.is_none_or(|source| source == rank)
-            {
-                continue;
-            }
-            let destination = &edge.destination_worker.0;
-            let members = || match edge.destination_rank {
-                Some(consumer) => consumer..consumer + 1,
-                None => 0..self.worker_ranks.get(destination).copied().unwrap_or(0),
-            };
-            for consumer in members() {
-                if destination == worker && consumer == rank {
-                    continue;
-                }
-                match host(destination, consumer) {
-                    Some(consumer_host) if consumer_host == source_host => {}
-                    // A consumer elsewhere, or one the placement does not
-                    // name, cannot be assumed to share this host.
-                    _ => return true,
-                }
-            }
-        }
-        false
-    }
-
-    /// Acknowledgment slots of the ranks that read this rank's products.
-    ///
-    /// A retired product's chunk or segment is released only once no named
-    /// consumer's word shows it still reading, so the producer needs the
-    /// consumers' identities and not merely their number. The consumers are the
-    /// destinations of the edges leaving this rank, fixed when the placement
-    /// is; an edge that omits the destination rank names every rank of that
-    /// executor. A producing rank cannot derive them: it knows which component
-    /// it belongs to, not which component reads what it publishes, and a
-    /// product is consumed in a later batch than the one that produced it.
-    /// `ExecutorGroup::consumer_slots` uses this for calls outside the video
-    /// graph and states the slots on each producing call.
-    ///
-    /// The result is sorted and excludes this rank's own slot.
-    pub fn product_consumers(&self, worker: &str, rank: u32) -> Vec<u32> {
-        let mut slots = std::collections::BTreeSet::new();
-        for edge in &self.edges {
-            if edge.source_worker.0 != worker
-                || !edge.source_rank.is_none_or(|source| source == rank)
-            {
-                continue;
-            }
-            // A self-edge publishes to this rank's own address space, which
-            // needs no acknowledgment from another process.
-            if edge.destination_worker.0 == worker && edge.destination_rank == Some(rank) {
-                continue;
-            }
-            let destination = &edge.destination_worker.0;
-            match edge.destination_rank {
-                Some(consumer) => {
-                    slots.insert(self.acknowledgment_slot(destination, consumer));
-                }
-                // An edge without a rank names every rank of its executor.
-                None => {
-                    let members = self.worker_ranks.get(destination).copied().unwrap_or(0);
-                    for consumer in 0..members {
-                        if destination == worker && consumer == rank {
-                            continue;
-                        }
-                        slots.insert(self.acknowledgment_slot(destination, consumer));
-                    }
-                }
-            }
-        }
-        slots.into_iter().collect()
-    }
-
-    /// Select explicitly bound locations for a rank before admitting device work.
-    ///
-    /// Each input tensor keeps only the published locations that reach
-    /// `destination`: a location survives when the first edge matching its
-    /// source and `destination` carries the mechanism it was published on, or,
-    /// with no matching edge, when it is a local location on `destination`
-    /// itself. An endpoint's executor and rank are the ones `incarnations`
-    /// holds for its incarnation; a location whose source is not a live
-    /// incarnation matches no edge. `ExecutorGroup` calls this for each rank's
-    /// projected batch.
-    ///
-    /// # Errors
-    ///
-    /// Fails with every product that has a tensor left with no location. An
-    /// edge that names only one of the two mechanisms refuses products of the
-    /// other location here, and so does a product published over none of the
-    /// mechanisms its edge carries. Filtering is not rolled back: every
-    /// tensor keeps its filtered locations.
-    pub(crate) fn bind_inputs(
-        &self,
-        incarnations: &crate::executors::IncarnationRegistry,
-        products: &mut [ipc::TensorExport],
-        cache_inputs: &mut [ipc::CacheTransfer],
-        destination: &ipc::MainProcessEndpoint,
-    ) -> Result<(), UnroutableInputs> {
-        let position = incarnations.position(destination);
-        let mut unroutable = Vec::new();
-        for payload in products.iter_mut() {
-            let buffer = payload.product.buffer_id();
-            let mut bound = true;
-            for tensor in payload.value.tensors_mut() {
-                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
-            }
-            if !bound {
-                unroutable.push(buffer);
-            }
-        }
-        for export in cache_inputs.iter_mut() {
-            let mut bound = true;
-            for tensor in export.tensors_mut() {
-                bound &= self.bind_locations(incarnations, tensor, destination, position.as_ref());
-            }
-            if !bound {
-                unroutable.push(export.source);
-            }
-        }
-        if unroutable.is_empty() {
-            return Ok(());
-        }
-        Err(UnroutableInputs {
-            destination: position.map_or_else(
-                || destination.incarnation.clone(),
-                |(worker, rank)| format!("{}:{rank}", worker.0),
-            ),
-            buffers: unroutable,
-        })
-    }
-
-    /// Keeps the locations of one tensor that reach `destination`, as
-    /// `bind_inputs` selects them, and reports whether any remain.
-    fn bind_locations(
-        &self,
-        incarnations: &crate::executors::IncarnationRegistry,
-        tensor: &mut ipc::TensorTransfer,
-        destination: &ipc::MainProcessEndpoint,
-        destination_position: Option<&(ExecutorGroupId, u32)>,
-    ) -> bool {
-        use ipc::TransferTransport;
-
-        // A product's location chose the mechanism it was published on, so a
-        // location is kept where the edge carries that mechanism for either
-        // location.
-        tensor.locations.retain(|location| {
-            let published = match &location.transport {
-                TransferTransport::Local { .. } => TransferBackend::Local,
-                TransferTransport::PosixShm { .. } => TransferBackend::PosixShm,
-                TransferTransport::CudaVmm { .. } => TransferBackend::CudaVmm,
-                TransferTransport::Channel { .. } => TransferBackend::Channel,
-            };
-            let source = incarnations.position(&location.source);
-            self.edges
-                .iter()
-                .find(|edge| {
-                    let (Some((source_worker, source_rank)), Some((worker, rank))) =
-                        (&source, destination_position)
-                    else {
-                        return false;
-                    };
-                    edge.source_worker == *source_worker
-                        && edge
-                            .source_rank
-                            .is_none_or(|expected| expected == *source_rank)
-                        && edge.destination_worker == *worker
-                        && edge
-                            .destination_rank
-                            .is_none_or(|expected| expected == *rank)
-                })
-                .map_or_else(
-                    || &location.source == destination && published == TransferBackend::Local,
-                    |edge| edge.carries(published),
-                )
-        });
-        !tensor.locations.is_empty()
-    }
 
     /// Parses `source[:rank]->destination[:rank]=mechanisms` directed bindings.
     ///
@@ -1253,9 +771,6 @@ impl TransferConfig {
     /// both joined by `+` with the device mechanism first, as in
     /// `cuda_vmm+posix_shm`. `local` serves both locations. Entries are separated by
     /// commas, and an omitted rank covers every rank of that executor.
-    ///
-    /// The result holds no placement: `with_worker_defaults` fills
-    /// `worker_ranks` and `worker_hosts` and binds the edges left unnamed.
     ///
     /// # Errors
     ///
@@ -1322,11 +837,7 @@ impl TransferConfig {
             });
         }
 
-        Ok(Self {
-            edges,
-            worker_ranks: std::collections::BTreeMap::new(),
-            worker_hosts: std::collections::BTreeMap::new(),
-        })
+        Ok(Self { edges })
     }
 
     /// Resolves an edge's mechanism text into its device and host mechanisms.
@@ -1373,21 +884,6 @@ impl FromStr for TransferConfig {
     }
 }
 
-/// Transferred inputs that a consuming rank cannot read.
-///
-/// Every published location of these products travels on a mechanism that no
-/// configured edge to the consumer carries, so the requests reading them can
-/// never run there. `Dispatcher` fails those requests alone: the refusal
-/// says nothing about the rest of the batch or the health of either group.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("input products have no location on a configured transfer edge to {destination}")]
-pub(crate) struct UnroutableInputs {
-    /// The consuming rank, as `executor:rank`.
-    pub(crate) destination: String,
-    /// The products left without a location the consumer can read.
-    pub(crate) buffers: Vec<ipc::BufferId>,
-}
-
 /// Error returned for an invalid transfer-transport mapping.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -1402,8 +898,8 @@ impl TransferConfigError {
 
 /// An executor-reported execution error classified for scheduler failure policy.
 ///
-/// The typed taxonomy and execution context cross the IPC together so failure
-/// policy and diagnostics use the same call identity.
+/// The typed taxonomy and execution context travel together so failure policy
+/// and diagnostics use the same call identity.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("executor execute error: {message}")]
 pub struct ExecuteError {
@@ -1411,7 +907,7 @@ pub struct ExecuteError {
     /// join the same terminal outcome across ranks before returning the
     /// failure to the scheduler.
     pub batch_id: Option<u64>,
-    /// Whether the error invalidates the executor process or executor.
+    /// Whether the error invalidates the executor.
     pub fatal: bool,
     /// The failure's class, when the rank classified it.
     pub code: Option<ipc::ErrorCode>,
@@ -1479,12 +975,13 @@ pub struct ExecutorFailure {
     pub message: String,
 }
 
-/// The asynchronous, pipelined boundary the scheduler drives.
+/// The asynchronous, pipelined boundary a simulated pool implements.
 ///
 /// One submitted batch may come back from `poll` as several
 /// [`BatchResult`]s: each carries completions not reported by an earlier one,
 /// and the last has `done` set and carries the lifecycle command receipts.
 /// A failure may instead surface as an error from `poll`.
+#[cfg(feature = "testing")]
 pub trait Executor: Send {
     /// Returns the executor's concrete pool capabilities.
     fn info(&self) -> &ExecutorInfo;
@@ -1509,8 +1006,7 @@ pub trait Executor: Send {
     /// Closes the executor and its physical executors.
     fn close(&mut self) -> Result<(), ExecutorError>;
     /// Commits the executors' world: each executor takes the predecessor
-    /// world's storage it mapped read-only, and its group relaunches on a
-    /// loss and keeps its standby from then on. Returns what each executor
+    /// world's storage it mapped read-only. Returns what each executor
     /// reported. The default suits an executor whose executors succeed no
     /// world.
     fn commit(&mut self) -> Result<Vec<String>, ExecutorError> {
@@ -1522,17 +1018,16 @@ pub trait Executor: Send {
         Ok(())
     }
     /// Ends the storage of every world of `worlds` on the nodes of the
-    /// executor's executors (`Claims::retire`). The default suits an executor
-    /// that retains no storage.
+    /// executor's executors. The default suits an executor that retains no
+    /// storage.
     fn retire(&mut self, worlds: &[u64]) -> Result<(), ExecutorError> {
         let _ = worlds;
         Ok(())
     }
     /// Keeps the weights alone of every world of `worlds` on the nodes of
-    /// the executor's executors, in host storage when `to_host`
-    /// (`Claims::keep_weights`), and returns each node's report. The default
-    /// suits an executor that retains no storage, which has no node to
-    /// report.
+    /// the executor's executors, in host storage when `to_host`, and returns
+    /// each node's report. The default suits an executor that retains no
+    /// storage, which has no node to report.
     fn keep_weights(
         &mut self,
         worlds: &[u64],
@@ -1544,17 +1039,17 @@ pub trait Executor: Send {
     }
     /// Halves, or restores when not `halve`, the byte budgets of the links
     /// the deployment's transfers use on the nodes of the executor's
-    /// executors (`Claims::throttle`), and returns those nodes' hosts. The
-    /// default suits an executor that retains no storage and runs no
-    /// transfer, which throttles no host.
+    /// executors, and returns those nodes' hosts. The default suits an
+    /// executor that retains no storage and runs no transfer, which throttles
+    /// no host.
     fn throttle(&mut self, halve: bool) -> Result<Vec<String>, ExecutorError> {
         let _ = halve;
         Ok(Vec::new())
     }
-    /// The storage ledgers of the nodes of the executor's executors
-    /// (`Claims::ledgers`): for each node, JSON of `{"host": ..., "ledgers":
-    /// [...], "host_storage": {...}}`. The default suits an executor that
-    /// retains no storage, whose ledgers are empty.
+    /// The storage ledgers of the nodes of the executor's executors: for each
+    /// node, JSON of `{"host": ..., "ledgers": [...], "host_storage": {...}}`.
+    /// The default suits an executor that retains no storage, whose ledgers
+    /// are empty.
     fn ledgers(&mut self) -> Result<Vec<String>, ExecutorError> {
         Ok(Vec::new())
     }
@@ -1580,8 +1075,7 @@ pub trait Executor: Send {
     /// holding `tokens` tokens of every cache group (`uniserve.host_cache`),
     /// while none runs a batch, and returns each executor group's identity
     /// with its ranks' pools (JSON, `null` for a rank that copies no pages),
-    /// in rank order. Ranks that later replace lost ones map the same pools
-    /// before they serve. The default refuses: the executor has no executors.
+    /// in rank order. The default refuses: the executor has no executors.
     fn map_host_cache(
         &mut self,
         tokens: u64,
@@ -1596,7 +1090,7 @@ pub trait Executor: Send {
         anyhow::bail!("this executor runs no executor hook ({name})")
     }
 
-    /// Commit prepared expert allocations and retain their order for recovery.
+    /// Commit prepared expert allocations.
     fn commit_experts(
         &mut self,
         order: &BTreeMap<String, Vec<u32>>,
@@ -1922,50 +1416,6 @@ mod tests {
     }
 
     #[test]
-    fn a_producer_watches_the_slots_its_consumers_write() {
-        // A product retires only when the slots the producer watches are the
-        // same slots its consumers write. Both come from this derivation, so
-        // a disagreement would hang retirement or reuse live storage.
-        let mut transfer = TransferConfig {
-            edges: vec![
-                TransferEdge {
-                    source_worker: ExecutorGroupId("encoder".to_owned()),
-                    source_rank: Some(0),
-                    destination_worker: ExecutorGroupId("decode".to_owned()),
-                    destination_rank: None,
-                    device: Some(TransferBackend::CudaVmm),
-                    host: Some(TransferBackend::PosixShm),
-                },
-                TransferEdge {
-                    source_worker: ExecutorGroupId("encoder".to_owned()),
-                    source_rank: Some(0),
-                    destination_worker: ExecutorGroupId("encoder".to_owned()),
-                    destination_rank: Some(0),
-                    device: Some(TransferBackend::Local),
-                    host: Some(TransferBackend::Local),
-                },
-            ],
-            worker_ranks: std::collections::BTreeMap::new(),
-            worker_hosts: std::collections::BTreeMap::new(),
-        };
-        transfer.worker_ranks.insert("decode".to_owned(), 2);
-        transfer.worker_ranks.insert("encoder".to_owned(), 3);
-
-        // Slots are dense across the groups: groups take contiguous runs in
-        // the order the placement keys them.
-        assert_eq!(transfer.acknowledgment_slot("decode", 0), 0);
-        assert_eq!(transfer.acknowledgment_slot("decode", 1), 1);
-        assert_eq!(transfer.acknowledgment_slot("encoder", 0), 2);
-        assert_eq!(transfer.acknowledgment_slot("encoder", 2), 4);
-
-        // The unranked edge names every decode rank; the self-edge publishes
-        // into the producer's own address space and acknowledges nothing.
-        assert_eq!(transfer.product_consumers("encoder", 0), vec![0, 1]);
-        // A rank with no outgoing edge has no consumer to wait for.
-        assert_eq!(transfer.product_consumers("encoder", 1), Vec::<u32>::new());
-    }
-
-    #[test]
     fn a_channel_edge_is_a_transfer_backend() {
         // Host products cross hosts on the rank channel, so the mechanism has
         // to be nameable in a placement's transfer bindings.
@@ -1982,8 +1432,6 @@ mod tests {
         let both = TransferConfig::parse("decoder->muxer=cuda_vmm+posix_shm").unwrap();
         assert_eq!(both.edges[0].device, Some(TransferBackend::CudaVmm));
         assert_eq!(both.edges[0].host, Some(TransferBackend::PosixShm));
-        assert!(both.edges[0].carries(TransferBackend::PosixShm));
-        assert!(!both.edges[0].carries(TransferBackend::Channel));
 
         let local = TransferConfig::parse("decoder->decoder=local").unwrap();
         assert_eq!(local.edges[0].device, Some(TransferBackend::Local));
@@ -1992,165 +1440,6 @@ mod tests {
         assert!(TransferConfig::parse("a->b=posix_shm+channel").is_err());
         assert!(TransferConfig::parse("a->b=local+posix_shm").is_err());
         assert!(TransferConfig::parse("a->b=cuda_vmm+cuda_vmm").is_err());
-    }
-
-    #[test]
-    fn a_device_only_edge_refuses_a_product_published_as_host_bytes() {
-        use ipc::{
-            CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
-            TensorTransfer, TransferHandle, TransferTransport, MainProcessEndpoint as Endpoint,
-        };
-
-        // A device product that did not fit its producer's pool is published
-        // in the producer's own address space and as shared-memory bytes; an
-        // edge that carries only CUDA VMM takes neither to the decoder.
-        let transfer = TransferConfig::parse("denoiser->decoder=cuda_vmm").unwrap();
-        let endpoint = |group: &str| Endpoint {
-            host: "host".to_owned(),
-            address_space: format!("{group}-process"),
-            incarnation: format!("{group}-incarnation"),
-        };
-        let producer = endpoint("denoiser");
-        let locator = |transport| Locator {
-            source: producer.clone(),
-            transport,
-            nbytes: 4,
-            dtype: "float32".to_owned(),
-            shape: vec![1],
-            offset: vec![0],
-            device: "cpu".to_owned(),
-        };
-        let product = TensorRef {
-            request_key: RequestKey::new(1, ipc::RequestId(7), 1),
-            producer_call_id: CallId::new(1, 0),
-            output_index: 0,
-            generation: 1,
-            dtype: DType::F32,
-            shape_bound: ShapeBound {
-                dims: vec![DimBound::Static(1)],
-            },
-        };
-        let mut products = vec![TensorExport {
-            product: product.clone(),
-            value: TransferHandle::DeviceProduct {
-                height: 0,
-                width: 0,
-                value_range: String::new(),
-                tensor: TensorTransfer {
-                    shape: vec![1],
-                    locations: vec![
-                        locator(TransferTransport::Local {
-                            endpoint: producer.incarnation.clone(),
-                            key: 1,
-                        }),
-                        locator(TransferTransport::PosixShm {
-                            endpoint: producer.incarnation.clone(),
-                            name: "segment".to_owned(),
-                        }),
-                    ],
-                },
-            },
-        }];
-
-        let incarnations = crate::executors::IncarnationRegistry::default();
-        let decoder = endpoint("decoder");
-        incarnations.assign(&ExecutorGroupId("denoiser".to_owned()), [&producer]);
-        incarnations.assign(&ExecutorGroupId("decoder".to_owned()), [&decoder]);
-
-        let refusal = transfer
-            .bind_inputs(&incarnations, &mut products, &mut [], &decoder)
-            .unwrap_err();
-        assert_eq!(refusal.buffers, vec![product.buffer_id()]);
-        assert_eq!(refusal.destination, "decoder:0");
-    }
-
-    /// A publication binds to the edge of the executor and rank its source
-    /// incarnation serves; once a group replaces its ranks, the replaced
-    /// incarnation's publication binds to nothing and the replacement takes
-    /// the same edge.
-    #[test]
-    fn a_replaced_worker_incarnation_no_longer_binds_to_its_edge() {
-        use ipc::{
-            CallId, DType, DimBound, Locator, RequestKey, ShapeBound, TensorExport, TensorRef,
-            TensorTransfer, TransferHandle, TransferTransport, MainProcessEndpoint as Endpoint,
-        };
-
-        // Rank 1 of the denoiser sends to the decoder over shared storage,
-        // and no other rank of the denoiser has an edge.
-        let transfer = TransferConfig::parse("denoiser:1->decoder=posix_shm").unwrap();
-        let endpoint = |incarnation: &str| Endpoint {
-            host: "host".to_owned(),
-            address_space: format!("{incarnation}-process"),
-            incarnation: incarnation.to_owned(),
-        };
-        let denoiser = [endpoint("denoiser-0"), endpoint("denoiser-1")];
-        let decoder = endpoint("decoder-0");
-        let incarnations = crate::executors::IncarnationRegistry::default();
-        incarnations.assign(&ExecutorGroupId("denoiser".to_owned()), &denoiser);
-        incarnations.assign(&ExecutorGroupId("decoder".to_owned()), [&decoder]);
-
-        let product = TensorRef {
-            request_key: RequestKey::new(1, ipc::RequestId(7), 1),
-            producer_call_id: CallId::new(1, 0),
-            output_index: 0,
-            generation: 1,
-            dtype: DType::F32,
-            shape_bound: ShapeBound {
-                dims: vec![DimBound::Static(1)],
-            },
-        };
-        let published_by = |source: &Endpoint| TensorExport {
-            product: product.clone(),
-            value: TransferHandle::DeviceProduct {
-                height: 0,
-                width: 0,
-                value_range: String::new(),
-                tensor: TensorTransfer {
-                    shape: vec![1],
-                    locations: vec![Locator {
-                        source: source.clone(),
-                        transport: TransferTransport::PosixShm {
-                            endpoint: source.incarnation.clone(),
-                            name: "segment".to_owned(),
-                        },
-                        nbytes: 4,
-                        dtype: "float32".to_owned(),
-                        shape: vec![1],
-                        offset: vec![0],
-                        device: "cpu".to_owned(),
-                    }],
-                },
-            },
-        };
-
-        let mut live = vec![published_by(&denoiser[1])];
-        transfer
-            .bind_inputs(&incarnations, &mut live, &mut [], &decoder)
-            .unwrap();
-
-        // Rank 0 holds no edge to the decoder.
-        let mut unbound = vec![published_by(&denoiser[0])];
-        assert!(
-            transfer
-                .bind_inputs(&incarnations, &mut unbound, &mut [], &decoder)
-                .is_err()
-        );
-
-        // The denoiser replaces both of its ranks. The old rank 1 incarnation
-        // is retired, and its replacement takes the same edge.
-        let replacement = [endpoint("denoiser-0b"), endpoint("denoiser-1b")];
-        incarnations.assign(&ExecutorGroupId("denoiser".to_owned()), &replacement);
-
-        let mut retired = vec![published_by(&denoiser[1])];
-        assert!(
-            transfer
-                .bind_inputs(&incarnations, &mut retired, &mut [], &decoder)
-                .is_err()
-        );
-        let mut replaced = vec![published_by(&replacement[1])];
-        transfer
-            .bind_inputs(&incarnations, &mut replaced, &mut [], &decoder)
-            .unwrap();
     }
 
     #[test]
@@ -2184,35 +1473,5 @@ mod tests {
             TransferConfig::parse("encoder->denoiser=posix_shm,encoder:0->denoiser:1=cuda_vmm")
                 .is_err()
         );
-    }
-
-    #[test]
-    fn host_slots_name_every_rank_on_the_producing_ranks_host() {
-        let mut transfer = TransferConfig::default();
-        transfer.worker_ranks.insert("host".to_owned(), 2);
-        transfer.worker_ranks.insert("model".to_owned(), 4);
-        transfer
-            .worker_hosts
-            .insert("host".to_owned(), vec!["a".to_owned(), "b".to_owned()]);
-        transfer.worker_hosts.insert(
-            "model".to_owned(),
-            vec![
-                "a".to_owned(),
-                "a".to_owned(),
-                "b".to_owned(),
-                "b".to_owned(),
-            ],
-        );
-        // Model rank 3 is on host b with CPU executor 1 and model rank 2.
-        let slots = transfer.host_slots("model", 3);
-        let expected = [
-            transfer.acknowledgment_slot("host", 1),
-            transfer.acknowledgment_slot("model", 2),
-            transfer.acknowledgment_slot("model", 3),
-        ];
-        assert_eq!(slots, expected);
-        // An unplaced rank shares a host with no one.
-        assert!(transfer.host_slots("model", 7).is_empty());
-        assert!(TransferConfig::default().host_slots("model", 0).is_empty());
     }
 }

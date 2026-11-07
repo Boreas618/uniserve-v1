@@ -72,6 +72,7 @@ pub fn load(
         },
         Quantization::Bf16,
         &Representation::Dense,
+        &ExpertOrder::new(),
     )
 }
 
@@ -101,6 +102,7 @@ pub fn load_encoded(
         },
         Quantization::Nvfp4(layout),
         &Representation::read(root)?,
+        &ExpertOrder::new(),
     )
 }
 
@@ -126,6 +128,29 @@ pub fn load_checkpoint(
     options: LoadOptions,
     layout: ScaleLayout,
 ) -> Result<Qwen3Moe> {
+    load_placed(root, partition, loader, options, layout, &ExpertOrder::new())
+}
+
+/// Each routed layer's logical expert ids in physical slot order, by the module path
+/// [`crate::weights::ExpertSource::module`] states. A layer this map does not name keeps the
+/// checkpoint's order.
+pub type ExpertOrder = std::collections::BTreeMap<String, Vec<u32>>;
+
+/// [`load_checkpoint`] with the routed experts in the slots `order` states (`docs/admin.md`, Expert
+/// redistribution).
+///
+/// The stacks hold the experts in slot order, and one table maps every layer's logical ids to its
+/// slots. A deployment that never redistributes reads an identity table, so the graphs it captures
+/// are the graphs any later order replays over: a redistribution changes what the table's address
+/// and the stacks' addresses map, and no capture.
+pub fn load_placed(
+    root: &Path,
+    partition: Partition,
+    loader: &mut WeightLoader<'_>,
+    options: LoadOptions,
+    layout: ScaleLayout,
+    order: &ExpertOrder,
+) -> Result<Qwen3Moe> {
     let representation = Representation::read(root)?;
     // The shards are the fact and the declaration is a claim about them, so a load resolves each
     // parameter's representation from what the checkpoint stores. A shapes walk has no shard to ask
@@ -136,9 +161,115 @@ pub fn load_checkpoint(
     };
     refuse_dense_parameters(root, &representation)?;
     match representation {
-        Representation::Dense => load(root, partition, loader, options),
-        Representation::Nvfp4 { .. } => load_encoded(root, partition, loader, options, layout),
+        Representation::Dense => load_with(
+            root,
+            partition,
+            loader,
+            LoadOptions {
+                experts_encoded: false,
+                ..options
+            },
+            Quantization::Bf16,
+            &Representation::Dense,
+            order,
+        ),
+        Representation::Nvfp4 { .. } => load_with(
+            root,
+            partition,
+            loader,
+            LoadOptions {
+                experts_encoded: true,
+                ..options
+            },
+            Quantization::Nvfp4(layout),
+            &Representation::read(root)?,
+            order,
+        ),
     }
+}
+
+/// The slot of each logical expert, from `order`, the logical expert of each slot.
+///
+/// # Errors
+///
+/// When `order` is no permutation of `experts` experts.
+fn slot_row(module: &str, order: &[u32], experts: usize) -> Result<Vec<u32>> {
+    if order.len() != experts {
+        return Err(Error::Config(format!(
+            "the order of {module} names {} experts of {experts}",
+            order.len()
+        )));
+    }
+    let mut row = vec![u32::MAX; experts];
+    for (slot, expert) in order.iter().enumerate() {
+        let entry = row.get_mut(*expert as usize).ok_or_else(|| {
+            Error::Config(format!("the order of {module} names expert {expert}"))
+        })?;
+        *entry = as_u32(slot, "an expert slot")?;
+    }
+    if row.contains(&u32::MAX) {
+        return Err(Error::Config(format!(
+            "the order of {module} is not a permutation of its experts"
+        )));
+    }
+    Ok(row)
+}
+
+/// The experts of each routed layer in slot order, checked, with the table a route reads its slot
+/// from: `[routed layers, experts]` i32, row by row in layer order.
+///
+/// Every layer's row is one weight's row, because a retained weight takes a whole allocation
+/// granule: one table per layer would hold 2 MiB each for 512 bytes of content.
+fn expert_slots(
+    config: &Config,
+    order: &ExpertOrder,
+    loader: &mut WeightLoader<'_>,
+) -> Result<(HashMap<usize, Vec<u32>>, Option<(nn::Weight, Vec<usize>)>)> {
+    let experts = config.num_experts;
+    let layers: Vec<usize> = (0..config.num_hidden_layers)
+        .filter(|&layer| config.sparse(layer))
+        .collect();
+    for module in order.keys() {
+        if !crate::weights::expert_sources(config)
+            .iter()
+            .any(|source| &source.module == module)
+        {
+            return Err(Error::Config(format!(
+                "{module} is not a routed expert layer of this model"
+            )));
+        }
+    }
+    let mut slots = HashMap::with_capacity(layers.len());
+    let mut table = Vec::with_capacity(layers.len() * experts * 4);
+    for &layer in &layers {
+        let module = format!("layers.{layer}.mlp.experts");
+        let order: Vec<u32> = match order.get(&module) {
+            Some(order) => order.clone(),
+            None => (0..as_u32(experts, "num_experts")?).collect(),
+        };
+        table.extend(
+            slot_row(&module, &order, experts)?
+                .iter()
+                .flat_map(|slot| slot.to_le_bytes()),
+        );
+        slots.insert(layer, order);
+    }
+    if layers.is_empty() {
+        return Ok((slots, None));
+    }
+    let weight = loader
+        .constant(
+            "qwen3-moe.experts.slots",
+            DType::I32,
+            Shape::new(&[
+                as_u64(layers.len(), "the routed layers")?,
+                as_u64(experts, "num_experts")?,
+            ]),
+            &table,
+            "qwen3-moe",
+        )
+        .map_err(Error::from)?;
+    Ok((slots, Some((weight, layers))))
 }
 
 /// Refuse a declaration that quantizes a parameter this model builds as a dense module.
@@ -186,6 +317,7 @@ fn load_with(
     options: LoadOptions,
     quantization: Quantization,
     declaration: &Representation,
+    order: &ExpertOrder,
 ) -> Result<Qwen3Moe> {
     // The layout a packed projection's programs read, which is the deployment's choice and the same
     // one the expert stacks use. A dense deployment never builds one, so the value is unreachable
@@ -284,6 +416,7 @@ fn load_with(
         .map_err(Error::from)?;
     let _ = head_dim;
 
+    let (slots, slot_table) = expert_slots(&config, order, loader)?;
     let experts_source: HashMap<usize, crate::weights::ExpertSource> =
         crate::weights::expert_sources(&config)
             .into_iter()
@@ -407,6 +540,22 @@ fn load_with(
         };
 
         let mlp = if config.sparse(layer) {
+            let map = match &slot_table {
+                Some((table, layers)) => {
+                    let row = layers.iter().position(|routed| *routed == layer);
+                    let row = row.ok_or_else(|| {
+                        Error::Config(format!("layer {layer} has no row of the expert table"))
+                    })?;
+                    table
+                        .row(as_u64(row, "an expert table row")?)
+                        .map_err(Error::from)?
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "layer {layer} routes and no routed layer has a table"
+                    )));
+                }
+            };
             Mlp::Experts(expert_block(
                 loader,
                 &sources,
@@ -416,6 +565,8 @@ fn load_with(
                 &parameter,
                 hidden,
                 quantization,
+                &slots[&layer],
+                map,
             )?)
         } else {
             Mlp::Dense(Box::new(dense_block(
@@ -774,6 +925,8 @@ fn expert_block(
     parameter: &str,
     hidden: u64,
     quantization: Quantization,
+    slots: &[u32],
+    map: nn::Weight,
 ) -> Result<Moe> {
     let experts = as_u64(config.num_experts, "num_experts")?;
     let range = partition.expert_range(config);
@@ -824,11 +977,11 @@ fn expert_block(
             )));
         }
         let up_gate: QuantizedStack = loader
-            .nvfp4_stack(
+            .nvfp4_stack_in_slots(
                 &format!("{parameter}.mlp.experts.up_gate"),
                 &expert_source.checkpoint_prefix,
                 &["up", "gate"],
-                vocabulary,
+                slots,
                 Nvfp4Names::vllm(),
                 nn::weights::ValueLayout::InterleavedShuffled {
                     epilogue_tile_m: 128,
@@ -838,11 +991,11 @@ fn expert_block(
             )
             .map_err(Error::from)?;
         let down: QuantizedStack = loader
-            .nvfp4_stack(
+            .nvfp4_stack_in_slots(
                 &format!("{parameter}.mlp.experts.down"),
                 &expert_source.checkpoint_prefix,
                 &["down"],
-                vocabulary,
+                slots,
                 Nvfp4Names::vllm(),
                 nn::weights::ValueLayout::Shuffled {
                     epilogue_tile_m: 128,
@@ -857,7 +1010,7 @@ fn expert_block(
             router,
             up_gate,
             down,
-            None,
+            Some(map),
             vocabulary,
             top,
             activation,
@@ -869,8 +1022,8 @@ fn expert_block(
 
     let mut up_gate_parts = Vec::with_capacity(range.len() * 2);
     let mut down_parts = Vec::with_capacity(range.len());
-    for expert in range.clone() {
-        let tensors = expert_source.tensors(expert);
+    for slot in range.clone() {
+        let tensors = expert_source.tensors(slots[slot] as usize);
         up_gate_parts.push(tensors.up);
         up_gate_parts.push(tensors.gate);
         down_parts.push(tensors.down);
@@ -900,7 +1053,7 @@ fn expert_block(
             router,
             up_gate,
             down,
-            None,
+            Some(map),
             local,
             top,
             activation,
@@ -909,15 +1062,15 @@ fn expert_block(
         )
         .map_err(Error::from)
     } else {
-        // One rank holds a contiguous window of the vocabulary, so the block needs no expert map:
-        // `local_offset` is what tells the sort which routes are this rank's, and the router stays
-        // replicated over the whole vocabulary so every rank routes a token the same way.
+        // One rank holds a contiguous window of the slots: `local_offset` is what tells the sort
+        // which routes are this rank's, and the router stays replicated over the whole vocabulary
+        // so every rank routes a token the same way and the table names its slot on every rank.
         let offset = as_u32(range.start, "the first local expert")?;
         Moe::expert_parallel(
             router,
             up_gate,
             down,
-            None,
+            Some(map),
             as_u32(config.num_experts, "num_experts")?,
             local,
             offset,
@@ -1157,6 +1310,24 @@ fn frequency_bytes(frequencies: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_slot_row_inverts_the_order_it_is_read_from() {
+        // Slot 0 holds expert 2, so a route to expert 2 reads slot 0.
+        assert_eq!(
+            super::slot_row("layers.0.mlp.experts", &[2, 0, 1], 3).expect("a permutation"),
+            vec![1, 2, 0]
+        );
+    }
+
+    #[test]
+    fn a_slot_row_refuses_an_order_that_is_no_permutation() {
+        for order in [&[0, 0, 1][..], &[0, 1][..], &[0, 1, 3][..]] {
+            let error = super::slot_row("layers.0.mlp.experts", order, 3)
+                .expect_err("no permutation of three experts");
+            assert!(error.to_string().contains("layers.0.mlp.experts"), "{error}");
+        }
+    }
+
     use super::*;
     use crate::{Config, YaRn};
     use nn::weights::WeightSource;

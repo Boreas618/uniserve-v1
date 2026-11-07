@@ -105,6 +105,20 @@ pub(crate) enum Command {
     },
     /// Copy published pages to the host KV cache, with no batch to carry them.
     CopyPages(Vec<ipc::PageCopy>),
+    /// Give the cache's segments from `from` on back to the Storage Server (7.6). The scheduler
+    /// withdrew their units and waited for every request that held one.
+    ReleaseCache {
+        /// The first segment given back.
+        from: u32,
+    },
+    /// Unmap the graph pools' storage at their reserved addresses, keeping every capture (7.6).
+    SuspendGraphs,
+    /// Map the graph pools' storage at the addresses the captures hold.
+    RestoreGraphs,
+    /// Change what the rank's weights map, then have every runner fill again what it folds from
+    /// them (7.6). It is a queue item because the queue's order is what makes "no job reads the
+    /// weights" true at the moment their mappings change.
+    Rebind(Arc<dyn Fn() -> Result<()> + Send + Sync>),
     /// Wait for the events deferred storage release hangs on.
     After(Vec<Arc<platform::Event>>),
 }
@@ -135,6 +149,10 @@ impl Command {
                 Some(limit) => format!("waking {limit} segments of the resident cache planes"),
                 None => "waking every released segment of the resident cache planes".to_owned(),
             },
+            Self::ReleaseCache { from } => format!("giving back the cache from segment {from}"),
+            Self::SuspendGraphs => "suspending the graph pools".to_owned(),
+            Self::RestoreGraphs => "restoring the graph pools".to_owned(),
+            Self::Rebind(_) => "putting new weights at the rank's addresses".to_owned(),
             Self::After(_) => "waiting for deferred storage work".to_owned(),
         }
     }

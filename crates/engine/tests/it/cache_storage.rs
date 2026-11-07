@@ -1692,6 +1692,80 @@ fn a_sleeping_scheduler_admits_nothing_until_it_wakes() {
     thread.join().unwrap();
 }
 
+/// A main process gives the cache's storage to a weight update's load before
+/// it asks for the update: `abort` ends every request the scheduler holds,
+/// the one running and the one queued, and the executors then sleep.
+#[test]
+fn an_aborting_sleep_ends_every_request_before_the_executors_sleep() {
+    let (handle, executors, thread) = start(SimExecutors::filling(0));
+    let mut running = handle.submit(request(1, 2, 150)).unwrap();
+    assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
+
+    assert!(resize(&handle, CacheChange::SleepAborting).is_ok());
+    assert!(matches!(
+        terminal(&mut running),
+        Some(Event::Finished {
+            reason: FinishReason::Aborted,
+            ..
+        })
+    ));
+    assert_eq!(
+        executors.lock().unwrap().hooks,
+        vec!["uniserve.sleep".to_owned()]
+    );
+
+    // Asleep, the update needs no second sleep and no wake of its own: the
+    // process that put the executors to sleep wakes them.
+    let updated = handle
+        .update_weights("/checkpoints/next".to_owned(), WeightsInFlight::Abort)
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the scheduler answers");
+    assert!(updated.is_ok(), "{updated:?}");
+    assert!(resize(&handle, CacheChange::Wake).is_ok());
+    assert_eq!(
+        executors.lock().unwrap().hooks,
+        vec![
+            "uniserve.sleep".to_owned(),
+            r#"uniserve.update_weights {"model_path":"/checkpoints/next"}"#.to_owned(),
+            "uniserve.wake".to_owned(),
+        ]
+    );
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
+/// A held scheduler forms no batch and answers once those in flight completed.
+/// Every request keeps its state through the hold, and generates on from the
+/// token it reached once the hold ends.
+#[test]
+fn a_held_scheduler_keeps_its_requests_and_serves_on_after() {
+    let (handle, _executors, thread) = start(SimExecutors::filling(0));
+    let mut running = handle.submit(request(1, 2, 150)).unwrap();
+    assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
+
+    assert!(resize(&handle, CacheChange::Hold { held: true }).is_ok());
+    // What the batches in flight produced arrives, and then nothing does.
+    while next_token(&mut running, Duration::from_millis(200)).is_some() {}
+    assert_eq!(next_token(&mut running, Duration::from_millis(300)), None);
+    let mut waiting = handle.submit(request(2, 2, 4)).unwrap();
+    assert_eq!(next_token(&mut waiting, Duration::from_millis(300)), None);
+
+    assert!(resize(&handle, CacheChange::Hold { held: false }).is_ok());
+    assert!(next_token(&mut running, Duration::from_secs(10)).is_some());
+    assert!(matches!(
+        terminal(&mut waiting),
+        Some(Event::Finished { .. })
+    ));
+    assert!(matches!(
+        terminal(&mut running),
+        Some(Event::Finished { .. })
+    ));
+
+    handle.shutdown();
+    thread.join().unwrap();
+}
+
 /// A weight update that recomputes the requests in flight ends those that
 /// run as migratable, and rewrites the weights while the executors sleep,
 /// which they wake from after; requests are served again.
