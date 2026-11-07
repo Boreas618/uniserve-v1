@@ -104,6 +104,12 @@ thread_local! {
     static THREAD: Cell<u32> = const { Cell::new(0) };
 }
 
+/// Has CUPTI deliver the records of the operations that completed, so that a sink which is about to
+/// go has them first.
+pub fn flush() {
+    subscriber::flush(false);
+}
+
 /// The process's timeline recording; stops on drop. One records at a time.
 pub struct Timeline {
     kinds: Vec<u32>,

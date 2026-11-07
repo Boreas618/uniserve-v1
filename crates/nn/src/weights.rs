@@ -791,7 +791,7 @@ impl Projections {
 /// projection** — so the scalar [`QuantizedWeight::global_scale`] cannot serve it, and a model may
 /// not build the table itself (constructing a weight is the loader's, not a model's). The loader
 /// publishes all three from the checkpoint's per-expert, per-projection tensors: the encoded values
-/// and scales concatenated in the operator's reading order, and the reciprocals as a
+/// and scales concatenated in the operator's reading order, and the tensor scales as a
 /// `[projections, experts]` f32 weight — one packed table per projection, which is the shape the
 /// batched-GEMM entry reads and the shape the checkpoint itself carries a tensor per.
 ///
@@ -1627,7 +1627,7 @@ impl<'a> WeightLoader<'a> {
     /// The checkpoint stores each expert's projection as its own tensor, so a stack is a
     /// concatenation: expert-major, and within an expert the projections in `projections`' order
     /// (the gated product reads up first, gate second). The three fields answer the three the
-    /// operators take — packed values, block scales, and one reciprocal per **expert and
+    /// operators take — packed values, block scales, and one tensor scale per **expert and
     /// projection** — and all three are published through retained storage under one key per field,
     /// so a second load of the same checkpoint costs nothing.
     ///

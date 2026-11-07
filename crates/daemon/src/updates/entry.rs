@@ -343,6 +343,11 @@ impl Leader {
             .try_lock()
             .map_err(|_| UpdateError::InProgress)?;
         let replicas = self.replicas();
+        // A switch that ended still hands the replica to the epoch that serves, and the serving
+        // client is the one this change would be built from.
+        if !request.dry_run && replicas.iter().any(|replica| replica.follows_a_switch()) {
+            return Err(UpdateError::InProgress);
+        }
         let current = locked(&replicas[0].config).clone();
         let (target, _stated, update) = resolve(&current, &request)?;
         // A target that reverted with a failure is unavailable until it is
@@ -567,6 +572,22 @@ impl Leader {
             .await
             .map_err(|error| UpdateError::Refused(format!("{error:#}")))?
             .spec;
+        // Other model files serve the deployment's requests only when they are processed as the
+        // serving ones are: the same tokenizer, templates, generation defaults and model facts.
+        if current.model() != target.model() {
+            crate::leader::same_processing(current.model(), target.model())
+                .await
+                .map_err(UpdateError::Refused)?;
+            let served = locked(&replicas[0].served).clone();
+            if served.is_some_and(|served| served.model_facts != spec.model_facts) {
+                return Err(UpdateError::Refused(format!(
+                    "the model at {} has other generation limits, control tokens or context \
+                     length than the served model, which change how requests are processed: \
+                     deploy it instead",
+                    target.model()
+                )));
+            }
+        }
         spec.world = target_epoch;
         // §7.4 step 1: the target's main processes start as the serving
         // process's standby — they map the predecessor's cache read-only and
@@ -574,18 +595,16 @@ impl Leader {
         // The predecessor's segments are the ones it holds now, which only its
         // engine can state; without them the child would map nothing and the
         // launch would be a serving process's, claiming the same scopes
-        // writably. Its `world` is the predecessor's, which is what its
-        // segments are keyed by, and not the target's own `spec.world`: the
-        // successor reads one world while it serves the next.
-        let cache = serving_client.describe_cache().await.map_err(|reason| {
+        // writably. The engine states as well the world that created them, which
+        // is what they are keyed by, and not the target's own `spec.world`: the
+        // successor reads one world while it serves the next, an epoch that took
+        // storage over keys it as its creator did, and one relaunched created
+        // its own.
+        spec.predecessor = Some(serving_client.describe_cache().await.map_err(|reason| {
             UpdateError::Refused(format!(
                 "the serving epoch named no cache segments for its standby: {reason}"
             ))
-        })?;
-        spec.predecessor = Some(wire::Predecessor {
-            world: serving.world,
-            segments: cache,
-        });
+        })?);
         let joining = (!dry_run).then(|| spec.clone());
         let change = crate::updates::epoch::EpochChange {
             previous: previous_epoch,
@@ -604,6 +623,11 @@ impl Leader {
         let programs = next.programs.clone();
         let servers = self.program_servers(&target);
         let leader = self.program_leader_host(&target, &servers);
+        // A session does not cross epochs (`docs/profiling.md`): its ranks write their files while
+        // the epoch still executes, before the switch parks it.
+        if !dry_run {
+            self.end_profiles("world change").await;
+        }
         let applied = self.updates.apply(&previous, &next, change, dry_run);
         if let (Ok(_), Some(spec)) = (&applied, joining) {
             self.updates.await_programs(&target.host_identity);
@@ -641,10 +665,19 @@ impl Leader {
         Ok(serde_json::json!({ "commit": "no update in flight" }))
     }
 
+    /// Ends every replica's running profiling session, because its epoch stops executing.
+    async fn end_profiles(&self, reason: &str) {
+        for replica in self.replicas() {
+            let client = replica.hold().client();
+            crate::profiling::end_for_world(&replica, client.as_deref(), reason).await;
+        }
+    }
+
     /// Restores the previous epoch of the update in flight.
     pub async fn rollback(&self, reason: String) -> Result<serde_json::Value, UpdateError> {
         let _replacing = self.replicas.replacing.lock().await;
         if self.updates.running() {
+            self.end_profiles("rollback").await;
             if self.updates.rollback(&reason) {
                 return Ok(self
                     .updates
@@ -666,9 +699,25 @@ impl Leader {
             .iter()
             .filter_map(|replica| replica.hold().client())
             .find(|client| matches!(client.state(), EngineState::Ready | EngineState::Parked));
+        // Each node's daemon reads its ledgers over its claim; an engine this daemon did not launch
+        // (a simulated one) answers for itself.
+        let control = replicas
+            .iter()
+            .find_map(|replica| replica.control.get().cloned());
         let ledgers = match client {
             Some(client) => {
-                match tokio::time::timeout(LEDGER_READ, client.describe_storage()).await {
+                let read = async {
+                    match control {
+                        Some(control) => {
+                            tokio::task::spawn_blocking(move || control.storage_reports())
+                                .await
+                                .map_err(|error| error.to_string())?
+                                .map_err(|error| format!("{error:#}"))
+                        }
+                        None => client.describe_storage().await,
+                    }
+                };
+                match tokio::time::timeout(LEDGER_READ, read).await {
                     Ok(Ok(nodes)) => serde_json::Value::Array(
                         nodes
                             .iter()

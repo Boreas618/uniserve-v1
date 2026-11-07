@@ -136,6 +136,10 @@ pub(crate) struct Epoch {
     /// The routed experts' distribution this epoch loads (§7.6): what a redistribution committed,
     /// which a relaunch and a standby load again.
     pub experts: BTreeMap<String, Vec<u32>>,
+    /// The deployment's always-on profiling (`profiling_config`).
+    pub profiling: proto::request::wire::Profiling,
+    /// The KV cache the world this process succeeds holds, by worker group.
+    pub predecessor_cache: Vec<proto::request::wire::CacheSegments>,
 }
 
 /// The options of `uniserve engine`: the launch file the daemon writes for this process (§2.3).
@@ -530,7 +534,27 @@ fn load_rank(
     launch: &Launch,
     epoch: &Epoch,
 ) -> Result<LoadedRank> {
-    let plan = plan.sharing_cache_of(epoch.predecessor_world.filter(|_| launch.standby));
+    let adopted = epoch
+        .predecessor_cache
+        .iter()
+        .find(|cache| cache.worker_group == launch.group)
+        .filter(|_| launch.standby)
+        .map(|cache| ipc::CacheTable {
+            segments: cache
+                .segments
+                .iter()
+                .map(|segment| ipc::CacheSegment {
+                    world: segment.world,
+                    ordinal: segment.ordinal,
+                    units: segment.units,
+                })
+                .collect(),
+            held: cache.held,
+        });
+    let plan = plan.sharing_cache_of(
+        epoch.predecessor_world.filter(|_| launch.standby),
+        adopted,
+    );
     let host = HostGroup::connect(rendezvous, index, count, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
     // §8: the rank's Storage Server and its claim are the node's, which the daemon answered for; the
@@ -566,6 +590,7 @@ fn load_rank(
     let (model, memory, inventory, graph) = plan
         .load_and_open(&mut weights, &mut &*client, &host, &epoch.experts)
         .context("loading the epoch's model")?;
+    tracing::info!(rank = plan.rank(), "the rank loaded its model");
     let weights = weights.take_log();
     Ok(LoadedRank {
         plan,
@@ -693,6 +718,8 @@ pub(crate) fn run(
     log: &crate::cli::LogLevels,
 ) -> Result<ExitCode> {
     crate::follow_lifeline(lifeline);
+    // Before any thread reads the environment and before the first NVTX call.
+    executor::profiling::counters::inject();
     crate::logging::init_tracing(
         "Engine",
         log.log_level.as_deref(),
@@ -811,6 +838,10 @@ pub(crate) struct MainProcess {
     /// reporter must see every pass (§2.3's `/metrics`, `uniserve:num_requests_running`
     /// and its kind).
     stats_reporters: Vec<engine::SchedulerStatsReporter>,
+    /// CUPTI's always-on counters, for as long as the process serves.
+    _counters: Option<executor::profiling::counters::Counters>,
+    /// The control thread's driver calls that waited for the device, as of its last report.
+    control_calls: platform::cupti::blocking::Calls,
     /// This node's device executors, shared with the schedulers that submit through them: one
     /// executor thread per device, reached both by this process's own verbs (`precopy`,
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
@@ -1027,6 +1058,28 @@ impl MainProcess {
             proto::request::wire::EngineState::Starting,
             None,
         )?;
+        // The daemon waits for what this process became, so a start that fails says why: the
+        // process ends and its connection closes, which says only that it went.
+        let mut control = Some(control);
+        let started = Self::load(&mut control, plan, epoch, launch, build);
+        if let (Err(error), Some(control)) = (&started, control.as_mut()) {
+            state_failure(control, &format!("{error:#}"));
+        }
+        started
+    }
+
+    /// Everything of a start past the handshake. It takes `control` for the process it builds, and
+    /// leaves it to the caller when it fails before that.
+    fn load(
+        control: &mut Option<Control>,
+        plan: EpochPlan,
+        epoch: Epoch,
+        launch: &Launch,
+        build: &BuildConfig,
+    ) -> Result<Self> {
+        let connected = control
+            .as_mut()
+            .context("a main process starts on the connection it opened")?;
         // The daemon's two interfaces are two sockets: the epoch's requests and metrics travel on
         // the request connection above, and everything the daemon asks of this process - the claim,
         // the reports of §7.3, and every command of the program layer - travels on this one.
@@ -1034,13 +1087,16 @@ impl MainProcess {
             ProcessInterface::connect(&launch.processes, &launch.deployment, launch.engine)?;
         // Every command of the program layer arrives on this socket, and a stage waits for the
         // command before it: the control thread sleeps on it as it does on the request socket.
-        control.watch_process(Some(process.connection.descriptor()));
+        connected.watch_process(Some(process.connection.descriptor()));
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
         // the retained weights outlive every world of the epoch, so the store is built once, before
         // the model loads, and keeps what it maps for the epoch's life.
         // A host tier is the build config's, and it needs prefix caching to have pages to keep.
         let host_kv_cache = build.kv_cache.host_tier && build.kv_cache.prefix_caching;
+        // CUPTI accepts one subscriber per process, and what it observes begins at the subscription,
+        // so the process subscribes before it loads a module (`docs/profiling.md`).
+        executor::profiling::counters::subscribe();
         // §2.1: this process serves every rank of its node, each on its own device.
         let rank_plans = plan.ranks()?;
         let rank_numbers: Vec<u32> = rank_plans.iter().map(EpochPlan::rank).collect();
@@ -1072,6 +1128,26 @@ impl MainProcess {
         // rather than leaving the pool's figure to a plan that never sized one.
         if plan.devices().is_empty() {
             bail!("this rank serves no device");
+        }
+        // Every capture of this process carries the probes the deployment names, and the graphs
+        // keep them for good: only their switch changes while the process serves.
+        if !epoch.profiling.fence_components.is_empty() {
+            executor::profiling::fences::Fences::install(
+                plan.devices(),
+                epoch.profiling.fence_components.clone(),
+                epoch.profiling.fence_probes,
+                &epoch.profiling.fence_probes_off,
+            )
+            .context("installing the fence probes")?;
+        }
+        // CUPTI attributes a graph kernel's PC samples only when sampling was enabled before the
+        // graph was captured.
+        if epoch.profiling.graph_pc_sampling {
+            for device in plan.devices() {
+                let context = platform::PrimaryContext::retain(*device)?;
+                executor::profiling::pc_sampling::enable(&context)
+                    .context("enabling PC sampling for this rank's graphs")?;
+            }
         }
         let mut memories = Vec::with_capacity(ranks.len());
         let mut clients = Vec::with_capacity(ranks.len());
@@ -1162,6 +1238,7 @@ impl MainProcess {
                 }
                 let executor = Arc::new(executor);
                 data_ranks.push(executor::data_plane::Rank {
+                    rank: rank_plan.rank(),
                     executor: Arc::downgrade(&executor),
                     device: *device,
                     storage: Arc::clone(&client),
@@ -1194,8 +1271,7 @@ impl MainProcess {
                 checkpoint: launch.model.clone(),
                 experts: epoch.experts.clone(),
             },
-            build.kv_cache.max_tokens.map(std::num::NonZeroU64::get),
-            build.max_running_requests.get() as u64,
+            build.mem_fraction_static,
         ));
         // This node's schedulers, one thread per DP rank, each handing its batches to the executors
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
@@ -1214,7 +1290,8 @@ impl MainProcess {
                     &models[index],
                     &executors[index..=index],
                     &inventories[index],
-                    control.wake(),
+                    &memories[index],
+                    connected.wake(),
                     &data,
                 )?);
             }
@@ -1226,19 +1303,40 @@ impl MainProcess {
                 &models[0],
                 &executors,
                 &inventories[0],
-                control.wake(),
+                &memories[0],
+                connected.wake(),
                 &data,
             )?
         };
 
+        // The always-on counters: every stream a runner computes on is `device`, and the one the
+        // host KV cache's pages move on is `copy`.
+        let observed: Vec<(&'static str, platform::Stream)> = executors
+            .iter()
+            .flat_map(|executor| executor.streams().iter().cloned())
+            .map(|stream| ("device", stream))
+            .chain(
+                executors
+                    .iter()
+                    .map(|executor| ("copy", executor.copy_stream().clone())),
+            )
+            .collect();
+        let counters = executor::profiling::counters::Counters::start(
+            &observed,
+            !epoch.profiling.graph_pc_sampling,
+        );
         let stats_reporters = (0..schedulers.len())
             .map(|_| engine::SchedulerStatsReporter::default())
             .collect();
         let mut process = Self {
-            control,
+            control: control
+                .take()
+                .context("a main process starts on the connection it opened")?,
             schedulers,
             union,
             stats_reporters,
+            _counters: counters,
+            control_calls: platform::cupti::blocking::Calls::default(),
             executors,
             memory: memories,
             storage: clients,
@@ -1362,6 +1460,8 @@ impl MainProcess {
     fn serve(&mut self) -> Result<Option<UpdateFailure>> {
         let mut running = Vec::new();
         let mut reported = Instant::now();
+        // This thread must not wait for a device (§2.4): the count says whether it ever did.
+        let _watched = platform::cupti::blocking::Watched::enter();
         loop {
             let pass = Instant::now();
             if self.stopping {
@@ -3723,6 +3823,11 @@ impl MainProcess {
         // An early `Serve` is honoured here rather than at its arrival: this is the pass that
         // admits, so the request waiting in the frontend is exactly what it was waiting for.
         self.pending_serve = false;
+        // What the ranks hold to serve is warm by now, so the ledger hears of it before any request
+        // can ask for more (§7.6). A rank past its quota does not serve.
+        self.data
+            .book_serving()
+            .context("booking what the ranks hold in their devices' ledgers")?;
         self.resume_schedulers()
     }
 
@@ -4376,6 +4481,10 @@ impl MainProcess {
                         id: describe.id,
                         error,
                         segments,
+                        storage_world: self
+                            .storage
+                            .first()
+                            .map_or(0, |storage| storage.storage_world()),
                     },
                 ))
             }
@@ -4457,6 +4566,14 @@ impl MainProcess {
     /// policy's fuel and calls) come from the schedulers' handle and stay zero
     /// until it exists.
     fn send_metrics(&mut self) {
+        // The driver calls this thread waited in, and the fence records an idle device left unread,
+        // reach the next batch result.
+        let current = platform::cupti::blocking::Calls::current();
+        executor::profiling::counters::add_blocking("control", &current.since(&self.control_calls));
+        self.control_calls = current;
+        if let Some(fences) = executor::profiling::fences::Fences::installed() {
+            fences.poll(false);
+        }
         let mut kernel_launches = 0_u64;
         let mut device_ns = 0_u64;
         let mut queue = Vec::with_capacity(self.executors.len());
@@ -5123,6 +5240,25 @@ impl MainProcess {
                 let payload = hook.payload;
                 self.data_work(front, id, move |data| data.unload_adapter(&payload));
             }
+            // A session's collectors begin and end between two batches, which each rank's device
+            // thread alone knows: the work thread waits for it, and the control thread does not.
+            "uniserve.profile_start" => {
+                let payload = hook.payload;
+                self.data_work(front, id, move |data| data.start_profile(&payload));
+            }
+            "uniserve.profile_stop" => {
+                let payload = hook.payload;
+                self.data_work(front, id, move |data| data.stop_profile(&payload));
+            }
+            "uniserve.profile_release" => {
+                let payload = hook.payload;
+                self.data_work(front, id, move |data| data.release_profile(&payload));
+            }
+            // The probes read the switch in device storage, and writing it waits for nothing.
+            "uniserve.fence_switch" => match fence_switch(&hook.payload) {
+                Ok(results) => self.answer_now(front, id, results),
+                Err(error) => self.refuse(front, id, error),
+            },
             other => {
                 self.refuse(
                     front,
@@ -5646,6 +5782,33 @@ fn status_name(status: &ProgramStatus) -> &'static str {
     }
 }
 
+/// Writes the fence probes' device switch (`docs/profiling.md`): `{"enabled": bool, "off":
+/// [patterns]}`. A process without probes answers so.
+fn fence_switch(payload: &str) -> std::result::Result<Vec<String>, String> {
+    let payload: serde_json::Value = serde_json::from_str(payload)
+        .map_err(|error| format!("fence_switch: {error}"))?;
+    let enabled = payload["enabled"]
+        .as_bool()
+        .ok_or_else(|| "fence_switch states no enabled".to_owned())?;
+    let off: Vec<String> = match payload.get("off") {
+        Some(off) if !off.is_null() => serde_json::from_value(off.clone())
+            .map_err(|error| format!("fence_switch off: {error}"))?,
+        _ => Vec::new(),
+    };
+    let switched = executor::profiling::fences::Fences::installed()
+        .map(|fences| fences.switch(enabled, &off))
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    Ok(vec![
+        serde_json::json!({
+            "probes": switched.is_some(),
+            "enabled": enabled,
+            "off": switched.unwrap_or_default(),
+        })
+        .to_string(),
+    ])
+}
+
 fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
     use proto::process::report::Kind;
 
@@ -5858,18 +6021,51 @@ fn announce(
     state: proto::request::wire::EngineState,
     info: Option<proto::request::wire::EngineInfo>,
 ) -> Result<()> {
-    control
-        .daemon_mut()
-        .send(&proto::request::wire::FromEngine {
-            kind: Some(proto::request::wire::from_engine::Kind::State(
-                proto::request::wire::State {
-                    state: state as i32,
-                    info,
-                    error: String::new(),
-                },
-            )),
-        })
-        .context("stating what this process is to the daemon")
+    let message = proto::request::wire::FromEngine {
+        kind: Some(proto::request::wire::from_engine::Kind::State(
+            proto::request::wire::State {
+                state: state as i32,
+                info,
+                error: String::new(),
+            },
+        )),
+    };
+    // Every live front is told: a handover closes the launching daemon's front and leaves the
+    // attached ones serving, so a state stated to that front alone would end this process for a
+    // daemon that left.
+    let mut delivered = 0;
+    let mut failure = None;
+    for front in control.report_fronts() {
+        let Some(connection) = control.front_mut(front) else {
+            continue;
+        };
+        match connection.send(&message) {
+            Ok(()) => delivered += 1,
+            Err(error) => failure = Some(error),
+        }
+    }
+    match failure {
+        Some(error) if delivered == 0 => {
+            Err(error).context("stating what this process is to the daemon")
+        }
+        _ => Ok(()),
+    }
+}
+
+/// States to the daemon that launched this process why its start failed.
+fn state_failure(control: &mut Control, reason: &str) {
+    let sent = control.daemon_mut().send(&proto::request::wire::FromEngine {
+        kind: Some(proto::request::wire::from_engine::Kind::State(
+            proto::request::wire::State {
+                state: proto::request::wire::EngineState::Failed as i32,
+                info: None,
+                error: reason.to_owned(),
+            },
+        )),
+    });
+    if let Err(error) = sent {
+        tracing::warn!(%error, "the daemon was not told why this process's start failed");
+    }
 }
 
 /// What the engine answers a command over the deployment's storage ledgers or transfer budgets:
@@ -7924,6 +8120,7 @@ fn schedulers(
     model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
     rank: &ipc::MainProcessInfo,
+    memory: &Memory,
     control: ipc::Wake,
     data: &Arc<executor::data_plane::DataPlane>,
 ) -> Result<Vec<engine::SchedulerHandle>> {
@@ -7936,8 +8133,20 @@ fn schedulers(
     // One scheduler per scheduler thread: the configuration is this rank's, derived from what the
     // launch states, the build config fixes and the model's own geometry, and it refuses by name
     // when a fact it needs is one the launch file does not carry.
-    let facts = plan.rank_facts(model)?;
+    let mut facts = plan.rank_facts(model)?;
+    // The host KV cache copies a rank's pages on that rank's copy stream, and the pool this process
+    // states below is its one rank: a process of several devices would copy one rank's share of
+    // every page, so it keeps none until its inventory states them all.
+    let host_cache = plan.host_kv_cache(model) && executors.len() == 1 && plan.world_size() == 1;
+    if host_cache {
+        facts.deployment = Some(launch.deployment.clone());
+        facts.host_kv_cache = true;
+    }
     let config = engine::EngineConfig::of(&facts)?;
+    let mut rank = rank.clone();
+    if host_cache && let Some(cache) = rank.prefix_cache.as_mut() {
+        cache.host_token_bytes = memory.host_token_bytes();
+    }
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one executor thread per device and never two.
     // The scheduler plans against a description of the pool, and this process is the one pool it
@@ -7964,11 +8173,16 @@ fn schedulers(
         },
         max_model_len: plan.max_kv_len(model)?,
     };
-    let batches: Arc<dyn executor::batch::Batches> = Arc::new(
-        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
-            .stating(vec![inventory])
-            .with_data_plane(Arc::clone(data)),
-    );
+    let mut stated = executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
+        .stating(vec![inventory])
+        .with_data_plane(Arc::clone(data));
+    if host_cache {
+        stated = stated.keeping_host_cache(executor::batch::HostCacheKeys {
+            fingerprints: vec![data.serving_identity()?; memory.cache_groups()],
+            endpoint: None,
+        });
+    }
+    let batches: Arc<dyn executor::batch::Batches> = Arc::new(stated);
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.
     let progress = engine::CommandWaker::new(move || control.wake());
@@ -8015,12 +8229,18 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
     Ok(Epoch {
         generation: 0,
         predecessor_world: spec.predecessor.as_ref().map(|predecessor| predecessor.world),
+        predecessor_cache: spec
+            .predecessor
+            .as_ref()
+            .map(|predecessor| predecessor.segments.clone())
+            .unwrap_or_default(),
         experts: spec
             .expert_order
             .into_iter()
             .map(|(module, order)| (module, order.experts))
             .collect(),
         host: spec.host,
+        profiling: spec.profiling.unwrap_or_default(),
     })
 }
 

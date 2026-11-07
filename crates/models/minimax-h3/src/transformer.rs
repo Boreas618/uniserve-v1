@@ -32,6 +32,11 @@ use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
 
+/// The components a deployment's fence probes name (`profiling_config.fence_components`): the
+/// denoiser's stack and one of its layers.
+const TRANSFORMER: &str = "models.minimax_h3.denoiser.Transformer";
+const TRANSFORMER_LAYER: &str = "models.minimax_h3.denoiser.TransformerLayer";
+
 /// The two halves of a packed `[value, gate]` projection, as strided views without a copy.
 ///
 /// The checkpoint fuses the feed-forward's value half first and its gate half second, and the
@@ -1361,6 +1366,28 @@ impl Transformer {
         total_rows: u32,
         trace: Option<&Trace<'_>>,
     ) -> Result<()> {
+        f.fenced(TRANSFORMER, format_args!("transformer"), || {
+            self.stack(
+                f, adaln, step, hidden, rows, factors, visible, segments, total_rows, trace,
+            )
+        })
+    }
+
+    /// [`Self::forward`]'s work, between the stack's fence probes.
+    #[allow(clippy::too_many_arguments)]
+    fn stack(
+        &self,
+        f: &Forward,
+        adaln: &AdaLnCache,
+        step: TensorView,
+        hidden: TensorView,
+        rows: TensorView,
+        factors: Factors,
+        visible: Option<&Visible>,
+        segments: Option<&Segments>,
+        total_rows: u32,
+        trace: Option<&Trace<'_>>,
+    ) -> Result<()> {
         let groups = adaln.groups();
         let width = hidden.shape.last();
         let tokens = hidden.shape.dim(0);
@@ -1396,19 +1423,21 @@ impl Transformer {
             if next.is_some() {
                 adaln.layer(f, index + 1, entries, tables[(index + 1) % 2])?;
             }
-            arrived = layer.forward(
-                f,
-                hidden,
-                alternate,
-                per_layer[index % 2],
-                rows,
-                factors,
-                visible,
-                segments,
-                &scratch,
-                next.map(|layer| (layer, per_layer[(index + 1) % 2])),
-                arrived,
-            )?;
+            arrived = f.fenced(TRANSFORMER_LAYER, format_args!("layers.{index}"), || {
+                layer.forward(
+                    f,
+                    hidden,
+                    alternate,
+                    per_layer[index % 2],
+                    rows,
+                    factors,
+                    visible,
+                    segments,
+                    &scratch,
+                    next.map(|layer| (layer, per_layer[(index + 1) % 2])),
+                    arrived,
+                )
+            })?;
             // A diagnosis reads the layer's packed output as it stands: the same rows the next
             // layer reads, copied into the caller's view by an identity gather.
             if let Some(trace) = trace

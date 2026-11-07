@@ -55,7 +55,7 @@ use std::time::{Duration, Instant};
 
 use proto::process::{self, Report, Spawn};
 
-use crate::epoch::{EpochRecord, Epochs, Failure, Status, Update};
+use crate::epoch::{EpochRecord, Epochs, Failure, FilledPrograms, Status, Update};
 use crate::options::PreviousWorld;
 
 /// A node of the deployment the switch starts main processes on.
@@ -469,6 +469,15 @@ impl Switch {
     /// Why the update failed, when it did.
     pub(crate) fn failure(&self) -> Option<&Failure> {
         self.failure.as_ref()
+    }
+
+    /// The Program Servers selected `programs` for the target: an update names backends, and a
+    /// process that joins the epoch later is handed what its record names, where a revision of
+    /// zero names no package.
+    pub(crate) fn pin(&mut self, programs: &FilledPrograms) {
+        self.record.kernels = programs.kernels.clone();
+        self.record.policy = programs.policy.clone();
+        self.epochs.record(self.target, self.record.clone());
     }
 
     /// Worlds this switch dropped whose storage a later claim must retire:
@@ -1638,6 +1647,25 @@ mod tests {
     /// Front's order: spawn, claim, `Parked`, `Promote`, `Promoted`, `Serve`,
     /// `Drain`, `Drained`, and the record moves `Precopy` → `Serving` →
     /// `Probation` only after the drain.
+    /// A process that joins the target's epoch is handed what its record names, and an update
+    /// names backends: the revisions are the ones the Program Servers selected, and they stay
+    /// through the phases that write the record again.
+    #[test]
+    fn the_target_records_the_revisions_the_program_servers_selected() {
+        let (epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        switch.start(&mut roster);
+        let target = switch.target;
+        let mut selected = FilledPrograms {
+            kernels: switch.record().kernels.clone(),
+            policy: switch.record().policy.clone(),
+        };
+        selected.policy.revision = 7;
+        switch.pin(&selected);
+        prepared(&mut roster, &mut switch);
+        assert_eq!(epochs.get(target).unwrap().policy.revision, 7);
+    }
+
     #[test]
     fn the_switch_moves_through_its_phases_in_order() {
         let (epochs, mut switch) = setup();

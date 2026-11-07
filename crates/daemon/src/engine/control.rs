@@ -261,7 +261,7 @@ impl EngineControl {
                     Ok(wire::EngineState::Failed) => {
                         // The failed engine closes its workers and exits;
                         // their storage is free once it has.
-                        await_exit(&mut control, FAILED_EXIT);
+                        await_exit(&mut reader, &mut control, FAILED_EXIT);
                         anyhow::bail!("the engine failed to start: {}", state.error);
                     }
                     _ => {}
@@ -536,6 +536,44 @@ impl EngineControl {
             );
         }
         Ok(storage)
+    }
+
+    /// The storage ledgers every node's Storage Server keeps for the deployment, one JSON report
+    /// per node: `{"host": ..., "ledgers": [...], "host_storage": {...}, "transfers": [...]}`.
+    /// Each node's daemon reads them over its claim, so no main process is asked.
+    pub(crate) fn storage_reports(&self) -> anyhow::Result<Vec<String>> {
+        let (mut connection, nodes) = self.connect()?;
+        let mut reports = Vec::with_capacity(nodes.len());
+        for (index, node) in nodes.iter().enumerate() {
+            let host = node.host.clone();
+            connection.send(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: index as u64 + 1,
+                    kind: Some(request::Kind::Ledger(process::LedgerQuery {
+                        host: host.clone(),
+                        deployment: self.deployment.clone(),
+                    })),
+                })),
+            })?;
+            let answer: process::Downstream = connection
+                .recv(DAEMON_TIMEOUT)?
+                .context("the daemon did not report its storage ledgers")?;
+            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
+                anyhow::bail!("the daemon did not answer its ledger query");
+            };
+            anyhow::ensure!(
+                answer.error.is_empty(),
+                "the storage ledgers of {host}: {}",
+                answer.error
+            );
+            let Some(reply::Kind::Ledger(report)) = answer.kind else {
+                anyhow::bail!("the daemon returned no storage ledger");
+            };
+            let mut report: serde_json::Value = serde_json::from_str(&report.ledgers)?;
+            report["host"] = serde_json::Value::String(host);
+            reports.push(report.to_string());
+        }
+        Ok(reports)
     }
 
     /// Publishes one commit decision at every deployment node. Publication
@@ -926,12 +964,18 @@ fn still_serving(control: &mut Connection) -> anyhow::Result<bool> {
 
 /// Waits up to `timeout` for the daemon to report the engine process's exit
 /// on its control connection; a wait that times out is logged.
-fn await_exit(control: &mut Connection, timeout: Duration) {
+fn await_exit(reader: &mut Connection, control: &mut Connection, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        match exited(control) {
-            Ok(()) => std::thread::sleep(POLL_INTERVAL),
-            Err(_) => return,
+        if exited(control).is_err() {
+            return;
+        }
+        // A process that goes closes this connection, and the daemon then forgets it without
+        // reporting an exit on `control`.
+        match reader.try_recv::<wire::FromEngine>() {
+            Ok(Some(_)) => {}
+            Ok(None) if reader.wait(POLL_INTERVAL).is_ok() => {}
+            _ => return,
         }
     }
     tracing::warn!("the failed engine process did not exit within {timeout:?}");
@@ -945,7 +989,7 @@ fn exited(control: &mut Connection) -> anyhow::Result<()> {
             kind: Some(event::Kind::Exit(exit)),
         })) = message.kind
         {
-            anyhow::bail!("the engine process exited: {}", exit.status);
+            anyhow::bail!("the engine process exited: {}: {}", exit.status, exit.last_line.trim());
         }
     }
     Ok(())

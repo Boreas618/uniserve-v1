@@ -149,6 +149,9 @@ pub struct BatchOutput {
     /// the step on the host. `copy_us` is zero in-process and states a fact rather than a
     /// measurement: nothing is transferred for the completion, since the mechanism reads it here.
     pub timing: TimingCounters,
+    /// What this rank's counters, probes and profiling session accumulated since its last result,
+    /// which the scheduler adds into its statistics. Empty and absent while nothing observes it.
+    pub forward_stats: Option<ipc::ForwardStats>,
 }
 
 /// One batch: one phase of one step, as the mechanism assembles it.
@@ -189,6 +192,12 @@ pub struct Batch {
     /// and the graph then runs clean against the wrong memory. That failure looks like a model
     /// defect rather than a cache one, so it is refused at submit rather than left to the graph.
     pub block_tables: Vec<ipc::BlockTable>,
+    /// Pages of the host KV cache the batch's new units are filled with, on the runner's copy stream
+    /// before its forward: a request whose prefix the host held continues from them.
+    pub page_loads: Vec<ipc::PageCopy>,
+    /// Published pages the batch copies to the host KV cache beside its forward; the batch's output
+    /// waits for the copies, and the mechanism commits the pages once it read that output.
+    pub page_offloads: Vec<ipc::PageCopy>,
     /// A media computation's columns, and `None` for every causal-LM batch.
     ///
     /// One batch is one computation (2.4): a media batch states its inputs here and carries no token
@@ -854,6 +863,32 @@ pub trait Batches: Send + Sync {
     ) -> Result<Vec<String>> {
         Ok(Vec::new())
     }
+
+    /// Maps the host KV cache's page pools on this rank's devices, `tokens` tokens of each cache
+    /// group, and copies pages through them from now on. Answers each pool's name with its ranks'
+    /// pools, in rank order, as the mechanism keys the host KV cache by them. An executor that keeps
+    /// no host KV cache maps nothing, and the mechanism plans no host write.
+    fn map_host_cache(&self, _tokens: u64) -> Result<Vec<(String, Vec<Vec<ipc::PagePoolInfo>>)>> {
+        Ok(Vec::new())
+    }
+
+    /// Copies `offloads` to the host KV cache with no batch to carry them: the mechanism's pages
+    /// that wait while nothing runs. The submission's output means the copies finished.
+    fn copy_pages(&self, _offloads: Vec<ipc::PageCopy>) -> Result<Submission> {
+        Err(crate::Error::Invalid(
+            "this executor keeps no host KV cache to copy pages to".to_owned(),
+        ))
+    }
+}
+
+/// What a rank's pages are computed from, which keys them in the host KV cache: an epoch that
+/// computes the same pages finds what another epoch of the deployment left there.
+#[derive(Clone, Debug, Default)]
+pub struct HostCacheKeys {
+    /// Each cache group's upstream component identities, in group order.
+    pub fingerprints: Vec<String>,
+    /// Where an engine on another host reaches this rank's Storage Server.
+    pub endpoint: Option<String>,
 }
 
 /// One pool of the deployment an executor serves (4.2, 7.3).
@@ -898,6 +933,8 @@ pub struct Executors {
     /// executor facts from this and refuses to start on an empty answer, so a rank states its pools
     /// before it is handed over rather than after the first batch finds none.
     inventory: Vec<Inventory>,
+    /// What keys this rank's pages in the host KV cache, when the deployment keeps one.
+    host_cache: Option<HostCacheKeys>,
     /// What the storage operations of 7.6 reach, on a rank that keeps storage at a Storage Server.
     data: Option<Arc<crate::data_plane::DataPlane>>,
 }
@@ -918,8 +955,16 @@ impl Executors {
         Ok(Self {
             executors,
             inventory: Vec::new(),
+            host_cache: None,
             data: None,
         })
+    }
+
+    /// States that this rank keeps a host KV cache, with what keys its pages.
+    #[must_use]
+    pub fn keeping_host_cache(mut self, keys: HostCacheKeys) -> Self {
+        self.host_cache = Some(keys);
+        self
     }
 
     /// States what the storage operations of 7.6 reach on this rank.
@@ -1047,12 +1092,59 @@ impl Batches for Executors {
     fn submit(&self, batch: Batch) -> Result<Submission> {
         match self.device_of_unit(&batch)? {
             Some(executor) => executor.submit(batch),
-            None => self.on_every_device(batch, |executor, batch| executor.submit(batch)),
+            None => self.on_every_device(batch, |executor, mut batch| {
+                // A page copy names the rank that makes it, and a rank is a device here.
+                if let Some(rank) = self
+                    .executors
+                    .iter()
+                    .position(|held| std::ptr::eq(held.as_ref(), executor))
+                {
+                    batch.page_loads.retain(|copy| copy.rank as usize == rank);
+                    batch.page_offloads.retain(|copy| copy.rank as usize == rank);
+                }
+                executor.submit(batch)
+            }),
         }
     }
 
     fn shadow(&self, batch: Batch) -> Result<Submission> {
         self.on_every_device(batch, |executor, batch| executor.shadow(batch))
+    }
+
+    fn map_host_cache(&self, tokens: u64) -> Result<Vec<(String, Vec<Vec<ipc::PagePoolInfo>>)>> {
+        let Some(keys) = &self.host_cache else {
+            return Ok(Vec::new());
+        };
+        let ranks = self
+            .executors
+            .iter()
+            .map(|executor| executor.map_host_cache(tokens, keys))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(self
+            .inventory
+            .iter()
+            .map(|pool| (pool.group.clone(), ranks.clone()))
+            .collect())
+    }
+
+    fn copy_pages(&self, offloads: Vec<ipc::PageCopy>) -> Result<Submission> {
+        let mut submissions = self
+            .executors
+            .iter()
+            .enumerate()
+            .map(|(rank, executor)| {
+                let own = offloads
+                    .iter()
+                    .filter(|copy| copy.rank as usize == rank)
+                    .cloned()
+                    .collect();
+                executor.copy_pages(own)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let first = submissions
+            .pop()
+            .ok_or_else(|| crate::Error::Invalid("this rank holds no device".to_owned()))?;
+        Ok(first.joined(submissions))
     }
 
     fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>> {
@@ -1106,8 +1198,12 @@ pub enum JobKind {
     Discard,
     /// Giving the resident cache segments back, for a standby's park (2.5).
     Sleep,
+    /// Mapping the host KV cache's page pools, or copying pages to them with no batch to ride on.
+    HostCache,
     /// Mapping the released cache segments again, with the unit resets that follow (2.5).
     Wake,
+    /// A change of the rank's profiling session.
+    Profile,
     /// A job that only waits for the events it was given.
     After,
 }
@@ -1129,7 +1225,9 @@ impl JobKind {
             Self::Purge => "purge",
             Self::Discard => "discard",
             Self::Sleep => "sleep",
+            Self::HostCache => "host cache",
             Self::Wake => "wake",
+            Self::Profile => "profile",
             Self::After => "after",
         }
     }

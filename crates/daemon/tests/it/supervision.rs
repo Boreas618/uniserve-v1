@@ -38,6 +38,7 @@ fn exits_arrive_unasked_and_name_their_launch() {
             rank: 0,
             generation: 3,
             status: "exit status: 1".into(),
+            last_line: String::new(),
         }
     );
 }

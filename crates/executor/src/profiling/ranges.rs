@@ -6,9 +6,9 @@
 //! it while the process serves ([`set_enabled`]).
 //!
 //! NVTX reaches a tool through the injection library named in `NVTX_INJECTION64_PATH` when the
-//! process makes its first NVTX call; an administrator naming a tool there (Nsight Systems) is
-//! enough, and the executor starts no injection library itself because the main process has no
-//! Python environment to take CUPTI from.
+//! process makes its first NVTX call: the process names CUPTI there as it starts
+//! ([`super::counters::inject`]) unless a profiler (Nsight Systems) named its own, so a timeline
+//! session's CUPTI records the ranges.
 
 use std::ffi::CStr;
 use std::sync::OnceLock;

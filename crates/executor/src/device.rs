@@ -50,6 +50,10 @@ pub struct Executor {
     /// and the control thread reports it when the precopy finishes. Empty is a fact - every
     /// operator the update replaced was compared.
     uncompared: Arc<std::sync::Mutex<Vec<String>>>,
+    /// The streams this device's runners compute on, which the counters record.
+    streams: Vec<platform::Stream>,
+    /// The stream the device's page copies run on, which the counters record beside them.
+    copy_stream: platform::Stream,
     /// The rank's Storage Server client, bound after construction because the control thread builds
     /// it after the launch's claim while the executors exist before it: a sleep and a wake are the
     /// only calls that reach the ledger, and the device thread makes them (2.5).
@@ -250,10 +254,16 @@ impl Executor {
                  are extents inside one range that the first capture maps whole"
             );
         }
+        let streams: Vec<platform::Stream> = runners
+            .iter()
+            .filter_map(|named| named.runner.stream().cloned())
+            .collect();
+        let copy_stream = platform::Stream::new(device)?;
         let queue = JobQueue::new(device, Arc::clone(&events));
         let state = Device {
             device,
             runners,
+            copy_stream: copy_stream.clone(),
             queue: Arc::clone(&queue),
             scratch,
             shadow,
@@ -265,6 +275,10 @@ impl Executor {
             sticky: None,
             waits: true,
             pending_landing: None,
+            session: None,
+            step_end: None,
+            blocking: platform::cupti::blocking::Calls::default(),
+            refold: false,
         };
         let thread_queue = Arc::clone(&queue);
         let thread = std::thread::Builder::new()
@@ -286,7 +300,19 @@ impl Executor {
             counters,
             storage,
             uncompared,
+            streams,
+            copy_stream,
         })
+    }
+
+    /// The streams this device's runners compute on.
+    pub fn streams(&self) -> &[platform::Stream] {
+        &self.streams
+    }
+
+    /// The stream the device's page copies run on.
+    pub fn copy_stream(&self) -> &platform::Stream {
+        &self.copy_stream
     }
 
     /// The operators the last program-layer update could not compare, each with its reason (7.3
@@ -475,6 +501,46 @@ impl Executor {
         Ok(submission)
     }
 
+    /// Maps the host KV cache's page pools on this device's cache and answers what the rank reports
+    /// of them. It waits: a scheduler sizes the host KV cache once, before it serves anything.
+    pub fn map_host_cache(
+        &self,
+        tokens: u64,
+        keys: &crate::batch::HostCacheKeys,
+    ) -> Result<Vec<ipc::PagePoolInfo>> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        let pools = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.queue.submit(
+            Command::MapHostCache {
+                tokens,
+                keys: keys.clone(),
+                pools: Arc::clone(&pools),
+            },
+            &submission,
+            JobKind::HostCache,
+            None,
+        )?;
+        match submission.wait() {
+            crate::completion::Outcome::Success(_) => Ok(std::mem::take(
+                &mut *pools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )),
+            crate::completion::Outcome::Failed(error) => {
+                Err(Error::Invalid(format!("mapping the host KV cache: {error}")))
+            }
+            crate::completion::Outcome::Cancelled => {
+                Err(Error::Invalid("mapping the host KV cache was cancelled".into()))
+            }
+        }
+    }
+
+    /// Copies `offloads` to the host KV cache in queue order, with no batch to carry them.
+    pub fn copy_pages(&self, offloads: Vec<ipc::PageCopy>) -> Result<Submission> {
+        self.storage_command(Command::CopyPages(offloads), JobKind::HostCache)
+    }
+
     /// Gives the cache's segments from `from` on back to the Storage Server (7.6).
     pub fn release_cache(&self, from: u32) -> Result<Submission> {
         self.storage_command(Command::ReleaseCache { from }, JobKind::Sleep)
@@ -488,6 +554,27 @@ impl Executor {
     /// Maps the graph pools' storage at the addresses the captures hold (7.6).
     pub fn restore_graphs(&self) -> Result<Submission> {
         self.storage_command(Command::RestoreGraphs, JobKind::Wake)
+    }
+
+    /// Changes the rank's profiling session between two batches and answers what the session says.
+    /// It waits for the device thread, so it is a work thread's call and never the control thread's.
+    ///
+    /// # Errors
+    ///
+    /// When the session refuses, or the device's thread is gone.
+    pub fn profile(
+        &self,
+        change: crate::profiling::session::Change,
+    ) -> Result<serde_json::Value> {
+        let (answer, answered) = crossbeam_channel::bounded(1);
+        let submission = self.storage_command(Command::Profile { change, answer }, JobKind::Profile)?;
+        match answered.recv() {
+            Ok(result) => result,
+            Err(_) => match submission.wait() {
+                crate::Outcome::Failed(error) => Err(Error::Shared(error)),
+                _ => Err(Error::State("the rank's device ended before it answered")),
+            },
+        }
     }
 
     /// Runs `work`, which changes what the rank's weights map, in the queue's order: a batch
@@ -690,6 +777,8 @@ struct Launched {
 struct Device {
     /// Whether a job's device work is waited for before the job answers.
     waits: bool,
+    /// The stream the device's page copies run on.
+    copy_stream: platform::Stream,
     /// The replay the command just served left running.
     pending_landing: Option<PendingLanding>,
     device: DeviceId,
@@ -717,6 +806,16 @@ struct Device {
     sticky: Option<platform::Error>,
     /// The rank's Storage Server client, which a sleep and a wake reach the ledger through (2.5).
     storage: Arc<std::sync::Mutex<Option<Arc<crate::memory::retained::Retained>>>>,
+    /// The profiling session that records this rank, while one does.
+    session: Option<crate::profiling::session::Session>,
+    /// The end marker of the step being served, launched right behind its replay: the batch number,
+    /// its stage and the stream.
+    step_end: Option<(u64, &'static str, platform::Stream)>,
+    /// This thread's driver calls that waited for the device, when its last result left.
+    blocking: platform::cupti::blocking::Calls,
+    /// The weights changed while the graph pools were suspended, so the runners fill again what
+    /// they fold from them once the pools are back.
+    refold: bool,
 }
 
 impl Device {
@@ -734,6 +833,10 @@ impl Device {
         if let Err(error) = &_current {
             tracing::error!(device = self.device.0, %error, "the device's context is not current");
         }
+        // The driver calls this thread waits in are counted for as long as it serves
+        // (`uniserve:worker_blocking_calls`): waiting for its own device work is its design, so the
+        // figure is a record rather than a fault.
+        let _watched = platform::cupti::blocking::Watched::enter();
         // Deferred storage release gets its waiting commands through this queue (2.4).
         let events = Arc::clone(queue.events());
         let submitter = Arc::clone(queue);
@@ -944,11 +1047,20 @@ impl Device {
                 // replays overlap leaves its stream running: launching a graph costs the device
                 // milliseconds of idle, and the next step's launch fits behind this step's work.
                 let named = self.runner_mut(runner)?;
+                // A session's window is made of whole steps, so its rank runs them one at a time.
                 let overlapping = named.runner.overlaps_staged();
                 let stream = named.runner.stream().cloned();
+                let overlapping = overlapping && self.session.is_none();
+                self.begin_step(batch, stream.as_ref())?;
                 self.waits = !overlapping;
-                let output = self.perform(&label, jobs_of(runner, jobs)).map(Step::Done);
+                let output = self.perform(&label, jobs_of(runner, jobs));
                 self.waits = true;
+                let output = output
+                    .and_then(|mut output| {
+                        output.forward_stats = self.end_step(batch.id.0)?;
+                        Ok(output)
+                    })
+                    .map(Step::Done);
                 if overlapping && output.is_ok() {
                     let Some(stream) = stream else {
                         return Err(Error::Invariant(
@@ -1061,12 +1173,41 @@ impl Device {
                 self.shadow_attached = true;
                 Ok(Step::Done(BatchOutput::default()))
             }
+            Command::MapHostCache { tokens, keys, pools } => {
+                let client = self.storage()?;
+                for cache in self.caches() {
+                    let setup = crate::memory::prefix_cache::host::HostCacheSetup {
+                        fingerprint: keys.fingerprints.clone(),
+                        endpoint: keys.endpoint.clone(),
+                        device: self.device,
+                        copy: self.copy_stream.clone(),
+                    };
+                    let mut cache = cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *pools
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        setup.map(&client, &mut cache, *tokens)?;
+                }
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::CopyPages(offloads) => {
+                for cache in self.caches() {
+                    cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .copy_pages(offloads)?;
+                }
+                Ok(Step::Done(BatchOutput::default()))
+            }
             Command::Sleep => {
                 let client = self.storage()?;
                 let mut storage: &crate::memory::retained::Retained = &client;
                 for cache in self.caches() {
                     crate::memory::sleep(&cache, &mut storage)?;
                 }
+                crate::profiling::storage_remapped();
                 // The segments are given back by now; the device's own work is finished before the
                 // queue hands this command over, so a synchronize here would only wait on nothing.
                 Ok(Step::Done(BatchOutput::default()))
@@ -1098,6 +1239,7 @@ impl Device {
                         .clone();
                     crate::memory::wake(&cache, &mut storage, &stream, *limit)?;
                 }
+                crate::profiling::storage_remapped();
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::ReleaseCache { from } => {
@@ -1112,6 +1254,7 @@ impl Device {
                         planes.release_segments(*from, &mut storage)?;
                     }
                 }
+                crate::profiling::storage_remapped();
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::SuspendGraphs => {
@@ -1120,6 +1263,7 @@ impl Device {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .suspend()?;
+                crate::profiling::storage_remapped();
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::RestoreGraphs => {
@@ -1127,11 +1271,31 @@ impl Device {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .restore()?;
+                crate::profiling::storage_remapped();
+                if std::mem::take(&mut self.refold) {
+                    for named in &mut self.runners {
+                        named.runner.weights_changed()?;
+                    }
+                    self.synchronize()?;
+                }
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::Rebind(work) => {
                 self.synchronize()?;
                 work()?;
+                crate::profiling::storage_remapped();
+                // What a runner folds from the weights it computes in its arena, which a sleeping
+                // rank has unmapped: that waits for the storage to come back, and no batch runs
+                // before it does.
+                let suspended = self
+                    .pools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .suspended();
+                if suspended {
+                    self.refold = true;
+                    return Ok(Step::Done(BatchOutput::default()));
+                }
                 for named in &mut self.runners {
                     named.runner.weights_changed()?;
                 }
@@ -1157,6 +1321,13 @@ impl Device {
                     named.runner.discard(*generation)?;
                 }
                 self.synchronize()?;
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::Profile { change, answer } => {
+                self.synchronize()?;
+                let answered = self.profile(change.clone());
+                // A caller that stopped waiting has nothing to be told.
+                let _ = answer.send(answered);
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::After(events) => {
@@ -1204,7 +1375,8 @@ impl Device {
     /// program-layer command) answers empty.
     fn perform(&mut self, label: &str, jobs: Vec<Job>) -> Result<BatchOutput> {
         let mut output = BatchOutput::default();
-        for job in jobs {
+        let last = jobs.len().saturating_sub(1);
+        for (index, job) in jobs.into_iter().enumerate() {
             let runner = job
                 .runner()
                 .ok_or_else(|| Error::Invariant("a serving job names no runner".into()))?;
@@ -1233,6 +1405,14 @@ impl Device {
                 Err(error) => Err(error),
             }
             .and_then(|produced| {
+                // The step's end marker goes right behind its last launch: launched after the wait
+                // below, its span would hold the host's trip back as well as the device's work.
+                if index == last
+                    && let (Some((step, stage, stream)), Some(fences)) =
+                        (self.step_end.take(), crate::profiling::fences::Fences::installed())
+                {
+                    fences.mark(&stream, step, stage, false)?;
+                }
                 if self.waits {
                     self.synchronize()?;
                 }
@@ -1281,6 +1461,133 @@ impl Device {
             }
         }
         Ok(output)
+    }
+
+    /// A step begins: its session is told, and its begin marker goes on the stream it replays on.
+    fn begin_step(&mut self, batch: &Batch, stream: Option<&platform::Stream>) -> Result<()> {
+        let stage = batch.shape.variant.stage();
+        if let Some(mut session) = self.session.take() {
+            // A collector starts with nothing of the rank in flight, or it would record the end of
+            // the step before.
+            let applied = if session.begin(batch.id.0, stage) {
+                self.synchronize().map(|()| session.apply())
+            } else {
+                Ok(())
+            };
+            self.session = Some(session);
+            applied?;
+        }
+        if let (Some(fences), Some(stream)) =
+            (crate::profiling::fences::Fences::installed(), stream)
+        {
+            fences.mark(stream, batch.id.0, stage, true)?;
+            self.step_end = Some((batch.id.0, stage, stream.clone()));
+        }
+        Ok(())
+    }
+
+    /// A step's forward ended: its session is told, and what the rank observed since its last result
+    /// travels with this one.
+    fn end_step(&mut self, step: u64) -> Result<Option<ipc::ForwardStats>> {
+        if let Some(mut session) = self.session.take() {
+            let applied = if session.end(step) {
+                self.synchronize().map(|()| session.apply())
+            } else {
+                Ok(())
+            };
+            self.session = Some(session);
+            applied?;
+        }
+        let mut stats = ipc::ForwardStats::default();
+        let current = platform::cupti::blocking::Calls::current();
+        crate::profiling::counters::add_blocking("device", &current.since(&self.blocking));
+        self.blocking = current;
+        stats.blocking_calls = crate::profiling::counters::take_blocking();
+        let activity = platform::cupti::activity::take();
+        if activity.dropped_records > 0 {
+            tracing::warn!(
+                "CUPTI dropped {} activity records; the streams' device time misses their \
+                 operations",
+                activity.dropped_records
+            );
+        }
+        for stream in &activity.streams {
+            for (state, us) in [
+                ("busy", stream.busy_us),
+                ("gap", stream.gap_us),
+                ("late", stream.late_us),
+            ] {
+                if us > 0 {
+                    *stats
+                        .stream_us
+                        .entry(format!("{}/{state}", stream.name))
+                        .or_default() += us;
+                }
+            }
+        }
+        if let Some(fences) = crate::profiling::fences::Fences::installed() {
+            fences.poll_device(self.device, false);
+            let (histograms, lost) = fences.take(self.device);
+            stats.fence_us = histograms;
+            stats.fence_records_lost = lost;
+        }
+        if let Some(session) = &mut self.session {
+            stats.profile = session.progress();
+        }
+        let observed = !stats.blocking_calls.is_empty()
+            || !stats.stream_us.is_empty()
+            || !stats.fence_us.is_empty()
+            || stats.fence_records_lost > 0
+            || !stats.profile.is_empty();
+        Ok(observed.then_some(stats))
+    }
+
+    /// Performs one change of the rank's profiling session, with nothing of the rank in flight.
+    fn profile(&mut self, change: crate::profiling::session::Change) -> Result<serde_json::Value> {
+        use crate::profiling::session::{Change, Session};
+        match change {
+            Change::Start { start, rank } => {
+                if let Some(session) = &self.session {
+                    return Err(Error::Invalid(format!(
+                        "profiling session {} records the rank",
+                        session.id()
+                    )));
+                }
+                let (session, answer) = Session::start(*start, rank, self.device)?;
+                self.session = session;
+                Ok(answer)
+            }
+            Change::Stop {
+                session,
+                reason,
+                rank,
+            } => match self.session.take() {
+                Some(running) if running.id() == session => {
+                    let mut answer = running.stop(&reason);
+                    answer["rank"] = serde_json::json!(rank);
+                    Ok(answer)
+                }
+                other => {
+                    self.session = other;
+                    Ok(serde_json::json!({ "rank": rank, "session": session, "selected": false }))
+                }
+            },
+            Change::Release {
+                session,
+                collector,
+                reason,
+                rank,
+            } => {
+                let mut answer = match &mut self.session {
+                    Some(running) if running.id() == session => {
+                        running.release(collector, &reason)
+                    }
+                    _ => serde_json::json!({ "released": false }),
+                };
+                answer["rank"] = serde_json::json!(rank);
+                Ok(answer)
+            }
+        }
     }
 
     /// The bucket a job walks, when it walks one.

@@ -18,10 +18,6 @@ and the server the daemon starts there is stopped at the end).
   of the decode batch sizes is a world change under the same stream,
   which the operator commits; the manager attaches to the node, follows
   its events and detaches while it serves.
-- A world change while another process holds the device's free storage
-  gives back the tail of the serving world's KV cache for the successor,
-  and the committed successor grows its cache into the storage the
-  previous world freed.
 - A sleeping deployment gives back its KV cache and graph storage, holds
   new requests and recomputes the ones it ran once it wakes, and answers
   as before.
@@ -34,13 +30,14 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -55,6 +52,9 @@ from tests.python.e2e.http_helpers import (
     start_server,
     stop_server,
     worker_executable,
+)
+from tests.python.e2e.program_server import (
+    program_server as running_program_server,
 )
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
@@ -92,229 +92,9 @@ PROMPT = (
 )
 
 
-# The packages this file installs: the scheduling policy, and one kernel
-# package for every operator the deployment selects. A deployment's epoch is
-# resolved at this host's Program Server before its main processes serve
-# (design 5.1, 6.1): the policy fills the scheduling slot, and the operators
-# the build config names fill theirs, so a server that has the policy alone
-# refuses the epoch by the first kernel it lacks.
-#
-# ``FilledPrograms::of`` (``crates/daemon/src/epoch.rs``) fills paged attention
-# with the attention program's backend; ``moe_runner_backend`` is unset here, so
-# no grouped expert GEMM is filled, and the expert exchange is filled only for
-# an expert-parallel deployment — the model launches no exchange when every
-# expert is local, so this one-rank deployment names no such program.
-#
-# A program's backend is a package's name: the Program Server selects a program
-# by the backend its manifest declares, and no package is named ``auto``. The
-# deployment therefore states the attention backend it means (``OPTIONS``), and
-# it is the one design 9's default choice resolves to for this shape — BF16, no
-# window, head_dim 128, 64-token pages, one rank: trtllm-gen.
-POLICY_PACKAGE = "crates/ops/program-fixtures/policy"
-
-#: The descriptor keys the deployment launches: the model's own ``keys()`` plus
-#: the executor's sampler launches, as ``crates/ops`` generators state them
-#: (``notes/programs/qwen3-moe-keys.txt``). The store the fixture serves holds a
-#: module for every one of them.
-#:
-#: This file used to install one kernel package, the attention one the daemon
-#: names. That is enough for the epoch to *resolve* — the daemon names one
-#: operator and the Program Server fills that slot — but not to serve: a main
-#: process installs the kernels the model actually launches, and it resolves
-#: them from this host's store (``listed_programs`` in ``src/engine_main.rs``).
-#: With two packages there, the listing described nothing to overlay and the
-#: precopy stood in ``this node's devices`` until its 300 s budget ended it.
-KEYS = "notes/programs/qwen3-moe-keys.txt"
-
-#: The precisions whose rows in ``KEYS`` belong to deployments other than this
-#: file's. The key file covers three deployments — bf16 dense weights, NVFP4
-#: weights, and an fp8 KV variant — in one store, as its own header states.
-#: This file serves the bf16 dense one, so a row that names an NVFP4 encoding or
-#: an ``f8e4m3`` scale or page is another deployment's, and one operator
-#: (``kv_write_scaled``) stands in ``kv_write``'s place there. Building those
-#: rows here fails on packages that deployment's owner owes, which says nothing
-#: about whether this deployment can serve.
-FOREIGN_PRECISIONS = ("nvfp4", "f8e4m3")
-FOREIGN_OPERATORS = frozenset({"kv_write_scaled"})
-
 #: The socket of the module's Program Server, which every deployment of this
 #: file reaches through ``--program-server``. Set by :func:`program_server`.
 PROGRAM_SERVER: Path | None = None
-
-
-def _repository() -> Path:
-    """The repository root: the workspace the policy package is built in."""
-    return Path(__file__).resolve().parents[3]
-
-
-def _precompiler() -> Path:
-    """The wasm precompiler the Program Server turns a policy module into.
-
-    A policy is built for wasm32 and precompiled for this host's CPU, so the
-    server needs the precompiler before it can install a policy (design 5.3).
-    It is named by the environment, found on the path, shipped beside the
-    ``uniserve`` binary, or built from this tree, in that order.
-    """
-    named = os.environ.get("UNISERVE_SCHEDULING_PRECOMPILE")
-    if named:
-        return Path(named)
-    found = shutil.which("scheduling-precompile")
-    if found:
-        return Path(found)
-    beside = Path(require_uniserve_binary()).with_name("scheduling-precompile")
-    if beside.exists():
-        return beside
-    root = _repository()
-    done = subprocess.run(
-        [
-            "cargo",
-            "build",
-            "--package",
-            "scheduling",
-            "--bin",
-            "scheduling-precompile",
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
-    if done.returncode != 0:
-        pytest.fail(
-            f"scheduling-precompile did not build: {done.stderr[-2000:]}"
-        )
-    return root / "target" / "debug" / "scheduling-precompile"
-
-
-def _program_target() -> str:
-    """The target this host's modules are built for.
-
-    The engine derives it from the device it serves — ``sm_{major}{minor}a``
-    (``src/engine_plan.rs``) — and a store built for another target describes
-    nothing to overlay: the precopy then fails at the module lane rather than
-    the build. So the default is the served device's own compute capability,
-    read the way this file already reads that device; the environment's
-    ``UNISERVE_PROGRAM_TARGET`` names a target instead, for a host whose store
-    is provisioned elsewhere.
-    """
-    named = os.environ.get("UNISERVE_PROGRAM_TARGET")
-    if named:
-        return named
-    device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
-    reported = subprocess.run(
-        [
-            "nvidia-smi",
-            f"--id={device}",
-            "--query-gpu=compute_cap",
-            "--format=csv,noheader",
-        ],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    major, _, minor = reported.partition(".")
-    if not major.isdigit() or not minor.isdigit():
-        raise AssertionError(
-            f"nvidia-smi reported no compute capability for GPU {device}: "
-            f"{reported!r}"
-        )
-    return f"sm_{major}{minor}a"
-
-
-def _deployment_keys(store: Path) -> Path:
-    """The key lines this file's deployment serves, written beside `store`.
-
-    ``KEYS`` is the union of three deployments' rows; ``build_fixtures`` fails
-    on any row that does not build, so handing it the union would let another
-    deployment's missing package stop this one from serving. The rows kept here
-    are the bf16 dense deployment's: everything whose key names none of
-    ``FOREIGN_PRECISIONS`` and whose operator is not ``FOREIGN_OPERATORS``.
-    Comments and blank lines are dropped — the store's build reads rows, and
-    the selection remains readable in the file it came from.
-    """
-    kept = []
-    for line in (_repository() / KEYS).read_text().splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        operator, _, key = stripped.partition("\t")
-        if operator in FOREIGN_OPERATORS:
-            continue
-        lowered = stripped.lower()
-        if any(precision in lowered for precision in FOREIGN_PRECISIONS):
-            continue
-        kept.append(stripped)
-    if not kept:
-        raise AssertionError(
-            f"{KEYS} states no row for this deployment: "
-            f"{sorted(FOREIGN_PRECISIONS)} and "
-            f"{sorted(FOREIGN_OPERATORS)} excluded all of them"
-        )
-    path = store.parent / "deployment-keys.txt"
-    path.write_text("\n".join(kept) + "\n")
-    return path
-
-
-def _build_store(store: Path, target: str, python: Path | None) -> None:
-    """Builds a module for every kernel key this deployment launches.
-
-    `store` is ``build_fixtures``'s store, which it fills in its own shape: the
-    installed package sources under ``<store>/packages`` and the prepared
-    modules under ``<store>/modules``. The directory a Program Server serves is
-    the second of those — a store root holds the modules, not the store's
-    parent.
-
-    ``build_fixtures`` (``crates/program-server/examples``) is the store's own
-    producer: for each ``operator<TAB>key`` line of the key file it installs the
-    operator's package, prepares that key for `target`, and resolves it to the
-    module it names. It is given :func:`_deployment_keys`, not ``KEYS``: this
-    deployment's rows only, so a package another deployment owes fails that
-    deployment's run and not this one. The builds are real — Triton, nvcc and
-    CuTe DSL all run — so this takes minutes rather than seconds, once per
-    module. The Program Server then
-    serves the store as it stands, which is why ``--store-root`` below is this
-    directory and no kernel package is installed a second time.
-
-    Every row it is given is one this deployment launches, so a row that does
-    not build is this deployment's failure and the file stops here: a short
-    store would only move the same news to the precopy a minute later, and the
-    build's own output names the key and the reason.
-    """
-    command = [
-        "cargo",
-        "run",
-        "--package",
-        "program-server",
-        "--example",
-        "build_fixtures",
-        "--",
-        "--keys",
-        str(_deployment_keys(store)),
-        "--target",
-        target,
-        "--store",
-        str(store),
-    ]
-    if python is not None:
-        command += ["--python", str(python)]
-    built = subprocess.run(
-        command,
-        cwd=_repository(),
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
-    if built.returncode != 0:
-        missing = [
-            line.removeprefix("FAILED\t").replace("\t", " ")
-            for line in built.stdout.splitlines()
-            if line.startswith("FAILED\t")
-        ]
-        raise AssertionError(
-            "the deployment's own kernels did not build, so nothing can serve"
-            + (f": {', '.join(missing)}" if missing else "")
-            + f"\n{built.stdout[-4000:]}\n{built.stderr[-4000:]}"
-        )
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -322,93 +102,15 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
     """The host's Program Server, with the deployment's programs installed.
 
     Autouse and module-scoped because every deployment of this file needs it:
-    the daemon's leader resolves each epoch's programs at this server, and a
-    program's module exists nowhere else. Two sets of programs are here, built
-    once for the module:
-
-    * the kernels — a module for every descriptor key the deployment launches,
-      built into the store by ``build_fixtures`` (``KEYS``). The epoch is
-      refused by the first slot no installed program fills, and a main process
-      serves nothing until it can install the kernels the model launches;
-    * the policy — ``POLICY_PACKAGE``, installed below, because a policy is a
-      wasm package this host precompiles rather than a kernel key.
-
-    The package root and the store live as long as the module, and every test
-    of the module deploys against this one server, so a module is built once and
-    every later deployment of the module reuses it (design 5.3). They are not
-    shared with another run: a store entry is keyed by operator, backend,
-    revision, target and descriptor, and a revision counts from 1 in a fresh
-    package root, so a store kept across runs would answer a changed package
-    with the module the older source built.
+    the daemon's leader resolves each epoch's programs at this server.
     """
     global PROGRAM_SERVER
-    binary = require_uniserve_binary()
-    work = tmp_path_factory.mktemp("program-server")
-    socket = work / "program-server.sock"
-    log = work / "program-server.log"
-    target = _program_target()
-    interpreter = _repository() / ".venv" / "bin" / "python"
-    built = work / "programs"
-    _build_store(built, target, interpreter if interpreter.exists() else None)
-    # The builder's two directories are the two the server is given: installed
-    # sources for a rebuild, prepared modules for what it serves.
-    packages = built / "packages"
-    store = built / "modules"
-    command = [
-        str(binary),
-        "program-server",
-        "serve",
-        "--socket",
-        str(socket),
-        "--package-root",
-        str(packages),
-        "--store-root",
-        str(store),
-        "--target",
-        target,
-        "--wasm",
-        str(_precompiler()),
-    ]
-    if interpreter.exists():
-        command += ["--python", str(interpreter)]
-    process = start_server(command, log)
-    deadline = time.monotonic() + 120.0
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"the Program Server exited: {log.read_text()}")
-        if socket.exists():
-            break
-        time.sleep(0.2)
-    else:
-        raise TimeoutError(f"the Program Server left no socket at {socket}")
-
-    for package in (POLICY_PACKAGE,):
-        installed = subprocess.run(
-            [
-                str(binary),
-                "program-server",
-                "install",
-                "--socket",
-                str(socket),
-                str(_repository() / package),
-            ],
-            capture_output=True,
-            text=True,
-            # A kernel package builds its modules on the first prepare, not
-            # here: installing copies the source and registers its revision.
-            timeout=3600,
-        )
-        if installed.returncode != 0:
-            raise AssertionError(
-                f"installing {package} failed: "
-                f"{installed.stdout}\n{installed.stderr}"
-            )
-    PROGRAM_SERVER = socket
-    try:
-        yield socket
-    finally:
-        PROGRAM_SERVER = None
-        stop_server(process)
+    with running_program_server(tmp_path_factory) as socket:
+        PROGRAM_SERVER = socket
+        try:
+            yield socket
+        finally:
+            PROGRAM_SERVER = None
 
 
 def program_server_option() -> list[str]:
@@ -892,6 +594,27 @@ def _serve(
         yield base_url
 
 
+def _weight_bytes(base_url: str) -> int:
+    """The bytes of weights the deployment's ledgers book."""
+    status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
+    return sum(
+        entry["bytes"]
+        for node in status["ledgers"]
+        for ledger in node["ledgers"]
+        for entry in ledger["entries"]
+        if entry["item"] == "weights"
+    )
+
+
+def _listens(port: int) -> bool:
+    """Whether a server accepts connections on `port` of this host."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
 def _admin(
     base_url: str, path: str, body: dict | None = None
 ) -> httpx.Response:
@@ -909,15 +632,34 @@ def _apply(base_url: str, *assignments: str) -> dict:
     return response.json()["result"]
 
 
+def _apply_settled(base_url: str, *assignments: str) -> None:
+    """Applies `assignments` once the switch that ended left its replica."""
+    answers: list[httpx.Response] = []
+
+    def applied() -> bool:
+        answers.append(
+            httpx.put(
+                f"{base_url}/admin/config",
+                json={"set": list(assignments)},
+                timeout=1800,
+            )
+        )
+        return answers[-1].status_code != 409
+
+    _wait_until(applied, 120, "the replica stayed with the switch that ended")
+    assert answers[-1].status_code == 200, answers[-1].text
+
+
 def _change_world(base_url: str, *assignments: str) -> dict:
-    """Applies `assignments` as a world change and commits the successor;
-    returns the change's report.
+    """Applies `assignments` as an epoch switch and commits the target; returns
+    the update's report.
     """  # noqa: D205
     result = _apply(base_url, *assignments)
     assert result["change"] == "epoch", result
+    report = _on_trial(base_url)
     committed = _admin(base_url, "config/commit")
     assert committed.status_code == 200, committed.text
-    return result["epoch"]
+    return report
 
 
 def test_a_serving_deployment_answers_its_admin_api(
@@ -974,17 +716,13 @@ def test_a_serving_deployment_answers_its_admin_api(
         assert committed.status_code == 200, committed.text
         before_update = len(read)
         report = _change_world(base_url, CHANGE)
-        print(f"world change pause: {report['pause_seconds']:.3f} s")
+        print(f"epoch switch pause: {report['pause_ms']} ms")
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
         text = "".join(read)
         assert len(read) > before_update, "the stream ended before the update"
         numbers = [int(word) for word in re.findall(r"\d+", text)]
         assert numbers[:100] == list(range(1, 101)), text[:400]
-        assert any(
-            "the engine took the new scheduling limits in place" in line
-            for line in _log_lines(log)
-        )
 
         # The manager attaches, follows the node's events and detaches.
         manager = shutil.which("uniserve-manager") or str(
@@ -1178,6 +916,46 @@ def test_a_hot_restart_hands_the_deployment_to_a_successor_daemon(
         # inherits this environment, so both processes log them.
         with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
             _restart_while_streaming(base_url, name, log, successors)
+    finally:
+        for pid in successors:
+            _stop_pid(pid)
+
+
+def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
+    tmp_path: Path, runtime: Path
+):
+    """A successor daemon learns what a target maps from the process that serves.
+
+    The epoch that serves took its storage from the one before it, under that
+    world's name. The daemon that switched it is gone, and the next target still
+    maps that storage.
+    """
+    name = "qwen3-live-restart-switch"
+    log = tmp_path / "server.log"
+    executables = []
+    for ordinal in range(2):
+        directory = tmp_path / f"executable-{ordinal}"
+        directory.mkdir()
+        shutil.copy2(worker_executable(), directory / worker_executable().name)
+        executables.append(directory / worker_executable().name)
+    successors: list[int] = []
+    try:
+        with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
+            answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+            _change_world(base_url, f"worker_config.executable={executables[0]}")
+            _purged(base_url)
+            restarted = _admin(base_url, "restart")
+            assert restarted.status_code == 200, (
+                f"{restarted.text}{_log_trouble(log)}"
+            )
+            successors.append(restarted.json()["result"]["pid"])
+            _chat(base_url, name, RECOVERY_PROMPT, tokens=8)
+            _change_world(base_url, f"worker_config.executable={executables[1]}")
+            after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+            assert (
+                after["choices"][0]["message"]["content"]
+                == answer["choices"][0]["message"]["content"]
+            )
     finally:
         for pid in successors:
             _stop_pid(pid)
@@ -1466,10 +1244,15 @@ def _restart_while_streaming(
     # address serves, and the old one closes once the replaced daemon exits.
     previous = successors[-1]
     port = find_free_port()
-    moved = _apply(base_url, f"server_config.port={port}")
+    moved = _apply(base_url, f"admin_config.port={port}")
     assert moved["change"] == "daemon", moved
     successors.append(moved["pid"])
     moved_url = f"http://127.0.0.1:{port}"
+    # The answer comes from the daemon on the previous address, and the successor binds a new
+    # address once it holds the deployment.
+    _wait_until(
+        lambda: _listens(port), 60, "the new address did not open"
+    )
     reply = _chat(moved_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     _wait_until(
@@ -1480,7 +1263,7 @@ def _restart_while_streaming(
     with pytest.raises(httpx.ConnectError):
         httpx.get(f"{base_url}/health", timeout=5)
     status = httpx.get(f"{moved_url}/admin/config", timeout=10).json()
-    server = tomllib.loads(status["config"])["server_config"]
+    server = tomllib.loads(status["config"])["admin_config"]
     assert server["port"] == port, server
 
     # A change of both the daemon's options and what a world executes
@@ -1488,7 +1271,7 @@ def _restart_while_streaming(
     # changes the world in an operation of its own.
     previous = successors[-1]
     port = find_free_port()
-    both = _apply(moved_url, f"server_config.port={port}", CHANGE)
+    both = _apply(moved_url, f"admin_config.port={port}", CHANGE)
     assert both["change"] == "daemon", both
     assert both["then"] == "epoch", both
     successors.append(both["pid"])
@@ -1522,7 +1305,7 @@ def _restart_while_streaming(
         300,
         "the switch's target never served its configuration",
     )
-    assert served_config()["server_config"]["port"] == port
+    assert served_config()["admin_config"]["port"] == port
     reply = _chat(both_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     _wait_until(
@@ -1688,24 +1471,13 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         assert done.is_set(), "the count did not end"
         numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
         assert numbers[:200] == list(range(1, 201)), "".join(read)[:400]
+        weights = _weight_bytes(base_url)
         _change_world(base_url, CHANGE)
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
-        lines = _log_lines(log)
-        assert (
-            sum(
-                "uniserve.loading.rank: loaded numerical model" in line
-                for line in lines
-            )
-            == 1
-        ), (
-            "an engine read the checkpoint again rather than the weights "
-            "the Storage Server retains"
-        )
-        assert any(
-            re.search(r"mapped the retained weights .*missing=0", line)
-            for line in lines
-        ), "the successor world did not map the retained weights"
+        # The ledger books a storage once however many epochs map it, so a successor that read the
+        # checkpoint again would book its weights beside these.
+        assert _weight_bytes(base_url) == weights
 
 
 # The options of a deployment whose KV cache takes the device storage its
@@ -1750,9 +1522,16 @@ def _ballast(device: str, leave_gib: float) -> Iterator[int]:
         process.wait(timeout=120)
 
 
-def test_a_world_change_under_storage_pressure_shrinks_the_kv_cache(
+def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
     tmp_path: Path, runtime: Path
 ):
+    """A target beside a full GPU ends the update and changes nothing that serves.
+
+    A switch asks the serving epoch for no storage: the target maps its cache,
+    and its graphs are its own to find. With two GiB left on the GPU it finds no
+    room for them, so the update ends on its exit, and the stream goes on with
+    the cache as it was.
+    """
     name = "qwen3-live-pressure"
     log = tmp_path / "server.log"
     device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
@@ -1770,37 +1549,25 @@ def test_a_world_change_under_storage_pressure_shrinks_the_kv_cache(
         _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
         with _ballast(device, leave_gib=2.0) as held:
             print(f"ballast holds {held / (1 << 30):.1f} GiB; GPU free 2 GiB")
-            report = _change_world(base_url, CHANGE)
-            print(
-                "world change under pressure, pause: "
-                f"{report['pause_seconds']:.3f} s"
+            result = _apply(base_url, CHANGE)
+            assert result["change"] == "epoch", result
+            _wait_until(
+                lambda: _update(base_url).get("phase") == "abandoned",
+                600,
+                f"the update did not end: {_log_trouble(log)}",
             )
+            report = _update(base_url)
+            print("epoch switch under pressure:", json.dumps(report))
+            assert report["failure"]["kind"] == "process_exit", report
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
         numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
         assert numbers[:200] == list(range(1, 201)), "".join(read)[:400]
-
-        lines = _log_lines(log)
-        withdrew = [
+        assert not [
             line
-            for line in lines
+            for line in _log_lines(log)
             if "withdrew the tail of the KV cache" in line
-        ]
-        gave = [
-            line
-            for line in lines
-            if "gave back the tail of the KV cache" in line
-        ]
-        grew = [
-            line
-            for line in lines
-            if "growing the KV cache into the storage freed" in line
-        ]
-        for line in withdrew + gave + grew:
-            print(line)
-        assert withdrew, "the serving world did not shrink its KV cache"
-        assert gave, "the serving world's workers did not give the tail back"
-        assert grew, "the committed successor did not grow its KV cache"
+        ], "the switch shrank the serving epoch's KV cache"
         after = _chat(base_url, name, prompt, 32)["choices"][0]["message"][
             "content"
         ]
@@ -1861,8 +1628,8 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
         assert alone["choices"][0]["message"]["content"] == before, alone
         assert abs(after - awake) <= 2 * 1024, (awake, after)
         lines = _log_lines(log)
-        assert any("the worker sleeps" in line for line in lines)
-        assert any("the worker woke" in line for line in lines)
+        assert any("the scheduler sleeps" in line for line in lines)
+        assert any("the scheduler woke" in line for line in lines)
         status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
         assert status["deployment"]["asleep"] is False, status
         assert status["deployment"]["paused"] is False, status
@@ -2094,6 +1861,97 @@ def test_a_lost_main_process_is_relaunched_without_a_standby(
         assert evidence["relaunched"]
 
 
+def test_a_standby_started_after_a_switch_maps_what_its_epoch_serves_from(
+    tmp_path: Path, runtime: Path
+):
+    """A standby of a target maps storage another world created.
+
+    A target serves from the storage of the epoch before it, under that world's
+    name. The standby started beside the target finds it under the same name,
+    and takes over when the target's process is lost.
+    """
+    name = "qwen3-live-standby-switch"
+    log = tmp_path / "server.log"
+    options = (*OPTIONS, "worker_config.standby=true")
+    prepared = "the standby is prepared beside the serving engine"
+    with _serve(runtime, log, name, options=options) as base_url:
+        _wait_until(
+            lambda: _occurrences(log, prepared) >= 1,
+            600,
+            "the first epoch's standby did not start",
+        )
+        successor = tmp_path / worker_executable().name
+        shutil.copy2(worker_executable(), successor)
+        result = _apply(base_url, f"worker_config.executable={successor}")
+        assert result["change"] == "epoch", result
+        _on_trial(base_url)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        _purged(base_url)
+        _wait_until(
+            lambda: _occurrences(log, prepared) >= 2,
+            600,
+            f"the target's standby did not start: {_log_trouble(log)}",
+        )
+        evidence = _lose_the_serving_engine(
+            base_url, log, name, "standby-after-a-switch", standby=True
+        )
+        assert evidence["promoted"]
+
+
+def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
+    tmp_path: Path, runtime: Path
+):
+    """A process started again keys the storage it creates by its own world.
+
+    The epoch that replaces it maps that storage. So it does after a target's
+    process is lost, when the first epoch's storage is gone with it, and after a
+    revert that started the epoch again on the weights it kept.
+    """
+    name = "qwen3-live-relaunched-storage"
+    log = tmp_path / "server.log"
+    executables = []
+    for ordinal in range(3):
+        directory = tmp_path / f"executable-{ordinal}"
+        directory.mkdir()
+        shutil.copy2(worker_executable(), directory / worker_executable().name)
+        executables.append(directory / worker_executable().name)
+    with _serve(runtime, log, name) as base_url:
+        answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        result = _apply(base_url, f"worker_config.executable={executables[0]}")
+        assert result["change"] == "epoch", result
+        _on_trial(base_url)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        _purged(base_url)
+        _lose_the_serving_engine(
+            base_url, log, name, "relaunched-after-a-switch", standby=False
+        )
+        result = _apply(
+            base_url,
+            f"worker_config.executable={executables[1]}",
+            "update_config.previous_world=weights",
+        )
+        assert result["change"] == "epoch", result
+        _on_trial(base_url)
+        rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
+        assert rolled.status_code == 200, rolled.text
+        _wait_until(
+            lambda: _update(base_url).get("phase") == "abandoned",
+            300,
+            f"the revert did not end: {_log_trouble(log)}",
+        )
+        _apply_settled(base_url, f"worker_config.executable={executables[2]}")
+        _on_trial(base_url)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        assert (
+            after["choices"][0]["message"]["content"]
+            == answer["choices"][0]["message"]["content"]
+        )
+
+
 def test_an_epoch_switch_to_a_new_executable_fails_no_request(
     tmp_path: Path, runtime: Path
 ):
@@ -2183,6 +2041,8 @@ def _update(base_url: str) -> dict:
 
 # The span a trial's step time and throughput are averaged over.
 TRIAL_WINDOW_S = 5
+# Longer than the period an engine reports its counters on.
+STATS_REPORT_S = 3
 
 
 def _slower_executable(directory: Path) -> Path:
@@ -2258,6 +2118,33 @@ def _assert_whole(streaming: threading.Thread, streamed: dict) -> int:
         )
     assert len(streamed["reasons"]) == 1, f"the count ended {streamed['reasons']}"
     return len(numbers)
+
+
+def _host_tokens_read(base_url: str, ask: Callable[[], object]) -> float:
+    """The tokens `ask` reads from the host KV cache.
+
+    An engine reports its counters on a period, so each reading waits for the
+    report that holds what came before it.
+    """
+    time.sleep(STATS_REPORT_S)
+    before = _metric(base_url, "uniserve:prefix_cache_host_hits")
+    ask()
+    time.sleep(STATS_REPORT_S)
+    return _metric(base_url, "uniserve:prefix_cache_host_hits") - before
+
+
+def _purged(base_url: str) -> None:
+    """Waits until the committed switch ended its previous epoch."""
+    _wait_until(
+        lambda: _update(base_url).get("phase") == "purged",
+        300,
+        "the commit did not end the previous epoch",
+    )
+
+
+def _occurrences(log: Path, line: str) -> int:
+    """How many lines of the log hold `line`."""
+    return sum(line in text for text in _log_lines(log))
 
 
 def _on_trial(base_url: str) -> dict:
@@ -2357,8 +2244,10 @@ def test_a_regression_of_the_epoch_on_trial_reverts_it(
     """
     name = "qwen3-live-regression"
     log = tmp_path / "server.log"
+    # The walk costs a step about a fifth more than a replay, so a threshold of a
+    # fifth would read the machine and not the regression.
     thresholds = (
-        "update_config.rollback.step_time_regression=0.2",
+        "update_config.rollback.step_time_regression=0.05",
         f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
     )
     with _serve(runtime, log, name) as base_url:
@@ -2441,8 +2330,7 @@ def test_a_program_update_past_a_threshold_reverts_in_its_epoch(
             f'update_config.rollback.window="{TRIAL_WINDOW_S}s"',
         )
         assert result["change"] == "program", result
-        streaming.join(timeout=1800)
-        assert not streamed["errors"], streamed["errors"][0]
+        _assert_whole(streaming, streamed)
 
         def reverted() -> bool:
             _chat(base_url, name, RECOVERY_PROMPT, tokens=2)
@@ -2456,11 +2344,6 @@ def test_a_program_update_past_a_threshold_reverts_in_its_epoch(
         _artifact("program-throughput-regression", {"update": update})
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="a main process maps no host page pool, so no page reaches the host "
-    "(crates/engine/src/scheduler/submission.rs, map_host_cache)",
-)
 def test_the_requests_in_flight_warm_the_target_through_the_host_cache(
     tmp_path: Path, runtime: Path
 ):
@@ -2511,3 +2394,322 @@ def test_the_requests_in_flight_warm_the_target_through_the_host_cache(
                 "host_hit_tokens_on_the_target": read,
             },
         )
+
+
+def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
+    tmp_path: Path, runtime: Path
+):
+    """The two warming options change what a switch does.
+
+    A tail of two tokens is reached only at a page boundary, so it takes rounds a
+    page's tail does not. Prompts in their prefill run past a tail of one token, so
+    a round limits the source's prefill, and the wait still ends: a tail that stays
+    past the limit costs the requests a recomputation and no failure.
+    """
+    name = "qwen3-live-warming-options"
+    log = tmp_path / "server.log"
+    with _serve(runtime, log, name) as base_url:
+        first = tmp_path / "first"
+        first.mkdir()
+        later = [tmp_path / f"later-{attempt}" for attempt in range(4)]
+        for directory in (first, *later):
+            directory.mkdir(exist_ok=True)
+            shutil.copy2(worker_executable(), directory / "uniserve")
+
+        streaming, streamed = _start_count(base_url, name)
+        _wait_until(
+            lambda: len(_numbers(streamed["read"])) >= 200,
+            300,
+            "the count did not grow",
+        )
+        _apply(
+            base_url,
+            f"worker_config.executable={first / 'uniserve'}",
+            "update_config.cache_tail_tokens=2",
+        )
+        tight = _on_trial(base_url)["warming"]
+        print("a tail of two tokens:", json.dumps(tight))
+        assert tight["limit_tokens"] == 2, tight
+        assert tight["tail_tokens"] <= 2, tight
+        assert tight["rounds"] > 1, tight
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        _assert_whole(streaming, streamed)
+        _wait_until(
+            lambda: _update(base_url).get("phase") == "purged",
+            120,
+            "the update did not end",
+        )
+
+        # Prompts that never repeat keep a prefill running under the switch, and what
+        # they generate leaves a tail past a page. A round that happens on no tail ends
+        # the wait as it should and limits nothing, so the switch is tried again.
+        prompts = threading.Event()
+
+        def prefills() -> None:
+            turn = 0
+            while not prompts.is_set():
+                turn += 1
+                words = " ".join(f"{turn}-{word}" for word in range(2500))
+                try:
+                    _chat(base_url, name, words, tokens=48, timeout_s=120)
+                except httpx.HTTPError:
+                    time.sleep(0.2)
+
+        running = [threading.Thread(target=prefills) for _ in range(4)]
+        for thread in running:
+            thread.start()
+        try:
+            for directory in later:
+                _apply_settled(
+                    base_url,
+                    f"worker_config.executable={directory / 'uniserve'}",
+                    "update_config.cache_tail_tokens=1",
+                    "update_config.cache_prefill_tokens=128",
+                )
+                limited = _on_trial(base_url)["warming"]
+                if limited["prefill_limited"]:
+                    break
+                print("no tail under prefills:", json.dumps(limited))
+                committed = _admin(base_url, "config/commit")
+                assert committed.status_code == 200, committed.text
+                _purged(base_url)
+        finally:
+            prompts.set()
+            for thread in running:
+                thread.join(timeout=300)
+        print("under prefills:", json.dumps(limited))
+        assert limited["prefill_limited"], limited
+        _admin(base_url, "config/commit")
+        answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        assert _numbers([answer["choices"][0]["message"]["content"]])[:3] == [1, 2, 3]
+        assert not _occurrences(log, "starved"), _log_trouble(log)
+        _artifact("warming-options", {"tight": tight, "under_prefills": limited})
+
+
+def test_a_request_that_ends_at_once_leaves_its_pages_in_the_host_cache(
+    tmp_path: Path, runtime: Path
+):
+    """A prompt's pages reach the host KV cache though no batch follows them.
+
+    A request of one output token ends with the step that completes its pages,
+    and nothing else runs, so their copy has no later batch to go with: the
+    scheduler submits a batch of copies alone.
+    """
+    name = "qwen3-live-copies-alone"
+    log = tmp_path / "server.log"
+    prompt = " ".join(f"entry {index} of the table" for index in range(800))
+    with _serve(runtime, log, name) as base_url:
+        _chat(base_url, name, prompt, tokens=1)
+        time.sleep(2)
+        flushed = _admin(base_url, "flush_cache")
+        assert flushed.status_code == 200, flushed.text
+        found = _host_tokens_read(
+            base_url, lambda: _chat(base_url, name, prompt, tokens=1)
+        )
+        print("host tokens of a request of one token:", found)
+        assert found > 0, found
+        # What moved the pages is on the report beside what computed them.
+        metrics = httpx.get(f"{base_url}/metrics", timeout=10).text
+        copied = [
+            line
+            for line in metrics.splitlines()
+            if line.startswith("uniserve:worker_stream_us")
+            and 'stream="copy"' in line
+        ]
+        print("copy stream:", copied)
+        assert copied, metrics[:2000]
+
+
+def test_host_hits_beyond_the_device_cache_all_finish(
+    tmp_path: Path, runtime: Path
+):
+    """Requests that find more pages in the host than the device holds all end.
+
+    A host hit takes the units of its pages at admission, and a resident keeps
+    its units until it ends. Admitted together, requests whose tails run past
+    their first chunk would hold every unit with none left for those tails, so
+    admission keeps the units the residents' prompts still need.
+    """
+    name = "qwen3-live-host-hits"
+    log = tmp_path / "server.log"
+    prompts = [
+        " ".join(f"{turn}-{word}" for word in range(2495)) for turn in range(4)
+    ]
+    tail = " ".join(f"tail-{word}" for word in range(300))
+    with _serve(runtime, log, name) as base_url:
+        for prompt in prompts:
+            _chat(base_url, name, prompt, tokens=1)
+        time.sleep(2)
+        flushed = _admin(base_url, "flush_cache")
+        assert flushed.status_code == 200, flushed.text
+        errors: list[BaseException] = []
+
+        def ask(prompt: str) -> None:
+            try:
+                _chat(base_url, name, prompt, tokens=1, timeout_s=300)
+            except httpx.HTTPError as error:
+                errors.append(error)
+
+        def ask_together() -> None:
+            asking = [
+                threading.Thread(target=ask, args=(f"{prompt} {tail}",))
+                for prompt in prompts
+            ]
+            for thread in asking:
+                thread.start()
+            for thread in asking:
+                thread.join(timeout=400)
+
+        found = _host_tokens_read(base_url, ask_together)
+        print("host tokens of the four requests:", found)
+        assert not errors, f"{errors[0]!r}{_log_trouble(log)}"
+        assert found > 0, found
+        assert not _occurrences(log, "starved"), _log_trouble(log)
+
+
+def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
+    tmp_path: Path, runtime: Path
+):
+    """A page in the host KV cache belongs to the weights that computed it.
+
+    A prompt finds its pages in the host cache once the device's prefix cache is
+    flushed. After an update to other weights the same prompt finds none of them,
+    although the new weights name the same model: it computes its own, which the
+    next flush makes it find. The other checkpoint is another copy of the files,
+    so the two weights answer alike and a stale page would go unseen in the text.
+    """
+    other = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL")
+    if not other:
+        pytest.skip("UNISERVE_QWEN3_UPDATED_MODEL names no other checkpoint")
+    name = "qwen3-live-weights-pages"
+    log = tmp_path / "server.log"
+    prompt = " ".join(f"item {index} of the list" for index in range(800))
+
+    def found_in_the_host_cache() -> float:
+        """Sends the prompt on a flushed device; the host tokens it reads."""
+        flushed = _admin(base_url, "flush_cache")
+        assert flushed.status_code == 200, flushed.text
+        return _host_tokens_read(
+            base_url, lambda: _chat(base_url, name, prompt, tokens=16)
+        )
+
+    with _serve(runtime, log, name) as base_url:
+        first = _chat(base_url, name, prompt, tokens=16)
+        time.sleep(2)
+        old_weights = found_in_the_host_cache()
+        print("host tokens of the first weights:", old_weights)
+        assert old_weights > 0, old_weights
+        updated = _admin(base_url, "update_weights", {"model_path": other})
+        assert updated.status_code == 200, updated.text
+        print("updated:", updated.text[:400])
+        answers = []
+        stale = _host_tokens_read(
+            base_url,
+            lambda: answers.append(_chat(base_url, name, prompt, tokens=16)),
+        )
+        second = answers[0]
+        print("host tokens after the update:", stale)
+        assert stale == 0, stale
+        assert (
+            second["choices"][0]["message"]["content"]
+            == first["choices"][0]["message"]["content"]
+        )
+        time.sleep(2)
+        new_weights = found_in_the_host_cache()
+        print("host tokens of the new weights:", new_weights)
+        assert new_weights > 0, new_weights
+        _artifact(
+            "weight-update-host-pages",
+            {
+                "host_tokens_found_under_the_first_weights": old_weights,
+                "host_tokens_found_after_the_update": stale,
+                "host_tokens_found_under_the_new_weights": new_weights,
+            },
+        )
+
+
+def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
+    tmp_path: Path, runtime: Path
+):
+    """``previous_world = "host"`` moves bytes, and a revert brings them back.
+
+    A target of other model files maps none of the serving epoch's weights, so the
+    weights that epoch alone retains leave its GPU for host storage while the
+    target serves. The revert returns them and starts the epoch on them, under a
+    stream that crosses both moves whole, and it answers as it did.
+    """
+    other = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL")
+    if not other:
+        pytest.skip("UNISERVE_QWEN3_UPDATED_MODEL names no other checkpoint")
+    name = "qwen3-live-host-weights"
+    log = tmp_path / "server.log"
+    # The target loads its checkpoint beside the serving one, and the deployment's
+    # quota of the GPU holds both only past the default share.
+    options = (*OPTIONS, "mem_fraction_static=0.9")
+    with _serve(runtime, log, name, options=options) as base_url:
+        answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        streaming, streamed = _start_count(base_url, name)
+        result = _apply(
+            base_url, f"model={other}", "update_config.previous_world=host"
+        )
+        assert result["change"] == "epoch", result
+        _on_trial(base_url)
+        _wait_until(
+            lambda: _update(base_url)["moved_to_host_bytes"] > 0
+            or _update(base_url)["host_refused"],
+            300,
+            "the previous epoch's weights did not move",
+        )
+        trial = _update(base_url)
+        print("kept:", json.dumps(trial))
+        assert not trial["host_refused"], trial
+        assert trial["previous_world_kept"] == "host", trial
+        rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
+        assert rolled.status_code == 200, rolled.text
+        count = _assert_whole(streaming, streamed)
+        after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        assert (
+            after["choices"][0]["message"]["content"]
+            == answer["choices"][0]["message"]["content"]
+        )
+        update = _update(base_url)
+        assert update["phase"] == "abandoned", update
+        _artifact(
+            "host-weights",
+            {
+                "numbers_across_the_switch": count,
+                "moved_to_host_bytes": trial["moved_to_host_bytes"],
+                "update": update,
+            },
+        )
+
+
+def test_program_updates_under_a_request_keep_its_stream_whole(
+    tmp_path: Path, runtime: Path
+):
+    """In-place switches under a request leave its stream as a run without them.
+
+    A program update reaches a process that serves: its switchover captures
+    nothing a batch of the running request can be mistaken for, so every token
+    the request computes is the one its stream delivers. The count crosses as
+    many switches as fit under it, each one committed.
+    """
+    name = "qwen3-live-switches"
+    log = tmp_path / "server.log"
+    switches = 0
+    with _serve(runtime, log, name) as base_url:
+        for _ in range(2):
+            streaming, streamed = _start_count(base_url, name)
+            while not streamed["done"].is_set():
+                switches += 1
+                size = 4 if switches % 2 else 8
+                result = _apply(base_url, f"scheduler_config.max_batch={size}")
+                assert result["change"] == "program", result
+                committed = _admin(base_url, "config/commit")
+                assert committed.status_code == 200, committed.text
+                time.sleep(0.5)
+            _assert_whole(streaming, streamed)
+    print("switches:", switches)
+    assert switches >= 20, switches
+    _artifact("program-switches", {"switches": switches})

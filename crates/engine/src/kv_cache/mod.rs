@@ -1155,6 +1155,22 @@ impl BlockPool {
         self.take_idle(&mut inner, heads)
     }
 
+    /// Of `units`, those of pages the host KV cache has not been offered: a page goes to the host
+    /// as it is published, and from then on it holds the key it went under.
+    pub(crate) fn without_host_key(&self, units: &[u32]) -> Vec<u32> {
+        let inner = lock(&self.inner);
+        units
+            .iter()
+            .copied()
+            .filter(|unit| {
+                !inner
+                    .pages
+                    .values()
+                    .any(|page| page.host_key.is_some() && page.units.iter().any(|held| held.0 == *unit))
+            })
+            .collect()
+    }
+
     /// Pins the named pages, takes their units out of the free queue, and
     /// returns them idle: the second half of both acquisitions above.
     fn take_idle(&self, inner: &mut PoolInner, heads: Vec<u32>) -> Vec<IdlePage> {
@@ -2948,6 +2964,20 @@ mod tests {
 
     fn endpoint() -> Arc<MainProcessEndpoint> {
         Arc::new(ipc::MainProcessInfo::default().endpoint)
+    }
+
+    /// A page the host was offered holds its key from then on, so a plan that names it again
+    /// takes nothing: taking it would pin it out of the free queue at every step.
+    #[test]
+    fn a_page_offered_to_the_host_is_not_offered_again() {
+        let pool = BlockPool::new(8, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
+        let source = endpoint();
+        let offered = publish_pages(&coordinator, &pool, &[1, 2, 3, 4], 0, &[0], &source);
+        let kept = publish_pages(&coordinator, &pool, &[5, 6, 7, 8], 0, &[0], &source);
+        pool.set_host_key(&offered[0], storage::Key([7; 32]));
+        let units = [offered[0].units()[0].0, kept[0].units()[0].0];
+        assert_eq!(pool.without_host_key(&units), vec![units[1]]);
     }
 
     #[test]

@@ -686,8 +686,10 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let batch = self.token_batch(bucket)?;
         let group = self.group.clone();
+        let probes = crate::profiling::fences::capturing(&stream);
         let forward = crate::runners::denoiser::grouped(
-            nn::Forward::new(&stream, generation, &arena),
+            nn::Forward::new(&stream, generation, &arena)
+                .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
             group.as_deref(),
         );
         let layout = self.layout(bucket);
@@ -796,7 +798,7 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
         let generation = self.lifecycle.generation.number();
         let mut jobs = Vec::new();
         for bucket in self.capture_order() {
-            if self.lifecycle.graphs.captured(bucket, generation).is_none() {
+            if self.lifecycle.graphs.captured_for(bucket, generation).is_none() {
                 jobs.push(Job::Capture {
                     runner: self.id,
                     bucket,
@@ -859,6 +861,7 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                             device_us: launched.elapsed().as_micros() as u64,
                             ..Default::default()
                         },
+                        forward_stats: None,
                     });
                 }
                 let stream = self.stream.clone();
@@ -896,6 +899,7 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()
                     },
+                    forward_stats: None,
                 })
             }
             Job::Capture {

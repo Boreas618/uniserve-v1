@@ -448,22 +448,11 @@ message ResizeCache {
   // Matches the `Hooked` answer.
   uint64 id = 1;
   CacheChange change = 2;
-  // For a shrink: how long the requests that hold the tail may run on
-  // before they are recomputed; absent to let them run to their end.
-  optional uint64 preempt_after_ms = 3;
+  reserved 3, 5, 6, 8, 10, 12, 14;
   // Before the change: worlds of the deployment that keep their weights
   // alone on every node (a previous world kept as its weights, whose
   // processes exited), so that a growth takes the rest of their storage.
   repeated uint64 keep_weights = 4;
-  // For a shrink or a plan, what the world that succeeds this one adds: it
-  // loads its weights from the model's files (their keys differ), and it
-  // maps none of this world's KV cache, so copied or recomputed in-flight
-  // state needs units of its own.
-  bool successor_loads_weights = 5;
-  bool successor_unmapped_cache = 6;
-  // For a shrink or a plan: the successor's graph policy captures graphs,
-  // so its warmup takes a graph share where its model can be captured.
-  bool successor_captures_graphs = 8;
   // With `keep_weights`: the worlds keep their weights in host storage
   // (`update_config.previous_world = "host"`), which moves the weights each
   // world alone retains there through every node's Transfer Server; a node
@@ -475,17 +464,10 @@ message ResizeCache {
   // For a make-room change: the device bytes each device's storage ledger
   // must have room for beside everything it books.
   uint64 room_bytes = 9;
-  // Target rank capacities and concrete transfer allocations on each GPU.
-  repeated RankBudget rank_budgets = 10;
   // Per-device allocation requirements override room_bytes on named GPUs.
   repeated DeviceBytes device_bytes = 11;
-  // Warm successor pages into host storage; only its writable head is
-  // resident until promotion evicts the predecessor's copied cache.
-  bool successor_host_cache = 12;
   // Completed Host cache copies retained for rollback when execution retires.
   repeated bytes cache_keys = 13;
-  // The predecessor releases its graph pool during preparation.
-  bool eager_source = 14;
 }
 
 message DeviceBytes {
@@ -493,66 +475,18 @@ message DeviceBytes {
   uint64 bytes = 2;
 }
 
-// Resources a target rank adds beside retained source chunks.
-message RankBudget {
-  // The GPU's UUID: 16 bytes.
-  bytes gpu = 1;
-  uint64 weights = 2;
-  uint64 quota = 3;
-  uint64 process = 4;
-  uint64 graphs = 5;
-  uint64 fixed = 6;
-  uint64 cache = 7;
-  uint64 cache_capacity = 8;
-  repeated CachePageBudget pages = 9;
-  // Complete reservation supplied by multi-world request routing. Absent
-  // when the engine should size its own accepted request prefixes.
-  CacheReservation in_flight = 10;
-  // Bytes of one target cache tail segment, its physical allocation unit.
-  uint64 cache_segment = 11;
-}
-
-// Accepted prefix values and the device segments required to materialize them.
-message CacheReservation {
-  uint64 bytes = 1;
-  uint64 mapped = 2;
-}
-
-// Target cache page storage, after layer/head partitioning and encoding.
-message CachePageBudget {
-  uint32 tokens = 1;
-  uint64 bytes = 2;
-  optional uint32 window = 3;
-  bool state = 4;
-}
-
 enum CacheChange {
-  // Give back the tail of the KV cache until each device has the storage a
-  // world succeeding this one needs beside the storage they share: the
-  // requests that hold the tail run on, and are recomputed only past the
-  // shrink's `preempt_after_ms`.
-  CACHE_CHANGE_SHRINK = 0;
-  // Create the given-back tail again.
-  CACHE_CHANGE_RESTORE = 1;
+  // No change: a command that states none is refused.
+  CACHE_CHANGE_UNSPECIFIED = 0;
+  reserved 1, 5, 6;
   // Give back the whole KV cache and the CUDA graph storage, keeping the
   // weights, once no request runs.
   CACHE_CHANGE_SLEEP = 2;
   // Restore what a sleep gave back.
   CACHE_CHANGE_WAKE = 3;
   // Create as many of the segments given back as each device's storage
-  // ledger has room for: a successor world's cache grows as its
-  // predecessor's storage frees.
+  // ledger has room for.
   CACHE_CHANGE_GROW = 4;
-  // Change nothing: answer, for each device, with the storage the serving
-  // world and a world succeeding it hold there and the KV cache limit that
-  // leaves the serving world, or fail with why such a world does not fit.
-  CACHE_CHANGE_PLAN = 5;
-  // For a parked world whose successor maps none of its cache: give back
-  // every segment past the first, once the idle cached pages they hold
-  // reached the host KV cache (verified there, or copied there again), so
-  // that the successor's cache grows into them. Answered with the segments
-  // and bytes evicted; a resume creates them again.
-  CACHE_CHANGE_EVICT = 6;
   // Give back the tail of the KV cache until each device's storage ledger
   // has room for `room_bytes` (a profiling session's device storage): the
   // requests that hold the tail run on. Fails, changing nothing, when even
@@ -640,6 +574,10 @@ message CacheDescribed {
   // Empty when every worker group reported.
   string error = 2;
   repeated CacheSegments segments = 3;
+  // The world that created the storage the engine executes on, whose name keys
+  // it: its own, or the one its predecessor took it from. Only the process that
+  // maps the storage knows, since a relaunch of a world creates it afresh.
+  uint64 storage_world = 4;
 }
 
 // The published pages of one worker group's prefix cache.
@@ -1301,7 +1239,8 @@ message Profiling {
 
 // What an engine that succeeds another maps of it.
 message Predecessor {
-  // The predecessor's world.
+  // The world that created the storage the predecessor executes on, whose name
+  // keys it (`CacheDescribed.storage_world`).
   uint64 world = 1;
   // Each worker group's KV cache segments the predecessor holds, which the
   // successor's ranks map read-only behind segments of their own.
