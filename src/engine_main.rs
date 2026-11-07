@@ -630,7 +630,7 @@ pub(crate) fn run(
     );
 
     let launch = read_engine_args(launch_file)?;
-    let mut main = MainProcess::start(&launch, &launch.engine_config)?;
+    let mut main = MainProcess::start(&launch)?;
     let ending = main.serve();
     main.close();
     // Why this process ends is the daemon's own diagnostic: the supervisor reports
@@ -920,8 +920,9 @@ impl MainProcess {
     /// ([`EpochPlan`]), because three of the things the main process needs are the
     /// node's rather than the epoch's: which devices it serves, where its Program
     /// Server is, and what those devices measure.
-    fn start(launch: &EngineArgs, build: &proto::config::EngineConfig) -> Result<Self> {
-        let plan = EpochPlan::of(launch, build)?;
+    fn start(launch: &EngineArgs) -> Result<Self> {
+        let build = &launch.engine_config;
+        let plan = EpochPlan::of(launch)?;
         let mut control = Control::connect(
             &Endpoints {
                 requests: launch.requests.clone(),
