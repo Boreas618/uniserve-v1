@@ -60,6 +60,8 @@ struct Node {
     /// The token that brings the current deployment down.
     current: Mutex<Option<CancellationToken>>,
     server: ServerOptions,
+    /// The host's Program Server, which a deployment that names none resolves its programs at.
+    program_server: Option<std::path::PathBuf>,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -76,6 +78,7 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub async fn node(
     admin: AdminOptions,
     server: ServerOptions,
+    program_server: Option<std::path::PathBuf>,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let listener = Listener::bind(&admin)
@@ -87,6 +90,7 @@ pub async fn node(
         last_error: Mutex::new(None),
         current: Mutex::new(None),
         server: server.clone(),
+        program_server,
     });
     let mut app = Router::new()
         .route("/admin/config", put(deploy).get(idle_config))
@@ -198,6 +202,9 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
     }
     // The node's server serves the deployment's routes.
     config.server_config = node.server.clone();
+    if config.program_server.is_none() {
+        config.program_server = node.program_server.clone();
+    }
     if let Err(error) = config.validate(&stated) {
         return ApiError::invalid_request(format!("{error:#}"), Some("config")).into_response();
     }

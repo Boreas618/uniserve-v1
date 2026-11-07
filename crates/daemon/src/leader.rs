@@ -1742,13 +1742,22 @@ impl Leader {
         // What the configuration names is a part of what serves: the rest of an epoch's programs
         // come from the store. A target that resolves to what the epoch runs changes nothing,
         // whatever else the same apply changed.
-        if self
-            .epochs()
-            .serving()
-            .is_some_and(|(_, record)| {
-                record.kernels == next.programs.kernels && record.policy == next.programs.policy
-            })
-        {
+        //
+        // The epoch's record holds what its configuration named, and the target's resolution holds
+        // the store's programs beside that, so the two are compared over what the epoch named: a
+        // comparison of the whole sets differs for every target, and every change of a limit or a
+        // switch would then replace all of an epoch's programs with themselves.
+        if self.epochs().serving().is_some_and(|(_, record)| {
+            record.policy == next.programs.policy
+                && filled
+                    .kernels
+                    .keys()
+                    .all(|key| record.kernels.contains_key(key))
+                && record
+                    .kernels
+                    .iter()
+                    .all(|(key, program)| next.programs.kernels.get(key) == Some(program))
+        }) {
             return Ok(None);
         }
         // The reverted-update refusal is the daemon's record's, checked when
@@ -1934,6 +1943,14 @@ pub(crate) fn configurable(
 /// settings, generation defaults and chat template, byte for byte.
 pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), String> {
     use crate::model::assets::model_files::ResolvedModelFiles;
+    // A diffusers checkpoint keeps what processes a request in directories of its own, and states
+    // no tokenizer at its root for the model's files to resolve.
+    if std::path::Path::new(served)
+        .join(MODULAR_INDEX)
+        .is_file()
+    {
+        return same_pipeline(std::path::Path::new(served), std::path::Path::new(path));
+    }
     let resolve = |model: &str| {
         let model = model.to_owned();
         async move {
@@ -1974,6 +1991,47 @@ pub(crate) async fn same_processing(served: &str, path: &str) -> Result<(), Stri
                 "the checkpoint at {path} has another {name} than the served model, which \
                  changes how requests are processed: deploy it instead"
             ));
+        }
+    }
+    Ok(())
+}
+
+/// The index a diffusers checkpoint states its components in.
+const MODULAR_INDEX: &str = "modular_model_index.json";
+
+/// The components of a diffusers checkpoint that decide how a request is processed.
+const PROCESSING_COMPONENTS: [&str; 4] = ["tokenizer", "processor", "scheduler", "audio_scheduler"];
+
+/// [`same_processing`] for a diffusers checkpoint: the same index, and every file of the components
+/// that process a request the same.
+fn same_pipeline(served: &std::path::Path, path: &std::path::Path) -> Result<(), String> {
+    let read = |file: &std::path::Path| {
+        std::fs::read(file).map_err(|error| format!("{}: {error}", file.display()))
+    };
+    if read(&served.join(MODULAR_INDEX))? != read(&path.join(MODULAR_INDEX))? {
+        return Err(format!(
+            "the checkpoint at {} states other components than the served model: deploy it instead",
+            path.display()
+        ));
+    }
+    for component in PROCESSING_COMPONENTS {
+        let directory = served.join(component);
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("{}: {error}", directory.display())),
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("{}: {error}", directory.display()))?;
+            let name = entry.file_name();
+            if read(&entry.path())? != read(&path.join(component).join(&name))? {
+                return Err(format!(
+                    "the checkpoint at {} has another {component}/{} than the served model, \
+                     which changes how requests are processed: deploy it instead",
+                    path.display(),
+                    name.to_string_lossy()
+                ));
+            }
         }
     }
     Ok(())
