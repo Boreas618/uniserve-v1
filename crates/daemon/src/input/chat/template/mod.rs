@@ -33,7 +33,6 @@ use crate::input::chat::{
     ChatRole, ChatToolChoice,
 };
 use crate::options::ChatConfig;
-use crate::options::ChatTemplateContentFormatOption;
 use crate::output::chat::Error;
 use crate::output::chat::Result;
 use crate::output::tools::Tool;
@@ -83,7 +82,7 @@ impl HfChatRenderer {
     pub fn new(
         template: Option<String>,
         default_template_kwargs: HashMap<String, JsonValue>,
-        content_format: ChatTemplateContentFormatOption,
+        content_format: Option<ChatTemplateContentFormat>,
     ) -> Result<Self> {
         Ok(Self {
             default_template: template
@@ -553,7 +552,7 @@ mod tests {
     use expect_test::expect;
     use serde_json::Value;
 
-    use super::{ChatTemplateContentFormatOption, HfChatRenderer, MultimodalRenderInfo};
+    use super::{ChatTemplateContentFormat, HfChatRenderer, MultimodalRenderInfo};
     use crate::input::chat::{
         ChatContentPart, ChatMessage, ChatRequest, ChatRole, ChatToolChoice, GenerationPromptMode,
         ReasoningEffort,
@@ -571,18 +570,13 @@ mod tests {
     }
 
     fn render(template: Option<&str>, request: &ChatRequest) -> Result<String> {
-        HfChatRenderer::new(
-            template.map(str::to_owned),
-            HashMap::new(),
-            ChatTemplateContentFormatOption::Auto,
-        )?
-        .render(request)
+        HfChatRenderer::new(template.map(str::to_owned), HashMap::new(), None)?.render(request)
     }
 
     fn render_mm(
         template: &str,
         request: &ChatRequest,
-        content_format: ChatTemplateContentFormatOption,
+        content_format: Option<ChatTemplateContentFormat>,
     ) -> Result<String> {
         HfChatRenderer::new(Some(template.to_string()), HashMap::new(), content_format)?
             .with_multimodal(Some(MultimodalRenderInfo {
@@ -604,7 +598,7 @@ mod tests {
         let rendered = render_mm(
             "{{ messages[0].content }}",
             &image_request(),
-            ChatTemplateContentFormatOption::String,
+            Some(ChatTemplateContentFormat::String),
         )
         .unwrap();
 
@@ -616,7 +610,7 @@ mod tests {
         let rendered = render_mm(
             "{% for item in messages[0].content %}{% if item.type == 'image' %}<|image_pad|>{% else %}{{ item.text }}{% endif %}{% endfor %}",
             &image_request(),
-            ChatTemplateContentFormatOption::OpenAi,
+            Some(ChatTemplateContentFormat::OpenAi),
         )
         .unwrap();
 
@@ -639,7 +633,7 @@ mod tests {
         let rendered = render_mm(
             "{% if messages[0].role == 'system' %}{{ 'S:' + messages[0].content + '|' }}{% endif %}{% for message in messages[1:] %}{% if message.content is string %}{{ message.content }}{% else %}{% for item in message.content %}{% if item.type == 'image' %}<image>{% else %}{{ item.text }}{% endif %}{% endfor %}{% endif %}{% endfor %}",
             &request,
-            ChatTemplateContentFormatOption::Auto,
+            None,
         )
         .unwrap();
 
@@ -780,7 +774,7 @@ mod tests {
         let rendered = HfChatRenderer::new(
             Some("{{ bos_token }}|{{ bos_token is defined }}".to_string()),
             HashMap::new(),
-            ChatTemplateContentFormatOption::Auto,
+            None,
         )
         .unwrap()
         .with_special_tokens(Some(special_tokens))
@@ -824,7 +818,7 @@ mod tests {
                 "{%- if messages[0].content is string -%}{{ messages[0].content }}{%- else -%}{%- for item in messages[0].content %}{{ item.text }}|{%- endfor -%}{%- endif -%}".to_string(),
             ),
             HashMap::new(),
-            ChatTemplateContentFormatOption::String,
+            Some(ChatTemplateContentFormat::String),
         )
         .unwrap()
         .render(&request)
@@ -843,7 +837,7 @@ mod tests {
         let rendered = HfChatRenderer::new(
             Some("{{ messages[0].content[0].text }}{{ messages[0].content[1].text }}".to_string()),
             HashMap::new(),
-            ChatTemplateContentFormatOption::OpenAi,
+            Some(ChatTemplateContentFormat::OpenAi),
         )
         .unwrap()
         .render(&request)
@@ -861,7 +855,7 @@ mod tests {
                 ("enable_thinking".to_string(), Value::Bool(true)),
                 ("default_only".to_string(), Value::String("x".to_string())),
             ]),
-            ChatTemplateContentFormatOption::Auto,
+            None,
         )
         .unwrap();
 
@@ -885,7 +879,7 @@ mod tests {
                 ("enable_thinking".to_string(), Value::Bool(false)),
                 ("default_only".to_string(), Value::String("x".to_string())),
             ]),
-            ChatTemplateContentFormatOption::Auto,
+            None,
         )
         .unwrap();
 
@@ -905,7 +899,7 @@ mod tests {
                 "reasoning_effort".to_string(),
                 Value::String("medium".to_string()),
             )]),
-            ChatTemplateContentFormatOption::Auto,
+            None,
         )
         .unwrap();
 
@@ -989,7 +983,7 @@ mod tests {
         let rendered = HfChatRenderer::new(
             Some(QWEN3_TEMPLATE.to_string()),
             HashMap::new(),
-            ChatTemplateContentFormatOption::OpenAi,
+            Some(ChatTemplateContentFormat::OpenAi),
         )
         .unwrap()
         .render(&request)

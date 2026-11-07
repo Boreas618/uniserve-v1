@@ -30,7 +30,7 @@ use crate::input::{InputProcessor, RequestRenderer};
 use crate::leader::Leader;
 use crate::model::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::openai::video_jobs::VideoJobs;
-use crate::options::ChatTemplateContentFormatOption;
+use crate::options::ChatTemplateContentFormat;
 use crate::options::{ImageFetchConfig, LoggingConfig, ServeConfig, ServerConfig, VideoJobConfig};
 use crate::tokenizer::DynTokenizer;
 
@@ -262,7 +262,7 @@ pub(crate) fn leader_over(
             HfChatRenderer::new(
                 Some("{{ messages[0].content }}".to_string()),
                 HashMap::new(),
-                ChatTemplateContentFormatOption::String,
+                Some(ChatTemplateContentFormat::String),
             )
             .unwrap(),
         ),

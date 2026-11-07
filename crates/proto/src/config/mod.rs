@@ -535,7 +535,8 @@ pub struct ChatConfig {
     /// Keyword arguments bound into every chat-template render.
     pub template_kwargs: Option<HashMap<String, Value>>,
     /// How message content renders: `auto`, `string` or `openai`.
-    pub template_content_format: ChatTemplateContentFormatOption,
+    #[serde(with = "content_format")]
+    pub template_content_format: Option<ChatTemplateContentFormat>,
     /// `auto` splits `reasoning_content` from `content`; `none` streams
     /// reasoning delimiters as content.
     pub reasoning_parser: ReasoningParser,
@@ -681,60 +682,73 @@ impl Default for ProfilingConfig {
 /// (`docs/profiling.md`).
 pub const DEFAULT_FENCE_COMPONENTS: [&str; 1] = ["*.Transformer"];
 
-/// Configurable chat-template content format selection.
+/// The shape a chat template takes message `content` in.
 ///
-/// `FromStr` accepts the `*_LITERAL` constants case-insensitively.
-/// `ChatTemplateContentFormat::Preserve` has no option; only `Auto` detection
-/// selects it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, DeserializeFromStr, SerializeDisplay)]
-pub enum ChatTemplateContentFormatOption {
-    /// Detect the format from the template source.
+/// A configuration states `string` or `openai`, or leaves the shape to be detected from the
+/// template's source (`auto`, which is the field unset). `Preserve` is never stated: only detection
+/// selects it, for a template that handles both shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ChatTemplateContentFormat {
+    /// Content is a simple string.
     #[default]
-    Auto,
-    /// Always flatten content into plain strings before rendering.
     String,
-    /// Always pass content through in OpenAI-compatible structured form.
+    /// Content is a list of structured parts (OpenAI format).
     OpenAi,
+    /// String messages remain strings and structured messages remain lists.
+    Preserve,
 }
 
-impl ChatTemplateContentFormatOption {
-    /// Configuration literal for automatic content-shape detection.
-    pub const AUTO_LITERAL: &str = "auto";
-    /// Configuration literal for structured OpenAI content parts.
-    pub const OPENAI_LITERAL: &str = "openai";
-    /// Configuration literal for flattened string content.
-    pub const STRING_LITERAL: &str = "string";
-}
-
-impl FromStr for ChatTemplateContentFormatOption {
+impl FromStr for ChatTemplateContentFormat {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        if value.eq_ignore_ascii_case(Self::AUTO_LITERAL) {
-            Ok(Self::Auto)
-        } else if value.eq_ignore_ascii_case(Self::STRING_LITERAL) {
+        if value.eq_ignore_ascii_case("string") {
             Ok(Self::String)
-        } else if value.eq_ignore_ascii_case(Self::OPENAI_LITERAL) {
+        } else if value.eq_ignore_ascii_case("openai") {
             Ok(Self::OpenAi)
         } else {
             Err(format!(
-                "invalid content format `{value}`; expected one of: {}, {}, {}",
-                Self::AUTO_LITERAL,
-                Self::STRING_LITERAL,
-                Self::OPENAI_LITERAL
+                "invalid content format `{value}`; expected one of: auto, string, openai"
             ))
         }
     }
 }
 
-impl fmt::Display for ChatTemplateContentFormatOption {
-    /// Writes the lowercase configuration literal.
+impl fmt::Display for ChatTemplateContentFormat {
+    /// Writes the configuration literal.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Auto => f.write_str(Self::AUTO_LITERAL),
-            Self::String => f.write_str(Self::STRING_LITERAL),
-            Self::OpenAi => f.write_str(Self::OPENAI_LITERAL),
+        f.write_str(match self {
+            Self::String => "string",
+            Self::OpenAi => "openai",
+            Self::Preserve => "preserve",
+        })
+    }
+}
+
+/// `chat_config.template_content_format`: `auto`, or the field unset, detects the shape.
+mod content_format {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    use super::ChatTemplateContentFormat;
+
+    pub(super) fn serialize<S: Serializer>(
+        format: &Option<ChatTemplateContentFormat>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        match format {
+            Some(format) => serializer.collect_str(format),
+            None => serializer.serialize_str("auto"),
         }
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<ChatTemplateContentFormat>, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        if text.eq_ignore_ascii_case("auto") {
+            return Ok(None);
+        }
+        text.parse().map(Some).map_err(serde::de::Error::custom)
     }
 }
 

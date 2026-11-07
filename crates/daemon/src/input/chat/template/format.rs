@@ -1,8 +1,8 @@
 //! Chat-template content-shape detection and formatting options.
 //!
 //! Hugging Face templates expect message `content` either as a plain string or
-//! as an OpenAI-style list of typed parts. Under
-//! `ChatTemplateContentFormatOption::Auto` (`crate::options`),
+//! as an OpenAI-style list of typed parts. When the configuration states no
+//! shape (`chat_config.template_content_format = "auto"`),
 //! `detect_chat_template_content_format` inspects the parsed template AST:
 //!
 //! - no loop over a message's `content` selects `String`;
@@ -20,17 +20,7 @@ use minijinja::machinery::ast::{Expr, ForLoop, Set, Stmt};
 use minijinja::machinery::{WhitespaceConfig, parse};
 use minijinja::syntax::SyntaxConfig;
 
-/// Resolved message-content shape passed to a compiled template.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(super) enum ChatTemplateContentFormat {
-    /// Content is a simple string.
-    #[default]
-    String,
-    /// Content is a list of structured parts (OpenAI format).
-    OpenAi,
-    /// String messages remain strings and structured messages remain lists.
-    Preserve,
-}
+pub(super) use proto::config::ChatTemplateContentFormat;
 
 /// Returns whether an expression references the named variable.
 fn is_var_access(expr: &Expr, varname: &str) -> bool {

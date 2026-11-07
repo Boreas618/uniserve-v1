@@ -12,7 +12,7 @@ use daemon::input::{InputProcessor, ModelResolutionError, RequestRenderer};
 use daemon::model::ModelConfig;
 use daemon::model::assets::ResolvedModelFiles;
 use daemon::openai::ApiError;
-use daemon::options::ChatTemplateContentFormatOption;
+use daemon::options::ChatTemplateContentFormat;
 use daemon::options::MediaConfig;
 use daemon::output::OutputParams;
 use daemon::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
@@ -201,7 +201,7 @@ fn try_resolved_model(
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
         HashMap::new(),
-        ChatTemplateContentFormatOption::String,
+        Some(ChatTemplateContentFormat::String),
     )
     .unwrap();
     // A diffusers pipeline checkpoint has no root `config.json`, so MiniMax H3
@@ -577,7 +577,7 @@ fn context_length_limits_preprocessed_requests() {
     let renderer = HfChatRenderer::new(
         Some(CHAT_TEMPLATE.to_string()),
         HashMap::new(),
-        ChatTemplateContentFormatOption::String,
+        Some(ChatTemplateContentFormat::String),
     )
     .unwrap();
     let mut config = loaded.config().clone();
@@ -734,7 +734,7 @@ fn with_template(model_type: &str, template: &str) -> InputProcessor {
     let renderer = HfChatRenderer::new(
         Some(template.to_string()),
         HashMap::new(),
-        ChatTemplateContentFormatOption::String,
+        Some(ChatTemplateContentFormat::String),
     )
     .unwrap();
     InputProcessor::new(
