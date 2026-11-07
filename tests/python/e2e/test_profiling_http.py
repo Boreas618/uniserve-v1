@@ -35,6 +35,9 @@ from pathlib import Path
 import httpx
 import pytest
 
+from tests.python.e2e.program_server import (
+    program_server as running_program_server,
+)
 from tests.python.e2e.profiling_helpers import NAME, RANGE_PASS_STORAGE, serve
 from tests.python.e2e.profiling_helpers import Load as _Load
 from tests.python.e2e.profiling_helpers import ended as _ended
@@ -46,6 +49,8 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
 
 OPTIONS = (
     "dtype=bfloat16",
+    "attention_backend=trtllm",
+    "max_num_batched_tokens=512",
     "kv_cache_config.max_tokens=32768",
     "chat_config.reasoning_parser=none",
     "cuda_graph_config.prefill_token_sizes=[512]",
@@ -59,7 +64,10 @@ def served(tmp_path_factory: pytest.TempPathFactory) -> Iterator[str]:
     """A Qwen3 deployment serving with fence probes on its transformer
     layers, which the module's tests share.
     """  # noqa: D205
-    with serve(tmp_path_factory.mktemp("served"), OPTIONS) as base_url:
+    with (
+        running_program_server(tmp_path_factory) as programs,
+        serve(tmp_path_factory.mktemp("served"), OPTIONS, programs) as base_url,
+    ):
         yield base_url
 
 
