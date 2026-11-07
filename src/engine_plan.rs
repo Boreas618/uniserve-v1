@@ -173,17 +173,18 @@ impl executor::data_plane::ModelLoad for RankModel {
         weights: &mut dyn nn::RetainedWeights,
     ) -> std::result::Result<(), String> {
         let mut plan = self.plan.clone();
-        plan.checkpoint = target.checkpoint.clone();
+        Arc::make_mut(&mut plan.launch).engine_config.model.model =
+            target.checkpoint.to_string_lossy().into_owned();
         plan.load_model(weights, &target.experts)
             .map(drop)
             .map_err(|error| format!("{error:#}"))
     }
 
     fn expert_layers(&self) -> BTreeMap<String, u32> {
-        let Ok(ModelClass::CausalLm) = ModelClass::of(&self.plan.checkpoint) else {
+        let Ok(ModelClass::CausalLm) = ModelClass::of(self.plan.checkpoint()) else {
             return BTreeMap::new();
         };
-        let Ok(config) = qwen3_moe::Config::read(&self.plan.checkpoint) else {
+        let Ok(config) = qwen3_moe::Config::read(self.plan.checkpoint()) else {
             return BTreeMap::new();
         };
         let experts = u32::try_from(config.num_experts).unwrap_or(0);
@@ -208,14 +209,12 @@ impl Served {
 pub(crate) struct EpochPlan {
     /// The output and the media lane the ranks of this plan share, once the first rank made them.
     codec: Arc<std::sync::Mutex<Option<SharedCodec>>>,
-    /// The epoch's build config, which the daemon wrote (§7.2).
-    build: proto::config::EngineConfig,
-    /// The checkpoint this rank serves.
-    checkpoint: PathBuf,
+    /// The process's arguments, which every rank of it shares: the epoch's engine configuration
+    /// (§7.2), the checkpoint, the world and the node's interfaces. A plan that loads another
+    /// checkpoint holds its own copy, whose configuration names that checkpoint.
+    launch: Arc<EngineArgs>,
     /// This rank's devices, as the executor's names for them.
     devices: Vec<DeviceId>,
-    /// The Program Server's socket.
-    program_server: PathBuf,
     /// The targets this rank resolves a module for (§5.3).
     targets: Vec<Target>,
     /// The bucket catalog every device of this rank captures.
@@ -223,8 +222,6 @@ pub(crate) struct EpochPlan {
     /// This rank's ordinal inside its group, which the storage claims and the cache plan's
     /// agreement with its group are keyed by.
     rank: u32,
-    /// The world the epoch executes, which keys the storage it creates.
-    world: u64,
     /// The world whose cache planes this rank maps, on a standby: it serves from the planes its
     /// predecessor serves from, whose segments that world created.
     cache_world: Option<u64>,
@@ -232,14 +229,8 @@ pub(crate) struct EpochPlan {
     /// maps is the serving rank's cache, which only that rank sized.
     adopted_cache: Option<ipc::CacheTable>,
     /// Ranks in the deployment, whose minimum the cache plan's block size and slot count are
-    /// agreed by (§4.1).
+    /// agreed by (§4.1): the launch's, or this process's devices when its ranks are its devices.
     world_size: usize,
-    /// Batches the rank's schedulers keep in flight, which the capacity plan relays through.
-    queue_depth: usize,
-    /// This rank's executor group, which the rank facts name as its identity.
-    group: String,
-    /// The watchdog the launch file states apart from the build config (§2.4), when it states one.
-    watchdog_override: Option<Duration>,
     /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the plan.
     mapping: Mapping,
     /// The expert union of this node's ranks, on a deployment whose experts are split.
@@ -325,7 +316,8 @@ impl EpochPlan {
     /// starts every rank of a node with the ordinals that rank serves, and a main process that
     /// guessed its devices from the epoch's parallelism would capture graphs on another rank's
     /// device.
-    pub(crate) fn of(launch: &EngineArgs, build: &proto::config::EngineConfig) -> Result<Self> {
+    pub(crate) fn of(launch: &EngineArgs) -> Result<Self> {
+        let build = &launch.engine_config;
         let mapping = Mapping::of(launch, build)?;
         if launch.devices.is_empty() {
             bail!(
@@ -388,24 +380,28 @@ impl EpochPlan {
         }
         let targets = targets(&devices)?;
         Ok(Self {
-            build: build.clone(),
-            checkpoint: PathBuf::from(&launch.engine_config.model.model),
+            launch: Arc::new(launch.clone()),
             devices,
-            program_server: PathBuf::from(&launch.program_server),
             targets,
             buckets,
             rank: launch.rank,
-            world: launch.world,
             cache_world: None,
             adopted_cache: None,
             world_size: launch.world_size as usize,
-            queue_depth: launch.queue_depth as usize,
-            group: launch.group.clone(),
             codec: Arc::default(),
-            watchdog_override: launch.watchdog_timeout_s.map(Duration::from_secs),
             mapping,
             union: None,
         })
+    }
+
+    /// The epoch's engine configuration (§7.2).
+    fn engine_config(&self) -> &proto::config::EngineConfig {
+        &self.launch.engine_config
+    }
+
+    /// The checkpoint this rank serves.
+    fn checkpoint(&self) -> &Path {
+        Path::new(&self.launch.engine_config.model.model)
     }
 
     /// One plan per rank this process serves (§2.1: one main process drives every device of its
@@ -415,7 +411,7 @@ impl EpochPlan {
     /// its own device, so each is planned, loaded and opened as a rank of its own. The text class
     /// keeps one plan, whose second device is refused where its runner is built.
     pub(crate) fn ranks(&self) -> Result<Vec<Self>> {
-        let text = matches!(ModelClass::of(&self.checkpoint)?, ModelClass::CausalLm);
+        let text = matches!(ModelClass::of(self.checkpoint())?, ModelClass::CausalLm);
         let attention = self.attention_ranks()?;
         // Dedicated expert ranks hold the experts between them, whatever the schedulers number.
         let expert_ranks = match attention {
@@ -511,7 +507,7 @@ impl EpochPlan {
     /// Leading ranks of a deployment whose experts live on dedicated ranks, from its worker groups:
     /// the ranks of every group that is not an expert group, and zero without one.
     fn attention_ranks(&self) -> Result<u32> {
-        let groups = &self.build.parallel.worker_groups;
+        let groups = &self.engine_config().parallel.worker_groups;
         let experts =
             |group: &&engine::WorkerGroupConfig| group.role == engine::WorkerGroupRole::Experts;
         if !groups.iter().any(|group| experts(&group)) {
@@ -615,7 +611,7 @@ impl EpochPlan {
     /// The parallel groups this rank joins: `(sequence group's ranks, tensor group's ranks)` and its
     /// place in each. A rank of a media deployment is in both; the text class joins neither here.
     pub(crate) fn parallel_shape(&self) -> Result<ParallelShape> {
-        if matches!(ModelClass::of(&self.checkpoint)?, ModelClass::CausalLm) {
+        if matches!(ModelClass::of(self.checkpoint())?, ModelClass::CausalLm) {
             // The tensor group is the text model's only collective group: an expert union
             // exchanges over its own transport (`union_member`).
             return Ok(ParallelShape {
@@ -626,7 +622,7 @@ impl EpochPlan {
         }
         let (ulysses, tensor, tensor_rank, sequence_rank) = media_parallel(
             self.capability_groups(),
-            &self.group,
+            &self.launch.group,
             self.rank,
             self.mapping.tensor_parallel,
             self.mapping.tensor_rank,
@@ -686,7 +682,11 @@ impl EpochPlan {
         let (_, bound) = self.buckets.bounds();
         PrefillCatalogue {
             bound,
-            stated: self.build.cuda_graph.prefill_token_sizes.is_some(),
+            stated: self
+                .engine_config()
+                .cuda_graph
+                .prefill_token_sizes
+                .is_some(),
         }
     }
 
@@ -705,7 +705,7 @@ impl EpochPlan {
         let lanes = BlockingKind::ALL.map(|kind| match kind {
             BlockingKind::ModuleLoad => {
                 let workers = self
-                    .build
+                    .engine_config()
                     .load
                     .threads
                     .map_or_else(|| shared.clamp(1, 8), |threads| threads.get() as usize);
@@ -724,7 +724,7 @@ impl EpochPlan {
 
     /// The Program Server's socket, which the rank's program client connects to.
     pub(crate) fn program_server(&self) -> &Path {
-        &self.program_server
+        Path::new(&self.launch.program_server)
     }
 
     /// This rank's ordinal inside its group.
@@ -799,7 +799,7 @@ impl EpochPlan {
         // fraction still caps the pools' share of the whole device, and the smaller of the two
         // rules is the allowance: a deployment that asks for a smaller share gets it, and a device
         // already holding the weights gets only what remains.
-        let budget = quota(total, self.build.mem_fraction_static).min(storage.free);
+        let budget = quota(total, self.engine_config().mem_fraction_static).min(storage.free);
         // What a rank must be able to map to serve at all, which is every pool the allocator
         // books at its first capture: the graph range in full and the scratch. The graph range is
         // mapped whole and not a pool at a time - `arena::Pools::new` divides the range among the
@@ -817,7 +817,7 @@ impl EpochPlan {
                  mem_fraction_static {}, less than the {needs} bytes of graph range and scratch a \
                  rank maps to serve",
                 device.0,
-                self.build.mem_fraction_static,
+                self.engine_config().mem_fraction_static,
             );
         }
         Ok(GraphStorage {
@@ -852,15 +852,16 @@ impl EpochPlan {
     /// How long a job may run without rank progress before it is reported `Stalled` (§2.4): the
     /// launch file's when it states one apart from the build config, and the build config's else.
     pub(crate) fn watchdog_timeout(&self) -> Duration {
-        self.watchdog_override
-            .unwrap_or(self.build.worker.watchdog_timeout)
+        self.launch
+            .watchdog_timeout()
+            .unwrap_or(self.engine_config().worker.watchdog_timeout)
     }
 
     /// Whether this rank keeps a host KV cache: a text rank of a deployment with a host tier.
     pub(crate) fn host_kv_cache(&self, served: &Served) -> bool {
         matches!(served, Served::Text(_))
-            && self.build.kv_cache.host_tier
-            && self.build.kv_cache.prefix_caching
+            && self.engine_config().kv_cache.host_tier
+            && self.engine_config().kv_cache.prefix_caching
     }
 
     /// What this rank's scheduler starts with ([`engine::SchedulerHandle::over_batches_telling`]):
@@ -883,11 +884,11 @@ impl EpochPlan {
         served: &Served,
         host_kv_cache: bool,
     ) -> Result<(EngineArgs, engine::SchedulerConfig)> {
-        let running = self.build.max_running_requests.get();
+        let running = self.engine_config().max_running_requests.get();
         let (facts, max_batch, max_num_batched_tokens, graph_tiers) = match served {
             Served::Text(_) => {
                 let (rows, tokens) = self.buckets.bounds();
-                let control = checkpoint_tokens(&self.checkpoint)?;
+                let control = checkpoint_tokens(self.checkpoint())?;
                 let graph_tiers = self
                     .buckets
                     .iter()
@@ -911,12 +912,12 @@ impl EpochPlan {
                 (facts, rows as usize, tokens as usize, graph_tiers)
             }
             Served::Media(_) => {
-                let longest = self.build.model.max_model_len.map(|length| length.get()).context(
+                let longest = self.engine_config().model.max_model_len.map(|length| length.get()).context(
                     "a deployment of the media class states no `max_model_len`: the pipeline keeps \
                      no key/value cache, so no checkpoint figure implies one and the deployment's \
                      own is what its prompt capacities are checked against",
                 )?;
-                let tokens = prompt_capacity(&self.build.video, longest)?;
+                let tokens = prompt_capacity(&self.engine_config().video, longest)?;
                 let facts = proto::config::ModelFacts {
                     // A media request generates a clip, not tokens, so no understanding feature is
                     // served; the engine still needs the two lower bounds, as the frontend's arm
@@ -959,14 +960,17 @@ impl EpochPlan {
     /// base release it was trained on (`fastvideo_inference.json`'s `base_model_revision`). The two
     /// are one checkpoint to everything below this file.
     fn media_base(&self) -> Result<Option<PathBuf>> {
-        frontend::model::assets::pipeline::pinned_snapshot(&self.checkpoint)
-            .with_context(|| format!("reading the base {} pins", self.checkpoint.display()))
+        frontend::model::assets::pipeline::pinned_snapshot(self.checkpoint())
+            .with_context(|| format!("reading the base {} pins", self.checkpoint().display()))
     }
 
     /// The media checkpoint's typed configuration, the base it pins included.
     fn media_config(&self) -> Result<minimax_h3::Config> {
         let base = self.media_base()?;
-        Ok(minimax_h3::Config::read(&self.checkpoint, base.as_deref())?)
+        Ok(minimax_h3::Config::read(
+            self.checkpoint(),
+            base.as_deref(),
+        )?)
     }
 
     /// The runners a media rank serves `device` with: one per block the pipeline holds.
@@ -1001,11 +1005,11 @@ impl EpochPlan {
                 device.0
             );
         }
-        let longest = self.build.model.max_model_len.map(|length| length.get()).context(
+        let longest = self.engine_config().model.max_model_len.map(|length| length.get()).context(
             "a deployment of the media class states no `max_model_len`, and its prompt capacities \
              are checked against it",
         )?;
-        let capacities = prompt_capacities(&self.build.video, longest)?;
+        let capacities = prompt_capacities(&self.engine_config().video, longest)?;
         // The checkpoint's own statement of what it serves, read once: the candidates are per task,
         // and a task the checkpoint does not serve gets no graph.
         let config = self.media_config()?;
@@ -1015,13 +1019,14 @@ impl EpochPlan {
             .or(pipeline.transformer_ref())
             .context("the checkpoint holds no transformer, so no denoising step could run")?;
         let ladder = denoiser.rules().condition_ladder();
-        let candidates = media_candidates(&tasks, &self.build.video, &capacities, &ladder)?;
+        let candidates =
+            media_candidates(&tasks, &self.engine_config().video, &capacities, &ladder)?;
 
         // The buckets the deployment captures: an encode bucket per (rows, prompt capacity) and a
         // decode bucket per canvas. A denoiser derives its own from the candidates it walks, so the
         // set here is what the encoder and the decoder are bound with.
         let mut encode_buckets: Vec<executor::plan::Bucket> = Vec::new();
-        let rows = u32::try_from(self.build.max_running_requests.get())
+        let rows = u32::try_from(self.engine_config().max_running_requests.get())
             .context("more request slots than the protocol addresses")?;
         for capacity in &capacities {
             for row in 1..=rows {
@@ -1053,7 +1058,7 @@ impl EpochPlan {
         // The encoder writes its hidden states in the deployment's effective type, which the daemon
         // resolved against the checkpoint before it wrote this build config (a `dtype` of `auto`
         // never reaches a main process as `auto`).
-        let dtype = match self.build.model.dtype {
+        let dtype = match self.engine_config().model.dtype {
             proto::request::ModelDtype::Float16 => DType::F16,
             proto::request::ModelDtype::BFloat16 => DType::BF16,
             proto::request::ModelDtype::Float32 => DType::F32,
@@ -1284,7 +1289,7 @@ impl EpochPlan {
                     // and the head's own precision would decide a token from the last bit.
                     logits_dtype: DType::F32,
                     vocabulary: narrow(model.config().vocab_size, "vocab_size")?,
-                    slots: u32::try_from(self.build.max_running_requests.get())
+                    slots: u32::try_from(self.engine_config().max_running_requests.get())
                         .context("more request slots than the protocol addresses")?,
                     // A request may ask for any top-k it likes, so the candidate width is the
                     // vocabulary: a narrower buffer would silently sample a different set.
@@ -1345,7 +1350,7 @@ impl EpochPlan {
         served_tasks(
             &config.serving(),
             self.capability_groups(),
-            &self.checkpoint,
+            self.checkpoint(),
         )
     }
 
@@ -1356,7 +1361,7 @@ impl EpochPlan {
     /// as well. Such a deployment states no block to split, so it states no sequence degree and
     /// chooses no network of a checkpoint that holds two.
     fn capability_groups(&self) -> Option<&[engine::WorkerGroupConfig]> {
-        let groups = &self.build.parallel.worker_groups;
+        let groups = &self.engine_config().parallel.worker_groups;
         groups
             .iter()
             .any(|group| {
@@ -1398,13 +1403,13 @@ impl EpochPlan {
         experts: &qwen3_moe::load::ExpertOrder,
     ) -> Result<Served> {
         let mapping = &self.mapping;
-        match ModelClass::of(&self.checkpoint)? {
+        match ModelClass::of(self.checkpoint())? {
             ModelClass::CausalLm => {
                 // §8: the checkpoint's own representation stands unless the deployment fixed
                 // another, which is the build config's `dtype` and `quantization`.
-                let opened = nn::Checkpoint::open(&self.checkpoint)?;
+                let opened = nn::Checkpoint::open(self.checkpoint())?;
                 let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
-                let config = qwen3_moe::Config::read(&self.checkpoint)?;
+                let config = qwen3_moe::Config::read(self.checkpoint())?;
                 let partition = qwen3_moe::Partition::new(
                     &config,
                     mapping.tensor_parallel as usize,
@@ -1415,7 +1420,7 @@ impl EpochPlan {
                 // The checkpoint states its own representation: a calibrated export is read packed,
                 // and a dense one dense. The layout is the one the serving programs are built for.
                 let model = qwen3_moe::load::load_placed(
-                    &self.checkpoint,
+                    self.checkpoint(),
                     partition,
                     &mut loader,
                     mapping.load_options,
@@ -1430,8 +1435,8 @@ impl EpochPlan {
                 // main process as `auto`: it arrives as the checkpoint's own type).
                 let base = self.media_base()?;
                 let opened = match &base {
-                    Some(base) => nn::Checkpoint::open_roots(&[&self.checkpoint, base])?,
-                    None => nn::Checkpoint::open(&self.checkpoint)?,
+                    Some(base) => nn::Checkpoint::open_roots(&[self.checkpoint(), base])?,
+                    None => nn::Checkpoint::open(self.checkpoint())?,
                 };
                 let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
                 let config = self.media_config()?;
@@ -1443,7 +1448,7 @@ impl EpochPlan {
                 // groups carry that page as the daemon read it.
                 let (ulysses, tensor_parallel, tensor_rank, sequence_rank) = media_parallel(
                     self.capability_groups(),
-                    &self.group,
+                    &self.launch.group,
                     self.rank,
                     mapping.tensor_parallel,
                     mapping.tensor_rank,
@@ -1468,7 +1473,7 @@ impl EpochPlan {
                 // the layout's capacity is what the deployment prepared (`packing.py:557`,
                 // `denoiser.py:411`).
                 let longest = self
-                    .build
+                    .engine_config()
                     .model
                     .max_model_len
                     .map(|length| length.get())
@@ -1476,7 +1481,7 @@ impl EpochPlan {
                         "a deployment of the media class states no `max_model_len`, and its prompt \
                      capacities are checked against it",
                     )?;
-                let capacities = prompt_capacities(&self.build.video, longest)?;
+                let capacities = prompt_capacities(&self.engine_config().video, longest)?;
                 let text_capacity = *capacities.last().context(
                     "this deployment states no prompt capacity, so no layout could hold a prompt",
                 )?;
@@ -1501,7 +1506,7 @@ impl EpochPlan {
                 // follow their rasters, which the task's own default cannot know.
                 let partition = partition.sized(
                     text_capacity,
-                    self.build
+                    self.engine_config()
                         .video
                         .max_condition_rows
                         .unwrap_or(partition.condition_rows),
@@ -1511,12 +1516,12 @@ impl EpochPlan {
                         .blocks
                         .with(minimax_h3::Component::VideoPostprocessor),
                 );
-                let dtype = match self.build.model.dtype {
+                let dtype = match self.engine_config().model.dtype {
                     proto::request::ModelDtype::Float16 => DType::F16,
                     proto::request::ModelDtype::BFloat16 => DType::BF16,
                     proto::request::ModelDtype::Float32 => DType::F32,
                 };
-                let canvases = deployment_canvases(&self.build.video)?;
+                let canvases = deployment_canvases(&self.engine_config().video)?;
                 let model =
                     minimax_h3::load(&opened, partition, Some(dtype), &canvases, &mut loader)?;
                 // **One number, checked where both halves meet.** The partition above takes the
@@ -1558,26 +1563,34 @@ impl EpochPlan {
             .devices
             .first()
             .context("this rank serves no device to open its resident memory on")?;
-        let host = host_name()?;
+        // The rank's host identity is the daemon's, from the launch file: the storage claim, the
+        // deployment file's host names and the scheduler's storages are keyed by it, and a rank
+        // that reported the machine's name instead would read its own Storage Server as another
+        // host's wherever the two names differ.
+        let host = self.launch.host.as_str();
         // What one batch may be, in the class's own terms: a causal-language rank admits up to the
         // largest bucket its catalog captured (`Graphs` refuses anything larger before a kernel
         // runs, so the catalog is its bound and not an estimate), and a media rank admits the
         // deployment's requests at the widest prompt capacity it captures.
-        let (rows, tokens) =
-            match served {
-                Served::Text(_) => self.buckets.bounds(),
-                Served::Media(_) => {
-                    let longest = self.build.model.max_model_len.map(|length| length.get()).context(
-                    "a deployment of the media class states no `max_model_len`, and its prompt \
+        let (rows, tokens) = match served {
+            Served::Text(_) => self.buckets.bounds(),
+            Served::Media(_) => {
+                let longest = self
+                    .engine_config()
+                    .model
+                    .max_model_len
+                    .map(|length| length.get())
+                    .context(
+                        "a deployment of the media class states no `max_model_len`, and its prompt \
                      capacities are checked against it",
-                )?;
-                    (
-                        u32::try_from(self.build.max_running_requests.get())
-                            .context("more request slots than the protocol addresses")?,
-                        prompt_capacity(&self.build.video, longest)?,
-                    )
-                }
-            };
+                    )?;
+                (
+                    u32::try_from(self.engine_config().max_running_requests.get())
+                        .context("more request slots than the protocol addresses")?,
+                    prompt_capacity(&self.engine_config().video, longest)?,
+                )
+            }
+        };
         // Everything the engine states about the rank, and what the rank reports of itself. The two
         // differ in one field between the classes: a rank that keeps a paged cache states its
         // geometry and a rank that keeps none states its absence, and each planner refuses the
@@ -1601,38 +1614,38 @@ impl EpochPlan {
                 let facts = executor::capacity::RankFacts {
                     device: executor::config::Device::Cuda(device),
                     host: &host,
-                    world: self.cache_world.unwrap_or(self.world),
+                    world: self.cache_world.unwrap_or(self.launch.world),
                     world_size: self.world_size,
-                    queue_depth: self.queue_depth,
+                    queue_depth: self.queue_depth(),
                     // The model's page is the preset: the plan returns it or fails, and a plan that
                     // lowered it would leave every runner addressing pages the pool does not hold.
                     block_size: Some(model.page_tokens()),
                     max_batch_calls: rows as usize,
                     max_batch_tokens: tokens as usize,
-                    max_request_pool_size: self.build.max_running_requests.get(),
+                    max_request_pool_size: self.engine_config().max_running_requests.get(),
                     max_model_len: self.max_kv_len(served)? as usize,
                     max_total_tokens: self
-                        .build
+                        .engine_config()
                         .kv_cache
                         .max_tokens
                         .map(|tokens| usize::try_from(tokens.get()))
                         .transpose()
                         .context("kv_cache_config.max_tokens")?,
                     segments: self.adopted_cache.clone(),
-                    mem_fraction_static: self.build.mem_fraction_static,
+                    mem_fraction_static: self.engine_config().mem_fraction_static,
                     cache: Some(cache),
-                    kv_dtype: cache_dtype(model, self.build.kv_cache.dtype)?,
+                    kv_dtype: cache_dtype(model, self.engine_config().kv_cache.dtype)?,
                     transport_bytes: self.transport_bytes(device, model)?,
                 };
-                (facts, rank_report(device, &host)?)
+                (facts, rank_report(device, host)?)
             }
             Served::Media(_) => {
                 let facts = executor::capacity::RankFacts {
                     device: executor::config::Device::Cuda(device),
                     host: &host,
-                    world: self.world,
+                    world: self.launch.world,
                     world_size: self.world_size,
-                    queue_depth: self.queue_depth,
+                    queue_depth: self.queue_depth(),
                     // No page and no cache: the media class addresses no paged request, so the
                     // three figures a cache is described by are absent. `kv_dtype` is the
                     // deployment's own setting, kept here because the struct states one and the
@@ -1640,16 +1653,16 @@ impl EpochPlan {
                     block_size: None,
                     max_batch_calls: rows as usize,
                     max_batch_tokens: tokens as usize,
-                    max_request_pool_size: self.build.max_running_requests.get(),
+                    max_request_pool_size: self.engine_config().max_running_requests.get(),
                     max_model_len: self.max_kv_len(served)? as usize,
                     max_total_tokens: None,
                     segments: None,
-                    mem_fraction_static: self.build.mem_fraction_static,
+                    mem_fraction_static: self.engine_config().mem_fraction_static,
                     cache: None,
                     // The media plan fits no cache, so this figure is never read: it states the
                     // element type the rank's states are held in, which is the deployment's own
                     // model type rather than a cache setting the deployment did not make.
-                    kv_dtype: match self.build.model.dtype {
+                    kv_dtype: match self.engine_config().model.dtype {
                         proto::request::ModelDtype::Float16 => ipc::PrefixCacheDtype::Float16,
                         proto::request::ModelDtype::BFloat16 => ipc::PrefixCacheDtype::BFloat16,
                         proto::request::ModelDtype::Float32 => ipc::PrefixCacheDtype::Float32,
@@ -1657,7 +1670,8 @@ impl EpochPlan {
                     transport_bytes: 0,
                 };
                 let clips = frame_clips()?;
-                let frames = (self.build.video.max_seconds * f64::from(minimax_h3::FPS)).round();
+                let frames =
+                    (self.engine_config().video.max_seconds * f64::from(minimax_h3::FPS)).round();
                 let Served::Media(pipeline) = served else {
                     bail!("a media rank's report reads the media pipeline it holds");
                 };
@@ -1678,7 +1692,7 @@ impl EpochPlan {
                 } else {
                     "transformer"
                 };
-                (facts, media_rank_report(device, &host, bounds, denoiser)?)
+                (facts, media_rank_report(device, host, bounds, denoiser)?)
             }
         };
         // The ranks of this process agree over the group the main process formed at start, and a
@@ -1738,16 +1752,17 @@ impl EpochPlan {
             let config = self.media_config()?;
             info.video_denoiser = Some(denoiser_report(
                 pipeline,
-                &self.build.video,
+                &self.engine_config().video,
                 &self.media_tasks(&config)?,
             )?);
         }
         Ok((memory, info, graph))
     }
 
-    /// Requests this rank's scheduler may have in flight (launch: `scheduling.max_running_requests`).
+    /// Batches this rank's schedulers keep in flight, which the capacity plan relays through (the
+    /// launch's `queue_depth`).
     pub(crate) fn queue_depth(&self) -> usize {
-        self.queue_depth
+        self.launch.queue_depth as usize
     }
 
     /// The ranks of this process's group; one process holds one pool, so it is the deployment's.
@@ -1757,7 +1772,7 @@ impl EpochPlan {
 
     /// The keys a row reads at most: the cache's bound, from the epoch's context length.
     pub(crate) fn max_kv_len(&self, served: &Served) -> Result<u32> {
-        if let Some(length) = self.build.model.max_model_len {
+        if let Some(length) = self.engine_config().model.max_model_len {
             return Ok(length.get());
         }
         match served {
@@ -2156,20 +2171,6 @@ fn cache_dtype(
         DType::F8E4M3 => Ok(proto::request::PrefixCacheDtype::Float8E4m3Fn),
         other => bail!("this build plans no KV cache in a model whose activations are {other:?}"),
     }
-}
-
-/// This host's name, as `gethostname(2)` gives it: the report's host identity (§2.3).
-fn host_name() -> Result<String> {
-    let mut name = [0_u8; 256];
-    // SAFETY: gethostname writes at most `name.len()` bytes into `name`.
-    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("reading the host name");
-    }
-    let length = name
-        .iter()
-        .position(|byte| *byte == 0)
-        .unwrap_or(name.len());
-    String::from_utf8(name[..length].to_vec()).context("the host name is not UTF-8")
 }
 
 /// The page size the resident cache was planned with, checked against the model's (§4.5, §8).
