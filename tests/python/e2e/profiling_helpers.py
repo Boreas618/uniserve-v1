@@ -61,9 +61,11 @@ def stop_storage_server(socket: Path) -> None:
 
 
 @contextmanager
-def serve(tmp_path: Path, options: Sequence[str]) -> Iterator[str]:
-    """Serve Qwen3 under ``options`` (``--set`` assignments) until the block
-    ends; yields the base URL.
+def serve(
+    tmp_path: Path, options: Sequence[str], program_server: Path
+) -> Iterator[str]:
+    """Serve Qwen3 under ``options`` (``--set`` assignments), its programs from
+    the host's ``program_server``, until the block ends; yields the base URL.
     """  # noqa: D205
     runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     port = find_free_port()
@@ -80,6 +82,8 @@ def serve(tmp_path: Path, options: Sequence[str]) -> Iterator[str]:
         str(port),
         "--worker-executable",
         str(worker_executable()),
+        "--program-server",
+        str(program_server),
     ]
     for option in options:
         command += ["--set", option]
