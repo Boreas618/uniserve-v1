@@ -1,8 +1,8 @@
 """Per-head RMS normalization and rotation of queries and keys: the Triton
 source of the ``qk_norm_rope`` operator.
 
-One program normalizes and rotates the query heads and the key heads of a block
-of ``ROWS`` tokens. Each head's row is normalized by its own RMS with FP32
+One program normalizes and rotates ``ROWS`` head rows, the query heads' or the
+key heads', a token holding one row per head. Each head's row is normalized by its own RMS with FP32
 statistics — over the whole head, so the channels that do not rotate are
 normalized too — and then rotated by the token's cosine and sine factors:
 split-half rotation ("half") or adjacent-pair rotation ("interleaved"). Only the
@@ -116,6 +116,57 @@ def _turned_head(
 
 
 @triton.jit
+def _turned_rows(
+    source,
+    weight,
+    cosine_ptr,
+    sine_ptr,
+    out,
+    first,
+    rows,
+    HEADS: tl.constexpr,  # noqa: N803
+    DIM: tl.constexpr,
+    ROTATED: tl.constexpr,  # noqa: N803
+    PAIRS: tl.constexpr,  # noqa: N803
+    ROWS: tl.constexpr,
+    INTERLEAVED: tl.constexpr,
+    AFFINE: tl.constexpr,  # noqa: N803
+    epsilon,
+):
+    """Normalize and rotate the ``ROWS`` head rows from ``first`` of ``rows``.
+
+    A tensor of ``[tokens, HEADS, DIM]`` is ``tokens * HEADS`` head rows, so a row's offset is its
+    index and its token is that index over the heads.
+    """
+    row = first + tl.arange(0, ROWS)
+    live = row < rows
+    token = row // HEADS
+
+    # One factor pair per turned feature, shared by every head of the token.
+    pair = tl.arange(0, PAIRS)
+    factors = token[:, None] * (ROTATED // 2) + pair[None, :]
+    factor_mask = live[:, None] & (pair < ROTATED // 2)[None, :]
+    cosine = tl.load(cosine_ptr + factors, mask=factor_mask, other=0.0)
+    sine = tl.load(sine_ptr + factors, mask=factor_mask, other=0.0)
+
+    _turned_head(
+        source,
+        weight,
+        cosine,
+        sine,
+        out,
+        row * DIM,
+        live,
+        DIM,
+        ROTATED,
+        PAIRS,
+        INTERLEAVED,
+        AFFINE,
+        epsilon,
+    )
+
+
+@triton.jit
 def _norm_rope(
     query_ptr,
     key_ptr,
@@ -136,47 +187,46 @@ def _norm_rope(
     INTERLEAVED: tl.constexpr,
     AFFINE: tl.constexpr,  # noqa: N803
 ):
-    """The block's work: every query head, then every key head."""
+    """The block's work: ``ROWS`` query head rows, or ``ROWS`` key head rows.
+
+    The first programs take the query rows and the rest the key rows, so a step of few tokens still
+    spreads its heads over the device instead of walking them in one program.
+    """
     program = tl.program_id(0).to(tl.int64)
-    token = program * ROWS + tl.arange(0, ROWS)
-    live = token < tokens
-
-    # One factor pair per turned feature, shared by every head of the token.
-    pair = tl.arange(0, PAIRS)
-    factors = token[:, None] * (ROTATED // 2) + pair[None, :]
-    factor_mask = live[:, None] & (pair < ROTATED // 2)[None, :]
-    cosine = tl.load(cosine_ptr + factors, mask=factor_mask, other=0.0)
-    sine = tl.load(sine_ptr + factors, mask=factor_mask, other=0.0)
-
-    for head in tl.range(0, Q_HEADS):
-        _turned_head(
+    query_rows = tokens * Q_HEADS
+    query_programs = tl.cdiv(query_rows, ROWS)
+    if program < query_programs:
+        _turned_rows(
             query_ptr,
             q_weight_ptr,
-            cosine,
-            sine,
+            cosine_ptr,
+            sine_ptr,
             q_out_ptr,
-            (token * Q_HEADS + head) * DIM,
-            live,
+            program * ROWS,
+            query_rows,
+            Q_HEADS,
             DIM,
             ROTATED,
             PAIRS,
+            ROWS,
             INTERLEAVED,
             AFFINE,
             epsilon,
         )
-
-    for head in tl.range(0, K_HEADS):
-        _turned_head(
+    else:
+        _turned_rows(
             key_ptr,
             k_weight_ptr,
-            cosine,
-            sine,
+            cosine_ptr,
+            sine_ptr,
             k_out_ptr,
-            (token * K_HEADS + head) * DIM,
-            live,
+            (program - query_programs) * ROWS,
+            tokens * K_HEADS,
+            K_HEADS,
             DIM,
             ROTATED,
             PAIRS,
+            ROWS,
             INTERLEAVED,
             AFFINE,
             epsilon,
