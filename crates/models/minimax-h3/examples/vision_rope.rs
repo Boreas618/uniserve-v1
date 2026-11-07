@@ -11,7 +11,7 @@
 //! ```text
 //! cargo run -q -p minimax-h3 --example vision_rope -- --root /workspace/models/MiniMax-H3 \
 //!     --height 4 --width 4 --merge 2 --out artifacts/h3-vision-rope
-//! .venv/bin/python crates/models/minimax-h3/tools/compare_rope_factors.py --vision \
+//! python crates/models/minimax-h3/tools/compare_rope_factors.py --vision \
 //!     artifacts/h3-vision-rope --checkpoint /workspace/models/MiniMax-H3
 //! ```
 

@@ -17,7 +17,7 @@
 //! cargo run -q -p minimax-h3 --example encoder_rope -- --root /workspace/models/MiniMax-H3 \
 //!     --prompt-ids 32,2518,38835,8473,3941,264,89773,2070,518,38393,11,8413,3100,11,6884 \
 //!     --out artifacts/h3-stage4/rope
-//! .venv/bin/python crates/models/minimax-h3/tools/compare_rope_factors.py \
+//! python crates/models/minimax-h3/tools/compare_rope_factors.py \
 //!     --case artifacts/h3-stage4/rope --checkpoint /workspace/models/MiniMax-H3
 //! ```
 //!
