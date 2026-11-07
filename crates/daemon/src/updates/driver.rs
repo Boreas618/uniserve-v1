@@ -19,15 +19,19 @@
 //! arrives after that is dropped, since the epoch record it would have
 //! advanced is already final.
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use serde_json::Value;
 
-use crate::epoch::{Deployment, Epochs};
+use crate::epoch::{Deployment, Epochs, Failure};
+use crate::interference::StepTime;
 use crate::leader::UpdateError;
 use crate::updates::change::Applied;
 use crate::updates::epoch::{EpochChange, epoch_arm};
 use crate::updates::switch::{Phase, Roster, Switch};
+use crate::updates::trial::Trial;
 
 /// The trait object the daemon constructs once: the adapter b02 builds over
 /// `supervision`, behind a box so `Leader` names only this type.
@@ -43,6 +47,32 @@ pub(crate) struct Driver {
 struct State {
     roster: RosterHandle,
     switch: Option<Switch>,
+    /// The trial of the update on probation, whichever layer's it is.
+    trial: Option<Arc<Trial>>,
+    /// The serving epoch's steps against their baseline while the running
+    /// switch's target prepares.
+    transfers: Option<Arc<Mutex<StepTime>>>,
+    /// What the running switch's warming read.
+    warming: Option<Value>,
+    /// What the last update that ended reported, which the status keeps.
+    last: Option<Value>,
+}
+
+impl State {
+    /// `report` with what the update's trial and transfers read.
+    fn completed(&self, mut report: Value) -> Value {
+        if let Some(trial) = &self.trial {
+            report["trial"] = trial.report(crate::leader::outcomes());
+        }
+        if let Some(steps) = &self.transfers {
+            report["transfers"] = serde_json::to_value(*crate::leader::locked(steps))
+                .unwrap_or_default();
+        }
+        if let Some(warming) = &self.warming {
+            report["warming"] = warming.clone();
+        }
+        report
+    }
 }
 
 impl std::fmt::Debug for Driver {
@@ -60,6 +90,10 @@ impl Driver {
             state: Mutex::new(State {
                 roster,
                 switch: None,
+                trial: None,
+                transfers: None,
+                warming: None,
+                last: None,
             }),
         }
     }
@@ -80,7 +114,7 @@ impl Driver {
         dry_run: bool,
     ) -> Result<Option<Applied>, UpdateError> {
         let mut state = self.lock();
-        let State { roster, switch } = &mut *state;
+        let State { roster, switch, .. } = &mut *state;
         epoch_arm(
             previous,
             target,
@@ -98,7 +132,7 @@ impl Driver {
     /// switch once it ended.
     pub(crate) fn advance(&self) {
         let mut state = self.lock();
-        let State { roster, switch } = &mut *state;
+        let State { roster, switch, .. } = &mut *state;
         let Some(running) = switch.as_mut() else {
             // No switch to advance: a report of a finished update is dropped,
             // but the roster's feed is still drained so it cannot grow.
@@ -106,14 +140,27 @@ impl Driver {
             return;
         };
         running.advance(roster);
-        if matches!(running.phase(), Phase::Purged | Phase::Abandoned) {
-            // The update that ended is the deployment's last, reverted or
-            // committed: the epoch layer keeps it, so applying the same
-            // target again asks for `force` (§7.2, §7.3 step 4) and the
-            // status reports why it was unavailable.
-            self.epochs.set_update(running.update().clone());
-            *switch = None;
+        self.settle(&mut state);
+    }
+
+    /// Frees the slot of a switch that ended. The update that ended is the
+    /// deployment's last, reverted or committed: the epoch layer keeps it, so
+    /// applying the same target again asks for `force` (§7.2, §7.3 step 4) and
+    /// the status reports why it was unavailable.
+    fn settle(&self, state: &mut State) {
+        let Some(running) = state.switch.as_ref() else {
+            return;
+        };
+        if !matches!(running.phase(), Phase::Purged | Phase::Abandoned) {
+            return;
         }
+        self.epochs.set_update(running.update().clone());
+        let report = crate::updates::epoch::report(running);
+        state.last = Some(state.completed(report));
+        state.trial = None;
+        state.transfers = None;
+        state.warming = None;
+        state.switch = None;
     }
 
     /// Whether no switch runs: the one that ran was committed or returned to the previous epoch.
@@ -129,10 +176,23 @@ impl Driver {
         }
     }
 
+    /// Whether the running switch waits only for what the daemon gives its target: every node's
+    /// target parked. `None` when no switch prepares any more, which ends such a wait.
+    pub(crate) fn parked(&self) -> Option<bool> {
+        let state = self.lock();
+        let running = state.switch.as_ref()?;
+        (running.phase() == Phase::Preparing).then(|| running.parked_everywhere())
+    }
+
+    /// The warming ended as `warming` states, which the update reports.
+    pub(crate) fn warmed(&self, warming: Value) {
+        self.lock().warming = Some(warming);
+    }
+
     /// The running switch's target on `host` took its programs.
     pub(crate) fn handed(&self, host: &str) {
         let mut state = self.lock();
-        let State { roster, switch } = &mut *state;
+        let State { roster, switch, .. } = &mut *state;
         if let Some(running) = switch.as_mut() {
             running.handed(roster, host);
         }
@@ -142,7 +202,7 @@ impl Driver {
     /// commit; the acknowledgement arrives through [`Driver::advance`].
     pub(crate) fn commit(&self) -> bool {
         let mut state = self.lock();
-        let State { roster, switch } = &mut *state;
+        let State { roster, switch, .. } = &mut *state;
         let Some(running) = switch.as_mut() else {
             return false;
         };
@@ -154,12 +214,86 @@ impl Driver {
     /// switch was there to revert.
     pub(crate) fn rollback(&self, reason: &str) -> bool {
         let mut state = self.lock();
-        let State { roster, switch } = &mut *state;
+        let State { roster, switch, .. } = &mut *state;
         let Some(running) = switch.as_mut() else {
             return false;
         };
         running.revert(roster, reason.to_owned());
         true
+    }
+
+    /// The trial's `failure` reverts the update on probation (§7.3 step 4):
+    /// `false` when no switch stands on probation, so a threshold read while
+    /// the update ended decides nothing.
+    pub(crate) fn fail_trial(&self, failure: Failure) -> bool {
+        let mut state = self.lock();
+        let State { roster, switch, .. } = &mut *state;
+        let Some(running) = switch.as_mut() else {
+            return false;
+        };
+        if running.phase() != Phase::Probation {
+            return false;
+        }
+        running.revert_with(roster, failure);
+        true
+    }
+
+    /// `trial` decides the update in flight from now on, and the status
+    /// reports it.
+    pub(crate) fn begin_trial(&self, trial: Arc<Trial>) {
+        self.lock().trial = Some(trial);
+    }
+
+    /// The trial of a program-layer update ended: what it read stays as the
+    /// report of the last update.
+    pub(crate) fn end_trial(&self, report: Value) {
+        let mut state = self.lock();
+        state.last = Some(state.completed(report));
+        state.trial = None;
+    }
+
+    /// `steps` holds the serving epoch's steps against their baseline while
+    /// the target prepares, which the status reports.
+    pub(crate) fn watch_transfers(&self, steps: Arc<Mutex<StepTime>>) {
+        self.lock().transfers = Some(steps);
+    }
+
+    /// When the running switch's switchover began, and the previous epoch's
+    /// number and launch generation; `None` before it began.
+    pub(crate) fn promotion(&self) -> Option<(Instant, (u64, u64))> {
+        let state = self.lock();
+        let running = state.switch.as_ref()?;
+        Some((running.promotion()?, running.previous()))
+    }
+
+    /// The hosts where the previous epoch's processes have to start again for
+    /// the running switch's revert.
+    pub(crate) fn relaunch_due(&self) -> BTreeSet<String> {
+        self.lock()
+            .switch
+            .as_ref()
+            .map(|running| running.relaunch_due().clone())
+            .unwrap_or_default()
+    }
+
+    /// The previous epoch's process on `host` ended for the trial.
+    pub(crate) fn previous_ended(&self, host: &str) {
+        let mut state = self.lock();
+        let State { roster, switch, .. } = &mut *state;
+        if let Some(running) = switch.as_mut() {
+            running.previous_ended(roster, host);
+        }
+    }
+
+    /// The previous epoch serves again on `host`, at the launch generation
+    /// `generation` its owner started it at.
+    pub(crate) fn relaunched(&self, host: &str, generation: u64) {
+        let mut state = self.lock();
+        let State { roster, switch, .. } = &mut *state;
+        if let Some(running) = switch.as_mut() {
+            running.serving(roster, host, generation);
+        }
+        self.settle(&mut state);
     }
 
     /// The running switch's phase, `None` when nothing runs.
@@ -169,10 +303,22 @@ impl Driver {
 
     /// The running switch as the operator sees it, `None` when nothing runs.
     pub(crate) fn report(&self) -> Option<Value> {
-        self.lock()
-            .switch
-            .as_ref()
-            .map(crate::updates::epoch::report)
+        let state = self.lock();
+        let report = state.switch.as_ref().map(crate::updates::epoch::report)?;
+        Some(state.completed(report))
+    }
+
+    /// The update as the status reports it: the one in flight, else the one
+    /// that ended last.
+    pub(crate) fn status(&self) -> Option<Value> {
+        self.report().or_else(|| {
+            let state = self.lock();
+            if state.trial.is_some() {
+                let update = serde_json::json!({ "change": "program", "phase": "probation" });
+                return Some(state.completed(update));
+            }
+            state.last.clone()
+        })
     }
 
     /// Whether an update is in flight.
@@ -308,8 +454,10 @@ mod tests {
                 },
                 environment: HashMap::new(),
             },
+            previous_world: 11,
             previous_generation: 5,
             spawn_generation: 7,
+            keeps: crate::options::PreviousWorld::Parked,
         }
     }
 

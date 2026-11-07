@@ -29,15 +29,21 @@
 //!    the last drained epoch. From the frontend's `Serve` on, a dead target is
 //!    not a drop: the previous epoch must serve again, and it was parked at
 //!    the switchover rather than ended (§7.4).
-//! 4. **Probation**, recorded once the drain completed: a failure the target
-//!    reports, or a target process that exits, reverts.
+//! 4. **Probation**, recorded once the drain completed. The previous epoch is
+//!    kept as `update_config.previous_world` states: drained and alive, or its
+//!    processes stopped and its weights kept ([`Roster::keep_weights`]). A
+//!    failure the target reports, a target process that exits, or a threshold of
+//!    `update_config.rollback` ([`crate::updates::trial`]) reverts.
 //! 5. **Commit** records the target as serving once it acknowledges, stops
 //!    the old generation and purges and retires the previous world; **revert**
-//!    commands the target back (`Revert`), returns the parked previous epoch
-//!    to serving once every target acknowledged, serves the frontend only
-//!    once every host serves, stops the target generation, records it purged
-//!    and marks the target configuration
-//!    unavailable, so applying it again needs `force`.
+//!    drains the target (a target that failed is stopped instead), returns the
+//!    previous epoch to serving once every target ended its requests, serves
+//!    the frontend only once every host serves, stops the target generation,
+//!    records it purged and marks the target configuration unavailable, so
+//!    applying it again needs `force`. A previous epoch whose processes are gone
+//!    is started again on the weights it kept, by whoever owns its engine: the
+//!    switch names it ([`Switch::relaunch_due`]) and is told it serves
+//!    ([`Switch::serving`]).
 //!
 //! A world dropped before the switchover is kept in [`Switch::discarded`] and
 //! passed in the next claim's `retire`: storage ends only through a claim,
@@ -50,6 +56,7 @@ use std::time::{Duration, Instant};
 use proto::process::{self, Report, Spawn};
 
 use crate::epoch::{EpochRecord, Epochs, Failure, Status, Update};
+use crate::options::PreviousWorld;
 
 /// A node of the deployment the switch starts main processes on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +122,17 @@ pub(crate) struct Spawned {
     pub(crate) pid: u32,
 }
 
+/// What a node did with a previous epoch's storage (`Roster::keep_weights`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct KeptWeights {
+    /// The storages the node's server released.
+    pub(crate) released: u64,
+    /// The bytes of weights it moved to host storage.
+    pub(crate) moved_bytes: u64,
+    /// Why it kept the weights on its GPUs although host storage was asked.
+    pub(crate) refused: Option<String>,
+}
+
 /// What the switch asks of the nodes: claim a world's storage, start and
 /// stop main processes, command one generation's main process, command the
 /// frontend, and take the events that arrive. The daemon's supervision is
@@ -154,14 +172,18 @@ pub(crate) trait Roster {
     ///
     /// Its main processes were parked at the switchover, not ended (§7.4:
     /// the serving epoch is parked at the step boundary, and the old epoch's
-    /// main processes exit at purge), so the normal path is `Serve { epoch:
-    /// previous }` to them, at the launch generation they always had — the
-    /// model generation travels inside the command, not in `generation`.
-    /// Only when those processes are gone does the epoch layer start a fresh
-    /// generation instead (spawn, claim, park, promote), which the switch
-    /// waits for exactly as it waits for the parked ones. Either way the
-    /// switch learns the host serves through `serving`.
+    /// main processes exit at purge), so this is `Serve { epoch: previous }`
+    /// to them, at the launch generation they always had — the model
+    /// generation travels inside the command, not in `generation`. The switch
+    /// learns the host serves through `serving`.
     fn resume(&mut self, host: &str, generation: u64, reason: &str);
+    /// Retains `world`'s weights on `host` once its processes exited, and
+    /// releases the rest of its exclusive storage; with `to_host` the weights
+    /// it alone retains move to host storage. Answers what the node did.
+    fn keep_weights(&mut self, host: &str, world: u64, to_host: bool) -> Result<KeptWeights, String> {
+        let _ = (host, world, to_host);
+        Ok(KeptWeights::default())
+    }
     /// Takes the events that arrived since the last call.
     fn events(&mut self) -> Vec<Event>;
 }
@@ -205,6 +227,10 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
 
     fn resume(&mut self, host: &str, generation: u64, reason: &str) {
         (**self).resume(host, generation, reason)
+    }
+
+    fn keep_weights(&mut self, host: &str, world: u64, to_host: bool) -> Result<KeptWeights, String> {
+        (**self).keep_weights(host, world, to_host)
     }
 
     fn events(&mut self) -> Vec<Event> {
@@ -261,6 +287,10 @@ pub(crate) struct Switch {
     awaiting_programs: BTreeSet<String>,
     /// The previous epoch's number, which `Serve` and `Drain` name.
     previous: u64,
+    /// The world the previous epoch executes, whose storage a claim retires
+    /// or keeps: the epoch a deployment starts with is number 0, its world the
+    /// first engine's.
+    previous_world: u64,
     /// The launch generation the target's children are started at.
     ///
     /// The epoch layer chooses it and owes the switch one property: it is
@@ -320,7 +350,26 @@ pub(crate) struct Switch {
     switchover_started: Option<Instant>,
     /// The operator committed before the trial began (`Switch::commit`).
     commit_asked: bool,
+    /// The operator reverted before the trial began (`Switch::revert`).
+    revert_asked: Option<Failure>,
     pause: Option<Duration>,
+    /// What the previous epoch keeps through the trial
+    /// (`update_config.previous_world`).
+    keeps: PreviousWorld,
+    /// What it keeps as the trial goes: `keeps`, or `weights` once a node
+    /// refused to move the weights to host storage.
+    kept: PreviousWorld,
+    /// Each node's reason for keeping the weights on its GPUs.
+    host_refused: Vec<String>,
+    /// The bytes of weights the nodes moved to host storage.
+    moved_bytes: u64,
+    /// Whether the trial stopped the previous epoch's processes: a revert then
+    /// starts them again, exited or not.
+    previous_stopped: bool,
+    /// Hosts whose stopped previous-epoch main process exited.
+    previous_exited: BTreeSet<String>,
+    /// Hosts that have to start the previous epoch again before it can serve.
+    relaunch_due: BTreeSet<String>,
     /// Whether a serving main process of the previous epoch exited during the
     /// switch, which hands the failure domain to the standby promotion
     /// (§2.5) instead of a revert.
@@ -328,8 +377,8 @@ pub(crate) struct Switch {
 }
 
 impl Switch {
-    /// A switch of epoch `previous` (launch generation `previous_generation`)
-    /// to epoch `target`, whose record is `record`, with the target's
+    /// A switch of epoch `previous` of world `previous_world` (launch generation
+    /// `previous_generation`) to epoch `target`, whose record is `record`, with the target's
     /// children started at `spawn_generation` — above every live generation
     /// of the group and rank, the serving epoch's standby included —
     /// retiring `discarded`, the worlds an earlier switch dropped.
@@ -339,7 +388,7 @@ impl Switch {
         update: Update,
         target: u64,
         record: EpochRecord,
-        previous: u64,
+        (previous, previous_world): (u64, u64),
         previous_generation: u64,
         spawn_generation: u64,
         group: String,
@@ -347,6 +396,7 @@ impl Switch {
         start: Start,
         requests: String,
         discarded: Vec<u64>,
+        keeps: PreviousWorld,
     ) -> Self {
         let mut record = record;
         record.status = Status::Precopy;
@@ -356,6 +406,7 @@ impl Switch {
             update,
             target,
             previous,
+            previous_world,
             spawn_generation,
             spawned: Vec::new(),
             previous_generation,
@@ -382,7 +433,15 @@ impl Switch {
             failure: None,
             switchover_started: None,
             commit_asked: false,
+            revert_asked: None,
             pause: None,
+            keeps,
+            kept: keeps,
+            host_refused: Vec::new(),
+            moved_bytes: 0,
+            previous_stopped: false,
+            previous_exited: BTreeSet::new(),
+            relaunch_due: BTreeSet::new(),
             promotion_due: false,
         }
     }
@@ -421,6 +480,40 @@ impl Switch {
     /// The switchover's pause, once it ended.
     pub(crate) fn pause(&self) -> Option<Duration> {
         self.pause
+    }
+
+    /// When the switchover began: what the trial's baseline ends at.
+    pub(crate) fn promotion(&self) -> Option<Instant> {
+        self.switchover_started
+    }
+
+    /// The previous epoch's number and launch generation.
+    pub(crate) fn previous(&self) -> (u64, u64) {
+        (self.previous, self.previous_generation)
+    }
+
+    /// What the previous epoch is kept as through the trial: what the update
+    /// asked for, or `weights` where a node could not move them to host storage.
+    pub(crate) fn previous_kept(&self) -> PreviousWorld {
+        self.kept
+    }
+
+    /// Why the previous epoch's weights stayed on the GPUs although host
+    /// storage was asked: each node's refusal.
+    pub(crate) fn host_refused(&self) -> &[String] {
+        &self.host_refused
+    }
+
+    /// The bytes of weights the nodes moved to host storage.
+    pub(crate) fn moved_bytes(&self) -> u64 {
+        self.moved_bytes
+    }
+
+    /// The hosts that have to start the previous epoch again: its processes
+    /// exited for the trial, the target stopped, and it serves only once its
+    /// owner started it on the weights it kept and said so (`Self::serving`).
+    pub(crate) fn relaunch_due(&self) -> &BTreeSet<String> {
+        &self.relaunch_due
     }
 
     /// Whether a serving main process died during the switch: the failure
@@ -523,6 +616,12 @@ impl Switch {
         self.progress(roster);
     }
 
+    /// Whether every node's target parked, so only what the daemon still gives it holds the
+    /// switchover back.
+    pub(crate) fn parked_everywhere(&self) -> bool {
+        self.nodes.iter().all(|node| self.parked.contains(&node.host))
+    }
+
     /// States that `hosts`' targets are given their programs by the daemon, so none of them is
     /// promoted before it holds them: a target parks before any `Precopy` names a generation.
     pub(crate) fn await_programs(&mut self, hosts: impl IntoIterator<Item = String>) {
@@ -570,6 +669,7 @@ impl Switch {
         self.previous_serving.insert(generation);
         self.previous_generation = self.previous_generation.max(generation);
         self.serving.insert(host.to_owned());
+        self.relaunch_due.remove(host);
         let hosts: BTreeSet<String> = self.nodes.iter().map(|node| node.host.clone()).collect();
         if hosts.is_subset(&self.serving) && self.pending_restore.take().is_some() {
             self.finish_restore(roster);
@@ -606,16 +706,26 @@ impl Switch {
     /// The operator rolls back, or the probation did: the previous epoch
     /// serves again and the target is dropped.
     pub(crate) fn revert(&mut self, roster: &mut impl Roster, reason: String) {
-        let failure = Failure {
-            kind: "reverted".to_owned(),
-            reason,
-            device: None,
-        };
+        self.revert_with(
+            roster,
+            Failure {
+                kind: "reverted".to_owned(),
+                reason,
+                device: None,
+            },
+        );
+    }
+
+    /// Reverts with `failure` as the update's first one: a threshold of the
+    /// trial, or the operator.
+    pub(crate) fn revert_with(&mut self, roster: &mut impl Roster, failure: Failure) {
         match self.phase {
             Phase::Probation => self.reverting(roster, failure),
-            // The switchover happened and the frontend serves the target:
-            // the previous epoch must admit and serve again.
-            Phase::Serving => self.restore(roster, failure),
+            // The switchover happened and the previous epoch is draining: its
+            // requests move to the target, and only a drained process can
+            // serve again, so the revert waits for the trial it ends. A target
+            // that fails meanwhile returns at once (`Self::restore`).
+            Phase::Serving => self.revert_asked = Some(failure),
             Phase::Preparing | Phase::Promoting => self.failed(roster, failure),
             Phase::Committing | Phase::Reverting | Phase::Purged | Phase::Abandoned => {}
         }
@@ -680,37 +790,54 @@ impl Switch {
         self.phase = Phase::Abandoned;
     }
 
-    /// Reverts a target that serves on probation: `Revert` is the update
-    /// layer's decision, so the target ends its trial and takes the previous
-    /// generation back, and the first reason is what marks the configuration
-    /// unavailable (§7.3 step 4). The epoch that served before the
-    /// switchover is parked, not ended (§7.4), so it can be served again once
-    /// every target acknowledges the revert.
+    /// Reverts a target that serves on probation: the target's requests end
+    /// migratable at their step boundary, as the previous epoch's did at the
+    /// switchover, and the first reason is what marks the configuration
+    /// unavailable (§7.3 step 4). A target that failed is not commanded again
+    /// (§7.4): it is stopped, and its requests are lost to it and migrate. The
+    /// previous epoch serves again once every target drained or exited.
     fn reverting(&mut self, roster: &mut impl Roster, failure: Failure) {
+        self.reverting_without(roster, failure, None);
+    }
+
+    /// [`Self::reverting`], with `failed` the host whose target reported the
+    /// failure.
+    fn reverting_without(
+        &mut self,
+        roster: &mut impl Roster,
+        failure: Failure,
+        failed: Option<&str>,
+    ) {
         self.update.fail(failure.clone());
-        let reason = failure.reason.clone();
         self.failure = Some(failure);
         self.phase = Phase::Reverting;
         let generation = self.target_generation();
-        for node in &self.nodes {
+        let nodes = self.nodes.clone();
+        for node in &nodes {
+            if failed == Some(node.host.as_str()) {
+                self.target_reverted.insert(node.host.clone());
+                roster.stop(&node.host, &self.group, Some(generation));
+                continue;
+            }
+            if self.target_dead.contains(&node.host) {
+                self.target_reverted.insert(node.host.clone());
+                continue;
+            }
             roster.command(
                 &node.host,
                 generation,
-                command(process::command::Kind::Revert(process::Revert {
-                    reason: reason.clone(),
+                command(process::command::Kind::Drain(process::Drain {
+                    epoch: self.target,
                 })),
             );
         }
     }
 
-    /// Returns to the previous epoch after the frontend was told the target
-    /// serves: the previous epoch admits again, the frontend serves it, and
-    /// the target is stopped and retired.
     /// Starts the return to the previous epoch after the target died or
-    /// faulted while serving: every target that still runs is reverted, so no
-    /// host keeps serving the trial, and then every host returns the parked
-    /// previous epoch to serving (§7.4). The frontend is served it only once
-    /// every host says it serves.
+    /// faulted before the trial began: every target that still runs drains,
+    /// so no host keeps serving it, and every host returns the previous epoch
+    /// to serving at once (§7.4). The frontend is served it only once every
+    /// host says it serves.
     fn restore(&mut self, roster: &mut impl Roster, failure: Failure) {
         self.update.fail(failure.clone());
         let reason = failure.reason.clone();
@@ -726,8 +853,8 @@ impl Switch {
             roster.command(
                 &node.host,
                 generation,
-                command(process::command::Kind::Revert(process::Revert {
-                    reason: reason.clone(),
+                command(process::command::Kind::Drain(process::Drain {
+                    epoch: self.target,
                 })),
             );
         }
@@ -743,7 +870,7 @@ impl Switch {
         let generation = self.target_generation();
         for node in &self.nodes {
             roster.stop(&node.host, &self.group, Some(generation));
-            let _ = roster.claim(&node.host, self.previous, &self.scopes(node), &retire);
+            let _ = roster.claim(&node.host, self.previous_world, &self.scopes(node), &retire);
         }
         self.record.status = Status::Purged;
         self.epochs.record(self.target, self.record.clone());
@@ -752,17 +879,31 @@ impl Switch {
     }
 
     /// Every host returns its previous epoch to serving: `Serve { epoch:
-    /// previous }` to the processes the switchover parked, or a fresh
-    /// generation where they are gone.
+    /// previous }` to the processes the switchover parked. Where the trial
+    /// stopped them the target stops first, since the previous epoch's start
+    /// takes the storage it held, and its owner is asked to start it again.
     fn resume(&mut self, roster: &mut impl Roster, reason: &str) {
-        for node in &self.nodes {
-            roster.resume(&node.host, self.previous_generation, reason);
+        let generation = self.target_generation();
+        let nodes = self.nodes.clone();
+        for node in &nodes {
+            if self.previous_stopped {
+                roster.stop(&node.host, &self.group, Some(generation));
+                self.relaunch_due.insert(node.host.clone());
+            } else {
+                roster.resume(&node.host, self.previous_generation, reason);
+            }
+        }
+        if !self.relaunch_due.is_empty() {
+            // The record is what a process started now reads its programs
+            // from: the target's stands no more.
+            self.record.status = Status::Purged;
+            self.epochs.record(self.target, self.record.clone());
         }
     }
 
-    /// Every target acknowledged its revert: the previous epoch returns to
-    /// serving on every host, and the frontend is served it when every host
-    /// reports serving.
+    /// Every target drained or ended: the previous epoch returns to serving
+    /// on every host, and the frontend is served it when every host reports
+    /// serving.
     fn reverted(&mut self, roster: &mut impl Roster) {
         let failure = self.failure.clone().unwrap_or_else(|| Failure {
             kind: "reverted".to_owned(),
@@ -871,6 +1012,16 @@ impl Switch {
                     self.drained.insert(host);
                     self.progress(roster);
                 }
+                // The trial stopped it: `update_config.previous_world` keeps its
+                // weights alone, and its exit is what lets the node release the
+                // rest of its storage. A commit retires that storage anyway, and
+                // a revert under way starts the epoch on it.
+                Phase::Probation if self.previous_stopped => {
+                    self.previous_ended(roster, &host);
+                }
+                Phase::Committing | Phase::Reverting if self.previous_stopped => {
+                    self.previous_exited.insert(host);
+                }
                 Phase::Probation | Phase::Committing | Phase::Reverting => {
                     self.promotion_due = true;
                 }
@@ -899,6 +1050,38 @@ impl Switch {
                     self.failure = Some(failure);
                 }
                 _ => {}
+            }
+        }
+    }
+
+    /// `host`'s previous-epoch process ended for the trial: the node keeps
+    /// its weights alone, in host storage when the update asked and the node
+    /// can. A node that refuses, or fails to keep them, keeps them on its GPUs:
+    /// nothing else of the trial depends on it, and the status says why.
+    ///
+    /// The process's owner reports this: a process the daemon's engine control
+    /// started ends with its connection, which no roster event states.
+    pub(crate) fn previous_ended(&mut self, roster: &mut impl Roster, host: &str) {
+        if self.phase != Phase::Probation
+            || !self.previous_stopped
+            || !self.previous_exited.insert(host.to_owned())
+        {
+            return;
+        }
+        let to_host = self.keeps == PreviousWorld::Host;
+        match roster.keep_weights(host, self.previous_world, to_host) {
+            Ok(kept) => {
+                self.moved_bytes += kept.moved_bytes;
+                if let Some(refused) = kept.refused {
+                    self.kept = PreviousWorld::Weights;
+                    self.host_refused.push(format!("{host}: {refused}"));
+                }
+            }
+            Err(reason) => {
+                if to_host {
+                    self.kept = PreviousWorld::Weights;
+                }
+                self.host_refused.push(format!("{host}: {reason}"));
             }
         }
     }
@@ -995,7 +1178,7 @@ impl Switch {
             }
             (Phase::Probation, _) if self.is_target(generation) => {
                 if let Some(failure) = Failure::of_report(&report) {
-                    self.reverting(roster, failure);
+                    self.reverting_without(roster, failure, Some(&host));
                 }
             }
             (Phase::Committing, Some(Kind::Committed(_))) if self.is_target(generation) => {
@@ -1008,8 +1191,10 @@ impl Switch {
                     self.failure = Some(failure);
                 }
             }
-            (Phase::Reverting, Some(Kind::Reverted(_)))
-                if self.pending_restore.is_none() && self.is_target(generation) =>
+            (Phase::Reverting, Some(Kind::Drained(drained)))
+                if self.pending_restore.is_none()
+                    && drained.epoch == self.target
+                    && self.is_target(generation) =>
             {
                 self.target_reverted.insert(host);
             }
@@ -1080,6 +1265,19 @@ impl Switch {
                 self.record.status = Status::Probation;
                 self.epochs.record(self.target, self.record.clone());
                 self.phase = Phase::Probation;
+                if let Some(failure) = self.revert_asked.take() {
+                    self.reverting(roster, failure);
+                    return;
+                }
+                // What the trial keeps of the previous epoch: a process that
+                // serves nothing holds the storage the target could use, and
+                // `previous_world` says whether a revert is worth that storage.
+                if self.keeps != PreviousWorld::Parked {
+                    self.previous_stopped = true;
+                    for node in &self.nodes {
+                        roster.stop(&node.host, &self.group, Some(self.previous_generation));
+                    }
+                }
                 if std::mem::take(&mut self.commit_asked) {
                     self.commit(roster);
                 }
@@ -1087,7 +1285,7 @@ impl Switch {
             Phase::Committing if hosts.is_subset(&self.committed) => {
                 self.record.status = Status::Serving;
                 self.epochs.record(self.target, self.record.clone());
-                let retire = vec![self.previous];
+                let retire = vec![self.previous_world];
                 for node in &self.nodes {
                     // Addressed per node for the same reason `Promote` is.
                     let generation = self
@@ -1144,6 +1342,10 @@ mod tests {
         scripted: Vec<Event>,
         fail_spawn: Option<String>,
         fail_claim: Option<String>,
+        /// The retentions the switch asked for: host, world and `to_host`.
+        kept: Vec<(String, u64, bool)>,
+        /// Why every node refuses to move weights to host storage.
+        refuse_host: Option<String>,
         /// The generation the roster allocates for the first process it
         /// starts, and each one after it: the real adapter allocates every
         /// process's number, which is not the epoch's spawn generation.
@@ -1222,6 +1424,19 @@ mod tests {
         fn resume(&mut self, host: &str, generation: u64, reason: &str) {
             self.resumes
                 .push((host.to_owned(), generation, reason.to_owned()));
+        }
+
+        fn keep_weights(
+            &mut self,
+            host: &str,
+            world: u64,
+            to_host: bool,
+        ) -> Result<KeptWeights, String> {
+            self.kept.push((host.to_owned(), world, to_host));
+            Ok(KeptWeights {
+                refused: self.refuse_host.clone(),
+                ..KeptWeights::default()
+            })
         }
 
         fn events(&mut self) -> Vec<Event> {
@@ -1304,7 +1519,7 @@ mod tests {
             Update::new(7, Deployment::of(ServeConfig::default())),
             12,
             record(),
-            11,
+            (11, 11),
             5,
             6,
             "engine:0".to_owned(),
@@ -1312,6 +1527,7 @@ mod tests {
             start,
             "unix:/run/requests.sock".to_owned(),
             Vec::new(),
+            PreviousWorld::Parked,
         );
         (epochs, switch)
     }
@@ -1742,7 +1958,7 @@ mod tests {
             Update::new(8, Deployment::of(ServeConfig::default())),
             13,
             record(),
-            12,
+            (12, 12),
             6,
             8,
             "engine:0".to_owned(),
@@ -1750,6 +1966,7 @@ mod tests {
             start(),
             "unix:/run/requests.sock".to_owned(),
             discarded,
+            PreviousWorld::Parked,
         );
         let mut roster = Fake::default();
         next.start(&mut roster);
@@ -1912,7 +2129,7 @@ mod tests {
             Update::new(7, Deployment::of(ServeConfig::default())),
             12,
             record(),
-            11,
+            (11, 11),
             5,
             7,
             "engine:0".to_owned(),
@@ -1920,6 +2137,7 @@ mod tests {
             start(),
             "unix:/run/requests.sock".to_owned(),
             Vec::new(),
+            PreviousWorld::Parked,
         );
         let mut roster = Fake::default();
         switch.start(&mut roster);
@@ -2011,27 +2229,16 @@ mod tests {
             "the replacement of the dead epoch must serve first"
         );
         assert_eq!(
-            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Revert(_))),
-            2,
-            "the target reverts while the replacement comes up"
+            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Drain(_))),
+            1,
+            "the target that still runs drains while the replacement comes up"
         );
 
-        roster.scripted = vec![
-            report_event(
-                "n0",
-                6,
-                report(process::report::Kind::Reverted(process::Reverted {
-                    reason: "an illegal address".to_owned(),
-                })),
-            ),
-            report_event(
-                "n1",
-                6,
-                report(process::report::Kind::Reverted(process::Reverted {
-                    reason: "an illegal address".to_owned(),
-                })),
-            ),
-        ];
+        roster.scripted = vec![report_event(
+            "n0",
+            6,
+            report(process::report::Kind::Drained(process::Drained { epoch: 12 })),
+        )];
         switch.advance(&mut roster);
 
         switch.serving(&mut roster, "n0", 7);
@@ -2201,9 +2408,9 @@ mod tests {
 
         assert_eq!(switch.phase(), Phase::Reverting);
         assert_eq!(
-            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Revert(_))),
+            roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Drain(_))),
             1,
-            "the dead target is not commanded; its sibling is"
+            "the dead target is not commanded; its sibling drains"
         );
         assert!(roster.commands.iter().all(|(host, _, _)| host == "n1"));
         assert!(
@@ -2247,40 +2454,30 @@ mod tests {
         switch.advance(&mut roster);
         assert_eq!(switch.phase(), Phase::Reverting);
         assert_eq!(
-            roster
-                .commands
-                .iter()
-                .filter(|(_, _, kind)| matches!(kind, process::command::Kind::Revert(_)))
-                .count(),
-            2,
-            "a revert per node"
+            roster.commands,
+            vec![(
+                "n0".to_owned(),
+                6,
+                process::command::Kind::Drain(process::Drain { epoch: 12 })
+            )],
+            "the target that failed is not commanded again; its sibling drains"
         );
-        assert!(roster.commands.iter().all(|(_, generation, kind)| {
-            *generation == 6
-                && matches!(kind, process::command::Kind::Revert(revert)
-                    if revert.reason == "an illegal address")
-        }));
+        assert!(
+            roster
+                .stops
+                .contains(&("n1".to_owned(), "engine:0".to_owned(), Some(6))),
+            "the target that failed is stopped where it runs"
+        );
         assert!(
             roster.serves.is_empty(),
             "the frontend waits for the revert"
         );
 
-        roster.scripted = vec![
-            report_event(
-                "n0",
-                6,
-                report(process::report::Kind::Reverted(process::Reverted {
-                    reason: "an illegal address".to_owned(),
-                })),
-            ),
-            report_event(
-                "n1",
-                6,
-                report(process::report::Kind::Reverted(process::Reverted {
-                    reason: "an illegal address".to_owned(),
-                })),
-            ),
-        ];
+        roster.scripted = vec![report_event(
+            "n0",
+            6,
+            report(process::report::Kind::Drained(process::Drained { epoch: 12 })),
+        )];
         switch.advance(&mut roster);
 
         assert_eq!(switch.phase(), Phase::Reverting);
@@ -2340,6 +2537,204 @@ mod tests {
                 .claims
                 .iter()
                 .all(|(_, world, _, retire)| *world == 11 && retire == &[12])
+        );
+    }
+
+    /// A threshold of the trial reverts as a fault does, with the threshold as
+    /// the update's first failure, and the target drains: it did not fail, and
+    /// its requests end migratable rather than lost. The previous epoch serves
+    /// again only once every target drained, and the frontend only once every
+    /// host serves.
+    #[test]
+    fn a_passed_threshold_drains_the_target_and_marks_the_update_unavailable() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        serve_target(&mut roster, &mut switch);
+        roster.commands.clear();
+        roster.serves.clear();
+
+        switch.revert_with(
+            &mut roster,
+            Failure {
+                kind: "step_time_regression".to_owned(),
+                reason: "steps take 30 ms against 10 ms".to_owned(),
+                device: None,
+            },
+        );
+        assert_eq!(switch.phase(), Phase::Reverting);
+        assert_eq!(
+            roster.commands_of(6, |kind| {
+                matches!(kind, process::command::Kind::Drain(drain) if drain.epoch == 12)
+            }),
+            2,
+            "every target drains"
+        );
+        assert!(roster.resumes.is_empty(), "the target serves until it drained");
+
+        for host in ["n0", "n1"] {
+            roster.scripted = vec![report_event(
+                host,
+                6,
+                report(process::report::Kind::Drained(process::Drained { epoch: 12 })),
+            )];
+            switch.advance(&mut roster);
+        }
+        assert_eq!(roster.resumes.len(), 2);
+        assert!(roster.serves.is_empty());
+        for host in ["n0", "n1"] {
+            roster.scripted = vec![report_event(
+                host,
+                5,
+                report(process::report::Kind::Promoted(process::Promoted {
+                    generation: 5,
+                    program_generation: 0,
+                })),
+            )];
+            switch.advance(&mut roster);
+        }
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert_eq!(
+            roster.serves,
+            vec![(11, "unix:/run/requests.sock".to_owned())]
+        );
+        assert_eq!(
+            switch.update().unavailable().map(|failure| failure.kind.as_str()),
+            Some("step_time_regression")
+        );
+    }
+
+    /// An operator who reverts before the drain ended is answered when the
+    /// trial begins: only a drained epoch can serve again.
+    #[test]
+    fn a_revert_before_the_trial_waits_for_the_drain() {
+        let (_epochs, mut switch) = setup();
+        let mut roster = Fake::default();
+        prepared(&mut roster, &mut switch);
+        switch.promoted(&mut roster, "n0", 6);
+        switch.promoted(&mut roster, "n1", 6);
+        assert_eq!(switch.phase(), Phase::Serving);
+        switch.revert(&mut roster, "the operator".to_owned());
+        assert_eq!(switch.phase(), Phase::Serving);
+        switch.drained(&mut roster, "n0", 11);
+        switch.drained(&mut roster, "n1", 11);
+        assert_eq!(switch.phase(), Phase::Reverting);
+    }
+
+    /// A switch of `keeps`, its target serving on trial.
+    fn on_trial(keeps: PreviousWorld) -> (Switch, Fake) {
+        let epochs = Arc::new(Epochs::new());
+        let mut switch = Switch::new(
+            Arc::clone(&epochs),
+            Update::new(7, Deployment::of(ServeConfig::default())),
+            12,
+            record(),
+            (11, 11),
+            5,
+            6,
+            "engine:0".to_owned(),
+            nodes(),
+            start(),
+            "unix:/run/requests.sock".to_owned(),
+            Vec::new(),
+            keeps,
+        );
+        let mut roster = Fake::default();
+        serve_target(&mut roster, &mut switch);
+        (switch, roster)
+    }
+
+    /// `parked` keeps the drained processes through the trial; `weights` stops
+    /// them, and once each exited its node keeps the weights alone.
+    #[test]
+    fn previous_world_says_what_the_trial_keeps() {
+        let (switch, roster) = on_trial(PreviousWorld::Parked);
+        assert_eq!(switch.phase(), Phase::Probation);
+        assert!(
+            !roster.stops.iter().any(|stop| stop.2 == Some(5)),
+            "parked processes stay alive"
+        );
+        assert!(roster.kept.is_empty());
+
+        let (mut switch, mut roster) = on_trial(PreviousWorld::Weights);
+        assert_eq!(
+            roster.stops.iter().filter(|stop| stop.2 == Some(5)).count(),
+            2,
+            "every node stops its process"
+        );
+        assert!(roster.kept.is_empty(), "the node waits for the exit");
+        roster.scripted = vec![exit_event("n0", 5), exit_event("n1", 5)];
+        switch.advance(&mut roster);
+        assert_eq!(
+            roster.kept,
+            vec![
+                ("n0".to_owned(), 11, false),
+                ("n1".to_owned(), 11, false)
+            ]
+        );
+        assert!(!switch.promotion_due(), "the exit is the trial's own");
+        assert_eq!(switch.previous_kept(), PreviousWorld::Weights);
+    }
+
+    /// `host` asks for host storage, and a node that refuses keeps the weights
+    /// on its GPUs: the status reports `weights`, with its reason.
+    #[test]
+    fn a_node_that_refuses_host_storage_keeps_the_weights() {
+        let (mut switch, mut roster) = on_trial(PreviousWorld::Host);
+        roster.refuse_host = Some("no Transfer Server".to_owned());
+        roster.scripted = vec![exit_event("n0", 5), exit_event("n1", 5)];
+        switch.advance(&mut roster);
+        assert_eq!(roster.kept[0], ("n0".to_owned(), 11, true));
+        assert_eq!(switch.previous_kept(), PreviousWorld::Weights);
+        assert_eq!(
+            switch.host_refused(),
+            ["n0: no Transfer Server", "n1: no Transfer Server"]
+        );
+    }
+
+    /// A revert of an epoch kept as its weights stops the target first and asks
+    /// the epoch's owner to start it again; the frontend moves once it said the
+    /// epoch serves, at the generation it started.
+    #[test]
+    fn a_revert_starts_an_epoch_whose_processes_exited_again() {
+        let (mut switch, mut roster) = on_trial(PreviousWorld::Weights);
+        roster.scripted = vec![exit_event("n0", 5), exit_event("n1", 5)];
+        switch.advance(&mut roster);
+        roster.stops.clear();
+        roster.serves.clear();
+
+        switch.revert(&mut roster, "the operator".to_owned());
+        for host in ["n0", "n1"] {
+            roster.scripted = vec![report_event(
+                host,
+                6,
+                report(process::report::Kind::Drained(process::Drained { epoch: 12 })),
+            )];
+            switch.advance(&mut roster);
+        }
+        assert!(roster.resumes.is_empty(), "no process is left to command");
+        assert_eq!(switch.relaunch_due().len(), 2);
+        assert_eq!(
+            roster.kept.len(),
+            2,
+            "the node kept the weights before the revert, and not again under it"
+        );
+        assert_eq!(
+            roster.stops.iter().filter(|stop| stop.2 == Some(6)).count(),
+            2,
+            "the target stops before the epoch starts on its storage"
+        );
+        assert!(
+            switch.epochs.get(12).is_some_and(|record| record.status == Status::Purged),
+            "a process started now reads the previous epoch's programs"
+        );
+        switch.serving(&mut roster, "n0", 9);
+        assert!(roster.serves.is_empty());
+        switch.serving(&mut roster, "n1", 9);
+        assert_eq!(switch.phase(), Phase::Abandoned);
+        assert!(switch.relaunch_due().is_empty());
+        assert_eq!(
+            roster.serves,
+            vec![(11, "unix:/run/requests.sock".to_owned())]
         );
     }
 
@@ -2478,7 +2873,7 @@ mod tests {
             Update::new(7, Deployment::of(ServeConfig::default())),
             12,
             record(),
-            11,
+            (11, 11),
             5,
             7,
             "engine:0".to_owned(),
@@ -2486,6 +2881,7 @@ mod tests {
             start(),
             "unix:/run/requests.sock".to_owned(),
             Vec::new(),
+            PreviousWorld::Parked,
         );
         let mut roster = Fake::default();
         switch.start(&mut roster);

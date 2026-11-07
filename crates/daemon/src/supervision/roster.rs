@@ -92,21 +92,6 @@ pub(crate) struct ProcessRoster {
     requests: String,
     /// Launches the epoch layer stopped: their exit is not a failure.
     stopping: BTreeSet<u64>,
-    /// A resume's fresh generation, waiting for the child to park so it can be
-    /// promoted: the launch generation the spawn allocated and the epoch it
-    /// serves.
-    resuming: BTreeMap<u64, u64>,
-    /// The epoch a fresh generation is being started for: `spawn` allocates
-    /// the generation itself, so the epoch waits here until that number is
-    /// known.
-    resuming_epoch: Option<u64>,
-    /// How the loop last started a main process: the executable and its
-    /// arguments, for the fresh generation a restore may need.
-    start: Option<(
-        String,
-        crate::engine::launch::Launch,
-        std::collections::HashMap<String, String>,
-    )>,
     /// Events the adapter raised, ahead of the ones still on the wire.
     queued: VecDeque<Event>,
     next_request: u64,
@@ -133,9 +118,6 @@ impl ProcessRoster {
             frontend: None,
             requests: String::new(),
             stopping: BTreeSet::new(),
-            resuming: BTreeMap::new(),
-            resuming_epoch: None,
-            start: None,
             queued: VecDeque::new(),
             next_request: 1,
         }
@@ -276,23 +258,6 @@ impl ProcessRoster {
             Some(Kind::Drained(_)) => self.row(generation, ProcessState::Parked),
             _ => {}
         }
-        // A fresh generation of a resume serves as soon as it is promoted, and
-        // its promotion is the epoch layer's own step.
-        if self.resuming.contains_key(&generation)
-            && matches!(report.kind, Some(Kind::Parked(_)))
-            && let Some(peer) = self
-                .engines
-                .iter()
-                .find(|(_, launch)| **launch == generation)
-                .map(|(engine, _)| *engine)
-        {
-            if let Err(error) = self.link.commands.send(
-                peer,
-                command(process::command::Kind::Promote(process::Promote {})),
-            ) {
-                tracing::warn!(generation, %error, "promoting a restored epoch did not reach its main process");
-            }
-        }
         self.queued.push_back(Event::Report {
             host,
             generation,
@@ -336,52 +301,12 @@ impl ProcessRoster {
         if let Some(launch) = self.launches.get_mut(&generation) {
             launch.pid = None;
         }
-        self.resuming.remove(&generation);
         self.engines.retain(|_, launch| *launch != generation);
         self.queued.push_back(Event::Exit {
             host: exit.host,
             generation,
             code: exit.status.parse().ok(),
         });
-    }
-
-    /// Starts a fresh generation of the previous epoch for a restore whose
-    /// processes are gone: claim its world, let it park, and promote it.
-    fn fresh(&mut self, host: &str, epoch: u64, group: &str, rank: u64) {
-        let scope = process::Scope {
-            group: group.to_owned(),
-            rank: rank as u32,
-        };
-        match self.claim(host, epoch, &[scope], &[]) {
-            Ok(()) => {}
-            Err(reason) => {
-                tracing::warn!(%host, epoch, %reason, "claiming the previous epoch for a restore failed");
-                return;
-            }
-        }
-        let Some((executable, launch, environment)) = self.start.clone() else {
-            return;
-        };
-        // The fresh process's identity is allocated here, from the same
-        // counter the epoch's children took theirs from: it is above the
-        // target's generation, so the process the target ends never names this
-        // one, and the epoch waits for the number its `Parked` reports.
-        let generation = self.epochs.next_generation(group, rank);
-        self.resuming_epoch = Some(epoch);
-        let start = Spawn {
-            host: host.to_owned(),
-            group: group.to_owned(),
-            rank: rank as u32,
-            generation,
-            executable,
-            arguments: Vec::new(),
-            environment,
-            inherit: Vec::new(),
-        };
-        if let Err(reason) = self.spawn(start, &launch) {
-            tracing::warn!(%host, epoch, %reason, "starting the previous epoch for a restore failed");
-            self.resuming_epoch = None;
-        }
     }
 }
 
@@ -441,11 +366,6 @@ impl Roster for ProcessRoster {
             "--launch".to_owned(),
             path.display().to_string(),
         ];
-        self.start = Some((
-            spawn.executable.clone(),
-            launch.clone(),
-            spawn.environment.clone(),
-        ));
         self.launches.insert(
             generation,
             Launch {
@@ -456,16 +376,10 @@ impl Roster for ProcessRoster {
                 pid: None,
             },
         );
-        // A fresh generation of a restore: its epoch is now known under the
-        // number this spawn allocated, so its `Parked` promotes it.
-        if let Some(epoch) = self.resuming_epoch.take() {
-            self.resuming.insert(generation, epoch);
-        }
         let start = process::request::Kind::Spawn(spawn);
         let reply = self.request(start)?;
         if !reply.error.is_empty() {
             self.launches.remove(&generation);
-            self.resuming.remove(&generation);
             return Err(reply.error);
         }
         let Some(process::reply::Kind::Spawned(spawned)) = reply.kind else {
@@ -557,41 +471,62 @@ impl Roster for ProcessRoster {
     }
 
     fn resume(&mut self, host: &str, generation: u64, reason: &str) {
-        // The previous epoch's process of that launch is still alive — it
-        // drained, not ended — so it serves again: §7.4 parks the epoch the
-        // switchover drained.
+        // The previous epoch's process of that launch is alive: it drained, not
+        // ended, so it serves again (§7.4). A process that is gone is the
+        // switch's to report: its owner starts it again.
         let alive = self
             .engines
             .iter()
             .find(|(_, launch)| **launch == generation)
             .map(|(engine, _)| *engine);
-        if let Some(engine) = alive
-            && let Some(launch) = self.launches.get(&generation)
-            && launch.host == host
-            && let Some(epoch) = launch.epoch
-        {
-            let _ = self.link.commands.send(
-                engine,
-                command(process::command::Kind::Serve(process::Serve {
-                    epoch,
-                    requests: self.requests.clone(),
-                })),
-            );
-            tracing::info!(%host, generation, epoch, reason, "the previous epoch serves again");
+        let Some(engine) = alive else {
+            tracing::warn!(%host, generation, reason, "the previous epoch's process is gone");
             return;
+        };
+        let Some(epoch) = self
+            .launches
+            .get(&generation)
+            .filter(|launch| launch.host == host)
+            .and_then(|launch| launch.epoch)
+        else {
+            return;
+        };
+        if let Err(error) = self.link.commands.send(
+            engine,
+            command(process::command::Kind::Serve(process::Serve {
+                epoch,
+                requests: self.requests.clone(),
+            })),
+        ) {
+            tracing::warn!(%host, generation, %error, "serving the previous epoch did not reach it");
         }
-        // Its process is gone: a fresh generation of the epoch takes over,
-        // above the target's (the switch records that generation as the
-        // previous epoch's).
-        let Some(launch) = self.launches.get(&generation) else {
-            return;
+        tracing::info!(%host, generation, epoch, reason, "the previous epoch serves again");
+    }
+
+    fn keep_weights(
+        &mut self,
+        host: &str,
+        world: u64,
+        to_host: bool,
+    ) -> Result<crate::updates::switch::KeptWeights, String> {
+        let reply = self.request(process::request::Kind::KeepWeights(process::KeepWeights {
+            host: host.to_owned(),
+            deployment: self.deployment.clone(),
+            worlds: vec![world],
+            to_host,
+            cache_keys: Vec::new(),
+        }))?;
+        if !reply.error.is_empty() {
+            return Err(reply.error);
+        }
+        let Some(process::reply::Kind::WeightsKept(kept)) = reply.kind else {
+            return Err("the daemon answered a retention without its report".to_owned());
         };
-        let (group, rank, epoch) = (launch.group.clone(), launch.rank, launch.epoch);
-        let Some(epoch) = epoch else {
-            return;
-        };
-        self.fresh(host, epoch, &group, rank);
-        let _ = reason;
+        Ok(crate::updates::switch::KeptWeights {
+            released: kept.released,
+            moved_bytes: kept.moved_bytes,
+            refused: (!kept.refused.is_empty()).then_some(kept.refused),
+        })
     }
 
     fn events(&mut self) -> Vec<Event> {

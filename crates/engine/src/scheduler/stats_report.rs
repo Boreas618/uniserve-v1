@@ -49,6 +49,7 @@ pub struct SchedulerStatsReporter {
     last_worker_exec_us_total: u64,
     last_batch_roundtrip_us_total: u64,
     last_batch_timing_count: u64,
+    last_batch_tokens_total: u64,
     last_numerical_faults: u64,
     // Indexed in the `ExecutionDomainStats::groups` order `domain_stats` reads.
     last_domains: [DomainCumulative; super::stats::ExecutionDomainStats::COUNT],
@@ -98,14 +99,17 @@ impl SchedulerStatsReporter {
             .batch_roundtrip_us_total
             .load(Ordering::Relaxed);
         let batch_timing_count = stats.timing.batch_timing_count.load(Ordering::Relaxed);
+        let batch_tokens_total = stats.timing.batch_tokens_total.load(Ordering::Relaxed);
         let delta_worker_exec_us =
             worker_exec_us_total.saturating_sub(self.last_worker_exec_us_total);
         let delta_batch_roundtrip_us =
             batch_roundtrip_us_total.saturating_sub(self.last_batch_roundtrip_us_total);
         let delta_batch_count = batch_timing_count.saturating_sub(self.last_batch_timing_count);
+        let delta_batch_tokens = batch_tokens_total.saturating_sub(self.last_batch_tokens_total);
         self.last_worker_exec_us_total = worker_exec_us_total;
         self.last_batch_roundtrip_us_total = batch_roundtrip_us_total;
         self.last_batch_timing_count = batch_timing_count;
+        self.last_batch_tokens_total = batch_tokens_total;
         let numerical_faults = stats.general.numerical_faults.load(Ordering::Relaxed);
         let delta_numerical_faults = numerical_faults.saturating_sub(self.last_numerical_faults);
         self.last_numerical_faults = numerical_faults;
@@ -137,6 +141,7 @@ impl SchedulerStatsReporter {
             worker_exec_us: delta_worker_exec_us,
             batch_roundtrip_us: delta_batch_roundtrip_us,
             batch_count: delta_batch_count,
+            batch_tokens: delta_batch_tokens,
             domain_stats: self.domain_stats(stats),
             numerical_faults: delta_numerical_faults,
         }

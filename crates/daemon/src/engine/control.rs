@@ -556,6 +556,47 @@ impl EngineControl {
         Ok(())
     }
 
+    /// Has every node's daemon halve, or restore when not `halve`, the byte
+    /// budgets of the links the deployment's transfers use, and answers the
+    /// hosts that took it. A node that holds no claim of the deployment has
+    /// nothing to throttle and says so by answering.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot be reached or refuses.
+    pub(crate) fn throttle_transfers(&self, halve: bool) -> anyhow::Result<Vec<String>> {
+        let (mut connection, nodes) = self.connect()?;
+        let mut hosts = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            connection.send(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: 1,
+                    kind: Some(request::Kind::ThrottleTransfers(
+                        process::ThrottleTransfers {
+                            host: node.host.clone(),
+                            deployment: self.deployment.clone(),
+                            halve,
+                        },
+                    )),
+                })),
+            })?;
+            let answer: process::Downstream = connection
+                .recv(DAEMON_TIMEOUT)?
+                .context("the daemon did not report the throttle")?;
+            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
+                anyhow::bail!("the daemon did not answer the throttle");
+            };
+            anyhow::ensure!(
+                answer.error.is_empty(),
+                "throttling transfers at {}: {}",
+                node.host,
+                answer.error
+            );
+            hosts.push(node.host);
+        }
+        Ok(hosts)
+    }
+
     /// The arguments of a main process: its program name and the launch file
     /// the daemon wrote for it, and nothing else. Everything the process needs
     /// is in that file, so a flag beside it would be a second account of the
@@ -1226,6 +1267,13 @@ pub struct EpochProcess {
 /// resolves and loads the modules, instantiates the policy, rebinds or
 /// recaptures the graphs and shadows the replaced operators (§7.3 step 2).
 const PRECOPY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+impl crate::interference::Throttle for EngineControl {
+    fn throttle(&self, halve: bool) -> Result<Vec<String>, String> {
+        self.throttle_transfers(halve)
+            .map_err(|error| format!("{error:#}"))
+    }
+}
 
 /// How long a main process takes to switch, commit, revert or purge: each is
 /// a boundary decision the main process makes at its next batch (§7.3 steps
