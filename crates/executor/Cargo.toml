@@ -12,6 +12,7 @@ publish = false
 [dependencies]
 media = { path = "../media" }
 bytemuck.workspace = true
+crossbeam-channel.workspace = true
 platform.workspace = true
 indexmap.workspace = true
 ipc.workspace = true
@@ -22,6 +23,7 @@ nvtx.workspace = true
 nn.workspace = true
 ops.workspace = true
 proto.workspace = true
+rusqlite.workspace = true
 rustix = { workspace = true, features = ["fs", "pipe", "system"] }
 serde.workspace = true
 serde_json.workspace = true

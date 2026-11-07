@@ -119,6 +119,12 @@ pub(crate) enum Command {
     /// them (7.6). It is a queue item because the queue's order is what makes "no job reads the
     /// weights" true at the moment their mappings change.
     Rebind(Arc<dyn Fn() -> Result<()> + Send + Sync>),
+    /// Change the rank's profiling session (`docs/profiling.md`), at a batch boundary: a session's
+    /// collectors begin and end between two forwards, and only this thread knows where that is.
+    Profile {
+        change: crate::profiling::session::Change,
+        answer: crossbeam_channel::Sender<Result<serde_json::Value>>,
+    },
     /// Wait for the events deferred storage release hangs on.
     After(Vec<Arc<platform::Event>>),
 }
@@ -153,6 +159,7 @@ impl Command {
             Self::SuspendGraphs => "suspending the graph pools".to_owned(),
             Self::RestoreGraphs => "restoring the graph pools".to_owned(),
             Self::Rebind(_) => "putting new weights at the rank's addresses".to_owned(),
+            Self::Profile { .. } => "changing the rank's profiling session".to_owned(),
             Self::After(_) => "waiting for deferred storage work".to_owned(),
         }
     }
@@ -426,6 +433,24 @@ impl JobQueue {
             .unwrap_or_default()
     }
 
+    /// Queues a join of `runner`, answered to nobody: the rank that opened the step waits for this
+    /// rank inside the step, not for this command.
+    pub(crate) fn join_step(&self, runner: crate::runner::RunnerId) -> Result<()> {
+        let id = crate::batch::SubmissionId(self.next_submission());
+        let (submission, _) = crate::batch::Submission::pending(id);
+        let jobs = vec![Job::Join { runner }];
+        self.submit(
+            Command::Steps {
+                generation: None,
+                jobs,
+            },
+            &submission,
+            crate::batch::JobKind::Replay,
+            None,
+        )
+        .map(|_| ())
+    }
+
     /// Stops the queue: no further command is taken, and a waiting executor thread returns.
     pub fn close(&self) {
         let mut state = lock(&self.state);
@@ -452,6 +477,7 @@ impl std::fmt::Debug for JobQueue {
 pub(crate) fn jobs_of(runner: crate::runner::RunnerId, jobs: crate::batch::Jobs) -> Vec<Job> {
     jobs.iter()
         .map(|job| match job {
+            Job::Join { .. } => Job::Join { runner },
             Job::Replay {
                 bucket,
                 generation,

@@ -226,6 +226,40 @@ pub struct Forward<'a> {
     /// name. This is the only seam at which one layer's own output can be read while it exists, and it
     /// is a diagnosis: nothing a forward computes depends on a probe being present.
     pub attention_probe: Option<&'a dyn AttentionProbe>,
+    /// Times the model's components on the device, or `None`.
+    ///
+    /// A forward captured into a graph captures its probes, and every replay then runs them. Nothing
+    /// a forward computes depends on a fence being present.
+    pub fence: Option<&'a dyn Fence>,
+}
+
+/// Times a model's components on the device (`docs/profiling.md`, fence probes).
+///
+/// A model states each of its modules with [`Forward::fenced`]: the module's component, which names
+/// its class across the deployment (`models.qwen3_moe.Transformer`), and its path in the model
+/// (`layers.3`), which names this instance. Which components carry probes is the deployment's
+/// choice, so an implementation answers `None` for a component no pattern names and the module then
+/// runs as if unobserved.
+pub trait Fence {
+    /// The module instance at `path` of `component` is entered on `stream`: launch its entry probe.
+    /// Answers the instance the exit names, or `None` when this component carries no probe.
+    ///
+    /// # Errors
+    ///
+    /// When the probe could not be launched.
+    fn enter(
+        &self,
+        component: &'static str,
+        path: std::fmt::Arguments<'_>,
+        stream: &Stream,
+    ) -> Result<Option<u32>>;
+
+    /// The instance [`Self::enter`] answered returns on `stream`: launch its exit probe.
+    ///
+    /// # Errors
+    ///
+    /// When the probe could not be launched.
+    fn exit(&self, instance: u32, stream: &Stream) -> Result<()>;
 }
 
 /// Observes one layer's attention output, at the launch that wrote it.
@@ -254,6 +288,7 @@ impl<'a> Forward<'a> {
             shadow: None,
             live_tokens: None,
             attention_probe: None,
+            fence: None,
         }
     }
 
@@ -273,6 +308,7 @@ impl<'a> Forward<'a> {
             shadow: None,
             live_tokens: None,
             attention_probe: None,
+            fence: None,
         }
     }
 
@@ -312,6 +348,25 @@ impl<'a> Forward<'a> {
         self
     }
 
+    /// Waits for what this forward issued so far, when it is not being captured.
+    ///
+    /// A launch that waits on its device for the other ranks of a group holds that device until
+    /// they arrive, and the first use of a kernel takes a lock of the whole process and waits for
+    /// its device to drain. The ranks of a host are threads of one process, so a rank that walked
+    /// on past such a launch can hold that lock for a kernel that needs its peers, while the peers
+    /// queue on the lock in front of the same launch. A captured walk runs no kernel, and a replay
+    /// finds every kernel ready, so only an eager walk is held back here (`Group::settled` states
+    /// the same rule for a collective).
+    pub fn settled(&self) -> Result<()> {
+        let Some(stream) = self.stream else {
+            return Ok(());
+        };
+        if stream.capture_status().map_err(Error::Platform)? == ops::platform::CaptureStatus::None {
+            stream.synchronize().map_err(Error::Platform)?;
+        }
+        Ok(())
+    }
+
     /// The same forward over an expert exchange.
     pub fn with_exchange(mut self, exchange: &'a ExchangeViews) -> Self {
         self.exchange = Some(exchange);
@@ -330,6 +385,35 @@ impl<'a> Forward<'a> {
     }
 
     /// Observe every layer's attention output at the launch that wrote it.
+    pub fn with_fence(mut self, fence: Option<&'a dyn Fence>) -> Self {
+        self.fence = fence;
+        self
+    }
+
+    /// Runs `body`, the forward of the module instance at `path` of `component`, between its fence
+    /// probes when this forward has a fence and the deployment probes the component.
+    ///
+    /// # Errors
+    ///
+    /// What `body` answers, or the probe's own failure.
+    pub fn fenced<T, E: From<Error>>(
+        &self,
+        component: &'static str,
+        path: std::fmt::Arguments<'_>,
+        body: impl FnOnce() -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
+        let (Some(fence), Some(stream)) = (self.fence, self.stream) else {
+            return body();
+        };
+        let instance = fence.enter(component, path, stream)?;
+        let answer = body()?;
+        if let Some(instance) = instance {
+            fence.exit(instance, stream)?;
+        }
+        Ok(answer)
+    }
+
+    /// Observes every layer's attention output (see [`Self::attention_probe`]).
     pub fn with_attention_probe(mut self, probe: &'a dyn AttentionProbe) -> Self {
         self.attention_probe = Some(probe);
         self

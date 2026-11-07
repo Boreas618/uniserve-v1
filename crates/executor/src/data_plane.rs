@@ -24,12 +24,14 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
+use crate::capacity::device::{DeviceBooking, DeviceBudget};
+use crate::profiling::session::Change;
 use crate::batch::Submission;
 use crate::completion::Outcome;
 use crate::device::Executor;
 use crate::memory::allocation::Backing as _;
 use crate::memory::prefix_cache::PrefixCache;
-use crate::memory::prefix_cache::planes::{CachePlanes, PlaneLayout};
+use crate::memory::prefix_cache::planes::CachePlanes;
 use crate::memory::reload::{Matching, Reloading, Walk, WeightPair, paired};
 use crate::memory::retained::Retained;
 use crate::memory::weights::{LoadedWeight, WeightStore, retained_key};
@@ -66,6 +68,8 @@ pub trait ModelLoad: Send + Sync {
 
 /// What the data plane holds of one rank.
 pub struct Rank {
+    /// The rank's number in its epoch, as a profiling session's `workers` name it.
+    pub rank: u32,
     /// The rank's device executor: the queue a change of its mappings goes through. Weak, because
     /// the epoch's close joins the device's thread and owns the last handle.
     pub executor: std::sync::Weak<Executor>,
@@ -171,9 +175,11 @@ pub struct DataPlane {
     /// A mapping change failed part of the way: the rank's weights are no one checkpoint's, and the
     /// epoch ends rather than computing with them.
     poisoned: Mutex<Option<String>>,
-    /// The tokens the deployment fixed the cache at, when it fixed a capacity.
-    max_total_tokens: Option<u64>,
-    request_slots: u64,
+    /// The share of each device the deployment may hold.
+    fraction: f64,
+    /// What each rank books beside the storage the Storage Server retains, in rank order, once the
+    /// ranks serve: the graph pools and the process, and a session's storage.
+    bookings: Mutex<Vec<DeviceBooking>>,
 }
 
 fn rejected(what: &str, error: impl std::fmt::Display) -> Error {
@@ -217,14 +223,8 @@ fn identity_of(log: &[LoadedWeight]) -> String {
 }
 
 impl DataPlane {
-    /// The data plane over `ranks`, which serve `target`. `max_total_tokens` is the capacity the
-    /// deployment fixed for the cache, when it fixed one, and `request_slots` the rank's slots.
-    pub fn new(
-        ranks: Vec<Rank>,
-        target: Target,
-        max_total_tokens: Option<u64>,
-        request_slots: u64,
-    ) -> Self {
+    /// The data plane over `ranks`, which serve `target` within `fraction` of each device.
+    pub fn new(ranks: Vec<Rank>, target: Target, fraction: f64) -> Self {
         Self {
             ranks: ranks.into_iter().map(Mutex::new).collect(),
             target: Mutex::new(target),
@@ -233,9 +233,199 @@ impl DataPlane {
             adapters: Mutex::new(BTreeMap::new()),
             suspended: AtomicBool::new(false),
             poisoned: Mutex::new(None),
-            max_total_tokens,
-            request_slots,
+            fraction,
+            bookings: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Books what the ranks hold beside the retained storage in their devices' ledgers, as they
+    /// start to serve (§7.6): each rank's graph pools, and what its process holds beside them. From
+    /// here on the quota binds the whole rank, so a storage that would take the deployment past it
+    /// is refused at the Storage Server and not found out by the device.
+    ///
+    /// Booked once: a process that already booked keeps its figures, and a standby books when it is
+    /// promoted, because until then the ledger counts what it maps of its predecessor.
+    ///
+    /// # Errors
+    ///
+    /// When a rank's storage does not fit its quota, or NVML cannot state the process's storage.
+    pub fn book_serving(&self) -> Result<()> {
+        let mut bookings = lock(&self.bookings);
+        if !bookings.is_empty() {
+            return Ok(());
+        }
+        let mut measured = Vec::with_capacity(self.ranks.len());
+        for rank in &self.ranks {
+            let rank = lock(rank);
+            let graph = rank.executor()?.memory().graph;
+            let budget = DeviceBudget::new(
+                // Nothing runs as a rank opens admission, so there is nothing to wait for.
+                Arc::new(|_| Ok(())),
+                Arc::clone(&rank.storage),
+                BTreeMap::new(),
+            )?;
+            let booking = budget.booking(rank.device, self.fraction, graph, 0)?;
+            booking.submit(&rank.storage, !self.suspended.load(Ordering::Acquire))?;
+            measured.push(booking);
+        }
+        *bookings = measured;
+        Ok(())
+    }
+
+    /// Books again what the ranks book, the graph pools as `graphs` says: a suspended pool holds no
+    /// storage, and the ledger hands its bytes to what a sleep or a load wants them for.
+    fn rebook(&self, graphs: bool) -> Result<()> {
+        let bookings = lock(&self.bookings);
+        for (rank, booking) in self.ranks.iter().zip(bookings.iter()) {
+            booking.submit(&lock(rank).storage, graphs)?;
+        }
+        Ok(())
+    }
+
+    /// Books `bytes` of device storage a session's collectors hold on `rank`'s device with the
+    /// rank's process. Answers the ledger's refusal; a process that books nothing yet, a standby,
+    /// has nothing to book it beside.
+    fn book_profiling(&self, index: usize, bytes: u64) -> Result<Option<String>> {
+        let mut bookings = lock(&self.bookings);
+        let Some(booking) = bookings.get_mut(index) else {
+            return Ok(None);
+        };
+        if booking.profiling == bytes {
+            return Ok(None);
+        }
+        let booked = std::mem::replace(&mut booking.profiling, bytes);
+        let graphs = !self.suspended.load(Ordering::Acquire);
+        match booking.submit(&lock(&self.ranks[index]).storage, graphs) {
+            Ok(_) => Ok(None),
+            Err(error) => {
+                booking.profiling = booked;
+                match error {
+                    // `Retained::book` answers the server's refusal of a booking past the quota so.
+                    Error::Unsupported(refusal) => Ok(Some(refusal)),
+                    error => Err(error),
+                }
+            }
+        }
+    }
+
+    /// Starts the profiling session `payload` states on every rank (`docs/profiling.md`): each
+    /// books what its collectors hold, then starts at its next batch boundary. A rank whose ledger
+    /// cannot fit the storage answers that it refused, and the daemon ends what the others started.
+    ///
+    /// # Errors
+    ///
+    /// When the payload is no session, or a rank cannot create its file.
+    pub fn start_profile(&self, payload: &str) -> Result<Vec<String>> {
+        let start: proto::profile::SessionStart =
+            serde_json::from_str(payload).map_err(|error| rejected("profile_start", error))?;
+        let mut answers = Vec::with_capacity(self.ranks.len());
+        for (index, rank) in self.ranks.iter().enumerate() {
+            let (number, executor) = {
+                let rank = lock(rank);
+                (rank.rank, rank.executor()?)
+            };
+            let held = crate::profiling::session::device_storage(&start.request, number);
+            if let Some(refusal) = self.book_profiling(index, held)? {
+                answers.push(
+                    serde_json::json!({
+                        "rank": number,
+                        "selected": true,
+                        "refused": format!(
+                            "range_metrics holds {held} bytes of device storage for its range \
+                             profiler pass, which the ledger of the rank's GPU cannot fit: \
+                             {refusal}"
+                        ),
+                    })
+                    .to_string(),
+                );
+                continue;
+            }
+            let started = executor.profile(Change::Start {
+                start: Box::new(start.clone()),
+                rank: number,
+            });
+            match started {
+                Ok(answer) => answers.push(answer.to_string()),
+                Err(error) => {
+                    self.unbook_profiling(index);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(answers)
+    }
+
+    /// The session's storage is no longer held on `index`'s device. A failure leaves the larger
+    /// booking in the ledger, which only overstates the rank's storage, so it is logged rather than
+    /// failing the session's end.
+    fn unbook_profiling(&self, index: usize) {
+        let failure = match self.book_profiling(index, 0) {
+            Ok(None) => return,
+            Ok(Some(refusal)) => refusal,
+            Err(error) => error.to_string(),
+        };
+        tracing::warn!("unbooking the ended profiling session's device storage failed: {failure}");
+    }
+
+    /// Ends the profiling session `payload` names on every rank: each writes what remains and closes
+    /// its file, and the ledger gives back what the session held.
+    ///
+    /// # Errors
+    ///
+    /// When the payload names no session, or a rank's device is gone.
+    pub fn stop_profile(&self, payload: &str) -> Result<Vec<String>> {
+        let value: serde_json::Value =
+            serde_json::from_str(payload).map_err(|error| rejected("profile_stop", error))?;
+        let session = value["session"]
+            .as_u64()
+            .ok_or_else(|| Error::Invalid("profile_stop names no session".into()))?;
+        let reason = value["reason"].as_str().unwrap_or("stopped").to_owned();
+        let mut answers = Vec::with_capacity(self.ranks.len());
+        for (index, rank) in self.ranks.iter().enumerate() {
+            let (number, executor) = {
+                let rank = lock(rank);
+                (rank.rank, rank.executor()?)
+            };
+            let answer = executor.profile(Change::Stop {
+                session,
+                reason: reason.clone(),
+                rank: number,
+            })?;
+            self.unbook_profiling(index);
+            answers.push(answer.to_string());
+        }
+        Ok(answers)
+    }
+
+    /// Turns one collector of a session off on every rank, for the quality-of-service guard.
+    ///
+    /// # Errors
+    ///
+    /// When the payload names no session or collector, or a rank's device is gone.
+    pub fn release_profile(&self, payload: &str) -> Result<Vec<String>> {
+        let value: serde_json::Value =
+            serde_json::from_str(payload).map_err(|error| rejected("profile_release", error))?;
+        let session = value["session"]
+            .as_u64()
+            .ok_or_else(|| Error::Invalid("profile_release names no session".into()))?;
+        let collector: proto::profile::Collector = serde_json::from_value(value["collector"].clone())
+            .map_err(|error| rejected("profile_release", error))?;
+        let reason = value["reason"].as_str().unwrap_or("released").to_owned();
+        let mut answers = Vec::with_capacity(self.ranks.len());
+        for rank in &self.ranks {
+            let (number, executor) = {
+                let rank = lock(rank);
+                (rank.rank, rank.executor()?)
+            };
+            let answer = executor.profile(Change::Release {
+                session,
+                collector,
+                reason: reason.clone(),
+                rank: number,
+            })?;
+            answers.push(answer.to_string());
+        }
+        Ok(answers)
     }
 
     /// Why this epoch must end, once a change of its mappings failed part of the way.
@@ -555,6 +745,7 @@ impl DataPlane {
             let executor = lock(rank).executor()?;
             done("suspending the graph pools", executor.suspend_graphs()?)?;
         }
+        self.rebook(false)?;
         tracing::info!("the graph pools gave their storage back at unchanged addresses");
         Ok(())
     }
@@ -572,6 +763,7 @@ impl DataPlane {
             let executor = lock(rank).executor()?;
             done("restoring the graph pools", executor.restore_graphs()?)?;
         }
+        self.rebook(true)?;
         tracing::info!("the graph pools took their storage back at the addresses the graphs hold");
         Ok(())
     }
@@ -585,48 +777,16 @@ impl DataPlane {
                 let device = rank.device;
                 let planes = Self::planes_of(&rank);
                 let memory = device.memory_info()?;
-                let graph_share = crate::capacity::graph_storage_budget_bytes(
-                    i64::try_from(memory.total).unwrap_or(i64::MAX),
-                );
-                let (ledger, host_storage) = rank.storage.ledger(device)?;
-                let scratch = rank.cache.as_ref().map_or(0, |cache| lock(cache).scratch_lent());
-                // The head segment a successor creates beside this rank's: the sentinel, the
-                // scratch of a warmup like this rank's and the writable pages one request needs to
-                // advance, in whole granules.
-                let head_bytes = match planes.as_ref() {
-                    Some(planes) => {
-                        let plan = planes.plan();
-                        let granularity =
-                            platform::HandleType::Descriptor.granularity(device)? as u64;
-                        u64::from(PlaneLayout::whole_granules(
-                            1 + scratch + plan.progress_units(),
-                            plan.plane_bytes,
-                            granularity,
-                        )) * planes.unit_bytes()
-                    }
-                    None => 0,
-                };
-                let capacity_units = match (planes.as_ref(), self.max_total_tokens) {
-                    (Some(planes), Some(tokens)) => {
-                        Some(planes.plan().token_units(tokens, self.request_slots))
-                    }
-                    _ => None,
-                };
+                let (ledger, _) = rank.storage.ledger(device)?;
                 Ok(serde_json::json!({
                     "segments": planes.as_ref().and_then(|planes| planes.segments()).unwrap_or_default(),
                     "held": planes.as_ref().map_or(0, |planes| planes.held_segments()),
                     "unit_bytes": planes.as_ref().map_or(0, |planes| planes.unit_bytes()),
-                    "head_bytes": head_bytes,
-                    "capacity_units": capacity_units,
-                    "scratch_units": scratch,
                     "free_bytes": memory.free,
-                    "graph_share_bytes": graph_share,
-                    "capturable": true,
                     "host": rank.host,
                     "scope": rank.storage.scope(),
                     "world": rank.storage.world(),
                     "ledger": ledger,
-                    "host_storage": host_storage,
                 })
                 .to_string())
             })

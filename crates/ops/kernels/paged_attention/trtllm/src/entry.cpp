@@ -106,8 +106,10 @@ bool dtype_of(int64_t code, Data_type& dtype) {
   }
 }
 
-// The runners are one per element-type combination and load the artifact's
-// kernel table; the process keeps them for its life, as captured graphs do.
+// The runners are one per device and element-type combination and load the
+// artifact's kernel table; the process keeps them for its life, as captured graphs
+// do. A runner holds kernels loaded into one device's context, and the ranks of a
+// host are threads of one process, so a device never borrows another's runner.
 std::mutex& runner_mutex() {
   static std::mutex mutex;
   return mutex;
@@ -119,8 +121,10 @@ std::unordered_map<uint32_t, TllmGenFmhaRunner>& runners() {
 }
 
 uint32_t runner_key(Data_type query, Data_type key_value, Data_type out) {
-  return static_cast<uint32_t>(query) << 16 | static_cast<uint32_t>(key_value) << 8 |
-         static_cast<uint32_t>(out);
+  int device = 0;
+  cudaGetDevice(&device);
+  return static_cast<uint32_t>(device) << 24 | static_cast<uint32_t>(query) << 16 |
+         static_cast<uint32_t>(key_value) << 8 | static_cast<uint32_t>(out);
 }
 
 // Whether this process already built the runner these dtypes need.

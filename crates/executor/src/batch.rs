@@ -149,6 +149,9 @@ pub struct BatchOutput {
     /// the step on the host. `copy_us` is zero in-process and states a fact rather than a
     /// measurement: nothing is transferred for the completion, since the mechanism reads it here.
     pub timing: TimingCounters,
+    /// What this rank's counters, probes and profiling session accumulated since its last result,
+    /// which the scheduler adds into its statistics. Empty and absent while nothing observes it.
+    pub forward_stats: Option<ipc::ForwardStats>,
 }
 
 /// One batch: one phase of one step, as the mechanism assembles it.
@@ -604,6 +607,11 @@ impl Jobs {
 /// One job the device executor issues, in submission order.
 #[derive(Clone)]
 pub enum Job {
+    /// Takes this rank's part in the expert step a peer opened, with no tokens of its own.
+    Join {
+        /// The runner that joins.
+        runner: crate::runner::RunnerId,
+    },
     /// Replays the captured graph of `bucket`: the runner staged the batch's inputs already.
     Replay {
         /// The runner that serves the batch.
@@ -669,6 +677,7 @@ impl Job {
     /// performed and carried beside that error.
     pub fn describe(&self) -> String {
         match self {
+            Self::Join { .. } => "joining an expert step".to_owned(),
             Self::Replay {
                 bucket,
                 generation,
@@ -701,7 +710,7 @@ impl Job {
     /// What kind of job this is, for the watchdog's report.
     pub fn kind(&self) -> JobKind {
         match self {
-            Self::Replay { .. } => JobKind::Replay,
+            Self::Join { .. } | Self::Replay { .. } => JobKind::Replay,
             Self::Capture { .. } => JobKind::Capture,
             Self::Rebind { .. } => JobKind::Rebind,
             Self::Shadow { .. } => JobKind::Shadow,
@@ -720,7 +729,8 @@ impl Job {
     /// The runner that performs the job, if a runner does.
     pub fn runner(&self) -> Option<crate::runner::RunnerId> {
         match self {
-            Self::Replay { runner, .. }
+            Self::Join { runner }
+            | Self::Replay { runner, .. }
             | Self::Capture { runner, .. }
             | Self::Rebind { runner, .. }
             | Self::Shadow { runner, .. }
@@ -732,6 +742,10 @@ impl Job {
 impl std::fmt::Debug for Job {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::Join { runner } => formatter
+                .debug_struct("Join")
+                .field("runner", runner)
+                .finish(),
             Self::Replay {
                 runner,
                 bucket,
@@ -1188,6 +1202,8 @@ pub enum JobKind {
     HostCache,
     /// Mapping the released cache segments again, with the unit resets that follow (2.5).
     Wake,
+    /// A change of the rank's profiling session.
+    Profile,
     /// A job that only waits for the events it was given.
     After,
 }
@@ -1211,6 +1227,7 @@ impl JobKind {
             Self::Sleep => "sleep",
             Self::HostCache => "host cache",
             Self::Wake => "wake",
+            Self::Profile => "profile",
             Self::After => "after",
         }
     }

@@ -16,6 +16,7 @@ pub mod decoder;
 pub mod denoiser;
 pub(crate) mod diag;
 pub mod encoder;
+pub mod experts;
 pub(crate) mod floor;
 pub mod lifecycle;
 pub mod media;

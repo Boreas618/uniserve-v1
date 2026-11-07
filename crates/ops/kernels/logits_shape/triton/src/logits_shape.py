@@ -66,8 +66,12 @@ def _logits_shape_kernel(
         current = tl.load(
             logits_ptr + row * vocabulary + columns, mask=mask, other=0.0
         ).to(tl.float32)
+        # A padded row names slot -1, which addresses memory before the table: it reads no
+        # counts, and its logits are discarded.
         counts = tl.load(
-            counts_ptr + slot * vocabulary + columns, mask=mask, other=0
+            counts_ptr + slot * vocabulary + columns,
+            mask=mask & (slot >= 0),
+            other=0,
         ).to(tl.float32)
         for index in tl.static_range(EXTRAS):
             token = tl.load(extras_ptr + row * EXTRAS + index)

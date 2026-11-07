@@ -543,6 +543,7 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
                         device_us: launched.elapsed().as_micros() as u64,
                         ..Default::default()
                     },
+                    forward_stats: None,
                 })
             }
             Job::Capture {
@@ -555,6 +556,9 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
             } => self
                 .rebind(*bucket, *generation)
                 .map(|()| BatchOutput::default()),
+            Job::Join { .. } => Err(Error::Invariant(
+                "an audio decoder runner joins no expert step".into(),
+            )),
             Job::Shadow { operator, key, .. } => Err(Error::Invariant(format!(
                 "an audio decoder runner compares no operator, and the device asked it to shadow \
                  {operator} {key}"

@@ -341,9 +341,6 @@ pub struct RankFacts<'a> {
     /// The rank's host endpoint, as it advertises itself.
     pub host: &'a str,
     pub world: u64,
-    /// The cache a standby maps as its predecessor holds it: the planes exist already, so the
-    /// rank's grant does not pay for them and its own figures do not size them.
-    pub segments: Option<ipc::CacheTable>,
     /// The deployment's rank count, which no peer list states.
     pub world_size: usize,
     /// Requests the scheduler may have in flight, which the daemon places.
@@ -359,6 +356,12 @@ pub struct RankFacts<'a> {
     pub max_request_pool_size: usize,
     /// The model's longest request.
     pub max_model_len: usize,
+    /// The tokens the deployment fixed the cache at (`kv_cache_config.max_tokens`), or `None` to
+    /// size it from storage.
+    pub max_total_tokens: Option<usize>,
+    /// The planes a standby adopts: the cache of the world it stands by for, which it maps and did
+    /// not size. `None` for a rank that lays its planes out itself.
+    pub segments: Option<ipc::CacheTable>,
     /// Fraction of the device's storage the epoch may hold.
     pub mem_fraction_static: f64,
     /// The paged key/value geometry this rank keeps, or `None` for a rank that keeps no paged
@@ -368,6 +371,9 @@ pub struct RankFacts<'a> {
     /// other can honour, and the two would differ silently if a zero stood for absence.
     pub cache: Option<CacheGeometry>,
     pub kv_dtype: ipc::PrefixCacheDtype,
+    /// Device bytes the rank's expert transport takes at its first capture, after the cache is
+    /// fitted, or zero for a rank that exchanges no experts.
+    pub transport_bytes: u64,
 }
 
 /// A rank's plan with the figures no owner states: the widest block table a
@@ -662,6 +668,12 @@ pub fn plan_media(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> R
     plan(facts, report, group, None)
 }
 
+/// What a rank's process maps after its plan and beside its pools: the modules a precopy loads and
+/// the workspaces of the native libraries they call. A rank measured 2.26 GB of it serving
+/// Qwen3-30B-A3B over twelve graphs; a cache sized from storage leaves it this room, because the
+/// ledger refuses a rank whose process does not fit beside its cache.
+const PROCESS_ALLOWANCE: u64 = 4 << 30;
+
 /// The one planner both entry points share: what differs between them is only the cache fitted.
 fn plan(
     facts: &RankFacts<'_>,
@@ -696,15 +708,35 @@ fn plan(
         }
         Device::Cpu => (0, 0),
     };
+    // A cache sized from storage takes what the deployment's quota leaves: the device's share less
+    // what is mapped by now, which is the weights and the process, and less what the process has yet
+    // to map. Nothing else bounds it, so the fraction binds here or nowhere.
+    let grant = match (facts.device, &cache) {
+        (Device::Cuda(index), Some(_)) => {
+            let storage = index.memory_info()?;
+            let held = storage.total.saturating_sub(storage.free);
+            let quota = crate::capacity::device::quota(storage.total, facts.mem_fraction_static);
+            let grant = quota
+                .saturating_sub(held.saturating_add(PROCESS_ALLOWANCE))
+                .min(storage.free);
+            Some(usize::try_from(grant).unwrap_or(usize::MAX))
+        }
+        _ => None,
+    };
     let request = CapacityRequest {
         device: facts.device,
         block_size: facts.block_size.map(|size| size as usize),
-        pool_storage_bytes: None,
+        pool_storage_bytes: grant,
         pool_storage_full_bytes: None,
         mem_fraction_static: facts.mem_fraction_static,
         max_batch_calls: facts.max_batch_calls,
         max_batch_tokens: facts.max_batch_tokens,
-        max_total_tokens: Some(facts.max_model_len),
+        // A rank without a paged cache plans its request's whole footprint, whose bound is the
+        // longest request.
+        max_total_tokens: match &cache {
+            Some(_) => facts.max_total_tokens,
+            None => Some(facts.max_model_len),
+        },
         max_request_pool_size: facts.max_request_pool_size,
         encoder_cache_entries: 0,
         segments: facts.segments.clone(),
@@ -735,7 +767,9 @@ fn plan(
         facts.queue_depth,
         0,
         total_bytes,
-        reserved_bytes,
+        // The transport is created at the first capture, when a program exists, so the cache is
+        // fitted around what it will take.
+        reserved_bytes + facts.transport_bytes,
         granularity,
         group,
         |size| match &cache {
@@ -1304,7 +1338,6 @@ mod tests {
             device: Device::Cuda(DeviceId(0)),
             host: "rank",
             world: 0,
-            segments: None,
             world_size: 1,
             queue_depth: 2,
             block_size: Some(64),
@@ -1312,9 +1345,12 @@ mod tests {
             max_batch_tokens: 2048,
             max_request_pool_size: 8,
             max_model_len: 4096,
+            max_total_tokens: Some(4096),
+            segments: None,
             mem_fraction_static: 0.5,
             cache,
             kv_dtype: ipc::PrefixCacheDtype::BFloat16,
+            transport_bytes: 0,
         }
     }
 

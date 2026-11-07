@@ -18,6 +18,7 @@
 //! `cuGraphExecKernelNodeSetParams` addresses a node of the graph the executable was instantiated
 //! from.
 
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 
 use ops::Kernel;
@@ -54,7 +55,10 @@ pub type Nodes = Vec<(&'static str, String, Vec<platform::WalkedNode>)>;
 /// says otherwise.
 pub struct Captured {
     /// The executable the stream launches.
-    exec: GraphExec,
+    ///
+    /// Replaced before a replay when it no longer suits CUPTI's recording of the process: a timeline
+    /// changed how graphs are traced, or storage the graph addresses was remapped.
+    exec: RefCell<GraphExec>,
     /// The graph the executable was instantiated from; its nodes are the handles a rebind sets.
     ///
     /// Shared, because a rebind builds the prepared generation's executable from this same graph
@@ -67,6 +71,10 @@ pub struct Captured {
     kernels: Vec<Arc<Kernel>>,
     /// How many kernel nodes the graph has: what one replay launches (7.3's counters).
     kernel_nodes: u64,
+    /// The renewal the executable was instantiated at ([`crate::profiling::graph_renewals`]).
+    renewal: Cell<u64>,
+    /// The parameters a rebind set on the executable, which a new one of the template needs again.
+    rebound: RefCell<Vec<(GraphNode, OwnedKernelNodeParams)>>,
 }
 
 impl Captured {
@@ -198,22 +206,35 @@ impl Captured {
             );
         }
         Ok(Self {
-            exec,
+            exec: RefCell::new(exec),
             template,
             nodes,
             kernels,
             kernel_nodes,
+            renewal: Cell::new(crate::profiling::graph_renewals()),
+            rebound: RefCell::new(Vec::new()),
         })
     }
 
     /// Replays the graph on `stream`, after the work already queued on it.
     pub fn launch(&self, stream: &Stream) -> Result<()> {
-        Ok(self.exec.launch(stream)?)
+        let renewal = crate::profiling::graph_renewals();
+        if self.renewal.get() != renewal {
+            // The template keeps the capture's nodes, so a new executable needs nothing captured
+            // again; an executable still in flight is freed by the driver when it completes.
+            let exec = self.template.instantiate()?;
+            for (node, params) in self.rebound.borrow().iter() {
+                exec.set_kernel_node_params_owned(node.clone(), params)?;
+            }
+            *self.exec.borrow_mut() = exec;
+            self.renewal.set(renewal);
+        }
+        Ok(self.exec.borrow().launch(stream)?)
     }
 
     /// The executable, for a caller that needs its raw handle in a report.
-    pub fn exec(&self) -> &GraphExec {
-        &self.exec
+    pub fn exec(&self) -> std::cell::Ref<'_, GraphExec> {
+        self.exec.borrow()
     }
 
     /// The template graph the executable was instantiated from.
@@ -314,7 +335,10 @@ impl Captured {
             )));
         }
         for (node, owned) in kernels.into_iter().zip(params) {
-            self.exec.set_kernel_node_params_owned(node.clone(), owned)?;
+            self.exec
+                .borrow()
+                .set_kernel_node_params_owned(node.clone(), owned)?;
+            self.rebound.borrow_mut().push((node.clone(), owned.clone()));
         }
         Ok(params.len())
     }

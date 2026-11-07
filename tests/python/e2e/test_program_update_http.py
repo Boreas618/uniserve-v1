@@ -278,7 +278,7 @@ def program_server(tmp_path_factory: pytest.TempPathFactory):
     socket = work / "program-server.sock"
     log = work / "program-server.log"
     target = _program_target()
-    interpreter = _repository() / ".venv" / "bin" / "python"
+    interpreter = _repository() / "crates/program-server/python/.venv/bin/python"
     built = work / "programs"
     _build_store(built, target, interpreter if interpreter.exists() else None)
     command = [

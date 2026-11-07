@@ -565,6 +565,8 @@ pub struct Group {
     pub ranks: u64,
     /// Tokens one rank's exchange carries.
     pub capacity: u64,
+    /// Leading ranks of the exchange that hold no experts; zero when every rank holds its share.
+    pub attention: u64,
 }
 
 impl Group {
@@ -573,7 +575,7 @@ impl Group {
     /// The exchange hands a rank its own `capacity` tokens first and then its peers', so the rows this
     /// rank sorts over are the whole group's, not its own batch's.
     pub fn received(&self) -> u64 {
-        self.ranks.saturating_mul(self.capacity)
+        (self.ranks + self.attention).saturating_mul(self.capacity)
     }
 }
 
@@ -670,6 +672,17 @@ pub fn exchanged_bytes(
     Ok(total)
 }
 
+/// The per-expert scalars a fused exchange's kernel multiplies in, one table per use.
+#[derive(Clone)]
+pub struct FusedTables {
+    /// `[local]` f32: dequantizes the first product, a weight's tensor scale times the rows' scale.
+    pub up_gate_alpha: Weight,
+    /// `[local]` f32: dequantizes the second product.
+    pub down_alpha: Weight,
+    /// `[local]` f32: the global scale the gated rows are encoded with.
+    pub gated_scale: Weight,
+}
+
 /// The expert stacks a block multiplies.
 ///
 /// A checkpoint is either dense (BF16/F16 expert matrices) or calibrated NVFP4 (the encoded fields
@@ -735,6 +748,8 @@ pub struct Moe {
     activation: Activation,
     renormalize: bool,
     scale: Option<Weight>,
+    /// The per-expert tables a fused exchange reads, on an encoded expert-parallel block.
+    fused: Option<FusedTables>,
     tile: u32,
     /// Experts of the vocabulary this rank holds; every expert in the colocated case.
     local: u32,
@@ -1043,10 +1058,51 @@ impl Moe {
             activation,
             renormalize,
             scale,
+            fused: None,
             tile: 128,
             local,
             local_offset,
         })
+    }
+
+    /// An encoded block placed on one rank of a group whose exchange runs the experts in one launch.
+    ///
+    /// `up_gate` and `down` hold this rank's `[local, ...]` experts, in the layouts the fused kernel
+    /// reads; `tables` are its per-expert scalars.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block is named by its parts, as `expert_parallel` names them"
+    )]
+    pub fn fused_expert_parallel(
+        router: Linear,
+        up_gate: QuantizedStack,
+        down: QuantizedStack,
+        tables: FusedTables,
+        map: Option<Weight>,
+        experts: u32,
+        local: u32,
+        local_offset: u32,
+        top: u32,
+        activation: Activation,
+        renormalize: bool,
+    ) -> Result<Self> {
+        let mut block = Self::build(
+            router,
+            ExpertStacks::Encoded {
+                up_gate: Box::new(up_gate),
+                down: Box::new(down),
+            },
+            map,
+            experts,
+            local,
+            local_offset,
+            top,
+            activation,
+            renormalize,
+            None,
+        )?;
+        block.fused = Some(tables);
+        Ok(block)
     }
 
     /// The same block placed on one rank of an expert-parallel group.
@@ -1285,11 +1341,7 @@ impl Moe {
     /// `hidden` and `out` are `[tokens, hidden]`.
     pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
         if self.local != self.experts || f.exchange.is_some() {
-            return Err(Error::Unsupported(
-                "Moe: this block's experts are split across ranks; call \
-                 forward_expert_parallel so the routes travel over the exchange"
-                    .to_owned(),
-            ));
+            return self.forward_expert_parallel(f, hidden, out);
         }
         let hidden_width = u64::from(self.hidden);
         hidden
@@ -1725,13 +1777,6 @@ impl Moe {
             )
         })?;
         exchange.require_extents("Moe")?;
-        let ExpertStacks::Dense { up_gate, down } = &self.stacks else {
-            return Err(Error::Unsupported(
-                "Moe::forward_expert_parallel: an encoded stack has no exchange path yet; the \
-                 quantized block is colocated"
-                    .to_owned(),
-            ));
-        };
         let hidden_width = u64::from(self.hidden);
         let top = u64::from(self.top);
         let ranks = u64::from(exchange.ranks);
@@ -1752,7 +1797,7 @@ impl Moe {
         }
         // The group's geometry has to agree with the placement the block was built for.
         let expected_ranks = u64::from(self.experts / self.local.max(1));
-        if ranks != expected_ranks {
+        if ranks - u64::from(exchange.attention) != expected_ranks {
             return Err(Error::shape(
                 "Moe",
                 format!(
@@ -1777,7 +1822,7 @@ impl Moe {
         for (name, view, dtype) in [
             ("ids", exchange.ids, DType::I32),
             ("weights", exchange.weights, DType::F32),
-            ("counts", exchange.counts, DType::I32),
+            ("live", exchange.live, DType::I32),
         ] {
             if view.dtype != dtype {
                 return Err(Error::shape(
@@ -1797,10 +1842,7 @@ impl Moe {
         }
 
         let experts = u64::from(self.experts);
-        let local = u64::from(self.local);
-        let intermediate = u64::from(self.intermediate);
         let arena = f.arena();
-        let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
 
         // 1. The replicated router and its top-k: every rank routes whole tokens the same way.
         let scores = arena.tensor(hidden.dtype, Shape::new(&[tokens, experts]))?;
@@ -1821,30 +1863,97 @@ impl Moe {
         f.operate::<TopkSoftmax>(&routing, args)?;
         let sent = ids;
 
+        self.exchange_routes(f, exchange, hidden, sent, weights, out)
+    }
+
+    /// Takes part in the group's step with no tokens of this rank's own.
+    ///
+    /// Every rank runs every expert layer of a step, because a dispatch waits on its device for the
+    /// same dispatch on every rank. A rank with no batch of its own calls this: its experts serve the
+    /// tokens routed to them and it sends none.
+    pub fn join_expert_step(&self, f: &Forward) -> Result<()> {
+        let exchange = f.exchange.ok_or_else(|| {
+            Error::shape(
+                "Moe",
+                "a join reads the group's exchange views, and the forward borrows none".to_owned(),
+            )
+        })?;
+        exchange.require_extents("Moe")?;
+        let width = u64::from(self.hidden);
+        let top = u64::from(self.top);
+        let base = DevicePtr::new(0);
+        let rows = TensorView::new(base, exchange.states.dtype, Shape::new(&[0, width]));
+        let ids = TensorView::new(base, DType::I32, Shape::new(&[0, top]));
+        let weights = TensorView::new(base, DType::F32, Shape::new(&[0, top]));
+        self.exchange_routes(f, exchange, rows, ids, weights, rows)
+    }
+
+    /// Dispatches `hidden`'s routes, runs this rank's experts over what it received, and combines
+    /// each token's partial sums into `out`.
+    fn exchange_routes(
+        &self,
+        f: &Forward,
+        exchange: &crate::exchange::ExchangeViews,
+        hidden: TensorView,
+        sent: TensorView,
+        weights: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        if exchange.fused {
+            return self.fused_routes(f, exchange, hidden, sent, weights, out);
+        }
+        let ExpertStacks::Dense { up_gate, down } = &self.stacks else {
+            return Err(Error::Unsupported(
+                "Moe::forward_expert_parallel: an encoded stack has no exchange path yet; the \
+                 quantized block is colocated"
+                    .to_owned(),
+            ));
+        };
+        let hidden_width = u64::from(self.hidden);
+        let top = u64::from(self.top);
+        let tokens = hidden.rows();
+        let local = u64::from(self.local);
+        let intermediate = u64::from(self.intermediate);
+        let received = u64::from(exchange.ranks) * u64::from(exchange.capacity);
+        let arena = f.arena();
+        let launch_tokens = u32::try_from(tokens)
+            .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?;
+        let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
+
         // 3. Dispatch: each token's payload goes to the ranks that hold its experts.
         let exchange_descriptor = |mode: Mode| exchange::Descriptor {
             mode,
             hidden: self.hidden,
+            intermediate: self.intermediate,
             top: self.top,
             experts: self.experts,
             max_tokens: exchange.capacity,
             ranks: exchange.ranks,
-            dtype: hidden.dtype,
+            attention: exchange.attention,
+            dtype: exchange.states.dtype,
         };
         let dispatch = exchange_descriptor(Mode::Dispatch);
         let args = ExchangeArgs {
             transport: exchange.transport,
-            tokens: u32::try_from(tokens)
-                .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?,
+            tokens: launch_tokens,
             state: hidden,
             ids: sent,
             weights,
+            live: f.live_of(),
             out: empty,
-            counts: exchange.counts,
+            fused: None,
             ranks: exchange.ranks,
         };
 
+        (exchange.meet)()?;
         f.operate::<ExpertExchange>(&dispatch, args)?;
+        f.settled()?;
+
+        // A rank that holds no experts receives nothing: its routes went to the expert ranks, and
+        // only their sums come back.
+        if exchange.source_only {
+            return self.combine_routes(f, exchange, launch_tokens, out);
+        }
 
         // 4. The rows this rank was sent, grouped by its own experts.
         let tiles = ops::moe::max_tiles(received, top, local, u64::from(self.tile));
@@ -1867,13 +1976,10 @@ impl Moe {
             permuted_to_token,
             total_padded_tokens,
             num_non_exiting_tiles,
-            // The expert-parallel path's `tokens` is `received` - the routes this rank holds,
-            // gathered from many batches - not the batch's token rows. A batcher's live count
-            // is a number over the pre-dispatch batch, so passing it here would compare a count
-            // of one population against a shape of another. The exchange delivers a route only
-            // to the rank that owns it, so every delivered row is live and this path states no
-            // count: padding exists on the single-rank path, which is where the bucket is padded.
-            live_tokens: None,
+            // The rows the step holds, which the agreed capacity decides on the device: the views'
+            // extents are the transport's largest step, and the rows past the count are left over
+            // from an earlier one.
+            live_tokens: Some(exchange.live),
             local_offset: self.local_offset,
         };
 
@@ -1885,14 +1991,14 @@ impl Moe {
         // `down` hold `local` experts, and the sort rebased every received route into that window
         // with `local_offset`, so the vocabulary count would name a stack this rank does not hold
         // (and the operator's shape check would refuse the launch).
-        let gated = arena.tensor(hidden.dtype, Shape::new(&[rows, intermediate]))?;
+        let gated = arena.tensor(exchange.states.dtype, Shape::new(&[rows, intermediate]))?;
         let first = GatherGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
             experts: self.local,
             top: self.top,
             activation: self.activation,
-            dtype: hidden.dtype,
+            dtype: exchange.states.dtype,
             tile: MMA_TILE,
             cluster: MMA_CLUSTER,
         };
@@ -1912,13 +2018,14 @@ impl Moe {
 
         // Permuted-height for the reason the dense path's is: the combine below indexes it through
         // `expanded_to_permuted`.
-        let products = arena.tensor(hidden.dtype, Shape::new(&[rows, hidden_width]))?;
+        let products =
+            arena.tensor(exchange.states.dtype, Shape::new(&[rows, hidden_width]))?;
         let second = RouteGemmDescriptor {
             hidden: self.hidden,
             intermediate: self.intermediate,
             experts: self.local,
             top: self.top,
-            dtype: hidden.dtype,
+            dtype: exchange.states.dtype,
             tile: MMA_TILE,
             cluster: MMA_CLUSTER,
         };
@@ -1935,8 +2042,8 @@ impl Moe {
 
         f.operate::<RouteGemm>(&second, args)?;
 
-        // 6. Each received row's routes summed with their FP32 weights, in receive order.
-        let combined = arena.tensor(hidden.dtype, Shape::new(&[received, hidden_width]))?;
+        // 6. Each received row's routes summed with their FP32 weights, in receive order, straight
+        //    into the transport's view the peers read back.
         let combine_descriptor = combine::Descriptor {
             layout: combine::Layout::Permuted,
             hidden: self.hidden,
@@ -1944,32 +2051,150 @@ impl Moe {
             experts: self.experts,
             input: products.dtype,
             scales: DType::F32,
-            output: hidden.dtype,
+            output: exchange.states.dtype,
         };
         let args = UnpermuteArgs {
             routes: products,
             expanded_to_permuted,
             scales: exchange.weights,
-            out: combined,
+            out: exchange.combined,
         };
 
         f.operate::<MoeUnpermute>(&combine_descriptor, args)?;
 
-        // 7. Combine: the ranks' partial sums for this rank's tokens, rounded once to `out`.
-        let combine_exchange = exchange_descriptor(Mode::Combine);
+        self.combine_routes(f, exchange, launch_tokens, out)
+    }
+
+    /// One launch exchanges the routes, runs every rank's experts and combines.
+    ///
+    /// The rows are encoded straight into the transport's symmetric views, where the peers read
+    /// them, with the same encoder the stack's other products take: the encode is the layer's, and
+    /// the kernel starts from the bytes.
+    fn fused_routes(
+        &self,
+        f: &Forward,
+        exchange: &crate::exchange::ExchangeViews,
+        hidden: TensorView,
+        sent: TensorView,
+        weights: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let ExpertStacks::Encoded { up_gate, down } = &self.stacks else {
+            return Err(Error::Unsupported(
+                "Moe: a fused exchange runs encoded experts, and this block's are dense".to_owned(),
+            ));
+        };
+        let tables = self.fused.as_ref().ok_or_else(|| {
+            Error::Unsupported(
+                "Moe: this block was loaded without the tables a fused exchange reads".to_owned(),
+            )
+        })?;
+        let tokens = hidden.rows();
+        let launch_tokens = u32::try_from(tokens)
+            .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?;
+        if tokens > 0 {
+            let token_scale = f
+                .arena()
+                .tensor(DType::F32, Shape::new(&[tokens]))?;
+            let descriptor =
+                self.quantize_descriptor(hidden.dtype, self.hidden, ScaleLayout::Linear);
+            let args = QuantizeArgs {
+                input: hidden,
+                values: TensorView::new(
+                    exchange.packed.ptr,
+                    exchange.packed.dtype,
+                    Shape::new(&[tokens, exchange.packed.shape.last()]),
+                ),
+                scales: TensorView::new(
+                    exchange.packed_scales.ptr,
+                    DType::U8,
+                    Shape::new(&[tokens, exchange.packed_scales.shape.last()]),
+                ),
+                global_scale: up_gate.encode_scale.view(),
+                token_scale,
+            };
+            f.operate::<Nvfp4Quantize>(&descriptor, args)?;
+        }
+        let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
+        let address = |weight: &Weight| weight.view().ptr.address();
+        let bytes = |weight: &Weight| {
+            weight.view().numel() / u64::from(self.local)
+        };
+        let layer = exchange::FusedLayer {
+            up_gate: address(&up_gate.values),
+            up_gate_scales: address(&up_gate.scales),
+            down: address(&down.values),
+            down_scales: address(&down.scales),
+            up_gate_alpha: address(&tables.up_gate_alpha),
+            down_alpha: address(&tables.down_alpha),
+            gated_scale: address(&tables.gated_scale),
+            up_gate_scale_bytes: i64::try_from(bytes(&up_gate.scales))
+                .map_err(|_| Error::shape("Moe", "a scale table beyond i64".to_owned()))?,
+            down_scale_bytes: i64::try_from(bytes(&down.scales))
+                .map_err(|_| Error::shape("Moe", "a scale table beyond i64".to_owned()))?,
+        };
+        let descriptor = exchange::Descriptor {
+            mode: Mode::Fused,
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            top: self.top,
+            experts: self.experts,
+            max_tokens: exchange.capacity,
+            ranks: exchange.ranks,
+            attention: exchange.attention,
+            dtype: out.dtype,
+        };
         let args = ExchangeArgs {
             transport: exchange.transport,
-            tokens: u32::try_from(tokens)
-                .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?,
-            state: combined,
+            tokens: launch_tokens,
+            state: empty,
+            ids: sent,
+            weights,
+            live: f.live_of(),
+            out,
+            fused: Some(layer),
+            ranks: exchange.ranks,
+        };
+        (exchange.meet)()?;
+        f.operate::<ExpertExchange>(&descriptor, args)?;
+        f.settled()
+    }
+
+    /// Combine: the ranks' partial sums for this rank's tokens, rounded once to `out`.
+    fn combine_routes(
+        &self,
+        f: &Forward,
+        exchange: &crate::exchange::ExchangeViews,
+        tokens: u32,
+        out: TensorView,
+    ) -> Result<()> {
+        let empty = TensorView::new(DevicePtr::new(0), DType::U8, Shape::new(&[0]));
+        let descriptor = exchange::Descriptor {
+            mode: Mode::Combine,
+            hidden: self.hidden,
+            intermediate: self.intermediate,
+            top: self.top,
+            experts: self.experts,
+            max_tokens: exchange.capacity,
+            ranks: exchange.ranks,
+            attention: exchange.attention,
+            dtype: exchange.states.dtype,
+        };
+        let args = ExchangeArgs {
+            transport: exchange.transport,
+            tokens,
+            state: empty,
             ids: empty,
             weights: empty,
+            live: f.live_of(),
             out,
-            counts: exchange.counts,
+            fused: None,
             ranks: exchange.ranks,
         };
 
-        f.operate::<ExpertExchange>(&combine_exchange, args)
+        (exchange.meet)()?;
+        f.operate::<ExpertExchange>(&descriptor, args)?;
+        f.settled()
     }
 
     /// The bound the combined rows' implementations may differ by.
@@ -2065,6 +2290,7 @@ pub(super) mod tests {
             layout: ops::fp4::ScaleLayout::Linear,
             encode_scale: weight(DType::F32, &[1]),
             input_scale: None,
+            activation_scale: 1.0,
         };
         Moe::quantized(
             router,
@@ -2308,6 +2534,7 @@ pub(super) mod tests {
         let decode = Group {
             ranks: 8,
             capacity: 15,
+            attention: 0,
         };
         assert_eq!(decode.received(), 120);
         assert_eq!(
@@ -2332,6 +2559,7 @@ pub(super) mod tests {
         let prefill = Group {
             ranks: 8,
             capacity: 1_024,
+            attention: 0,
         };
         let rows = exchanged_rows(1_024, geometry, prefill).expect("the prefill's rows");
         assert_eq!(rows, 67_456);
@@ -2358,14 +2586,17 @@ pub(super) mod tests {
             Group {
                 ranks: 5,
                 capacity: 1_024,
+                attention: 0,
             },
             Group {
                 ranks: 0,
                 capacity: 15,
+                attention: 0,
             },
             Group {
                 ranks: 8,
                 capacity: 0,
+                attention: 0,
             },
         ] {
             assert!(
@@ -2380,7 +2611,8 @@ pub(super) mod tests {
                 geometry,
                 Group {
                     ranks: 8,
-                    capacity: 15
+                    capacity: 15,
+                    attention: 0,
                 },
                 DType::BF16
             )
@@ -2420,6 +2652,7 @@ pub(super) mod tests {
             layout: ops::fp4::ScaleLayout::Linear,
             encode_scale: weight(DType::F32, &[1]),
             input_scale: None,
+            activation_scale: 1.0,
         };
         // Down's contraction is the gated width, so 512 experts' contraction does not fit 768.
         assert!(
