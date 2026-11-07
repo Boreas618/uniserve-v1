@@ -2034,7 +2034,7 @@ mod tests {
     /// rank of a one-rank group.
     fn rank_facts() -> RankFacts {
         RankFacts {
-            model: Some("Qwen/Qwen3-4B".to_owned()),
+            model: Some("Qwen/Qwen3-30B-A3B".to_owned()),
             dtype: Some(crate::ModelDtype::BFloat16),
             world: Some(7),
             group: Some("model".to_owned()),
@@ -2086,7 +2086,7 @@ mod tests {
         );
         assert!(config.prefix_cache);
         assert!(config.predecessor.is_none());
-        assert_eq!(config.worker_process.model, "Qwen/Qwen3-4B");
+        assert_eq!(config.worker_process.model, "Qwen/Qwen3-30B-A3B");
         assert_eq!(config.worker_process.max_model_len, 32768);
         Ok(())
     }
