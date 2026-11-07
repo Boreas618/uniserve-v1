@@ -32,6 +32,7 @@ import shutil
 import signal
 import socket
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -2643,7 +2644,10 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
         pytest.skip("UNISERVE_QWEN3_UPDATED_MODEL names no other checkpoint")
     name = "qwen3-live-host-weights"
     log = tmp_path / "server.log"
-    with _serve(runtime, log, name) as base_url:
+    # The target loads its checkpoint beside the serving one, and the deployment's
+    # quota of the GPU holds both only past the default share.
+    options = (*OPTIONS, "mem_fraction_static=0.9")
+    with _serve(runtime, log, name, options=options) as base_url:
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
         streaming, streamed = _start_count(base_url, name)
         result = _apply(
