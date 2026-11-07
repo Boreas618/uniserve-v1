@@ -672,10 +672,12 @@ struct PendingLanding {
     started: Instant,
     /// How long staging its batch took, in milliseconds.
     staged_ms: u64,
-    /// The media call it serves.
-    call: ipc::MediaCall,
+    /// The media call it serves, when it serves one.
+    call: Option<ipc::MediaCall>,
     /// The batch it serves.
     batch: u64,
+    /// The runner that answers it.
+    runner: crate::runner::RunnerId,
 }
 
 /// A command whose replay is running, with the answer its submission gets when it lands.
@@ -775,8 +777,11 @@ impl Device {
                     };
                     // A host call has nothing left on its stream, so it answers now and the replay
                     // in flight keeps running. A replay stays in flight, and the one before it
-                    // lands with this one already on the stream.
-                    if matches!(landing.pending.landed.query(), Ok(true)) {
+                    // lands with this one already on the stream: a token step's answers are in
+                    // order, because the next step of a request follows from the one before.
+                    let answered = landing.pending.call.is_some()
+                        && matches!(landing.pending.landed.query(), Ok(true));
+                    if answered {
                         self.land(queue, landing);
                     } else {
                         if let Some(previous) = launched.take() {
@@ -880,18 +885,20 @@ impl Device {
         let result = pending
             .landed
             .synchronize()
-            .map(|()| output)
-            .map_err(Error::from);
-        tracing::info!(
-            device = self.device.0,
-            call = ?pending.call,
-            batch = pending.batch,
-            staged_ms = pending.staged_ms,
-            total_ms = pending.started.elapsed().as_millis() as u64,
-            began_ms = since_start(pending.started),
-            ended_ms = since_start(Instant::now()),
-            "a media batch was served"
-        );
+            .map_err(Error::from)
+            .and_then(|()| self.runner_mut(pending.runner)?.runner.landed(output));
+        if let Some(call) = pending.call {
+            tracing::info!(
+                device = self.device.0,
+                call = ?call,
+                batch = pending.batch,
+                staged_ms = pending.staged_ms,
+                total_ms = pending.started.elapsed().as_millis() as u64,
+                began_ms = since_start(pending.started),
+                ended_ms = since_start(Instant::now()),
+                "a media batch was served"
+            );
+        }
         if let Err(error) = &result {
             tracing::warn!(%error, device = self.device.0, "a device command failed");
             if let Ok(Some(sticky)) = self.probe_sticky() {
@@ -927,16 +934,15 @@ impl Device {
                 // replays overlap leaves its stream running: launching a graph costs the device
                 // milliseconds of idle, and the next step's launch fits behind this step's work.
                 let named = self.runner_mut(runner)?;
-                let overlapping = named.runner.overlaps_replays();
+                let overlapping = named.runner.overlaps_staged();
                 let stream = named.runner.stream().cloned();
                 self.waits = !overlapping;
                 let output = self.perform(&label, jobs_of(runner, jobs)).map(Step::Done);
                 self.waits = true;
                 if overlapping && output.is_ok() {
-                    let (Some(stream), Some(media)) = (stream, &batch.media) else {
+                    let Some(stream) = stream else {
                         return Err(Error::Invariant(
-                            "a runner whose replays overlap serves a media batch on a stream"
-                                .into(),
+                            "a runner whose replays overlap serves a batch on a stream".into(),
                         ));
                     };
                     let landed = platform::Event::new(platform::EventFlags::default());
@@ -945,8 +951,9 @@ impl Device {
                         landed,
                         started,
                         staged_ms: staged.as_millis() as u64,
-                        call: media.computation.call,
+                        call: batch.media.as_ref().map(|media| media.computation.call),
                         batch: batch.id.0,
+                        runner,
                     });
                     return output;
                 }

@@ -18,8 +18,26 @@ use crate::{Error, Result};
 pub(crate) struct Column {
     /// The device buffer's view: what a captured graph addresses.
     pub(crate) device: TensorView,
-    /// The pinned host side, and the allocation whose address `device` names.
+    /// The pinned host side, and the allocation whose address `device` names until the column is
+    /// [placed](Column::place).
     pub(crate) host: platform::PinnedBuffer,
+    /// The device storage of a placed column.
+    placed: Option<Placed>,
+}
+
+/// What a column keeps once it has device storage of its own.
+///
+/// A graph reading host memory reads it while it runs, so a batch staged behind a running graph
+/// would rewrite what that graph reads. A placed column takes its values by a copy on the stream
+/// instead, and the two host halves take turns: the next batch writes one while the copy of the
+/// other waits behind the graph in flight.
+struct Placed {
+    /// Kept for the addresses a captured graph holds.
+    _storage: platform::Buffer,
+    /// The host half the next write does not touch.
+    other: platform::PinnedBuffer,
+    /// How many bytes of `host` the next [`Column::push`] carries.
+    written: usize,
 }
 
 impl Column {
@@ -36,7 +54,68 @@ impl Column {
             dtype,
             ops::Shape::new(&[numel]),
         );
-        Ok(Self { device, host })
+        Ok(Self {
+            device,
+            host,
+            placed: None,
+        })
+    }
+
+    /// Moves the column to device storage from `pools`, with the values its host side holds.
+    ///
+    /// The graphs captured afterwards address the storage, so this runs before the first capture.
+    pub(crate) fn place(
+        &mut self,
+        device: DeviceId,
+        pools: &mut crate::arena::Pools,
+        stream: &platform::Stream,
+    ) -> Result<()> {
+        if self.placed.is_some() {
+            return Ok(());
+        }
+        let bytes = self.host.len();
+        let storage = pools.allocate(platform::PoolKind::Resident, bytes as u64)?;
+        // SAFETY: the destination is `bytes` of storage just carved for this column, the source its
+        // own host side of the same length, and the caller waits before either is touched again.
+        unsafe {
+            platform::memcpy_async(storage.address(), self.host.address(), bytes, stream)?;
+        }
+        self.device = TensorView::new(
+            ops::DevicePtr::new(storage.address()),
+            self.device.dtype,
+            self.device.shape,
+        );
+        self.placed = Some(Placed {
+            _storage: storage,
+            other: platform::PinnedBuffer::new(device, bytes)?,
+            written: 0,
+        });
+        Ok(())
+    }
+
+    /// Hands what was written since the last push to the device, on `stream`.
+    ///
+    /// Only a placed column has anything to carry; the graph reads any other from the host.
+    pub(crate) fn push(&mut self, stream: &platform::Stream) -> Result<()> {
+        let Some(placed) = self.placed.as_mut() else {
+            return Ok(());
+        };
+        if placed.written == 0 {
+            return Ok(());
+        }
+        // SAFETY: the destination is this column's device storage and the source its pinned host
+        // half; neither is shorter than `written`, and the other half takes the next write.
+        unsafe {
+            platform::memcpy_async(
+                self.device.ptr.address(),
+                self.host.address(),
+                placed.written,
+                stream,
+            )?;
+        }
+        placed.written = 0;
+        std::mem::swap(&mut self.host, &mut placed.other);
+        Ok(())
     }
 
     /// Writes `bytes` into the host side; the device copy follows in [`Column::upload`].
@@ -52,6 +131,9 @@ impl Column {
         // least that size, allocated for exactly this purpose; the buffer is not read concurrently.
         unsafe {
             self.host.as_mut_slice()[..bytes.len()].copy_from_slice(bytes);
+        }
+        if let Some(placed) = self.placed.as_mut() {
+            placed.written = bytes.len();
         }
         Ok(())
     }
