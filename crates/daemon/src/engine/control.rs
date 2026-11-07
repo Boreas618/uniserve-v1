@@ -36,6 +36,30 @@ const DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 /// How often a wait rechecks the engine process while it starts.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Variables a main process's CUDA and NCCL libraries read before their first use, with the value it
+/// runs with unless the daemon's own environment states the variable.
+///
+/// - `CUDA_MODULE_LOADING=EAGER`: lazy module loading synchronizes the context when a kernel is first
+///   used, which can deadlock against a collective another stream is waiting in for a peer.
+/// - `NCCL_RUNTIME_CONNECT=0`: deferred peer handshakes would allocate connection buffers after the
+///   process booked its device storage.
+const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
+    ("CUDA_MODULE_LOADING", "EAGER"),
+    ("NCCL_RUNTIME_CONNECT", "0"),
+];
+
+/// The environment a main process is started under: stated on its command, so it precedes any CUDA
+/// or NCCL initialization.
+fn main_process_environment() -> std::collections::HashMap<String, String> {
+    RUNTIME_DEFAULTS
+        .into_iter()
+        .map(|(name, value)| {
+            let value = std::env::var(name).unwrap_or_else(|_| value.to_owned());
+            (name.to_owned(), value)
+        })
+        .collect()
+}
+
 /// Starts the engine processes of one deployment.
 /// Whether `executable` is this process's own binary, by canonical path: a
 /// bare name is looked up by the operating system, not by us, and counts as
@@ -738,7 +762,7 @@ impl EngineControl {
             build: own_executable(&executable).then(|| proto::BUILD.to_owned()),
             executable,
             launch,
-            environment: std::collections::HashMap::new(),
+            environment: main_process_environment(),
         })
     }
 
@@ -770,6 +794,7 @@ impl EngineControl {
                     generation: engine,
                     executable,
                     arguments,
+                    environment: main_process_environment(),
                     ..process::Spawn::default()
                 })),
             })),

@@ -5,12 +5,12 @@
 //! - Refill and dispatch: `refill_executor` admits requests, asks the
 //!   generation assembler (`assemble`) and the video media planner
 //!   for batches while a rank queue has room, and
-//!   `dispatch_submissions` hands them to the executor in order per worker,
+//!   `dispatch_submissions` hands them to the executor in order per executor,
 //!   each after the batches producing its inputs.
 //! - Video media scheduling: a video request runs the calls of its graph
 //!   (`graph::VideoGraph`, built at admission from its task and conditions),
 //!   offered by `ready_calls` as their inputs become available. Calls occupy
-//!   their components' capacity on their workers and, for media reading,
+//!   their components' capacity on their executors and, for media reading,
 //!   encoding and muxing, host task pools, tracked by the media occupancy,
 //!   and `plan_media_call` builds one call with its products, buffer
 //!   bindings, latent pages and reading components.
@@ -22,7 +22,7 @@
 //!   identity against the in-flight window before any completion is applied,
 //!   stages completions, and applies them in request-local dependency order.
 //! - Failure reconciliation: `on_executor_error` retires only the work a
-//!   `ExecutorFailure` invalidates. Any other executor error, and a worker
+//!   `ExecutorFailure` invalidates. Any other executor error, and an executor
 //!   failure classified as a control-plane invariant violation, is
 //!   engine-fatal.
 //!
@@ -39,7 +39,7 @@ mod projection;
 mod results;
 
 use super::*;
-use ipc::{BufferId, MediaCall};
+use ipc::BufferId;
 use scheduling::PolicyError;
 use scheduling::guest::{Plan, Room};
 
@@ -57,7 +57,7 @@ impl Scheduler {
     /// Dispatches queued work while preserving order at every shared destination
     /// and after every product it reads.
     /// The caller retains blocked destinations for the whole scheduling tick, so
-    /// assembling more work cannot repeatedly retry an unavailable worker.
+    /// assembling more work cannot repeatedly retry an unavailable executor.
     ///
     /// Each queued batch is tried once per invocation; a batch that cannot be
     /// submitted goes back to the end of the queue. Returns whether any batch
@@ -69,7 +69,7 @@ impl Scheduler {
     ) -> bool {
         let mut progressed = false;
         // Products of the batches held back in this pass. A call may be
-        // submitted before its inputs' producers complete, since its worker
+        // submitted before its inputs' producers complete, since its executor
         // waits on them, but not before they are submitted, which is when the
         // executor learns where each product is published. A consumer is
         // queued after its producer and held batches keep their order, so the
@@ -104,9 +104,9 @@ impl Scheduler {
             // The `Finish` commands this batch carries close the rows of the
             // requests they name once it is submitted: batches reach a rank in
             // submission order, so no later `Start` can name a row before the
-            // worker has seen its close.
-            // The in-process arm has no worker process to tell: the rows and
-            // buffers a lifecycle command closes are this scheduler's own
+            // executor has seen its close.
+            // The in-process arm has nothing to tell: the rows and buffers a
+            // lifecycle command closes are this scheduler's own
             // pools, so the command is answered here, where it would have been
             // submitted. Its `Finish` and `Free` have nothing left to reach.
             if batch.requests.is_empty() && self.executor.serves_in_process() {
@@ -169,7 +169,7 @@ impl Scheduler {
     /// Returns whether any rank queue can still accept a batch.
     ///
     /// `queue_depth` bounds the batches in flight on one rank, not across the
-    /// worker group: a batch carries one call kind to one component, so a media
+    /// executor group: a batch carries one call kind to one component, so a media
     /// pass occupies a slot on each component it touches rather than a single
     /// shared slot. Assembling stops once every rank queue is full.
     fn a_rank_queue_admits(&self) -> bool {
@@ -186,8 +186,8 @@ impl Scheduler {
     /// scheduler's own capacity: they return as soon as the `Finish` that names
     /// the request has been submitted, because every later batch on that rank
     /// is ordered behind it and no admission can reuse the row before the
-    /// worker has seen the close. The buffers stay in the record until the
-    /// acknowledgement, because they are spans the worker still holds.
+    /// executor has seen the close. The buffers stay in the record until the
+    /// acknowledgement, because they are spans the executor still holds.
     fn close_retiring_row(&mut self, request_key: RequestKey) {
         let Some(retiring) = self
             .retiring_requests
@@ -265,7 +265,7 @@ impl Scheduler {
     /// commands, from the batches the executor has not accepted yet.
     ///
     /// A batch is planned from the state of the step that named it, and a
-    /// worker queue deeper than one batch keeps it queued while later steps
+    /// executor queue deeper than one batch keeps it queued while later steps
     /// run. A request that ends in that window leaves calls behind that no
     /// result will resolve, and a batch that still carries one can no longer
     /// state the layout its kernels read: the request's allocation is gone, so
@@ -273,7 +273,7 @@ impl Scheduler {
     /// other work, and one left with nothing is forgotten - the pending
     /// identity goes with it, so no step waits for a result it will never see.
     /// Its `Finish` and `Free` commands stay: they are what settles the
-    /// worker's state for the request.
+    /// executor's state for the request.
     pub(super) fn retire_queued_calls(&mut self, id: RequestId) {
         let requests: HashSet<RequestKey> = self
             .inflight
@@ -502,7 +502,7 @@ impl Scheduler {
     /// switch serves on under the previous policy, or the epoch stops.
     fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
         // A closing scheduler lets what is in flight drain before its
-        // workers close; a sleeping one runs nothing.
+        // executors close; a sleeping one runs nothing.
         if self.closing || self.asleep || self.held {
             return Vec::new();
         }
@@ -576,7 +576,7 @@ impl Scheduler {
 
     /// Frees the one thing a victim names.
     ///
-    /// An encoder entry leaves the encoder cache and its worker buffer goes with
+    /// An encoder entry leaves the encoder cache and its executor buffer goes with
     /// it; a device page goes to the host KV cache, exactly as a withdrawal's
     /// pages do, and the units it held return when the copy completes (or at
     /// once when the host cache has nowhere to put it).
@@ -1207,22 +1207,6 @@ impl Scheduler {
             shape_bound: ShapeBound::default(),
         })
     }
-}
-
-/// The calls that read the products of an image generation call, or `None`
-/// for a call whose readers are the destinations of its transfer edges.
-///
-/// Image generation chains its state calls on one denoising component: text
-/// features feed latent preparation, which feeds the denoising steps.
-/// `ExecutorGroup::consumer_slots` reads this for a media call whose placement
-/// names no readers; a video request's calls name theirs from the request's
-/// graph (`plan_media_call`).
-pub(crate) fn generation_consuming_calls(media_call: MediaCall) -> Option<&'static [MediaCall]> {
-    Some(match media_call {
-        MediaCall::TextEncoding => &[MediaCall::LatentPreparation],
-        MediaCall::LatentPreparation | MediaCall::Denoising => &[MediaCall::Denoising],
-        _ => return None,
-    })
 }
 
 impl Scheduler {

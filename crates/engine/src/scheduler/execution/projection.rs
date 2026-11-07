@@ -348,7 +348,7 @@ impl Scheduler {
 
     /// Returns the latest accepted state call identity, or `None` when the
     /// request is not running or its current epoch is not yet registered
-    /// with its workers.
+    /// with its executors.
     pub(in crate::scheduler) fn state_predecessor(&self, id: RequestId) -> Option<CallId> {
         let state = self.running.get(&id)?;
         state.worker_registered.then_some(())?;
@@ -377,7 +377,7 @@ impl Scheduler {
         Some(call.call_id)
     }
 
-    /// Applies completed worker commands to scheduler-owned allocation state.
+    /// Applies completed executor commands to scheduler-owned allocation state.
     ///
     /// A `Free` returns its buffer's allocation to the buffer pool when a
     /// pending free, the live request of the same epoch, or its retiring
@@ -464,7 +464,7 @@ impl Scheduler {
             return false;
         };
 
-        // Bound speculation by worker capacity and exclude requests whose
+        // Bound speculation by executor capacity and exclude requests whose
         // terminal or relay state makes the projection unsafe.
         if queue.len() >= self.info.max_unresolved_calls as usize
             || state.terminal_intent.is_terminal()
@@ -552,10 +552,10 @@ impl Scheduler {
     /// - The canvas pass that follows the prefill completing a context (a
     ///   readout's pass or a block's first step), since the prefill cannot
     ///   stop the request. The pass reads the prefix cache the prefill writes, and only
-    ///   the worker's device order puts the write first: the worker runs the
+    ///   the executor's device order puts the write first: the executor runs the
     ///   forwards over the prefix cache in submission order on the device's
     ///   primary stream, and work on another stream orders behind their
-    ///   batches (the retired worker's page executor).
+    ///   batches (the retired executor's page executor).
     /// - A stopped block's commit queued behind the block's steps still in
     ///   flight. The host has accepted the step that stopped the block, so
     ///   every step behind it is a no-op whose completion is false, and the

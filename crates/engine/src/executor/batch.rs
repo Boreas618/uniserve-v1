@@ -1,15 +1,13 @@
-//! Logical submissions and their executor-local protocol projection.
+//! Logical submissions.
 //!
 //! The scheduler builds an [`ExecutionBatch`] of calls, each paired with the
-//! [`RequestPlacement`] it chose, plus lifecycle commands, and hands it to an
-//! `Executor`. `Dispatcher` splits it into one `ExecutionBatch` per target
-//! executor and lowers each with `ExecutionBatch::into_protocol`, which gathers
-//! the per-call placement fields into the flat, call-indexed arrays of the
-//! wire `Batch` and the persistent spans of each rank's own buffer pool.
+//! [`RequestPlacement`] it chose, plus lifecycle commands, and hands it to
+//! `Submissions`, which describes it to the device executor or gives it to the
+//! simulated one.
 
 use super::ExecutorGroupId;
 use ipc::{
-    Batch, BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
+    BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
     ForwardBatch, LatentParams, NewRequest, RequestKey, TensorExport,
 };
 use std::collections::BTreeMap;
@@ -53,14 +51,13 @@ pub struct RequestPlacement {
     pub worker: ExecutorGroupId,
     /// Executor-local request row when a replicated route owns its own address
     /// space. Unset placements retain the admission's canonical row;
-    /// `Dispatcher` applies the override to the `Start` it sends the executor.
+    /// The executor applies the override to the request's `Start`.
     pub request_pool_idx: Option<u32>,
     /// Cache tables and newly acquired units used by this call.
     pub block_tables: Vec<BlockTable>,
     pub new_cache_units: Vec<CacheUnitAllocation>,
-    /// Rows use a local call index until gathered into the physical batch:
-    /// `ExecutionBatch::validate` requires every row's index to be zero, and
-    /// `into_protocol` offsets it by the call's position.
+    /// Rows use a local call index: `ExecutionBatch::validate` requires every
+    /// row's index to be zero.
     pub forward: ForwardBatch,
     pub latent: Option<LatentParams>,
     pub decode: Option<DecodeRange>,
@@ -76,16 +73,11 @@ pub struct RequestPlacement {
     /// connects its calls; empty for a call whose products leave the graph.
     /// Admission fixes a video request's route, so a product is published
     /// only toward the replicas that read it. `None` for calls outside a
-    /// video graph, whose readers follow from their call kind
-    /// (`generation_consuming_calls`) or their transfer edges.
+    /// video graph.
     pub readers: Option<BTreeMap<String, ExecutorGroupId>>,
 }
 
 /// One logical executor submission. Its rank projections are derived only inside an executor.
-///
-/// `Dispatcher` also uses this type for the part of a logical batch routed
-/// to one executor; that part keeps the logical `id`, so completions from every
-/// executor correlate to the same batch.
 #[derive(Debug, Clone)]
 pub struct ExecutionBatch {
     /// Logical batch identity used to correlate partial completions.
@@ -98,8 +90,7 @@ pub struct ExecutionBatch {
     pub input_transfers: Vec<TensorExport>,
     /// External cache exports consumed by explicit cache installation.
     ///
-    /// `ExecutionBatch::new` leaves this empty; `Dispatcher` fills it on
-    /// the executor-local batches it builds.
+    /// `ExecutionBatch::new` leaves this empty.
     pub cache_inputs: Vec<ipc::CacheTransfer>,
     /// Published pages the batch writes to the host KV cache.
     pub page_offloads: Option<PageOffloads>,
@@ -227,10 +218,7 @@ impl ExecutionBatch {
     /// Requires at least one call, command or page write; checks that call
     /// identities are unique and belong to this batch, that each placement
     /// describes its own call, and that every `Start` is unique and names a
-    /// request with a call in this batch. The records themselves and the wire-level constraints
-    /// between calls (one kind and component per batch, allocation tables
-    /// matching their calls, non-overlapping spans) are checked once, by
-    /// `Batch::validate`, which `into_protocol` runs.
+    /// request with a call in this batch.
     pub fn validate(&self) -> anyhow::Result<()> {
         // A batch of page offloads alone writes the engine's last published
         // pages to the host KV cache before it closes its executors.
@@ -293,89 +281,5 @@ impl ExecutionBatch {
             );
         }
         Ok(())
-    }
-}
-
-impl ExecutionBatch {
-    /// Lowers a logical batch into a wire batch and the persistent spans of
-    /// its calls on each rank.
-    ///
-    /// Concatenates the placements' tables, pages, latent parameters and
-    /// decode ranges in call order, and rebases each placement's forward
-    /// rows onto the call's position in `calls`. The wire batch carries no
-    /// buffer spans, because they address each rank's own pool: they are
-    /// returned beside it, in call order, for the executor group to project
-    /// onto its ranks. `collective_seq` is the executor's next collective
-    /// sequence, which `Dispatcher` commits only after the executor
-    /// accepts the batch. Fails when adding the call's position to a forward
-    /// row's call index overflows `u32` or `Batch::validate_unplaced`
-    /// rejects the result.
-    pub(crate) fn into_protocol(
-        self,
-        collective_seq: u64,
-    ) -> anyhow::Result<(Batch, Vec<RankBuffer>)> {
-        let Self {
-            id: batch_id,
-            requests,
-            commands,
-            input_transfers: input_products,
-            cache_inputs,
-            page_offloads,
-            // The executor-process wire batch carries no columns: they are the
-            // in-process executor's layout, not the wire protocol's.
-            columns: _,
-            // A media computation's buffers are the in-process executor's, and
-            // the wire batch has nowhere to carry them: refusing here is the
-            // difference between a media call that stops by name and one a
-            // executor serves with no inputs at all.
-            media,
-        } = self;
-        anyhow::ensure!(
-            media.is_none(),
-            "a media computation is served in process, and the wire batch carries no media \
-             columns: {:?}",
-            media.map(|columns| columns.computation.call)
-        );
-        let mut block_tables = Vec::new();
-        let mut new_cache_units = Vec::new();
-        let mut forward = ForwardBatch::default();
-        let mut latent_params = Vec::new();
-        let mut decode_ranges = Vec::new();
-        let mut page_loads = Vec::new();
-        let mut rank_buffers = Vec::new();
-        let mut calls = Vec::with_capacity(requests.len());
-
-        for (call_index, (call, placement)) in requests.into_iter().enumerate() {
-            block_tables.extend(placement.block_tables);
-            new_cache_units.extend(placement.new_cache_units);
-            forward.append(placement.forward, call_index as u32)?;
-            latent_params.extend(placement.latent);
-            decode_ranges.extend(placement.decode);
-            page_loads.extend(placement.page_loads);
-            rank_buffers.extend(placement.buffers);
-            calls.push(call);
-        }
-
-        let (page_offloads, latent_offloads) =
-            page_offloads.map_or_else(Default::default, |writes| (writes.pages, writes.latents));
-        let batch = Batch {
-            batch_id,
-            collective_seq,
-            calls,
-            block_tables,
-            new_cache_units,
-            forward,
-            latent_params,
-            decode_ranges,
-            buffer_allocations: Vec::new(),
-            commands,
-            input_products,
-            cache_inputs,
-            page_loads,
-            page_offloads,
-            latent_offloads,
-        };
-        batch.validate_unplaced()?;
-        Ok((batch, rank_buffers))
     }
 }

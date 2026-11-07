@@ -14,7 +14,7 @@ impl Scheduler {
     /// Sets the call's device predicate, derives its prefix cache, forward-row, and
     /// latent inputs from the lengths its in-flight predecessors project,
     /// mints product identities, moves `reserved_buffers` into the request's
-    /// allocations, selects the executing worker, registers the call in
+    /// allocations, selects the executing executor, registers the call in
     /// flight, and appends it with its `RequestPlacement` to `batch`.
     /// `admitted` marks a call whose batch carries the request's `Start`, so
     /// its complete cache tables are sent.
@@ -241,7 +241,7 @@ impl Scheduler {
 
             // A table is declared when its held page interval changed since
             // its last declaration (growth, or window retirement in a
-            // sliding-window group) or it holds fresh units, which the worker
+            // sliding-window group) or it holds fresh units, which the executor
             // must reset before use. A forward's fresh units are those
             // allocated since the declared watermark (`plan_call`).
             // Admission (or re-admission) declares every table again, with
@@ -304,7 +304,7 @@ impl Scheduler {
             }
             // A context prefill with vision blocks appends one forward row per
             // segment, in context order: the prompt tokens between blocks, and
-            // each block, which the worker evaluates as one attention block.
+            // each block, which the executor evaluates as one attention block.
             // Every other call that appends prefix cache has one row. Each row attends
             // to the visible prefix and the rows before it, and persists its
             // tokens in the prefix cache.
@@ -476,7 +476,7 @@ impl Scheduler {
             }
             // The conditioned branch reads the request's own context; a
             // branch without a prefix of its own (an image-unconditional
-            // branch the worker states none for) reads it too.
+            // branch the executor states none for) reads it too.
             let own = (main_slot, conditioning_tokens);
             let mut rows = vec![own];
             if state.req.image.guides_text() {
@@ -493,7 +493,7 @@ impl Scheduler {
         let mut latent = None;
 
         // Latent allocations describe the request-owned page table this call
-        // addresses; the worker's latent pool keeps the trajectory's steps.
+        // addresses; the executor's latent pool keeps the trajectory's steps.
         if call.addresses_latent_pages() {
             let Some(state) = self.running.get(&request_id) else {
                 self.fatal = true;
@@ -523,7 +523,7 @@ impl Scheduler {
             ));
         }
 
-        // Worker selection records the request's residency on that worker. A
+        // Executor selection records the request's residency on that executor. A
         // request that has not run this component yet is placed where the
         // policy says (§4.4); one that has goes back to the replica holding its
         // state, whatever the policy would answer.
@@ -564,7 +564,7 @@ impl Scheduler {
             submitted_us.saturating_sub(planned_us),
         );
         // The runtime's buffer pool is one address space, so every rank of
-        // the worker holds each span at the same offset.
+        // the executor holds each span at the same offset.
         let buffers = RankBuffer::on_every_rank(
             &call_buffers,
             self.executor.info().rank_count(&worker) as u32,

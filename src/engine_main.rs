@@ -1190,7 +1190,6 @@ impl MainProcess {
         let schedulers = schedulers(
             &first_plan,
             launch,
-            &memories[0],
             &models[0],
             &executors,
             &inventories[0],
@@ -7879,7 +7878,6 @@ fn device_command(
 fn schedulers(
     plan: &EpochPlan,
     launch: &Launch,
-    memory: &Memory,
     model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
     rank: &ipc::MainProcessInfo,
@@ -7895,7 +7893,7 @@ fn schedulers(
     // One scheduler per scheduler thread: the configuration is this rank's, derived from what the
     // launch states, the build config fixes and the model's own geometry, and it refuses by name
     // when a fact it needs is one the launch file does not carry.
-    let facts = plan.rank_facts(memory, model)?;
+    let facts = plan.rank_facts(model)?;
     let config = engine::EngineConfig::of(&facts)?;
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one executor thread per device and never two.

@@ -31,14 +31,14 @@ pub struct SchedulerConfig {
     /// bound. Submission counts waiting token and media requests together
     /// with finished requests whose output events are still retained.
     pub max_queued_requests: Option<usize>,
-    /// Block-diffusion sampling of every canvas the deployment generates, as
-    /// the ranks are launched with. A block-diffusion runtime has no
+    /// Block-diffusion sampling of every canvas the deployment generates. A
+    /// block-diffusion runtime has no
     /// autoregressive decode, so each request it does not read out runs
     /// under this sampling; without it the runtime serves readouts only.
     pub canvas: Option<ipc::CanvasSampling>,
-    /// The most draft tokens a verification carries per request, as the
-    /// world's workers were launched with (`EngineSpec::speculation`); zero
-    /// when the deployment does not speculate.
+    /// The most draft tokens a verification carries per request
+    /// (`EngineSpec::speculation`); zero when the deployment does not
+    /// speculate.
     pub draft_tokens: usize,
     /// The captured graph sizes the deployment states, in tokens (the spec's
     /// `cuda_graphs` decode batch sizes and prefill token sizes), ascending and
@@ -46,9 +46,8 @@ pub struct SchedulerConfig {
     /// fit.
     ///
     /// Empty when the spec states none, and on a reconfigure, which carries no
-    /// graph catalog: a worker then runs its own captured catalog or eagerly,
-    /// and the tier bound is honest but vacuous. The worker echoing the graph
-    /// sizes it actually launched is the open item that closes it.
+    /// graph catalog: an executor then runs its own captured catalog or
+    /// eagerly, and the tier bound is honest but vacuous.
     pub graph_tiers: Vec<u32>,
 }
 

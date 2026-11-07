@@ -236,7 +236,7 @@ impl CallCoordinates {
 /// One denoising step of a block-diffusion request's resident canvas.
 ///
 /// The deployment's launch configuration fixes the sampling
-/// (`LaunchDescriptor::canvas_sampling`); the worker holds the canvas, its
+/// (`EngineConfig::canvas_sampling`); the worker holds the canvas, its
 /// self-conditioning input and its stopping history in the request's slot.
 /// `block` counts the blocks already committed to the request's context and
 /// `step` the steps already run on this canvas; step zero starts the canvas
