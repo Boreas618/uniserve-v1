@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-r"""Dump one probe of the MiniMax-H3 denoiser from today's implementation.
+r"""Dump one probe of the MiniMax-H3 denoiser from the reference implementation.
+
+**This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
+repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
+checkout of the last tree that held the package and that tree's interpreter, with the tree on the
+path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+
+    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \
+        /workspace/uniserve-v1/.venv/bin/python <this file> ...
 
 The reference half of the block-by-block numeric comparison (`specs/worker.md` 10) for the block that
 the other dumpers do not reach: the two VAE dumpers cover the decoders, the encoder dumper covers the
@@ -10,8 +18,8 @@ write.
 Names are taken from the protocol's table (`notes/h3/diagnosis.md` §2), never re-derived here, so a
 tensor that changes shape changes in one place.
 
-    .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --list
-    .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py \\
+    python crates/models/minimax-h3/tools/dump_denoiser.py --list
+    python crates/models/minimax-h3/tools/dump_denoiser.py \\
         --checkpoint /opt/uv/models/MiniMax-H3 --case <case.json> --probe noise \\
         --out artifacts/diagnosis/denoiser/ref
 
@@ -27,7 +35,7 @@ compare step: it reads the candidate's `stack_in.h3t` and `case.json`, runs the 
 stack of the case's layer count at step 0 over those bytes, and writes `stack_out.h3t`, so both
 sides of the comparison compute on one input:
 
-    .venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --probe stack_out \
+    python crates/models/minimax-h3/tools/dump_denoiser.py --probe stack_out \
         --stack <candidate out>/denoiser --checkpoint <checkpoint> --out <reference out>
 
 It needs the checkpoint's weights and the reference's compiled extensions - the run host - but not

@@ -1,6 +1,14 @@
 #!/usr/bin/env python3
 """Run the reference's eager generation for one t2va request and write its tensors.
 
+**This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
+repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
+checkout of the last tree that held the package and that tree's interpreter, with the tree on the
+path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+
+    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
+        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+
 This is the reference half of the served diagnosis in `notes/h3/diagnosis.md`. Run it with the
 Python tree's interpreter:
 
