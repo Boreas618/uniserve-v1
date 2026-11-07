@@ -858,7 +858,17 @@ impl Device {
             if let Some(entry) = queue.next_if(|entry| self.overlaps(entry)) {
                 return Some(entry);
             }
-            if queue.has_pending() || !matches!(in_flight.pending.landed.query(), Ok(false)) {
+            // A peer opened a step and woke this rank, and this rank's own batch is queued behind
+            // the wake: the batch enters that step with its tokens, so it goes first, beside the
+            // replay in flight. The wake stays queued, and finds the step closed when it is taken.
+            if let Some(entry) = queue.next_past_joins(|entry| self.overlaps(entry)) {
+                return Some(entry);
+            }
+            // A queued wake waits beside the replay as a batch would: the rank's own batch is
+            // usually just behind it, and landing the replay first would take the overlap away.
+            if queue.has_pending_besides_joins()
+                || !matches!(in_flight.pending.landed.query(), Ok(false))
+            {
                 return None;
             }
             std::thread::sleep(LANDING_POLL);
