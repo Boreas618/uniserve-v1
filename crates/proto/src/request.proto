@@ -640,6 +640,10 @@ message CacheDescribed {
   // Empty when every worker group reported.
   string error = 2;
   repeated CacheSegments segments = 3;
+  // The world that created the storage the engine executes on, whose name keys
+  // it: its own, or the one its predecessor took it from. Only the process that
+  // maps the storage knows, since a relaunch of a world creates it afresh.
+  uint64 storage_world = 4;
 }
 
 // The published pages of one worker group's prefix cache.
@@ -1301,7 +1305,8 @@ message Profiling {
 
 // What an engine that succeeds another maps of it.
 message Predecessor {
-  // The predecessor's world.
+  // The world that created the storage the predecessor executes on, whose name
+  // keys it (`CacheDescribed.storage_world`).
   uint64 world = 1;
   // Each worker group's KV cache segments the predecessor holds, which the
   // successor's ranks map read-only behind segments of their own.

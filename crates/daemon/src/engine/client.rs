@@ -153,8 +153,8 @@ enum Answered {
     Results(Vec<String>),
     /// Each worker group's prefix cache index (`Parked`).
     Index(Vec<wire::GroupIndex>),
-    /// Each worker group's KV cache segments (`CacheDescribed`).
-    Segments(Vec<wire::CacheSegments>),
+    /// What a successor maps of the engine (`CacheDescribed`).
+    Cache(wire::Predecessor),
     Prefixes(Vec<wire::RequestPrefix>),
 }
 
@@ -594,12 +594,12 @@ impl EngineClient {
     ///
     /// Fails with the reason a scheduler did not describe its cache, or
     /// when the engine ends first.
-    pub async fn describe_cache(&self) -> Result<Vec<wire::CacheSegments>, String> {
+    pub async fn describe_cache(&self) -> Result<wire::Predecessor, String> {
         match self
             .ask(|id| wire::engine_command::Kind::DescribeCache(wire::DescribeCache { id }))
             .await?
         {
-            Answered::Segments(segments) => Ok(segments),
+            Answered::Cache(predecessor) => Ok(predecessor),
             _ => Err("the engine answered a cache description with something else".to_owned()),
         }
     }
@@ -933,7 +933,7 @@ impl Answered {
     fn results(self) -> Vec<String> {
         match self {
             Self::Results(results) => results,
-            Self::Index(_) | Self::Segments(_) | Self::Prefixes(_) => Vec::new(),
+            Self::Index(_) | Self::Cache(_) | Self::Prefixes(_) => Vec::new(),
         }
     }
 }
@@ -1098,7 +1098,10 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             Some(from_engine::Kind::CacheDescribed(described)) => {
                 if let Some(answer) = lock(&shared.answers).remove(&described.id) {
                     let _ = answer.send(if described.error.is_empty() {
-                        Ok(Answered::Segments(described.segments))
+                        Ok(Answered::Cache(wire::Predecessor {
+                            world: described.storage_world,
+                            segments: described.segments,
+                        }))
                     } else {
                         Err(described.error)
                     });

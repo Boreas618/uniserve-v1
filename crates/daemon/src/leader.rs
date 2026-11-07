@@ -2781,8 +2781,8 @@ impl Replica {
         // shorter than the ones it will be promoted into, and the failure would
         // surface at promotion rather than here. `DescribeCache` is the same
         // account the epoch switch's target is built from.
-        let segments = match serving.describe_cache().await {
-            Ok(segments) => segments,
+        let predecessor = match serving.describe_cache().await {
+            Ok(predecessor) => predecessor,
             Err(reason) => {
                 // No standby is better than one that maps the wrong units: the
                 // loss path relaunches the engine instead (`Replica::recover`).
@@ -2793,10 +2793,7 @@ impl Replica {
                 return Ok(());
             }
         };
-        spec.predecessor = Some(wire::Predecessor {
-            world: spec.world,
-            segments,
-        });
+        spec.predecessor = Some(predecessor);
         let build = crate::epoch::BuildConfig::of(&locked(&self.config));
         let sink = stats_sink(
             self.model_name.clone(),

@@ -1707,6 +1707,12 @@ fn describe_caches(id: u64, front: usize, routing: &Arc<Routing>) {
                 Frame::plain(from_engine::Kind::CacheDescribed(wire::CacheDescribed {
                     id,
                     error,
+                    storage_world: segments
+                        .iter()
+                        .flat_map(|cache| &cache.segments)
+                        .map(|segment| segment.world)
+                        .min()
+                        .unwrap_or(0),
                     segments,
                 })),
             );

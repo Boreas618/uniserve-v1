@@ -590,23 +590,16 @@ impl Leader {
         // The predecessor's segments are the ones it holds now, which only its
         // engine can state; without them the child would map nothing and the
         // launch would be a serving process's, claiming the same scopes
-        // writably. Its `world` is the one that created them, which is what
-        // they are keyed by, and not the target's own `spec.world`: the
-        // successor reads one world while it serves the next, and an epoch
-        // that took storage over keys it as its creator did.
-        let cache = serving_client.describe_cache().await.map_err(|reason| {
+        // writably. The engine states as well the world that created them, which
+        // is what they are keyed by, and not the target's own `spec.world`: the
+        // successor reads one world while it serves the next, an epoch that took
+        // storage over keys it as its creator did, and one relaunched created
+        // its own.
+        spec.predecessor = Some(serving_client.describe_cache().await.map_err(|reason| {
             UpdateError::Refused(format!(
                 "the serving epoch named no cache segments for its standby: {reason}"
             ))
-        })?;
-        let storage_world = epochs.storage_world(serving.world);
-        spec.predecessor = Some(wire::Predecessor {
-            world: storage_world,
-            segments: cache,
-        });
-        if !dry_run {
-            epochs.inherit_storage(target_epoch, storage_world);
-        }
+        })?);
         let joining = (!dry_run).then(|| spec.clone());
         let change = crate::updates::epoch::EpochChange {
             previous: previous_epoch,

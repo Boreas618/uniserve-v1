@@ -705,6 +705,11 @@ impl Retained {
         &self.scope
     }
 
+    /// The world whose name keys this worker's exclusive storages: the one that created them.
+    pub fn storage_world(&self) -> u64 {
+        self.storage_world
+    }
+
     /// The worker's world.
     pub(crate) fn world(&self) -> u64 {
         self.world
