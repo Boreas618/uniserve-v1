@@ -441,6 +441,7 @@ impl Supervisor {
                         rank,
                         generation,
                         status,
+                        last_line: last_stderr.unwrap_or_default(),
                     },
                 )
             })
