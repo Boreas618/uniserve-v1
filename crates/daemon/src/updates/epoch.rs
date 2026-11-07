@@ -154,7 +154,7 @@ fn record(
         ))
     })?;
     let mut record = serving.clone();
-    record.build_config = target.build_config.clone();
+    record.config = target.config.engine_config();
     record.kernels = target.programs.kernels.clone();
     record.policy = target.programs.policy.clone();
     record.previous_kernels = serving.kernels;
@@ -211,7 +211,7 @@ pub(crate) fn report(switch: &Switch) -> Value {
         "phase": switch.phase().name(),
         "generation": switch.generation(),
         "pause_ms": switch.pause().map(|pause| pause.as_millis()),
-        "build": switch.record().build_config.executable,
+        "build": switch.record().config.executable,
         "failure": switch.failure().map(|failure| json!({
             "kind": failure.kind,
             "reason": failure.reason,
@@ -229,9 +229,10 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
-    use crate::epoch::{BuildConfig, FilledPrograms, Program};
+    use crate::epoch::{FilledPrograms, Program};
     use crate::options::ServerArgs;
     use crate::updates::switch::{Event, Phase, Start};
+    use proto::config::EngineConfig;
     use proto::process::{self, Spawn};
 
     /// A roster that records what the switch asks of it and reports nothing
@@ -307,7 +308,6 @@ mod tests {
     fn epoch_target(base: &Deployment) -> Deployment {
         let mut target = base.clone();
         target.config.worker_config.executable = PathBuf::from("/opt/other-uniserve");
-        target.build_config = BuildConfig::of(&target.config);
         target
     }
 
@@ -326,7 +326,7 @@ mod tests {
 
     fn serving_record(deployment: &Deployment) -> EpochRecord {
         EpochRecord {
-            build_config: deployment.build_config.clone(),
+            config: deployment.config.engine_config(),
             kernels: deployment.programs.kernels.clone(),
             policy: deployment.programs.policy.clone(),
             previous_kernels: BTreeMap::new(),
@@ -347,7 +347,7 @@ mod tests {
                 executable: "/opt/uniserve".to_owned(),
                 build: Some("2.0.0+new".to_owned()),
                 launch: crate::engine::launch::Launch {
-                    build_config: "/run/build-config-13.json".into(),
+                    engine_config: "/run/engine-config-13.json".into(),
                     model: "/models/qwen3".into(),
                     requests: "unix:/run/requests.sock".to_owned(),
                     processes: "unix:/run/processes.sock".to_owned(),
@@ -470,7 +470,7 @@ mod tests {
         };
         assert_eq!(report["change"], "epoch");
         assert_eq!(report["phase"], "preparing");
-        assert_eq!(report["build"], target.build_config.executable);
+        assert_eq!(report["build"], target.config.engine_config().executable);
 
         let running = running.expect("the switch is kept for the caller");
         assert_eq!(running.phase(), Phase::Preparing);
@@ -481,7 +481,7 @@ mod tests {
 
         let record = epochs.get(12).expect("the target's record");
         assert_eq!(record.status, Status::Precopy);
-        assert_eq!(record.build_config, target.build_config);
+        assert_eq!(record.config, target.config.engine_config());
         assert_eq!(record.kernels, target.programs.kernels);
         assert_eq!(record.previous_kernels, target.programs.kernels);
         assert_eq!(record.previous_policy, Some(target.programs.policy.clone()));

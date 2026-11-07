@@ -156,7 +156,7 @@ impl EngineControl {
     pub fn start(
         &self,
         spec: wire::EngineSpec,
-        build: &crate::epoch::BuildConfig,
+        build: &proto::config::EngineConfig,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         let engine = self.next_engine.fetch_add(1, Ordering::Relaxed);
@@ -178,7 +178,7 @@ impl EngineControl {
         &self,
         mut spec: wire::EngineSpec,
         engine: u64,
-        build: &crate::epoch::BuildConfig,
+        build: &proto::config::EngineConfig,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         // A spec of no world starts a world of its own, which takes the
@@ -197,7 +197,7 @@ impl EngineControl {
         // The epoch's build config, written once per world: every process of
         // that world reads the same bytes, and the launch file names its path
         // (`specs/worker.md` §2.3).
-        self.write_build_config(world, build)?;
+        self.write_engine_config(world, build)?;
         let launch = self.launch(&spec, engine)?;
         let path = launch::write(&self.runtime, engine, &launch)?;
         let mut control = self.spawn(engine, &executable, &spec.host, Self::arguments(&path))?;
@@ -721,12 +721,12 @@ impl EngineControl {
              module: it is not started without one",
         )?;
         anyhow::ensure!(spec.world != 0, "the engine spec names no world");
-        let build_config = launch::build_config_path(&self.runtime, spec.world);
+        let engine_config = launch::engine_config_path(&self.runtime, spec.world);
         anyhow::ensure!(
-            build_config.is_file(),
+            engine_config.is_file(),
             "the epoch's build config {} has not been written: write it with \
-             `EngineControl::write_build_config` before starting a main process",
-            build_config.display()
+             `EngineControl::write_engine_config` before starting a main process",
+            engine_config.display()
         );
         // One main process per node today, so it has no peer to accept: the
         // world is this rank alone. A deployment that starts more states their
@@ -735,7 +735,7 @@ impl EngineControl {
         let peers: Vec<String> = Vec::new();
         let world_size = u32::try_from(peers.len() + 1).unwrap_or(u32::MAX);
         Ok(Launch {
-            build_config,
+            engine_config,
             model: PathBuf::from(&spec.model),
             requests: self.request_address.clone(),
             processes: self.processes.clone(),
@@ -773,12 +773,12 @@ impl EngineControl {
     /// # Errors
     ///
     /// Fails when the file cannot be written.
-    pub(crate) fn write_build_config(
+    pub(crate) fn write_engine_config(
         &self,
         world: u64,
-        config: &crate::epoch::BuildConfig,
+        config: &proto::config::EngineConfig,
     ) -> anyhow::Result<PathBuf> {
-        Ok(launch::write_build_config(&self.runtime, world, config)?)
+        Ok(launch::write_engine_config(&self.runtime, world, config)?)
     }
 
     /// What the epoch layer starts one epoch's main process with: the
@@ -1822,7 +1822,7 @@ mod tests {
         )
         .unwrap();
         control
-            .write_build_config(3, &crate::epoch::BuildConfig::of(&ServerArgs::default()))
+            .write_engine_config(3, &ServerArgs::default().engine_config())
             .unwrap();
         let own = std::env::current_exe().unwrap().display().to_string();
         // The deployment's own spec, as `ServeOptions` builds it: an epoch's

@@ -94,7 +94,6 @@ use anyhow::{Context as _, Result, bail};
 use clap::Args;
 
 use crate::engine_plan::{EpochPlan, PrefillCatalogue};
-use daemon::epoch::BuildConfig;
 use engine::{PolicyProgram, PolicySource, ProgramSource};
 use executor::batch::Submission;
 use executor::blocking::{BlockingKind, ThreadPool};
@@ -116,10 +115,11 @@ use program_server::{
     Client, Descriptors, PhaseKind, PrepareRequest, Program, ProgramRequest, ProgramSlot, Selector,
     Target,
 };
+use proto::config::EngineConfig;
 
 /// The epoch as this node takes it at start.
 ///
-/// The daemon fixes the epoch with a [`BuildConfig`] (design §7.2 and §7.7) and
+/// The daemon fixes the epoch with a [`proto::config::EngineConfig`] (design §7.2 and §7.7) and
 /// fills its operators and its scheduling interface with programs (§5.1); the
 /// main process never receives program content, only the programs' names, and it
 /// resolves their modules from the Program Server itself.
@@ -164,7 +164,7 @@ pub(crate) struct EngineArgs {
 pub(crate) struct Launch {
     /// The epoch's build config, as the daemon wrote it: a path, since the config is the epoch's and
     /// not the process's.
-    pub build_config: PathBuf,
+    pub engine_config: PathBuf,
     /// The checkpoint the epoch serves.
     pub model: PathBuf,
     /// The leader daemon's request interface, `unix:<path>` or `<host>:<port>`. It speaks the
@@ -724,11 +724,16 @@ pub(crate) fn run(
     );
 
     let launch = Launch::read(&args.launch)?;
-    let build: BuildConfig = serde_json::from_reader(
-        std::fs::File::open(&launch.build_config)
-            .with_context(|| format!("opening {}", launch.build_config.display()))?,
+    let build: proto::config::EngineConfig = serde_json::from_reader(
+        std::fs::File::open(&launch.engine_config)
+            .with_context(|| format!("opening {}", launch.engine_config.display()))?,
     )
-    .with_context(|| format!("reading the build config {}", launch.build_config.display()))?;
+    .with_context(|| {
+        format!(
+            "reading the build config {}",
+            launch.engine_config.display()
+        )
+    })?;
     let mut main = MainProcess::start(&launch, &build)?;
     let ending = main.serve();
     main.close();
@@ -1019,7 +1024,7 @@ impl MainProcess {
     /// ([`EpochPlan`]), because three of the things the main process needs are the
     /// node's rather than the epoch's: which devices it serves, where its Program
     /// Server is, and what those devices measure.
-    fn start(launch: &Launch, build: &BuildConfig) -> Result<Self> {
+    fn start(launch: &Launch, build: &proto::config::EngineConfig) -> Result<Self> {
         let plan = EpochPlan::of(launch, build)?;
         let mut control = Control::connect(
             &Endpoints {
@@ -1072,7 +1077,7 @@ impl MainProcess {
         plan: EpochPlan,
         epoch: Epoch,
         launch: &Launch,
-        build: &BuildConfig,
+        build: &proto::config::EngineConfig,
     ) -> Result<Self> {
         let connected = control
             .as_mut()

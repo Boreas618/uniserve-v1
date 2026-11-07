@@ -352,9 +352,10 @@ mod tests {
     use proto::process::{Committed, Drained, Parked, Promoted, Report, Spawn};
 
     use super::*;
-    use crate::epoch::{BuildConfig, EpochRecord, Program, Status, Update};
+    use crate::epoch::{EpochRecord, Program, Status, Update};
     use crate::options::ServerArgs;
     use crate::updates::switch::{Event, Start};
+    use proto::config::EngineConfig;
 
     /// The reports the test feeds as if the adapter had delivered them.
     type Feed = Arc<Mutex<Vec<Event>>>;
@@ -415,7 +416,7 @@ mod tests {
 
     fn record(world: u64) -> EpochRecord {
         EpochRecord {
-            build_config: BuildConfig::of(&ServerArgs::default()),
+            config: ServerArgs::default().engine_config(),
             kernels: Default::default(),
             policy: Program {
                 backend: "fcfs".to_owned(),
@@ -440,7 +441,7 @@ mod tests {
                 executable: "/opt/uniserve".to_owned(),
                 build: Some("2.0.0+new".to_owned()),
                 launch: crate::engine::launch::Launch {
-                    build_config: "/run/build-config-12.json".into(),
+                    engine_config: "/run/engine-config-12.json".into(),
                     model: "/models/qwen3".into(),
                     requests: "unix:/run/requests.sock".to_owned(),
                     processes: "unix:/run/processes.sock".to_owned(),

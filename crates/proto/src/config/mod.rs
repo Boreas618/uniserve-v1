@@ -788,3 +788,79 @@ impl Default for VideoJobConfig {
         }
     }
 }
+
+/// The model an epoch serves, and how its parameters are represented.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelConfig {
+    /// Local model directory or Hugging Face repository.
+    pub model: String,
+    /// Longest sequence a request may reach, in tokens; the checkpoint's own limit when unset.
+    pub max_model_len: Option<NonZeroU32>,
+    /// Element type of parameters and activations.
+    pub dtype: crate::request::ModelDtype,
+    /// The checkpoint's quantization (`quantization`, SGLang's precision policy).
+    pub quantization: serde_json::Map<String, Value>,
+}
+
+/// How an epoch's ranks divide the model and the requests.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ParallelConfig {
+    /// Tensor-parallel workers of each scheduler's group when no deployment file is given.
+    pub tensor_parallel_size: NonZeroUsize,
+    /// Schedulers, each with its own KV cache and worker groups.
+    pub data_parallel_size: NonZeroUsize,
+    /// The deployment file that places worker groups and their blocks.
+    pub worker_groups: Option<PathBuf>,
+    /// The host whose engine processes serve requests.
+    pub engine_host: Option<String>,
+}
+
+/// Everything an epoch's engine processes are built from (§7.1, §7.7).
+///
+/// The leader daemon resolves it once from the serving options and hands the same value to every
+/// engine process of the epoch. Any change to it is a new epoch, except a change to a value that
+/// selects a program's backend or is a program's parameter, which the program layer applies in
+/// place; [`EngineConfig::build_hash`] tells the two apart.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct EngineConfig {
+    /// The build of the engine executable the epoch runs: a replaced executable is a new epoch
+    /// even at the same configuration.
+    pub executable: String,
+    /// The model and its numerical representation.
+    pub model: ModelConfig,
+    /// The ranks' division of the model and the requests.
+    pub parallel: ParallelConfig,
+    /// Concurrently resident requests: the request slots every rank holds.
+    pub max_running_requests: NonZeroUsize,
+    /// Each rank's share of its device's storage.
+    pub mem_fraction_static: f64,
+    pub load: LoadConfig,
+    pub kv_cache: KvCacheConfig,
+    pub moe: MoeConfig,
+    pub cuda_graph: CudaGraphConfig,
+    pub worker: WorkerConfig,
+    pub speculative: SpeculativeConfig,
+    pub video: VideoConfig,
+    pub profiling: ProfilingConfig,
+}
+
+impl EngineConfig {
+    /// The identity of the build this configuration makes: two configurations whose hashes differ
+    /// need a new epoch, and two whose hashes agree differ at most in what the program layer
+    /// changes in place (§7.7).
+    ///
+    /// Every value enters it except those §7.7 assigns to the programs: the expert exchange, which
+    /// selects a program's backend; the speculative cost figures, which are the scheduling
+    /// policy's parameters; and the probes' switches, which change at a step boundary.
+    pub fn build_hash(&self) -> String {
+        let mut build = self.clone();
+        build.moe.exchange = MoeConfig::default().exchange;
+        build.speculative.expected_speedup = None;
+        build.speculative.refill_token_cost = None;
+        build.profiling.fence_probes = ProfilingConfig::default().fence_probes;
+        build.profiling.fence_probes_off = Vec::new();
+        let bytes = serde_json::to_vec(&build).expect("a configuration serializes");
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(&bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
