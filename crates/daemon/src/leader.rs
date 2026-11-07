@@ -2182,6 +2182,7 @@ impl Replica {
             // once it holds them.
             let host = config.host_identity.clone();
             let handing = Arc::clone(updates.epochs());
+            let pinning = Arc::clone(&updates);
             let target_page = spec
                 .kv_cache
                 .as_ref()
@@ -2203,6 +2204,7 @@ impl Replica {
                     reason: format!("{error:#}"),
                     device: None,
                 })?;
+                pinning.pin(&pinned);
                 handing.hand_target(&config.host_identity, engine, &config, &pinned)
             })
             .await;
@@ -2362,6 +2364,8 @@ impl Replica {
                 if !matches!(published, Ok(Ok(()))) {
                     warn!(epoch, "publishing the committed epoch's world failed: {published:?}");
                 }
+                // The standby of the epoch before ended with it (`worker_config.standby`).
+                replica.start_standby();
             }
         });
     }

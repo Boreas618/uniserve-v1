@@ -625,17 +625,22 @@ impl Epochs {
     }
 
     /// Why `target` may not be applied without `force` (§7.2, §7.3 step 4):
-    /// the last update reverted from the same programs after a failure.
+    /// the last update reverted from the same programs and the same build
+    /// after a failure.
     ///
     /// The comparison is the programs', revisions included, because those
     /// are what a reverted program-layer update was: applying the same
     /// configuration again selects the same revisions, so the refusal is
-    /// about the change and not about how it was asked for.
+    /// about the change and not about how it was asked for. The build is what
+    /// a reverted epoch update was, whose programs most often did not change,
+    /// so another build is another change.
     pub fn unavailable(&self, target: &Deployment) -> Option<Failure> {
         let update = locked(&self.update);
         let update = update.as_ref()?;
         let failure = update.unavailable()?;
-        (update.target.programs == target.programs).then(|| failure.clone())
+        (update.target.programs == target.programs
+            && update.target.build_config == target.build_config)
+            .then(|| failure.clone())
     }
 
     /// Records that epoch `epoch` now executes `programs`, keeping what it
@@ -1993,6 +1998,12 @@ mod tests {
             refused.reason
         );
         assert!(epochs.program_update().is_none());
+        let mut another_build = target.clone();
+        another_build.build_config.model = "another checkpoint".to_owned();
+        assert!(
+            epochs.unavailable(&another_build).is_none(),
+            "the same programs on another build are another change"
+        );
 
         epochs
             .apply_programs(Update::new(1, target), processes(), true)
