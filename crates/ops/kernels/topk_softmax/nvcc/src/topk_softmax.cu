@@ -14,7 +14,10 @@
 //   expert order, by repeated warp arg-max;
 // - their sum by the xor butterfly over k lanes that PyTorch's row sum of a
 //   [tokens, k] tensor uses, clamped below by FLT_EPSILON, divides them;
-// - a per-expert scale multiplies the result in FP32.
+// - a per-expert scale multiplies the result in FP32;
+// - a route's expert is written as the slot the logical-to-physical map names,
+//   when there is a map. The selection above is over logical ids, so the picks
+//   and the order of equal scores do not depend on where the experts lie.
 //
 // Launches synchronize nothing, so CUDA graphs capture them.
 //
@@ -77,12 +80,13 @@ __device__ __forceinline__ float load_value(const void* data, int kind, int64_t 
 
 // The arguments are the operator's packed launch parameters: the scores, their
 // storage kind, the row stride in elements, the token count, the expert count,
-// the top-k width, the renormalize flag, the per-expert scale and its kind, and
-// the two outputs.
+// the top-k width, the renormalize flag, the per-expert scale and its kind, the
+// two outputs, and the logical-to-physical expert map (null for none).
 extern "C" __global__ void uniserve_topk_softmax(const void* scores, int score_kind,
                                                  int64_t row_stride, int rows, int experts,
                                                  int top, int renormalize, const void* scale,
-                                                 int scale_kind, int32_t* ids, float* weights) {
+                                                 int scale_kind, int32_t* ids, float* weights,
+                                                 const int32_t* map) {
   // `experts` and `top` arrive as launch arguments while the iteration count and
   // the butterfly width are baked into this cubin. A call arriving with a
   // different expert count would reduce over part of the row and write
@@ -193,6 +197,9 @@ extern "C" __global__ void uniserve_topk_softmax(const void* scores, int score_k
     weight = weight / total;
   }
   if (scale_kind != kAbsent) weight = weight * load_value(scale, scale_kind, expert);
-  ids[static_cast<int64_t>(row) * top + lane] = expert;
+  // A padding row of a captured bucket holds no scores: its picks may name no
+  // expert, and `moe_sort` drops such an id. The map is read for real ids alone.
+  const bool mapped = map != nullptr && expert >= 0 && expert < experts;
+  ids[static_cast<int64_t>(row) * top + lane] = mapped ? map[expert] : expert;
   weights[static_cast<int64_t>(row) * top + lane] = weight;
 }

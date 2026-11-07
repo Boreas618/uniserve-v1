@@ -10,6 +10,10 @@
 //! xor butterflies, keeps the `top` largest probabilities in descending order with equal ones in
 //! ascending expert order, and divides them by their sum clamped below by `FLT_EPSILON` when
 //! `Descriptor::renormalize` holds; an optional per-expert scale multiplies the result in FP32.
+//! With a map, each route's id is written as the weight row the map names: the selection is over
+//! logical ids, so which experts a token picks, and the order of equal scores, do not depend on
+//! where the experts lie (`docs/admin.md`, Expert redistribution). The map is a launch value, a
+//! null pointer without one, so a captured graph reads whatever the table at its address says.
 //! The arithmetic and its order are those of the existing CUDA kernel
 //! (`uniserve_kernels/src/uniserve_kernels/csrc/topk_softmax.cu:52-197`), which in turn reproduces
 //! PyTorch's warp softmax and row-sum composition.
@@ -101,6 +105,9 @@ pub struct TopkArgs {
     pub ids: TensorView,
     /// `[tokens, top]` FP32 route weights, written.
     pub weights: TensorView,
+    /// `[experts]` i32 weight row of each logical expert, when the block's experts are not in
+    /// logical order: `ids` then holds rows.
+    pub map: Option<TensorView>,
 }
 
 /// The router's softmax top-k.
@@ -203,6 +210,16 @@ impl Op for TopkSoftmax {
             }
         };
 
+        if let Some(map) = args.map {
+            map.require_shape(Self::NAME, Shape::new(&[experts]))?;
+            if map.dtype != DType::I32 {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!("expected an i32 expert map, found {}", map.dtype),
+                ));
+            }
+        }
+
         cubin_metadata(kernel, Self::NAME, WARPS_PER_BLOCK)?;
         let grid = LaunchGrid::covering(tokens, TOKENS_PER_BLOCK)?;
         let mut arguments = Arguments::new();
@@ -228,6 +245,7 @@ impl Op for TopkSoftmax {
             }
         }
         arguments.view(args.ids).view(args.weights);
+        arguments.pointer(args.map.map_or(DevicePtr::new(0), |map| map.ptr));
         kernel.launch(grid, &mut arguments, stream)
     }
 
