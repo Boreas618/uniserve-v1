@@ -29,8 +29,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use engine::{
-    BatchCapacity, EngineConfig, Event, GenerationConstraint, GenerationRequest, Parameters,
-    PolicyProgram, PolicySource, Progress, SchedulerHandle, Stage,
+    BatchCapacity, Event, GenerationConstraint, GenerationRequest, Parameters, PolicyProgram,
+    PolicySource, Progress, SchedulerConfig, SchedulerHandle, Stage,
 };
 use executor::batch::{
     Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
@@ -256,9 +256,12 @@ fn reached(handle: &SchedulerHandle, steps: u64) -> Progress {
 fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
     let serving = Arc::new(Serving::new(vec![pool()]));
     let batches: Arc<dyn Batches> = serving.clone();
-    let mut config = EngineConfig::sim("call-counts");
-    config.max_running_requests = 4;
-    let handle = SchedulerHandle::over_batches(config, batches).expect("the pool serves");
+    let args = engine::sim_args("call-counts");
+    let limits = SchedulerConfig {
+        max_running_requests: 4,
+        ..SchedulerConfig::default()
+    };
+    let handle = SchedulerHandle::over_batches(&args, limits, batches).expect("the pool serves");
 
     // The trial asks the decision set once on the state that exists now - a
     // `dispatch` and no `observe`, since observing a step's events is the step's

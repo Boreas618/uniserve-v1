@@ -143,11 +143,14 @@ fn terminal(events: &mut engine::EventRx) -> Event {
 fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     // The reference: the same request, generated without interruption.
     let reference_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
-    let mut reference_config = support::config(&reference_pool, "worlds");
+    let (mut reference_config, reference_limits) = support::config(&reference_pool, "worlds");
     reference_config.world = 1;
-    let reference =
-        SchedulerHandle::over_batches(reference_config, reference_pool.clone() as Arc<dyn Batches>)
-            .expect("the reference world serves");
+    let reference = SchedulerHandle::over_batches(
+        &reference_config,
+        reference_limits,
+        reference_pool.clone() as Arc<dyn Batches>,
+    )
+    .expect("the reference world serves");
     install(&reference, &reference_pool);
     let mut reference_events = reference
         .submit(request(91, 8, 100, Vec::new()))
@@ -184,11 +187,14 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
 
     // The running world generates the first part.
     let running_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
-    let mut running_config = support::config(&running_pool, "worlds");
+    let (mut running_config, running_limits) = support::config(&running_pool, "worlds");
     running_config.world = 1;
-    let running =
-        SchedulerHandle::over_batches(running_config, running_pool.clone() as Arc<dyn Batches>)
-            .expect("the running world serves");
+    let running = SchedulerHandle::over_batches(
+        &running_config,
+        running_limits,
+        running_pool.clone() as Arc<dyn Batches>,
+    )
+    .expect("the running world serves");
     install(&running, &running_pool);
     let mut running_events = running
         .submit(request(91, 8, 100, Vec::new()))
@@ -200,16 +206,18 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
         "the running world generates the reference's first tokens"
     );
 
-    // Its successor starts beside it, on trial.
+    // Its successor starts beside it.
     answer("the running world's cache", running.describe_cache())
         .expect("the running world states its cache");
     let successor_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
-    let mut successor_config = support::config(&successor_pool, "worlds");
+    let (mut successor_config, successor_limits) = support::config(&successor_pool, "worlds");
     successor_config.world = 2;
-    successor_config.trial = true;
-    let successor =
-        SchedulerHandle::over_batches(successor_config, successor_pool.clone() as Arc<dyn Batches>)
-            .expect("the successor starts beside the running world");
+    let successor = SchedulerHandle::over_batches(
+        &successor_config,
+        successor_limits,
+        successor_pool.clone() as Arc<dyn Batches>,
+    )
+    .expect("the successor starts beside the running world");
     install(&successor, &successor_pool);
 
     // The running world parks, the successor is promoted with its index, and

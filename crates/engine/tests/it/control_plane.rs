@@ -1586,23 +1586,23 @@ fn hybrid_groups_share_one_unit_pool() {
 /// override that permission while preserving each request's active cache state.
 #[test]
 fn prefix_cache_configuration_controls_reuse() {
-    use engine::{EngineConfig, SchedulerHandle};
+    use engine::{SchedulerConfig, SchedulerHandle};
 
     let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
     let mut outputs = Vec::new();
     for enabled in [true, false] {
         let mut sim = SimEngine::new();
         sim.set_text_len(4);
-        let config = EngineConfig {
-            prefix_cache: enabled,
-            ..EngineConfig::sim("sim-model")
-        };
+        let mut args = engine::sim_args("sim-model");
+        args.engine_config.kv_cache.prefix_caching = enabled;
         let executor = SimExecutor::new(sim);
         let rank = executor
             .info()
             .runtime_info()
             .expect("the sim states its rank");
-        let engine = SchedulerHandle::with_executor(config, Box::new(executor)).unwrap();
+        let engine =
+            SchedulerHandle::with_executor(&args, SchedulerConfig::default(), Box::new(executor))
+                .unwrap();
         support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
         let stats = engine.stats();
         let mut replies = Vec::new();
@@ -1924,7 +1924,7 @@ fn latent_blocks_are_admitted_only_at_captured_sizes() {
 /// page boundary, and no deeper.
 #[test]
 fn a_state_group_reuses_prefixes_up_to_a_checkpoint() {
-    use engine::{EngineConfig, SchedulerHandle};
+    use engine::{SchedulerConfig, SchedulerHandle};
     use std::sync::atomic::Ordering;
 
     let prompt: Vec<u32> = (0..600u32).map(|i| (i % 53) + 7).collect();
@@ -1932,16 +1932,16 @@ fn a_state_group_reuses_prefixes_up_to_a_checkpoint() {
     sim.set_text_len(4);
     sim.set_block_size(16);
     sim.add_state_group(2);
-    let config = EngineConfig {
-        prefix_cache: true,
-        ..EngineConfig::sim("sim-model")
-    };
+    let mut args = engine::sim_args("sim-model");
+    args.engine_config.kv_cache.prefix_caching = true;
     let executor = SimExecutor::new(sim);
     let rank = executor
         .info()
         .runtime_info()
         .expect("the sim states its rank");
-    let engine = SchedulerHandle::with_executor(config, Box::new(executor)).unwrap();
+    let engine =
+        SchedulerHandle::with_executor(&args, SchedulerConfig::default(), Box::new(executor))
+            .unwrap();
     support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
     let stats = engine.stats();
     for rid in 1..=2 {

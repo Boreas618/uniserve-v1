@@ -945,7 +945,8 @@ mod tests {
         let mut executor = engine::SimExecutor::new(engine::SimEngine::new());
         let nodes = executor.report_ledgers();
         let core = engine::SchedulerHandle::with_executor(
-            engine::EngineConfig::sim(crate::test_support::SERVED_MODEL),
+            &engine::sim_args(crate::test_support::SERVED_MODEL),
+            engine::SchedulerConfig::default(),
             Box::new(executor),
         )
         .expect("start a sim scheduler");

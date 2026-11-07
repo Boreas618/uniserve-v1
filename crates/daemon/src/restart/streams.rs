@@ -485,7 +485,7 @@ pub(crate) fn finished(request_id: &str) {
 
 #[cfg(test)]
 mod tests {
-    use engine::{EngineConfig, SimEngine};
+    use engine::SimEngine;
     use proto::handoff::stream::Application;
     use tokio_util::sync::CancellationToken;
 
@@ -604,7 +604,7 @@ mod tests {
         // The queue of taken-over responses is this process's, so the test
         // starts from what earlier tests left there.
         let _ = take_adopted();
-        let core = sim_core(EngineConfig::sim("refused-handoff"), SimEngine::new());
+        let core = sim_core(engine::sim_args("refused-handoff"), SimEngine::new());
         let client = std::sync::Arc::new(sim_client(vec![core]));
         let leader = std::sync::Arc::new(leader_over(
             sim_model(ModelParameters::Qwen3),
@@ -645,7 +645,7 @@ mod tests {
     #[tokio::test]
     async fn a_response_that_names_no_application_stays_with_the_predecessor() {
         let _ = take_adopted();
-        let core = sim_core(EngineConfig::sim("refused-handoff-2"), SimEngine::new());
+        let core = sim_core(engine::sim_args("refused-handoff-2"), SimEngine::new());
         let client = std::sync::Arc::new(sim_client(vec![core]));
         let leader = std::sync::Arc::new(leader_over(
             sim_model(ModelParameters::Qwen3),

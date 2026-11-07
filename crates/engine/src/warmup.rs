@@ -48,8 +48,9 @@ use anyhow::Context as _;
 use ipc::{CallKind, ForwardMode, MediaCall};
 use ipc::{ImageParams, SamplingParams};
 
-use crate::core::{EngineConfig, SchedulerHandle};
+use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
+use proto::config::EngineArgs;
 
 /// Denoising steps of a warmup image: the fewest that run a step from a
 /// prepared latent and a step from a denoised one.
@@ -116,15 +117,15 @@ impl Warm {
 
 /// Runs the warm-up once the epoch's first policy serves, on a thread of its own
 /// ([`Warm`] is what it holds).
-pub(crate) fn after_serving(core: &SchedulerHandle, config: &EngineConfig) {
+pub(crate) fn after_serving(core: &SchedulerHandle, args: &EngineArgs) {
     let intent = core.warmup();
     let serving = core.serving();
-    let config = config.clone();
+    let args = args.clone();
     let spawned = std::thread::Builder::new()
         .name("warmup".to_owned())
         .spawn(move || {
             wait_serving(serving);
-            if let Err(error) = warm(&intent, &config) {
+            if let Err(error) = warm(&intent, &args) {
                 // Serving continues: the shapes this warms are the ones a client
                 // request reaches anyway, where its failure is visible.
                 tracing::warn!(%error, "the serving path's warm-up failed; the engine serves on");
@@ -170,17 +171,21 @@ pub(crate) struct Group {
 /// `limits` are the deployment's resolved generation limits, so a shape serving
 /// could not reach is left out here as well.
 pub(crate) fn groups(
-    config: &EngineConfig,
+    args: &EngineArgs,
     info: &ipc::MainProcessInfo,
     limits: &crate::GenerationLimits,
     mut next_id: impl FnMut() -> ipc::RequestId,
 ) -> anyhow::Result<Vec<Group>> {
+    let facts =
+        args.engine_config.model.facts.as_ref().context(
+            "the engine configuration states no model facts to warm the serving path with",
+        )?;
     let supports = |kind| info.supported_calls.contains(&kind);
     // Keeps the requests clients could submit, naming what it leaves out.
     let servable = |what: &str, requests: Vec<GenerationRequest>| {
         // A deployment with block sampling generates every request but a
         // readout in canvases, so admission checks its canvas features.
-        let canvases = config.canvas_sampling.is_some();
+        let canvases = facts.canvas_sampling.is_some();
         let (kept, refused): (Vec<_>, Vec<_>) = requests.into_iter().partition(|request| {
             let needs = if canvases && !request.is_readout() {
                 request.canvas_features()
@@ -199,7 +204,7 @@ pub(crate) fn groups(
     };
     let mut und = |tokens: usize| {
         warmup_request(
-            config,
+            facts.bos,
             next_id(),
             GenerationConstraint::UndOnly,
             tokens,
@@ -227,7 +232,7 @@ pub(crate) fn groups(
     }
 
     if info.diffusion_lm_step_rows > 0 {
-        let sampling = config.canvas_sampling.context(
+        let sampling = facts.canvas_sampling.context(
             "executors report diffusion LM step rows but the deployment has no block sampling",
         )?;
         let length = sampling.canvas_length as usize;
@@ -279,7 +284,7 @@ pub(crate) fn groups(
             let requests = servable(
                 &what,
                 vec![warmup_request(
-                    config,
+                    facts.bos,
                     next_id(),
                     GenerationConstraint::GenOnly,
                     0,
@@ -296,8 +301,10 @@ pub(crate) fn groups(
     Ok(groups)
 }
 
-pub(crate) fn warm(core: &Warm, config: &EngineConfig) -> anyhow::Result<()> {
-    let on_cuda = config
+pub(crate) fn warm(core: &Warm, args: &EngineArgs) -> anyhow::Result<()> {
+    let on_cuda = args
+        .engine_config
+        .parallel
         .worker_groups
         .iter()
         .flat_map(|worker| &worker.ranks)
@@ -308,7 +315,7 @@ pub(crate) fn warm(core: &Warm, config: &EngineConfig) -> anyhow::Result<()> {
 
     let info = core.info().clone();
     let limits = core.generation_limits();
-    for group in groups(config, &info, &limits, || core.next_request_id())? {
+    for group in groups(args, &info, &limits, || core.next_request_id())? {
         run(core, &group.what, group.requests)?;
         tracing::info!(warmup = %group.what, "completed a serving path warm-up group");
     }
@@ -324,7 +331,7 @@ pub(crate) fn warm(core: &Warm, config: &EngineConfig) -> anyhow::Result<()> {
 /// request prefills the guidance prefix a client's request without a
 /// negative prompt does.
 fn warmup_request(
-    config: &EngineConfig,
+    bos: u32,
     request_id: ipc::RequestId,
     constraint: GenerationConstraint,
     tokens: usize,
@@ -334,7 +341,7 @@ fn warmup_request(
 ) -> GenerationRequest {
     GenerationRequest {
         request_id,
-        prompt_token_ids: vec![config.bos],
+        prompt_token_ids: vec![bos],
         negative_prompt_token_ids: negative_token_ids,
         multimodal_inputs: MultimodalInputs::default(),
         constraint,
@@ -439,20 +446,34 @@ mod tests {
     /// The requests are stated without being submitted: a scheduler with no
     /// policy forms no batch, so a warm-up only runs once the epoch's first
     /// policy serves, and what a deployment's shapes ask for is checked here.
-    fn groups_of(sim: SimEngine, deployment: impl FnOnce(&mut EngineConfig)) -> Vec<Group> {
-        let mut config = EngineConfig::sim("warmup");
-        config.worker_groups[0].ranks[0].device = "cuda:0".to_owned();
-        deployment(&mut config);
+    fn groups_of(sim: SimEngine, deployment: impl FnOnce(&mut EngineArgs)) -> Vec<Group> {
+        let mut args = crate::core::sim_args("warmup");
+        args.engine_config.parallel.worker_groups[0].ranks[0].device = "cuda:0".to_owned();
+        deployment(&mut args);
         let executor = SimExecutor::new(sim);
-        let core = SchedulerHandle::with_executor(config.clone(), Box::new(executor)).unwrap();
+        let core = SchedulerHandle::with_executor(
+            &args,
+            crate::scheduler::SchedulerConfig::default(),
+            Box::new(executor),
+        )
+        .unwrap();
         let mut id = 0;
-        let groups = groups(&config, core.info(), &core.generation_limits(), || {
+        let groups = groups(&args, core.info(), &core.generation_limits(), || {
             id += 1;
             ipc::RequestId(id)
         })
         .expect("the deployment's warm-up requests are stated");
         core.shutdown();
         groups
+    }
+
+    /// The model facts `args` states, which a test adjusts.
+    fn facts(args: &mut EngineArgs) -> &mut proto::config::ModelFacts {
+        args.engine_config
+            .model
+            .facts
+            .as_mut()
+            .expect("the simulated arguments state the model's facts")
     }
 
     fn shape(height: u32, width: u32, branches: u8, negative_token_ids: Vec<u32>) -> ImageWarmup {
@@ -488,12 +509,17 @@ mod tests {
 
     #[test]
     fn a_cpu_deployment_runs_no_warmup() {
-        // `EngineConfig::sim` runs on CPU, where no serving path is captured.
-        let config = EngineConfig::sim("warmup");
+        // `sim_args` runs on CPU, where no serving path is captured.
+        let args = crate::core::sim_args("warmup");
         let executor = SimExecutor::new(SimEngine::new());
-        let core = SchedulerHandle::with_executor(config.clone(), Box::new(executor)).unwrap();
+        let core = SchedulerHandle::with_executor(
+            &args,
+            crate::scheduler::SchedulerConfig::default(),
+            Box::new(executor),
+        )
+        .unwrap();
         let intent = core.warmup();
-        let result = warm(&intent, &config);
+        let result = warm(&intent, &args);
         core.shutdown();
         result.expect("a CPU deployment has nothing to warm");
     }
@@ -564,7 +590,7 @@ mod tests {
             ]),
             // At most two guidance branches: no client can submit the
             // three-branch shape either.
-            |config| config.generation_limits.max_cfg_branches = 2,
+            |args| facts(args).limits.max_cfg_branches = 2,
         );
         let images: Vec<&str> = groups
             .iter()
@@ -600,12 +626,13 @@ mod tests {
         // The ranks run under the deployment's block sampling.
         sim.set_canvas_sampling(canvas);
 
-        let groups = groups_of(sim, |config| {
-            config.generation_limits = GenerationLimits {
+        let groups = groups_of(sim, |args| {
+            let facts = facts(args);
+            facts.limits = GenerationLimits {
                 features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::TOKEN_DENOISING,
-                ..config.generation_limits.clone()
+                ..facts.limits.clone()
             };
-            config.canvas_sampling = Some(canvas);
+            facts.canvas_sampling = Some(canvas);
         });
 
         let rows: Vec<usize> = groups

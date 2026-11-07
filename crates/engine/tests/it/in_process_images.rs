@@ -17,12 +17,12 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::Engine as _;
-use engine::{EngineConfig, SchedulerHandle, WorkerGroupConfig};
 use engine::{
     Event, FeedbackNextToken, FeedbackSource, FinishReason, GenerationConstraint,
     GenerationFeatures, GenerationLimits, GenerationRequest, ImageEncoderInput,
     ImageGenerationConfig, ImageInput, ImageTrigger, MultimodalInputs, Request,
 };
+use engine::{SchedulerConfig, SchedulerHandle, WorkerGroupConfig};
 use ipc::{ImageParams, RequestId, SamplingParams};
 use proto::config::BlockConfig;
 
@@ -51,8 +51,14 @@ fn logged_engine(
         .into_iter()
         .map(|name| (name.to_owned(), BlockConfig::parallel(vec![0])))
         .collect();
-    let mut config = EngineConfig::sim("stub");
-    config.generation_limits = GenerationLimits {
+    let mut args = engine::sim_args("stub");
+    let facts = args
+        .engine_config
+        .model
+        .facts
+        .as_mut()
+        .expect("the simulated arguments state the model's facts");
+    facts.limits = GenerationLimits {
         features: GenerationFeatures::UNDERSTANDING
             | GenerationFeatures::VISION_ENCODE
             | GenerationFeatures::LATENT_ENCODE
@@ -69,9 +75,9 @@ fn logged_engine(
         max_cfg_branches: 3,
         encoder_cache_entries: 16,
     };
-    config.eos = vec![END_OF_IMAGE];
-    config.end_of_image = END_OF_IMAGE;
-    config.worker_groups = vec![WorkerGroupConfig::placed(
+    facts.eos = vec![END_OF_IMAGE];
+    facts.end_of_image = END_OF_IMAGE;
+    args.engine_config.parallel.worker_groups = vec![WorkerGroupConfig::placed(
         &["localhost".to_owned()],
         "cpu",
         1,
@@ -101,8 +107,9 @@ fn logged_engine(
     let rank = engine::Executor::info(&executor)
         .runtime_info()
         .expect("the sim states its rank");
-    let handle = SchedulerHandle::with_executor(config, Box::new(executor))
-        .expect("the simulated executor serves");
+    let handle =
+        SchedulerHandle::with_executor(&args, SchedulerConfig::default(), Box::new(executor))
+            .expect("the simulated executor serves");
     crate::support::install_policy_on(&handle, engine::BatchCapacity::of(&rank));
     Ok((handle, context))
 }

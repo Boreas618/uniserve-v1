@@ -8069,10 +8069,6 @@ fn schedulers(
     if executors.is_empty() {
         bail!("the scheduler node holds no device to serve a batch on");
     }
-    // One scheduler per scheduler thread: the configuration is this rank's, derived from what the
-    // launch states, the build config fixes and the model's own geometry, and it refuses by name
-    // when a fact it needs is one the launch file does not carry.
-    let mut facts = plan.rank_facts(model)?;
     // The host KV cache copies a rank's pages on that rank's copy stream, into the pool the one rank
     // of this scheduler's inventory states. A scheduler of an expert union serves one device, as a
     // scheduler of one rank does, and its peers' schedulers keep their own pools of the same pages:
@@ -8080,11 +8076,9 @@ fn schedulers(
     // device's share of every page, so it keeps none, and no text model runs one today: a rank
     // maps its model on one device.
     let host_cache = plan.host_kv_cache(model) && executors.len() == 1;
-    if host_cache {
-        facts.deployment = Some(launch.engine_config.deployment.clone());
-        facts.host_kv_cache = true;
-    }
-    let config = engine::EngineConfig::of(&facts)?;
+    // One scheduler per scheduler thread: it reads the engine configuration as this rank resolves
+    // it, with the model's facts, and the limits this rank captured.
+    let (args, limits) = plan.scheduler_args(launch, model, host_cache)?;
     let mut rank = rank.clone();
     if host_cache && let Some(cache) = rank.prefix_cache.as_mut() {
         cache.host_token_bytes = memory.host_token_bytes();
@@ -8129,7 +8123,7 @@ fn schedulers(
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.
     let progress = engine::CommandWaker::new(move || control.wake());
-    let handle = engine::SchedulerHandle::over_batches_telling(config, batches, progress)?;
+    let handle = engine::SchedulerHandle::over_batches_telling(&args, limits, batches, progress)?;
     Ok(vec![handle])
 }
 
