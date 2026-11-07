@@ -264,7 +264,7 @@ mod tests {
         fn spawn(
             &mut self,
             spawn: Spawn,
-            _launch: &crate::engine::launch::Launch,
+            _launch: &proto::config::EngineArgs,
         ) -> Result<crate::updates::switch::Spawned, String> {
             let pid = self.spawns.len() as u32 + 1;
             let generation = spawn.generation;
@@ -346,7 +346,7 @@ mod tests {
             start: Start {
                 executable: "/opt/uniserve".to_owned(),
                 build: Some("2.0.0+new".to_owned()),
-                launch: crate::engine::launch::Launch {
+                launch: proto::config::EngineArgs {
                     engine_config: "/run/engine-config-13.json".into(),
                     model: "/models/qwen3".into(),
                     requests: "unix:/run/requests.sock".to_owned(),

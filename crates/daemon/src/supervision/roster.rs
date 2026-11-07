@@ -341,7 +341,7 @@ impl Roster for ProcessRoster {
     fn spawn(
         &mut self,
         mut spawn: Spawn,
-        launch: &crate::engine::launch::Launch,
+        launch: &proto::config::EngineArgs,
     ) -> Result<crate::updates::switch::Spawned, String> {
         // The launch generation is the caller's, allocated once from the
         // deployment's one counter ([`Epochs::next_generation`]): the switch
@@ -647,8 +647,8 @@ mod tests {
         }
     }
 
-    fn launch() -> crate::engine::launch::Launch {
-        crate::engine::launch::Launch {
+    fn launch() -> proto::config::EngineArgs {
+        proto::config::EngineArgs {
             engine_config: "/run/engine-config-1.json".into(),
             model: "/models/qwen3".into(),
             requests: "unix:/run/requests.sock".to_owned(),

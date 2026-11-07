@@ -9,4 +9,4 @@
 //! The command ends with its daemon: the lifeline the supervising daemon gave this process ends
 //! when the daemon, and every daemon a hot restart handed its processes to, ended.
 
-pub(crate) use crate::engine_main::{EngineArgs, run};
+pub(crate) use crate::engine_main::run;

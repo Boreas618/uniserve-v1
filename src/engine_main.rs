@@ -84,6 +84,7 @@
 //! purge, watchdog, probe, close}`, `Submission::wait`) are published in
 //! `crates/executor` and are used as they are written there.
 
+use proto::config::EngineArgs;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -142,108 +143,12 @@ pub(crate) struct Epoch {
     pub predecessor_cache: Vec<proto::request::wire::CacheSegments>,
 }
 
-/// The options of `uniserve engine`: the launch file the daemon writes for this process (§2.3).
-///
-/// Everything else the process needs is that file's; the daemon's own account of who this process
-/// is, which build config it serves and where it reaches the epoch's interfaces. A flag beside it
-/// would be a second account of the same thing, and the two would drift.
-#[derive(Debug, Clone, Args)]
-pub(crate) struct EngineArgs {
-    /// The launch file the daemon wrote for this main process.
-    #[arg(long)]
-    pub launch: PathBuf,
-}
-
-/// One engine process's launch, as the daemon writes it (`notes` of the launch contract).
-///
-/// The claim token and the Storage Server's socket are not here: they are runtime facts of the node
-/// this process runs on, which the daemon answers when the process asks for them, so a launch file
-/// cannot carry a claim that has not been minted yet.
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Launch {
-    /// The epoch's build config, as the daemon wrote it: a path, since the config is the epoch's and
-    /// not the process's.
-    pub engine_config: PathBuf,
-    /// The checkpoint the epoch serves.
-    pub model: PathBuf,
-    /// The leader daemon's request interface, `unix:<path>` or `<host>:<port>`. It speaks the
-    /// request vocabulary: `wire::{Hello, Welcome, ToEngine, FromEngine}` - the epoch's
-    /// submissions, its per-request commands, and this process's accepted requests, events and
-    /// metrics.
-    pub requests: String,
-    /// The daemon's process interface, `unix:<path>` or `<host>:<port>`: the supervision frames
-    /// this process claims its storage with and reports to, and the one place a program-layer
-    /// command can reach it. It speaks `process::{Hello, Welcome, Upstream, Downstream}`, which is
-    /// a different vocabulary from `requests`, not a second address of the same one.
-    pub processes: String,
-    /// The engine number the daemon started this process under.
-    pub engine: u64,
-    /// The Program Server's socket.
-    pub program_server: String,
-    /// The devices this rank serves, as CUDA ordinals.
-    pub devices: Vec<u32>,
-    /// This rank's executor group, which keys its storage claims.
-    pub group: String,
-    /// This rank's ordinal inside its group.
-    pub rank: u32,
-    /// The deployment's name, under which the Storage Servers key its claims.
-    pub deployment: String,
-    /// The world the epoch executes, which keys the storage it creates.
-    pub world: u64,
-    /// Whether this node holds the epoch's schedulers.
-    #[serde(default)]
-    pub scheduler_node: bool,
-    /// The addresses on which this node accepts its peer main processes' connections.
-    #[serde(default)]
-    pub peers: Vec<String>,
-    /// How long a job may run without progress before it is reported `Stalled`, when the daemon
-    /// states it apart from the build config (§2.4).
-    #[serde(default)]
-    pub watchdog_timeout_s: Option<u64>,
-    /// The probation an update must survive before the daemon commits it (§7.3 step 4). The daemon
-    /// measures the probation and decides the commit; this process reports what happened and does
-    /// not judge it, so the field is read where the epoch is decided and not here.
-    #[serde(default)]
-    pub rollback_s: Option<u64>,
-    /// The rank layout's queue depth for this rank's executor groups: how many batches the rank's
-    /// schedulers keep in flight, which the capacity plan relays through (§4.1).
-    ///
-    /// Required, not defaulted: a zero depth plans a rank with no relay and silently halves the
-    /// pipeline's slack.
-    pub queue_depth: u32,
-    /// The number of ranks in this process's world, of which this group's rank is one.
-    ///
-    /// Required, not defaulted: a world of one on a multi-node deployment sizes this rank's storage
-    /// claim for one rank, and the second node's claim would collide with it.
-    pub world_size: u32,
-    /// Whether this process was started as the standby of the epoch that serves: it maps its
-    /// scope's storage, loads the epoch's weights, opens its pools and captures its graphs, and
-    /// then parks - executing nothing and admitting nothing - and reports `Parked`. The daemon
-    /// promotes it in place (`Promote`, answered `Promoted`) and only then does the frontend
-    /// submit to it (§2.5, §7.4).
-    ///
-    /// Defaulted rather than required, so that a launch file written before this field existed
-    /// still reads: an initial process is not a standby, and `false` says exactly that. A standby
-    /// that claimed its storage writable would give its scope two writers, which is why the role
-    /// is the launcher's statement rather than the process's guess.
-    #[serde(default)]
-    pub standby: bool,
-}
-
-impl Launch {
-    /// The launch file's contents.
-    fn read(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path)
-            .with_context(|| format!("opening the launch file {}", path.display()))?;
-        serde_json::from_reader(file)
-            .with_context(|| format!("reading the launch file {}", path.display()))
-    }
-
-    /// §2.4's watchdog bound: the launch's when the daemon states one apart from the build config.
-    fn watchdog_timeout(&self) -> Option<Duration> {
-        self.watchdog_timeout_s.map(Duration::from_secs)
-    }
+/// The launch file's contents.
+fn read_engine_args(path: &Path) -> Result<EngineArgs> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("opening the launch file {}", path.display()))?;
+    serde_json::from_reader(file)
+        .with_context(|| format!("reading the launch file {}", path.display()))
 }
 
 /// This process's connection to its daemon's process interface (§2.3).
@@ -487,7 +392,7 @@ unsafe impl Send for LoadedRank {}
 fn load_ranks(
     plans: Vec<EpochPlan>,
     storage: &ipc::StorageLaunch,
-    launch: &Launch,
+    launch: &EngineArgs,
     epoch: &Epoch,
 ) -> Result<Vec<LoadedRank>> {
     let count = plans.len();
@@ -531,7 +436,7 @@ fn load_rank(
     index: usize,
     count: usize,
     storage: &ipc::StorageLaunch,
-    launch: &Launch,
+    launch: &EngineArgs,
     epoch: &Epoch,
 ) -> Result<LoadedRank> {
     let adopted = epoch
@@ -643,7 +548,7 @@ fn group_over(
 /// on, the token this rank presents, and where another host reaches its pages.
 fn claim(
     process: &mut ProcessInterface,
-    launch: &Launch,
+    launch: &EngineArgs,
     host: &str,
     host_kv_cache: bool,
     ranks: &[u32],
@@ -710,7 +615,7 @@ fn claim_token(bytes: &[u8]) -> Result<[u8; 16]> {
 
 /// Runs the `uniserve engine` command.
 pub(crate) fn run(
-    args: &EngineArgs,
+    launch_file: &Path,
     lifeline: Option<i32>,
     log: &crate::cli::LogLevels,
 ) -> Result<ExitCode> {
@@ -723,7 +628,7 @@ pub(crate) fn run(
         log.log_level_http.as_deref(),
     );
 
-    let launch = Launch::read(&args.launch)?;
+    let launch = read_engine_args(launch_file)?;
     let build: proto::config::EngineConfig = serde_json::from_reader(
         std::fs::File::open(&launch.engine_config)
             .with_context(|| format!("opening {}", launch.engine_config.display()))?,
@@ -1024,7 +929,7 @@ impl MainProcess {
     /// ([`EpochPlan`]), because three of the things the main process needs are the
     /// node's rather than the epoch's: which devices it serves, where its Program
     /// Server is, and what those devices measure.
-    fn start(launch: &Launch, build: &proto::config::EngineConfig) -> Result<Self> {
+    fn start(launch: &EngineArgs, build: &proto::config::EngineConfig) -> Result<Self> {
         let plan = EpochPlan::of(launch, build)?;
         let mut control = Control::connect(
             &Endpoints {
@@ -1076,7 +981,7 @@ impl MainProcess {
         control: &mut Option<Control>,
         plan: EpochPlan,
         epoch: Epoch,
-        launch: &Launch,
+        launch: &EngineArgs,
         build: &proto::config::EngineConfig,
     ) -> Result<Self> {
         let connected = control
@@ -8156,7 +8061,7 @@ fn device_command(
 /// result.
 fn schedulers(
     plan: &EpochPlan,
-    launch: &Launch,
+    launch: &EngineArgs,
     model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
     rank: &ipc::MainProcessInfo,
@@ -8242,7 +8147,7 @@ fn schedulers(
 /// through this interface: the daemon names them and this process resolves their modules from the
 /// Program Server (§5.1). The build config is the one the daemon wrote for this node, which `run`
 /// reads before the handshake.
-fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
+fn handshake(control: &mut Control, launch: &EngineArgs) -> Result<Epoch> {
     control.daemon_mut().send(&proto::request::wire::Hello {
         engine: launch.engine,
         build: proto::BUILD.to_owned(),

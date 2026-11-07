@@ -8,6 +8,7 @@
 //! specification and waits until the engine reports that it serves; the
 //! engine's process lives for as long as its control connection does.
 
+use proto::config::EngineArgs;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,7 +20,7 @@ use proto::request::wire;
 use proto::{Connection, Listener};
 
 use crate::engine::client::{EngineClient, EngineState, StatsSink};
-use crate::engine::launch::{self, Launch};
+use crate::engine::launch;
 
 /// The worker group a daemon supervises an engine process under.
 pub(crate) const ENGINE_GROUP: &str = "engine";
@@ -687,7 +688,7 @@ impl EngineControl {
     /// child on a host that does not share this daemon's runtime directory, a
     /// node with no Program Server, a spec of no world, and an epoch whose
     /// build config has not been written.
-    fn launch(&self, spec: &wire::EngineSpec, engine: u64) -> anyhow::Result<Launch> {
+    fn launch(&self, spec: &wire::EngineSpec, engine: u64) -> anyhow::Result<EngineArgs> {
         anyhow::ensure!(!spec.model.is_empty(), "the engine spec names no model");
         // Form (A): the child opens the launch file this daemon wrote, so it
         // has to be this daemon's own host. A remote host needs the launch
@@ -734,7 +735,7 @@ impl EngineControl {
         // world is its peers and itself).
         let peers: Vec<String> = Vec::new();
         let world_size = u32::try_from(peers.len() + 1).unwrap_or(u32::MAX);
-        Ok(Launch {
+        Ok(EngineArgs {
             engine_config,
             model: PathBuf::from(&spec.model),
             requests: self.request_address.clone(),
