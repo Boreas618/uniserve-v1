@@ -14,7 +14,6 @@ use std::ffi::OsString;
 use clap::{Args, Parser, Subcommand};
 use daemon::options::ServerArgs;
 
-use crate::engine::EngineArgs;
 use crate::storage::StorageArgs;
 
 /// Top-level parser for the `uniserve` binary.
@@ -62,7 +61,11 @@ pub(crate) enum Command {
     /// Run the main process of this node and epoch: its schedulers and the
     /// request interface.
     #[command(hide = true)]
-    Engine(EngineArgs),
+    Engine {
+        /// The launch file the daemon wrote for this engine process (`proto::config::EngineArgs`).
+        #[arg(long)]
+        launch: std::path::PathBuf,
+    },
     /// The Storage Server of this host and the operator's commands against
     /// it.
     Storage(Box<StorageArgs>),
@@ -125,7 +128,7 @@ mod tests {
                         _ => "other",
                     }
                 }
-                Command::Engine(_) => "other",
+                Command::Engine { .. } => "other",
             };
             assert_eq!(name, expected);
         }

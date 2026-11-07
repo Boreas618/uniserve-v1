@@ -438,7 +438,7 @@ impl crate::updates::switch::Roster for Uncommanded {
     fn spawn(
         &mut self,
         _spawn: proto::process::Spawn,
-        _launch: &crate::engine::launch::Launch,
+        _launch: &proto::config::EngineArgs,
     ) -> Result<crate::updates::switch::Spawned, String> {
         Ok(crate::updates::switch::Spawned {
             generation: _spawn.generation,

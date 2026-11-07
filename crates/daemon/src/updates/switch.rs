@@ -84,7 +84,7 @@ pub(crate) struct Start {
     /// (`engine/launch.rs`). Every field is the epoch's; the process's own
     /// identity is the generation the spawn carries, which the adapter puts
     /// into the file's `engine` (§2.3, §7.4).
-    pub(crate) launch: crate::engine::launch::Launch,
+    pub(crate) launch: proto::config::EngineArgs,
     /// Variables set over the daemon's environment.
     pub(crate) environment: HashMap<String, String>,
 }
@@ -153,7 +153,7 @@ pub(crate) trait Roster {
     fn spawn(
         &mut self,
         spawn: Spawn,
-        launch: &crate::engine::launch::Launch,
+        launch: &proto::config::EngineArgs,
     ) -> Result<Spawned, String>;
     /// Stops one launch generation of `group` on `host`; every generation
     /// when `generation` is `None`.
@@ -209,7 +209,7 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
     fn spawn(
         &mut self,
         spawn: Spawn,
-        launch: &crate::engine::launch::Launch,
+        launch: &proto::config::EngineArgs,
     ) -> Result<Spawned, String> {
         (**self).spawn(spawn, launch)
     }
@@ -1413,7 +1413,7 @@ mod tests {
         fn spawn(
             &mut self,
             spawn: Spawn,
-            _launch: &crate::engine::launch::Launch,
+            _launch: &proto::config::EngineArgs,
         ) -> Result<Spawned, String> {
             if let Some(reason) = &self.fail_spawn {
                 return Err(reason.clone());
@@ -1504,7 +1504,7 @@ mod tests {
         Start {
             executable: "/opt/uniserve".to_owned(),
             build: Some("2.0.0+new".to_owned()),
-            launch: crate::engine::launch::Launch {
+            launch: proto::config::EngineArgs {
                 engine_config: "/run/engine-config-11.json".into(),
                 model: "/models/qwen3".into(),
                 requests: "unix:/run/requests.sock".to_owned(),

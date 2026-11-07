@@ -137,7 +137,7 @@ fn main() -> Result<std::process::ExitCode> {
     match cli.command {
         Command::Serve(args) => serve::run(*args, &command_matches(), &cli.log),
         Command::Frontend(args) => frontend::run(*args, &command_matches(), &cli.log),
-        Command::Engine(args) => engine::run(&args, lifeline, &cli.log),
+        Command::Engine { launch } => engine::run(&launch, lifeline, &cli.log),
         Command::Storage(args) => Ok(storage::run(*args)),
         Command::Rules => rules::run(),
         Command::External(arguments) => run_external(&arguments),

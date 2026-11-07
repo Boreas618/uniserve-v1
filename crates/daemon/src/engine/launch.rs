@@ -22,73 +22,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-use proto::config::EngineConfig;
-
-/// One engine process's launch, mirroring the engine's own `Launch` field for
-/// field (`src/engine_main.rs`): the same names, the same types, and no field
-/// either side may add alone.
-///
-/// The claim token and the Storage Server's socket are not here: they are
-/// runtime facts of the node the process runs on, which the daemon answers
-/// when the process asks.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct Launch {
-    /// The epoch's build config, as the daemon wrote it.
-    pub engine_config: PathBuf,
-    /// The checkpoint the epoch serves.
-    pub model: PathBuf,
-    /// The leader daemon's request interface, `unix:<path>` or
-    /// `<host>:<port>`.
-    pub requests: String,
-    /// The daemon's process interface, `unix:<path>` or `<host>:<port>`: the
-    /// supervision frames this process claims its storage with and reports to,
-    /// and the one place a program-layer command can reach it. A different
-    /// vocabulary from `requests`, not a second address of the same one.
-    pub processes: String,
-    /// The identity the daemon started this process under: the engine number,
-    /// or the launch generation in the epoch-switch path, where that is the
-    /// only allocator.
-    pub engine: u64,
-    /// The Program Server's socket.
-    pub program_server: String,
-    /// The devices this rank serves, as CUDA ordinals.
-    pub devices: Vec<u32>,
-    /// This rank's worker group, which keys its storage claims.
-    pub group: String,
-    /// This rank's ordinal inside its group.
-    pub rank: u32,
-    /// The deployment's name, under which the Storage Servers key its claims.
-    pub deployment: String,
-    /// The world the epoch executes, which keys the storage it creates.
-    pub world: u64,
-    /// Whether this node holds the epoch's schedulers.
-    #[serde(default)]
-    pub scheduler_node: bool,
-    /// The addresses on which this node accepts its peer main processes'
-    /// connections; empty for a world of one.
-    #[serde(default)]
-    pub peers: Vec<String>,
-    /// How long a job may run without progress before it is reported
-    /// `Stalled`, when the daemon states it apart from the build config.
-    #[serde(default)]
-    pub watchdog_timeout_s: Option<u64>,
-    /// The probation an update must survive before the daemon commits it.
-    #[serde(default)]
-    pub rollback_s: Option<u64>,
-    /// The rank layout's queue depth for this rank's worker groups.
-    pub queue_depth: u32,
-    /// The number of ranks in this process's world, of which this group's rank
-    /// is one.
-    pub world_size: u32,
-    /// Whether this process starts as the serving process's standby (§2.5): it
-    /// claims its scope's storage read-only, parks once it is prepared, and is
-    /// promoted in place when the serving process of its failure domain fails.
-    /// The role is stated here because a standby that claimed writable storage
-    /// would give the scope two writers.
-    #[serde(default)]
-    pub standby: bool,
-}
+use proto::config::{EngineArgs, EngineConfig};
 
 /// The path of one engine process's launch file.
 pub(crate) fn launch_path(directory: &Path, engine: u64) -> PathBuf {
@@ -107,7 +41,7 @@ pub(crate) fn engine_config_path(directory: &Path, world: u64) -> PathBuf {
 /// # Errors
 ///
 /// Fails when the directory or the file cannot be written.
-pub(crate) fn write(directory: &Path, engine: u64, launch: &Launch) -> io::Result<PathBuf> {
+pub(crate) fn write(directory: &Path, engine: u64, launch: &EngineArgs) -> io::Result<PathBuf> {
     let path = launch_path(directory, engine);
     let bytes = serde_json::to_vec_pretty(launch)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
@@ -177,8 +111,8 @@ mod tests {
     use super::*;
     use crate::options::ServerArgs;
 
-    fn launch() -> Launch {
-        Launch {
+    fn launch() -> EngineArgs {
+        EngineArgs {
             engine_config: PathBuf::from("/run/uniserve/engine-config-12.json"),
             model: PathBuf::from("/models/qwen3"),
             requests: "unix:/run/uniserve/requests.sock".to_owned(),
@@ -213,10 +147,10 @@ mod tests {
         directory
     }
 
-    /// The engine accepts a launch file only with its exact key set, so the
-    /// writer's keys are pinned here: the engine's own struct is `pub(crate)`
-    /// in the binary and cannot be round-tripped from this crate, and the key
-    /// set is what a round trip would prove.
+    /// The launch file states exactly the engine's fields, and the engine reads
+    /// it back as the one type both sides use (`proto::config::EngineArgs`).
+    /// A key a newer daemon adds is read past rather than refused, so an
+    /// engine of an older build still starts from it.
     #[test]
     fn a_launch_file_states_exactly_the_engines_fields() {
         let directory = scratch("keys");
@@ -260,15 +194,15 @@ mod tests {
         assert_eq!(value["world_size"], json!(1));
         assert_eq!(value["standby"], json!(false));
 
-        // The mirror reads back what the writer wrote.
-        let read: Launch =
-            serde_json::from_str(&text).expect("the launch file reads back as the mirror");
+        // The engine reads back what the writer wrote.
+        let read: EngineArgs = serde_json::from_str(&text).expect("the launch file reads back");
         assert_eq!(read, launch());
 
-        // An unknown key is refused, as the engine refuses it.
+        // A key this build does not know is read past.
         let mut extra = value;
         extra["generation"] = json!(7);
-        assert!(serde_json::from_value::<Launch>(extra).is_err());
+        let read: EngineArgs = serde_json::from_value(extra).expect("an unknown key is read past");
+        assert_eq!(read, launch());
         let _ = std::fs::remove_dir_all(&directory);
     }
 

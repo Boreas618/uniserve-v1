@@ -41,7 +41,7 @@ use platform::DeviceId;
 use program_server::Target;
 use proto::request::{GenerationFeatures, GenerationLimits, GraphPolicy};
 
-use crate::engine_main::Launch;
+use proto::config::EngineArgs;
 
 /// One deployment's output and the media lane its stages run on.
 type SharedCodec = (
@@ -325,7 +325,7 @@ impl EpochPlan {
     /// starts every rank of a node with the ordinals that rank serves, and a main process that
     /// guessed its devices from the epoch's parallelism would capture graphs on another rank's
     /// device.
-    pub(crate) fn of(launch: &Launch, build: &proto::config::EngineConfig) -> Result<Self> {
+    pub(crate) fn of(launch: &EngineArgs, build: &proto::config::EngineConfig) -> Result<Self> {
         let mapping = Mapping::of(launch, build)?;
         if launch.devices.is_empty() {
             bail!(
@@ -871,7 +871,7 @@ impl EpochPlan {
     /// name per rank in rank order: a world of one states this node's own, because one node is one
     /// host and the name is read from the machine rather than invented, while a world of more ranks
     /// leaves the fact absent - the real names are the deployment's, and a launch file, which is per
-    /// node, does not carry them (`Launch::peers` is this node's peer addresses).
+    /// node, does not carry them (`EngineArgs::peers` is this node's peer addresses).
     ///
     /// The rest stay `None`, and that is the answer rather than a gap to fill with a guess: `bos`,
     /// `eos`, `end_of_image` and `generation_limits` are the checkpoint's tokenizer and generation
@@ -2999,7 +2999,7 @@ impl Mapping {
     /// routed experts of the deployment's schedulers. A rank's ordinal places it in both: its
     /// tensor rank is its position inside its scheduler's group, and its expert rank is which
     /// scheduler's share of the experts it keeps.
-    fn of(launch: &Launch, build: &proto::config::EngineConfig) -> Result<Self> {
+    fn of(launch: &EngineArgs, build: &proto::config::EngineConfig) -> Result<Self> {
         let tensor_parallel = u32::try_from(build.parallel.tensor_parallel_size.get())
             .context("a tensor-parallel degree larger than u32::MAX")?;
         if tensor_parallel == 0 {
