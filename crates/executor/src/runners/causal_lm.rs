@@ -2270,7 +2270,9 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                     && !self.recaptured
                     && matches!(
                         bucket.variant,
-                        crate::plan::Variant::PrefillWrite | crate::plan::Variant::PrefillOutput
+                        crate::plan::Variant::PrefillWrite
+                            | crate::plan::Variant::PrefillOutput
+                            | crate::plan::Variant::PrefillGreedy
                     )
                     && self.staging.live_tokens() > 0
                 {
@@ -4863,11 +4865,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 )
                 .map_err(Error::from)?;
         }
-        // A prefill bucket may end a greedy request's prompt, whose first token is the argmax of the
-        // row - a decision the graph cannot make for one row of a bucket that draws. The view is kept
-        // (the arena's buffer is live until the next `begin`, and `read_sampled` runs before that);
-        // a decode bucket's variant already states its path.
-        let logits = (!bucket.variant.is_decode()).then_some(logits);
+        // A bucket that draws may end a greedy request's prompt, whose first token is the argmax of
+        // the row - a decision the graph cannot make for one row of a bucket that draws. The view
+        // is kept (the arena's buffer is live until the next `begin`, and `read_sampled` runs before
+        // that); a greedy bucket's own launch already states every token it keeps.
+        let logits = (bucket.variant == crate::plan::Variant::PrefillOutput).then_some(logits);
         self.bucket_samples
             .borrow_mut()
             .insert(bucket, Sampled {

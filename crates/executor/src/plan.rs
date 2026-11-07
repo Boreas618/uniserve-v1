@@ -35,15 +35,17 @@ use std::fmt;
 /// --- | --- | ---
 /// | [`Variant::PrefillWrite`] | the KV cache | runs over every row, and every row's draw is discarded (`logits_rows` are all `-1`) |
 /// | [`Variant::PrefillOutput`] | the KV cache **and** every sampling row's logits | runs over every row of the bucket; a row that ends a prompt keeps its token |
+/// | [`Variant::PrefillGreedy`] | the same, for a batch whose prompt endings are all greedy | runs, greedily |
 /// | [`Variant::DecodeGreedy`] | one token per row | runs, greedily |
 /// | [`Variant::DecodeSampled`] | one token per row | runs, one draw per row |
 ///
-/// A prefill bucket carries the sampler because the logits are computed anyway - the sampler is a
-/// tail over them, so its cost is not the forward's cost, and a greedy-only variant would double the
-/// largest graphs' memory to decide one token - and because it is what makes a sampled first token
-/// possible without a decode step spent only on drawing.
+/// A prefill bucket carries the sampler because the logits are computed anyway, and because it is
+/// what makes a first token possible without a decode step spent only on choosing it. The draw is
+/// the expensive tail: its candidate selection walks every row of the bucket for milliseconds, which
+/// a batch of greedy prompt endings and a batch that ends no prompt both have no use for. So those
+/// two take the greedy tail, and only a batch with a drawing row pays for the draw.
 ///
-/// **One rule keeps the two paths of a prompt ending agreeing:** a captured draw is replaced on the
+/// **One rule keeps the two paths of a prompt ending agreeing:** in such a batch, a draw is replaced on the
 /// host by the argmax of the row's own logits **only for a strictly greedy row whose slot held
 /// nothing before the step**. Every penalty is the identity over an empty history, so the draw and
 /// the argmax answer the same token there; a row with history is refused by name, because its token
@@ -58,6 +60,9 @@ pub enum Variant {
     PrefillWrite,
     /// Prefill rows of host tokens that also project each row's last hidden state.
     PrefillOutput,
+    /// A [`Self::PrefillOutput`] whose rows that end a prompt are all greedy: each row's first
+    /// token is the argmax of its shaped logits, and nothing is drawn.
+    PrefillGreedy,
     /// One encode of prompt rows: the text model's and the vision tower's outputs, kept as the
     /// conditioning the denoiser reads.
     Encode,
@@ -105,6 +110,7 @@ impl Variant {
             Self::DecodeSampled => "decode_sampled",
             Self::PrefillWrite => "prefill_write",
             Self::PrefillOutput => "prefill_output",
+            Self::PrefillGreedy => "prefill_greedy",
             Self::Encode => "encode",
             Self::Denoise => "denoise",
             Self::Decode => "decode",
@@ -190,9 +196,13 @@ impl Variant {
     ///
     /// A greedy request states temperature zero, whose shaping divides by one, so the row's largest
     /// candidate *is* its token. No draw can produce it - the draw runs in token-id order - so the
-    /// two are separate launch sequences and a bucket is homogeneous in which one it takes.
+    /// two are separate launch sequences and a bucket is homogeneous in which one it takes. A
+    /// prefill that ends no prompt keeps no token, so it takes the cheaper of the two.
     pub const fn greedy(self) -> bool {
-        matches!(self, Self::DecodeGreedy)
+        matches!(
+            self,
+            Self::DecodeGreedy | Self::PrefillGreedy | Self::PrefillWrite
+        )
     }
 
     /// Whether a bucket of this variant runs the sampler (4.4).
@@ -641,6 +651,24 @@ pub fn prefill_catalog() -> Vec<u32> {
         .collect()
 }
 
+/// The row buckets of prefill graphs for a batch of at most `rows` rows.
+///
+/// Powers of two from eight, then `rows`, so that every batch the rank forms fits one and a bucket
+/// at most doubles its rows. The last power of two below `rows` merges into it rather than leaving
+/// a bucket that holds few row counts.
+pub fn prefill_row_buckets(rows: u32) -> Vec<u32> {
+    let mut buckets = Vec::new();
+    let mut size = 8;
+    while 2 * size <= rows {
+        buckets.push(size);
+        size *= 2;
+    }
+    if rows > 0 {
+        buckets.push(rows);
+    }
+    buckets
+}
+
 /// The media flow shapes `(height, width)` captured when the build config names none.
 pub const FLOW_CATALOG: [(u32, u32); 2] = [(1152, 2048), (2048, 1152)];
 
@@ -667,9 +695,11 @@ impl Buckets {
 
     /// The bucket set of a build config's decode row sizes and prefill row and token sizes.
     ///
-    /// A prefill bucket is captured for every token size with every row size, without ever
-    /// asking for more than `max_rows` rows or `max_tokens` tokens. Decode sizes are their own
-    /// buckets, because a decode forward's row count is its token count.
+    /// Decode sizes are their own buckets, because a decode forward's row count is its token
+    /// count. A prefill bucket holds any batch of fewer rows, whose rows past its own are empty
+    /// sequences, so its rows are the coarse [`prefill_row_buckets`] of the largest size: every
+    /// decode size against every token size would be thousands of graphs that serve no batch
+    /// better.
     pub fn causal_lm(rows: &[u32], tokens: &[u32], sampled: bool) -> Self {
         let mut buckets = Vec::new();
         for &rows in rows {
@@ -677,10 +707,16 @@ impl Buckets {
             if sampled {
                 buckets.push(Bucket::decode(rows, Variant::DecodeSampled));
             }
+        }
+        for bucket in prefill_row_buckets(rows.iter().copied().max().unwrap_or(0)) {
             for &count in tokens {
                 // A prefill chunk never holds fewer tokens than rows: a row holds at least one.
-                for variant in [Variant::PrefillWrite, Variant::PrefillOutput] {
-                    buckets.push(Bucket::prefill(rows, count.max(rows), variant));
+                for variant in [
+                    Variant::PrefillWrite,
+                    Variant::PrefillOutput,
+                    Variant::PrefillGreedy,
+                ] {
+                    buckets.push(Bucket::prefill(bucket, count.max(bucket), variant));
                 }
             }
         }
@@ -1523,9 +1559,9 @@ mod tests {
         // The e2e deployment's own sizes: 4 decode sizes and one prefill size, sampling on.
         let buckets = Buckets::for_batch(Some(&[1, 2, 4, 8]), Some(&[512]), 256, 40960, true)
             .expect("the deployment's sizes");
-        // 4 sizes x (greedy + sampled) decode, and 4 sizes x 1 token count x (write + output)
-        // prefill: a prefill bucket is captured per row size, because rows bound the packing.
-        assert_eq!(buckets.len(), 16, "16 buckets, so 16 captures");
+        // 4 sizes x (greedy + sampled) decode, and one row bucket x 1 token count x (write, drawn
+        // and greedy output) prefill: a prefill bucket holds any batch of fewer rows.
+        assert_eq!(buckets.len(), 11, "11 buckets, so 11 captures");
 
         // With no configured size the catalogues are the plan, and every size they state is
         // captured with each computation it admits. The count is derived from them here rather than
@@ -1538,8 +1574,15 @@ mod tests {
         for &row in &rows {
             stated.insert(Bucket::decode(row, Variant::DecodeGreedy));
             stated.insert(Bucket::decode(row, Variant::DecodeSampled));
+        }
+        let largest = rows.iter().copied().max().unwrap_or(0);
+        for row in prefill_row_buckets(largest) {
             for &count in &tokens {
-                for variant in [Variant::PrefillWrite, Variant::PrefillOutput] {
+                for variant in [
+                    Variant::PrefillWrite,
+                    Variant::PrefillOutput,
+                    Variant::PrefillGreedy,
+                ] {
                     stated.insert(Bucket::prefill(row, count.max(row), variant));
                 }
             }
