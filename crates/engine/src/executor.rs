@@ -7,7 +7,7 @@
 //!
 //! Besides the trait, this module owns the values that cross that boundary:
 //! [`ExecutorInfo`], which merges the pools' reported capabilities, beside
-//! their placement, into the single capacity view the scheduler plans against;
+//! their layout, into the single capacity view the scheduler plans against;
 //! the result types a poll returns; and [`TransferConfig`], the directed
 //! transfer edges a deployment names between its executor groups, which a
 //! replica's spec keeps for its own groups (`EngineConfig::replica_specs`).
@@ -35,14 +35,14 @@ mod batch;
 mod codecs;
 pub(crate) mod inventory;
 
-pub use batch::{ExecutionBatch, PageOffloads, RankBuffer, RequestPlacement};
+pub use batch::{ExecutionBatch, PageOffloads, RankBuffer, RequestDispatch};
 
 /// How one pool is placed.
 ///
 /// The deployment decides these values, so the ranks' reports do not carry
 /// them.
 #[derive(Debug, Clone, Default, PartialEq)]
-pub struct PoolPlacement {
+pub struct PoolLayout {
     /// Unresolved physical batches the pool admits at once, counted as at
     /// least one.
     pub queue_depth: usize,
@@ -67,12 +67,12 @@ pub struct ExecutorInfo {
     ///
     /// `from_inventory` and `SimExecutor` fill this; `from_workers` leaves it
     /// empty.
-    pub placements: BTreeMap<ExecutorGroupId, PoolPlacement>,
+    pub layouts: BTreeMap<ExecutorGroupId, PoolLayout>,
     /// For each executor that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
     ///
-    /// `from_inventory` fills this from the placement; `from_workers` and
+    /// `from_inventory` fills this from the layout; `from_workers` and
     /// `SimExecutor` leave it empty. Scheduler admission restricts a video
     /// encoding call's candidates to the set of the executor chosen to decode.
     pub video_codecs: BTreeMap<ExecutorGroupId, BTreeSet<ExecutorGroupId>>,
@@ -84,7 +84,7 @@ pub struct ExecutorInfo {
     ///
     /// `from_inventory` fills this from its ranks; a pool absent from it, as
     /// `from_workers` and `SimExecutor` leave every pool, has its placed ranks
-    /// (`PoolPlacement::ranks`, one when it has no placement), each backing
+    /// (`PoolLayout::ranks`, one when it has no layout), each backing
     /// its reported `buffer_pool_bytes`.
     pub rank_buffer_bytes: BTreeMap<ExecutorGroupId, Vec<u64>>,
     /// For each pool, each rank's prefix cache as the rank reported it, with
@@ -152,8 +152,12 @@ impl ExecutorInfo {
 
     /// Returns the configuration the engine placed component `name` with on
     /// `executor`, or `None` when the pool holds no such component.
-    pub fn component_config(&self, worker: &ExecutorGroupId, name: &str) -> Option<&ComponentConfig> {
-        self.placements.get(worker)?.components.get(name)
+    pub fn component_config(
+        &self,
+        worker: &ExecutorGroupId,
+        name: &str,
+    ) -> Option<&ComponentConfig> {
+        self.layouts.get(worker)?.components.get(name)
     }
 
     /// The persistent buffer bytes each rank of `executor` backs, in rank
@@ -163,9 +167,9 @@ impl ExecutorInfo {
             return bytes.clone();
         }
         let ranks = self
-            .placements
+            .layouts
             .get(worker)
-            .map_or(1, |placement| placement.ranks.max(1));
+            .map_or(1, |layout| layout.ranks.max(1));
         self.workers
             .iter()
             .find(|(id, _)| id == worker)
@@ -720,10 +724,9 @@ impl TransferEdge {
     pub fn mechanisms(&self) -> impl Iterator<Item = TransferBackend> + '_ {
         self.device.into_iter().chain(self.host)
     }
-
 }
 
-/// Per-edge data-plane transfer selection (`placement_config.transfer`) and the placement it
+/// Per-edge data-plane transfer selection (`device_config.transfer`) and the rank layout it
 /// is resolved against.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TransferConfig {
@@ -764,7 +767,6 @@ impl std::fmt::Display for TransferConfig {
 }
 
 impl TransferConfig {
-
     /// Parses `source[:rank]->destination[:rank]=mechanisms` directed bindings.
     ///
     /// `mechanisms` names the edge's device mechanism, its host mechanism, or
@@ -1253,7 +1255,7 @@ mod tests {
         let pool =
             |id: &str, routes: &[(MediaCall, &str)], configs: Vec<(&str, ComponentConfig)>| {
                 let (id, info) = media_pool(id, routes, 0);
-                let placement = PoolPlacement {
+                let layout = PoolLayout {
                     queue_depth: 1,
                     ranks: 8,
                     components: configs
@@ -1261,7 +1263,7 @@ mod tests {
                         .map(|(name, config)| (name.to_owned(), config))
                         .collect(),
                 };
-                ((id.clone(), info), (id, placement))
+                ((id.clone(), info), (id, layout))
             };
         let encoder = |id: &str, config: ComponentConfig| {
             pool(
@@ -1270,16 +1272,18 @@ mod tests {
                 vec![("latent_encoder", config)],
             )
         };
-        let round_units =
-            |pools: Vec<((ExecutorGroupId, MainProcessInfo), (ExecutorGroupId, PoolPlacement))>| {
-                let (workers, placements) = pools.into_iter().unzip();
-                ExecutorInfo {
-                    workers,
-                    placements,
-                    ..ExecutorInfo::default()
-                }
-                .media_units(MediaCall::LatentEncoding)
-            };
+        let round_units = |pools: Vec<(
+            (ExecutorGroupId, MainProcessInfo),
+            (ExecutorGroupId, PoolLayout),
+        )>| {
+            let (workers, layouts) = pools.into_iter().unzip();
+            ExecutorInfo {
+                workers,
+                layouts,
+                ..ExecutorInfo::default()
+            }
+            .media_units(MediaCall::LatentEncoding)
+        };
 
         assert_eq!(
             round_units(vec![encoder("a", temporal((0..4).collect(), 1))]),
@@ -1418,7 +1422,7 @@ mod tests {
     #[test]
     fn a_channel_edge_is_a_transfer_backend() {
         // Host products cross hosts on the rank channel, so the mechanism has
-        // to be nameable in a placement's transfer bindings.
+        // to be nameable in a rank layout's transfer bindings.
         let transfer = TransferConfig::parse("video_decoder->muxer=channel").unwrap();
         assert_eq!(transfer.edges[0].host, Some(TransferBackend::Channel));
         assert_eq!(transfer.edges[0].device, None);

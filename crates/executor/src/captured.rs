@@ -338,7 +338,9 @@ impl Captured {
             self.exec
                 .borrow()
                 .set_kernel_node_params_owned(node.clone(), owned)?;
-            self.rebound.borrow_mut().push((node.clone(), owned.clone()));
+            self.rebound
+                .borrow_mut()
+                .push((node.clone(), owned.clone()));
         }
         Ok(params.len())
     }

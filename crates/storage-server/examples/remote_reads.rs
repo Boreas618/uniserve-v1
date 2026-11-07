@@ -71,7 +71,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use ::storage::protocol::{
     Event, FabricHandle, LinkEnd, Priority, Region, Reply, Request, Span, TransferEnd,
 };
-use ::storage::{Access, Client, Key, Placement, Role, Scope, StorageRecord, TensorRecord};
+use ::storage::{Access, Client, Key, Location, Role, Scope, StorageRecord, TensorRecord};
 use anyhow::{Context, bail, ensure};
 use clap::Parser as _;
 use platform::{
@@ -363,7 +363,7 @@ fn device_storage(
         .export_descriptor()?
         .context("a retainable allocation exports a descriptor")?;
     let record = StorageRecord {
-        placement: Placement::Device { gpu: gpu.uuid()?.0 },
+        location: Location::Device { gpu: gpu.uuid()?.0 },
         bytes: allocation.len() as u64,
         segment: None,
         fabric: None,
@@ -513,7 +513,7 @@ fn hold(options: &Options) -> anyhow::Result<()> {
     ));
     storages.push((
         StorageRecord {
-            placement: Placement::Host { numa_node },
+            location: Location::Host { numa_node },
             bytes: host_bytes,
             segment: None,
             fabric: None,
@@ -711,7 +711,7 @@ fn read(options: &Options) -> anyhow::Result<()> {
                 vec![tensor("destination", 0, options.bytes, Access::Exclusive)],
                 &[(
                     StorageRecord {
-                        placement: Placement::Host { numa_node: None },
+                        location: Location::Host { numa_node: None },
                         bytes: options.bytes,
                         segment: None,
                         fabric: None,

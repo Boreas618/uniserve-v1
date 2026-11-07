@@ -266,7 +266,7 @@ impl MediaStorage {
     /// Builds the address spaces of a group whose ranks back `rank_bytes`.
     ///
     /// A rank backs a component's results when it is one of the component's
-    /// ranks in `components`, the group's placement, or one of a reading
+    /// ranks in `components`, the group's layout, or one of a reading
     /// component's, where readers follow the video
     /// graph's persistent product edges (`MediaCall::readers`) through the
     /// deployment's `routing`; the executor sizes each rank's pool by the same
@@ -305,7 +305,11 @@ impl MediaStorage {
                 }
                 // A rank with no pool keeps its products in its own process, in the product store: it
                 // backs nothing here, so a reservation books no bytes and binds no span on it.
-                holding.retain(|rank| rank_bytes.get(*rank as usize).is_some_and(|bytes| *bytes > 0));
+                holding.retain(|rank| {
+                    rank_bytes
+                        .get(*rank as usize)
+                        .is_some_and(|bytes| *bytes > 0)
+                });
                 (name.to_owned(), holding.into_iter().collect())
             })
             .collect();
@@ -320,7 +324,7 @@ impl MediaStorage {
     }
 
     /// The ranks that back the declared results of `component`, in rank
-    /// order; none for a component no route or placement names.
+    /// order; none for a component no route or dispatch names.
     pub(super) fn holders(&self, component: &str) -> &[u32] {
         self.holders.get(component).map_or(&[], Vec::as_slice)
     }

@@ -20,8 +20,8 @@ use engine::{
     BatchCapacity, EngineConfig, Event, GenerationConstraint, GenerationRequest, SchedulerHandle,
     Stage,
 };
-use executor::batch::{Batch, Batches, Inventory, Placement};
-use ipc::{ComponentConfig, ImageParams, SamplingParams, MainProcessEndpoint, MainProcessInfo};
+use executor::batch::{Batch, Batches, Inventory, PoolLayout};
+use ipc::{ComponentConfig, ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams};
 
 use crate::support::SAMPLED;
 
@@ -367,9 +367,13 @@ fn logprobs_report_the_model_distribution_under_a_cutoff() {
         let mut sim = SimEngine::new();
         sim.set_text_len(8);
         let executor = SimExecutor::new(sim);
-        let rank = executor.info().runtime_info().expect("the sim states its rank");
-        let engine = SchedulerHandle::with_executor(EngineConfig::sim("logprobs"), Box::new(executor))
-            .expect("the simulated executor serves");
+        let rank = executor
+            .info()
+            .runtime_info()
+            .expect("the sim states its rank");
+        let engine =
+            SchedulerHandle::with_executor(EngineConfig::sim("logprobs"), Box::new(executor))
+                .expect("the simulated executor serves");
         crate::support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
 
         let mut request = text_request(1, 2, 7);
@@ -380,7 +384,9 @@ fn logprobs_report_the_model_distribution_under_a_cutoff() {
             n_logprobs: 5,
             ..Default::default()
         };
-        let mut events = engine.submit(request).expect("the engine takes the submission");
+        let mut events = engine
+            .submit(request)
+            .expect("the engine takes the submission");
         let deadline = Instant::now() + ANSWER;
         let mut reported = None;
         while Instant::now() < deadline && reported.is_none() {

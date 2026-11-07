@@ -5,7 +5,7 @@
 //! all of one rank's heads, and an all-to-all turns one into the other around each attention. The
 //! text encoder is sharded over the vocabulary, the attention heads and every dense projection by
 //! tensor parallelism. The values here are a *mathematical* description the layers apply; they are
-//! not a runner, a communicator, a stream or a placement (`AGENTS.md`, Model Library Boundary).
+//! not a runner, a communicator, a stream or a rank layout (`AGENTS.md`, Model Library Boundary).
 //!
 //! A sequence rank's own token slice and the order ranks are gathered in are the runner's business:
 //! the model is told how many ranks the exchange runs over, and the layer that shards a tensor
@@ -511,7 +511,7 @@ impl Partition {
     /// `sequence_rank` is this rank's place in the denoiser's Ulysses group; it is not the text
     /// encoder's (`tensor_rank`), and a deployment must state both.
     ///
-    /// This block set is the **port's** statement of the components a task places. The placement a
+    /// This block set is the **port's** statement of the components a task places. The layout a
     /// rank acts on is the model package's own declarations (`Declarations`), so
     /// a deployment that calls this constructor is also the place where the two statements can be
     /// held against each other: equal components are a proof the two agree, and a difference is a
@@ -644,13 +644,16 @@ impl Partition {
                 self.ulysses_degree
             ))
         })?;
-        Ok(Arrangement::new(config, self.text_rows, self.condition_rows, shard)?
-            .at_rank(u32::try_from(self.sequence_rank).map_err(|_| {
-                Error::config(format!(
-                    "a sequence rank of {} does not fit a row count",
-                    self.sequence_rank
-                ))
-            })?))
+        Ok(
+            Arrangement::new(config, self.text_rows, self.condition_rows, shard)?.at_rank(
+                u32::try_from(self.sequence_rank).map_err(|_| {
+                    Error::config(format!(
+                        "a sequence rank of {} does not fit a row count",
+                        self.sequence_rank
+                    ))
+                })?,
+            ),
+        )
     }
 
     /// A deployment's partition, checked against the checkpoint's head counts.
@@ -926,7 +929,7 @@ mod tests {
         let error = alone.validate(&config).expect_err("no denoiser");
         assert!(format!("{error}").contains("conditioning half"), "{error}");
 
-        // With a denoiser beside them the same partition validates, which is the placement the
+        // With a denoiser beside them the same partition validates, which is the layout the
         // deployment actually uses.
         let mut together = alone;
         together.blocks = together.blocks.with(Component::Transformer);

@@ -16,9 +16,9 @@ use ipc::{CallId, LatentParams, MediaCall, RequestKey, TensorRef};
 /// so the executor learns them from the calls that name them; the raster is the
 /// image the samples decode to. A standalone video denoiser's request slot
 /// fixes its own pages, which the executor derives from its pool geometry, so
-/// a video request has no placement.
+/// a video request has no dispatch.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct LatentPlacement {
+pub(crate) struct LatentDispatch {
     /// Pages the request owns in its executor's latent pool.
     pub(crate) page_table: Vec<u32>,
     /// Latent units the trajectory occupies in those pages, in the
@@ -105,15 +105,15 @@ impl Denoising {
     pub(crate) fn params(
         request_key: RequestKey,
         call_id: CallId,
-        placement: &LatentPlacement,
+        dispatch: &LatentDispatch,
     ) -> LatentParams {
         LatentParams {
             request_key,
             call_id,
-            page_table: placement.page_table.clone(),
-            latent_units: placement.latent_units,
-            height: placement.height,
-            width: placement.width,
+            page_table: dispatch.page_table.clone(),
+            latent_units: dispatch.latent_units,
+            height: dispatch.height,
+            width: dispatch.width,
         }
     }
 

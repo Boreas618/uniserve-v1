@@ -50,7 +50,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use ipc::FenceHistogram;
-use platform::{Device, DeviceAllocation, DeviceId, Function, Library, LaunchConfig, PinnedBuffer, Stream};
+use platform::{
+    Device, DeviceAllocation, DeviceId, Function, LaunchConfig, Library, PinnedBuffer, Stream,
+};
 
 use crate::{Error, Result, lock};
 
@@ -354,11 +356,7 @@ impl nn::Fence for Probes {
         path: std::fmt::Arguments<'_>,
         stream: &Stream,
     ) -> nn::Result<Option<u32>> {
-        let Some(instance) = self
-            .fences
-            .instance(component, path)
-            .map_err(fence_error)?
-        else {
+        let Some(instance) = self.fences.instance(component, path).map_err(fence_error)? else {
             return Ok(None);
         };
         self.fences
@@ -1086,7 +1084,10 @@ mod tests {
     #[test]
     fn nested_instances_each_sum_their_own_span() {
         let instance_components = [1, 2];
-        let time = component_time(&instance_components, vec![(10, 0), (12, 2), (15, 3), (20, 1)]);
+        let time = component_time(
+            &instance_components,
+            vec![(10, 0), (12, 2), (15, 3), (20, 1)],
+        );
         assert_eq!(time.get(&1), Some(&10));
         assert_eq!(time.get(&2), Some(&3));
     }

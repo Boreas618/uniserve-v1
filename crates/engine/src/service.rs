@@ -42,8 +42,8 @@ use crate::core::SchedulerHandle;
 use crate::handle::EventRx;
 use crate::scheduler::{
     Arrival, BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE,
-    DEFAULT_MAX_NUM_BATCHED_TOKENS, PolicyProgram, PolicySource, PolicyUsage, SchedulerConfig,
-    RoutePolicy, RouteTrial, SchedulerStatsReporter, TrialState, arrival_view, ceilings_of,
+    DEFAULT_MAX_NUM_BATCHED_TOKENS, PolicyProgram, PolicySource, PolicyUsage, RoutePolicy,
+    RouteTrial, SchedulerConfig, SchedulerStatsReporter, TrialState, arrival_view, ceilings_of,
 };
 use scheduling::PolicyError;
 use scheduling::guest::event::{End, Event as PolicyEvent};

@@ -50,8 +50,7 @@ fn served_key(
         let better = match best {
             None => true,
             Some((smallest, newest)) => {
-                captured_generation > newest
-                    || (captured_generation == newest && bucket < smallest)
+                captured_generation > newest || (captured_generation == newest && bucket < smallest)
             }
         };
         if better {
@@ -135,7 +134,9 @@ impl Graphs {
         let served = served_key(self.captured.keys().copied(), generation, |held| {
             *held == bucket
         })?;
-        self.captured.get(&served).map(|captured| (served.1, captured))
+        self.captured
+            .get(&served)
+            .map(|captured| (served.1, captured))
     }
 
     /// The smallest captured bucket that holds `shape` and belongs to `generation`, or, when that
@@ -311,26 +312,14 @@ mod tests {
         let only = |held: &Bucket| *held == bucket;
 
         // The generation asked for serves the bucket it prepared.
-        assert_eq!(
-            served_key(keys.into_iter(), 3, only),
-            Some((bucket, 3))
-        );
+        assert_eq!(served_key(keys.into_iter(), 3, only), Some((bucket, 3)));
         // One that prepared nothing for it serves from the newest older generation that did.
-        assert_eq!(
-            served_key(keys.into_iter(), 4, only),
-            Some((bucket, 3))
-        );
-        assert_eq!(
-            served_key(keys.into_iter(), 2, only),
-            Some((bucket, 1))
-        );
+        assert_eq!(served_key(keys.into_iter(), 4, only), Some((bucket, 3)));
+        assert_eq!(served_key(keys.into_iter(), 2, only), Some((bucket, 1)));
         // A generation prepared later never serves an earlier request: a revert must not be served
         // by the generation that replaced it.
         assert_eq!(served_key(keys.into_iter(), 0, only), None);
-        assert_eq!(
-            served_key(keys.into_iter(), 5, |_| true),
-            Some((larger, 5))
-        );
+        assert_eq!(served_key(keys.into_iter(), 5, |_| true), Some((larger, 5)));
         // Within one generation the smallest bucket that accepts the batch wins.
         assert_eq!(served_key(keys.into_iter(), 1, |_| true), Some((bucket, 1)));
     }

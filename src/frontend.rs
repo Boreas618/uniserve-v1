@@ -150,7 +150,9 @@ fn content_format(
 }
 
 /// Which reasoning parser splits model output.
-fn reasoning_parser(parser: daemon::options::ReasoningParser) -> frontend::options::ReasoningParser {
+fn reasoning_parser(
+    parser: daemon::options::ReasoningParser,
+) -> frontend::options::ReasoningParser {
     use daemon::options::ReasoningParser as File;
     use frontend::options::ReasoningParser as Owned;
     match parser {

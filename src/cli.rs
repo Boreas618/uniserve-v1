@@ -19,10 +19,7 @@ use crate::storage::StorageArgs;
 
 /// Top-level parser for the `uniserve` binary.
 #[derive(Debug, Parser)]
-#[command(
-    name = "uniserve",
-    about = "UniServe OpenAI-compatible server."
-)]
+#[command(name = "uniserve", about = "UniServe OpenAI-compatible server.")]
 pub(crate) struct Cli {
     #[command(flatten)]
     pub log: LogLevels,
@@ -122,10 +119,12 @@ mod tests {
                 Command::Frontend(_) => "frontend",
                 Command::Storage(_) => "storage",
                 Command::Rules => "rules",
-                Command::External(arguments) => match arguments.first().and_then(|name| name.to_str()) {
-                    Some("program-server") => "program-server",
-                    _ => "other",
-                },
+                Command::External(arguments) => {
+                    match arguments.first().and_then(|name| name.to_str()) {
+                        Some("program-server") => "program-server",
+                        _ => "other",
+                    }
+                }
                 Command::Engine(_) => "other",
             };
             assert_eq!(name, expected);

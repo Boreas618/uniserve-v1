@@ -87,7 +87,9 @@ impl Function {
             return Ok(String::new());
         }
         // SAFETY: the string is NUL-terminated and lives as long as the function does.
-        Ok(unsafe { std::ffi::CStr::from_ptr(text) }.to_string_lossy().into_owned())
+        Ok(unsafe { std::ffi::CStr::from_ptr(text) }
+            .to_string_lossy()
+            .into_owned())
     }
 
     /// Launches the kernel on `stream` with `config` and `parameters`, which

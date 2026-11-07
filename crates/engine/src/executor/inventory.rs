@@ -17,14 +17,14 @@ use anyhow::ensure;
 use ipc::MainProcessInfo;
 
 use crate::ExecutorGroupId;
-use crate::executor::{ExecutorInfo, PoolPlacement, RankEncoderPools};
 use crate::executor::codecs::video_unit_codecs;
+use crate::executor::{ExecutorInfo, PoolLayout, RankEncoderPools};
 
 impl ExecutorInfo {
     /// The capability information of the pools `pools` describes, as the mechanism reads it.
     ///
     /// Fails, naming the pool, when a pool reports no rank, states no longest sequence, states a
-    /// longest sequence another pool does not, or when its placement disagrees with the ranks it
+    /// longest sequence another pool does not, or when its layout disagrees with the ranks it
     /// reports; fails as [`ExecutorInfo::from_workers`] does when two pools share an identity or
     /// replicas of one component expose different numerical outputs.
     pub fn from_inventory(pools: &[executor::batch::Inventory]) -> anyhow::Result<Self> {
@@ -80,18 +80,18 @@ impl ExecutorInfo {
         for pool in pools {
             let id = ExecutorGroupId(pool.group.clone());
             ensure!(
-                pool.placement.ranks.max(1) == pool.ranks.len(),
+                pool.layout.ranks.max(1) == pool.ranks.len(),
                 "pool {} was launched for {} ranks and reports {}",
                 named(&pool.group),
-                pool.placement.ranks,
+                pool.layout.ranks,
                 pool.ranks.len()
             );
-            info.placements.insert(
+            info.layouts.insert(
                 id.clone(),
-                PoolPlacement {
-                    queue_depth: pool.placement.queue_depth.max(1),
+                PoolLayout {
+                    queue_depth: pool.layout.queue_depth.max(1),
                     ranks: pool.ranks.len(),
-                    components: pool.placement.components.clone(),
+                    components: pool.layout.components.clone(),
                 },
             );
             // Each rank's own reports, in launch order: media buffers, the
@@ -136,7 +136,7 @@ impl ExecutorInfo {
         // and an encoder is a candidate for a decoder only when every media
         // unit it would encode stays on the host that decoded it.
         let routing = info.media_routing()?;
-        let placements = pools
+        let layouts = pools
             .iter()
             .map(|pool| {
                 (
@@ -145,11 +145,11 @@ impl ExecutorInfo {
                         .iter()
                         .map(|rank| rank.endpoint.host.clone())
                         .collect::<Vec<_>>(),
-                    pool.placement.components.clone(),
+                    pool.layout.components.clone(),
                 )
             })
             .collect::<Vec<_>>();
-        info.video_codecs = video_unit_codecs(&routing, &placements)?;
+        info.video_codecs = video_unit_codecs(&routing, &layouts)?;
         Ok(info)
     }
 }
@@ -330,7 +330,7 @@ fn named(group: &str) -> &str {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use ipc::{ComponentConfig, MediaCall, MainProcessEndpoint};
+    use ipc::{ComponentConfig, MainProcessEndpoint, MediaCall};
     use std::collections::BTreeSet;
 
     /// A rank's report, with the fields a mechanism reads distinguishable per
@@ -380,7 +380,7 @@ mod tests {
         executor::batch::Inventory {
             group: group.to_owned(),
             ranks,
-            placement: executor::batch::Placement {
+            layout: executor::batch::PoolLayout {
                 queue_depth: 2,
                 ranks: placed_ranks,
                 components,
@@ -440,10 +440,10 @@ mod tests {
             Some(vec!["gpu-a", "gpu-b"]),
             "the caches are the ranks' own, in launch order"
         );
-        let placement = info.placements.get(&id).expect("the pool's launch");
-        assert_eq!(placement.ranks, 2);
-        assert_eq!(placement.queue_depth, 2);
-        assert_eq!(placement.components, components(&[("text", &[0, 1])]));
+        let layout = info.layouts.get(&id).expect("the pool's launch");
+        assert_eq!(layout.ranks, 2);
+        assert_eq!(layout.queue_depth, 2);
+        assert_eq!(layout.components, components(&[("text", &[0, 1])]));
         assert_eq!(info.max_model_len, 4096);
         assert_eq!(info.rank_count(&id), 2);
     }

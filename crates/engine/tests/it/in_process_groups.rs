@@ -202,7 +202,11 @@ fn generate(
 
     let mut streams: Vec<_> = requests
         .into_iter()
-        .map(|request| engine.submit(request).expect("the engine takes the submission"))
+        .map(|request| {
+            engine
+                .submit(request)
+                .expect("the engine takes the submission")
+        })
         .collect();
     let mut generated = Vec::new();
     for events in &mut streams {
@@ -217,7 +221,10 @@ fn generate(
                 Err(_) => thread::sleep(Duration::from_millis(1)),
             }
         }
-        assert!(finished, "a request did not finish: it generated {tokens:?}");
+        assert!(
+            finished,
+            "a request did not finish: it generated {tokens:?}"
+        );
         generated.push(tokens);
     }
     engine.shutdown();
@@ -284,7 +291,10 @@ fn losing_every_worker_stops_request_admission() {
 fn a_prefill_group_hands_its_requests_to_a_decode_group() {
     use engine::ExecutorGroupRole;
 
-    let prompts = vec![vec![7, 8, 9], (0..600u32).map(|index| index % 47 + 5).collect()];
+    let prompts = vec![
+        vec![7, 8, 9],
+        (0..600u32).map(|index| index % 47 + 5).collect(),
+    ];
     let requests = || {
         prompts
             .iter()

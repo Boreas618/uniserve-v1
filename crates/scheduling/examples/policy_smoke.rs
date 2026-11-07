@@ -209,8 +209,8 @@ fn run(path: &str, precompile: bool, steps: u32) -> Result<(), Box<dyn Error>> {
         tokens: vec![10, 0, 4, 4],
     };
     let before = Meter::of(&policy);
-    let placements = policy.experts(&load)?.placement.len();
-    println!("experts: {placements} placements");
+    let layouts = policy.experts(&load)?.layout.len();
+    println!("experts: {layouts} layouts");
     before.report(&policy, "experts");
 
     println!(

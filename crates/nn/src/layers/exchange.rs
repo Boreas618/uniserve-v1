@@ -52,7 +52,12 @@ impl UlyssesExchange {
     }
 
     /// Starts [`Self::exchange`] beside the forward's stream, which goes on at once.
-    pub fn start(&self, f: &Forward, send: TensorView, recv: TensorView) -> Result<crate::Transfer> {
+    pub fn start(
+        &self,
+        f: &Forward,
+        send: TensorView,
+        recv: TensorView,
+    ) -> Result<crate::Transfer> {
         self.check_views(send, recv)?;
         self.group(f)?.start_all_to_all(send, recv, f.stream()?)
     }

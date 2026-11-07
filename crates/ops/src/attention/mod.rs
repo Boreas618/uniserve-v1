@@ -679,7 +679,7 @@ impl Op for PagedAttention {
         // The compiled programs load their operands in 16-byte units and assert it: the cute
         // kernel's `tensorptr<bf16, gmem, align16>` and trtllm-gen's vectorized loads both refuse a
         // pointer that is not 16-byte aligned or a step that is not a multiple of 8 elements of a
-        // 2-byte type. A host-side placement defect that breaks either surfaces here, by name,
+        // 2-byte type. A host-side layout defect that breaks either surfaces here, by name,
         // rather than as a warp fault inside a kernel with no operand named in it.
         let element_bytes = descriptor.query.bytes().unwrap_or(2).max(2);
         let unit = 16 / element_bytes.max(1);

@@ -582,7 +582,7 @@ fn export_group(
 mod tests {
     use std::collections::HashSet;
 
-    use ipc::{BlockTable, RequestKey, TransferTransport, MainProcessEndpoint};
+    use ipc::{BlockTable, MainProcessEndpoint, RequestKey, TransferTransport};
     use ipc::{CallId, PrefixCacheDtype, RequestId, UnitId};
 
     use super::*;

@@ -159,7 +159,7 @@ impl Default for ParallelConfig {
 }
 
 impl ParallelConfig {
-    /// Row-major rank order shared by placement, numerical meshes and routing.
+    /// Row-major rank order shared by rank layout, numerical meshes and routing.
     pub fn dimensions(&self) -> [(&'static str, usize); 4] {
         let [context, ulysses] = self.sequence_parallel.dimensions();
         [

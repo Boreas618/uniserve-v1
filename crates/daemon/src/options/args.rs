@@ -628,7 +628,11 @@ mod tests {
     fn the_retired_quantization_option_is_refused_by_name() {
         for args in [
             vec!["m", "--set", "quantization_config.mode=performance"],
-            vec!["m", "--set", "quantization_config={ mode = \"performance\" }"],
+            vec![
+                "m",
+                "--set",
+                "quantization_config={ mode = \"performance\" }",
+            ],
         ] {
             let error = resolved(&args).unwrap_err();
             let message = format!("{error:#}");
@@ -636,7 +640,10 @@ mod tests {
                 message.contains("`quantization_config` is retired"),
                 "{args:?}: {message}"
             );
-            assert!(message.contains("`--set quantization.mode=...`"), "{args:?}: {message}");
+            assert!(
+                message.contains("`--set quantization.mode=...`"),
+                "{args:?}: {message}"
+            );
         }
         let error = resolve_text("[quantization_config]\nmode = \"performance\"\n", &[])
             .expect_err("the retired name is refused in a configuration file too");
@@ -895,7 +902,7 @@ mod tests {
     }
 
     /// Without a deployment file each scheduler's group runs one component
-    /// tensor-parallel over its workers; the placement shorthand is refused
+    /// tensor-parallel over its workers; the rank layout shorthand is refused
     /// beside a file.
     #[test]
     fn the_shorthand_places_engine_cores_and_is_refused_beside_a_file() {
@@ -906,7 +913,7 @@ mod tests {
             "--data-parallel-size",
             "2",
             "--set",
-            "placement_config.device=cpu",
+            "device_config.device=cpu",
         ])
         .unwrap();
         assert_eq!(engine.worker_groups.len(), 2);
@@ -930,8 +937,8 @@ mod tests {
         reread.validate(&stated).unwrap();
         for shorthand in [
             ["--tensor-parallel-size", "2"],
-            ["--set", "placement_config.device=cpu"],
-            ["--set", "placement_config.queue_depth=3"],
+            ["--set", "device_config.device=cpu"],
+            ["--set", "device_config.queue_depth=3"],
         ] {
             let mut args = vec!["m", "--worker-groups", path];
             args.extend(shorthand);

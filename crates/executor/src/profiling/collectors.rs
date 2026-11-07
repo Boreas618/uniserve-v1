@@ -138,7 +138,8 @@ fn deliver(delivered: timeline::Delivered) {
         });
         return;
     }
-    let mut records: BTreeMap<u32, Vec<Record>> = ranks.keys().map(|&key| (key, Vec::new())).collect();
+    let mut records: BTreeMap<u32, Vec<Record>> =
+        ranks.keys().map(|&key| (key, Vec::new())).collect();
     for record in delivered.records {
         match device_of(&record) {
             Some(device) => {
@@ -224,9 +225,7 @@ fn leave_timeline(device: DeviceId) {
     } else if let Some(running) = shared.running.take() {
         drop(running);
         let by_default = super::graphs_whole_by_default();
-        if by_default
-            && let Err(error) = platform::cupti::activity::hold_graph_trace(true)
-        {
+        if by_default && let Err(error) = platform::cupti::activity::hold_graph_trace(true) {
             tracing::warn!("the counters' whole-graph record did not resume: {error}");
         }
         super::set_graph_trace(by_default);
@@ -756,7 +755,8 @@ fn prepare(
             // past it. The buffer takes the image's bytes per sample, which
             // exceed a raw record's (on GB200, 13.6 KB of image against 8 KiB
             // of buffer for the default metrics).
-            let per_read = (super::session::DRAIN_PERIOD.as_nanos() as u64).div_ceil(options.interval_ns);
+            let per_read =
+                (super::session::DRAIN_PERIOD.as_nanos() as u64).div_ceil(options.interval_ns);
             let samples = (2 * per_read).max(PM_MIN_SAMPLES);
             PmSampler::sample_bytes(device, &options.metrics)
                 .and_then(|bytes| {

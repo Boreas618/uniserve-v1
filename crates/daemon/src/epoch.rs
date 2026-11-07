@@ -1463,7 +1463,8 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
         .map_or(max_batch, |rows| max_batch.min(rows));
     // A batch holds running requests, so the deployment's bound on those bounds it as well: a media
     // deployment captures no decode graph, and its bound is the only one it states.
-    let max_batch = max_batch.min(u32::try_from(config.max_running_requests.get()).unwrap_or(u32::MAX));
+    let max_batch =
+        max_batch.min(u32::try_from(config.max_running_requests.get()).unwrap_or(u32::MAX));
     let arguments = Arguments {
         chunked_prefill_size: scheduler
             .chunked_prefill_size

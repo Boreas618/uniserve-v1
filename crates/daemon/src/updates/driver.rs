@@ -65,8 +65,8 @@ impl State {
             report["trial"] = trial.report(crate::leader::outcomes());
         }
         if let Some(steps) = &self.transfers {
-            report["transfers"] = serde_json::to_value(*crate::leader::locked(steps))
-                .unwrap_or_default();
+            report["transfers"] =
+                serde_json::to_value(*crate::leader::locked(steps)).unwrap_or_default();
         }
         if let Some(warming) = &self.warming {
             report["warming"] = warming.clone();

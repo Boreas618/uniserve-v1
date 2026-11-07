@@ -20,12 +20,13 @@ use engine::{
     Stage,
 };
 use executor::batch::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, Placement, RowState, Submission,
+    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
     SubmissionId,
 };
 use executor::completion::Outcome;
 use ipc::{
-    ComponentConfig, ImageParams, SamplingParams, TimingCounters, MainProcessEndpoint, MainProcessInfo,
+    ComponentConfig, ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams,
+    TimingCounters,
 };
 
 /// How long a command answer may take.
@@ -81,7 +82,7 @@ fn pool() -> Inventory {
     Inventory {
         group: "model".to_owned(),
         ranks: vec![rank("gpu-a")],
-        placement: Placement {
+        layout: PoolLayout {
             queue_depth: 1,
             ranks: 1,
             components: std::collections::BTreeMap::from([(
@@ -271,7 +272,8 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
     // The boot's whole shape: the facts of a launch file, the executor's batch
     // path, one handle. Nothing is launched: the pool is the rank.
     let config = engine::EngineConfig::of(&facts()).expect("the facts state a configuration");
-    let handle = SchedulerHandle::over_batches(config, batches).expect("the facts boot a scheduler");
+    let handle =
+        SchedulerHandle::over_batches(config, batches).expect("the facts boot a scheduler");
 
     // The handle is the launched path's: its commands answer, and a stage waits
     // for a boundary.

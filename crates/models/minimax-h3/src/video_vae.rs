@@ -744,7 +744,7 @@ impl VideoDecoder {
         programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(ACTIVATION, STREAM));
         programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(STREAM, ACTIVATION));
 
-        // The two placements into the token stream, the register rows and the zero row: every
+        // The two row writes into the token stream, the register rows and the zero row: every
         // row-major gather is one program.
         programs.launch::<RowsOp>(&Rows::descriptor_of(STREAM, rows::Mode::Replace, width));
 
@@ -949,7 +949,7 @@ impl VideoDecoder {
             ));
         }
         // **A tile's rows, not the clip's.** These two tables say where a tile's register tokens and
-        // its trailing zero row go, and the placement launches against that tile's own slice of the
+        // its trailing zero row go, and the row write launches against that tile's own slice of the
         // stream, so one tile's offsets serve every tile and every canvas of a uniform grid.
         let register_rows = indices(
             loader,
@@ -1949,7 +1949,7 @@ pub(crate) mod tests {
             }
         }
         let config = video_config();
-        // Two tiles across and one down: the rows of a placement repeat per tile.
+        // Two tiles across and one down: the written rows repeat per tile.
         let canvas = Canvas::clip(&config, 16, 28);
         let tiles = 2_u64;
         let tile = largest_tile(&config, canvas.height, canvas.width).expect("a tile");
@@ -2656,7 +2656,7 @@ pub(crate) mod tests {
         // The contraction length is a descriptor field of one program, so the projections are three
         // keys: the FP32 restore, every biased FP16 product, and `post_quant_conv`'s bias-free one.
         assert_eq!(count("gemm"), 3);
-        assert_eq!(count("rows"), 1, "two placements, one program");
+        assert_eq!(count("rows"), 1, "two row writes, one program");
         assert_eq!(count("rotary_factors"), 1);
         assert_eq!(count("qk_norm_rope"), 1);
         assert_eq!(count("weighted_rms_norm"), 1);

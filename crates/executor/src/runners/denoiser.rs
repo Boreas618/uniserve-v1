@@ -437,7 +437,7 @@ fn missing_product(
     request: ipc::RequestKey,
     kinds: &[Product],
 ) -> Result<Option<Product>> {
-    // **Presence, not placement.** Whether a product exists is a fact about the store; where a
+    // **Presence, not device and stream.** Whether a product exists is a fact about the store; where a
     // reader wants it is `copy_into`'s question. Asking `borrow` here made a deployment that puts
     // the text encoder on its own GPU refuse every step with "no call produced it".
     for kind in kinds {
@@ -475,7 +475,9 @@ fn stated_request(warm: &WarmRequest, conditioning: &[u8]) -> Result<WarmRequest
     use models::video::{ConditionRole, Conditioning};
 
     let decoded = Conditioning::decode(conditioning).map_err(|error| {
-        Error::Invalid(format!("a media request's conditioning does not decode: {error}"))
+        Error::Invalid(format!(
+            "a media request's conditioning does not decode: {error}"
+        ))
     })?;
     let count = |role: ConditionRole| {
         decoded
@@ -1064,7 +1066,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let group = self.group.clone();
-        let forward = grouped(nn::Forward::new(&stream, &kernels, &arena), group.as_deref());
+        let forward = grouped(
+            nn::Forward::new(&stream, &kernels, &arena),
+            group.as_deref(),
+        );
         let layout = layout_of(bucket)?;
         let tables = self.model.state_tables(&layout);
         let key = Self::key(bucket);
@@ -1172,7 +1177,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                     row.request.request_id.0
                 ))
             })?;
-            Ok(source.at(source.offset_elements(at)).reshape(Shape::new(shape)))
+            Ok(source
+                .at(source.offset_elements(at))
+                .reshape(Shape::new(shape)))
         };
         let mut media = Vec::with_capacity(pieces.len());
         for piece in &pieces {
@@ -1242,7 +1249,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// Writes one named tensor of the block-by-block diagnosis, when a directory is named.
     fn dump(&self, block: &str, name: &str, view: TensorView) {
         if self.diag.enabled() {
-            let _ = self.diag.write(self.device, &self.stream, block, name, view);
+            let _ = self
+                .diag
+                .write(self.device, &self.stream, block, name, view);
         }
     }
 
@@ -1505,7 +1514,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let group = self.group.clone();
-        let forward = grouped(nn::Forward::new(&stream, &kernels, &arena), group.as_deref());
+        let forward = grouped(
+            nn::Forward::new(&stream, &kernels, &arena),
+            group.as_deref(),
+        );
         let layout = layout_of(bucket)?;
         let tables = self.model.state_tables(&layout);
         let key = Self::key(bucket);
@@ -1720,7 +1732,12 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
         let generation = self.lifecycle.generation.number();
         let mut jobs = Vec::new();
         for bucket in self.capture_order() {
-            if self.lifecycle.graphs.captured_for(bucket, generation).is_none() {
+            if self
+                .lifecycle
+                .graphs
+                .captured_for(bucket, generation)
+                .is_none()
+            {
                 jobs.push(Job::Capture {
                     runner: self.id,
                     bucket,
@@ -1821,7 +1838,9 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                     .graphs
                     .captured_for(*bucket, *generation)
                     .ok_or_else(|| {
-                        Error::Invariant(format!("no graph of bucket {bucket} at generation {generation}"))
+                        Error::Invariant(format!(
+                            "no graph of bucket {bucket} at generation {generation}"
+                        ))
                     })?;
                 if !eager {
                     captured.launch(&stream)?;
@@ -2184,7 +2203,7 @@ mod product_tests {
             _request: ipc::RequestKey,
             _kind: Product,
         ) -> Result<Option<products::Published>> {
-            unreachable!("the presence rule reads existence, not a placement")
+            unreachable!("the presence rule reads existence, not a device and stream")
         }
 
         fn copy_into(
@@ -2315,10 +2334,16 @@ mod product_tests {
             text_tags: vec![1; 9],
             conditions: Vec::new(),
         };
-        let stated = stated_request(&warm, &conditioning.encode().expect("a conditioning encodes"))
-            .expect("a t2va conditioning states a request");
+        let stated = stated_request(
+            &warm,
+            &conditioning.encode().expect("a conditioning encodes"),
+        )
+        .expect("a t2va conditioning states a request");
         assert_eq!(stated.text_tokens, 9);
-        assert_eq!((stated.width, stated.height, stated.frames), (768, 768, 107));
+        assert_eq!(
+            (stated.width, stated.height, stated.frames),
+            (768, 768, 107)
+        );
         assert!(stated.conditions.is_empty());
         assert!(
             stated_request(&warm, b"not a conditioning").is_err(),
@@ -2364,8 +2389,8 @@ mod product_tests {
         let store = Store {
             held: vec![Product::Text],
         };
-        let missing = missing_product(&store, request(), step_products(&layout))
-            .expect("a store answers");
+        let missing =
+            missing_product(&store, request(), step_products(&layout)).expect("a store answers");
         assert_eq!(
             missing, None,
             "a store holding the encoder's rows leaves a conditioned step nothing missing: the \

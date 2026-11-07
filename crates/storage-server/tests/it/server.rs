@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use ::storage::protocol::{ErrorKind, Item};
 use ::storage::{
-    Access, Claim, Client, Error, Key, Mode, Placement, Role, Scope, StorageRecord, TensorRecord,
+    Access, Claim, Client, Error, Key, Location, Mode, Role, Scope, StorageRecord, TensorRecord,
     socket,
 };
 use storage_server::{Launch, Server};
@@ -178,7 +178,7 @@ pub(crate) fn tensor(
 
 pub(crate) fn host(bytes: u64) -> StorageRecord {
     StorageRecord {
-        placement: Placement::Host { numa_node: None },
+        location: Location::Host { numa_node: None },
         bytes,
         segment: None,
         fabric: None,
@@ -1774,10 +1774,10 @@ fn one_key_keeps_a_copy_at_each_location() {
     let claim = head
         .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
-    let near = Placement::Host { numa_node: Some(0) };
-    let far = Placement::Host { numa_node: Some(1) };
+    let near = Location::Host { numa_node: Some(0) };
+    let far = Location::Host { numa_node: Some(1) };
     let on = |location| StorageRecord {
-        placement: location,
+        location: location,
         bytes: 4,
         segment: None,
         fabric: None,
@@ -1805,11 +1805,11 @@ fn one_key_keeps_a_copy_at_each_location() {
     let got = second.get(vec![key(1)], Mode::Read, vec![far]).unwrap();
     assert_eq!(got.storages.len(), 1);
     let (record, descriptor) = got.storages.into_iter().next().unwrap();
-    assert_eq!(record.placement, far);
+    assert_eq!(record.location, far);
     assert_eq!(contents(descriptor), b"bbbb");
     let every = second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     assert_eq!(every.storages.len(), 2);
-    let elsewhere = Placement::Host { numa_node: Some(2) };
+    let elsewhere = Location::Host { numa_node: Some(2) };
     assert_eq!(
         second
             .get(vec![key(1)], Mode::Read, vec![elsewhere])
@@ -1835,15 +1835,10 @@ fn one_key_keeps_a_copy_at_each_location() {
     let got = first
         .get(vec![key(1), key(2)], Mode::Read, Vec::new())
         .unwrap();
-    let mut held: Vec<(Key, Placement)> = got
+    let mut held: Vec<(Key, Location)> = got
         .tensors
         .iter()
-        .map(|tensor| {
-            (
-                tensor.key,
-                got.storages[tensor.storage as usize].0.placement,
-            )
-        })
+        .map(|tensor| (tensor.key, got.storages[tensor.storage as usize].0.location))
         .collect();
     held.sort_by_key(|(key, _)| *key);
     assert_eq!(held, vec![(key(1), far), (key(2), near)]);
@@ -1851,12 +1846,12 @@ fn one_key_keeps_a_copy_at_each_location() {
     // Each copy lives while some scope retains it at its location.
     second.retain(Vec::new(), Vec::new()).unwrap();
     first.retain(vec![key(2)], vec![near]).unwrap();
-    let listed: Vec<(Key, Placement)> = head
+    let listed: Vec<(Key, Location)> = head
         .list()
         .unwrap()
         .tensors
         .into_iter()
-        .map(|tensor| (tensor.key, tensor.placement))
+        .map(|tensor| (tensor.key, tensor.location))
         .collect();
     assert_eq!(listed, vec![(key(2), near)]);
 }
@@ -1868,7 +1863,7 @@ pub(crate) const GPU: [u8; 16] = [0x5a; 16];
 /// A storage of `bytes` on [`GPU`], of KV cache `segment` when given.
 pub(crate) fn device(bytes: u64, segment: Option<::storage::Segment>) -> StorageRecord {
     StorageRecord {
-        placement: Placement::Device { gpu: GPU },
+        location: Location::Device { gpu: GPU },
         bytes,
         segment,
         fabric: None,

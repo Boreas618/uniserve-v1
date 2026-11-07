@@ -72,7 +72,11 @@ impl ExchangeViews {
     /// capacity.
     #[must_use]
     pub fn at_rows(&self, rows: u32) -> Self {
-        let step_rows = if rows == 0 { self.capacity } else { rows.min(self.capacity) };
+        let step_rows = if rows == 0 {
+            self.capacity
+        } else {
+            rows.min(self.capacity)
+        };
         Self {
             transport: self.transport,
             ranks: self.ranks,
@@ -97,7 +101,11 @@ impl ExchangeViews {
     pub fn narrowed(&self) -> Self {
         let rows = u64::from(self.ranks) * u64::from(self.step_rows);
         let head = |view: TensorView| {
-            TensorView::new(view.ptr, view.dtype, crate::Shape::new(&[rows, view.shape.last()]))
+            TensorView::new(
+                view.ptr,
+                view.dtype,
+                crate::Shape::new(&[rows, view.shape.last()]),
+            )
         };
         let mut narrowed = self.at_rows(self.step_rows);
         narrowed.states = head(self.states);
@@ -175,7 +183,11 @@ mod tests {
             weights: TensorView::new(base, DType::F32, Shape::new(&[rows, top])),
             combined: TensorView::new(base, DType::BF16, Shape::new(&[rows, hidden])),
             live: TensorView::new(base, DType::I32, Shape::new(&[1])),
-            packed: TensorView::new(base, DType::U8, Shape::new(&[u64::from(capacity), hidden / 2])),
+            packed: TensorView::new(
+                base,
+                DType::U8,
+                Shape::new(&[u64::from(capacity), hidden / 2]),
+            ),
             packed_scales: TensorView::new(
                 base,
                 DType::F8E4M3,

@@ -291,7 +291,12 @@ fn a_purge_keeps_the_graph_a_live_generation_still_serves() {
     .expect("the serving generation's graph");
     let mut precopied_value = 10u32;
     let precopied = Captured::new(
-        capture_graph(&stream, &precopied_kernel, &mut address, &mut precopied_value),
+        capture_graph(
+            &stream,
+            &precopied_kernel,
+            &mut address,
+            &mut precopied_value,
+        ),
         Vec::new(),
         Vec::new(),
     )
@@ -332,7 +337,11 @@ fn a_purge_keeps_the_graph_a_live_generation_still_serves() {
     );
 
     // The generation that never switched over is discarded; only now is the bucket free.
-    assert_eq!(graphs.discard(2), vec![bucket], "the discard named no bucket");
+    assert_eq!(
+        graphs.discard(2),
+        vec![bucket],
+        "the discard named no bucket"
+    );
     assert!(
         !graphs.holds(bucket),
         "the bucket is still held after every generation's graph was released"

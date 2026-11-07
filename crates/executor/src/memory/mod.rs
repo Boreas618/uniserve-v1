@@ -280,7 +280,7 @@ impl Memory {
             None => None,
         };
         // One buffer pool per rank, given to the product store, which binds the scheduler's
-        // placements into it; a second pool would allocate the same bytes twice.
+        // dispatches into it; a second pool would allocate the same bytes twice.
         let buffer = BufferPool::allocate(
             plan.info.buffer_pool_bytes.max(1),
             &request.devices,
@@ -354,7 +354,10 @@ impl Memory {
     /// books and asks no driver, so a figure that could not be computed is left
     /// out rather than failing the report.
     pub fn mapped_resident(&self) -> u64 {
-        let planes = self.prefix_cache.as_ref().map_or(0, |cache| lock(cache).mapped_bytes());
+        let planes = self
+            .prefix_cache
+            .as_ref()
+            .map_or(0, |cache| lock(cache).mapped_bytes());
         let latents = self
             .latents
             .as_ref()
@@ -396,9 +399,7 @@ impl Memory {
     /// keeps no paged cache.
     pub fn host_token_bytes(&self) -> u64 {
         self.prefix_cache.as_ref().map_or(0, |cache| {
-            prefix_cache::host::token_bytes(
-                lock(cache).plan(),
-            )
+            prefix_cache::host::token_bytes(lock(cache).plan())
         })
     }
 

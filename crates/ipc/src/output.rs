@@ -30,7 +30,7 @@ pub enum ErrorCode {
     UnsupportedCall,
     /// A message, a call or a launch value breaks the protocol contract.
     InvalidDescriptor,
-    /// The deployment asks for a placement, a device or a kernel the rank
+    /// The deployment asks for a rank layout, a device or a kernel the rank
     /// cannot provide.
     UnsupportedSetup,
     /// A request's inputs are invalid for its computation.

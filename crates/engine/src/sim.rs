@@ -24,15 +24,15 @@ use std::time::Duration;
 use crate::CommandWaker;
 use crate::executor::{
     BatchResult, CallResult, CommandOutcome, CommandResult, ComponentConfig, ExecutionBatch,
-    Executor, ExecutorFailure, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, PoolPlacement,
+    Executor, ExecutorFailure, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, PoolLayout,
 };
 use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use ipc::philox;
 use ipc::{
-    BatchOutput, Call, CallKind, CallOutput, CallStatus, ErrorCode, FinishFlags, NewRequest,
-    SamplingState, TensorRef, TimingCounters, MainProcessInfo,
+    BatchOutput, Call, CallKind, CallOutput, CallStatus, ErrorCode, FinishFlags, MainProcessInfo,
+    NewRequest, SamplingState, TensorRef, TimingCounters,
 };
 use ipc::{ImageParams, RequestId, SamplingParams, TokenLogprob};
 
@@ -218,11 +218,7 @@ impl SimLoss {
                 .pending
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *pending = Some((
-                group,
-                stall_failure(stall).to_string(),
-                requests,
-            ));
+            *pending = Some((group, stall_failure(stall).to_string(), requests));
         }
         if let Some(waker) = self
             .wake
@@ -366,14 +362,14 @@ impl SimExecutor {
     )]
     pub fn new(mut engine: SimEngine) -> Self {
         let info = engine.info().clone();
-        let placement = engine.placement.clone();
+        let layout = engine.layout.clone();
         let max_model_len = engine.max_model_len;
         let groups = engine.groups.clone();
         let latent_pools = engine.latent_pools.clone();
         let encoder_pools = engine.encoder_pools.clone();
         let results_on_wait = engine.results_on_wait;
         let stop = std::sync::Arc::clone(&engine.stop);
-        let depth = placement.queue_depth.max(1);
+        let depth = layout.queue_depth.max(1);
         let (to_worker, jobs) = crossbeam_channel::unbounded();
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(1);
@@ -388,9 +384,9 @@ impl SimExecutor {
                     match job {
                         Job::Batch(batch) => {
                             let commands = batch.commands.clone();
-                            let result = engine.execute(batch).map(|report| {
-                                (batch_result(report, &commands), commands)
-                            });
+                            let result = engine
+                                .execute(batch)
+                                .map(|report| (batch_result(report, &commands), commands));
                             if results_tx.send(result).is_err() {
                                 break;
                             }
@@ -407,9 +403,9 @@ impl SimExecutor {
                         .iter()
                         .map(|group| (group.clone(), info.clone()))
                         .collect(),
-                    placements: groups
+                    layouts: groups
                         .iter()
-                        .map(|group| (group.clone(), placement.clone()))
+                        .map(|group| (group.clone(), layout.clone()))
                         .collect(),
                     // The pool's own fact, as an inventory states it: the
                     // mechanism shapes a KV view to it, and refuses to shape
@@ -675,7 +671,7 @@ impl Executor for SimExecutor {
     /// Validates a logical batch and queues it for the simulator thread.
     ///
     /// Returns `WouldBlock` with the batch while `depth` batches are in
-    /// flight. Returns `Failed` when the executor is closed, a placement names
+    /// flight. Returns `Failed` when the executor is closed, a dispatch names
     /// an executor other than the simulator, the batch fails validation, or the
     /// simulator thread is gone. The batch's admissions and products are
     /// recorded before it is queued and are not rolled back if queuing fails.
@@ -685,8 +681,8 @@ impl Executor for SimExecutor {
                 "Executor is closed"
             )));
         }
-        for (_, placement) in &batch.requests {
-            if !self.is_ready(&placement.worker) {
+        for (_, dispatch) in &batch.requests {
+            if !self.is_ready(&dispatch.worker) {
                 return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
                     "Executor cannot accept this request"
                 )));
@@ -1210,8 +1206,8 @@ impl SimSpeculation {
 pub struct SimEngine {
     info: MainProcessInfo,
     /// How the simulated pool is placed: its queue depth and its components'
-    /// placement, which `SimExecutor` states to the scheduler.
-    placement: PoolPlacement,
+    /// layout, which `SimExecutor` states to the scheduler.
+    layout: PoolLayout,
     /// The longest sequence the simulated pool serves: the model's context
     /// length, which `SimExecutor` states to the scheduler as
     /// `ExecutorInfo::max_model_len`.
@@ -1417,7 +1413,7 @@ impl SimEngine {
         };
         Self {
             info,
-            placement: PoolPlacement {
+            layout: PoolLayout {
                 queue_depth: 1,
                 ranks: 1,
                 components: BTreeMap::new(),
@@ -1981,8 +1977,7 @@ impl SimEngine {
                         "uniserve-sim-video request={}",
                         call.request_key.request_id.0
                     );
-                    record.media_output =
-                        Some(publish_media(
+                    record.media_output = Some(publish_media(
                         "uniserve-video-",
                         payload.as_bytes(),
                         media_overstatement,
@@ -2010,8 +2005,11 @@ impl SimEngine {
                             synthetic_feedback_values(seed, request.image_index, height, width);
                         ipc::append_feedback(&mut media, &values, ipc::PixelRange::SignedUnit);
                     }
-                    record.media_output =
-                        Some(publish_media("uniserve-image-", &media, media_overstatement)?);
+                    record.media_output = Some(publish_media(
+                        "uniserve-image-",
+                        &media,
+                        media_overstatement,
+                    )?);
                 }
             }
         }
@@ -2060,13 +2058,13 @@ impl SimEngine {
 
     /// Sets the pool's unresolved-batch capacity, clamped to at least one.
     pub fn set_queue_depth(&mut self, depth: u32) {
-        self.placement.queue_depth = (depth as usize).max(1);
+        self.layout.queue_depth = (depth as usize).max(1);
     }
 
     /// Names the executor groups this deployment runs, replacing the single
     /// `sim` group.
     ///
-    /// Each group reports the same placement, ranks and pools: what differs
+    /// Each group reports the same layout, ranks and pools: what differs
     /// between them in a test is which one has failed.
     pub fn name_groups(&mut self, names: &[&str]) {
         self.groups = names
@@ -2078,12 +2076,12 @@ impl SimEngine {
     /// Places the pool's components, as a deployment places an executor
     /// group's, and gives the pool the ranks they span.
     pub fn place_components(&mut self, components: BTreeMap<String, ComponentConfig>) {
-        self.placement.ranks = components
+        self.layout.ranks = components
             .values()
             .flat_map(|component| component.ranks.iter().copied())
             .max()
             .map_or(1, |last| last + 1);
-        self.placement.components = components;
+        self.layout.components = components;
     }
 
     /// Sets the number of synthetic tokens emitted before the configured EOS.
@@ -2512,11 +2510,7 @@ fn set_cache_lengths(lengths: &mut CallOutput, visible: u32) {
 /// by that name and unlinks it when it opens the result. `extra_bytes` is
 /// declared in the report without being written: the disagreement between a
 /// statement of extent and its storage that the claim refuses.
-fn publish_media(
-    prefix: &str,
-    bytes: &[u8],
-    extra_bytes: u64,
-) -> anyhow::Result<ipc::MediaOutput> {
+fn publish_media(prefix: &str, bytes: &[u8], extra_bytes: u64) -> anyhow::Result<ipc::MediaOutput> {
     use std::io::Write;
 
     let mut storage = tempfile::Builder::new()
@@ -2922,7 +2916,7 @@ mod tests {
             batch_id,
             vec![(
                 call,
-                crate::executor::RequestPlacement {
+                crate::executor::RequestDispatch {
                     worker: ExecutorGroupId("sim".into()),
                     request_pool_idx: None,
                     block_tables: Vec::new(),

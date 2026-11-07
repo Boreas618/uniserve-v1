@@ -21,8 +21,8 @@
 #
 # The server command states only what can change the scored text or what
 # the design keeps: the checkpoint, the KV cache dtype, the serving
-# capacity and the sampler. It names no `placement_config.queue_depth`
-# (§4.4 makes placement a scheduling-policy decision) and no
+# capacity and the sampler. It names no `device_config.queue_depth`
+# (§4.4 makes dispatch a scheduling-policy decision) and no
 # `chat_config.reasoning_parser` (§7.7 puts chat_config in the
 # host/frontend layer): neither can change the tokens a fixed-seed request
 # generates, and a field the design retires would make the candidate run
