@@ -631,6 +631,24 @@ def _apply(base_url: str, *assignments: str) -> dict:
     return response.json()["result"]
 
 
+def _apply_settled(base_url: str, *assignments: str) -> None:
+    """Applies `assignments` once the switch that ended left its replica."""
+    answers: list[httpx.Response] = []
+
+    def applied() -> bool:
+        answers.append(
+            httpx.put(
+                f"{base_url}/admin/config",
+                json={"set": list(assignments)},
+                timeout=1800,
+            )
+        )
+        return answers[-1].status_code != 409
+
+    _wait_until(applied, 120, "the replica stayed with the switch that ended")
+    assert answers[-1].status_code == 200, answers[-1].text
+
+
 def _change_world(base_url: str, *assignments: str) -> dict:
     """Applies `assignments` as an epoch switch and commits the target; returns
     the update's report.
@@ -1922,16 +1940,7 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
             300,
             f"the revert did not end: {_log_trouble(log)}",
         )
-        _wait_until(
-            lambda: httpx.put(
-                f"{base_url}/admin/config",
-                json={"set": [f"worker_config.executable={executables[2]}"]},
-                timeout=60,
-            ).status_code
-            != 409,
-            120,
-            "the replica stayed with the switch that ended",
-        )
+        _apply_settled(base_url, f"worker_config.executable={executables[2]}")
         _on_trial(base_url)
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
@@ -2401,9 +2410,9 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
     with _serve(runtime, log, name) as base_url:
         first = tmp_path / "first"
         first.mkdir()
-        second = tmp_path / "second"
-        second.mkdir()
-        for directory in (first, second):
+        later = [tmp_path / f"later-{attempt}" for attempt in range(4)]
+        for directory in (first, *later):
+            directory.mkdir(exist_ok=True)
             shutil.copy2(worker_executable(), directory / "uniserve")
 
         streaming, streamed = _start_count(base_url, name)
@@ -2431,7 +2440,9 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
             "the update did not end",
         )
 
-        # Prompts that never repeat keep a prefill running under the switch.
+        # Prompts that never repeat keep a prefill running under the switch, and what
+        # they generate leaves a tail past a page. A round that happens on no tail ends
+        # the wait as it should and limits nothing, so the switch is tried again.
         prompts = threading.Event()
 
         def prefills() -> None:
@@ -2440,7 +2451,7 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
                 turn += 1
                 words = " ".join(f"{turn}-{word}" for word in range(2500))
                 try:
-                    _chat(base_url, name, words, tokens=1, timeout_s=120)
+                    _chat(base_url, name, words, tokens=48, timeout_s=120)
                 except httpx.HTTPError:
                     time.sleep(0.2)
 
@@ -2448,13 +2459,20 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
         for thread in running:
             thread.start()
         try:
-            _apply(
-                base_url,
-                f"worker_config.executable={second / 'uniserve'}",
-                "update_config.cache_tail_tokens=1",
-                "update_config.cache_prefill_tokens=128",
-            )
-            limited = _on_trial(base_url)["warming"]
+            for directory in later:
+                _apply_settled(
+                    base_url,
+                    f"worker_config.executable={directory / 'uniserve'}",
+                    "update_config.cache_tail_tokens=1",
+                    "update_config.cache_prefill_tokens=128",
+                )
+                limited = _on_trial(base_url)["warming"]
+                if limited["prefill_limited"]:
+                    break
+                print("no tail under prefills:", json.dumps(limited))
+                committed = _admin(base_url, "config/commit")
+                assert committed.status_code == 200, committed.text
+                _purged(base_url)
         finally:
             prompts.set()
             for thread in running:
