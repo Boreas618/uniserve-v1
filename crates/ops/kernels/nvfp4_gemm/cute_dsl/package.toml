@@ -41,6 +41,6 @@ architectures = ["sm_100a", "sm_100f"]
 # a `tile_to_shape` of that atom, not a row-major view. A row-major matrix would
 # need a conversion pass before the MMA; nothing here declares one.
 [kernel.descriptors]
-dimensions = { packed = ["u8"], scale = ["f8e4m3"], accumulate = ["f32"], output = ["bf16", "f16"], layout = ["swizzled_128x4"], epilogue = ["none"], m = ["128", "256", "1024", "4096"], n = ["256", "512", "2048", "4096", "8192"], k = ["2048", "4096", "7168", "16384"] }
+dimensions = { packed = ["u8"], scale = ["f8e4m3"], accumulate = ["f32"], output = ["bf16", "f16"], layout = ["swizzled_128x4"], epilogue = ["none"], m = ["128", "256", "1024", "4096", "16384"], n = ["256", "512", "2048", "4096", "8192"], k = ["2048", "4096", "7168", "16384"] }
 
 [parameters]

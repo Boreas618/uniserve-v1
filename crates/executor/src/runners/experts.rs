@@ -456,6 +456,7 @@ impl Member {
             ranks: shape.ranks,
             attention: shape.attention_ranks,
             capacity: shape.max_tokens,
+            step_rows: shape.max_tokens,
             states: views.states,
             ids: views.ids,
             weights: views.weights,

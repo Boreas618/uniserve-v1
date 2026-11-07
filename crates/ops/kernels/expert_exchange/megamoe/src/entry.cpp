@@ -35,7 +35,8 @@
 extern "C" int32_t uniserve_megamoe_stage_routes(int64_t* routes, float* weights,
                                                  const int32_t* ids, const float* route_weights,
                                                  const int32_t* live, int32_t tokens,
-                                                 int32_t extent, int32_t top, void* stream);
+                                                 int32_t extent, int32_t top, int32_t experts,
+                                                 void* stream);
 
 namespace {
 
@@ -372,7 +373,7 @@ extern "C" int32_t uniserve_expert_exchange_launch(uniserve_exchange_call* call,
   auto* routes = reinterpret_cast<int64_t*>(own + transport->layout.routes);
   auto* weights = reinterpret_cast<float*>(own + transport->layout.weights);
   if (uniserve_megamoe_stage_routes(routes, weights, call->ids, call->weights, call->live, tokens,
-                                    extent, kTop, stream) != 0) {
+                                    extent, kTop, kExperts, stream) != 0) {
     return refuse(call->error, "expert_exchange could not stage its routes");
   }
   constexpr int64_t kUpRows = 2 * static_cast<int64_t>(kIntermediate);

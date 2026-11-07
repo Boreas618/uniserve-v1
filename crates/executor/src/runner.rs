@@ -50,6 +50,21 @@ pub trait Runner: Send {
         false
     }
 
+    /// Whether the batch just staged may stay in flight once launched, which a runner whose answer
+    /// feeds the next launch refuses for that batch alone.
+    fn overlaps_staged(&self) -> bool {
+        self.overlaps_replays()
+    }
+
+    /// Turns `output`, the answer a replay gave when it launched, into its answer now that its work
+    /// has landed.
+    fn landed(
+        &mut self,
+        output: crate::batch::BatchOutput,
+    ) -> Result<crate::batch::BatchOutput> {
+        Ok(output)
+    }
+
     /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
     fn submit(&mut self, batch: Batch) -> Result<Jobs>;
 
