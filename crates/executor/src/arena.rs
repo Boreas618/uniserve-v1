@@ -811,6 +811,7 @@ mod tests {
             tokens: 1,
             extent: crate::plan::Extent::None,
             serves: None,
+            capacity: 0,
         }
     }
 
