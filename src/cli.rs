@@ -6,13 +6,13 @@
 //! epoch), `storage` (a host's Storage Server) and `program-server` (a host's
 //! Program Server). The binary's own options, its log levels, are global; each
 //! command declares its own. `serve` and `frontend` take the serving command
-//! line (`daemon::options::ServeArgs`), which resolves one configuration from
+//! line (`daemon::options::ServerArgs`), which resolves one configuration from
 //! a `--config` file, a few flags and `--set` assignments.
 
 use std::ffi::OsString;
 
 use clap::{Args, Parser, Subcommand};
-use daemon::options::ServeArgs;
+use daemon::options::ServerArgs;
 
 use crate::engine::EngineArgs;
 use crate::storage::StorageArgs;
@@ -50,7 +50,7 @@ pub(crate) enum Command {
     #[command(
         override_usage = "uniserve serve [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
-    Serve(Box<ServeArgs>),
+    Serve(Box<ServerArgs>),
     /// Run the deployment's application process: the HTTP and OpenAI API,
     /// input and output processing, facts and migration, on the leader node.
     /// The node's daemon starts it with the deployment's configuration.
@@ -58,7 +58,7 @@ pub(crate) enum Command {
         hide = true,
         override_usage = "uniserve frontend [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
-    Frontend(Box<ServeArgs>),
+    Frontend(Box<ServerArgs>),
     /// Run the main process of this node and epoch: its schedulers and the
     /// request interface.
     #[command(hide = true)]

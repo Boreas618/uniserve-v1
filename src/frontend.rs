@@ -27,13 +27,17 @@ use crate::logging;
 
 /// Runs the `frontend` command with the deployment's `args`, logging under
 /// `log`.
-pub(crate) fn run(args: daemon::options::ServeArgs, log: &LogLevels) -> Result<ExitCode> {
+pub(crate) fn run(
+    args: daemon::options::ServerArgs,
+    matches: &clap::ArgMatches,
+    log: &LogLevels,
+) -> Result<ExitCode> {
     logging::init_tracing(
         "Frontend",
         log.log_level.as_deref(),
         log.log_level_http.as_deref(),
     );
-    let (config, stated) = args.resolve_for(daemon::options::Listen::Frontend)?;
+    let (config, stated) = args.resolve(matches, daemon::options::Listen::Frontend)?;
     config
         .model
         .as_deref()
@@ -51,7 +55,7 @@ pub(crate) fn run(args: daemon::options::ServeArgs, log: &LogLevels) -> Result<E
 
 /// Serves the deployment's application until `shutdown` is cancelled.
 async fn serve(
-    _config: daemon::options::ServeConfig,
+    _config: daemon::options::ServerArgs,
     _stated: daemon::options::Stated,
     _shutdown: CancellationToken,
 ) -> Result<()> {

@@ -270,7 +270,7 @@ impl Restarter {
     pub(crate) async fn restart(
         &self,
         executable: Option<String>,
-        config: Option<crate::options::ServeConfig>,
+        config: Option<crate::options::ServerArgs>,
         then: Option<Box<crate::updates::change::ApplyRequest>>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
@@ -306,7 +306,7 @@ impl Restarter {
     async fn hand_over(
         &self,
         executable: Option<String>,
-        config: Option<crate::options::ServeConfig>,
+        config: Option<crate::options::ServerArgs>,
         then: Option<Box<crate::updates::change::ApplyRequest>>,
         leader: &Arc<Leader>,
         admin: &Arc<Admin>,
@@ -1088,7 +1088,7 @@ async fn prepared_successor(
 fn adopted_epoch(
     world: u64,
     engine: u64,
-    options: &crate::options::ServeConfig,
+    options: &crate::options::ServerArgs,
     programs: Option<HandedPrograms>,
 ) -> (crate::epoch::EpochRecord, crate::epoch::ManagedProcess) {
     let deployment = crate::epoch::Deployment::of(options.clone());
@@ -1138,7 +1138,7 @@ mod tests {
     /// see and does not invent.
     #[test]
     fn an_adopted_epoch_records_the_build_it_serves_and_the_generation_it_runs_at() {
-        let options = crate::options::ServeConfig::default();
+        let options = crate::options::ServerArgs::default();
         let (record, process) = adopted_epoch(7, 12, &options, None);
         assert_eq!(record.status, crate::epoch::Status::Serving);
         assert_eq!(record.world, 7);

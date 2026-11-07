@@ -10,7 +10,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::leader::UpdateError;
-use crate::options::ServeConfig;
+use crate::options::ServerArgs;
 
 /// How the requests in flight at a promotion continue when the new world
 /// computes other numerics than the one they ran on.
@@ -60,7 +60,7 @@ pub enum Applied {
     /// successor applies `then`, the same change, which the epoch layer then
     /// switches: the orchestrator changes before what it orchestrates.
     Daemon {
-        config: Box<ServeConfig>,
+        config: Box<ServerArgs>,
         executable: Option<String>,
         then: Option<Box<ApplyRequest>>,
     },
@@ -121,11 +121,11 @@ mod tests {
 /// admin API resolves a change here before it routes it, so the target an
 /// operator sees planned is the target the leader applies.
 pub(crate) fn resolve(
-    current: &ServeConfig,
+    current: &ServerArgs,
     request: &ApplyRequest,
 ) -> Result<
     (
-        ServeConfig,
+        ServerArgs,
         crate::options::Stated,
         crate::options::UpdateConfig,
     ),

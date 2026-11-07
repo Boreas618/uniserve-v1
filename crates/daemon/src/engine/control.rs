@@ -1805,7 +1805,7 @@ fn unanswerable(host: &str, error: impl std::fmt::Display) -> crate::epoch::Fail
 mod tests {
     use super::*;
     use crate::engine::stand_in::{Answer, Seen, main_processes, process};
-    use crate::options::ServeConfig;
+    use crate::options::ServerArgs;
 
     /// An epoch's start names this daemon's own build only for its own binary,
     /// and starts the process with the launch file alone: another executable's
@@ -1822,13 +1822,13 @@ mod tests {
         )
         .unwrap();
         control
-            .write_build_config(3, &crate::epoch::BuildConfig::of(&ServeConfig::default()))
+            .write_build_config(3, &crate::epoch::BuildConfig::of(&ServerArgs::default()))
             .unwrap();
         let own = std::env::current_exe().unwrap().display().to_string();
         // The deployment's own spec, as `ServeOptions` builds it: an epoch's
         // start reads the ranks it places, and a spec with no scheduling or
         // cache tables is no deployment's.
-        let mut spec = ServeConfig::default().engine_spec().unwrap();
+        let mut spec = ServerArgs::default().engine_spec().unwrap();
         // The leader completes the options' spec with what the loaded model
         // determines, and a start reads it back (`crate::leader`), so a spec an
         // epoch could start always states facts. This test starts a process,
@@ -1882,7 +1882,7 @@ mod tests {
     /// An update of the default deployment's filled programs, for the switch to
     /// move.
     fn update() -> crate::epoch::Update {
-        crate::epoch::Update::new(1, crate::epoch::Deployment::of(ServeConfig::default()))
+        crate::epoch::Update::new(1, crate::epoch::Deployment::of(ServerArgs::default()))
     }
 
     /// The program layer moves every main process through the generations each
@@ -1893,7 +1893,7 @@ mod tests {
     fn a_switch_moves_every_main_process_through_the_generations_they_numbered() {
         let (processes, seen) =
             main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
-        let target = crate::epoch::Deployment::of(ServeConfig::default());
+        let target = crate::epoch::Deployment::of(ServerArgs::default());
         let mut switch = ProgramSwitch::new(
             &processes,
             vec![process("rank-0", 7), process("rank-1", 8)],
@@ -1961,7 +1961,7 @@ mod tests {
                 Answer::Refuses("the package has no module for this GPU".to_owned()),
             ),
         ]);
-        let target = crate::epoch::Deployment::of(ServeConfig::default());
+        let target = crate::epoch::Deployment::of(ServerArgs::default());
         let mut switch = ProgramSwitch::new(
             &processes,
             vec![process("rank-0", 7), process("rank-1", 8)],
@@ -2003,7 +2003,7 @@ mod tests {
                 })),
             }),
         )]);
-        let target = crate::epoch::Deployment::of(ServeConfig::default());
+        let target = crate::epoch::Deployment::of(ServerArgs::default());
         let mut switch = ProgramSwitch::new(&processes, vec![process("rank-0", 7)], update());
         let failure = switch
             .precopy(&target.programs.kernels, &target.programs.policy)
@@ -2036,7 +2036,7 @@ mod tests {
                 })),
             }),
         )]);
-        let target = crate::epoch::Deployment::of(ServeConfig::default());
+        let target = crate::epoch::Deployment::of(ServerArgs::default());
         let mut switch = ProgramSwitch::new(&processes, vec![process("rank-0", 7)], update());
         let failure = switch
             .precopy(&target.programs.kernels, &target.programs.policy)

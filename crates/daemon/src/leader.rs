@@ -51,7 +51,7 @@ use crate::metrics::log_stats::StatsLogger;
 use crate::metrics::stats::{self as metrics, RequestStats};
 use crate::migration::{Migrator, RequestEvents};
 use crate::model::{ModelConfig, ModelParameters};
-use crate::options::{ReasoningParser, ServeConfig, Stated};
+use crate::options::{ReasoningParser, ServerArgs, Stated};
 use crate::output::RequestOutputStream;
 
 /// How long the epoch's Program Servers may take to select its programs.
@@ -140,7 +140,7 @@ pub(crate) struct SwitchTarget {
     /// The spec the target is welcomed with.
     pub(crate) spec: wire::EngineSpec,
     /// The configuration the target serves.
-    pub(crate) config: ServeConfig,
+    pub(crate) config: ServerArgs,
     /// The programs the target takes before it is promoted.
     pub(crate) programs: crate::epoch::FilledPrograms,
     /// The Program Servers that select those programs' revisions, and the host that leads them.
@@ -508,7 +508,7 @@ impl Leader {
     /// Loads the configured model and starts the engine process that serves
     /// it, with its schedulers and worker processes.
     ///
-    /// `config` must have passed [`ServeConfig::validate`]; `stated` holds the
+    /// `config` must have passed [`ServerArgs::validate`]; `stated` holds the
     /// option paths the operator set; `daemon` is this node's daemon's
     /// process socket, through which the engine process and every worker
     /// start. The engine's start blocks until every rank has loaded the
@@ -519,11 +519,11 @@ impl Leader {
     /// Fails when the model assets cannot be resolved, when an option of
     /// another model family was stated ([`Stated::refuse_foreign_options`]),
     /// when the options do not form an engine spec
-    /// ([`ServeConfig::engine_spec`]), when the engine process fails to
+    /// ([`ServerArgs::engine_spec`]), when the engine process fails to
     /// start, or when the model cannot be bound to the capabilities its
     /// workers report.
     pub async fn start(
-        config: &ServeConfig,
+        config: &ServerArgs,
         stated: &Stated,
         daemon: String,
         commands: Option<&crate::supervision::ProcessCommands>,
@@ -625,7 +625,7 @@ impl Leader {
     /// The configuration selects a backend for attention and for the grouped experts, which are a
     /// causal language model's operators. A video deployment launches neither, so a slot filled for
     /// them would pin a program no call reaches: every operator it runs is filled from the store.
-    fn named_programs(&self, config: &ServeConfig) -> crate::epoch::FilledPrograms {
+    fn named_programs(&self, config: &ServerArgs) -> crate::epoch::FilledPrograms {
         let mut filled = crate::epoch::FilledPrograms::of(config);
         if self.video_denoiser().is_some() {
             filled.kernels.clear();
@@ -650,7 +650,7 @@ impl Leader {
     async fn install_programs(
         &self,
         commands: &crate::supervision::ProcessCommands,
-        config: &ServeConfig,
+        config: &ServerArgs,
         engines: Vec<u64>,
         world: u64,
     ) -> anyhow::Result<()> {
@@ -827,7 +827,7 @@ impl Leader {
     /// # Errors
     ///
     /// As [`Leader::start`], before the engine starts.
-    pub(crate) async fn prepare(config: &ServeConfig, stated: &Stated) -> anyhow::Result<Prepared> {
+    pub(crate) async fn prepare(config: &ServerArgs, stated: &Stated) -> anyhow::Result<Prepared> {
         let LoadedModel {
             config: model_config,
             tokenizer,
@@ -884,7 +884,7 @@ impl Leader {
     /// Fails when the model cannot be bound to the capabilities the
     /// engine's workers report.
     pub(crate) fn finish(
-        config: &ServeConfig,
+        config: &ServerArgs,
         prepared: Prepared,
         control: Arc<EngineControl>,
         client: EngineClient,
@@ -988,7 +988,7 @@ impl Leader {
         clients: Vec<Arc<EngineClient>>,
         processor: InputProcessor,
         images: MediaConnector,
-        options: &ServeConfig,
+        options: &ServerArgs,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
         Self::observed(
@@ -1015,7 +1015,7 @@ impl Leader {
         clients: Vec<Arc<EngineClient>>,
         processor: InputProcessor,
         images: MediaConnector,
-        options: &ServeConfig,
+        options: &ServerArgs,
         observer: Arc<crate::observe::Observer>,
         updates: Arc<crate::updates::driver::Driver>,
     ) -> Self {
@@ -1028,7 +1028,7 @@ impl Leader {
         let stats_logger = logging
             .log_stats
             .then(|| StatsLogger::start(model_name.clone(), Arc::clone(&schedulers)));
-        let replica_options = ServeConfig {
+        let replica_options = ServerArgs {
             model: Some(model_name.clone()),
             served_model_name: Some(served_model_name.clone()),
             ..options.clone()
@@ -1382,7 +1382,7 @@ impl Leader {
     ///
     /// `UpdateError::Failed` when no replica serves — the same answer
     /// [`Self::apply_programs`] gives, so a caller may ask either first.
-    pub(crate) fn serving_config(&self) -> Result<ServeConfig, UpdateError> {
+    pub(crate) fn serving_config(&self) -> Result<ServerArgs, UpdateError> {
         self.replicas()
             .first()
             .map(|replica| locked(&replica.config).clone())
@@ -1426,7 +1426,7 @@ impl Leader {
     pub(crate) async fn apply_programs(
         &self,
         number: u64,
-        target: &ServeConfig,
+        target: &ServerArgs,
         options: &crate::options::UpdateConfig,
         force: bool,
         dry_run: bool,
@@ -1648,8 +1648,8 @@ impl Leader {
 impl Leader {
     pub(crate) async fn route(
         &self,
-        current: &ServeConfig,
-        target: &ServeConfig,
+        current: &ServerArgs,
+        target: &ServerArgs,
         force: bool,
     ) -> Result<Option<crate::epoch::Update>, UpdateError> {
         if crate::epoch::host_layer_differ(current, target) {
@@ -1769,7 +1769,7 @@ impl Leader {
     /// host to name them.
     pub(crate) fn program_servers(
         &self,
-        config: &ServeConfig,
+        config: &ServerArgs,
     ) -> Vec<crate::engine::control::ProgramServer> {
         let socket = config
             .program_server
@@ -1802,7 +1802,7 @@ impl Leader {
     /// of the deployment.
     pub(crate) fn program_leader_host(
         &self,
-        config: &ServeConfig,
+        config: &ServerArgs,
         servers: &[crate::engine::control::ProgramServer],
     ) -> String {
         config
@@ -1827,7 +1827,7 @@ pub(crate) struct EngineHandoff {
     pub(crate) engine: u64,
     pub(crate) next_engine: u64,
     pub(crate) served: wire::EngineSpec,
-    pub(crate) config: ServeConfig,
+    pub(crate) config: ServerArgs,
     /// New requests wait (`Leader::pause`).
     pub(crate) paused: bool,
     /// The engine sleeps, and whether its sleep paused new requests.
@@ -2054,7 +2054,7 @@ pub(crate) struct Replica {
     pub(crate) served: std::sync::Mutex<Option<wire::EngineSpec>>,
     /// The options the serving engine's spec was made from, which an update
     /// overrides.
-    pub(crate) config: std::sync::Mutex<ServeConfig>,
+    pub(crate) config: std::sync::Mutex<ServerArgs>,
     /// The model their statistics are labelled with.
     pub(crate) model_name: String,
     /// Held while an engine is replaced, by a world change, a commit, a
@@ -2099,7 +2099,7 @@ pub(crate) struct Replica {
 
 impl Replica {
     pub(crate) fn new(
-        options: &ServeConfig,
+        options: &ServerArgs,
         client: Arc<EngineClient>,
         observer: Arc<crate::observe::Observer>,
         ordinal: usize,
@@ -2490,7 +2490,7 @@ impl Replica {
         control: &Arc<EngineControl>,
         updates: &Arc<crate::updates::driver::Driver>,
         spec: Option<wire::EngineSpec>,
-        config: &ServeConfig,
+        config: &ServerArgs,
     ) -> anyhow::Result<Arc<EngineClient>> {
         let host = config.host_identity.clone();
         let generation = updates
@@ -2510,7 +2510,7 @@ impl Replica {
         control: &Arc<EngineControl>,
         updates: &Arc<crate::updates::driver::Driver>,
         spec: Option<wire::EngineSpec>,
-        config: &ServeConfig,
+        config: &ServerArgs,
         generation: u64,
     ) -> anyhow::Result<Arc<EngineClient>> {
         let spec = spec.context("the replica has no served spec")?;

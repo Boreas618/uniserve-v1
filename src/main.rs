@@ -124,10 +124,19 @@ fn main() -> Result<std::process::ExitCode> {
         default(panic);
     }));
     let lifeline = take_lifeline();
-    let cli = Cli::parse();
+    // The serving commands read which flags their command line states, so they keep its matches.
+    let matches = <Cli as clap::CommandFactory>::command().get_matches();
+    let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+        .unwrap_or_else(|error| error.exit());
+    let command_matches = || {
+        matches
+            .subcommand()
+            .map(|(_, matches)| matches.clone())
+            .unwrap_or_default()
+    };
     match cli.command {
-        Command::Serve(args) => serve::run(*args, &cli.log),
-        Command::Frontend(args) => frontend::run(*args, &cli.log),
+        Command::Serve(args) => serve::run(*args, &command_matches(), &cli.log),
+        Command::Frontend(args) => frontend::run(*args, &command_matches(), &cli.log),
         Command::Engine(args) => engine::run(&args, lifeline, &cli.log),
         Command::Storage(args) => Ok(storage::run(*args)),
         Command::Rules => rules::run(),

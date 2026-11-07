@@ -353,7 +353,7 @@ mod tests {
 
     use super::*;
     use crate::epoch::{BuildConfig, EpochRecord, Program, Status, Update};
-    use crate::options::ServeConfig;
+    use crate::options::ServerArgs;
     use crate::updates::switch::{Event, Start};
 
     /// The reports the test feeds as if the adapter had delivered them.
@@ -415,7 +415,7 @@ mod tests {
 
     fn record(world: u64) -> EpochRecord {
         EpochRecord {
-            build_config: BuildConfig::of(&ServeConfig::default()),
+            build_config: BuildConfig::of(&ServerArgs::default()),
             kernels: Default::default(),
             policy: Program {
                 backend: "fcfs".to_owned(),
@@ -434,7 +434,7 @@ mod tests {
         EpochChange {
             previous: 11,
             target,
-            update: Update::new(7, Deployment::of(ServeConfig::default())),
+            update: Update::new(7, Deployment::of(ServerArgs::default())),
             group: "engine".to_owned(),
             start: Start {
                 executable: "/opt/uniserve".to_owned(),
@@ -490,8 +490,8 @@ mod tests {
         epochs.record(11, record(11));
         let (roster, feed) = Fake::with_feed();
         let driver = Driver::new(Arc::clone(&epochs), Box::new(roster));
-        let previous = Deployment::of(ServeConfig::default());
-        let mut target_config = ServeConfig::default();
+        let previous = Deployment::of(ServerArgs::default());
+        let mut target_config = ServerArgs::default();
         target_config.worker_config.executable = "/opt/uniserve-b".into();
         let target = Deployment::of(target_config);
 

@@ -149,7 +149,7 @@ pub(crate) async fn pipeline_tokenizer(
 /// type.
 pub(crate) trait LoadModel {
     fn load(
-        config: &crate::options::ServeConfig,
+        config: &crate::options::ServerArgs,
     ) -> impl std::future::Future<Output = std::result::Result<LoadedModel, ModelResolutionError>>;
 }
 
@@ -162,7 +162,7 @@ impl LoadModel for ModelConfig {
     /// `max_position_embeddings` or `ModelConfig::DEFAULT_MAX_MODEL_LEN`,
     /// and for a pipeline the model's default prompt limit.
     async fn load(
-        config: &crate::options::ServeConfig,
+        config: &crate::options::ServerArgs,
     ) -> std::result::Result<LoadedModel, ModelResolutionError> {
         let max_model_len = config.max_model_len.map(std::num::NonZeroU32::get);
         // A diffusers pipeline declares its class and component folders in a

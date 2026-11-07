@@ -1,8 +1,9 @@
-//! The command line that resolves a [`ServeConfig`].
+//! The command line that resolves a [`ServerArgs`].
 //!
 //! Options are read from three places, each overriding the last: the TOML
 //! file `--config` names, the flags that name the most common options (each
-//! a shortcut for one path of the tree, [`FLAG_PATHS`]), and repeatable
+//! the option of its own name, declared on the option's field of
+//! [`ServerArgs`]), and repeatable
 //! `--set PATH=VALUE` assignments that reach any option by its path, such as
 //! `--set cuda_graph_config.policy=off`. The three are merged as TOML values
 //! and deserialized once, so every option is checked by the same type
@@ -13,29 +14,9 @@ use std::num::{NonZeroU32, NonZeroUsize};
 use std::path::PathBuf;
 
 use anyhow::{Context as _, anyhow};
-use clap::Args;
 use toml::{Table, Value};
 
-use super::ServeConfig;
-
-/// Each flag and the configuration path it sets.
-pub const FLAG_PATHS: [(&str, &str); 15] = [
-    ("MODEL", "model"),
-    ("--host", "admin_config.host"),
-    ("--port", "admin_config.port"),
-    ("--served-model-name", "served_model_name"),
-    ("--worker-groups", "worker_groups"),
-    ("--tensor-parallel-size", "tensor_parallel_size"),
-    ("--data-parallel-size", "data_parallel_size"),
-    ("--max-running-requests", "max_running_requests"),
-    ("--max-model-len", "max_model_len"),
-    ("--mem-fraction-static", "mem_fraction_static"),
-    ("--host-identity", "host_identity"),
-    ("--nnodes", "nnodes"),
-    ("--node-rank", "node_rank"),
-    ("--dist-init-addr", "dist_init_addr"),
-    ("--worker-executable", "worker_config.executable"),
-];
+use super::ServerArgs;
 
 /// Which process the `--host` and `--port` flags state the listening address
 /// of: the daemon's own server (`admin_config`) or the application's
@@ -44,86 +25,6 @@ pub const FLAG_PATHS: [(&str, &str); 15] = [
 pub enum Listen {
     Daemon,
     Frontend,
-}
-
-/// The serving command line.
-#[derive(Debug, Clone, Default, Args)]
-pub struct ServeArgs {
-    /// Local model directory or Hugging Face repository (`model`).
-    #[arg(value_name = "MODEL")]
-    pub model: Option<String>,
-    /// TCP address the server listens on (`admin_config.host` for `serve`,
-    /// `server_config.host` for `frontend`).
-    #[arg(long)]
-    pub host: Option<String>,
-    /// TCP port the server listens on (`admin_config.port` for `serve`,
-    /// `server_config.port` for `frontend`).
-    #[arg(long)]
-    pub port: Option<u16>,
-    /// The single model name the API serves (`served_model_name`).
-    #[arg(long)]
-    pub served_model_name: Option<String>,
-    /// Deployment file placing worker groups and their components
-    /// (`worker_groups`).
-    #[arg(long, value_name = "FILE")]
-    pub worker_groups: Option<PathBuf>,
-    /// Tensor-parallel workers of each scheduler without a deployment file
-    /// (`tensor_parallel_size`).
-    #[arg(long)]
-    pub tensor_parallel_size: Option<NonZeroUsize>,
-    /// Schedulers (`data_parallel_size`).
-    #[arg(long)]
-    pub data_parallel_size: Option<NonZeroUsize>,
-    /// Concurrently resident requests (`max_running_requests`).
-    #[arg(long)]
-    pub max_running_requests: Option<NonZeroUsize>,
-    /// Longest sequence a request may reach, in tokens (`max_model_len`).
-    #[arg(long)]
-    pub max_model_len: Option<NonZeroU32>,
-    /// Each rank's share of its device's storage, in (0, 1]
-    /// (`mem_fraction_static`).
-    #[arg(long)]
-    pub mem_fraction_static: Option<f64>,
-    /// This node's host name in a deployment of several nodes
-    /// (`host_identity`).
-    #[arg(long)]
-    pub host_identity: Option<String>,
-    /// Nodes of the deployment, each running one `uniserve serve`
-    /// (`nnodes`).
-    #[arg(long)]
-    pub nnodes: Option<NonZeroU32>,
-    /// This node's rank; the leader is rank 0 (`node_rank`).
-    #[arg(long)]
-    pub node_rank: Option<u32>,
-    /// The leader's `host:port` the other nodes join at
-    /// (`dist_init_addr`).
-    #[arg(long, value_name = "HOST:PORT")]
-    pub dist_init_addr: Option<String>,
-    /// The `uniserve` executable that runs the workers
-    /// (`worker_config.executable`).
-    #[arg(long, value_name = "PATH")]
-    pub worker_executable: Option<PathBuf>,
-    /// This host's Program Server socket, which the daemon prepares an
-    /// epoch's programs against (`program_server`); the Program Server's
-    /// default socket when unset.
-    #[arg(long, value_name = "PATH")]
-    pub program_server: Option<PathBuf>,
-    /// TOML file of serving options; the flags and `--set` override it.
-    #[arg(long, value_name = "FILE")]
-    pub config: Option<PathBuf>,
-    /// Set the option at PATH, such as `cuda_graph_config.policy=off` or
-    /// `moe_config.exchange=deepep`; repeatable, and it overrides the flags
-    /// and the file. VALUE is a TOML value (`2`, `true`, `[1024, 4096]`,
-    /// `{ mode = "balanced" }`) or JSON, and otherwise text; a list may be
-    /// comma-separated text. One invocation may not set both a table and an
-    /// option inside it.
-    #[arg(long = "set", value_name = "PATH=VALUE")]
-    pub set: Vec<String>,
-    /// The descriptor of the handoff socket to the daemon this one succeeds,
-    /// whose deployment it takes over, as `POST /admin/restart` starts its
-    /// successor (`daemon::restart`); every other argument is ignored.
-    #[arg(long, hide = true, value_name = "FD")]
-    pub predecessor: Option<i32>,
 }
 
 /// The configuration paths an invocation stated: every table and option the
@@ -177,11 +78,14 @@ impl Stated {
     }
 }
 
-impl ServeArgs {
-    /// Resolves the configuration: the `--config` file, overridden by the
-    /// flags, overridden by `--set`, with every unstated option at its
-    /// default and `server_config.api_key` falling back to
-    /// `UNISERVE_API_KEY`. Returns it with the paths the invocation stated.
+impl ServerArgs {
+    /// Resolves the configuration this command line states: the `--config` file, overridden by
+    /// the flags the command line states, overridden by `--set`, with every unstated option at its
+    /// default and `server_config.api_key` falling back to `UNISERVE_API_KEY`. `--host` and
+    /// `--port` state `listen`'s address. Returns it with the paths the invocation stated.
+    ///
+    /// `matches` are the command line's own: a flag counts when the command line states it, which
+    /// clap's value source tells apart from the default it parsed beside the stated ones.
     ///
     /// # Errors
     ///
@@ -190,98 +94,52 @@ impl ServeArgs {
     /// option that is not a table, or the merged tree names an unknown
     /// option or a value its option does not take; the message names the
     /// option's path.
-    pub fn resolve(&self) -> anyhow::Result<(ServeConfig, Stated)> {
-        self.resolve_for(Listen::Daemon)
-    }
-
-    /// Resolves the configuration as [`resolve`](Self::resolve) does, with
-    /// `--host` and `--port` stating `listen`'s address.
-    ///
-    /// # Errors
-    ///
-    /// Fails as [`resolve`](Self::resolve) does.
-    pub fn resolve_for(&self, listen: Listen) -> anyhow::Result<(ServeConfig, Stated)> {
-        let mut tree = match &self.config {
+    pub fn resolve(
+        &self,
+        matches: &clap::ArgMatches,
+        listen: Listen,
+    ) -> anyhow::Result<(ServerArgs, Stated)> {
+        let mut tree = match &self.config_file {
             Some(path) => std::fs::read_to_string(path)
                 .with_context(|| format!("reading --config {}", path.display()))?
                 .parse::<Table>()
                 .with_context(|| format!("parsing --config {}", path.display()))?,
             None => Table::new(),
         };
-        for (path, value) in self.flag_values(listen) {
-            let path = path.split('.').map(str::to_owned).collect::<Vec<_>>();
-            set(&mut tree, &path, value)?;
+        // Each stated flag is the option of its own name, as this value prints it.
+        let printed = Value::try_from(self).context("printing the command line's options")?;
+        for id in matches.ids() {
+            let id = id.as_str();
+            if matches.value_source(id) != Some(clap::parser::ValueSource::CommandLine) {
+                continue;
+            }
+            if let Some(value) = printed.get(id) {
+                set(&mut tree, &[id.to_owned()], value.clone())?;
+            }
+        }
+        let (host, port) = match listen {
+            Listen::Daemon => ("admin_config", "admin_config"),
+            Listen::Frontend => ("server_config", "server_config"),
+        };
+        let path = |table: &str, key: &str| vec![table.to_owned(), key.to_owned()];
+        if let Some(value) = &self.host {
+            set(&mut tree, &path(host, "host"), Value::String(value.clone()))?;
+        }
+        if let Some(value) = self.port {
+            set(
+                &mut tree,
+                &path(port, "port"),
+                Value::Integer(i64::from(value)),
+            )?;
+        }
+        if let Some(value) = &self.worker_executable {
+            let value = Value::String(value.to_string_lossy().into_owned());
+            set(&mut tree, &path("worker_config", "executable"), value)?;
         }
         for (path, value) in assignments(&self.set)? {
             set(&mut tree, &path, value)?;
         }
         configured(tree)
-    }
-
-    /// The values the flags state, by configuration path.
-    fn flag_values(&self, listen: Listen) -> Vec<(&'static str, Value)> {
-        let (host_path, port_path) = match listen {
-            Listen::Daemon => ("admin_config.host", "admin_config.port"),
-            Listen::Frontend => ("server_config.host", "server_config.port"),
-        };
-        let text = |value: &str| Value::String(value.to_owned());
-        let path = |value: &PathBuf| Value::String(value.to_string_lossy().into_owned());
-        let count = |value: u64| Value::Integer(i64::try_from(value).unwrap_or(i64::MAX));
-
-        [
-            ("model", self.model.as_deref().map(text)),
-            (host_path, self.host.as_deref().map(text)),
-            (
-                port_path,
-                self.port.map(|port| Value::Integer(i64::from(port))),
-            ),
-            (
-                "served_model_name",
-                self.served_model_name.as_deref().map(text),
-            ),
-            ("worker_groups", self.worker_groups.as_ref().map(path)),
-            (
-                "tensor_parallel_size",
-                self.tensor_parallel_size
-                    .map(|size| count(size.get() as u64)),
-            ),
-            (
-                "data_parallel_size",
-                self.data_parallel_size.map(|size| count(size.get() as u64)),
-            ),
-            (
-                "max_running_requests",
-                self.max_running_requests
-                    .map(|requests| count(requests.get() as u64)),
-            ),
-            (
-                "max_model_len",
-                self.max_model_len
-                    .map(|length| count(u64::from(length.get()))),
-            ),
-            (
-                "mem_fraction_static",
-                self.mem_fraction_static.map(Value::Float),
-            ),
-            ("host_identity", self.host_identity.as_deref().map(text)),
-            (
-                "nnodes",
-                self.nnodes.map(|nodes| count(u64::from(nodes.get()))),
-            ),
-            (
-                "node_rank",
-                self.node_rank.map(|rank| count(u64::from(rank))),
-            ),
-            ("dist_init_addr", self.dist_init_addr.as_deref().map(text)),
-            (
-                "worker_config.executable",
-                self.worker_executable.as_ref().map(path),
-            ),
-            ("program_server", self.program_server.as_ref().map(path)),
-        ]
-        .into_iter()
-        .filter_map(|(path, value)| value.map(|value| (path, value)))
-        .collect()
     }
 }
 
@@ -314,9 +172,9 @@ fn deserialize_options<T: serde::de::DeserializeOwned>(tree: Table) -> anyhow::R
 }
 
 /// The configuration of a TOML tree of options, with the paths it states.
-fn configured(tree: Table) -> anyhow::Result<(ServeConfig, Stated)> {
+fn configured(tree: Table) -> anyhow::Result<(ServerArgs, Stated)> {
     let stated = Stated::of(&tree);
-    let mut config: ServeConfig = deserialize_options(tree)?;
+    let mut config: ServerArgs = deserialize_options(tree)?;
     // A retired option's name is refused here, with the configuration, rather
     // than left unknown: an unknown field names the mistake but not the way
     // out, and a table nothing reads would be silent. The field that parses it
@@ -334,13 +192,13 @@ fn configured(tree: Table) -> anyhow::Result<(ServeConfig, Stated)> {
 }
 
 /// Resolves a configuration from `text`, a TOML file's contents, overridden
-/// by the `--set` assignments `sets`, as [`ServeArgs::resolve`] does for a
+/// by the `--set` assignments `sets`, as [`ServerArgs::resolve`] does for a
 /// command line without flags.
 ///
 /// # Errors
 ///
-/// Fails as [`ServeArgs::resolve`] fails.
-pub fn resolve_text(text: &str, sets: &[String]) -> anyhow::Result<(ServeConfig, Stated)> {
+/// Fails as [`ServerArgs::resolve`] fails.
+pub fn resolve_text(text: &str, sets: &[String]) -> anyhow::Result<(ServerArgs, Stated)> {
     let mut tree = text.parse::<Table>().context("parsing the configuration")?;
     for (path, value) in assignments(sets)? {
         set(&mut tree, &path, value)?;
@@ -355,7 +213,7 @@ pub fn resolve_text(text: &str, sets: &[String]) -> anyhow::Result<(ServeConfig,
 /// # Errors
 ///
 /// Fails when a value has no TOML form.
-pub fn printed(config: &ServeConfig) -> anyhow::Result<String> {
+pub fn printed(config: &ServerArgs) -> anyhow::Result<String> {
     fn omit_defaults(table: &mut Table, defaults: &Table) {
         table.retain(|key, value| {
             let Some(default) = defaults.get(key) else {
@@ -373,24 +231,24 @@ pub fn printed(config: &ServeConfig) -> anyhow::Result<String> {
     }
 
     let mut table = Table::try_from(config).context("encoding the configuration")?;
-    let defaults = Table::try_from(ServeConfig::default()).context("encoding the defaults")?;
+    let defaults = Table::try_from(ServerArgs::default()).context("encoding the defaults")?;
     omit_defaults(&mut table, &defaults);
     toml::to_string_pretty(&table).context("printing the configuration")
 }
 
 /// `config` with the `--set` assignments `texts` applied over it, as
-/// [`ServeArgs::resolve`] applies them over the file and the flags, and the
+/// [`ServerArgs::resolve`] applies them over the file and the flags, and the
 /// paths they assign. The API key is the one `config` holds.
 ///
 /// # Errors
 ///
-/// Fails as [`ServeArgs::resolve`] fails on an assignment: one that is
+/// Fails as [`ServerArgs::resolve`] fails on an assignment: one that is
 /// malformed or conflicts with another, a path that crosses an option that
 /// is not a table, or a value its option does not take.
 pub fn overridden(
-    config: &ServeConfig,
+    config: &ServerArgs,
     texts: &[String],
-) -> anyhow::Result<(ServeConfig, Vec<String>)> {
+) -> anyhow::Result<(ServerArgs, Vec<String>)> {
     let mut tree = match Value::try_from(config).context("encoding the configuration")? {
         Value::Table(tree) => tree,
         _ => return Err(anyhow!("the configuration is not a table")),
@@ -400,7 +258,7 @@ pub fn overridden(
         paths.push(path.join("."));
         set(&mut tree, &path, value)?;
     }
-    let mut overridden: ServeConfig = deserialize_options(tree)?;
+    let mut overridden: ServerArgs = deserialize_options(tree)?;
     overridden.server_config.api_key = config.server_config.api_key.clone();
     Ok((overridden, paths))
 }
@@ -503,14 +361,16 @@ mod tests {
     #[derive(Parser)]
     struct Command {
         #[command(flatten)]
-        serve: ServeArgs,
+        serve: ServerArgs,
     }
 
-    fn resolved(args: &[&str]) -> anyhow::Result<(ServeConfig, Stated)> {
+    fn resolved(args: &[&str]) -> anyhow::Result<(ServerArgs, Stated)> {
         let command = <Command as clap::CommandFactory>::command();
         let matches =
             command.try_get_matches_from(std::iter::once("serve").chain(args.iter().copied()))?;
-        Command::from_arg_matches(&matches)?.serve.resolve()
+        Command::from_arg_matches(&matches)?
+            .serve
+            .resolve(&matches, Listen::Daemon)
     }
 
     fn written(name: &str, body: &str) -> PathBuf {
@@ -723,7 +583,23 @@ mod tests {
             "/opt/env/bin/uniserve",
         ])
         .unwrap();
-        for (_, path) in FLAG_PATHS {
+        for path in [
+            "model",
+            "admin_config.host",
+            "admin_config.port",
+            "served_model_name",
+            "worker_groups",
+            "tensor_parallel_size",
+            "data_parallel_size",
+            "max_running_requests",
+            "max_model_len",
+            "mem_fraction_static",
+            "host_identity",
+            "nnodes",
+            "node_rank",
+            "dist_init_addr",
+            "worker_config.executable",
+        ] {
             assert!(stated.contains(path), "{path} is set by its flag");
         }
         assert_eq!(
@@ -732,7 +608,7 @@ mod tests {
         );
 
         let text = printed(&config).unwrap();
-        let reread: ServeConfig = toml::from_str(&text).unwrap();
+        let reread: ServerArgs = toml::from_str(&text).unwrap();
         assert_eq!(reread, config, "{text}");
     }
 
@@ -851,7 +727,7 @@ mod tests {
 
     /// Resolves `args`, checks them, and derives the engine configuration
     /// the engine reads from the spec they state.
-    fn lowered(args: &[&str]) -> anyhow::Result<(ServeConfig, engine::EngineConfig)> {
+    fn lowered(args: &[&str]) -> anyhow::Result<(ServerArgs, engine::EngineConfig)> {
         let (config, stated) = resolved(args)?;
         config.validate(&stated)?;
         let mut spec = config.engine_spec()?;

@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 
 use crate::epoch::{Deployment, EpochRecord, Epochs, Layer, Status, Update, layer};
 use crate::leader::UpdateError;
-use crate::options::ServeConfig;
+use crate::options::ServerArgs;
 use crate::updates::change::Applied;
 use crate::updates::switch::{Node, Roster, Start, Switch};
 
@@ -178,7 +178,7 @@ fn record(
 
 /// The nodes the epoch's main processes run on: this host at rank 0, and the
 /// rank layout's hosts for the other ranks.
-fn nodes(config: &ServeConfig) -> Result<Vec<Node>, UpdateError> {
+fn nodes(config: &ServerArgs) -> Result<Vec<Node>, UpdateError> {
     let count = config.nnodes.get();
     let mut nodes = Vec::with_capacity(count as usize);
     nodes.push(Node {
@@ -230,7 +230,7 @@ mod tests {
 
     use super::*;
     use crate::epoch::{BuildConfig, FilledPrograms, Program};
-    use crate::options::ServeConfig;
+    use crate::options::ServerArgs;
     use crate::updates::switch::{Event, Phase, Start};
     use proto::process::{self, Spawn};
 
@@ -299,7 +299,7 @@ mod tests {
     }
 
     fn previous() -> Deployment {
-        Deployment::of(ServeConfig::default())
+        Deployment::of(ServerArgs::default())
     }
 
     /// The same deployment at another executable: a change of the build
