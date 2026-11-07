@@ -40,7 +40,7 @@ import tempfile
 import threading
 import time
 import tomllib
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -910,14 +910,15 @@ def _apply(base_url: str, *assignments: str) -> dict:
 
 
 def _change_world(base_url: str, *assignments: str) -> dict:
-    """Applies `assignments` as a world change and commits the successor;
-    returns the change's report.
+    """Applies `assignments` as an epoch switch and commits the target; returns
+    the update's report.
     """  # noqa: D205
     result = _apply(base_url, *assignments)
     assert result["change"] == "epoch", result
+    report = _on_trial(base_url)
     committed = _admin(base_url, "config/commit")
     assert committed.status_code == 200, committed.text
-    return result["epoch"]
+    return report
 
 
 def test_a_serving_deployment_answers_its_admin_api(
@@ -974,17 +975,13 @@ def test_a_serving_deployment_answers_its_admin_api(
         assert committed.status_code == 200, committed.text
         before_update = len(read)
         report = _change_world(base_url, CHANGE)
-        print(f"world change pause: {report['pause_seconds']:.3f} s")
+        print(f"epoch switch pause: {report['pause_ms']} ms")
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
         text = "".join(read)
         assert len(read) > before_update, "the stream ended before the update"
         numbers = [int(word) for word in re.findall(r"\d+", text)]
         assert numbers[:100] == list(range(1, 101)), text[:400]
-        assert any(
-            "the engine took the new scheduling limits in place" in line
-            for line in _log_lines(log)
-        )
 
         # The manager attaches, follows the node's events and detaches.
         manager = shutil.which("uniserve-manager") or str(
@@ -1178,6 +1175,46 @@ def test_a_hot_restart_hands_the_deployment_to_a_successor_daemon(
         # inherits this environment, so both processes log them.
         with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
             _restart_while_streaming(base_url, name, log, successors)
+    finally:
+        for pid in successors:
+            _stop_pid(pid)
+
+
+def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
+    tmp_path: Path, runtime: Path
+):
+    """A successor daemon learns what a target maps from the process that serves.
+
+    The epoch that serves took its storage from the one before it, under that
+    world's name. The daemon that switched it is gone, and the next target still
+    maps that storage.
+    """
+    name = "qwen3-live-restart-switch"
+    log = tmp_path / "server.log"
+    executables = []
+    for ordinal in range(2):
+        directory = tmp_path / f"executable-{ordinal}"
+        directory.mkdir()
+        shutil.copy2(worker_executable(), directory / worker_executable().name)
+        executables.append(directory / worker_executable().name)
+    successors: list[int] = []
+    try:
+        with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
+            answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+            _change_world(base_url, f"worker_config.executable={executables[0]}")
+            _purged(base_url)
+            restarted = _admin(base_url, "restart")
+            assert restarted.status_code == 200, (
+                f"{restarted.text}{_log_trouble(log)}"
+            )
+            successors.append(restarted.json()["result"]["pid"])
+            _chat(base_url, name, RECOVERY_PROMPT, tokens=8)
+            _change_world(base_url, f"worker_config.executable={executables[1]}")
+            after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+            assert (
+                after["choices"][0]["message"]["content"]
+                == answer["choices"][0]["message"]["content"]
+            )
     finally:
         for pid in successors:
             _stop_pid(pid)
@@ -1750,9 +1787,16 @@ def _ballast(device: str, leave_gib: float) -> Iterator[int]:
         process.wait(timeout=120)
 
 
-def test_a_world_change_under_storage_pressure_shrinks_the_kv_cache(
+def test_a_target_that_finds_no_storage_leaves_the_serving_epoch_serving(
     tmp_path: Path, runtime: Path
 ):
+    """A target beside a full GPU ends the update and changes nothing that serves.
+
+    A switch asks the serving epoch for no storage: the target maps its cache,
+    and its graphs are its own to find. With two GiB left on the GPU it finds no
+    room for them, so the update ends on its exit, and the stream goes on with
+    the cache as it was.
+    """
     name = "qwen3-live-pressure"
     log = tmp_path / "server.log"
     device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
@@ -1770,37 +1814,25 @@ def test_a_world_change_under_storage_pressure_shrinks_the_kv_cache(
         _wait_until(lambda: len(read) >= 32, 300, "the count did not stream")
         with _ballast(device, leave_gib=2.0) as held:
             print(f"ballast holds {held / (1 << 30):.1f} GiB; GPU free 2 GiB")
-            report = _change_world(base_url, CHANGE)
-            print(
-                "world change under pressure, pause: "
-                f"{report['pause_seconds']:.3f} s"
+            result = _apply(base_url, CHANGE)
+            assert result["change"] == "epoch", result
+            _wait_until(
+                lambda: _update(base_url).get("phase") == "abandoned",
+                600,
+                f"the update did not end: {_log_trouble(log)}",
             )
+            report = _update(base_url)
+            print("epoch switch under pressure:", json.dumps(report))
+            assert report["failure"]["kind"] == "process_exit", report
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
         numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
         assert numbers[:200] == list(range(1, 201)), "".join(read)[:400]
-
-        lines = _log_lines(log)
-        withdrew = [
+        assert not [
             line
-            for line in lines
+            for line in _log_lines(log)
             if "withdrew the tail of the KV cache" in line
-        ]
-        gave = [
-            line
-            for line in lines
-            if "gave back the tail of the KV cache" in line
-        ]
-        grew = [
-            line
-            for line in lines
-            if "growing the KV cache into the storage freed" in line
-        ]
-        for line in withdrew + gave + grew:
-            print(line)
-        assert withdrew, "the serving world did not shrink its KV cache"
-        assert gave, "the serving world's workers did not give the tail back"
-        assert grew, "the committed successor did not grow its KV cache"
+        ], "the switch shrank the serving epoch's KV cache"
         after = _chat(base_url, name, prompt, 32)["choices"][0]["message"][
             "content"
         ]
@@ -1861,8 +1893,7 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
         assert alone["choices"][0]["message"]["content"] == before, alone
         assert abs(after - awake) <= 2 * 1024, (awake, after)
         lines = _log_lines(log)
-        assert any("the worker sleeps" in line for line in lines)
-        assert any("the worker woke" in line for line in lines)
+        assert any("the ranks sleep" in line for line in lines)
         status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
         assert status["deployment"]["asleep"] is False, status
         assert status["deployment"]["paused"] is False, status
@@ -2094,6 +2125,98 @@ def test_a_lost_main_process_is_relaunched_without_a_standby(
         assert evidence["relaunched"]
 
 
+def test_a_standby_started_after_a_switch_maps_what_its_epoch_serves_from(
+    tmp_path: Path, runtime: Path
+):
+    """A standby of a target maps storage another world created.
+
+    A target serves from the storage of the epoch before it, under that world's
+    name. The standby started beside the target finds it under the same name,
+    and takes over when the target's process is lost.
+    """
+    name = "qwen3-live-standby-switch"
+    log = tmp_path / "server.log"
+    options = (*OPTIONS, "worker_config.standby=true")
+    prepared = "the standby is prepared beside the serving engine"
+    with _serve(runtime, log, name, options=options) as base_url:
+        _wait_until(
+            lambda: _occurrences(log, prepared) >= 1,
+            600,
+            "the first epoch's standby did not start",
+        )
+        successor = tmp_path / worker_executable().name
+        shutil.copy2(worker_executable(), successor)
+        result = _apply(base_url, f"worker_config.executable={successor}")
+        assert result["change"] == "epoch", result
+        _on_trial(base_url)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        _purged(base_url)
+        _wait_until(
+            lambda: _occurrences(log, prepared) >= 2,
+            600,
+            f"the target's standby did not start: {_log_trouble(log)}",
+        )
+        evidence = _lose_the_serving_engine(
+            base_url, log, name, "standby-after-a-switch", standby=True
+        )
+        assert evidence["promoted"]
+
+
+def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
+    tmp_path: Path, runtime: Path
+):
+    """A process started again keys the storage it creates by its own world.
+
+    The epoch that replaces it maps that storage. So it does after a target's
+    process is lost, when the first epoch's storage is gone with it, and after a
+    revert that started the epoch again on the weights it kept.
+    """
+    name = "qwen3-live-relaunched-storage"
+    log = tmp_path / "server.log"
+    executables = []
+    for ordinal in range(3):
+        directory = tmp_path / f"executable-{ordinal}"
+        directory.mkdir()
+        shutil.copy2(worker_executable(), directory / worker_executable().name)
+        executables.append(directory / worker_executable().name)
+    with _serve(runtime, log, name) as base_url:
+        answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        result = _apply(base_url, f"worker_config.executable={executables[0]}")
+        assert result["change"] == "epoch", result
+        _on_trial(base_url)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        _purged(base_url)
+        _lose_the_serving_engine(
+            base_url, log, name, "relaunched-after-a-switch", standby=False
+        )
+        result = _apply(
+            base_url,
+            f"worker_config.executable={executables[1]}",
+            "update_config.previous_world=weights",
+        )
+        assert result["change"] == "epoch", result
+        _on_trial(base_url)
+        rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
+        assert rolled.status_code == 200, rolled.text
+        _wait_until(
+            lambda: _update(base_url).get("phase") == "abandoned",
+            300,
+            f"the revert did not end: {_log_trouble(log)}",
+        )
+        result = _apply(base_url, f"worker_config.executable={executables[2]}")
+        assert result["change"] == "epoch", result
+        _on_trial(base_url)
+        committed = _admin(base_url, "config/commit")
+        assert committed.status_code == 200, committed.text
+        after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
+        assert (
+            after["choices"][0]["message"]["content"]
+            == answer["choices"][0]["message"]["content"]
+        )
+
+
 def test_an_epoch_switch_to_a_new_executable_fails_no_request(
     tmp_path: Path, runtime: Path
 ):
@@ -2183,6 +2306,8 @@ def _update(base_url: str) -> dict:
 
 # The span a trial's step time and throughput are averaged over.
 TRIAL_WINDOW_S = 5
+# Longer than the period an engine reports its counters on.
+STATS_REPORT_S = 3
 
 
 def _slower_executable(directory: Path) -> Path:
@@ -2258,6 +2383,33 @@ def _assert_whole(streaming: threading.Thread, streamed: dict) -> int:
         )
     assert len(streamed["reasons"]) == 1, f"the count ended {streamed['reasons']}"
     return len(numbers)
+
+
+def _host_tokens_read(base_url: str, ask: Callable[[], object]) -> float:
+    """The tokens `ask` reads from the host KV cache.
+
+    An engine reports its counters on a period, so each reading waits for the
+    report that holds what came before it.
+    """
+    time.sleep(STATS_REPORT_S)
+    before = _metric(base_url, "uniserve:prefix_cache_host_hits")
+    ask()
+    time.sleep(STATS_REPORT_S)
+    return _metric(base_url, "uniserve:prefix_cache_host_hits") - before
+
+
+def _purged(base_url: str) -> None:
+    """Waits until the committed switch ended its previous epoch."""
+    _wait_until(
+        lambda: _update(base_url).get("phase") == "purged",
+        300,
+        "the commit did not end the previous epoch",
+    )
+
+
+def _occurrences(log: Path, line: str) -> int:
+    """How many lines of the log hold `line`."""
+    return sum(line in text for text in _log_lines(log))
 
 
 def _on_trial(base_url: str) -> dict:
@@ -2586,6 +2738,91 @@ def test_warming_waits_for_the_stated_tail_and_limits_the_prefill(
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
         assert _numbers([answer["choices"][0]["message"]["content"]])[:3] == [1, 2, 3]
         _artifact("warming-options", {"tight": tight, "under_prefills": limited})
+
+
+def test_a_request_that_ends_at_once_leaves_its_pages_in_the_host_cache(
+    tmp_path: Path, runtime: Path
+):
+    """A prompt's pages reach the host KV cache though no batch follows them.
+
+    A request of one output token ends with the step that completes its pages,
+    and nothing else runs, so their copy has no later batch to go with: the
+    scheduler submits a batch of copies alone.
+    """
+    name = "qwen3-live-copies-alone"
+    log = tmp_path / "server.log"
+    prompt = " ".join(f"entry {index} of the table" for index in range(800))
+    with _serve(runtime, log, name) as base_url:
+        _chat(base_url, name, prompt, tokens=1)
+        time.sleep(2)
+        flushed = _admin(base_url, "flush_cache")
+        assert flushed.status_code == 200, flushed.text
+        found = _host_tokens_read(
+            base_url, lambda: _chat(base_url, name, prompt, tokens=1)
+        )
+        print("host tokens of a request of one token:", found)
+        assert found > 0, found
+
+
+def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
+    tmp_path: Path, runtime: Path
+):
+    """A page in the host KV cache belongs to the weights that computed it.
+
+    A prompt finds its pages in the host cache once the device's prefix cache is
+    flushed. After an update to other weights the same prompt finds none of them,
+    although the new weights name the same model: it computes its own, which the
+    next flush makes it find. The other checkpoint is another copy of the files,
+    so the two weights answer alike and a stale page would go unseen in the text.
+    """
+    other = os.environ.get("UNISERVE_QWEN3_UPDATED_MODEL")
+    if not other:
+        pytest.skip("UNISERVE_QWEN3_UPDATED_MODEL names no other checkpoint")
+    name = "qwen3-live-weights-pages"
+    log = tmp_path / "server.log"
+    prompt = " ".join(f"item {index} of the list" for index in range(800))
+
+    def found_in_the_host_cache() -> float:
+        """Sends the prompt on a flushed device; the host tokens it reads."""
+        flushed = _admin(base_url, "flush_cache")
+        assert flushed.status_code == 200, flushed.text
+        return _host_tokens_read(
+            base_url, lambda: _chat(base_url, name, prompt, tokens=16)
+        )
+
+    with _serve(runtime, log, name) as base_url:
+        first = _chat(base_url, name, prompt, tokens=16)
+        time.sleep(2)
+        old_weights = found_in_the_host_cache()
+        print("host tokens of the first weights:", old_weights)
+        assert old_weights > 0, old_weights
+        updated = _admin(base_url, "update_weights", {"model_path": other})
+        assert updated.status_code == 200, updated.text
+        print("updated:", updated.text[:400])
+        answers = []
+        stale = _host_tokens_read(
+            base_url,
+            lambda: answers.append(_chat(base_url, name, prompt, tokens=16)),
+        )
+        second = answers[0]
+        print("host tokens after the update:", stale)
+        assert stale == 0, stale
+        assert (
+            second["choices"][0]["message"]["content"]
+            == first["choices"][0]["message"]["content"]
+        )
+        time.sleep(2)
+        new_weights = found_in_the_host_cache()
+        print("host tokens of the new weights:", new_weights)
+        assert new_weights > 0, new_weights
+        _artifact(
+            "weight-update-host-pages",
+            {
+                "host_tokens_found_under_the_first_weights": old_weights,
+                "host_tokens_found_after_the_update": stale,
+                "host_tokens_found_under_the_new_weights": new_weights,
+            },
+        )
 
 
 def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
