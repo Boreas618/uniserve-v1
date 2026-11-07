@@ -1781,14 +1781,15 @@ impl UnitColumn {
 mod segment_rounding_tests {
     use super::*;
 
-    /// A plane of a sixteenth of a granule fills a granule every sixteen units. A cache fitted to a
-    /// capacity keeps what it was asked for, and one fitted to the storage rounds into it.
+    /// A plane of a thirty-second of a granule fills a granule every thirty-two units, as a
+    /// Qwen3-30B-A3B page does. A cache fitted to a capacity keeps what it was asked for, and one
+    /// fitted to the storage rounds into it.
     #[test]
     fn a_capacity_rounds_up_to_whole_segments_and_a_grant_rounds_down() {
-        let (plane, granule) = (1 << 16, 1 << 20);
+        let (plane, granule) = (1 << 16, 1 << 21);
         assert_eq!(segmented_units(640, plane, granule), 512);
-        assert_eq!(segmented_units_above(640, plane, granule), 640);
-        assert_eq!(segmented_units_above(641, plane, granule), 768);
+        assert_eq!(segmented_units_above(640, plane, granule), 768);
+        assert_eq!(segmented_units_above(768, plane, granule), 768);
         // Too few units for a segment of whole granules stay as they are.
         assert_eq!(segmented_units_above(7, plane, granule), 7);
     }
