@@ -727,7 +727,7 @@ async fn program_update(
         // No replica serves: the world path answers that account itself.
         return Ok(None);
     };
-    let Ok((target, _, _)) = crate::updates::change::resolve(&current, request) else {
+    let Ok((target, _, options)) = crate::updates::change::resolve(&current, request) else {
         // The change itself is refused; the world path answers it the same way.
         return Ok(None);
     };
@@ -747,7 +747,7 @@ async fn program_update(
     let epochs = leader.epochs();
     let number = admin.running_number();
     let planned = match leader
-        .apply_programs(number, &target, request.force, true)
+        .apply_programs(number, &target, &options, request.force, true)
         .await
     {
         Ok(Some(planned)) => planned,
@@ -763,7 +763,7 @@ async fn program_update(
     let epoch = epochs.serving().map_or(0, |(epoch, _)| epoch);
     program_phase(admin, &epochs, Phase::Precopy, epoch, &planned);
     match leader
-        .apply_programs(number, &target, request.force, false)
+        .apply_programs(number, &target, &options, request.force, false)
         .await
     {
         Ok(Some(update)) => {

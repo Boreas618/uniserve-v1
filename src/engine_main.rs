@@ -929,6 +929,8 @@ pub(crate) struct MainProcess {
     boundary: bool,
     /// A `Serve` that arrived before the boundary: the epoch may admit, but not yet.
     pending_serve: bool,
+    /// A `Serve` that arrived while the epoch drained: it serves again once the drain ended.
+    serve_after_drain: Option<proto::process::Serve>,
     /// Whether admission is owed to the warmup: the switchover that opens the epoch queues one
     /// capture per device and does not wait for them, so a batch admitted the moment the boundary
     /// opened could be planned into a bucket whose capture has not run - a replay finds no graph of
@@ -1201,6 +1203,7 @@ impl MainProcess {
             serving: false,
             boundary: false,
             pending_serve: false,
+            serve_after_drain: None,
             admission_owed: false,
             max_running_requests: u32::try_from(build.max_running_requests.get())
                 .unwrap_or(u32::MAX),
@@ -3473,6 +3476,10 @@ impl MainProcess {
         // drained epoch reaches none, so what the precopy built is given back now rather than left
         // prepared for a boundary that cannot come.
         self.drop_prepared("the epoch drained before its switchover")?;
+        // The daemon's client reads this before the first request ends migratable, on the same
+        // connection, so a request that moves never finds this epoch ready: it waits for the epoch
+        // the frontend serves next rather than being submitted to a process that admits nothing.
+        self.announce(proto::request::wire::EngineState::Parked)?;
         // A scheduler parks once its requests have ended, and a request ends only when the daemon
         // acknowledges it through this thread, so the answers are polled from the serve pass:
         // waiting here would hold the acknowledgement the park is waiting for.
@@ -3522,6 +3529,10 @@ impl MainProcess {
                 },
             )),
         });
+        // A revert that overtook the drain serves this epoch again, now that it can.
+        if let Some(serve) = self.serve_after_drain.take() {
+            self.resume(serve)?;
+        }
         Ok(())
     }
 
@@ -3583,6 +3594,11 @@ impl MainProcess {
             self.pending_serve = true;
             return Ok(());
         }
+        if self.draining.is_some() {
+            self.serve_after_drain = Some(serve);
+            return Ok(());
+        }
+        let drained = self.parked.is_some();
         // §2.5: a process that parked gave its segments back, so nothing may be admitted until they
         // are mapped again - and a wake that fails fails the resume by name rather than serving
         // unmapped pages.
@@ -3592,7 +3608,27 @@ impl MainProcess {
         // owed rather than refused: admission opens when the last submission finishes, the same way
         // it does at a switchover (§4.5).
         self.open_admission()
-            .with_context(|| format!("resuming epoch {}", serve.epoch))
+            .with_context(|| format!("resuming epoch {}", serve.epoch))?;
+        if drained {
+            // A target ran on this cache's storage while this epoch stood drained, so what its
+            // index names holds the target's pages now. The frontend moves only after the report
+            // below, so every request comes after this command.
+            for scheduler in &self.schedulers {
+                scheduler.flush_cache();
+            }
+            // §7.4 step 5: the daemon returns a drained epoch to serving and moves the frontend once
+            // every host says so, as a promotion's answer says it of a target.
+            self.send_report(proto::process::Report {
+                kind: Some(proto::process::report::Kind::Promoted(
+                    proto::process::Promoted {
+                        generation: self.control.engine(),
+                        program_generation: self.served_generation(),
+                    },
+                )),
+            });
+            self.announce(proto::request::wire::EngineState::Ready)?;
+        }
+        Ok(())
     }
 
     /// Promotes this standby in place (§2.5).
@@ -4248,12 +4284,10 @@ impl MainProcess {
                     error: WORKER_ERA.to_owned(),
                 }),
             ),
+            // A warming reads how far the requests in flight reached the host KV cache, and limits
+            // what they prefill meanwhile; both are every scheduler's own state (§7.4 step 1).
             Some(proto::request::wire::engine_command::Kind::CacheWarm(warm)) => Some(
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: warm.id,
-                    results: Vec::new(),
-                    error: WORKER_ERA.to_owned(),
-                }),
+                proto::request::wire::from_engine::Kind::Hooked(self.warm_cache(warm)),
             ),
             // The executor era's park, resume and trial commit move an executor world between
             // processes. The epoch parks, resumes and commits through the process connection, in
@@ -4355,6 +4389,48 @@ impl MainProcess {
             self.send_event(front, kind);
         }
         Ok(None)
+    }
+
+    /// Answers one operation of an epoch's warming from every scheduler.
+    ///
+    /// Only the operations that stay inside a scheduler are this process's: the copies of the
+    /// executor era's warming ran on its workers' hooks, and an epoch's pages reach a target through
+    /// the host KV cache. The operations asked here take no fence, so a scheduler answers at its
+    /// next pass; the bound is the one a scheduler that stopped answering is named by.
+    fn warm_cache(&mut self, warm: proto::request::wire::CacheWarm) -> proto::request::wire::Hooked {
+        use storage::manifest::cache::Operation;
+        let hooked = |results: Vec<String>, error: String| proto::request::wire::Hooked {
+            id: warm.id,
+            results,
+            error,
+        };
+        let operation: Operation = match serde_json::from_slice(&warm.operation) {
+            Ok(operation) => operation,
+            Err(error) => return hooked(Vec::new(), error.to_string()),
+        };
+        if !matches!(operation, Operation::Prefill { .. } | Operation::Warmed) {
+            return hooked(Vec::new(), WORKER_ERA.to_owned());
+        }
+        let together = engine::HookBarrier::new(self.schedulers.len());
+        let answers: Vec<_> = self
+            .schedulers
+            .iter()
+            .map(|scheduler| scheduler.cache_warm(operation.clone(), Arc::clone(&together)))
+            .collect();
+        let mut results = Vec::with_capacity(answers.len());
+        for answer in answers {
+            match answer.recv_timeout(WARMING_ANSWER) {
+                Ok(Ok(result)) => results.extend(result),
+                Ok(Err(error)) => return hooked(Vec::new(), error),
+                Err(error) => {
+                    return hooked(
+                        Vec::new(),
+                        format!("a scheduler did not answer the warming: {error}"),
+                    );
+                }
+            }
+        }
+        hooked(results, String::new())
     }
 
     /// Sends the engine's counters to the daemon, one report a second and a
@@ -4662,7 +4738,11 @@ impl MainProcess {
             | proto::request::wire::EngineState::Standby => Some(self.engine_info()?),
             _ => None,
         };
-        self.announced = info.clone();
+        // A parked process states no info and keeps what it announced: its cache's description
+        // holds until it serves again.
+        if info.is_some() {
+            self.announced = info.clone();
+        }
         tracing::info!(
             state = ?state,
             schedulers = self.schedulers.len(),
@@ -5135,6 +5215,9 @@ fn answer(
         }
     }
 }
+
+/// How long a scheduler takes to answer a warming's read: its next pass.
+const WARMING_ANSWER: Duration = Duration::from_secs(2);
 
 /// What the engine answers a command of the executor era's surface: the operation named an executor
 /// world of its own, and this epoch executes batches itself (§2.4).
