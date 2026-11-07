@@ -337,6 +337,32 @@ impl JobQueue {
         Some(entry)
     }
 
+    /// Whether a command other than a join is pending.
+    pub(crate) fn has_pending_besides_joins(&self) -> bool {
+        lock(&self.state).pending.iter().any(|entry| !is_join(entry))
+    }
+
+    /// The first pending command that is not a join, when only joins are ahead of it and `wanted`
+    /// accepts it; the joins stay queued, in their order.
+    pub(crate) fn next_past_joins(&self, wanted: impl FnOnce(&Entry) -> bool) -> Option<Entry> {
+        let mut state = lock(&self.state);
+        if state.closed {
+            return None;
+        }
+        let index = state.pending.iter().position(|entry| !is_join(entry))?;
+        if index == 0 || !wanted(&state.pending[index]) {
+            return None;
+        }
+        let entry = state.pending.remove(index)?;
+        state.current = Some(Current {
+            submission: entry.submission_id,
+            kind: entry.kind,
+            batch: entry.batch,
+            started: std::time::Instant::now(),
+        });
+        Some(entry)
+    }
+
     /// Whether a command is pending.
     pub(crate) fn has_pending(&self) -> bool {
         !lock(&self.state).pending.is_empty()
@@ -438,6 +464,15 @@ impl JobQueue {
         drop(state);
         self.ready.notify_all();
     }
+}
+
+/// Whether `entry` only joins a peer's expert step.
+fn is_join(entry: &Entry) -> bool {
+    matches!(
+        &entry.command,
+        Command::Steps { jobs, .. }
+            if !jobs.is_empty() && jobs.iter().all(|job| matches!(job, Job::Join { .. }))
+    )
 }
 
 impl std::fmt::Debug for JobQueue {
