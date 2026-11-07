@@ -1570,17 +1570,22 @@ impl Scheduler {
                 // Hit pages that are currently unreferenced count as free
                 // until acquisition takes them, so they are subtracted from
                 // the free units. A resident keeps what it holds until it ends
-                // and takes the rest of its prompt chunk by chunk, and a host
-                // hit holds the units of all its pages from its admission, so
-                // the head leaves the units the residents' prompts still take:
-                // requests that hold every unit with none for their tails
-                // would wait for one another until the watchdog fails them.
+                // and is never preempted, and a host hit holds the units of all
+                // its pages from its admission, so the head's whole prompt fits
+                // beside what the residents' prompts still take: requests that
+                // hold every unit with none for their tails would wait for one
+                // another until the watchdog fails them.
+                let head_units = cache
+                    .coordinator
+                    .units_after_prefix(cached_tokens, n)
+                    .min(cache.coordinator.min_units_for_prompt(n, chunk_limit))
+                    .max(first_chunk_units);
                 let capacity_available = self
                     .storage
                     .free_units()
                     .saturating_sub(prefix_hit.cached_free_units)
                     .saturating_sub(self.units_residents_still_need(chunk_limit))
-                    >= first_chunk_units;
+                    >= head_units;
                 if capacity_available {
                     let Some(st) = self.waiting.pop_front() else {
                         break;
