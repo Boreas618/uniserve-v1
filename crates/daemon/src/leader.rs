@@ -2659,6 +2659,11 @@ impl Replica {
         }
     }
 
+    /// Whether a switch still decides which engine serves this replica.
+    pub(crate) fn follows_a_switch(&self) -> bool {
+        self.following.load(Ordering::SeqCst)
+    }
+
     /// Starts the standby in the background, if this replica serves and has
     /// none. Errors are logged: a replica without a standby still serves, and a
     /// loss then relaunches ([`Replica::recover`]) instead of promoting.

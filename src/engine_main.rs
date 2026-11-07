@@ -5847,18 +5847,35 @@ fn announce(
     state: proto::request::wire::EngineState,
     info: Option<proto::request::wire::EngineInfo>,
 ) -> Result<()> {
-    control
-        .daemon_mut()
-        .send(&proto::request::wire::FromEngine {
-            kind: Some(proto::request::wire::from_engine::Kind::State(
-                proto::request::wire::State {
-                    state: state as i32,
-                    info,
-                    error: String::new(),
-                },
-            )),
-        })
-        .context("stating what this process is to the daemon")
+    let message = proto::request::wire::FromEngine {
+        kind: Some(proto::request::wire::from_engine::Kind::State(
+            proto::request::wire::State {
+                state: state as i32,
+                info,
+                error: String::new(),
+            },
+        )),
+    };
+    // Every live front is told: a handover closes the launching daemon's front and leaves the
+    // attached ones serving, so a state stated to that front alone would end this process for a
+    // daemon that left.
+    let mut delivered = 0;
+    let mut failure = None;
+    for front in control.report_fronts() {
+        let Some(connection) = control.front_mut(front) else {
+            continue;
+        };
+        match connection.send(&message) {
+            Ok(()) => delivered += 1,
+            Err(error) => failure = Some(error),
+        }
+    }
+    match failure {
+        Some(error) if delivered == 0 => {
+            Err(error).context("stating what this process is to the daemon")
+        }
+        _ => Ok(()),
+    }
 }
 
 /// What the engine answers a command over the deployment's storage ledgers or transfer budgets:

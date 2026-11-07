@@ -343,6 +343,11 @@ impl Leader {
             .try_lock()
             .map_err(|_| UpdateError::InProgress)?;
         let replicas = self.replicas();
+        // A switch that ended still hands the replica to the epoch that serves, and the serving
+        // client is the one this change would be built from.
+        if !request.dry_run && replicas.iter().any(|replica| replica.follows_a_switch()) {
+            return Err(UpdateError::InProgress);
+        }
         let current = locked(&replicas[0].config).clone();
         let (target, _stated, update) = resolve(&current, &request)?;
         // A target that reverted with a failure is unavailable until it is
