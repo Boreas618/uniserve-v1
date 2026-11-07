@@ -376,6 +376,11 @@ struct DispatchParams {
 /// A block takes tokens in turn. Its first threads name the ranks a token goes to
 /// and claim a slot in each; then the whole block stores the row into every target.
 /// The last block to finish publishes the counts and waits for every peer's.
+/// The rank holding expert `id`, or -1 for an id that names no expert.
+__device__ __forceinline__ int target_of(int32_t id, int experts, int per_rank) {
+  return (id >= 0 && id < experts) ? id / per_rank : -1;
+}
+
 __global__ void __launch_bounds__(kThreads) dispatch_kernel(const DispatchParams p) {
   __shared__ int32_t target_slot[kMaxRanks];
   __shared__ bool is_last;
@@ -393,14 +398,17 @@ __global__ void __launch_bounds__(kThreads) dispatch_kernel(const DispatchParams
       target_slot[rank] = -1;
     }
     __syncthreads();
-    // One route per thread: the first route of each target claims the target's slot.
+    // One route per thread: the first route of each target claims the target's slot. An id
+    // outside the vocabulary names no expert, so its route goes nowhere: a row whose hidden state
+    // is no token's (a warm pose's) routes by whatever its router made of it.
     if (threadIdx.x < p.top) {
       const int route = threadIdx.x;
-      const int target = p.ids[static_cast<int64_t>(token) * p.top + route] / per_rank;
-      bool first = true;
+      const int target = target_of(p.ids[static_cast<int64_t>(token) * p.top + route],
+                                   p.experts, per_rank);
+      bool first = target >= 0;
       for (int earlier = 0; earlier < route; ++earlier) {
-        first = first &&
-                p.ids[static_cast<int64_t>(token) * p.top + earlier] / per_rank != target;
+        first = first && target_of(p.ids[static_cast<int64_t>(token) * p.top + earlier],
+                                   p.experts, per_rank) != target;
       }
       int32_t slot = -1;
       if (first) {
