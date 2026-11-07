@@ -163,6 +163,8 @@ def main():
             "scale_kind": "i32",
             "ids": "*i32",
             "weights": "*fp32",
+            # The logical-to-physical expert map, a pointer the operator passes null without one.
+            "map": "*i32",
         },
     }
     (out / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")

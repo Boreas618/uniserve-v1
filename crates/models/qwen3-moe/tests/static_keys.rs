@@ -62,7 +62,6 @@ fn the_walk_states_the_model_with_no_weights_and_no_device() {
         "kv_write",
         "paged_attention",
         "topk_softmax",
-        "expert_gather",
         "moe_sort",
         "gather_gemm",
         "route_gemm",
