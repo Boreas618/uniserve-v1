@@ -15,7 +15,7 @@ use ops::rope::{
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::layers::launch::{PDL, QK_NORM_TOKENS, ROTARY_BLOCK};
+use crate::layers::launch::{PDL, QK_NORM_ROWS, ROTARY_BLOCK};
 
 /// The tokens one program of the strided form normalizes, per head.
 const STRIDED_TOKENS: u32 = 8;
@@ -309,7 +309,7 @@ impl Rotary {
             rotation,
             epsilon: epsilon.into(),
             rotated,
-            rows: QK_NORM_TOKENS,
+            rows: QK_NORM_ROWS,
             block: head.next_power_of_two().min(1024) as u32,
             affine,
             pdl: PDL,

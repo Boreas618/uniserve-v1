@@ -96,7 +96,7 @@
 
 use minimax_h3::SPLIT_HALF;
 use nn::layers::tiles::{
-    ELEMENTWISE_BLOCK, EMBEDDING_TOKENS, LOGITS_BLOCK, PDL, POSITION_BLOCK, QK_NORM_TOKENS,
+    ELEMENTWISE_BLOCK, EMBEDDING_TOKENS, LOGITS_BLOCK, PDL, POSITION_BLOCK, QK_NORM_ROWS,
     ROTARY_BLOCK, ROTATE_BLOCK, ROWS_BLOCK, UNPATCHIFY_BLOCK, row_tile,
 };
 use ops::DType;
@@ -1109,7 +1109,7 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
                 rotation: SPLIT_HALF,
                 epsilon: ops::Float::from(NORM_EPSILON),
                 rotated: ROTATED,
-                rows: QK_NORM_TOKENS,
+                rows: QK_NORM_ROWS,
                 block: row_tile(HEAD_DIM).min(1024),
                 affine: true,
                 pdl: PDL,
@@ -1456,7 +1456,7 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
                 // and a 64-bit literal would name a different key.
                 epsilon: ops::Float::from(1.0e-5_f32),
                 rotated: 48,
-                rows: QK_NORM_TOKENS,
+                rows: QK_NORM_ROWS,
                 // `head_dim.next_power_of_two().min(1024)` - the row tile `nn`'s `Rotary` builds.
                 block: 64,
                 affine: false,
