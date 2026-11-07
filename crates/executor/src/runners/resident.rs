@@ -582,7 +582,7 @@ impl KvProvider for ResidentCache {
             }
             // The units are this cache's before anything is written into them.
             let acquired: Vec<u32> = allocation.unit_ids.iter().map(|unit| unit.0).collect();
-            cache.reset_units(&acquired, stream)?;
+            cache.acquire_units(&acquired, stream)?;
             cache.copy_units(&allocation.copies, stream)?;
         }
         Ok(())

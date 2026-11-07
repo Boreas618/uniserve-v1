@@ -658,6 +658,36 @@ impl PrefixCache {
         column.recycle(units, stream)
     }
 
+    /// Make the given units of every group fresh for a new owner on `stream`: flags zero and scales
+    /// one, and the values left as they are.
+    ///
+    /// A unit the mechanism acquires for a request is written before it is read: attention reads a
+    /// page only below the request's length, and a page the request continues from an earlier one
+    /// is copied in first. So zeroing its values is a fill of every layer's page that no read
+    /// observes, issued on the batch stream ahead of the forward, one fill per column for each run
+    /// of units. The flags and scales are what a later import and a quantized read do observe.
+    pub fn acquire_units(&mut self, units: &[u32], stream: impl Issue) -> Result<()> {
+        let mut units = units.to_vec();
+        units.sort_unstable();
+        units.dedup();
+        if units.first() == Some(&0) {
+            return Err(Error::Invalid(
+                "unit zero is the block tables' sentinel and cannot be acquired".to_owned(),
+            ));
+        }
+        let mut start = 0;
+        while start < units.len() {
+            let mut end = start + 1;
+            while end < units.len() && units[end] == units[end - 1] + 1 {
+                end += 1;
+            }
+            self.planes
+                .reset_units(units[start], (end - start) as u32, false, stream)?;
+            start = end;
+        }
+        Ok(())
+    }
+
     /// Reset the given units of every group on `stream`: values and flags
     /// zero, scales one, so a later import converts those pages again.
     ///
