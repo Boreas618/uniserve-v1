@@ -1909,12 +1909,15 @@ impl Moe {
                     .to_owned(),
             ));
         };
+        // The received rows this walk's graph is shaped for, which the agreed step fits.
+        let narrowed = exchange.narrowed();
+        let exchange = &narrowed;
         let hidden_width = u64::from(self.hidden);
         let top = u64::from(self.top);
         let tokens = hidden.rows();
         let local = u64::from(self.local);
         let intermediate = u64::from(self.intermediate);
-        let received = u64::from(exchange.ranks) * u64::from(exchange.capacity);
+        let received = u64::from(exchange.ranks) * u64::from(exchange.step_rows);
         let arena = f.arena();
         let launch_tokens = u32::try_from(tokens)
             .map_err(|_| Error::shape("Moe", format!("{tokens} tokens exceed u32")))?;

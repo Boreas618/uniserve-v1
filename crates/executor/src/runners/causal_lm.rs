@@ -1738,6 +1738,8 @@ pub struct CausalLmRunner<M: CausalLm> {
     turn: usize,
     /// Whether the columns were moved to device storage, which the first capture does.
     placed: bool,
+    /// The bucket the last warm walk made ready, without its expert step size.
+    warmed: Option<Bucket>,
     /// The last prefill batch's dump line and the page bytes it left behind, so a decode's line is
     /// read beside the write that should have fed it.
     last_prefill: Option<String>,
@@ -1901,6 +1903,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             flights: std::collections::VecDeque::new(),
             turn: 0,
             placed: false,
+            warmed: None,
             last_prefill: None,
             enqueue_ms: 0.0,
             experts: None,
@@ -2014,13 +2017,13 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
 
     /// A replay is launched behind the one before it, because the driver takes the device idle for
     /// as long as a launch lasts when it waits for that replay to end. Every diagnosis reads a
-    /// replay's state as it ends, and a union's steps are entered in order, so those wait.
+    /// replay's state as it ends, so those wait. A union's ranks enter its steps in order on each
+    /// device thread, so a step entered behind one in flight is the next step on every rank.
     fn overlaps_replays(&self) -> bool {
         !runner_dump()
             && !eager_replay()
             && !recapture_real()
             && !graph_diff()
-            && self.experts.is_none()
     }
 
     /// A batch that keeps its logits answers its greedy rows on the host, and the next step reads
@@ -2263,12 +2266,23 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 let member = self.experts.as_mut().ok_or_else(|| {
                     Error::Invariant("a join reached a runner outside an expert union".into())
                 })?;
-                if member.woken()? && member.step(0, &stream)?.is_some() {
+                if member.woken()?
+                    && let Some(step) = member.step(0, &stream)?
+                {
                     let generation = self.lifecycle.generation.number();
+                    let join = self
+                        .buckets
+                        .at_capacity(Bucket::expert_join(), step.capacity)
+                        .ok_or_else(|| {
+                            Error::Invariant(format!(
+                                "no join graph holds a step of {} rows per rank",
+                                step.capacity
+                            ))
+                        })?;
                     let (_, captured) = self
                         .lifecycle
                         .graphs
-                        .captured_for(Bucket::expert_join(), generation)
+                        .captured_for(join, generation)
                         .ok_or_else(|| {
                             Error::Invariant(format!(
                                 "no join graph in generation {generation} or one it replaces"
@@ -2341,11 +2355,24 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 }
                 // Every rank of an expert union runs this step: the graph's dispatches wait on their
                 // devices for the peers', so the union is entered before the launch.
+                let mut expert_bucket = None;
                 if let Some(member) = self.experts.as_mut() {
                     let live = u32::try_from(self.staging.live_tokens())
                         .map_err(|_| Error::Invariant("a batch's tokens exceed u32".into()))?;
-                    member.step(live, &stream)?;
+                    // The step's rows decide which of the bucket's graphs holds its expert work.
+                    if let Some(step) = member.step(live, &stream)? {
+                        expert_bucket = Some(
+                            self.buckets.at_capacity(*bucket, step.capacity).ok_or_else(|| {
+                                Error::Invariant(format!(
+                                    "no graph of bucket {bucket} holds a step of {} rows per rank",
+                                    step.capacity
+                                ))
+                            })?,
+                        );
+                    }
                 }
+                let chosen = expert_bucket.unwrap_or(*bucket);
+                let bucket = &chosen;
                 let launched = Instant::now();
                 // A diagnosis, not a mode: the same batch, the same columns, the same arena and the
                 // same model, launched operator by operator instead of as one graph. It splits every
@@ -2601,6 +2628,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         self.place_columns()?;
+        // The same bucket for another expert step size runs the same operators over the same
+        // tokens, which the walk before it already made ready: its capture needs no warm walk.
+        let twin = self.warmed == Some(bucket.at_capacity(0));
+        self.warmed = Some(bucket.at_capacity(0));
+        if twin {
+            let stream = self.stream.clone();
+            self.capturing = true;
+            let walked = walk_capture(&stream, || self.walk(bucket, &kernels));
+            self.capturing = false;
+            return self.lifecycle.capture(bucket, generation, walked?, &kernels);
+        }
         // The first capture of the first generation is where the exchange's program exists, and
         // every rank reaches it in step: their plans capture the same buckets in the same order.
         if let Some(member) = self.experts.as_mut() {
@@ -4859,7 +4897,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
         if runner_dump() && !self.capturing {
             forward = forward.with_attention_probe(&probe);
         }
-        if let Some(views) = self.experts.as_ref().and_then(super::experts::Member::views) {
+        let shaped = self
+            .experts
+            .as_ref()
+            .and_then(super::experts::Member::views)
+            .map(|views| views.at_rows(bucket.capacity));
+        if let Some(views) = shaped.as_ref() {
             forward = forward.with_exchange(views);
         }
         let hidden = arena.tensor(
@@ -4969,8 +5012,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .and_then(super::experts::Member::views)
             .ok_or_else(|| {
                 Error::Invariant("a join walked with no expert transport".into())
-            })?;
-        let forward = Forward::new(&stream, generation, &arena).with_exchange(views);
+            })?
+            .at_rows(bucket.capacity);
+        let forward = Forward::new(&stream, generation, &arena).with_exchange(&views);
         self.model
             .join_expert_step(&forward)
             .map_err(Error::from)?;

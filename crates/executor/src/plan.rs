@@ -274,6 +274,7 @@ impl Shape {
             variant: self.variant,
             extent: Extent::None,
             serves: None,
+            capacity: 0,
         }
     }
 }
@@ -373,12 +374,24 @@ pub struct Bucket {
     /// The request this bucket serves as `(frames, width, height)`, when the extent alone does not
     /// say: a layout states latents, and a request states output frames and a canvas.
     pub serves: Option<(u32, u32, u32)>,
+    /// The rows per rank an expert step of this bucket's graph holds, or zero outside an expert
+    /// union. A union's ranks agree a step's rows before they launch, and the graph is the one whose
+    /// rows hold them: the expert work of a decode step is then shaped for the rows a decode step
+    /// exchanges, not for the largest prefill any rank could send.
+    pub capacity: u32,
 }
 
 impl Bucket {
     /// The bucket of a rank's join: the expert layers of one step, with no batch of its own.
     pub const fn expert_join() -> Self {
         Self::decode(1, Variant::ExpertJoin)
+    }
+
+    /// This bucket, captured for an expert step of `capacity` rows per rank.
+    #[must_use]
+    pub const fn at_capacity(mut self, capacity: u32) -> Self {
+        self.capacity = capacity;
+        self
     }
 
     /// A decode bucket of `rows` rows.
@@ -389,6 +402,7 @@ impl Bucket {
             tokens: rows,
             extent: Extent::None,
             serves: None,
+            capacity: 0,
         }
     }
 
@@ -404,6 +418,7 @@ impl Bucket {
             tokens,
             extent: Extent::None,
             serves: None,
+            capacity: 0,
         }
     }
 
@@ -418,6 +433,7 @@ impl Bucket {
             tokens: 0,
             extent: Extent::Latents(layout),
             serves: None,
+            capacity: 0,
         }
     }
 
@@ -433,6 +449,7 @@ impl Bucket {
             tokens: 0,
             extent: Extent::Latents(layout),
             serves: None,
+            capacity: 0,
         }
     }
 
@@ -533,6 +550,7 @@ impl Bucket {
             tokens: 0,
             extent: Extent::None,
             serves: None,
+            capacity: 0,
         }
     }
 
@@ -548,6 +566,7 @@ impl Bucket {
                 width,
             },
             serves: None,
+            capacity: 0,
         }
     }
 
@@ -593,6 +612,9 @@ impl Bucket {
 impl fmt::Display for Bucket {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.extent {
+            Extent::None if self.capacity > 0 => {
+                write!(formatter, "{}/{} expert rows", self.shape(), self.capacity)
+            }
             Extent::None => self.shape().fmt(formatter),
             Extent::Request {
                 frames,
@@ -824,6 +846,14 @@ impl Buckets {
             .iter()
             .copied()
             .find(|bucket| bucket.holds(shape))
+    }
+
+    /// `bucket`'s graph for an expert step of `capacity` rows per rank: the smallest of its
+    /// captures whose rows hold them.
+    pub fn at_capacity(&self, bucket: Bucket, capacity: u32) -> Option<Bucket> {
+        self.ascending.iter().copied().find(|candidate| {
+            candidate.at_capacity(0) == bucket.at_capacity(0) && candidate.capacity >= capacity
+        })
     }
 
     /// The smallest captured bucket that holds `shape`, or a refusal naming the shape.
