@@ -28,7 +28,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
-use ipc::ComponentConfig;
+use proto::config::BlockConfig;
 
 use crate::{Error, Result};
 
@@ -203,7 +203,7 @@ pub(crate) struct PlanInputs<'a> {
     pub physical: &'a [usize],
     /// Synchronize group creation locally (expert union present).
     pub local_sync: bool,
-    pub layouts: &'a BTreeMap<String, ComponentConfig>,
+    pub layouts: &'a BTreeMap<String, BlockConfig>,
     /// Axis selections each component's calls communicate over, from the
     /// model description; `None` selects every single axis.
     pub selections: Option<&'a BTreeMap<String, BTreeSet<Vec<String>>>>,
@@ -247,7 +247,7 @@ impl GroupPlan {
                 } else {
                     layout.ranks.clone()
                 };
-                let dimensions = layout.parallel_config.dimensions();
+                let dimensions = layout.dimensions();
                 let topology = Mesh::new(ranks, &dimensions)?;
                 let selections = match inputs.selections {
                     None => dimensions
@@ -292,7 +292,7 @@ impl GroupPlan {
             if copies == 0 || layout.distribution.is_some() || is_host_component(name) {
                 continue;
             }
-            let dimensions = layout.parallel_config.dimensions();
+            let dimensions = layout.dimensions();
             let mesh = Mesh::new(layout.ranks.clone(), &dimensions)?;
             if mesh.ranks.iter().any(|&rank| rank >= inputs.physical.len()) {
                 return Err(Error::Invalid(
@@ -410,7 +410,7 @@ impl GroupPlan {
 
 #[cfg(test)]
 mod tests {
-    use ipc::{ComponentDistribution, ParallelConfig, SequenceParallel};
+    use proto::config::{BlockDistribution, SequenceParallel};
 
     use super::*;
 
@@ -443,32 +443,28 @@ mod tests {
 
     #[test]
     fn every_rank_plans_the_same_groups_in_component_order() {
-        let tensor = ComponentConfig::parallel(
-            vec![0, 1],
-            ParallelConfig {
-                tensor_parallel_size: 2,
-                ..ParallelConfig::default()
-            },
-        );
-        let decoder = ComponentConfig {
+        let tensor = BlockConfig {
+            tensor_parallel_size: 2,
+            ..BlockConfig::parallel(vec![0, 1])
+        };
+        let decoder = BlockConfig {
             ranks: vec![2, 3],
-            parallel_config: ParallelConfig::default(),
-            distribution: Some(ComponentDistribution::TemporalUnits),
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            sequence_parallel: Default::default(),
+            distribution: Some(BlockDistribution::TemporalUnits),
             units_per_rank: 1,
             weights: Default::default(),
         };
-        let sequence = ComponentConfig::parallel(
-            vec![0, 1, 2, 3],
-            ParallelConfig {
-                tensor_parallel_size: 2,
-                sequence_parallel: SequenceParallel::Ulysses {
-                    ulysses_degree: 2,
-                    projection: Default::default(),
-                    projection_rows: None,
-                },
-                ..ParallelConfig::default()
+        let sequence = BlockConfig {
+            tensor_parallel_size: 2,
+            sequence_parallel: SequenceParallel::Ulysses {
+                ulysses_degree: 2,
+                projection: Default::default(),
+                projection_rows: None,
             },
-        );
+            ..BlockConfig::parallel(vec![0, 1, 2, 3])
+        };
         let layouts = BTreeMap::from([
             ("text".to_owned(), tensor),
             ("decoder".to_owned(), decoder),
@@ -535,18 +531,17 @@ mod tests {
 
     #[test]
     fn every_stream_copy_plans_its_own_groups_on_every_rank() {
-        let text = ComponentConfig::parallel(
-            vec![0, 1, 2, 3],
-            ParallelConfig {
-                tensor_parallel_size: 2,
-                pipeline_parallel_size: 2,
-                ..ParallelConfig::default()
-            },
-        );
-        let decoder = ComponentConfig {
+        let text = BlockConfig {
+            tensor_parallel_size: 2,
+            pipeline_parallel_size: 2,
+            ..BlockConfig::parallel(vec![0, 1, 2, 3])
+        };
+        let decoder = BlockConfig {
             ranks: vec![2, 3],
-            parallel_config: ParallelConfig::default(),
-            distribution: Some(ComponentDistribution::TemporalUnits),
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            sequence_parallel: Default::default(),
+            distribution: Some(BlockDistribution::TemporalUnits),
             units_per_rank: 1,
             weights: Default::default(),
         };
@@ -612,13 +607,10 @@ mod tests {
     fn an_unplaced_rank_still_plans_every_group() {
         let layouts = BTreeMap::from([(
             "text".to_owned(),
-            ComponentConfig::parallel(
-                vec![0, 1],
-                ParallelConfig {
-                    tensor_parallel_size: 2,
-                    ..ParallelConfig::default()
-                },
-            ),
+            BlockConfig {
+                tensor_parallel_size: 2,
+                ..BlockConfig::parallel(vec![0, 1])
+            },
         )]);
         let (plan, owns) = GroupPlan::components(&PlanInputs {
             rank: 2,

@@ -16,7 +16,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use engine::{
-    BatchEvent, CommandSender, ComponentConfig, EventRx, ExecutionBatch, SchedulerConfig,
+    BatchEvent, BlockConfig, CommandSender, EventRx, ExecutionBatch, SchedulerConfig,
     SchedulerStats, SimEngine, SimExecutor, sim_candidate_logprob,
 };
 use engine::{
@@ -703,7 +703,7 @@ fn an_image_encode_waits_for_a_free_host_task() {
     info.media_components = BTreeMap::from([(MediaCall::VisionEncoding, "model".to_owned())]);
     sim.place_components(BTreeMap::from([(
         "model".to_owned(),
-        ComponentConfig::parallel(vec![0], Default::default()),
+        BlockConfig::parallel(vec![0]),
     )]));
     let running = Running::start(sim, SchedulerConfig::default());
 

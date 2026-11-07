@@ -275,7 +275,7 @@ impl MediaStorage {
     pub(super) fn new(
         request_slots: usize,
         rank_bytes: &[u64],
-        components: &BTreeMap<String, ipc::ComponentConfig>,
+        components: &BTreeMap<String, proto::config::BlockConfig>,
         routing: &BTreeMap<MediaCall, String>,
     ) -> Self {
         let ranks = rank_bytes.len() as u32;

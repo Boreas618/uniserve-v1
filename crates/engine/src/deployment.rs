@@ -27,10 +27,8 @@
 use std::collections::BTreeMap;
 
 use anyhow::Context as _;
-use ipc::{
-    ComponentConfig, ComponentDistribution, ComponentWeights, ParallelConfig, SequenceParallel,
-};
 use ipc::{VIDEO_CODEC_COMPONENT, VIDEO_DECODER_COMPONENT};
+use proto::config::{BlockConfig, BlockDistribution, BlockWeights, SequenceParallel};
 use serde::{Deserialize, Serialize};
 
 use crate::core::{ExecutorGroupConfig, ExecutorGroupRole, ExecutorRank};
@@ -74,7 +72,7 @@ struct GroupEntry {
     components: BTreeMap<String, ComponentEntry>,
 }
 
-/// One `[worker_groups.components.<name>]` table: a [`ComponentConfig`] whose
+/// One `[worker_groups.components.<name>]` table: a [`BlockConfig`] whose
 /// parallel degrees are stated beside its membership.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,11 +88,11 @@ struct ComponentEntry {
     #[serde(default)]
     sequence_parallel: SequenceParallel,
     #[serde(default)]
-    distribution: Option<ComponentDistribution>,
+    distribution: Option<BlockDistribution>,
     #[serde(default = "one")]
     units_per_rank: usize,
     #[serde(default)]
-    weights: ComponentWeights,
+    weights: BlockWeights,
 }
 
 /// One `ranks` entry, `[HOST/]DEVICE`, naming one or more consecutive ranks.
@@ -208,16 +206,9 @@ impl Deployment {
                                 name.clone(),
                                 ComponentEntry {
                                     ranks: Some(component.ranks.clone()),
-                                    tensor_parallel_size: component
-                                        .parallel_config
-                                        .tensor_parallel_size,
-                                    pipeline_parallel_size: component
-                                        .parallel_config
-                                        .pipeline_parallel_size,
-                                    sequence_parallel: component
-                                        .parallel_config
-                                        .sequence_parallel
-                                        .clone(),
+                                    tensor_parallel_size: component.tensor_parallel_size,
+                                    pipeline_parallel_size: component.pipeline_parallel_size,
+                                    sequence_parallel: component.sequence_parallel.clone(),
                                     distribution: component.distribution,
                                     units_per_rank: component.units_per_rank,
                                     weights: component.weights,
@@ -337,7 +328,7 @@ impl GroupEntry {
 
 impl ComponentEntry {
     /// The component's layout within one replica of `rank_count` ranks.
-    fn resolve(&self, name: &str, rank_count: usize) -> anyhow::Result<ComponentConfig> {
+    fn resolve(&self, name: &str, rank_count: usize) -> anyhow::Result<BlockConfig> {
         // The video decoder and codec run one local copy per member rank
         // and take one independent media unit per rank per round, the only
         // layout a rank accepts for them.
@@ -348,19 +339,17 @@ impl ComponentEntry {
                 "{name} takes one media unit per rank, not {}",
                 self.units_per_rank
             );
-            distribution.get_or_insert(ComponentDistribution::TemporalUnits);
+            distribution.get_or_insert(BlockDistribution::TemporalUnits);
         }
 
-        Ok(ComponentConfig {
+        Ok(BlockConfig {
             ranks: self
                 .ranks
                 .clone()
                 .unwrap_or_else(|| (0..rank_count).collect()),
-            parallel_config: ParallelConfig {
-                tensor_parallel_size: self.tensor_parallel_size,
-                pipeline_parallel_size: self.pipeline_parallel_size,
-                sequence_parallel: self.sequence_parallel.clone(),
-            },
+            tensor_parallel_size: self.tensor_parallel_size,
+            pipeline_parallel_size: self.pipeline_parallel_size,
+            sequence_parallel: self.sequence_parallel.clone(),
             units_per_rank: self.units_per_rank,
             weights: self.weights,
             distribution,
@@ -414,7 +403,7 @@ mod tests {
             assert_eq!(worker.mem_fraction_static, Some(0.5));
             let transformer = &worker.components["transformer"];
             assert_eq!(transformer.ranks, vec![0, 1]);
-            assert_eq!(transformer.parallel_config.world_size().unwrap(), 2);
+            assert_eq!(transformer.world_size().unwrap(), 2);
         }
     }
 
@@ -464,7 +453,7 @@ mod tests {
         assert_eq!(omitted, stated);
         assert_eq!(
             omitted[0].components["video_decoder"].distribution,
-            Some(ComponentDistribution::TemporalUnits)
+            Some(BlockDistribution::TemporalUnits)
         );
         assert!(decoder("units_per_rank = 2").is_err());
     }

@@ -5,8 +5,8 @@
 use std::collections::BTreeMap;
 
 use engine::{
-    ComponentConfig, ComponentDistribution, DiffusionRequest, Request, SimEngine,
-    VideoDenoiserInfo, VideoTaskInfo,
+    BlockConfig, BlockDistribution, DiffusionRequest, Request, SimEngine, VideoDenoiserInfo,
+    VideoTaskInfo,
 };
 use ipc::{
     CallKind, ComponentInfo, DType, DiffusionSamplingParams, DimBound, MediaCall, OutputInfo,
@@ -31,10 +31,10 @@ pub(crate) fn component(
     ranks: Vec<usize>,
     distributed: bool,
     outputs: Vec<OutputInfo>,
-) -> (ComponentInfo, ComponentConfig) {
-    let mut config = ComponentConfig::parallel(ranks, Default::default());
+) -> (ComponentInfo, BlockConfig) {
+    let mut config = BlockConfig::parallel(ranks);
     if distributed {
-        config.distribution = Some(ComponentDistribution::TemporalUnits);
+        config.distribution = Some(BlockDistribution::TemporalUnits);
     }
 
     let info = ComponentInfo {

@@ -330,7 +330,8 @@ fn named(group: &str) -> &str {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use ipc::{ComponentConfig, MainProcessEndpoint, MediaCall};
+    use ipc::{MainProcessEndpoint, MediaCall};
+    use proto::config::BlockConfig;
     use std::collections::BTreeSet;
 
     /// A rank's report, with the fields a mechanism reads distinguishable per
@@ -352,15 +353,17 @@ mod tests {
         }
     }
 
-    fn components(names: &[(&str, &[usize])]) -> BTreeMap<String, ComponentConfig> {
+    fn components(names: &[(&str, &[usize])]) -> BTreeMap<String, BlockConfig> {
         names
             .iter()
             .map(|(name, ranks)| {
                 (
                     (*name).to_owned(),
-                    ComponentConfig {
+                    BlockConfig {
                         ranks: ranks.to_vec(),
-                        parallel_config: Default::default(),
+                        tensor_parallel_size: 1,
+                        pipeline_parallel_size: 1,
+                        sequence_parallel: Default::default(),
                         units_per_rank: 1,
                         weights: Default::default(),
                         distribution: None,
@@ -374,7 +377,7 @@ mod tests {
         group: &str,
         ranks: Vec<MainProcessInfo>,
         placed_ranks: usize,
-        components: BTreeMap<String, ComponentConfig>,
+        components: BTreeMap<String, BlockConfig>,
         max_model_len: u32,
     ) -> executor::batch::Inventory {
         executor::batch::Inventory {

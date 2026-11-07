@@ -27,7 +27,7 @@ pub(crate) fn video_unit_codecs(
     layouts: &[(
         ExecutorGroupId,
         Vec<String>,
-        std::collections::BTreeMap<String, crate::ComponentConfig>,
+        std::collections::BTreeMap<String, crate::BlockConfig>,
     )],
 ) -> anyhow::Result<
     std::collections::BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>,
@@ -106,7 +106,7 @@ pub(crate) fn video_unit_codecs(
 mod tests {
     use super::video_unit_codecs;
     use crate::ExecutorRank;
-    use crate::executor::{ComponentConfig, ExecutorGroupId};
+    use crate::executor::{BlockConfig, ExecutorGroupId};
     use ipc::MediaCall;
     use std::collections::BTreeMap;
 
@@ -117,11 +117,13 @@ mod tests {
         }
     }
 
-    fn distributed(ranks: Vec<usize>, units_per_rank: usize) -> ComponentConfig {
-        ComponentConfig {
+    fn distributed(ranks: Vec<usize>, units_per_rank: usize) -> BlockConfig {
+        BlockConfig {
             ranks,
-            parallel_config: Default::default(),
-            distribution: Some(ipc::ComponentDistribution::TemporalUnits),
+            tensor_parallel_size: 1,
+            pipeline_parallel_size: 1,
+            sequence_parallel: Default::default(),
+            distribution: Some(proto::config::BlockDistribution::TemporalUnits),
             units_per_rank,
             weights: Default::default(),
         }
@@ -140,7 +142,7 @@ mod tests {
         layouts: &[(
             &ExecutorGroupId,
             &[ExecutorRank],
-            &BTreeMap<String, ComponentConfig>,
+            &BTreeMap<String, BlockConfig>,
         )],
     ) -> anyhow::Result<BTreeMap<ExecutorGroupId, std::collections::BTreeSet<ExecutorGroupId>>>
     {

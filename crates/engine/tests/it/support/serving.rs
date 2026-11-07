@@ -14,7 +14,8 @@ use executor::batch::{
     SubmissionId,
 };
 use executor::completion::Outcome;
-use ipc::{ComponentConfig, MainProcessEndpoint, MainProcessInfo, TimingCounters};
+use ipc::{MainProcessEndpoint, MainProcessInfo, TimingCounters};
+use proto::config::BlockConfig;
 
 /// The token this pool samples for the `index`th call of every batch.
 pub(crate) const SAMPLED: u32 = 1000;
@@ -178,9 +179,11 @@ pub(crate) fn pool(group: &str) -> Inventory {
             ranks: 1,
             components: std::collections::BTreeMap::from([(
                 ipc::DEFAULT_COMPONENT.to_owned(),
-                ComponentConfig {
+                BlockConfig {
                     ranks: vec![0],
-                    parallel_config: Default::default(),
+                    tensor_parallel_size: 1,
+                    pipeline_parallel_size: 1,
+                    sequence_parallel: Default::default(),
                     units_per_rank: 1,
                     weights: Default::default(),
                     distribution: None,

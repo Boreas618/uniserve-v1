@@ -2914,7 +2914,7 @@ fn media_parallel(
     // The page states the text encoder's degree beside it, so the group's width is the page's and
     // the rank's place in it is the rank's place in the component.
     let (tensor_parallel, tensor_rank) = match placed.components.get(TEXT_COMPONENT) {
-        Some(text) if text.parallel_config.tensor_parallel_size > 1 => {
+        Some(text) if text.tensor_parallel_size > 1 => {
             let position = if text.ranks.is_empty() {
                 rank
             } else {
@@ -2928,14 +2928,14 @@ fn media_parallel(
                         )
                     })?
             };
-            (text.parallel_config.tensor_parallel_size, position)
+            (text.tensor_parallel_size, position)
         }
         _ => (tensor_parallel, tensor_rank),
     };
     let mut splits = placed.components.iter().filter(|(_, component)| {
         !matches!(
-            component.parallel_config.sequence_parallel,
-            ipc::SequenceParallel::Local
+            component.sequence_parallel,
+            proto::config::SequenceParallel::Local
         )
     });
     let (_, component) = match (splits.next(), splits.next()) {
@@ -2972,16 +2972,18 @@ fn media_parallel(
                 )
             })?
     };
-    let ulysses = match &component.parallel_config.sequence_parallel {
-        ipc::SequenceParallel::Ulysses {
+    let ulysses = match &component.sequence_parallel {
+        proto::config::SequenceParallel::Ulysses {
             ulysses_degree,
             projection,
             ..
         } => minimax_h3::partition::Ulysses::of(
             *ulysses_degree,
             match projection {
-                ipc::HeadProjection::Exchange => minimax_h3::partition::Projection::Exchange,
-                ipc::HeadProjection::Gather => minimax_h3::partition::Projection::Gather,
+                proto::config::HeadProjection::Exchange => {
+                    minimax_h3::partition::Projection::Exchange
+                }
+                proto::config::HeadProjection::Gather => minimax_h3::partition::Projection::Gather,
             },
         ),
         other => bail!(

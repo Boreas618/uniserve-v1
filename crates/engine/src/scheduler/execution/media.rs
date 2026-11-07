@@ -438,7 +438,7 @@ impl Scheduler {
         request: RequestKey,
         work: CallKind,
         component: &'a str,
-    ) -> Option<(&'a crate::ExecutorGroupId, &'a crate::ComponentConfig)> {
+    ) -> Option<(&'a crate::ExecutorGroupId, &'a crate::BlockConfig)> {
         let owner = self.dispatch.affinity.get(&(request, component.to_owned()));
         let (worker, bound, _) = self
             .dispatch

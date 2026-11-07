@@ -1543,11 +1543,11 @@ fn main_process_info_round_trips() {
 /// both forms must decode, each with its own units per rank.
 #[test]
 fn a_component_round_trips_with_and_without_a_distribution() {
-    use ipc::{ComponentConfig, ComponentDistribution, ParallelConfig};
+    use proto::config::{BlockConfig, BlockDistribution};
 
-    let grouped = ComponentConfig::parallel(vec![0], ParallelConfig::default());
-    let distributed = ComponentConfig {
-        distribution: Some(ComponentDistribution::TemporalUnits),
+    let grouped = BlockConfig::parallel(vec![0]);
+    let distributed = BlockConfig {
+        distribution: Some(BlockDistribution::TemporalUnits),
         units_per_rank: 3,
         ..grouped.clone()
     };
@@ -1561,7 +1561,7 @@ fn a_component_round_trips_with_and_without_a_distribution() {
 /// included.
 #[test]
 fn a_component_round_trips_with_every_sequence_parallel_strategy() {
-    use ipc::{ComponentConfig, ParallelConfig, SequenceParallel};
+    use proto::config::{BlockConfig, SequenceParallel};
 
     let strategies = [
         SequenceParallel::Local,
@@ -1579,12 +1579,15 @@ fn a_component_round_trips_with_every_sequence_parallel_strategy() {
         },
     ];
     for sequence_parallel in strategies {
-        let parallel = ParallelConfig {
+        let shape = BlockConfig {
             sequence_parallel,
-            ..Default::default()
+            ..BlockConfig::parallel(Vec::new())
         };
-        let count = parallel.world_size().unwrap();
-        let config = ComponentConfig::parallel((0..count).rev().collect(), parallel);
+        let count = shape.world_size().unwrap();
+        let config = BlockConfig {
+            ranks: (0..count).rev().collect(),
+            ..shape
+        };
         assert_eq!(round_trip(&config), config);
     }
 }

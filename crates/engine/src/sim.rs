@@ -23,8 +23,8 @@ use std::time::Duration;
 
 use crate::CommandWaker;
 use crate::executor::{
-    BatchResult, CallResult, CommandOutcome, CommandResult, ComponentConfig, ExecutionBatch,
-    Executor, ExecutorFailure, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, PoolLayout,
+    BatchResult, BlockConfig, CallResult, CommandOutcome, CommandResult, ExecutionBatch, Executor,
+    ExecutorFailure, ExecutorGroupId, ExecutorInfo, ExecutorSubmitError, PoolLayout,
 };
 use crate::scheduler::SpecialTokenIds;
 use base64::Engine as _;
@@ -2075,7 +2075,7 @@ impl SimEngine {
 
     /// Places the pool's components, as a deployment places an executor
     /// group's, and gives the pool the ranks they span.
-    pub fn place_components(&mut self, components: BTreeMap<String, ComponentConfig>) {
+    pub fn place_components(&mut self, components: BTreeMap<String, BlockConfig>) {
         self.layout.ranks = components
             .values()
             .flat_map(|component| component.ranks.iter().copied())
