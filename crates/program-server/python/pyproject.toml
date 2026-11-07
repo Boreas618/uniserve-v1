@@ -7,10 +7,9 @@
 # (design section 5.2: a package names the packages it needs, and this lock
 # fixes their versions).
 #
-# It is not the repository's `.venv`: the serving environment holds the full
-# runtime for the models under Python, while this one holds only what compiles
-# a kernel, so a package's compile script cannot depend on the runtime's
-# packages by accident.
+# It is not the repository's `.venv`: that environment holds the development
+# tools and the evaluator, while this one holds only what compiles a kernel, so
+# a package's compile script cannot depend on their packages by accident.
 #
 #   uv sync --project crates/program-server/python --python /usr/bin/python3.12
 #
