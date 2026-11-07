@@ -1569,11 +1569,21 @@ impl Scheduler {
 
                 // Hit pages that are currently unreferenced count as free
                 // until acquisition takes them, so they are subtracted from
-                // the free units.
+                // the free units. A host hit takes the units of all its pages
+                // at once, where a request that computes takes them chunk by
+                // chunk, and a resident keeps what it holds until it ends: the
+                // hit leaves the units the residents' prompts still need, or
+                // they would hold every unit with none for their tails.
+                let promised = if host_tokens > 0 {
+                    self.units_residents_still_need()
+                } else {
+                    0
+                };
                 let capacity_available = self
                     .storage
                     .free_units()
                     .saturating_sub(prefix_hit.cached_free_units)
+                    .saturating_sub(promised)
                     >= first_chunk_units;
                 if capacity_available {
                     let Some(st) = self.waiting.pop_front() else {
@@ -1601,6 +1611,25 @@ impl Scheduler {
             // capacity to free.
             break;
         }
+    }
+
+    /// The units the residents still take to hold their whole prompts.
+    fn units_residents_still_need(&self) -> usize {
+        let Some(cache) = self.storage.cache() else {
+            return 0;
+        };
+        self.running
+            .values()
+            .filter_map(|state| {
+                let held = state
+                    .block_tables()?
+                    .iter()
+                    .map(BlockTable::capacity_tokens)
+                    .min()?;
+                let prompt = state.req.prompt_token_ids.len();
+                Some(cache.coordinator.units_after_prefix(held.min(prompt), prompt))
+            })
+            .sum()
     }
 
     /// Probes the prefix cache on the configured prefill owner.
