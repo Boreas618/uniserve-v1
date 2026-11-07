@@ -10,7 +10,7 @@
 //! the `Executor` trait instead; that arm is built only with the `testing`
 //! feature, so a serving build holds the first alone.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -94,6 +94,15 @@ struct InProcess {
     /// carries it to the update. The scheduler reads them in `shadow_status`,
     /// which is why a submission is kept until it has finished.
     shadows: Vec<Submission>,
+    /// The pools each unresolved batch holds a slot of, by batch.
+    ///
+    /// A pool admits `queue_depth` batches at once, and that bound is what makes a step a batch:
+    /// a request becomes ready when its own batch ends, so a mechanism that refills at once sends
+    /// it alone, the batch after it carries one row again, and requests that run together never
+    /// meet in a step. While the slots are taken the ready requests wait for each other.
+    unresolved: HashMap<u64, Vec<ExecutorGroupId>>,
+    /// How many batches hold a slot of each pool.
+    occupied: HashMap<ExecutorGroupId, usize>,
 }
 
 /// The state of the shadow submissions an update's pass asked for (7.3 step 2).
@@ -208,6 +217,8 @@ impl Submissions {
                 nudged,
                 queue,
                 shadows: Vec::new(),
+                unresolved: HashMap::new(),
+                occupied: HashMap::new(),
             })),
         })
     }
@@ -278,9 +289,7 @@ impl Submissions {
         match &self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(executor) => executor.has_capacity(worker),
-            // `Batches::submit` queues on the device's own stream and never
-            // refuses for capacity, so a stated pool always has room here.
-            Path::InProcess(arm) => arm.info.workers.iter().any(|(id, _)| id == worker),
+            Path::InProcess(arm) => arm.has_room(worker),
         }
     }
 
@@ -578,12 +587,46 @@ impl InProcess {
         }
     }
 
+    /// Whether `worker` is a stated pool with a slot free.
+    fn has_room(&self, worker: &ExecutorGroupId) -> bool {
+        if !self.info.workers.iter().any(|(id, _)| id == worker) {
+            return false;
+        }
+        let depth = self
+            .info
+            .placements
+            .get(worker)
+            .map_or(1, |placement| placement.queue_depth.max(1));
+        self.occupied.get(worker).copied().unwrap_or(0) < depth
+    }
+
+    /// The pools `batch` takes a slot of: those its calls and its page offloads run on.
+    fn pools(batch: &ExecutionBatch) -> Vec<ExecutorGroupId> {
+        let mut pools: Vec<ExecutorGroupId> = batch
+            .requests
+            .iter()
+            .map(|(_, placement)| placement.worker.clone())
+            .chain(batch.page_offloads.iter().map(|offloads| offloads.worker.clone()))
+            .collect();
+        pools.sort();
+        pools.dedup();
+        pools
+    }
+
     fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+        let pools = Self::pools(&batch);
+        if !pools.iter().all(|pool| self.has_room(pool)) {
+            return Err(ExecutorSubmitError::WouldBlock(Box::new(batch)));
+        }
         let (device, calls) = self.describe(&batch).map_err(ExecutorSubmitError::Failed)?;
         let submission = self
             .batches
             .submit(device)
             .map_err(|error| ExecutorSubmitError::Failed(anyhow::anyhow!(error)))?;
+        for pool in &pools {
+            *self.occupied.entry(pool.clone()).or_default() += 1;
+        }
+        self.unresolved.insert(batch.id, pools);
         self.queue
             .send(Pending {
                 batch: batch.id,
@@ -595,6 +638,18 @@ impl InProcess {
                     "the in-process waiting thread has gone: {error}"
                 ))
             })
+    }
+
+    /// Gives back the slots of the batch `report` ends.
+    fn resolved(&mut self, report: &BatchReport) {
+        if !report.done {
+            return;
+        }
+        for pool in self.unresolved.remove(&report.batch_id).unwrap_or_default() {
+            if let Some(count) = self.occupied.get_mut(&pool) {
+                *count = count.saturating_sub(1);
+            }
+        }
     }
 
     fn shadow(
@@ -618,6 +673,26 @@ impl InProcess {
         Ok(())
     }
 
+    /// A report the waiting thread collected, with its batch's slots given back.
+    fn received(
+        &mut self,
+        report: Result<BatchReport, ExecutorError>,
+    ) -> Result<Option<BatchReport>, ExecutorError> {
+        match report {
+            Ok(report) => {
+                self.resolved(&report);
+                Ok(Some(report))
+            }
+            // A failure names no batch, and the mechanism retires what it affected: no slot is
+            // kept for a batch that will not report.
+            Err(error) => {
+                self.unresolved.clear();
+                self.occupied.clear();
+                Err(error)
+            }
+        }
+    }
+
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, ExecutorError> {
         let gone = || {
             anyhow::anyhow!("the in-process waiting thread has gone while batches were outstanding")
@@ -626,14 +701,14 @@ impl InProcess {
         // nudge for the park that follows, which is the one it is meant to end.
         if timeout.is_zero() {
             return match self.ready.try_recv() {
-                Ok(report) => report.map(Some),
+                Ok(report) => self.received(report),
                 Err(crossbeam_channel::TryRecvError::Empty) => Ok(None),
                 Err(crossbeam_channel::TryRecvError::Disconnected) => Err(gone()),
             };
         }
         crossbeam_channel::select! {
             recv(self.ready) -> report => match report {
-                Ok(report) => report.map(Some),
+                Ok(report) => self.received(report),
                 Err(_) => Err(gone()),
             },
             recv(self.nudged) -> _ => Ok(None),
@@ -861,7 +936,10 @@ mod tests {
             let inventory = Inventory {
                 group: "gpu".to_owned(),
                 ranks: vec![ipc::MainProcessInfo::default()],
-                placement: Placement::default(),
+                placement: Placement {
+                    queue_depth: 2,
+                    ..Placement::default()
+                },
                 max_model_len: 4096,
             };
             (
@@ -1048,6 +1126,40 @@ mod tests {
             "the extent is the bucket's, which is what the executor answered: {:?}",
             media.computation.extent
         );
+    }
+
+    /// A pool holds `queue_depth` unresolved batches, and a report gives its slot back.
+    ///
+    /// This is what makes requests that run together meet in one step: each is ready when its own
+    /// batch ends, so a pool that always took the next batch would serve them one row at a time.
+    #[test]
+    fn a_pool_holds_no_more_batches_than_its_queue_depth() {
+        let (devices, delivered) = Devices::one(Some(denoise_bucket()));
+        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
+        let pool = submissions.info().workers[0].0.clone();
+
+        assert!(submissions.has_capacity(&pool), "an idle pool has room");
+        for batch in 1..=2 {
+            submissions
+                .submit(media_batch(batch, MediaCall::Denoising, 1))
+                .expect("a batch within the depth is taken");
+        }
+        assert!(!submissions.has_capacity(&pool), "the depth is taken");
+        let refused = submissions.submit(media_batch(3, MediaCall::Denoising, 1));
+        assert!(
+            matches!(refused, Err(ExecutorSubmitError::WouldBlock(_))),
+            "a batch past the depth waits for a slot"
+        );
+        assert_eq!(
+            delivered.lock().expect("the recorder is not poisoned").len(),
+            2,
+            "a batch that waits reaches no device"
+        );
+
+        // The double's batches report no calls, which the mechanism reads as a failure: it ends
+        // the batches all the same, so the slots come back.
+        let _ = submissions.poll(Duration::from_secs(5));
+        assert!(submissions.has_capacity(&pool), "a report frees its slot");
     }
 
     /// The generation is the step's, for every batch of the step: a switchover mid-step cannot
