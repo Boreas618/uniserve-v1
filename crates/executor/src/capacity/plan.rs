@@ -719,6 +719,12 @@ fn plan(
         latent_feature_bytes: 0,
         latent: None,
     };
+    // A device's cache is split into segments of whole allocation granules, which is what lets it
+    // give storage back while every address stays valid (7.6).
+    let granularity = match facts.device {
+        Device::Cuda(index) => Some(platform::HandleType::Descriptor.granularity(index)? as u64),
+        Device::Cpu => None,
+    };
     let plan = token_plan(
         &request,
         report,
@@ -727,7 +733,7 @@ fn plan(
         0,
         total_bytes,
         reserved_bytes,
-        None,
+        granularity,
         group,
         |size| match &cache {
             Some(geometry) => Ok(Some(Arc::new(crate::memory::CachePlan::new(
@@ -967,15 +973,30 @@ impl TokenLayout {
                     )?)
                 }
                 (None, _) => {
-                    let rounded = crate::memory::prefix_cache::planes::segmented_units(
+                    // A cache fitted to a capacity rounds up to whole segments: it holds the tokens
+                    // it was asked for, where the storage has room. One fitted to the storage
+                    // rounds down into it.
+                    let above = crate::memory::prefix_cache::planes::segmented_units_above(
                         own,
                         cache.plane_bytes,
                         granularity,
                     );
+                    let fits = available.is_none_or(|bytes| {
+                        (u64::from(above) + reserved_units).saturating_mul(unit_bytes) <= bytes
+                    });
+                    let rounded = if fits {
+                        above
+                    } else {
+                        crate::memory::prefix_cache::planes::segmented_units(
+                            own,
+                            cache.plane_bytes,
+                            granularity,
+                        )
+                    };
                     tracing::info!(
                         fitted = own,
                         units = rounded,
-                        "rounded the KV cache down to whole segments"
+                        "rounded the KV cache to whole segments"
                     );
                     capacity.num_units = u64::from(rounded);
                     PlaneLayout::own(request.world, rounded, cache.plane_bytes, granularity)
