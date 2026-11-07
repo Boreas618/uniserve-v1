@@ -745,9 +745,6 @@ mod tests {
             (&body["deployment"]["asleep"], &body["deployment"]["paused"]),
             (&json!(false), &json!(false))
         );
-
-        let (status, _, _) = send(&app, post_json("/admin/hooks/uniserve.sleep", &json!({}))).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
     }
 
     /// A profiling session runs on every worker until the operator ends it,

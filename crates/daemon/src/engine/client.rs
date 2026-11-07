@@ -635,47 +635,6 @@ impl EngineClient {
             .collect()
     }
 
-    /// Grows the engine's KV cache as [`Self::resize_cache`] does, once the
-    /// worlds of `keep_weights` (a previous world kept as its weights, whose
-    /// processes exited) released every storage but their weights and the
-    /// completed rollback copies named by `cache_keys` on every
-    /// node, and with `to_host` moved those weights to host storage, so that
-    /// each GPU's ledger leaves the cache the rest. Returns each node's
-    /// report of the weights kept (JSON `{"host", "released", "moved_bytes",
-    /// "refused"}`), `refused` saying why a node kept them on its GPUs.
-    ///
-    /// # Errors
-    ///
-    /// Fails as [`Self::resize_cache`] does, or when a node keeps no
-    /// weights alone.
-    pub async fn grow_keeping_weights(
-        &self,
-        keep_weights: Vec<u64>,
-        to_host: bool,
-        cache_keys: Vec<Vec<u8>>,
-    ) -> Result<Vec<serde_json::Value>, String> {
-        let results = self
-            .ask(|id| {
-                wire::engine_command::Kind::ResizeCache(wire::ResizeCache {
-                    id,
-                    change: wire::CacheChange::Grow as i32,
-                    preempt_after_ms: None,
-                    keep_weights,
-                    keep_in_host_storage: to_host,
-                    cache_keys,
-                    ..wire::ResizeCache::default()
-                })
-            })
-            .await
-            .map(Answered::results)?;
-        // The nodes' reports come first, each as `{"kept": ...}`.
-        Ok(results
-            .iter()
-            .filter_map(|result| serde_json::from_str::<serde_json::Value>(result).ok())
-            .filter_map(|mut value| value.get_mut("kept").map(serde_json::Value::take))
-            .collect())
-    }
-
     /// The storage ledgers every node's Storage Server keeps for the
     /// deployment, one JSON result per node: `{"host": ..., "ledgers":
     /// [...], "host_storage": {...}}`. No worker is asked: each node's daemon
@@ -691,9 +650,8 @@ impl EngineClient {
             .map(Answered::results)
     }
 
-    /// Runs the worker hook `name` with the JSON `payload` on every worker
-    /// once the engine's batches in flight complete, and returns each
-    /// worker's JSON result.
+    /// Runs the data plane's operation `name` with the JSON `payload`, and
+    /// returns each rank's JSON result.
     ///
     /// # Errors
     ///
