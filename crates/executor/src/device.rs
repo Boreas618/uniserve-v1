@@ -450,7 +450,7 @@ impl Executor {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(client);
     }
 
-    /// Gives the resident cache's segments back, for a standby's park (2.5).
+    /// Gives every segment of the resident cache back to the Storage Server (7.6).
     ///
     /// One call per cache, in the device queue's order: a batch submitted before it finishes first,
     /// and nothing submitted after it runs until admission opens again on the wake's answer.
@@ -472,6 +472,34 @@ impl Executor {
         let (submission, _) = Submission::pending(id);
         self.queue
             .submit(Command::Wake { limit }, &submission, JobKind::Wake, None)?;
+        Ok(submission)
+    }
+
+    /// Gives the cache's segments from `from` on back to the Storage Server (7.6).
+    pub fn release_cache(&self, from: u32) -> Result<Submission> {
+        self.storage_command(Command::ReleaseCache { from }, JobKind::Sleep)
+    }
+
+    /// Unmaps the graph pools' storage at their reserved addresses, keeping every capture (7.6).
+    pub fn suspend_graphs(&self) -> Result<Submission> {
+        self.storage_command(Command::SuspendGraphs, JobKind::Sleep)
+    }
+
+    /// Maps the graph pools' storage at the addresses the captures hold (7.6).
+    pub fn restore_graphs(&self) -> Result<Submission> {
+        self.storage_command(Command::RestoreGraphs, JobKind::Wake)
+    }
+
+    /// Runs `work`, which changes what the rank's weights map, in the queue's order: a batch
+    /// submitted before it finished, and one submitted after it reads the new weights (7.6).
+    pub fn rebind(&self, work: Arc<dyn Fn() -> Result<()> + Send + Sync>) -> Result<Submission> {
+        self.storage_command(Command::Rebind(work), JobKind::Rebind)
+    }
+
+    fn storage_command(&self, command: Command, kind: JobKind) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue.submit(command, &submission, kind, None)?;
         Ok(submission)
     }
 
@@ -1053,6 +1081,44 @@ impl Device {
                         .clone();
                     crate::memory::wake(&cache, &mut storage, &stream, *limit)?;
                 }
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::ReleaseCache { from } => {
+                let client = self.storage()?;
+                let mut storage: &crate::memory::retained::Retained = &client;
+                for cache in self.caches() {
+                    let planes = {
+                        let cache = crate::lock(&cache);
+                        Arc::clone(cache.planes())
+                    };
+                    if planes.segments().is_some() {
+                        planes.release_segments(*from, &mut storage)?;
+                    }
+                }
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::SuspendGraphs => {
+                self.synchronize()?;
+                self.pools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .suspend()?;
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::RestoreGraphs => {
+                self.pools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .restore()?;
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::Rebind(work) => {
+                self.synchronize()?;
+                work()?;
+                for named in &mut self.runners {
+                    named.runner.weights_changed()?;
+                }
+                self.synchronize()?;
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::Revert(generation) => {

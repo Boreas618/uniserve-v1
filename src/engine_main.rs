@@ -133,6 +133,9 @@ pub(crate) struct Epoch {
     pub host: String,
     /// The world of the epoch this process succeeds, whose storages it maps until it is promoted.
     pub predecessor_world: Option<u64>,
+    /// The routed experts' distribution this epoch loads (§7.6): what a redistribution committed,
+    /// which a relaunch and a standby load again.
+    pub experts: BTreeMap<String, Vec<u32>>,
 }
 
 /// The options of `uniserve engine`: the launch file the daemon writes for this process (§2.3).
@@ -448,6 +451,8 @@ impl ProcessInterface {
 struct LoadedRank {
     /// The rank's own plan, whose one device is the rank's.
     plan: EpochPlan,
+    /// The weights its load reached, in order: what an update of §7.6 pairs against.
+    weights: Vec<executor::memory::weights::LoadedWeight>,
     /// The rank's Storage Server client, whose scope is the rank's.
     client: Arc<Retained>,
     /// The rank's partition of the model, mapped on its device.
@@ -525,6 +530,7 @@ fn load_rank(
     launch: &Launch,
     epoch: &Epoch,
 ) -> Result<LoadedRank> {
+    let plan = plan.sharing_cache_of(epoch.predecessor_world.filter(|_| launch.standby));
     let host = HostGroup::connect(rendezvous, index, count, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
     // §8: the rank's Storage Server and its claim are the node's, which the daemon answered for; the
@@ -558,10 +564,12 @@ fn load_rank(
     // weights are mapped first, so what the plan measures is what is left of the device rather than
     // what was there before the model.
     let (model, memory, inventory, graph) = plan
-        .load_and_open(&mut weights, &mut &*client, &host)
+        .load_and_open(&mut weights, &mut &*client, &host, &epoch.experts)
         .context("loading the epoch's model")?;
+    let weights = weights.take_log();
     Ok(LoadedRank {
         plan,
+        weights,
         client,
         model,
         memory,
@@ -813,11 +821,6 @@ pub(crate) struct MainProcess {
     /// `&mut` of its own `&Retained` (`impl ExclusiveStorage for &Retained`), so the device thread can
     /// hold one beside the control thread without a lock.
     storage: Vec<Arc<Retained>>,
-    /// Whether this process's segments are given back to the Storage Server: a park sets it, a wake
-    /// clears it. It exists so a process that never parked sends no wake at all - a wake for a pool
-    /// that never slept is a no-op, but its round trip would still wait behind a queued capture on
-    /// the first `Serve`, and the first token must not pay for a mechanism it did not use.
-    slept: bool,
     blocking: ThreadPool,
     /// The blocking lane the store's listing and the module loads run on (§2.4, §7.3 step 2).
     modules: Lane<ModuleWork>,
@@ -931,6 +934,8 @@ pub(crate) struct MainProcess {
     boundary: bool,
     /// A `Serve` that arrived before the boundary: the epoch may admit, but not yet.
     pending_serve: bool,
+    /// A `Serve` that arrived while the epoch drained: it serves again once the drain ended.
+    serve_after_drain: Option<proto::process::Serve>,
     /// Whether admission is owed to the warmup: the switchover that opens the epoch queues one
     /// capture per device and does not wait for them, so a batch admitted the moment the boundary
     /// opened could be planned into a bucket whose capture has not run - a replay finds no graph of
@@ -962,6 +967,15 @@ pub(crate) struct MainProcess {
     /// The generations this process has released: a purge is a release of what it holds, so a
     /// second request for one of them is answered rather than run again.
     released: std::collections::BTreeSet<u64>,
+    /// What this process's storage operations reach (§7.6).
+    data: Arc<executor::data_plane::DataPlane>,
+    /// The commands of §7.6 still working, each answered by the pass that sees it end: the
+    /// control thread waits for none of them.
+    owed: Vec<Owed>,
+    /// A weight update in progress (§7.6).
+    weights: Option<WeightUpdate>,
+    /// Whether the schedulers sleep: their storage is given back until a wake (§7.6).
+    asleep: bool,
     /// The probation an update must survive before it is committed, when the launch file states
     /// one (§7.3 step 4). The daemon decides the commit; this is the process's own guard against
     /// an update that is left on probation with nobody watching: it reverts at the threshold
@@ -1063,6 +1077,7 @@ impl MainProcess {
         let mut clients = Vec::with_capacity(ranks.len());
         let mut models = Vec::with_capacity(ranks.len());
         let mut inventories = Vec::with_capacity(ranks.len());
+        let mut data_ranks = Vec::with_capacity(ranks.len());
         let first_plan = ranks
             .first()
             .map(|rank| rank.plan.scheduled())
@@ -1077,6 +1092,7 @@ impl MainProcess {
         for (rank_index, rank) in ranks.into_iter().enumerate() {
             let LoadedRank {
                 plan: rank_plan,
+                weights,
                 client,
                 model,
                 mut memory,
@@ -1144,7 +1160,17 @@ impl MainProcess {
                         executor::runner::RunnerId(0),
                     )?;
                 }
-                executors.push(Arc::new(executor));
+                let executor = Arc::new(executor);
+                data_ranks.push(executor::data_plane::Rank {
+                    executor: Arc::downgrade(&executor),
+                    device: *device,
+                    storage: Arc::clone(&client),
+                    cache: memory.shared_cache(),
+                    model: Arc::new(crate::engine_plan::RankModel::new(rank_plan.clone())),
+                    serving: weights.clone(),
+                    host: epoch.host.clone(),
+                });
+                executors.push(executor);
                 generations.push(generation);
             }
             scheduled.push(rank_plan.scheduled());
@@ -1154,6 +1180,23 @@ impl MainProcess {
             inventories.push(inventory);
         }
 
+        // The quota comes after the load: what a process holds to serve at all is the deployment's
+        // statement, and what the quota governs is what it retains beside that (§7.6).
+        for rank in &data_ranks {
+            rank.storage
+                .state_quota(rank.device, build.mem_fraction_static)
+                .context("stating this rank's quota of its device")?;
+        }
+        // §7.6: the storage operations and the loads that change what the ranks hold.
+        let data = Arc::new(executor::data_plane::DataPlane::new(
+            data_ranks,
+            executor::data_plane::Target {
+                checkpoint: launch.model.clone(),
+                experts: epoch.experts.clone(),
+            },
+            build.kv_cache.max_tokens.map(std::num::NonZeroU64::get),
+            build.max_running_requests.get() as u64,
+        ));
         // This node's schedulers, one thread per DP rank, each handing its batches to the executors
         // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
@@ -1168,11 +1211,11 @@ impl MainProcess {
                 handles.extend(schedulers(
                     plan,
                     launch,
-                    &memories[index],
                     &models[index],
                     &executors[index..=index],
                     &inventories[index],
                     control.wake(),
+                    &data,
                 )?);
             }
             handles
@@ -1180,11 +1223,11 @@ impl MainProcess {
             schedulers(
                 &first_plan,
                 launch,
-                &memories[0],
                 &models[0],
                 &executors,
                 &inventories[0],
                 control.wake(),
+                &data,
             )?
         };
 
@@ -1199,7 +1242,6 @@ impl MainProcess {
             executors,
             memory: memories,
             storage: clients,
-            slept: false,
             blocking,
             modules,
             store: None,
@@ -1236,6 +1278,7 @@ impl MainProcess {
             serving: false,
             boundary: false,
             pending_serve: false,
+            serve_after_drain: None,
             admission_owed: false,
             max_running_requests: u32::try_from(build.max_running_requests.get())
                 .unwrap_or(u32::MAX),
@@ -1250,6 +1293,10 @@ impl MainProcess {
             paused: false,
             rollback: launch.rollback_s.map(Duration::from_secs),
             released: std::collections::BTreeSet::new(),
+            data,
+            owed: Vec::new(),
+            weights: None,
+            asleep: false,
         };
         if launch.standby {
             process.park_standby()?;
@@ -1279,17 +1326,6 @@ impl MainProcess {
     /// sends the epoch's programs.
     fn park_standby(&mut self) -> Result<()> {
         self.serving = false;
-        // The same release the `Park` command makes: this process serves nothing from here until a
-        // promotion, and a standby holding the cache's segments while a successor loads is the
-        // memory the handover needs. A pool that is not segmented has nothing to give back, and the
-        // line says so.
-        if let Err(error) = self.give_back_segments() {
-            tracing::warn!(
-                %error,
-                "this standby could not give the cache's segments back; it parks with them still \
-                 mapped"
-            );
-        }
         // The launch generation, which is what `Parked` states: the daemon files a report by it
         // (`supervision/roster.rs:236-244` reads `launch_of(engine, parked.generation)`), and the
         // program generation is zero here - a standby parks before any `Precopy` names one - so a
@@ -1316,80 +1352,6 @@ impl MainProcess {
             .first()
             .map(|generation| generation.number())
             .unwrap_or_else(|| self.update.current())
-    }
-
-    /// §2.5: gives the parked process's cache segments back to the Storage Server, and states what
-    /// went back and what stayed.
-    ///
-    /// The segments are the only pool a sleep releases: the graph pools and the scratch region are
-    /// reservations whose captures keep their addresses (the segments' offsets are fixed inside one
-    /// reserved range, so a wake is a remap and never a recapture), and the resident owners map
-    /// through the same ledger for the process's life. A pool that is not segmented has nothing to
-    /// give back, and the line says that rather than reading as a release that happened.
-    fn give_back_segments(&mut self) -> Result<()> {
-        let kept_before = self.memory.first().map(Memory::mapped_resident);
-        // One command per device, and the control thread waits for each: the release is what the
-        // successor's memory depends on, so a park that has not given its segments back is not
-        // reported `Parked` yet. The device queue serialises commands, so this runs between
-        // batches.
-        for executor in &self.executors {
-            let device = executor.device();
-            let submission = executor
-                .sleep()
-                .with_context(|| format!("queueing device {device}'s sleep"))?;
-            device_command(&self.watchdog, device, "the park's sleep", submission)?;
-        }
-        self.slept = true;
-        let kept = self.memory.first().map(Memory::mapped_resident);
-        if let (Some(before), Some(after)) = (kept_before, kept) {
-            tracing::info!(
-                given_back = before.saturating_sub(after),
-                kept = after,
-                pool = "the cache's segments",
-                devices = self.executors.len(),
-                "the park gave back the segments it no longer serves, and kept the pools it serves \
-                 with"
-            );
-        }
-        Ok(())
-    }
-
-    /// §2.5: takes the cache's segments back on every device, `limit` at a time, before admission
-    /// opens. A wake is a remap, not a repair: the generation's captures keep their addresses, so no
-    /// warmup follows it, and a wake that fails leaves admission closed and fails its caller by name.
-    fn take_back_segments(&mut self) -> Result<()> {
-        if !self.slept {
-            return Ok(());
-        }
-        let kept_before = self.memory.first().map(Memory::mapped_resident);
-        for executor in &self.executors {
-            let device = executor.device();
-            // No limit: this process takes back everything the Storage Server still holds for its
-            // rank. A limit is a bound on a smaller wake, not a demand that everything return.
-            let submission = executor
-                .wake(None)
-                .with_context(|| format!("queueing device {device}'s wake"))?;
-            device_command(&self.watchdog, device, "the wake", submission)?;
-        }
-        self.slept = false;
-        // The description this process answers a cache query from is refreshed here, and this is the
-        // one place it can go stale: a wake maps the segments again, and a segment that came back at
-        // a new offset is a different answer for a successor. Every scheduler answers it here - the
-        // streams are not paused - where asking from the handover's own control pass would wait.
-        if let Ok(info) = self.engine_info() {
-            self.announced = Some(info);
-        }
-        let kept = self.memory.first().map(Memory::mapped_resident);
-        if let (Some(before), Some(after)) = (kept_before, kept) {
-            tracing::info!(
-                taken_back = after.saturating_sub(before),
-                kept_after = after,
-                limit = "every segment the storage holds",
-                devices = self.executors.len(),
-                "the wake took its segments back before admission opened"
-            );
-        }
-        Ok(())
     }
 
     /// Serves until the daemon closes the process or a failure ends it.
@@ -1428,7 +1390,12 @@ impl MainProcess {
             // Server or a scheduler rather than a socket. Passes run back to back while one is in
             // flight, so each stage costs what its work costs: a recovery is made of these stages,
             // and a client's stream stands still for all of them.
-            if self.precopy.is_some() || !self.warming.is_empty() || self.draining.is_some() {
+            if self.precopy.is_some()
+                || !self.warming.is_empty()
+                || self.draining.is_some()
+                || !self.owed.is_empty()
+                || self.weights.is_some()
+            {
                 due = due.min(Instant::now() + TRANSITION_POLL);
             }
             let deadline = Some(stall.map_or(due, |stall| stall.min(due)));
@@ -1497,6 +1464,11 @@ impl MainProcess {
             self.note_waits();
             self.advance_precopy()?;
             self.advance_drain()?;
+            self.advance_owed();
+            self.advance_weights();
+            if let Some(reason) = self.data.poisoned() {
+                bail!("a change of this rank's weights failed part of the way: {reason}");
+            }
             if let Some(failure) = self.advance_warmup()? {
                 return Ok(Some(failure));
             }
@@ -1764,6 +1736,24 @@ impl MainProcess {
                             continue;
                         }
                     };
+                    // An adapter's tensors load into their slot (§7.6), and what computes with them
+                    // is a kernel program this epoch does not hold (§1): computing the base model
+                    // for a request that named an adapter would answer another model's text.
+                    if let proto::request::Request::Generation(generation) = &request
+                        && generation.adapter != 0
+                    {
+                        let adapter = generation.adapter;
+                        self.reject(
+                            front,
+                            id,
+                            proto::request::RejectionKind::Invalid,
+                            format!(
+                                "the adapter in slot {adapter} is loaded, and no kernel program of \
+                                 this epoch computes with an adapter"
+                            ),
+                        );
+                        continue;
+                    }
                     let rank = self.route(&request);
                     let Some(scheduler) = self.schedulers.get(rank) else {
                         bail!("a request was routed to rank {rank}, which holds no scheduler");
@@ -1855,18 +1845,6 @@ impl MainProcess {
                 // after `Promoted`.
                 Some(proto::process::command::Kind::Park(_)) => {
                     self.park_schedulers("parking for a promotion")?;
-                    // §2.5: the schedulers are parked and nothing is in flight, so the cache's
-                    // segments can go back to the Storage Server - a parked process that keeps them
-                    // holds a successor's memory. A park that cannot give them back is still a park:
-                    // the process serves nothing, and failing the epoch over a release would end a
-                    // process that a promotion can still use. It says so instead.
-                    if let Err(error) = self.give_back_segments() {
-                        tracing::warn!(
-                            %error,
-                            "the park could not give the cache's segments back; it is parked with \
-                             them still mapped"
-                        );
-                    }
                     self.send_report(proto::process::Report {
                         kind: Some(proto::process::report::Kind::Parked(
                             proto::process::Parked {
@@ -3508,6 +3486,10 @@ impl MainProcess {
         // drained epoch reaches none, so what the precopy built is given back now rather than left
         // prepared for a boundary that cannot come.
         self.drop_prepared("the epoch drained before its switchover")?;
+        // The daemon's client reads this before the first request ends migratable, on the same
+        // connection, so a request that moves never finds this epoch ready: it waits for the epoch
+        // the frontend serves next rather than being submitted to a process that admits nothing.
+        self.announce(proto::request::wire::EngineState::Parked)?;
         // A scheduler parks once its requests have ended, and a request ends only when the daemon
         // acknowledges it through this thread, so the answers are polled from the serve pass:
         // waiting here would hold the acknowledgement the park is waiting for.
@@ -3557,6 +3539,10 @@ impl MainProcess {
                 },
             )),
         });
+        // A revert that overtook the drain serves this epoch again, now that it can.
+        if let Some(serve) = self.serve_after_drain.take() {
+            self.resume(serve)?;
+        }
         Ok(())
     }
 
@@ -3618,16 +3604,36 @@ impl MainProcess {
             self.pending_serve = true;
             return Ok(());
         }
-        // §2.5: a process that parked gave its segments back, so nothing may be admitted until they
-        // are mapped again - and a wake that fails fails the resume by name rather than serving
-        // unmapped pages.
-        self.take_back_segments()
-            .with_context(|| format!("waking epoch {} before it admits", serve.epoch))?;
+        if self.draining.is_some() {
+            self.serve_after_drain = Some(serve);
+            return Ok(());
+        }
+        let drained = self.parked.is_some();
         // A `Serve` that arrives while the warmup still has to capture this generation's buckets is
         // owed rather than refused: admission opens when the last submission finishes, the same way
         // it does at a switchover (§4.5).
         self.open_admission()
-            .with_context(|| format!("resuming epoch {}", serve.epoch))
+            .with_context(|| format!("resuming epoch {}", serve.epoch))?;
+        if drained {
+            // A target ran on this cache's storage while this epoch stood drained, so what its
+            // index names holds the target's pages now. The frontend moves only after the report
+            // below, so every request comes after this command.
+            for scheduler in &self.schedulers {
+                scheduler.flush_cache();
+            }
+            // §7.4 step 5: the daemon returns a drained epoch to serving and moves the frontend once
+            // every host says so, as a promotion's answer says it of a target.
+            self.send_report(proto::process::Report {
+                kind: Some(proto::process::report::Kind::Promoted(
+                    proto::process::Promoted {
+                        generation: self.control.engine(),
+                        program_generation: self.served_generation(),
+                    },
+                )),
+            });
+            self.announce(proto::request::wire::EngineState::Ready)?;
+        }
+        Ok(())
     }
 
     /// Promotes this standby in place (§2.5).
@@ -3657,10 +3663,6 @@ impl MainProcess {
             });
             bail!("{reason}");
         }
-        // §2.5: the promotion runs on the addresses the predecessor's segments held, so
-        // they are mapped again before anything is admitted, and a wake that fails fails
-        // the promotion by name.
-        self.take_back_segments()?;
         self.promoted = true;
         // The generation the schedulers must stamp this process's batches with: the one it
         // holds. A promotion is the one cut-over that reaches no `switchover` of this
@@ -4222,10 +4224,10 @@ impl MainProcess {
         // connection the epoch owns exactly one command, `Shutdown`: every request finishes as
         // aborted and the owners close in the order they need (`close`).
         //
-        // The rest are the engine surface of the executor era, and the daemon's migration, expert
-        // and admin paths still send them here. Each is answered with what it needs instead of
-        // being dropped: a command a process does not serve is otherwise a caller waiting for a
-        // reply that never comes, which is a hang with no name in it.
+        // The data plane of §7.6 runs here too: each of its commands goes to whoever does the work,
+        // and the rest of the engine surface is answered with whose it is instead of being dropped.
+        // A command a process does not serve is otherwise a caller waiting for a reply that never
+        // comes, which is a hang with no name in it.
         let refused = match command.kind {
             Some(proto::request::wire::engine_command::Kind::Shutdown(_)) => {
                 self.stopping = true;
@@ -4259,41 +4261,48 @@ impl MainProcess {
                 }
                 return Ok(None);
             }
-            Some(proto::request::wire::engine_command::Kind::Hook(hook)) => Some(
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: hook.id,
-                    results: Vec::new(),
-                    error: WORKER_ERA.to_owned(),
-                }),
-            ),
-            Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => Some(
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: resize.id,
-                    results: Vec::new(),
-                    error: WORKER_ERA.to_owned(),
-                }),
-            ),
-            Some(proto::request::wire::engine_command::Kind::UpdateWeights(update)) => Some(
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: update.id,
-                    results: Vec::new(),
-                    error: WORKER_ERA.to_owned(),
-                }),
-            ),
-            Some(proto::request::wire::engine_command::Kind::CommitExperts(commit)) => Some(
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: commit.id,
-                    results: Vec::new(),
-                    error: WORKER_ERA.to_owned(),
-                }),
-            ),
+            // §7.6: what the data plane changes inside the epoch. None of these waits here: each
+            // goes to whoever does the work and is answered by the pass that sees it end.
+            Some(proto::request::wire::engine_command::Kind::Hook(hook)) => {
+                self.engine_operation(front, hook);
+                return Ok(None);
+            }
+            Some(proto::request::wire::engine_command::Kind::ResizeCache(resize)) => {
+                self.resize_cache(front, &resize);
+                return Ok(None);
+            }
+            Some(proto::request::wire::engine_command::Kind::UpdateWeights(update)) => {
+                self.start_weight_update(front, update);
+                return Ok(None);
+            }
+            Some(proto::request::wire::engine_command::Kind::CommitExperts(commit)) => {
+                let order: BTreeMap<String, Vec<u32>> = commit
+                    .order
+                    .into_iter()
+                    .map(|(module, order)| (module, order.experts))
+                    .collect();
+                let together = engine::HookBarrier::new(self.schedulers.len());
+                let answers = self
+                    .schedulers
+                    .iter()
+                    .map(|scheduler| {
+                        scheduler.commit_experts(order.clone(), Arc::clone(&together))
+                    })
+                    .collect();
+                self.owe(front, commit.id, answers, Owing::Storage);
+                return Ok(None);
+            }
+            // A warming reads how far the requests in flight reached the host KV cache, and limits
+            // what they prefill meanwhile; both are every scheduler's own state (§7.4 step 1).
             Some(proto::request::wire::engine_command::Kind::CacheWarm(warm)) => Some(
-                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
-                    id: warm.id,
-                    results: Vec::new(),
-                    error: WORKER_ERA.to_owned(),
-                }),
+                proto::request::wire::from_engine::Kind::Hooked(self.warm_cache(warm)),
             ),
+            Some(proto::request::wire::engine_command::Kind::FlushCache(_)) => {
+                for scheduler in &self.schedulers {
+                    scheduler.flush_cache();
+                }
+                return Ok(None);
+            }
             // The executor era's park, resume and trial commit move an executor world between
             // processes. The epoch parks, resumes and commits through the process connection, in
             // front of the frontend rather than behind it (§2.5, §7.4).
@@ -4379,8 +4388,7 @@ impl MainProcess {
                     },
                 ))
             }
-            // FlushCache and Attach state no id and are answered with a state this process does
-            // not own: there is nothing to answer on, and a log line is what is left.
+            // A command that states no id has nothing to answer on, and a log line is what is left.
             Some(other) => {
                 tracing::warn!(
                     "the daemon sent an engine command this epoch does not serve: {}",
@@ -4394,6 +4402,48 @@ impl MainProcess {
             self.send_event(front, kind);
         }
         Ok(None)
+    }
+
+    /// Answers one operation of an epoch's warming from every scheduler.
+    ///
+    /// Only the operations that stay inside a scheduler are this process's: the copies of the
+    /// executor era's warming ran on its workers' hooks, and an epoch's pages reach a target through
+    /// the host KV cache. The operations asked here take no fence, so a scheduler answers at its
+    /// next pass; the bound is the one a scheduler that stopped answering is named by.
+    fn warm_cache(&mut self, warm: proto::request::wire::CacheWarm) -> proto::request::wire::Hooked {
+        use storage::manifest::cache::Operation;
+        let hooked = |results: Vec<String>, error: String| proto::request::wire::Hooked {
+            id: warm.id,
+            results,
+            error,
+        };
+        let operation: Operation = match serde_json::from_slice(&warm.operation) {
+            Ok(operation) => operation,
+            Err(error) => return hooked(Vec::new(), error.to_string()),
+        };
+        if !matches!(operation, Operation::Prefill { .. } | Operation::Warmed) {
+            return hooked(Vec::new(), PAGES_THROUGH_HOST.to_owned());
+        }
+        let together = engine::HookBarrier::new(self.schedulers.len());
+        let answers: Vec<_> = self
+            .schedulers
+            .iter()
+            .map(|scheduler| scheduler.cache_warm(operation.clone(), Arc::clone(&together)))
+            .collect();
+        let mut results = Vec::with_capacity(answers.len());
+        for answer in answers {
+            match answer.recv_timeout(WARMING_ANSWER) {
+                Ok(Ok(result)) => results.extend(result),
+                Ok(Err(error)) => return hooked(Vec::new(), error),
+                Err(error) => {
+                    return hooked(
+                        Vec::new(),
+                        format!("a scheduler did not answer the warming: {error}"),
+                    );
+                }
+            }
+        }
+        hooked(results, String::new())
     }
 
     /// Sends the engine's counters to the daemon, one report a second and a
@@ -4701,7 +4751,11 @@ impl MainProcess {
             | proto::request::wire::EngineState::Standby => Some(self.engine_info()?),
             _ => None,
         };
-        self.announced = info.clone();
+        // A parked process states no info and keeps what it announced: its cache's description
+        // holds until it serves again.
+        if info.is_some() {
+            self.announced = info.clone();
+        }
         tracing::info!(
             state = ?state,
             schedulers = self.schedulers.len(),
@@ -4869,6 +4923,579 @@ impl MainProcess {
         }
         self.control.close();
     }
+}
+
+/// A command of §7.6 still working: what answers it, and who waits.
+struct Owed {
+    id: u64,
+    front: usize,
+    answers: Vec<crossbeam_channel::Receiver<std::result::Result<Vec<String>, String>>>,
+    results: Vec<String>,
+    failure: Option<String>,
+    then: Owing,
+}
+
+/// What follows the end of a command of §7.6.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owing {
+    /// The answer alone.
+    Answer,
+    /// What the storage holds changed: what this process announced of it is read again.
+    Storage,
+    /// As `Storage`, and the schedulers now sleep or do not.
+    Sleep(bool),
+}
+
+/// A weight update in progress (§7.6): one stage at a time, each ended by a pass.
+struct WeightUpdate {
+    id: u64,
+    front: usize,
+    path: String,
+    in_flight: engine::WeightsInFlight,
+    stage: WeightStage,
+    /// Whether this update put the schedulers to sleep, so it wakes them.
+    slept: bool,
+    /// Whether this update holds the schedulers' batches and gives the graph storage to a `keep`
+    /// load.
+    suspended: bool,
+    /// What each rank reported of the new weights.
+    results: Vec<String>,
+    /// Why the update failed, once it did: the stages that remain only put things back.
+    failure: Option<String>,
+}
+
+type DataAnswer = crossbeam_channel::Receiver<std::result::Result<Vec<String>, String>>;
+
+/// Where a weight update stands.
+enum WeightStage {
+    /// The pass moving it from one stage to the next.
+    Between,
+    /// The checkpoint's load is walked, moving no byte.
+    Planning(crossbeam_channel::Receiver<executor::Result<executor::data_plane::Planned>>),
+    /// The schedulers quiesce: for `recompute` and `abort` they sleep, so the cache's storage holds
+    /// the new checkpoint, and for a `keep` the free storage does not hold, they stop forming
+    /// batches. The load waits.
+    Quiescing(Vec<DataAnswer>, Option<executor::data_plane::Planned>),
+    /// The new weights are published, beside the weights that serve.
+    Loading(crossbeam_channel::Receiver<executor::Result<executor::data_plane::Planned>>),
+    /// The schedulers put the new weights in place at a boundary.
+    Applying(Vec<DataAnswer>),
+    /// The graph storage a `keep` load took comes back.
+    Restoring(crossbeam_channel::Receiver<executor::Result<()>>),
+    /// The schedulers wake, or form batches again.
+    Resuming(Vec<DataAnswer>),
+}
+
+impl MainProcess {
+    /// Waits for `answers` on later passes, then answers `id` on `front`.
+    fn owe(&mut self, front: usize, id: u64, answers: Vec<DataAnswer>, then: Owing) {
+        self.owed.push(Owed {
+            id,
+            front,
+            answers,
+            results: Vec::new(),
+            failure: None,
+            then,
+        });
+    }
+
+    /// Answers every command of §7.6 that ended.
+    fn advance_owed(&mut self) {
+        let mut finished = Vec::new();
+        for (index, owed) in self.owed.iter_mut().enumerate() {
+            owed.answers.retain(|answer| match answer.try_recv() {
+                Ok(Ok(results)) => {
+                    owed.results.extend(results);
+                    false
+                }
+                Ok(Err(error)) => {
+                    owed.failure.get_or_insert(error);
+                    false
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => true,
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    owed.failure
+                        .get_or_insert_with(|| "the work ended before it answered".to_owned());
+                    false
+                }
+            });
+            if owed.answers.is_empty() {
+                finished.push(index);
+            }
+        }
+        for index in finished.into_iter().rev() {
+            let owed = self.owed.remove(index);
+            if let Owing::Sleep(asleep) = owed.then
+                && owed.failure.is_none()
+            {
+                self.asleep = asleep;
+            }
+            if owed.then != Owing::Answer {
+                self.refresh_announced();
+            }
+            self.send_event(
+                owed.front,
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id: owed.id,
+                    results: owed.results,
+                    error: owed.failure.unwrap_or_default(),
+                }),
+            );
+        }
+    }
+
+    /// Reads again what a successor and an attaching daemon are told of this process's storage. A
+    /// change of the cache's segments or of the weights' identity leaves the old answer stale.
+    fn refresh_announced(&mut self) {
+        match self.engine_info() {
+            Ok(info) => self.announced = Some(info),
+            Err(error) => tracing::warn!(%error, "the engine's description was not read again"),
+        }
+    }
+
+    /// Runs one operation the daemon names on a work thread of its own, and answers it from a later
+    /// pass: an expert redistribution's plan walks the model's load, and an adapter reads its file.
+    fn data_work(
+        &mut self,
+        front: usize,
+        id: u64,
+        work: impl FnOnce(&executor::data_plane::DataPlane) -> executor::Result<Vec<String>>
+        + Send
+        + 'static,
+    ) {
+        let (answer, answered) = crossbeam_channel::bounded(1);
+        let data = Arc::clone(&self.data);
+        let spawned = std::thread::Builder::new()
+            .name("data-plane".into())
+            .spawn(move || {
+                let _ = answer.send(work(&data).map_err(|error| error.to_string()));
+            });
+        if let Err(error) = spawned {
+            let _ = error;
+            self.send_event(
+                front,
+                proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                    id,
+                    results: Vec::new(),
+                    error: "the data plane's work thread did not start".to_owned(),
+                }),
+            );
+            return;
+        }
+        self.owe(front, id, vec![answered], Owing::Answer);
+    }
+
+    /// Serves one named operation (§7.6).
+    ///
+    /// The names are the daemon's own: an expert redistribution's stages and a LoRA adapter's load
+    /// and unload. They run beside the batches: nothing here touches what a batch reads, because a
+    /// redistribution's copies go to new storage and its one change of the served weights is the
+    /// `CommitExperts` that follows, at a boundary.
+    fn engine_operation(&mut self, front: usize, hook: proto::request::wire::Hook) {
+        let id = hook.id;
+        match hook.name.as_str() {
+            "uniserve.prepare_experts" => {
+                let orders: BTreeMap<String, Vec<u32>> = match serde_json::from_str(&hook.payload) {
+                    Ok(orders) => orders,
+                    Err(error) => {
+                        self.refuse(front, id, format!("an expert order: {error}"));
+                        return;
+                    }
+                };
+                self.data_work(front, id, move |data| data.prepare_experts(orders));
+            }
+            "uniserve.start_experts" => {
+                let data = Arc::clone(&self.data);
+                self.data_work(front, id, move |_| data.start_experts());
+            }
+            "uniserve.experts_ready" => match self.data.experts_ready() {
+                Ok(results) => self.answer_now(front, id, results),
+                Err(error) => self.refuse(front, id, error.to_string()),
+            },
+            "uniserve.abort_experts" => {
+                self.data_work(front, id, |data| data.abort_experts());
+            }
+            "load_lora_adapter" => {
+                let payload = hook.payload;
+                self.data_work(front, id, move |data| data.load_adapter(&payload));
+            }
+            "unload_lora_adapter" => {
+                let payload = hook.payload;
+                self.data_work(front, id, move |data| data.unload_adapter(&payload));
+            }
+            other => {
+                self.refuse(
+                    front,
+                    id,
+                    format!("this process has no operation named {other:?}"),
+                );
+            }
+        }
+    }
+
+    fn answer_now(&mut self, front: usize, id: u64, results: Vec<String>) {
+        self.send_event(
+            front,
+            proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                id,
+                results,
+                error: String::new(),
+            }),
+        );
+    }
+
+    fn refuse(&mut self, front: usize, id: u64, error: String) {
+        self.send_event(
+            front,
+            proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                id,
+                results: Vec::new(),
+                error,
+            }),
+        );
+    }
+
+    /// Changes the KV cache's device storage (§7.6): every scheduler withdraws, gives back or
+    /// restores its units, and the pass that sees the last one end answers.
+    fn resize_cache(&mut self, front: usize, resize: &proto::request::wire::ResizeCache) {
+        // The storage of a previous epoch is each node's daemon's to keep or release over its
+        // claim; this process holds no claim of the deployment's.
+        if !resize.keep_weights.is_empty() {
+            self.refuse(front, resize.id, LEDGERS.to_owned());
+            return;
+        }
+        let change = match engine::CacheChange::from_wire(resize) {
+            Ok(change) => change,
+            Err(error) => {
+                self.refuse(front, resize.id, error);
+                return;
+            }
+        };
+        tracing::info!(?change, "changing the KV cache storage");
+        let then = match change {
+            engine::CacheChange::Sleep => Owing::Sleep(true),
+            engine::CacheChange::Wake => Owing::Sleep(false),
+            _ => Owing::Storage,
+        };
+        let answers = self
+            .schedulers
+            .iter()
+            .map(|scheduler| scheduler.resize_cache(change.clone()))
+            .collect();
+        self.owe(front, resize.id, answers, then);
+    }
+
+    /// Starts an in-place weight update (§7.6, `docs/admin.md`).
+    fn start_weight_update(&mut self, front: usize, update: proto::request::wire::UpdateWeights) {
+        let in_flight = match proto::request::wire::WeightsInFlight::try_from(update.in_flight) {
+            Ok(proto::request::wire::WeightsInFlight::Keep) => engine::WeightsInFlight::Keep,
+            Ok(proto::request::wire::WeightsInFlight::Recompute) => {
+                engine::WeightsInFlight::Recompute
+            }
+            Ok(proto::request::wire::WeightsInFlight::Abort) => engine::WeightsInFlight::Abort,
+            Err(_) => {
+                self.refuse(
+                    front,
+                    update.id,
+                    format!("unknown in-flight choice {}", update.in_flight),
+                );
+                return;
+            }
+        };
+        if self.weights.is_some() {
+            self.refuse(front, update.id, "another weight update is in progress".to_owned());
+            return;
+        }
+        tracing::info!(model = update.model_path, ?in_flight, "updating the weights in place");
+        let mut target = self.data.target();
+        target.checkpoint = PathBuf::from(&update.model_path);
+        let (answer, answered) = crossbeam_channel::bounded(1);
+        let data = Arc::clone(&self.data);
+        let spawned = std::thread::Builder::new()
+            .name("weight-plan".into())
+            .spawn(move || {
+                let _ = answer.send(data.plan(target, executor::memory::reload::Matching::SameTensors));
+            });
+        if spawned.is_err() {
+            self.refuse(
+                front,
+                update.id,
+                "the weight update's work thread did not start".to_owned(),
+            );
+            return;
+        }
+        self.weights = Some(WeightUpdate {
+            id: update.id,
+            front,
+            path: update.model_path,
+            in_flight,
+            stage: WeightStage::Planning(answered),
+            slept: false,
+            suspended: false,
+            results: Vec::new(),
+            failure: None,
+        });
+    }
+
+    /// Moves a weight update to its next stage, when the one it is in ended.
+    fn advance_weights(&mut self) {
+        let Some(mut update) = self.weights.take() else {
+            return;
+        };
+        update.stage = match std::mem::replace(&mut update.stage, WeightStage::Between) {
+            WeightStage::Between => WeightStage::Between,
+            WeightStage::Planning(answer) => match answer.try_recv() {
+                Err(crossbeam_channel::TryRecvError::Empty) => WeightStage::Planning(answer),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    update.failure = Some("the weight update's plan ended unanswered".to_owned());
+                    return self.finish_weights(update);
+                }
+                Ok(Err(error)) => {
+                    update.failure = Some(error.to_string());
+                    return self.finish_weights(update);
+                }
+                Ok(Ok(planned)) => match self.quiesce(&mut update, &planned) {
+                    Ok(answers) if answers.is_empty() => self.load_weights(planned, false),
+                    Ok(answers) => WeightStage::Quiescing(answers, Some(planned)),
+                    Err(refusal) => {
+                        update.failure = Some(refusal);
+                        self.data.discard(planned);
+                        return self.finish_weights(update);
+                    }
+                },
+            },
+            WeightStage::Quiescing(mut answers, planned) => {
+                if !collect(&mut answers, &mut Vec::new(), &mut update.failure) {
+                    WeightStage::Quiescing(answers, planned)
+                } else {
+                    let Some(planned) = planned else {
+                        return self.finish_weights(update);
+                    };
+                    if update.failure.is_some() {
+                        self.data.discard(planned);
+                        self.resume_after(update);
+                        return;
+                    }
+                    self.load_weights(planned, update.suspended)
+                }
+            }
+            WeightStage::Loading(answer) => match answer.try_recv() {
+                Err(crossbeam_channel::TryRecvError::Empty) => WeightStage::Loading(answer),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    update.failure = Some("the weight load ended unanswered".to_owned());
+                    self.resume_after(update);
+                    return;
+                }
+                Ok(Err(error)) => {
+                    update.failure = Some(error.to_string());
+                    self.resume_after(update);
+                    return;
+                }
+                Ok(Ok(planned)) => {
+                    self.data.stage(planned);
+                    WeightStage::Applying(
+                        self.schedulers
+                            .iter()
+                            .map(|scheduler| {
+                                scheduler.update_weights(update.path.clone(), update.in_flight)
+                            })
+                            .collect(),
+                    )
+                }
+            },
+            WeightStage::Applying(mut answers) => {
+                let mut results = std::mem::take(&mut update.results);
+                let finished = collect(&mut answers, &mut results, &mut update.failure);
+                update.results = results;
+                if finished {
+                    self.data.discard_staged();
+                    self.resume_after(update);
+                    return;
+                }
+                WeightStage::Applying(answers)
+            }
+            WeightStage::Restoring(answer) => match answer.try_recv() {
+                Err(crossbeam_channel::TryRecvError::Empty) => WeightStage::Restoring(answer),
+                result => {
+                    if let Ok(Err(error)) = result {
+                        update.failure.get_or_insert(error.to_string());
+                    }
+                    self.release_schedulers(update);
+                    return;
+                }
+            },
+            WeightStage::Resuming(mut answers) => {
+                if collect(&mut answers, &mut Vec::new(), &mut update.failure) {
+                    return self.finish_weights(update);
+                }
+                WeightStage::Resuming(answers)
+            }
+        };
+        self.weights = Some(update);
+    }
+
+    /// Whether the update's load needs the schedulers still first, and what stills them.
+    ///
+    /// `recompute` and `abort` give the cache's storage to the load, as a sleep does. `keep` holds
+    /// the requests' KV cache, so its load goes beside it and the batches go on, unless the free
+    /// storage does not hold the new weights: the graph storage then goes too, which stops batches
+    /// for as long as the load runs. Storage that holds neither refuses the update, with nothing
+    /// changed.
+    fn quiesce(
+        &mut self,
+        update: &mut WeightUpdate,
+        planned: &executor::data_plane::Planned,
+    ) -> std::result::Result<Vec<DataAnswer>, String> {
+        if self.asleep {
+            return Ok(Vec::new());
+        }
+        let change = match update.in_flight {
+            engine::WeightsInFlight::Recompute => {
+                update.slept = true;
+                engine::CacheChange::Sleep
+            }
+            engine::WeightsInFlight::Abort => {
+                update.slept = true;
+                engine::CacheChange::SleepAborting
+            }
+            engine::WeightsInFlight::Keep => {
+                let bytes = planned.bytes();
+                let rooms = self.data.room().map_err(|error| error.to_string())?;
+                let graphs = self.data.graph_bytes();
+                tracing::info!(bytes, graphs, ?rooms, "the room a `keep` load has beside the cache");
+                if rooms.iter().all(|room| room.holds(bytes, 0)) {
+                    return Ok(Vec::new());
+                }
+                if !rooms.iter().all(|room| room.holds(bytes, graphs)) {
+                    return Err(format!(
+                        "the new weights take {bytes} bytes beside the KV cache, and each device \
+                         has {rooms:?} of room with {graphs} bytes of graph storage to give back: \
+                         `keep` cannot load them, and `recompute` or `abort` gives the cache's \
+                         storage to the load"
+                    ));
+                }
+                update.suspended = true;
+                engine::CacheChange::Hold { held: true }
+            }
+        };
+        Ok(self
+            .schedulers
+            .iter()
+            .map(|scheduler| scheduler.resize_cache(change.clone()))
+            .collect())
+    }
+
+    /// Starts publishing the new weights beside the ones that serve, after giving the graph storage
+    /// up to them when `suspend` says so. A thread of its own: the load reads a checkpoint for
+    /// minutes, and neither a scheduler nor this thread may wait for it.
+    fn load_weights(&mut self, planned: executor::data_plane::Planned, suspend: bool) -> WeightStage {
+        let (answer, answered) = crossbeam_channel::bounded(1);
+        let data = Arc::clone(&self.data);
+        let spawned = std::thread::Builder::new()
+            .name("weight-load".into())
+            .spawn(move || {
+                let loaded = match suspend.then(|| data.suspend_graphs()) {
+                    Some(Err(error)) => {
+                        data.discard(planned);
+                        Err(error)
+                    }
+                    _ => data.load(planned),
+                };
+                let _ = answer.send(loaded);
+            });
+        if let Err(error) = spawned {
+            tracing::error!(%error, "the weight load's thread did not start");
+        }
+        WeightStage::Loading(answered)
+    }
+
+    /// Puts back what the update stilled, and answers once it is.
+    fn resume_after(&mut self, mut update: WeightUpdate) {
+        if !update.suspended {
+            return self.release_schedulers(update);
+        }
+        let (answer, answered) = crossbeam_channel::bounded(1);
+        let data = Arc::clone(&self.data);
+        let spawned = std::thread::Builder::new()
+            .name("graph-restore".into())
+            .spawn(move || {
+                let _ = answer.send(data.restore_graphs());
+            });
+        if let Err(error) = spawned {
+            update.failure.get_or_insert(error.to_string());
+        }
+        update.stage = WeightStage::Restoring(answered);
+        self.weights = Some(update);
+    }
+
+    /// Lets the schedulers run again, when this update stilled them.
+    fn release_schedulers(&mut self, mut update: WeightUpdate) {
+        let change = if update.slept {
+            engine::CacheChange::Wake
+        } else if update.suspended {
+            engine::CacheChange::Hold { held: false }
+        } else {
+            return self.finish_weights(update);
+        };
+        update.stage = WeightStage::Resuming(
+            self.schedulers
+                .iter()
+                .map(|scheduler| scheduler.resize_cache(change.clone()))
+                .collect(),
+        );
+        self.weights = Some(update);
+    }
+
+    /// Answers the update.
+    fn finish_weights(&mut self, update: WeightUpdate) {
+        self.refresh_announced();
+        let WeightUpdate {
+            id,
+            front,
+            results,
+            failure,
+            path,
+            ..
+        } = update;
+        match &failure {
+            Some(reason) => {
+                tracing::warn!(model = path, %reason, "the weights were not updated");
+            }
+            None => tracing::info!(model = path, "updated the weights in place"),
+        }
+        self.send_event(
+            front,
+            proto::request::wire::from_engine::Kind::Hooked(proto::request::wire::Hooked {
+                id,
+                results,
+                error: failure.unwrap_or_default(),
+            }),
+        );
+    }
+}
+
+/// Reads whatever `answers` holds; `true` once none is left to wait for.
+fn collect(
+    answers: &mut Vec<DataAnswer>,
+    results: &mut Vec<String>,
+    failure: &mut Option<String>,
+) -> bool {
+    answers.retain(|answer| match answer.try_recv() {
+        Ok(Ok(answered)) => {
+            results.extend(answered);
+            false
+        }
+        Ok(Err(error)) => {
+            failure.get_or_insert(error);
+            false
+        }
+        Err(crossbeam_channel::TryRecvError::Empty) => true,
+        Err(crossbeam_channel::TryRecvError::Disconnected) => {
+            failure.get_or_insert_with(|| "the scheduler ended before it answered".to_owned());
+            false
+        }
+    });
+    answers.is_empty()
 }
 
 impl MainProcess {
@@ -5179,10 +5806,13 @@ fn answer(
     }
 }
 
-/// What the engine answers a command of the executor era's surface: the operation named an executor
-/// world of its own, and this epoch executes batches itself (§2.4).
-const WORKER_ERA: &str = "this epoch has no worker of that kind: the command names a worker-era engine, and the epoch's \
-     executors are the process's own";
+/// How long a scheduler takes to answer a warming's read: its next pass.
+const WARMING_ANSWER: Duration = Duration::from_secs(2);
+
+/// What a warming operation that copies pages is answered: pages reach a target through the host
+/// KV cache (§7.4), so this process runs no copy of its own.
+const PAGES_THROUGH_HOST: &str = "an epoch's pages reach its target through the host KV cache: this \
+     process copies none itself";
 
 /// The events a takeover from `from` replays: everything this process produced past the position
 /// the successor's consumer states.
@@ -7291,11 +7921,11 @@ fn device_command(
 fn schedulers(
     plan: &EpochPlan,
     launch: &Launch,
-    memory: &Memory,
     model: &crate::engine_plan::Served,
     executors: &[Arc<Executor>],
     rank: &ipc::MainProcessInfo,
     control: ipc::Wake,
+    data: &Arc<executor::data_plane::DataPlane>,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
@@ -7306,7 +7936,7 @@ fn schedulers(
     // One scheduler per scheduler thread: the configuration is this rank's, derived from what the
     // launch states, the build config fixes and the model's own geometry, and it refuses by name
     // when a fact it needs is one the launch file does not carry.
-    let facts = plan.rank_facts(memory, model)?;
+    let facts = plan.rank_facts(model)?;
     let config = engine::EngineConfig::of(&facts)?;
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one executor thread per device and never two.
@@ -7336,7 +7966,8 @@ fn schedulers(
     };
     let batches: Arc<dyn executor::batch::Batches> = Arc::new(
         executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
-            .stating(vec![inventory]),
+            .stating(vec![inventory])
+            .with_data_plane(Arc::clone(data)),
     );
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.
@@ -7384,6 +8015,11 @@ fn handshake(control: &mut Control, launch: &Launch) -> Result<Epoch> {
     Ok(Epoch {
         generation: 0,
         predecessor_world: spec.predecessor.as_ref().map(|predecessor| predecessor.world),
+        experts: spec
+            .expert_order
+            .into_iter()
+            .map(|(module, order)| (module, order.experts))
+            .collect(),
         host: spec.host,
     })
 }

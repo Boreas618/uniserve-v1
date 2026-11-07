@@ -36,6 +36,30 @@ const DAEMON_TIMEOUT: Duration = Duration::from_secs(90);
 /// How often a wait rechecks the engine process while it starts.
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+/// Variables a main process's CUDA and NCCL libraries read before their first use, with the value it
+/// runs with unless the daemon's own environment states the variable.
+///
+/// - `CUDA_MODULE_LOADING=EAGER`: lazy module loading synchronizes the context when a kernel is first
+///   used, which can deadlock against a collective another stream is waiting in for a peer.
+/// - `NCCL_RUNTIME_CONNECT=0`: deferred peer handshakes would allocate connection buffers after the
+///   process booked its device storage.
+const RUNTIME_DEFAULTS: [(&str, &str); 2] = [
+    ("CUDA_MODULE_LOADING", "EAGER"),
+    ("NCCL_RUNTIME_CONNECT", "0"),
+];
+
+/// The environment a main process is started under: stated on its command, so it precedes any CUDA
+/// or NCCL initialization.
+fn main_process_environment() -> std::collections::HashMap<String, String> {
+    RUNTIME_DEFAULTS
+        .into_iter()
+        .map(|(name, value)| {
+            let value = std::env::var(name).unwrap_or_else(|_| value.to_owned());
+            (name.to_owned(), value)
+        })
+        .collect()
+}
+
 /// Starts the engine processes of one deployment.
 /// Whether `executable` is this process's own binary, by canonical path: a
 /// bare name is looked up by the operating system, not by us, and counts as
@@ -556,6 +580,47 @@ impl EngineControl {
         Ok(())
     }
 
+    /// Has every node's daemon halve, or restore when not `halve`, the byte
+    /// budgets of the links the deployment's transfers use, and answers the
+    /// hosts that took it. A node that holds no claim of the deployment has
+    /// nothing to throttle and says so by answering.
+    ///
+    /// # Errors
+    ///
+    /// Fails when a node's daemon cannot be reached or refuses.
+    pub(crate) fn throttle_transfers(&self, halve: bool) -> anyhow::Result<Vec<String>> {
+        let (mut connection, nodes) = self.connect()?;
+        let mut hosts = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            connection.send(&process::Upstream {
+                kind: Some(upstream::Kind::Request(process::Request {
+                    id: 1,
+                    kind: Some(request::Kind::ThrottleTransfers(
+                        process::ThrottleTransfers {
+                            host: node.host.clone(),
+                            deployment: self.deployment.clone(),
+                            halve,
+                        },
+                    )),
+                })),
+            })?;
+            let answer: process::Downstream = connection
+                .recv(DAEMON_TIMEOUT)?
+                .context("the daemon did not report the throttle")?;
+            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
+                anyhow::bail!("the daemon did not answer the throttle");
+            };
+            anyhow::ensure!(
+                answer.error.is_empty(),
+                "throttling transfers at {}: {}",
+                node.host,
+                answer.error
+            );
+            hosts.push(node.host);
+        }
+        Ok(hosts)
+    }
+
     /// The arguments of a main process: its program name and the launch file
     /// the daemon wrote for it, and nothing else. Everything the process needs
     /// is in that file, so a flag beside it would be a second account of the
@@ -697,7 +762,7 @@ impl EngineControl {
             build: own_executable(&executable).then(|| proto::BUILD.to_owned()),
             executable,
             launch,
-            environment: std::collections::HashMap::new(),
+            environment: main_process_environment(),
         })
     }
 
@@ -729,6 +794,7 @@ impl EngineControl {
                     generation: engine,
                     executable,
                     arguments,
+                    environment: main_process_environment(),
                     ..process::Spawn::default()
                 })),
             })),
@@ -1226,6 +1292,13 @@ pub struct EpochProcess {
 /// resolves and loads the modules, instantiates the policy, rebinds or
 /// recaptures the graphs and shadows the replaced operators (§7.3 step 2).
 const PRECOPY_TIMEOUT: Duration = Duration::from_secs(20 * 60);
+
+impl crate::interference::Throttle for EngineControl {
+    fn throttle(&self, halve: bool) -> Result<Vec<String>, String> {
+        self.throttle_transfers(halve)
+            .map_err(|error| format!("{error:#}"))
+    }
+}
 
 /// How long a main process takes to switch, commit, revert or purge: each is
 /// a boundary decision the main process makes at its next batch (§7.3 steps

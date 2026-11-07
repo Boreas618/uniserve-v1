@@ -81,9 +81,6 @@ pub(crate) fn digest(config: &ServeConfig) -> anyhow::Result<String> {
         .collect())
 }
 
-/// How often a trial checks its thresholds.
-const TRIAL_POLL: Duration = Duration::from_millis(500);
-
 /// How long the closed engine of a world takes to exit.
 const CLOSED_EXIT: Duration = Duration::from_secs(60);
 
@@ -347,7 +344,7 @@ impl Leader {
             .map_err(|_| UpdateError::InProgress)?;
         let replicas = self.replicas();
         let current = locked(&replicas[0].config).clone();
-        let (target, stated, _update) = resolve(&current, &request)?;
+        let (target, _stated, update) = resolve(&current, &request)?;
         // A target that reverted with a failure is unavailable until it is
         // applied with `force` (§7.2, §7.3 step 4), whichever layer would
         // apply it: the epoch layer's switch and the program layer both end
@@ -385,7 +382,10 @@ impl Leader {
         // A change of what the main processes build is the epoch layer's
         // (§7.4): one switch for the deployment, decided before either of the
         // other two layers looks at the change.
-        if let Some(applied) = self.apply_epoch(&current, &target, request.dry_run).await? {
+        if let Some(applied) = self
+            .apply_epoch(&current, &target, &update, request.dry_run)
+            .await?
+        {
             return Ok(applied);
         }
         // The program layer (§7.2): only what the serving epoch's processes
@@ -401,7 +401,7 @@ impl Leader {
             .serving()
             .map_or(0, |(epoch, _)| epoch);
         if let Some(update) = self
-            .apply_programs(epoch, &target, request.force, request.dry_run)
+            .apply_programs(epoch, &target, &update, request.force, request.dry_run)
             .await?
         {
             return Ok(Applied::Program(serde_json::json!({
@@ -463,6 +463,7 @@ impl Leader {
         &self,
         current: &ServeConfig,
         target: &ServeConfig,
+        update: &crate::options::UpdateOptions,
         dry_run: bool,
     ) -> Result<Option<Applied>, UpdateError> {
         let previous = crate::epoch::Deployment::of(current.clone());
@@ -543,7 +544,17 @@ impl Leader {
             .map(|rank| epochs.next_generation(group, rank))
             .max()
             .unwrap_or(0);
-        let target_epoch = previous_epoch + 1;
+        // The epoch's number is the world it executes, so it is above every epoch and world the
+        // daemon knows: an epoch a revert retired keeps its number, a world's storage ends with the
+        // world it was claimed for, and the first epoch's world is its first engine's, not 0.
+        let target_epoch = epochs
+            .records()
+            .iter()
+            .map(|(epoch, record)| (*epoch).max(record.world))
+            .max()
+            .unwrap_or(previous_epoch)
+            .max(previous_epoch)
+            + 1;
         // The epoch's own build config is written once, and the launch file
         // every process of it reads names that path (§2.3). The world is the
         // epoch's identity, which the switch claims.
@@ -585,8 +596,10 @@ impl Leader {
             start: control
                 .epoch_start(&spec, spawn_generation)
                 .map_err(UpdateError::Failed)?,
+            previous_world: serving.world,
             previous_generation,
             spawn_generation,
+            keeps: update.previous_world,
         };
         let programs = next.programs.clone();
         let servers = self.program_servers(&target);
@@ -605,6 +618,7 @@ impl Leader {
                     leader,
                     engine: spawn_generation,
                     epoch: target_epoch,
+                    update: update.clone(),
                 },
             );
         }
@@ -688,6 +702,8 @@ impl Leader {
             deployment_gpus(nodes).into()
         });
         status["ledgers"] = ledgers;
+        // The update in flight, or the one that ended last, with its trial.
+        status["update"] = self.updates.status().unwrap_or_default();
         // A revert's mark lives with the epoch layer's last update; the
         // replicas' own marks are the ones a handover carried in.
         if let Some(update) = self.updates.epochs().update()
@@ -799,7 +815,7 @@ impl Replica {
             ));
         }
         let current = locked(&self.config).clone();
-        let (target, stated, _update) = resolve(&current, &request)?;
+        let (target, stated, _) = resolve(&current, &request)?;
         // A configuration a rollback marked unavailable stays refused unless
         // the change is forced.
         self.available(&target, request.force)?;

@@ -12,6 +12,9 @@ pub(super) struct Warming {
     /// [`Warming::reserved`].
     pub(super) reserved: Vec<Reserved>,
     pub(super) prefill_tokens: Option<usize>,
+    /// The tokens of each request in flight its host pages held when no offload
+    /// was on its way: what [`Scheduler::host_coverage`] answers meanwhile.
+    host_tokens: HashMap<RequestId, u32>,
 }
 
 /// One claimed page of a precopy: the stored page, the request it serves, and
@@ -36,12 +39,22 @@ impl Warming {
 
 impl Scheduler {
     /// Fence the current batches, mutate page ownership, and return concrete
-    /// worker storage views. Device copies run later at the Transfer Server.
+    /// executor storage views. Device copies run later at the Transfer Server.
     pub(super) fn warm_cache(
         &mut self,
         operation: Operation,
         together: &crate::HookBarrier,
     ) -> Result<Vec<String>, String> {
+        // Reading how far the host holds the requests in flight and limiting
+        // what they prefill touch no page: the batches in flight go on, or a
+        // warming that polls would stall the steps it runs beside.
+        if matches!(operation, Operation::Prefill { .. } | Operation::Warmed) {
+            return self.warm_pages(operation).and_then(|snapshot| {
+                serde_json::to_string(&snapshot)
+                    .map(|value| vec![value])
+                    .map_err(|error| error.to_string())
+            });
+        }
         let closing = std::mem::replace(&mut self.closing, true);
         let result = self
             .drain_batches()
@@ -92,6 +105,7 @@ impl Scheduler {
                 Vec::new()
             }
             Operation::Coverage { prefixes, keep } => self.cache_coverage(prefixes, keep),
+            Operation::Warmed => self.host_coverage(),
             Operation::Prefill { tokens } => {
                 if tokens == Some(0) {
                     return Err("a warming prefill limit must be positive".into());
@@ -192,22 +206,69 @@ impl Scheduler {
                 .collect()
         };
         Ok(Snapshot {
-            page_tokens: self
-                .storage
-                .cache()
-                .and_then(|cache| {
-                    cache
-                        .coordinator
-                        .groups()
-                        .iter()
-                        .map(|shape| shape.block_size as u32)
-                        .max()
-                })
-                .unwrap_or(1),
+            page_tokens: self.page_tokens(),
             prefixes,
             ranks,
             nodes: self.executor.storage_nodes(),
         })
+    }
+
+    /// Each migratable request in flight, with the tokens it computed and the
+    /// tokens of the full pages it published to the host KV cache. A page is
+    /// published to the host as it completes (`Scheduler::advance_prefix_pages`),
+    /// so the read waits for no copy of its own: the boundary a request offered
+    /// holds once no offload is on its way, and until then the last one that
+    /// held answers, which is what a successor's admission can read now.
+    fn host_coverage(&mut self) -> Vec<Prefix> {
+        let Some(kv_offload) = self.kv_offload.as_ref() else {
+            return Vec::new();
+        };
+        let settled = !kv_offload.offloading();
+        let page_tokens = self.page_tokens();
+        let mut prefixes = Vec::new();
+        let mut live = HashMap::new();
+        for (&id, state) in &self.running {
+            if !state.req.is_migratable() || state.terminal_intent.is_terminal() {
+                continue;
+            }
+            // A request that publishes no page computes its state again whatever a wait does.
+            if !state.req.cache.write || state.has_context_images() || state.rebuilds_images() {
+                continue;
+            }
+            let offered = state.offload_boundary as u32 / page_tokens * page_tokens;
+            let held = self.warming.host_tokens.get(&id).copied().unwrap_or(0);
+            let host_tokens = if settled { offered } else { held.min(offered) };
+            live.insert(id, host_tokens);
+            prefixes.push(Prefix {
+                world: 0,
+                request: id.0,
+                resume: (0, id.0),
+                capacity_tokens: 0,
+                tokens: Vec::new(),
+                computed: state.cache_visible_len,
+                cached: host_tokens,
+                isolation_key: state.req.cache.isolation_key,
+                state_seeds: Vec::new(),
+                pages: Vec::new(),
+            });
+        }
+        self.warming.host_tokens = live;
+        prefixes
+    }
+
+    /// The tokens of the cache's largest page.
+    fn page_tokens(&self) -> u32 {
+        self.storage
+            .cache()
+            .and_then(|cache| {
+                cache
+                    .coordinator
+                    .groups()
+                    .iter()
+                    .map(|shape| shape.block_size as u32)
+                    .max()
+            })
+            .unwrap_or(1)
     }
 
     fn snapshot_pages(&mut self, world: u64, after: &[(u64, u32)]) -> Result<Vec<Prefix>, String> {
@@ -319,7 +380,7 @@ impl Scheduler {
             .workers
             .iter()
             .find(|(_, worker)| worker.prefix_cache.is_some())
-            .ok_or("no cache worker owns the target pages")?;
+            .ok_or("no cache executor owns the target pages")?;
         let endpoint = Arc::new(worker.endpoint.clone());
         let mut targets = Vec::new();
         let mut reserved = Vec::new();

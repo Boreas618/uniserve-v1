@@ -175,13 +175,6 @@ fn main() {
         }),
     ));
     lines.push((
-        "expert_gather".to_owned(),
-        key(&ops::moe::routing::GatherDescriptor {
-            experts: EXPERTS,
-            top: TOP,
-        }),
-    ));
-    lines.push((
         "moe_sort".to_owned(),
         key(&moe::sort::Descriptor {
             experts: EXPERTS,

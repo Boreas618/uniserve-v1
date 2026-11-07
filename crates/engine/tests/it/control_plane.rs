@@ -2051,6 +2051,33 @@ fn prefix_cache_enforces_read_write_and_isolation_policy() {
     let _ = jh.join();
 }
 
+/// A scheduler with no host KV cache has nothing to warm through: it names no
+/// request, so an epoch switch's warming waits for none of its requests.
+#[test]
+fn a_scheduler_without_a_host_cache_warms_nothing() {
+    let executor = Box::new(SimExecutor::new(SimEngine::new()));
+    let sched =
+        support::scheduler_with(executor, special_tokens(), SchedulerConfig::default()).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let handle = CommandSender::new(tx);
+    let jh = thread::spawn(move || sched.run(rx));
+
+    let answer = handle
+        .cache_warm(
+            storage::manifest::cache::Operation::Warmed,
+            engine::HookBarrier::new(1),
+        )
+        .recv()
+        .unwrap()
+        .unwrap();
+    let snapshot: storage::manifest::cache::Snapshot =
+        serde_json::from_str(&answer[0]).unwrap();
+    assert!(snapshot.prefixes.is_empty());
+
+    drop(handle);
+    jh.join().unwrap();
+}
+
 /// Under FCFS with a 256-token step budget and prefill chunks capped at 64
 /// tokens, a 1000-token prompt is prefilled in many chunks; it and a
 /// concurrent short request must both finish and emit text. The test observes
@@ -3893,9 +3920,9 @@ fn slow_client_releases_execution_slots_before_output_capacity_returns() {
     assert_eq!(scheduler.stats.general.in_flight.load(Ordering::Relaxed), 0);
 }
 
-/// Executor whose executor process can be lost: once `lost` is set, every poll
-/// reports an executor failure, as an executor exit does, and the scheduler
-/// latches engine-fatal. Everything else is the simulator.
+/// Executor that can be lost: once `lost` is set, every poll reports an
+/// executor failure, and the scheduler latches engine-fatal. Everything else
+/// is the simulator.
 struct LosableExecutor {
     inner: SimExecutor,
     lost: Arc<AtomicBool>,
@@ -3924,7 +3951,7 @@ impl Executor for LosableExecutor {
 
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError> {
         if self.lost.load(Ordering::SeqCst) {
-            return Err(anyhow::anyhow!("worker process exited"));
+            return Err(anyhow::anyhow!("the executor was lost"));
         }
         self.inner.poll(timeout)
     }
@@ -4097,10 +4124,6 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
 /// An engine whose only executor group is lost, with nothing to replace it,
 /// stops admitting work: its scheduler thread ends, and a submission after
 /// that is refused rather than queued for executors that will never exist.
-///
-/// The launched-path case this states kills a rank process and makes its
-/// relaunch fail at the OS boundary. The loss here is the same event told to
-/// the simulator, and the assertion is the engine's, not the process's.
 #[test]
 fn losing_every_worker_stops_request_admission() {
     let mut sim = SimEngine::new();

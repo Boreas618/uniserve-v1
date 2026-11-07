@@ -9,7 +9,7 @@
 //!
 //! A request's KV lives in physical cache units. One logical page of a cache
 //! group holds `block_size` tokens and occupies `units_per_page` units
-//! (`ipc::CacheGroup`, reported by the worker at handshake and kept in
+//! (`ipc::CacheGroup`, reported by the executor at handshake and kept in
 //! `MainProcessInfo`). The KV-write kernels address one row of the cache planes per
 //! token and store it themselves as `unit * block_size + position % block_size`,
 //! the number this module states in the batch's slot column. Nothing else
@@ -29,7 +29,7 @@
 
 use std::ops::Range;
 
-/// A cache group's page shape, as the worker reported it (`ipc::CacheGroup`).
+/// A cache group's page shape, as the executor reported it (`ipc::CacheGroup`).
 ///
 /// Only `block_size` is needed to turn a position into a slot; `units_per_page`
 /// is carried so the mapping can refuse a page shape it cannot address (see

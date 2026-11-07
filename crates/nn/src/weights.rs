@@ -876,6 +876,31 @@ impl Weight {
     pub fn shape(&self) -> Shape {
         self.view.shape
     }
+
+    /// Row `row` of a two-axis weight, as a weight of its own in the same region.
+    ///
+    /// # Errors
+    ///
+    /// A weight of another rank, or a row past its first axis.
+    pub fn row(&self, row: u64) -> Result<Self> {
+        let shape = self.view.shape;
+        if shape.rank() != 2 || row >= shape.dim(0) {
+            return Err(Error::weight(
+                "",
+                format!("row {row} of a weight of {:?}", shape.dims()),
+            ));
+        }
+        let element = self.view.dtype.bytes().unwrap_or(0);
+        let bytes = shape.dim(1) * element;
+        Ok(Self {
+            backing: self.backing,
+            view: TensorView::new(
+                self.view.ptr.offset(row * bytes),
+                self.view.dtype,
+                Shape::new(&[shape.dim(1)]),
+            ),
+        })
+    }
 }
 
 /// The boundary between a checkpoint and retained storage: converts a weight once and publishes it.
@@ -1630,12 +1655,44 @@ impl<'a> WeightLoader<'a> {
         layout: ScaleLayout,
         input_scale: bool,
     ) -> Result<QuantizedStack> {
+        let slots: Vec<u32> = (0..experts).collect();
+        self.nvfp4_stack_in_slots(
+            name,
+            prefix,
+            projections,
+            &slots,
+            names,
+            values_layout,
+            layout,
+            input_scale,
+        )
+    }
+
+    /// [`Self::nvfp4_stack`] with the experts of `slots` in that order: slot `s` of the stack holds
+    /// expert `slots[s]`, so a redistribution's order is a load of the same checkpoint.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the arguments of `nvfp4_stack`, with the slots in place of the expert count"
+    )]
+    pub fn nvfp4_stack_in_slots(
+        &mut self,
+        name: &str,
+        prefix: &str,
+        projections: &[&str],
+        slots: &[u32],
+        names: Nvfp4Names,
+        values_layout: ValueLayout,
+        layout: ScaleLayout,
+        input_scale: bool,
+    ) -> Result<QuantizedStack> {
+        let vocabulary = u32::try_from(slots.len())
+            .map_err(|_| Error::weight(name, "more slots than a stack holds".to_owned()))?;
         self.nvfp4_window(
             name,
             prefix,
             projections,
-            0..experts,
-            experts,
+            slots,
+            vocabulary,
             names,
             values_layout,
             layout,
@@ -1644,12 +1701,12 @@ impl<'a> WeightLoader<'a> {
         .map(|(stack, _)| stack)
     }
 
-    /// [`Self::nvfp4_stack`] over the `window` of a vocabulary of `vocabulary` experts one rank
-    /// holds.
+    /// [`Self::nvfp4_stack_in_slots`] over the `slots` of a vocabulary of `vocabulary` experts one
+    /// rank holds.
     ///
     /// The activation encoder's scale is the whole vocabulary's: a token is encoded once on the rank
     /// that holds it, for experts on any rank, so every rank must encode with the same number. The
-    /// second value is each window expert's tensor scales, expert-major, one per projection.
+    /// second value is each held expert's tensor scales, expert-major, one per projection.
     #[allow(
         clippy::too_many_arguments,
         reason = "the stack is named by its parts, as `nvfp4_stack` names them"
@@ -1659,7 +1716,7 @@ impl<'a> WeightLoader<'a> {
         name: &str,
         prefix: &str,
         projections: &[&str],
-        window: std::ops::Range<u32>,
+        slots: &[u32],
         vocabulary: u32,
         names: Nvfp4Names,
         values_layout: ValueLayout,
@@ -1667,13 +1724,14 @@ impl<'a> WeightLoader<'a> {
         input_scale: bool,
     ) -> Result<(QuantizedStack, Vec<f32>)> {
         let calibrated = input_scale;
-        if window.is_empty() || projections.is_empty() {
+        let experts = u32::try_from(slots.len())
+            .map_err(|_| Error::weight(name, "more slots than a stack holds".to_owned()))?;
+        if experts == 0 || projections.is_empty() {
             return Err(Error::weight(
                 name,
                 "a stack has experts and at least one projection".to_owned(),
             ));
         }
-        let experts = window.end - window.start;
         let count = u64::from(experts);
         let per = projections.len() as u64;
 
@@ -1688,7 +1746,7 @@ impl<'a> WeightLoader<'a> {
         let mut activation_reciprocals = Vec::with_capacity(experts as usize * projections.len());
         let mut scale_shape = None;
         let mut scale_dtype = None;
-        for expert in u64::from(window.start)..u64::from(window.end) {
+        for expert in slots {
             for projection in projections {
                 let stem = format!("{prefix}.{expert}.{projection}_proj");
                 let (values_name, scales_name) = (
@@ -1978,7 +2036,7 @@ impl<'a> WeightLoader<'a> {
             .copied()
             .fold(f32::INFINITY, f32::min);
         if calibrated {
-            for expert in (0..vocabulary).filter(|expert| !window.contains(expert)) {
+            for expert in (0..vocabulary).filter(|expert| !slots.contains(expert)) {
                 for projection in projections {
                     let stem = format!("{prefix}.{expert}.{projection}_proj");
                     let tensor = format!("{stem}.{}", spelling.input_scale);

@@ -1,10 +1,10 @@
 //! The in-process boot: a main process that holds its own devices reads the
 //! facts its launch states, derives its configuration from them
 //! (`EngineConfig::of`), and serves over the executor's own batch path
-//! (`Submissions::over_batches`) — with no executor group launched and no device.
+//! (`SchedulerHandle::over_batches`), here with no device.
 //!
-//! `SchedulerHandle::boot` is that one composition. This test states what it
-//! has to produce: a handle the epoch's policy commands reach, over a pool whose
+//! This test states what that composition has to produce: a handle the epoch's
+//! policy commands reach, over a pool whose
 //! inventory is the only statement of what it serves, and one request served
 //! through it to a token the pool itself sampled.
 //!
@@ -119,14 +119,11 @@ fn facts() -> RankFacts {
         // needs and read as "the policy served nothing".
         max_batch: Some(16),
         max_num_batched_tokens: Some(512),
-        block_size: Some(64),
-        kv_cache_dtype: Some(ipc::PrefixCacheDtype::BFloat16),
         graph_tiers: Some(vec![1, 8]),
         bos: Some(0),
         eos: Some(vec![151645]),
         end_of_image: Some(0),
         generation_limits: Some(engine::EngineConfig::sim("boot").generation_limits.clone()),
-        max_model_len: Some(4096),
         ..RankFacts::default()
     }
 }
@@ -272,7 +269,8 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
     let batches: Arc<dyn Batches> = serving.clone();
     // The boot's whole shape: the facts of a launch file, the executor's batch
     // path, one handle. Nothing is launched: the pool is the rank.
-    let handle = SchedulerHandle::boot(&facts(), batches).expect("the facts boot a scheduler");
+    let config = engine::EngineConfig::of(&facts()).expect("the facts state a configuration");
+    let handle = SchedulerHandle::over_batches(config, batches).expect("the facts boot a scheduler");
 
     // The handle is the launched path's: its commands answer, and a stage waits
     // for a boundary.

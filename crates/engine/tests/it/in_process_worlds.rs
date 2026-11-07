@@ -201,28 +201,13 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
         "the running world generates the reference's first tokens"
     );
 
-    // Its successor starts beside it, under the same claim, with its cache.
-    let caches = answer("the running world's cache", running.describe_cache())
+    // Its successor starts beside it, on trial.
+    answer("the running world's cache", running.describe_cache())
         .expect("the running world states its cache");
     let successor_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
     let mut successor_config = support::config(&successor_pool, "worlds");
     successor_config.world = 2;
-    successor_config.predecessor = Some(
-        caches
-            .into_iter()
-            .map(|cache| {
-                (
-                    cache.worker_group.clone(),
-                    ipc::PredecessorCache {
-                        world: 1,
-                        segments: cache.segments[..cache.held as usize].to_vec(),
-                        num_units: cache.units,
-                        scratch_units: cache.scratch,
-                    },
-                )
-            })
-            .collect(),
-    );
+    successor_config.trial = true;
     let successor =
         SchedulerHandle::over_batches(successor_config, successor_pool.clone() as Arc<dyn Batches>)
             .expect("the successor starts beside the running world");

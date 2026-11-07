@@ -2,8 +2,7 @@
 //! mechanism reads them.
 //!
 //! Design §4.4's completion path is the mechanism's own: it is fed by whichever
-//! executor ran the batch, and it must not be shaped by the wire protocol one of
-//! them happens to speak. This module is that shape. `notes/sched/completion.md`
+//! executor ran the batch. This module is that shape. `notes/sched/completion.md`
 //! states, field by field, whether the device produces a value or the mechanism
 //! already owns it; the short version is that the executor states *what
 //! execution did* — the tokens it accepted, the cache extent it initialized and
@@ -13,16 +12,15 @@
 //! (`OutputSender::und_token_outcome`), and the call's budget, cache window and
 //! sampling rows are the plan's.
 //!
-//! Two fillers produce these types, one per executor, both at the edge of the
-//! mechanism and neither inventing a value:
+//! Two fillers produce these types, both at the edge of the mechanism and
+//! neither inventing a value:
 //!
-//! - [`CallCompletion::from_wire`] / [`BatchReport::from_wire`] for the
-//!   worker-process executor, which speaks `ipc`. They are temporary: they are
-//!   deleted with that executor (§2.4).
 //! - [`BatchReport::from_output`] / [`CallCompletion::from_output`] for the
 //!   in-process executor, which reports `executor::batch::BatchOutput`: the
-//!   device's own account of each call (2.4). This is the filler the
-//!   worker-process one is deleted with.
+//!   device's own account of each call (2.4).
+//! - `CallCompletion::from_wire` / `BatchReport::from_wire` for a simulated
+//!   executor, which reports in `ipc`'s types; built only with the `testing`
+//!   feature.
 
 use std::sync::Arc;
 
@@ -31,6 +29,7 @@ use ipc::{
     SharedMediaError, TimingCounters, TokenLogprob,
 };
 
+#[cfg(feature = "testing")]
 use crate::executor::{BatchResult, CallResult};
 
 /// One call's completion, as the mechanism reads it.
@@ -73,13 +72,14 @@ pub(crate) struct CallCompletion {
 }
 
 impl CallCompletion {
-    /// The worker-process edge: what a rank reported, in the mechanism's type.
+    /// The simulated edge: what a simulated rank reported, in the mechanism's
+    /// type.
     ///
-    /// A worker's `finish_flags` are dropped rather than carried: the stop
+    /// A rank's `finish_flags` are dropped rather than carried: the stop
     /// conditions are the request's own rules and the mechanism evaluates them
     /// from the sampled token, so a second, device-side copy of that rule would
-    /// be a weaker one. Temporary — this filler goes with the worker-process
-    /// executor.
+    /// be a weaker one.
+    #[cfg(feature = "testing")]
     pub(crate) fn from_wire(result: CallResult) -> Self {
         let output = result.output;
         Self {
@@ -113,7 +113,7 @@ impl CallCompletion {
     /// it, and that name is claimed here — the mapping is what the mechanism
     /// delivers, and claiming it is what unlinks the name.
     ///
-    /// Two things the device reports differently from a worker, both stated
+    /// Two things the device reports differently from an executor, both stated
     /// rather than filled in: a call has no timing of its own (the batch
     /// measures the step, and `BatchReport::timing` carries it), and a token's
     /// log-probability arrives as one number per accepted token, not as ranked
@@ -195,13 +195,13 @@ pub(crate) struct BatchReport {
     /// The batch's own measurements: the execution time the report is measured
     /// by.
     pub timing: TimingCounters,
-    /// Per-worker model-forward statistics.
+    /// Per-executor model-forward statistics.
     pub forward_stats: Vec<ForwardStats>,
 }
 
 impl BatchReport {
-    /// The worker-process edge: a logical result, in the mechanism's type.
-    /// Temporary, with [`CallCompletion::from_wire`].
+    /// The simulated edge: a logical result, in the mechanism's type.
+    #[cfg(feature = "testing")]
     pub(crate) fn from_wire(result: BatchResult) -> Self {
         Self {
             batch_id: result.batch_id,
@@ -212,7 +212,7 @@ impl BatchReport {
                 .collect(),
             command_results: result.command_results,
             done: result.done,
-            // The wire states a duration per worker; the mechanism measures a
+            // The wire states a duration per executor; the mechanism measures a
             // step by the device work it waited for, which is their sum.
             timing: TimingCounters {
                 device_us: result
@@ -301,7 +301,7 @@ impl BatchReport {
             // batch's calls together, never a part of one.
             done: true,
             timing: output.timing,
-            // Device-side forward statistics are a worker's readout, not a
+            // Device-side forward statistics are an executor's readout, not a
             // rank's own (`crate::executors`); a process reports none here.
             forward_stats: Vec::new(),
         })

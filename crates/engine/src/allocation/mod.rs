@@ -3,8 +3,8 @@
 //! Each pool allocates its actual backing. Executor addresses are assembled from
 //! these owned allocations when constructing a batch; no region copies persist.
 //!
-//! The backing storage itself lives in the executor processes, which report its
-//! capacity in `MainProcessInfo`; these pools assign its rows, units, pages, and
+//! The backing storage itself is the executor's, which reports its capacity in
+//! `MainProcessInfo`; these pools assign its rows, units, pages, and
 //! byte ranges. Row zero of the request state, unit zero of the cache pool and
 //! page zero of the latent pool are the executor's inactive sentinels, so no
 //! pool ever hands them out, and the executor IPC validation rejects a request

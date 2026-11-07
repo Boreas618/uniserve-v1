@@ -165,7 +165,7 @@ impl Scheduler {
     /// Applies one command; returns true on shutdown.
     ///
     /// Every submission is validated by `enqueue` or `enqueue_media`, which
-    /// refuse what the loaded workers cannot serve and report their own
+    /// refuse what the loaded executors cannot serve and report their own
     /// rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         // Work that finished on another thread before this command arrived is
@@ -494,14 +494,14 @@ impl Scheduler {
     ///
     /// The ask is kept until a step has shadowed its batches, which is when it
     /// is answered; a shadow submission the executor refuses answers it at once
-    /// with the executor's reason. Only the in-process arm shadows: a
-    /// worker-process executor shadows a world on its own workers, so the ask is
-    /// refused there rather than left waiting for a step that cannot run it.
+    /// with the executor's reason. Only the in-process arm shadows: a supplied
+    /// executor runs no shadow pass, so the ask is refused there rather than
+    /// left waiting for a step that cannot run it.
     fn ask_shadow(&mut self, generation: u64, answer: StageAnswer) {
         if !self.executor.serves_in_process() {
             answer.send(Err(format!(
                 "the shadow pass of generation {generation} starts when a step submits through \
-                 executor::Batches; this scheduler still submits its batches to the worker processes"
+                 executor::Batches; this scheduler submits its batches to a supplied executor"
             )));
             return;
         }
@@ -671,7 +671,7 @@ impl Scheduler {
             }
             Some(other) => {
                 let _ = answer.send(Err(format!(
-                    "{} is the engine process's own command, not one scheduler's",
+                    "{} is the main process's own command, not one scheduler's",
                     engine_command_name(&other)
                 )));
                 return;
