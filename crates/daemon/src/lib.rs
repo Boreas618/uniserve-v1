@@ -22,7 +22,7 @@
 //!   interface it serves;
 //! - `model`: the served checkpoint: its files, configuration and family
 //!   profile; `tokenizer`: its tokenizer;
-//! - `options`: the serving option tree (`options::ServeConfig`);
+//! - `options`: the serving option tree (`options::ServerArgs`);
 //! - `metrics`: the Prometheus registry the daemon exports;
 //! - `restart`: the hot restart that hands a deployment to a successor
 //!   daemon.

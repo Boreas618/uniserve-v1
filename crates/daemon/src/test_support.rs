@@ -31,7 +31,7 @@ use crate::leader::Leader;
 use crate::model::{ModelConfig, ModelParameters, SamplingDefaults};
 use crate::openai::video_jobs::VideoJobs;
 use crate::options::ChatTemplateContentFormat;
-use crate::options::{ImageFetchConfig, LoggingConfig, ServeConfig, ServerConfig, VideoJobConfig};
+use crate::options::{ImageFetchConfig, LoggingConfig, ServerArgs, ServerConfig, VideoJobConfig};
 use crate::tokenizer::DynTokenizer;
 
 /// Served model name the simulated engines answer to.
@@ -276,12 +276,12 @@ pub(crate) fn leader_over(
     )
     .unwrap();
     let images = MediaConnector::from_image_options(&ImageFetchConfig::default()).unwrap();
-    let options = ServeConfig {
+    let options = ServerArgs {
         logging_config: LoggingConfig {
             log_requests: false,
             log_stats: false,
         },
-        ..ServeConfig::default()
+        ..ServerArgs::default()
     };
     Leader::new(
         SERVED_MODEL.to_owned(),

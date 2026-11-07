@@ -29,7 +29,7 @@ use tracing::info;
 use crate::engine::client::EngineState;
 use crate::engine::hold::HoldState;
 use crate::leader::{Leader, Replica, UpdateError, locked};
-use crate::options::ServeConfig;
+use crate::options::ServerArgs;
 use crate::updates::change::{Applied, ApplyRequest, resolve};
 use crate::updates::epoch::Unavailable;
 
@@ -72,7 +72,7 @@ fn deployment_gpus(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> {
 
 /// The digest of a configuration, which names it in the status and the
 /// unavailable marks: of its printed TOML.
-pub(crate) fn digest(config: &ServeConfig) -> anyhow::Result<String> {
+pub(crate) fn digest(config: &ServerArgs) -> anyhow::Result<String> {
     use sha2::Digest as _;
     let printed = crate::options::printed(config)?;
     Ok(sha2::Sha256::digest(printed.as_bytes())
@@ -463,8 +463,8 @@ impl Leader {
     /// daemon starts with.
     async fn apply_epoch(
         &self,
-        current: &ServeConfig,
-        target: &ServeConfig,
+        current: &ServerArgs,
+        target: &ServerArgs,
         update: &crate::options::UpdateConfig,
         dry_run: bool,
     ) -> Result<Option<Applied>, UpdateError> {
@@ -821,7 +821,7 @@ impl Replica {
 
     /// The digest of `target`, which names it, unless a rollback marked it
     /// unavailable and the update does not `force` it.
-    fn available(&self, target: &ServeConfig, force: bool) -> Result<String, UpdateError> {
+    fn available(&self, target: &ServerArgs, force: bool) -> Result<String, UpdateError> {
         let target_digest =
             digest(target).map_err(|error| UpdateError::Failed(error.context("digest")))?;
         if !force && let Some(unavailable) = locked(&self.worlds).unavailable.get(&target_digest) {
@@ -1098,7 +1098,7 @@ mod tests {
                 ),
             )
             .unwrap();
-            let config = crate::options::ServeConfig {
+            let config = crate::options::ServerArgs {
                 worker_groups: Some(path.clone()),
                 ..Default::default()
             };

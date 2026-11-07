@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 use crate::options::{
-    CudaGraphConfig, KvCacheConfig, LoadConfig, ServeConfig, VideoConfig, WorkerConfig,
+    CudaGraphConfig, KvCacheConfig, LoadConfig, ServerArgs, VideoConfig, WorkerConfig,
 };
 
 /// The operator names the epoch record keys its kernel programs by (§5.1,
@@ -187,7 +187,7 @@ impl BuildConfig {
     /// daemon and the main process are one binary, so a deployment cannot
     /// run them at different builds. A daemon that starts a main process of
     /// another build compares that executable's identity instead (§7.4).
-    pub fn of(config: &ServeConfig) -> Self {
+    pub fn of(config: &ServerArgs) -> Self {
         Self {
             executable: proto::BUILD.to_owned(),
             model: config.model().to_owned(),
@@ -785,7 +785,7 @@ impl Epochs {
         &self,
         host: &str,
         engine: u64,
-        config: &crate::options::ServeConfig,
+        config: &crate::options::ServerArgs,
     ) -> Result<(), Failure> {
         let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
             kind: "no_command_channel".to_owned(),
@@ -816,7 +816,7 @@ impl Epochs {
         &self,
         host: &str,
         engine: u64,
-        config: &crate::options::ServeConfig,
+        config: &crate::options::ServerArgs,
         programs: &FilledPrograms,
     ) -> Result<(), Failure> {
         let commands = locked(&self.commands).clone().ok_or_else(|| Failure {
@@ -831,7 +831,7 @@ impl Epochs {
         &self,
         host: &str,
         engine: u64,
-        config: &crate::options::ServeConfig,
+        config: &crate::options::ServerArgs,
         programs: &FilledPrograms,
         commands: crate::supervision::ProcessCommands,
     ) -> Result<(), Failure> {
@@ -1278,7 +1278,7 @@ pub struct FilledPrograms {
 
 impl FilledPrograms {
     /// The programs `config` fills, without the revisions `prepare` selects.
-    pub fn of(config: &ServeConfig) -> Self {
+    pub fn of(config: &ServerArgs) -> Self {
         let mut kernels = BTreeMap::new();
         let attention = attention_programs(config);
         kernels.extend(attention);
@@ -1372,7 +1372,7 @@ const AUTO_BACKEND: &str = "auto";
 /// The attention operator's programs: one entry for every phase when the
 /// per-phase backends differ, or a single entry whose phase is `None` when
 /// they agree (§5.2).
-fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
+fn attention_programs(config: &ServerArgs) -> Vec<(KernelKey, Program)> {
     let prefill = config
         .prefill_attention_backend
         .clone()
@@ -1415,7 +1415,7 @@ fn attention_programs(config: &ServeConfig) -> Vec<(KernelKey, Program)> {
 /// The scheduling program's parameters: the values §7.7 assigns to the
 /// scheduling policy, which decides with them inside the build config's
 /// bounds (§4.4).
-fn policy_arguments(config: &ServeConfig) -> toml::Table {
+fn policy_arguments(config: &ServerArgs) -> toml::Table {
     #[derive(Serialize)]
     struct Arguments {
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -1443,7 +1443,7 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
     // prefill graph and states no budget hands its policy the guest's 8192-token
     // default, and the mechanism refuses the epoch's limits against the graph's
     // ceiling after the weights are loaded. A stated bound above the catalog is
-    // refused at load (`ServeConfig::validate`), never clamped here.
+    // refused at load (`ServerArgs::validate`), never clamped here.
     let token_bound = config
         .max_num_batched_tokens
         .map(|size| u32::try_from(size.get()).unwrap_or(u32::MAX))
@@ -1454,7 +1454,7 @@ fn policy_arguments(config: &ServeConfig) -> toml::Table {
     // the deployment's batch is the smaller of its own and that: a deployment
     // that leaves the batch at its default means the catalog's figure, and one
     // that states more than its graphs capture is refused at load
-    // (`ServeConfig::validate`), never clamped here.
+    // (`ServerArgs::validate`), never clamped here.
     let max_batch = u32::try_from(scheduler.max_batch.get()).unwrap_or(u32::MAX);
     let max_batch = config
         .cuda_graph_config
@@ -1524,7 +1524,7 @@ pub enum Layer {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Deployment {
     /// The configuration.
-    pub config: ServeConfig,
+    pub config: ServerArgs,
     /// The projection that builds a main process.
     pub build_config: BuildConfig,
     /// The filled programs; the deployment a change is compared against
@@ -1536,7 +1536,7 @@ pub struct Deployment {
 impl Deployment {
     /// The deployment `config` describes, with the programs it fills and
     /// without the revisions `prepare` selects.
-    pub fn of(config: ServeConfig) -> Self {
+    pub fn of(config: ServerArgs) -> Self {
         Self {
             build_config: BuildConfig::of(&config),
             programs: FilledPrograms::of(&config),
@@ -1568,7 +1568,7 @@ pub fn layer(previous: &Deployment, next: &Deployment) -> Layer {
 /// the model's processor options) and the ones the daemon reads alone
 /// (logging, the update's own policy and the admin API's address). A change
 /// of them is a hot restart of the process that reads them (§7.5).
-pub fn host_layer_differ(current: &ServeConfig, target: &ServeConfig) -> bool {
+pub fn host_layer_differ(current: &ServerArgs, target: &ServerArgs) -> bool {
     crate::options::daemon_options_differ(current, target)
         || current.update_config != target.update_config
 }
@@ -1592,7 +1592,7 @@ mod tests {
 
     /// A serving epoch's record at the default configuration.
     fn record() -> EpochRecord {
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         EpochRecord {
             build_config: BuildConfig::of(&config),
             kernels: BTreeMap::from([(KernelKey::all("rms_norm"), program("triton"))]),
@@ -1616,7 +1616,7 @@ mod tests {
 
         let (commands, seen, carried) = main_processes_recording(vec![(9, Answer::Serves(12))]);
         let epochs = Epochs::new();
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         epochs.record(0, record());
         epochs.supervise(commands);
 
@@ -1661,8 +1661,8 @@ mod tests {
     /// the model's files that fell to the program layer would answer an update that moved nothing.
     #[test]
     fn a_change_of_the_models_files_is_an_epoch_change() {
-        let serving = Deployment::of(ServeConfig::default());
-        let mut other = ServeConfig::default();
+        let serving = Deployment::of(ServerArgs::default());
+        let mut other = ServerArgs::default();
         other.model = Some("/models/other".to_owned());
         assert_eq!(layer(&serving, &Deployment::of(other)), Layer::Epoch);
     }
@@ -1678,7 +1678,7 @@ mod tests {
         let (commands, seen) =
             main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
         let epochs = Epochs::new();
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
             build_config: BuildConfig::of(&config),
@@ -1760,7 +1760,7 @@ mod tests {
 
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
             build_config: BuildConfig::of(&config),
@@ -1836,7 +1836,7 @@ mod tests {
 
         let (commands, _seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
             build_config: BuildConfig::of(&config),
@@ -1905,7 +1905,7 @@ mod tests {
 
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
             build_config: BuildConfig::of(&config),
@@ -1955,7 +1955,7 @@ mod tests {
 
         let (commands, _) = main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
         let epochs = Epochs::new();
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
             build_config: BuildConfig::of(&config),
@@ -2024,7 +2024,7 @@ mod tests {
             Answer::Refuses("the policy module did not build".to_owned()),
         )]);
         let epochs = Epochs::new();
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         let serving = Deployment {
             config: config.clone(),
             build_config: BuildConfig::of(&config),
@@ -2098,11 +2098,11 @@ mod tests {
     /// same bound, so the policy's limits cannot disagree with the workers'
     /// `BatchCapacity` (§4.4). A deployment that states a chunk larger than
     /// its bound keeps its own value here — the mechanism refuses it
-    /// (`PolicyError::BadLimits`), and `ServeConfig::validate` refuses it at
+    /// (`PolicyError::BadLimits`), and `ServerArgs::validate` refuses it at
     /// load by the option's name, rather than this code clamping it.
     #[test]
     fn the_policys_limits_are_the_launchs_own_token_bound() {
-        let mut config = ServeConfig::default();
+        let mut config = ServerArgs::default();
         config.max_num_batched_tokens = NonZeroUsize::new(8192);
         config.scheduler_config.chunked_prefill_size = None;
         let programs = FilledPrograms::of(&config);
@@ -2129,7 +2129,7 @@ mod tests {
         // policy the largest shape the catalog bounds a batch to: the same
         // figure the engine admits a batch under, so a policy that states no
         // bound of its own never declares more than the engine built for.
-        let mut config = ServeConfig::default();
+        let mut config = ServerArgs::default();
         config.cuda_graph_config.prefill_token_sizes = Some(vec![
             NonZeroU32::new(128).unwrap(),
             NonZeroU32::new(512).unwrap(),
@@ -2154,7 +2154,7 @@ mod tests {
         // deployment's own batch, or the largest decode graph when it states
         // none, and a catalog that grows with a new world moves the derived
         // figure with it.
-        let mut config = ServeConfig::default();
+        let mut config = ServerArgs::default();
         config.cuda_graph_config.decode_batch_sizes = Some(vec![
             NonZeroU32::new(1).unwrap(),
             NonZeroU32::new(2).unwrap(),
@@ -2189,7 +2189,7 @@ mod tests {
 
         // A deployment that states no token bound and no catalog states no
         // limit, and the mechanism's ceilings are the workers' own.
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         let programs = FilledPrograms::of(&config);
         assert!(
             !programs
@@ -2217,103 +2217,103 @@ mod tests {
     #[test]
     fn a_change_is_routed_by_what_it_moves() {
         /// How a case changes the default configuration.
-        fn set(change: fn(&mut ServeConfig)) -> ServeConfig {
-            let mut config = ServeConfig::default();
+        fn set(change: fn(&mut ServerArgs)) -> ServerArgs {
+            let mut config = ServerArgs::default();
             change(&mut config);
             config
         }
 
         // The frontend's own options (§7.7 host layer, frontend row).
-        let host_frontend: Vec<(&str, fn(&mut ServeConfig))> = vec![
-            ("server_config.port", |config: &mut ServeConfig| {
+        let host_frontend: Vec<(&str, fn(&mut ServerArgs))> = vec![
+            ("server_config.port", |config: &mut ServerArgs| {
                 config.server_config.port = 8001
             }),
-            ("chat_config", |config: &mut ServeConfig| {
+            ("chat_config", |config: &mut ServerArgs| {
                 config.chat_config.template = Some("{{messages}}".to_owned())
             }),
-            ("mm_processor_kwargs", |config: &mut ServeConfig| {
+            ("mm_processor_kwargs", |config: &mut ServerArgs| {
                 config
                     .mm_processor_kwargs
                     .insert("min_pixels".to_owned(), Value::from(1024));
             }),
         ];
         // The daemon's own options (§7.7 host layer, daemon row).
-        let host_daemon: Vec<(&str, fn(&mut ServeConfig))> = vec![
-            ("logging_config.log_requests", |config: &mut ServeConfig| {
+        let host_daemon: Vec<(&str, fn(&mut ServerArgs))> = vec![
+            ("logging_config.log_requests", |config: &mut ServerArgs| {
                 config.logging_config.log_requests = true
             }),
-            ("update_config", |config: &mut ServeConfig| {
+            ("update_config", |config: &mut ServerArgs| {
                 config.update_config.transfer_slowdown += 1.0
             }),
         ];
         // The values that build a main process (§7.7 build-config row).
-        let epoch: Vec<(&str, fn(&mut ServeConfig))> = vec![
-            ("max_running_requests", |config: &mut ServeConfig| {
+        let epoch: Vec<(&str, fn(&mut ServerArgs))> = vec![
+            ("max_running_requests", |config: &mut ServerArgs| {
                 config.max_running_requests = NonZeroUsize::new(4).unwrap()
             }),
-            ("max_model_len", |config: &mut ServeConfig| {
+            ("max_model_len", |config: &mut ServerArgs| {
                 config.max_model_len = Some(NonZeroU32::new(2048).unwrap())
             }),
-            ("mem_fraction_static", |config: &mut ServeConfig| {
+            ("mem_fraction_static", |config: &mut ServerArgs| {
                 config.mem_fraction_static = 0.5
             }),
             (
                 "speculative_config.num_draft_tokens",
-                |config: &mut ServeConfig| config.speculative_config.num_draft_tokens = 4,
+                |config: &mut ServerArgs| config.speculative_config.num_draft_tokens = 4,
             ),
-            ("moe_config.microbatches", |config: &mut ServeConfig| {
+            ("moe_config.microbatches", |config: &mut ServerArgs| {
                 config.moe_config.microbatches = NonZeroU32::new(2).unwrap()
             }),
             (
                 "profiling_config.graph_pc_sampling",
-                |config: &mut ServeConfig| config.profiling_config.graph_pc_sampling = true,
+                |config: &mut ServerArgs| config.profiling_config.graph_pc_sampling = true,
             ),
         ];
         // The program backends (§7.7 backend row) and the program parameters
         // (§7.7 parameter row).
-        let program: Vec<(&str, fn(&mut ServeConfig))> = vec![
-            ("scheduler_config.policy", |config: &mut ServeConfig| {
+        let program: Vec<(&str, fn(&mut ServerArgs))> = vec![
+            ("scheduler_config.policy", |config: &mut ServerArgs| {
                 config.scheduler_config.policy = proto::request::SchedulingPolicy::Priority
             }),
             (
                 "scheduler_config.chunked_prefill_size",
-                |config: &mut ServeConfig| {
+                |config: &mut ServerArgs| {
                     config.scheduler_config.chunked_prefill_size = NonZeroUsize::new(2048)
                 },
             ),
-            ("scheduler_config.max_batch", |config: &mut ServeConfig| {
+            ("scheduler_config.max_batch", |config: &mut ServerArgs| {
                 config.scheduler_config.max_batch = NonZeroUsize::new(8).unwrap()
             }),
-            ("max_num_batched_tokens", |config: &mut ServeConfig| {
+            ("max_num_batched_tokens", |config: &mut ServerArgs| {
                 config.max_num_batched_tokens = NonZeroUsize::new(4096)
             }),
             (
                 "speculative_config.expected_speedup",
-                |config: &mut ServeConfig| config.speculative_config.expected_speedup = Some(2.5),
+                |config: &mut ServerArgs| config.speculative_config.expected_speedup = Some(2.5),
             ),
             (
                 "speculative_config.refill_token_cost",
-                |config: &mut ServeConfig| config.speculative_config.refill_token_cost = Some(0.5),
+                |config: &mut ServerArgs| config.speculative_config.refill_token_cost = Some(0.5),
             ),
-            ("attention_backend", |config: &mut ServeConfig| {
+            ("attention_backend", |config: &mut ServerArgs| {
                 config.attention_backend = "flashinfer".to_owned()
             }),
-            ("prefill_attention_backend", |config: &mut ServeConfig| {
+            ("prefill_attention_backend", |config: &mut ServerArgs| {
                 config.prefill_attention_backend = Some("fa4".to_owned())
             }),
-            ("decode_attention_backend", |config: &mut ServeConfig| {
+            ("decode_attention_backend", |config: &mut ServerArgs| {
                 config.decode_attention_backend = Some("trtllm".to_owned())
             }),
-            ("moe_runner_backend", |config: &mut ServeConfig| {
+            ("moe_runner_backend", |config: &mut ServerArgs| {
                 config.moe_runner_backend = Some("cutlass".to_owned())
             }),
             (
                 "flashinfer_config.workspace_size",
-                |config: &mut ServeConfig| config.flashinfer_config.workspace_size = 1 << 30,
+                |config: &mut ServerArgs| config.flashinfer_config.workspace_size = 1 << 30,
             ),
         ];
 
-        let base = Deployment::of(ServeConfig::default());
+        let base = Deployment::of(ServerArgs::default());
         assert_eq!(layer(&base, &base), Layer::None, "no change");
 
         for (what, change) in host_frontend.iter().chain(host_daemon.iter()) {
@@ -2347,7 +2347,7 @@ mod tests {
         // `forward_expert_parallel` only when an expert lives on another rank),
         // so the setting moves nothing there — and filling the slot anyway
         // would pin a program no call reaches.
-        let exchange_only = set(|config: &mut ServeConfig| {
+        let exchange_only = set(|config: &mut ServerArgs| {
             config.moe_config.exchange = proto::request::ExpertExchange::DeepEp
         });
         assert_eq!(
@@ -2355,7 +2355,7 @@ mod tests {
             Layer::None,
             "at one rank the exchange setting moves nothing"
         );
-        let mut spread = ServeConfig::default();
+        let mut spread = ServerArgs::default();
         spread.moe_config.expert_parallel = true;
         let mut spread_exchanged = spread.clone();
         spread_exchanged.moe_config.exchange = proto::request::ExpertExchange::DeepEp;
@@ -2403,7 +2403,7 @@ mod tests {
     /// (§7.7).
     #[test]
     fn the_filled_programs_name_the_operators_and_phases() {
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         let programs = FilledPrograms::of(&config);
 
         // One attention program for every phase, and no expert exchange for a
@@ -2428,7 +2428,7 @@ mod tests {
         // A deployment that spreads its experts over ranks does route through
         // the exchange, and the slot states the backend its configuration
         // names.
-        let mut parallel = ServeConfig::default();
+        let mut parallel = ServerArgs::default();
         parallel.moe_config.expert_parallel = true;
         let programs = FilledPrograms::of(&parallel);
         assert_eq!(
@@ -2448,7 +2448,7 @@ mod tests {
             chunked_prefill_size: NonZeroUsize::new(2048),
             ..SchedulerConfig::default()
         };
-        let mut stated = ServeConfig::default();
+        let mut stated = ServerArgs::default();
         stated.scheduler_config = scheduler;
         stated.max_num_batched_tokens = NonZeroUsize::new(4096);
         stated.speculative_config.expected_speedup = Some(2.5);
@@ -2472,7 +2472,7 @@ mod tests {
 
         // Per-phase attention: two entries, each naming its phase, once the
         // fields state different backends.
-        let mut split = ServeConfig::default();
+        let mut split = ServerArgs::default();
         split.prefill_attention_backend = Some("fa4".to_owned());
         split.decode_attention_backend = Some("trtllm".to_owned());
         let programs = FilledPrograms::of(&split);
@@ -2495,7 +2495,7 @@ mod tests {
         // operator states it or both phases state the same one; an unstated
         // phase falls back to `attention_backend`, which the split above
         // keeps as a phase of its own.
-        let mut one = ServeConfig::default();
+        let mut one = ServerArgs::default();
         one.attention_backend = "fa4".to_owned();
         let programs = FilledPrograms::of(&one);
         assert_eq!(
@@ -2509,7 +2509,7 @@ mod tests {
             )),
             "one backend covers every phase of the operator"
         );
-        let mut agreed = ServeConfig::default();
+        let mut agreed = ServerArgs::default();
         agreed.prefill_attention_backend = Some("fa4".to_owned());
         agreed.decode_attention_backend = Some("fa4".to_owned());
         let programs = FilledPrograms::of(&agreed);
@@ -2520,7 +2520,7 @@ mod tests {
         );
 
         // A stated grouped expert GEMM program fills both of its operators.
-        let mut moe = ServeConfig::default();
+        let mut moe = ServerArgs::default();
         moe.moe_runner_backend = Some("cutlass".to_owned());
         let programs = FilledPrograms::of(&moe);
         for operator in [operators::GATHER_GEMM, operators::ROUTE_GEMM] {
@@ -2537,7 +2537,7 @@ mod tests {
     /// has no such package (§5.1).
     #[test]
     fn a_program_left_at_auto_is_refused_by_the_option_that_states_it() {
-        let refused = FilledPrograms::of(&ServeConfig::default())
+        let refused = FilledPrograms::of(&ServerArgs::default())
             .stated()
             .expect_err("the default attention backend is a choice, not a package");
         assert!(
@@ -2545,7 +2545,7 @@ mod tests {
             "{refused}"
         );
 
-        let mut stated = ServeConfig::default();
+        let mut stated = ServerArgs::default();
         stated.attention_backend = "trtllm".to_owned();
         stated.moe_config.expert_parallel = true;
         stated.moe_config.exchange = proto::request::ExpertExchange::AllToAll;
@@ -2560,7 +2560,7 @@ mod tests {
     /// `force` afterwards.
     #[test]
     fn an_update_keeps_the_first_failure_and_is_unavailable_with_it() {
-        let mut update = Update::new(1, Deployment::of(ServeConfig::default()));
+        let mut update = Update::new(1, Deployment::of(ServerArgs::default()));
         update.commit();
         assert_eq!(
             update.unavailable(),
@@ -2568,7 +2568,7 @@ mod tests {
             "a committed update is available"
         );
 
-        let mut update = Update::new(2, Deployment::of(ServeConfig::default()));
+        let mut update = Update::new(2, Deployment::of(ServerArgs::default()));
         let first = Failure {
             kind: "illegal_address".to_owned(),
             reason: "an illegal memory access was encountered".to_owned(),
@@ -2817,7 +2817,7 @@ mod tests {
     /// not refused.
     #[test]
     fn a_build_config_reads_back_what_it_wrote() {
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         let build = BuildConfig::of(&config);
         assert!(build.cuda_graph.flow_shapes.is_none());
         let text = serde_json::to_string(&build).expect("a build config is JSON");

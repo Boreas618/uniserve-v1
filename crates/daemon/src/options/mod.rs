@@ -1,7 +1,7 @@
 //! Serving options: one typed configuration tree, read from a TOML file,
 //! a few command-line flags and `--set PATH=VALUE` assignments.
 //!
-//! [`ServeConfig`] is the single declaration of every option, its type and
+//! [`ServerArgs`] is the single declaration of every option, its type and
 //! its default. Its top level holds the options most deployments state; the
 //! rest sit in `*_config` tables, one per owner of the behavior they
 //! configure (`cuda_graph_config` for graph capture, `moe_config` for expert
@@ -9,7 +9,7 @@
 //! [`ServeArgs`] reads the tree: a `--config` file first, then the flags that
 //! name a path of it, then `--set` assignments, each overriding the last.
 //! The tree is the server's configuration: each part of the server reads its
-//! own table, and [`ServeConfig::engine_spec`] states what of it concerns
+//! own table, and [`ServerArgs::engine_spec`] states what of it concerns
 //! the engine process.
 //!
 //! Some options configure one model family: the token batch budgets,
@@ -36,7 +36,7 @@ use serde_json::Value;
 
 use models::ModelDescription;
 
-pub use args::{FLAG_PATHS, Listen, ServeArgs, Stated, overridden, printed, resolve_text};
+pub use args::{Listen, Stated, overridden, printed, resolve_text};
 pub use proto::config::{
     ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DEFAULT_FENCE_COMPONENTS, DeviceConfig,
     FlashInferConfig, ImageFetchConfig, ImageSize, KvCacheConfig, LoadConfig, LoggingConfig,
@@ -133,112 +133,193 @@ impl Stated {
 }
 
 /// Every serving option.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, clap::Args)]
 #[serde(default, deny_unknown_fields)]
-pub struct ServeConfig {
+pub struct ServerArgs {
     /// Local model directory or Hugging Face repository; required.
+    #[arg(value_name = "MODEL")]
     pub model: Option<String>,
     /// The single model name the API serves; `model` when unset.
+    #[arg(long)]
     pub served_model_name: Option<String>,
     /// Longest sequence a request may reach, in tokens. Unset, a checkpoint
     /// with a root `config.json` uses its `max_position_embeddings` (8192
     /// when it declares none) and a MiniMax-H3 pipeline 16384 prompt tokens.
+    #[arg(long)]
     pub max_model_len: Option<NonZeroU32>,
     /// Element type of parameters and activations.
+    #[arg(skip = ServerArgs::default().dtype)]
     pub dtype: ModelDtype,
     /// Precision policy, such as `mode = "balanced"` or per-component
     /// selections under `components`; empty selects the model's default.
+    #[arg(skip)]
     pub quantization: serde_json::Map<String, Value>,
     /// The retired name of `quantization`. A configuration that states it is
     /// refused with the name to state instead, and it is never written back.
     #[serde(rename = "quantization_config", skip_serializing)]
+    #[arg(skip)]
     pub retired_quantization_config: Option<Value>,
     /// Options of the model's multimodal processor; the processor refuses
     /// one it does not take.
+    #[arg(skip)]
     pub mm_processor_kwargs: serde_json::Map<String, Value>,
     /// Attention program (the paged-attention operator's backend) for every
     /// attention call, by the name the ranks' attention registry gives it;
     /// `auto` selects a native kernel per call.
+    #[arg(skip)]
     pub attention_backend: String,
     /// The attention program that fills prompt processing; unset takes
     /// `attention_backend` (`prefill_attention_backend`, `specs/worker.md`
     /// §5.2).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(skip)]
     pub prefill_attention_backend: Option<String>,
     /// The attention program that fills one decoding token; unset takes
     /// `attention_backend` (`decode_attention_backend`, §5.2).
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(skip)]
     pub decode_attention_backend: Option<String>,
     /// The grouped expert GEMM program (`moe_runner_backend`, §5.1, §9);
     /// unset lets the daemon resolve it when it prepares the epoch.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(skip)]
     pub moe_runner_backend: Option<String>,
     /// This host's Program Server socket (`program_server`), which the
     /// daemon prepares an epoch's programs against (§5.1, §6.3); unset takes
     /// the Program Server's default socket. A host-layer value: the daemon
     /// reads it alone, and a change of it is a hot restart.
     #[serde(skip_serializing_if = "Option::is_none")]
+    #[arg(long, value_name = "PATH")]
     pub program_server: Option<PathBuf>,
     /// Concurrently resident requests, clamped to what the workers hold.
+    #[arg(long, default_value_t = ServerArgs::default().max_running_requests)]
     pub max_running_requests: NonZeroUsize,
     /// Token work admitted in one scheduling step, 8192 when unset; token
     /// models only.
+    #[arg(skip)]
     pub max_num_batched_tokens: Option<NonZeroUsize>,
     /// Each rank's share of its device's total storage for weights, static
     /// allocations and the KV cache, in (0, 1]. A deployment group's
     /// `mem_fraction_static` overrides it.
+    #[arg(long, default_value_t = ServerArgs::default().mem_fraction_static)]
     pub mem_fraction_static: f64,
     /// Tensor-parallel workers of each scheduler's group when no
     /// `worker_groups` file is given.
+    #[arg(long, default_value_t = ServerArgs::default().tensor_parallel_size)]
     pub tensor_parallel_size: NonZeroUsize,
     /// Schedulers, each with its own scheduler, KV cache and worker
     /// groups. With a `worker_groups` file, its model groups form the engine
     /// cores as equal consecutive blocks.
+    #[arg(long, default_value_t = ServerArgs::default().data_parallel_size)]
     pub data_parallel_size: NonZeroUsize,
     /// Deployment file placing worker groups and their components.
+    #[arg(long, value_name = "FILE")]
     pub worker_groups: Option<PathBuf>,
     /// This node's host name; its daemon runs the ranks placed on this
     /// host, and a deployment rank entry without a host names it.
+    #[arg(long, default_value_t = ServerArgs::default().host_identity)]
     pub host_identity: String,
     /// Host running the engine and ranks whose configuration omits a host.
     /// Unset uses this node's identity. The engine can move to another
     /// joined node through a world change; the daemon's identity stays local.
+    #[arg(skip)]
     pub engine_host: Option<String>,
     /// Nodes of the deployment, each running one `uniserve serve`.
+    #[arg(long, default_value_t = ServerArgs::default().nnodes)]
     pub nnodes: NonZeroU32,
     /// This node's rank among `nnodes`. The leader, rank 0, serves the API
     /// and runs the engine; every other node runs only its daemon, which
     /// joins the leader's.
+    #[arg(long, default_value_t = ServerArgs::default().node_rank)]
     pub node_rank: u32,
     /// The leader's `host:port`, which the other nodes' daemons join at and
     /// the leader binds; required with several nodes.
+    #[arg(long, value_name = "HOST:PORT")]
     pub dist_init_addr: Option<String>,
+    #[arg(skip)]
     pub server_config: ServerConfig,
     /// The daemon's own HTTP server (`admin_config`): the address this node's
     /// admin API listens on (design §7.7). The application's server is
     /// `server_config`'s, which the frontend reads.
+    #[arg(skip)]
     pub admin_config: AdminConfig,
+    #[arg(skip)]
     pub load_config: LoadConfig,
+    #[arg(skip)]
     pub kv_cache_config: KvCacheConfig,
+    #[arg(skip)]
     pub scheduler_config: SchedulerConfig,
+    #[arg(skip)]
     pub speculative_config: SpeculativeConfig,
+    #[arg(skip)]
     pub migration_config: MigrationConfig,
+    #[arg(skip)]
     pub update_config: UpdateConfig,
+    #[arg(skip)]
     pub device_config: DeviceConfig,
+    #[arg(skip)]
     pub moe_config: MoeConfig,
+    #[arg(skip)]
     pub cuda_graph_config: CudaGraphConfig,
+    #[arg(skip)]
     pub flashinfer_config: FlashInferConfig,
+    #[arg(skip)]
     pub worker_config: WorkerConfig,
+    #[arg(skip)]
     pub profiling_config: ProfilingConfig,
+    #[arg(skip)]
     pub logging_config: LoggingConfig,
+    #[arg(skip)]
     pub chat_config: ChatConfig,
+    #[arg(skip)]
     pub image_fetch_config: ImageFetchConfig,
+    #[arg(skip)]
     pub video_config: VideoConfig,
+    #[arg(skip)]
     pub media_config: MediaConfig,
+    #[arg(skip)]
     pub video_job_config: VideoJobConfig,
+
+    // The command line's inputs that are not options: where the options come from, and the
+    // shortcuts for the three nested options the flags name. None is part of the configuration's
+    // tree, so a printed configuration never carries one.
+    /// TOML file of serving options; the flags and `--set` override it.
+    #[serde(skip)]
+    #[arg(long = "config", value_name = "FILE")]
+    pub config_file: Option<PathBuf>,
+    /// Set the option at PATH, such as `cuda_graph_config.policy=off` or
+    /// `moe_config.exchange=deepep`; repeatable, and it overrides the flags
+    /// and the file. VALUE is a TOML value (`2`, `true`, `[1024, 4096]`,
+    /// `{ mode = "balanced" }`) or JSON, and otherwise text; a list may be
+    /// comma-separated text. One invocation may not set both a table and an
+    /// option inside it.
+    #[serde(skip)]
+    #[arg(long = "set", value_name = "PATH=VALUE")]
+    pub set: Vec<String>,
+    /// TCP address the server listens on (`admin_config.host` for `serve`,
+    /// `server_config.host` for `frontend`).
+    #[serde(skip)]
+    #[arg(long)]
+    pub host: Option<String>,
+    /// TCP port the server listens on (`admin_config.port` for `serve`,
+    /// `server_config.port` for `frontend`).
+    #[serde(skip)]
+    #[arg(long)]
+    pub port: Option<u16>,
+    /// The `uniserve` executable that runs the workers
+    /// (`worker_config.executable`).
+    #[serde(skip)]
+    #[arg(long, value_name = "PATH")]
+    pub worker_executable: Option<PathBuf>,
+    /// The descriptor of the handoff socket to the daemon this one succeeds,
+    /// whose deployment it takes over, as `POST /admin/restart` starts its
+    /// successor (`daemon::restart`); every other argument is ignored.
+    #[serde(skip)]
+    #[arg(long, hide = true, value_name = "FD")]
+    pub predecessor: Option<i32>,
 }
 
-impl Default for ServeConfig {
+impl Default for ServerArgs {
     fn default() -> Self {
         Self {
             model: None,
@@ -284,6 +365,12 @@ impl Default for ServeConfig {
             video_config: VideoConfig::default(),
             media_config: MediaConfig::default(),
             video_job_config: VideoJobConfig::default(),
+            config_file: None,
+            set: Vec::new(),
+            host: None,
+            port: None,
+            worker_executable: None,
+            predecessor: None,
         }
     }
 }
@@ -318,8 +405,8 @@ impl Default for AdminConfig {
 /// compares): the configuration a hot restart of the daemon serves when an
 /// update changes both the daemon and what a world executes, before the
 /// daemon's successor changes the world.
-pub fn with_daemon_options(current: &ServeConfig, target: &ServeConfig) -> ServeConfig {
-    ServeConfig {
+pub fn with_daemon_options(current: &ServerArgs, target: &ServerArgs) -> ServerArgs {
+    ServerArgs {
         server_config: target.server_config.clone(),
         admin_config: target.admin_config.clone(),
         logging_config: target.logging_config.clone(),
@@ -337,7 +424,7 @@ pub fn with_daemon_options(current: &ServeConfig, target: &ServeConfig) -> Serve
 /// alone (its HTTP server, the request and output processing, the media
 /// and video jobs, logging and migration), which a hot restart of the
 /// daemon applies; the engine spec covers every other option.
-pub fn daemon_options_differ(current: &ServeConfig, target: &ServeConfig) -> bool {
+pub fn daemon_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool {
     current.server_config != target.server_config
         || current.admin_config != target.admin_config
         || current.logging_config != target.logging_config
@@ -438,10 +525,10 @@ pub struct RollbackConfig {
     pub window: Option<Duration>,
 }
 
-impl ServeConfig {
+impl ServerArgs {
     /// The configured model: a local directory or a Hugging Face repository.
     ///
-    /// Empty while unstated; [`ServeConfig::validate`] refuses that.
+    /// Empty while unstated; [`ServerArgs::validate`] refuses that.
     pub fn model(&self) -> &str {
         self.model.as_deref().unwrap_or_default()
     }

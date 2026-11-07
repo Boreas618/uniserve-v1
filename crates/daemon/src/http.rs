@@ -42,7 +42,7 @@ use crate::http::middleware::ConcurrencyLimit;
 use crate::leader::{Leader, Task};
 use crate::openai::video_jobs::VideoJobs;
 use crate::openai::{self, ApiError, chat_completions, videos};
-use crate::options::{MediaConfig, ServeConfig, ServerConfig, Stated};
+use crate::options::{MediaConfig, ServerArgs, ServerConfig, Stated};
 
 /// HTTP body limit of every route but the video submission routes, in bytes.
 pub(crate) const BODY_LIMIT: usize = 64 << 20;
@@ -82,7 +82,7 @@ const OPENMETRICS_CONTENT_TYPE: &str = "application/openmetrics-text; version=1.
 /// Fails when the configuration is invalid, the daemon cannot start or
 /// fails, the engine cannot start, the listener cannot be bound or report
 /// its address, the server fails, or the engine shutdown fails.
-pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationToken) -> Result<()> {
+pub async fn serve(config: ServerArgs, stated: Stated, shutdown: CancellationToken) -> Result<()> {
     config
         .validate(&stated)
         .context("invalid serving configuration")?;
@@ -203,7 +203,7 @@ pub async fn serve(config: ServeConfig, stated: Stated, shutdown: CancellationTo
 /// As [`serve_on`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn serve_leader(
-    config: &ServeConfig,
+    config: &ServerArgs,
     stated: &Stated,
     engine: Arc<Leader>,
     admin: Arc<admin::Admin>,
@@ -265,7 +265,7 @@ pub(crate) async fn serve_leader(
 /// Returns `served`'s failure, or the first failure of the steps that
 /// follow.
 pub(crate) async fn finish(
-    config: &ServeConfig,
+    config: &ServerArgs,
     engine: &Arc<Leader>,
     daemon: Arc<std::sync::Mutex<Option<Daemon>>>,
     retire: Arc<AtomicBool>,
@@ -341,7 +341,7 @@ async fn serve_on(
     engine: &Arc<Leader>,
     admin: &Arc<admin::Admin>,
     listener: Listener,
-    config: &ServeConfig,
+    config: &ServerArgs,
     shutdown: &CancellationToken,
     accepting: &CancellationToken,
     jobs: Arc<VideoJobs>,
@@ -1082,7 +1082,7 @@ mod tests {
             let shutdown = shutdown.clone();
             async move {
                 let admin = admin::Admin::new(shutdown.clone(), Arc::new(AtomicBool::new(false)));
-                let config = ServeConfig::default();
+                let config = ServerArgs::default();
                 let jobs = Arc::new(VideoJobs::new(
                     config.video_job_config.clone(),
                     shutdown.child_token(),
@@ -1122,7 +1122,7 @@ mod tests {
         let engine = Arc::new(sim_engine(ModelParameters::Qwen3));
         let (listener, address) = loopback().await;
         let budget = Duration::from_millis(200);
-        let mut config = ServeConfig::default();
+        let mut config = ServerArgs::default();
         config.server_config.shutdown_timeout = budget;
         let shutdown = CancellationToken::new();
         let server = tokio::spawn({

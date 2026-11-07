@@ -175,7 +175,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::options::ServeConfig;
+    use crate::options::ServerArgs;
 
     fn launch() -> Launch {
         Launch {
@@ -277,7 +277,7 @@ mod tests {
     #[test]
     fn the_build_config_is_written_once_per_epoch() {
         let directory = scratch("build");
-        let config = BuildConfig::of(&ServeConfig::default());
+        let config = BuildConfig::of(&ServerArgs::default());
         let path = write_build_config(&directory, 12, &config).expect("the build config");
         assert_eq!(
             path.file_name().and_then(|name| name.to_str()),

@@ -1348,7 +1348,7 @@ mod tests {
 
     use super::*;
     use crate::epoch::{BuildConfig, Deployment, Program, UpdateState};
-    use crate::options::ServeConfig;
+    use crate::options::ServerArgs;
 
     /// A roster that records what the switch asks of it and replays the
     /// events a test scripts.
@@ -1467,7 +1467,7 @@ mod tests {
 
     /// The record a target epoch starts with.
     fn record() -> EpochRecord {
-        let config = ServeConfig::default();
+        let config = ServerArgs::default();
         EpochRecord {
             build_config: BuildConfig::of(&config),
             kernels: BTreeMap::new(),
@@ -1537,7 +1537,7 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let switch = Switch::new(
             Arc::clone(&epochs),
-            Update::new(7, Deployment::of(ServeConfig::default())),
+            Update::new(7, Deployment::of(ServerArgs::default())),
             12,
             record(),
             (11, 11),
@@ -1995,7 +1995,7 @@ mod tests {
         let discarded = switch.discarded().to_vec();
         let mut next = Switch::new(
             Arc::clone(&epochs),
-            Update::new(8, Deployment::of(ServeConfig::default())),
+            Update::new(8, Deployment::of(ServerArgs::default())),
             13,
             record(),
             (12, 12),
@@ -2166,7 +2166,7 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let mut switch = Switch::new(
             Arc::clone(&epochs),
-            Update::new(7, Deployment::of(ServeConfig::default())),
+            Update::new(7, Deployment::of(ServerArgs::default())),
             12,
             record(),
             (11, 11),
@@ -2677,7 +2677,7 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let mut switch = Switch::new(
             Arc::clone(&epochs),
-            Update::new(7, Deployment::of(ServeConfig::default())),
+            Update::new(7, Deployment::of(ServerArgs::default())),
             12,
             record(),
             (11, 11),
@@ -2924,7 +2924,7 @@ mod tests {
         let epochs = Arc::new(Epochs::new());
         let mut switch = Switch::new(
             Arc::clone(&epochs),
-            Update::new(7, Deployment::of(ServeConfig::default())),
+            Update::new(7, Deployment::of(ServerArgs::default())),
             12,
             record(),
             (11, 11),

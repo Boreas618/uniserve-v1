@@ -33,7 +33,7 @@ use super::{middleware, retire_deployment, router, video_body_limit};
 use crate::leader::Leader;
 use crate::openai::ApiError;
 use crate::openai::video_jobs::VideoJobs;
-use crate::options::{AdminConfig, ServeConfig, ServerConfig, resolve_text};
+use crate::options::{AdminConfig, ServerArgs, ServerConfig, resolve_text};
 use crate::supervision::Daemon;
 
 /// How often a deployment that is brought down checks for requests in
@@ -243,7 +243,7 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
 /// brings it down.
 async fn run(
     node: Arc<Node>,
-    config: ServeConfig,
+    config: ServerArgs,
     stated: crate::options::Stated,
     token: CancellationToken,
 ) {
@@ -261,7 +261,7 @@ async fn run(
 /// The deployment's whole life on the node.
 async fn serve_deployment(
     node: &Arc<Node>,
-    config: &ServeConfig,
+    config: &ServerArgs,
     stated: &crate::options::Stated,
     token: &CancellationToken,
 ) -> Result<()> {

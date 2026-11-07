@@ -20,7 +20,11 @@ use crate::cli::LogLevels;
 use crate::logging;
 
 /// Runs the `serve` command with the daemon's `args`, logging under `log`.
-pub(crate) fn run(args: daemon::options::ServeArgs, log: &LogLevels) -> Result<ExitCode> {
+pub(crate) fn run(
+    args: daemon::options::ServerArgs,
+    matches: &clap::ArgMatches,
+    log: &LogLevels,
+) -> Result<ExitCode> {
     logging::init_tracing(
         "Daemon",
         log.log_level.as_deref(),
@@ -33,13 +37,15 @@ pub(crate) fn run(args: daemon::options::ServeArgs, log: &LogLevels) -> Result<E
         })?;
         return Ok(ExitCode::SUCCESS);
     }
-    runtime.block_on(serve(args))?;
+    let resolved = args.resolve(matches, daemon::options::Listen::Daemon)?;
+    runtime.block_on(serve(resolved))?;
     Ok(ExitCode::SUCCESS)
 }
 
-/// Serves the configuration `args` resolve until Ctrl-C or SIGTERM.
-async fn serve(args: daemon::options::ServeArgs) -> Result<()> {
-    let (config, stated) = args.resolve()?;
+/// Serves the resolved configuration until Ctrl-C or SIGTERM.
+async fn serve(
+    (config, stated): (daemon::options::ServerArgs, daemon::options::Stated),
+) -> Result<()> {
     // A model-less leader serves its admin API until a deployment is
     // configured. Followers join the leader without loading a model.
     if config.leads() && config.model.is_none() {
