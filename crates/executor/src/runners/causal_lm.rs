@@ -1488,6 +1488,24 @@ pub trait KvProvider: Send + Sync {
         install_block_tables_unavailable(tables)
     }
 
+    /// Records the batch's page copies on the cache's copy stream, and makes `stream` wait for the
+    /// loads the forward reads. Answers the fence of the offloads, which the batch's output waits
+    /// on. A provider that holds no cache refuses a copy rather than dropping it.
+    fn issue_pages(
+        &mut self,
+        loads: &[ipc::PageCopy],
+        offloads: &[ipc::PageCopy],
+        stream: &platform::Stream,
+    ) -> Result<Option<Arc<platform::Event>>> {
+        let _ = stream;
+        if loads.is_empty() && offloads.is_empty() {
+            return Ok(None);
+        }
+        Err(Error::Invalid(
+            "a batch copies pages and this runner holds no cache".to_owned(),
+        ))
+    }
+
     /// How many attention groups the model's layers index.
     fn groups(&self) -> usize;
 
@@ -1561,6 +1579,10 @@ struct PendingInstall {
     tables: Vec<ipc::BlockTable>,
     /// The units the mechanism allocated for this batch's pages, with their copies.
     units: Vec<ipc::CacheUnitAllocation>,
+    /// The host KV cache's pages the batch's new units load.
+    loads: Vec<ipc::PageCopy>,
+    /// The published pages the batch copies to the host KV cache.
+    offloads: Vec<ipc::PageCopy>,
 }
 
 /// A causal language model's runner: one block's decode and prefill phases.
@@ -1651,6 +1673,8 @@ pub struct CausalLmRunner<M: CausalLm> {
     /// failed one can leave the recording in a state it never recovers from.
     capturing: bool,
     pending_install: Option<PendingInstall>,
+    /// The fence of the running batch's page offloads, until its output waits on it.
+    offload_fence: Option<Arc<platform::Event>>,
     /// What `UNISERVE_RUNNER_DUMP` wrote about the batch that is about to be replayed, and the page
     /// its readback must name. Filled at submit, which sees the batch's own block tables, and read
     /// by the device thread, which is the only thread that may issue to this runner's stream.
@@ -1809,6 +1833,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             served: false,
             capturing: false,
             pending_install: None,
+            offload_fence: None,
             pending_dump: None,
             recaptured: false,
             last_prefill: None,
@@ -1947,6 +1972,8 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
             batch: batch.id,
             tables: batch.block_tables.clone(),
             units: batch.cache_units.clone(),
+            loads: batch.page_loads.clone(),
+            offloads: batch.page_offloads.clone(),
         });
         // What a batch says about where its tokens read and write their cache, when a deployment
         // asks for it: the addresses a prefill wrote and a decode reads are compared from these
@@ -2284,6 +2311,11 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                 let nodes = captured.kernel_nodes();
                 if !eager {
                     captured.launch(&stream)?;
+                }
+                // The output read behind this says the batch's offloads finished: the mechanism
+                // commits their pages from it, and the forward above did not wait for them.
+                if let Some(fence) = self.offload_fence.take() {
+                    stream.wait_event(&fence)?;
                 }
                 self.enqueue_ms = enqueue.elapsed().as_secs_f64() * 1e3;
                 if let Some(counters) = &self.counters {
@@ -3330,7 +3362,11 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .map(|unit| u64::from(unit.0))
             .or(self.cache_page);
         self.kv.install_block_tables(&install.tables, &self.stream)?;
-        self.kv.apply_cache_units(&install.units, &self.stream)
+        self.kv.apply_cache_units(&install.units, &self.stream)?;
+        self.offload_fence = self
+            .kv
+            .issue_pages(&install.loads, &install.offloads, &self.stream)?;
+        Ok(())
     }
 
     /// What the captured attention launch is given: its grid, and the call its kernel dereferences.

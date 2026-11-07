@@ -605,6 +605,24 @@ impl EpochPlan {
     /// facts, which neither the launch file nor the model's configuration states.
     /// `engine::EngineConfig::of` refuses each absent fact by name, so a deployment that needs one
     /// fails with the fact it is missing rather than planning against a made-up value.
+    /// Whether this rank keeps a host KV cache: a text rank of a deployment with a host tier.
+    pub(crate) fn host_kv_cache(&self, served: &Served) -> bool {
+        matches!(served, Served::Text(_))
+            && self.build.kv_cache.host_tier
+            && self.build.kv_cache.prefix_caching
+    }
+
+    /// What this rank's pages are computed from: an epoch of the same checkpoint and numerics finds
+    /// the pages another left in the host KV cache, and one of another computes other pages.
+    pub(crate) fn page_fingerprint(&self) -> String {
+        format!(
+            "{}|{:?}|{:?}",
+            self.checkpoint.display(),
+            self.build.dtype,
+            self.build.quantization
+        )
+    }
+
     pub(crate) fn rank_facts(&self, memory: &Memory, served: &Served) -> Result<engine::RankFacts> {
         let Served::Text(model) = served else {
             return self.media_rank_facts();
@@ -620,6 +638,8 @@ impl EpochPlan {
             .into_iter()
             .collect();
         Ok(engine::RankFacts {
+            deployment: None,
+            host_kv_cache: false,
             model: Some(self.checkpoint.display().to_string()),
             dtype: Some(self.build.dtype.clone()),
             world: Some(self.world),
@@ -962,6 +982,8 @@ impl EpochPlan {
             )?;
         let tokens = prompt_capacity(&self.build.video, longest)?;
         Ok(engine::RankFacts {
+            deployment: None,
+            host_kv_cache: false,
             model: Some(self.checkpoint.display().to_string()),
             dtype: Some(self.build.dtype.clone()),
             world: Some(self.world),

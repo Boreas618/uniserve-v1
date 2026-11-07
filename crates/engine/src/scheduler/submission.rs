@@ -392,9 +392,25 @@ impl Submissions {
     ) -> Result<Vec<(ExecutorGroupId, Vec<String>)>, ExecutorError> {
         match &mut self.path {
             Path::MainProcess(executor) => executor.map_host_cache(tokens),
-            // No rank of this process maps a host page pool, so the mechanism
-            // plans no host KV write rather than one nothing answers.
-            Path::InProcess(_) => Ok(Vec::new()),
+            // The ranks of this process map their pools through the executor that owns their
+            // caches: its device threads issue the copies.
+            Path::InProcess(in_process) => {
+                let mapped = in_process
+                    .batches
+                    .map_host_cache(tokens)
+                    .map_err(|error| anyhow::anyhow!(error))?;
+                mapped
+                    .into_iter()
+                    .map(|(group, ranks)| {
+                        let results = ranks
+                            .iter()
+                            .map(|pools| serde_json::to_string(&Some(pools)))
+                            .collect::<Result<Vec<_>, _>>()
+                            .map_err(|error| anyhow::anyhow!(error))?;
+                        Ok((ExecutorGroupId(group), results))
+                    })
+                    .collect()
+            }
         }
     }
 
@@ -535,6 +551,31 @@ impl InProcess {
     }
 
     fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+        // Pages that wait while nothing runs ride no forward: they are a batch of their own, which
+        // the mechanism reads the end of as it reads any other.
+        if batch.requests.is_empty()
+            && let Some(offloads) = batch
+                .page_offloads
+                .as_ref()
+                .filter(|offloads| !offloads.pages.is_empty())
+        {
+            let submission = self
+                .batches
+                .copy_pages(offloads.pages.clone())
+                .map_err(|error| ExecutorSubmitError::Failed(anyhow::anyhow!(error)))?;
+            return self
+                .queue
+                .send(Pending {
+                    batch: batch.id,
+                    submission,
+                    calls: Vec::new(),
+                })
+                .map_err(|error| {
+                    ExecutorSubmitError::Failed(anyhow::anyhow!(
+                        "the in-process waiting thread has gone: {error}"
+                    ))
+                });
+        }
         let (device, calls) = self.describe(&batch).map_err(ExecutorSubmitError::Failed)?;
         let submission = self
             .batches
@@ -694,6 +735,8 @@ impl InProcess {
                 generation,
                 cache_units: Vec::new(),
                 block_tables: Vec::new(),
+                page_loads: Vec::new(),
+                page_offloads: Vec::new(),
                 media: Some(media),
             };
             return Ok((device, calls));
@@ -766,6 +809,18 @@ impl InProcess {
                 .iter()
                 .flat_map(|(_, placement)| placement.block_tables.iter().cloned())
                 .collect(),
+            // The host KV cache's copies, which the runner issues on its copy stream: what the
+            // batch's new units load before the forward, and what it publishes beside it.
+            page_loads: batch
+                .requests
+                .iter()
+                .flat_map(|(_, placement)| placement.page_loads.iter().cloned())
+                .collect(),
+            page_offloads: batch
+                .page_offloads
+                .as_ref()
+                .map(|offloads| offloads.pages.clone())
+                .unwrap_or_default(),
             // A token forward carries no media columns: the media arm above is where a media
             // batch's are passed through, and this arm refuses a media call by name.
             media: None,

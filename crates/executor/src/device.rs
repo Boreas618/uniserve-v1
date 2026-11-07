@@ -475,6 +475,50 @@ impl Executor {
         Ok(submission)
     }
 
+    /// Maps the host KV cache's page pools on this device's cache and answers what the rank reports
+    /// of them. It waits: a scheduler sizes the host KV cache once, before it serves anything.
+    pub fn map_host_cache(
+        &self,
+        tokens: u64,
+        keys: &crate::batch::HostCacheKeys,
+    ) -> Result<Vec<ipc::PagePoolInfo>> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        let pools = Arc::new(std::sync::Mutex::new(Vec::new()));
+        self.queue.submit(
+            Command::MapHostCache {
+                tokens,
+                keys: keys.clone(),
+                pools: Arc::clone(&pools),
+            },
+            &submission,
+            JobKind::HostCache,
+            None,
+        )?;
+        match submission.wait() {
+            crate::completion::Outcome::Success(_) => Ok(std::mem::take(
+                &mut *pools
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            )),
+            crate::completion::Outcome::Failed(error) => {
+                Err(Error::Invalid(format!("mapping the host KV cache: {error}")))
+            }
+            crate::completion::Outcome::Cancelled => {
+                Err(Error::Invalid("mapping the host KV cache was cancelled".into()))
+            }
+        }
+    }
+
+    /// Copies `offloads` to the host KV cache in queue order, with no batch to carry them.
+    pub fn copy_pages(&self, offloads: Vec<ipc::PageCopy>) -> Result<Submission> {
+        let id = SubmissionId(self.queue.next_submission());
+        let (submission, _) = Submission::pending(id);
+        self.queue
+            .submit(Command::CopyPages(offloads), &submission, JobKind::HostCache, None)?;
+        Ok(submission)
+    }
+
     /// Whether one of this device's runners serves `phase` (4.4): what a router above the executors
     /// asks before it hands a batch over.
     pub fn serves(&self, phase: ipc::PhaseId) -> bool {
@@ -1014,6 +1058,34 @@ impl Device {
                     named.runner.attach_shadow(shadow, page_set);
                 }
                 self.shadow_attached = true;
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::MapHostCache { tokens, keys, pools } => {
+                let client = self.storage()?;
+                for cache in self.caches() {
+                    let setup = crate::memory::prefix_cache::host::HostCacheSetup {
+                        fingerprint: keys.fingerprints.clone(),
+                        endpoint: keys.endpoint.clone(),
+                        device: self.device,
+                        copy: platform::Stream::new(self.device)?,
+                    };
+                    let mut cache = cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    *pools
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        setup.map(&client, &mut cache, *tokens)?;
+                }
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::CopyPages(offloads) => {
+                for cache in self.caches() {
+                    cache
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .copy_pages(offloads)?;
+                }
                 Ok(Step::Done(BatchOutput::default()))
             }
             Command::Sleep => {

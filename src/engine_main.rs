@@ -7346,8 +7346,18 @@ fn schedulers(
     // One scheduler per scheduler thread: the configuration is this rank's, derived from what the
     // launch states, the build config fixes and the model's own geometry, and it refuses by name
     // when a fact it needs is one the launch file does not carry.
-    let facts = plan.rank_facts(memory, model)?;
+    let mut facts = plan.rank_facts(memory, model)?;
+    // The host KV cache copies a rank's pages on that rank's copy stream, and the pool this process
+    // states below is its one rank: a process of several devices would copy one rank's share of
+    // every page, so it keeps none until its inventory states them all.
+    let host_cache = plan.host_kv_cache(model) && executors.len() == 1;
+    facts.deployment = Some(launch.deployment.clone());
+    facts.host_kv_cache = host_cache;
     let config = engine::EngineConfig::of(&facts)?;
+    let mut rank = rank.clone();
+    if host_cache && let Some(cache) = rank.prefix_cache.as_mut() {
+        cache.host_token_bytes = memory.host_token_bytes();
+    }
     // The scheduler submits through the same devices this process drives, so a batch and a
     // switchover reach one executor thread per device and never two.
     // The scheduler plans against a description of the pool, and this process is the one pool it
@@ -7374,10 +7384,15 @@ fn schedulers(
         },
         max_model_len: plan.max_kv_len(model)?,
     };
-    let batches: Arc<dyn executor::batch::Batches> = Arc::new(
-        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
-            .stating(vec![inventory]),
-    );
+    let mut stated = executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
+        .stating(vec![inventory]);
+    if host_cache {
+        stated = stated.keeping_host_cache(executor::batch::HostCacheKeys {
+            fingerprints: vec![plan.page_fingerprint(); memory.cache_groups()],
+            endpoint: None,
+        });
+    }
+    let batches: Arc<dyn executor::batch::Batches> = Arc::new(stated);
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.
     let progress = engine::CommandWaker::new(move || control.wake());
