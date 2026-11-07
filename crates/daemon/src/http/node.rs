@@ -105,10 +105,16 @@ pub async fn node(
         }));
     }
     info!(%address, "the node serves no deployment yet");
-    let served = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown.clone().cancelled_owned())
-        .await
-        .context("the node's HTTP server failed");
+    // The connection writer is what takes a response's body out of its extensions (`conn`), so a
+    // deployment's routes answer nothing through any other server.
+    let served = super::conn::serve(
+        listener,
+        app,
+        shutdown.clone(),
+        super::handoff::Admissions::default(),
+    )
+    .await
+    .context("the node's HTTP server failed");
     // The deployment serving now comes down with the node.
     let current = locked(&node.current).take();
     if let Some(token) = current {
