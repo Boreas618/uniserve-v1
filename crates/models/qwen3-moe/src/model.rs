@@ -75,6 +75,9 @@ pub struct LoadOptions {
     /// is admitted within it; a batch larger than it is a deployment error rather than a buffer that
     /// grows.
     pub exchange_capacity: u64,
+    /// Leading ranks of the exchange that hold no experts: the attention ranks of a deployment whose
+    /// experts live on dedicated ranks, and zero when every rank holds its share.
+    pub exchange_attention: u32,
 }
 
 impl Default for LoadOptions {
@@ -86,6 +89,7 @@ impl Default for LoadOptions {
             page_tokens: 64,
             experts_encoded: false,
             exchange_capacity: 0,
+            exchange_attention: 0,
         }
     }
 }
@@ -290,6 +294,7 @@ impl Plan {
                         Error::Config(format!("{ranks} ranks exceed a plan's row counts"))
                     })?,
                     capacity: options.exchange_capacity,
+                    attention: u64::from(options.exchange_attention),
                 })
             }
         };
@@ -1359,6 +1364,15 @@ impl Substage {
 }
 
 impl CausalLm for Qwen3Moe {
+    fn join_expert_step(&self, f: &Forward) -> nn::Result<()> {
+        for layer in &self.layers {
+            if let Mlp::Experts(moe) = &layer.mlp {
+                moe.join_expert_step(f)?;
+            }
+        }
+        Ok(())
+    }
+
     fn embed_input_ids(&self, f: &Forward, ids: TensorView, out: TensorView) -> nn::Result<()> {
         self.embedding
             .forward(f, ids, out)

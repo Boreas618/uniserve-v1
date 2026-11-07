@@ -134,6 +134,9 @@ impl WeightLayout {
     /// thirty-two, which is the arrangement the trtllm-gen products read (`useShuffledMatrix`).
     pub const NVFP4_VALUES_SHUFFLED: Self = Self("nvfp4_values_shuffled");
     /// [`ValueLayout::InterleavedShuffled`]'s row order.
+    /// Packed values whose two row halves interleave in sixteen-row blocks, the second half's first:
+    /// the row order a gated product reads when each gate block precedes its up block.
+    pub const NVFP4_VALUES_GATE_FIRST: Self = Self("nvfp4_values_gate_first");
     pub const NVFP4_VALUES_INTERLEAVED_SHUFFLED: Self = Self("nvfp4_values_interleaved_shuffled");
 
     /// A calibrated NVFP4 matrix's E4M3 block scales in the linear layout: `[rows, columns / 16]`.
@@ -611,6 +614,9 @@ pub enum ValueLayout {
         /// Rows one MMA tile of the product covers, as [`Self::Shuffled`] states it.
         epilogue_tile_m: u32,
     },
+    /// A fused gated product's row order: thirty-two-row block `b` holds rows `[16b, 16b + 16)` of
+    /// the matrix's second half, then the same rows of its first half.
+    GateFirst,
 }
 
 impl ValueLayout {
@@ -620,6 +626,7 @@ impl ValueLayout {
             Self::Plain => WeightLayout::NVFP4_VALUES,
             Self::Shuffled { .. } => WeightLayout::NVFP4_VALUES_SHUFFLED,
             Self::InterleavedShuffled { .. } => WeightLayout::NVFP4_VALUES_INTERLEAVED_SHUFFLED,
+            Self::GateFirst => WeightLayout::NVFP4_VALUES_GATE_FIRST,
         }
     }
 
@@ -627,6 +634,7 @@ impl ValueLayout {
     pub fn block(self) -> Option<u64> {
         match self {
             Self::Plain => None,
+            Self::GateFirst => Some(32),
             Self::Shuffled { epilogue_tile_m } | Self::InterleavedShuffled { epilogue_tile_m } => {
                 Some(if epilogue_tile_m % 128 == 0 { 32 } else { 16 })
             }
@@ -643,6 +651,20 @@ impl ValueLayout {
         };
         let mut arranged = bytes.to_vec();
         let stride = row_bytes as usize;
+        if matches!(self, Self::GateFirst) {
+            for expert in 0..experts {
+                let base = expert * rows * row_bytes;
+                for position in 0..rows {
+                    let (group, within) = (position / 32, position % 32);
+                    let half = if within < 16 { rows / 2 } else { 0 };
+                    let source = (base + (group * 16 + within % 16 + half) * row_bytes) as usize;
+                    let target = (base + position * row_bytes) as usize;
+                    arranged[target..target + stride]
+                        .copy_from_slice(&bytes[source..source + stride]);
+                }
+            }
+            return arranged;
+        }
         let lanes = block / 8;
         for expert in 0..experts {
             let base = expert * rows * row_bytes;
@@ -808,6 +830,8 @@ pub struct QuantizedStack {
     /// consumer is weight-only; a calibrated checkpoint asked for this and missing it is refused by
     /// tensor name.
     pub input_scale: Option<Weight>,
+    /// The activation scale [`Self::encode_scale`] is the reciprocal of.
+    pub activation_scale: f32,
 }
 
 /// Whether `dtype` is one of the two element types a block-scale field may have.
@@ -1606,12 +1630,50 @@ impl<'a> WeightLoader<'a> {
         layout: ScaleLayout,
         input_scale: bool,
     ) -> Result<QuantizedStack> {
-        if experts == 0 || projections.is_empty() {
+        self.nvfp4_window(
+            name,
+            prefix,
+            projections,
+            0..experts,
+            experts,
+            names,
+            values_layout,
+            layout,
+            input_scale,
+        )
+        .map(|(stack, _)| stack)
+    }
+
+    /// [`Self::nvfp4_stack`] over the `window` of a vocabulary of `vocabulary` experts one rank
+    /// holds.
+    ///
+    /// The activation encoder's scale is the whole vocabulary's: a token is encoded once on the rank
+    /// that holds it, for experts on any rank, so every rank must encode with the same number. The
+    /// second value is each window expert's tensor scales, expert-major, one per projection.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the stack is named by its parts, as `nvfp4_stack` names them"
+    )]
+    pub fn nvfp4_window(
+        &mut self,
+        name: &str,
+        prefix: &str,
+        projections: &[&str],
+        window: std::ops::Range<u32>,
+        vocabulary: u32,
+        names: Nvfp4Names,
+        values_layout: ValueLayout,
+        layout: ScaleLayout,
+        input_scale: bool,
+    ) -> Result<(QuantizedStack, Vec<f32>)> {
+        let calibrated = input_scale;
+        if window.is_empty() || projections.is_empty() {
             return Err(Error::weight(
                 name,
                 "a stack has experts and at least one projection".to_owned(),
             ));
         }
+        let experts = window.end - window.start;
         let count = u64::from(experts);
         let per = projections.len() as u64;
 
@@ -1626,7 +1688,7 @@ impl<'a> WeightLoader<'a> {
         let mut activation_reciprocals = Vec::with_capacity(experts as usize * projections.len());
         let mut scale_shape = None;
         let mut scale_dtype = None;
-        for expert in 0..count {
+        for expert in u64::from(window.start)..u64::from(window.end) {
             for projection in projections {
                 let stem = format!("{prefix}.{expert}.{projection}_proj");
                 let (values_name, scales_name) = (
@@ -1911,10 +1973,20 @@ impl<'a> WeightLoader<'a> {
         };
         // One encoder serves the whole stack, so it takes the widest of its experts' calibrated
         // activation scales, whose reciprocal is the smallest: no expert's block scale saturates.
-        let encode = activation_reciprocals
+        let mut encode = activation_reciprocals
             .iter()
             .copied()
             .fold(f32::INFINITY, f32::min);
+        if calibrated {
+            for expert in (0..vocabulary).filter(|expert| !window.contains(expert)) {
+                for projection in projections {
+                    let stem = format!("{prefix}.{expert}.{projection}_proj");
+                    let tensor = format!("{stem}.{}", spelling.input_scale);
+                    let request = WeightRequest::region(&tensor, 0, Shape::new(&[1]));
+                    encode = encode.min(self.activation_reciprocal(&request)?);
+                }
+            }
+        }
         let encode = if encode.is_finite() { encode } else { 1.0 };
         let encode_scale = self.constant(
             &format!("{name}__nvfp4_encode_scale"),
@@ -1923,14 +1995,18 @@ impl<'a> WeightLoader<'a> {
             &encode.to_ne_bytes(),
             "nn",
         )?;
-        Ok(QuantizedStack {
-            values,
-            scales,
-            global_scale,
-            layout,
-            encode_scale,
-            input_scale,
-        })
+        Ok((
+            QuantizedStack {
+                values,
+                scales,
+                global_scale,
+                layout,
+                encode_scale,
+                input_scale,
+                activation_scale: encode.recip(),
+            },
+            tensor_scales,
+        ))
     }
 
     /// Publish bytes this loader computed, under a key it built, and answer the weight.

@@ -1218,6 +1218,18 @@ pub trait CausalLm {
     /// `hidden` is the `[rows, hidden]` view of the rows named by `TokenBatch::logits_rows`; the
     /// executor gathered them. `out` is `[rows, vocabulary]`.
     fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()>;
+
+    /// Runs every expert layer of one step with no tokens of this rank's own.
+    ///
+    /// A rank of an expert group runs every step of the group, because its experts serve the tokens
+    /// its peers route to them. A model without split experts has nothing to join.
+    fn join_expert_step(&self, f: &Forward) -> Result<()> {
+        let _ = f;
+        Err(crate::Error::Unsupported(
+            "this model splits no experts across ranks, so it has no expert step to join"
+                .to_owned(),
+        ))
+    }
 }
 
 #[cfg(test)]
