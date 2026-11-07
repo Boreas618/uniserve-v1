@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -592,6 +593,27 @@ def _serve(
         yield base_url
 
 
+def _weight_bytes(base_url: str) -> int:
+    """The bytes of weights the deployment's ledgers book."""
+    status = httpx.get(f"{base_url}/admin/config", timeout=60).json()
+    return sum(
+        entry["bytes"]
+        for node in status["ledgers"]
+        for ledger in node["ledgers"]
+        for entry in ledger["entries"]
+        if entry["item"] == "weights"
+    )
+
+
+def _listens(port: int) -> bool:
+    """Whether a server accepts connections on `port` of this host."""
+    try:
+        with socket.create_connection(("127.0.0.1", port), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
 def _admin(
     base_url: str, path: str, body: dict | None = None
 ) -> httpx.Response:
@@ -674,7 +696,7 @@ def test_a_serving_deployment_answers_its_admin_api(
         assert committed.status_code == 200, committed.text
         before_update = len(read)
         report = _change_world(base_url, CHANGE)
-        print(f"world change pause: {report['pause_seconds']:.3f} s")
+        print(f"world change pause: {report['pause_ms']} ms")
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
         text = "".join(read)
@@ -1166,10 +1188,15 @@ def _restart_while_streaming(
     # address serves, and the old one closes once the replaced daemon exits.
     previous = successors[-1]
     port = find_free_port()
-    moved = _apply(base_url, f"server_config.port={port}")
+    moved = _apply(base_url, f"admin_config.port={port}")
     assert moved["change"] == "daemon", moved
     successors.append(moved["pid"])
     moved_url = f"http://127.0.0.1:{port}"
+    # The answer comes from the daemon on the previous address, and the successor binds a new
+    # address once it holds the deployment.
+    _wait_until(
+        lambda: _listens(port), 60, "the new address did not open"
+    )
     reply = _chat(moved_url, name, "Say hello.")
     assert reply["choices"][0]["message"]["content"]
     _wait_until(
@@ -1188,7 +1215,7 @@ def _restart_while_streaming(
     # changes the world in an operation of its own.
     previous = successors[-1]
     port = find_free_port()
-    both = _apply(moved_url, f"server_config.port={port}", CHANGE)
+    both = _apply(moved_url, f"admin_config.port={port}", CHANGE)
     assert both["change"] == "daemon", both
     assert both["then"] == "epoch", both
     successors.append(both["pid"])
@@ -1388,24 +1415,13 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         assert done.is_set(), "the count did not end"
         numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
         assert numbers[:200] == list(range(1, 201)), "".join(read)[:400]
+        weights = _weight_bytes(base_url)
         _change_world(base_url, CHANGE)
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
-        lines = _log_lines(log)
-        assert (
-            sum(
-                "uniserve.loading.rank: loaded numerical model" in line
-                for line in lines
-            )
-            == 1
-        ), (
-            "an engine read the checkpoint again rather than the weights "
-            "the Storage Server retains"
-        )
-        assert any(
-            re.search(r"mapped the retained weights .*missing=0", line)
-            for line in lines
-        ), "the successor world did not map the retained weights"
+        # The ledger books a storage once however many epochs map it, so a successor that read the
+        # checkpoint again would book its weights beside these.
+        assert _weight_bytes(base_url) == weights
 
 
 # The options of a deployment whose KV cache takes the device storage its
@@ -1471,8 +1487,8 @@ def test_a_sleeping_deployment_gives_back_its_cache_and_graph_storage(
         assert alone["choices"][0]["message"]["content"] == before, alone
         assert abs(after - awake) <= 2 * 1024, (awake, after)
         lines = _log_lines(log)
-        assert any("the worker sleeps" in line for line in lines)
-        assert any("the worker woke" in line for line in lines)
+        assert any("the scheduler sleeps" in line for line in lines)
+        assert any("the scheduler woke" in line for line in lines)
         status = httpx.get(f"{base_url}/admin/status", timeout=10).json()
         assert status["deployment"]["asleep"] is False, status
         assert status["deployment"]["paused"] is False, status
