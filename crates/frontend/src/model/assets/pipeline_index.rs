@@ -149,7 +149,7 @@ mod tests {
     #[test]
     fn a_classic_component_resolves_to_its_key() {
         let index = PipelineIndex::parse(
-            r#"{"_class_name": "FluxPipeline", "tokenizer": ["transformers", "CLIPTokenizer"]}"#,
+            r#"{"_class_name": "ClassicPipeline", "tokenizer": ["transformers", "CLIPTokenizer"]}"#,
         )
         .unwrap();
 

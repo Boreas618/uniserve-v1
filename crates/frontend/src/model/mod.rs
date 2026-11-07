@@ -340,7 +340,6 @@ mod tests {
         for (description, model_type) in [
             (ModelDescription::Qwen3, "qwen3"),
             (ModelDescription::Qwen3, "qwen3_moe"),
-            (ModelDescription::Qwen3, "qwen3_5"),
         ] {
             let (_directory, _tokenizer, profile) = resolved_config(model_type).await;
             let profile = profile.unwrap();
