@@ -1,7 +1,7 @@
-//! Request residency and capability-based worker placement.
+//! Request residency and capability-based executor placement.
 //!
-//! The scheduler asks `Placement` which loaded worker replica executes a call.
-//! Candidates are the workers whose reported `supported_calls` and component
+//! The scheduler asks `Placement` which loaded executor replica executes a call.
+//! Candidates are the executors whose reported `supported_calls` and component
 //! bindings cover the call; once a request is placed on a replica for a
 //! component, its later calls for that component stay there. A request's
 //! decode calls stay on the replica that took its first decode-stage call,
@@ -15,9 +15,9 @@ use ipc::{ForwardMode, TransferMode};
 pub(super) struct Placement {
     /// Replica that holds each request's state for one bound component name.
     ///
-    /// Admission records the prefill worker of a token request and every route
+    /// Admission records the prefill executor of a token request and every route
     /// of a media request; `select_worker` records an entry each time it places
-    /// a call, keyed by the name the worker binds (which may be
+    /// a call, keyed by the name the executor binds (which may be
     /// `DEFAULT_COMPONENT` rather than the requested name).
     /// `Scheduler::refill_executor` prunes entries of requests that are no
     /// longer running or retiring.
@@ -47,7 +47,7 @@ pub(super) enum Choice {
     /// one already serving another of its components, or the one with the
     /// fewest resident requests.
     Existing,
-    /// The policy's answer for a request that has not run there yet: the worker
+    /// The policy's answer for a request that has not run there yet: the executor
     /// it named among the candidates `views::replicas` showed it.
     Target(crate::ExecutorGroupId),
 }
@@ -56,7 +56,7 @@ impl Placement {
     /// Enumerates loaded components that can execute the requested call.
     ///
     /// Which component serves a media call is the model's state, not the
-    /// engine's: a worker resolves it from the capabilities its components
+    /// engine's: an executor resolves it from the capabilities its components
     /// implement and reports it as `media_components`. That report is the
     /// only authority here. Calls without an explicit media route use the
     /// protocol's default component for an undivided model.
@@ -76,13 +76,13 @@ impl Placement {
         self.component_candidates(world, kind, component)
     }
 
-    /// Enumerates workers that support `kind` and can serve `component`, with
+    /// Enumerates executors that support `kind` and can serve `component`, with
     /// the component name each one binds.
     ///
-    /// A worker binding `component` by name serves it under that name. A
-    /// worker with no component bindings, or with a `DEFAULT_COMPONENT`
+    /// An executor binding `component` by name serves it under that name. A
+    /// executor with no component bindings, or with a `DEFAULT_COMPONENT`
     /// binding, serves any requested component under `DEFAULT_COMPONENT`.
-    /// Other workers are excluded.
+    /// Other executors are excluded.
     pub(super) fn component_candidates<'a>(
         &'a self,
         world: &'a dyn super::submission::World,
@@ -122,7 +122,7 @@ impl Placement {
 
     /// Selects one replica while preserving request residency.
     ///
-    /// Returns `None` when no worker can serve the component, when the replica
+    /// Returns `None` when no executor can serve the component, when the replica
     /// that already holds this request's component state is no longer a
     /// candidate or has no submission capacity, when a replica already holding
     /// another of the request's components has no capacity, or when no other
@@ -159,7 +159,7 @@ impl Placement {
         }
 
         // A request that has not run here yet runs where the policy says
-        // (design §4.4). A named worker that is not a candidate, or whose queue
+        // (design §4.4). A named executor that is not a candidate, or whose queue
         // has no room, leaves the call to a later step: the mechanism never
         // substitutes a replica the policy did not choose.
         if let Choice::Target(named) = choice {
@@ -167,7 +167,7 @@ impl Placement {
             return world.has_capacity(id).then_some((id, component));
         }
 
-        // Prefer a worker already selected for another component of this
+        // Prefer an executor already selected for another component of this
         // request. This keeps a replicated denoiser and its media decoders in
         // one process and avoids publishing their large latent products.
         let resident = self
@@ -185,8 +185,8 @@ impl Placement {
 
         // Among replicas with queue capacity, a new request goes to the one
         // holding the fewest distinct resident requests, so a burst fans out
-        // instead of filling the first configured worker. Queue capacity is a
-        // hard condition; ties go to the earliest worker in
+        // instead of filling the first configured executor. Queue capacity is a
+        // hard condition; ties go to the earliest executor in
         // `ExecutorInfo::workers`.
         candidates
             .into_iter()
@@ -274,7 +274,7 @@ impl Placement {
 
     /// Includes lifecycle commands in destination ordering, even when a batch has no compute.
     ///
-    /// Returns each call's placed worker plus every worker holding residency
+    /// Returns each call's placed executor plus every executor holding residency
     /// for a command's request. `Scheduler::dispatch_submissions` uses this
     /// set to hold back later batches that share a blocked destination.
     pub(super) fn batch_workers(&self, batch: &ExecutionBatch) -> HashSet<crate::ExecutorGroupId> {

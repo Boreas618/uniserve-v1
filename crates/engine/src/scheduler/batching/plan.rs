@@ -466,7 +466,7 @@ impl Scheduler {
                 // One step of the request's block is one read-only canvas row
                 // of the pass. The next step may be queued behind the steps
                 // still in flight, predicated on the last one's completion:
-                // the worker runs it as a no-op once an earlier step stopped
+                // the executor runs it as a no-op once an earlier step stopped
                 // the block, so the block's steps run back to back without
                 // waiting for each result. A step past the block's step limit
                 // is never queued, since the last step always stops it.
@@ -524,7 +524,7 @@ impl Scheduler {
                 // prefill row. The commit is planned once the host accepts
                 // the step that stopped the block, queued without a predicate
                 // behind the block's steps still in flight, which are no-ops
-                // (`follows_unconditionally`), so the worker launches it
+                // (`follows_unconditionally`), so the executor launches it
                 // while they run.
                 let st = self.running.get(&id)?;
                 let tokens = st.canvas_commit.clone();
@@ -986,7 +986,7 @@ impl Scheduler {
     /// Admission supplies the static whitelist and finish tokens. `projected`
     /// counts unresolved predecessors, so minimum-token and image limits apply
     /// at the successor's position without observing device results. Penalties
-    /// remain owned by the worker's accepted-token state.
+    /// remain owned by the executor's accepted-token state.
     ///
     /// `completing_images` counts image completions the planned call itself
     /// finishes, which the final feedback step does. Returns `None` when the

@@ -39,7 +39,7 @@ impl Warming {
 
 impl Scheduler {
     /// Fence the current batches, mutate page ownership, and return concrete
-    /// worker storage views. Device copies run later at the Transfer Server.
+    /// executor storage views. Device copies run later at the Transfer Server.
     pub(super) fn warm_cache(
         &mut self,
         operation: Operation,
@@ -380,7 +380,7 @@ impl Scheduler {
             .workers
             .iter()
             .find(|(_, worker)| worker.prefix_cache.is_some())
-            .ok_or("no cache worker owns the target pages")?;
+            .ok_or("no cache executor owns the target pages")?;
         let endpoint = Arc::new(worker.endpoint.clone());
         let mut targets = Vec::new();
         let mut reserved = Vec::new();

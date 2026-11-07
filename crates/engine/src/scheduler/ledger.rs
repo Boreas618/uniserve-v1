@@ -5,7 +5,7 @@
 //! and every item the deployment's worlds and the Transfer Server hold on it
 //! (weights, each KV cache segment, the other exclusive storages, graph
 //! pools, process storage, staging, the Transfer Server's context), each once
-//! however many worlds map it. Every worker reports its cache's GPU's ledger
+//! however many worlds map it. Every executor reports its cache's GPU's ledger
 //! with its segments (`uniserve.cache_storage`), and the limits of the two
 //! periods in which two worlds hold storage on the GPU follow from it
 //! (`specs/online-operations.md`, §6.4):
@@ -37,17 +37,17 @@
 use serde::{Deserialize, Serialize};
 use storage::{GpuLedger, HostStorage, Item, LedgerEntry, Scope};
 
-/// What `uniserve.cache_storage` reports of one worker.
+/// What `uniserve.cache_storage` reports of one executor.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct CacheStorage {
     /// The segments of each cache plane, in unit order; empty when the
     /// planes are not split.
     #[serde(default)]
     pub(super) segments: Vec<ipc::CacheSegment>,
-    /// Segments the worker holds: the first given back.
+    /// Segments the executor holds: the first given back.
     #[serde(default)]
     pub(super) held: u32,
-    /// Device bytes of one unit across the worker's planes.
+    /// Device bytes of one unit across the executor's planes.
     #[serde(default)]
     pub(super) unit_bytes: u64,
     /// Device bytes of the head segment a successor creates beside this
@@ -59,32 +59,32 @@ pub(super) struct CacheStorage {
     /// sized by storage.
     #[serde(default)]
     pub(super) capacity_units: Option<u64>,
-    /// Free bytes of the worker's device, which bound what the cache
+    /// Free bytes of the executor's device, which bound what the cache
     /// creates beside processes outside the deployment.
     #[serde(default)]
     pub(super) free_bytes: u64,
-    /// The share of the device a worker's capacity plan keeps for graphs
+    /// The share of the device an executor's capacity plan keeps for graphs
     /// and activations: the graph pool a successor's warmup captures in.
     #[serde(default)]
     pub(super) graph_share_bytes: u64,
-    /// Whether a rank of the worker's model captures graphs under a policy
+    /// Whether a rank of the executor's model captures graphs under a policy
     /// that captures; a successor of a model that serves every call eagerly
     /// takes no graph share.
     #[serde(default)]
     pub(super) capturable: bool,
-    /// The worker's host.
+    /// The executor's host.
     #[serde(default)]
     pub(super) host: String,
-    /// The worker's scope and world, which name its entries in the ledger.
+    /// The executor's scope and world, which name its entries in the ledger.
     #[serde(default)]
     pub(super) scope: Option<Scope>,
     #[serde(default)]
     pub(super) world: Option<u64>,
-    /// The deployment's ledger of the cache's GPU; `None` for a worker that
+    /// The deployment's ledger of the cache's GPU; `None` for an executor that
     /// keeps its storage itself, which no other world shares.
     #[serde(default)]
     pub(super) ledger: Option<GpuLedger>,
-    /// What the worker's host admits of new host storage.
+    /// What the executor's host admits of new host storage.
     #[serde(default)]
     pub(super) host_storage: Option<HostStorage>,
 }
@@ -99,7 +99,7 @@ impl CacheStorage {
             .sum()
     }
 
-    /// Whether `entry` is the worker's own: of its scope and world alone.
+    /// Whether `entry` is the executor's own: of its scope and world alone.
     fn owns(&self, entry: &LedgerEntry) -> bool {
         entry.scope == self.scope && self.world.is_some_and(|world| entry.worlds == [world])
     }
@@ -141,13 +141,13 @@ pub(super) struct Preparing {
     pub(super) quota: u64,
     /// What the serving world holds beside its KV cache, by item.
     pub(super) serving: Holdings,
-    /// The serving world's KV cache segments of this worker.
+    /// The serving world's KV cache segments of this executor.
     pub(super) serving_kv_cache: u64,
     /// What the successor adds beside what it maps read-only.
     pub(super) successor: Additions,
     /// The Transfer Server's context and staging.
     pub(super) transfer: u64,
-    /// What else the ledger books on the GPU: other workers of the
+    /// What else the ledger books on the GPU: other executors of the
     /// deployment on it.
     pub(super) others: u64,
     /// The serving world's KV cache limit: the quota less every other item,
@@ -208,7 +208,7 @@ pub(super) struct Preparing {
     pub(super) feasible: bool,
     /// Every entry of the GPU's ledger.
     pub(super) entries: Vec<String>,
-    /// What the worker's host admits of new host storage.
+    /// What the executor's host admits of new host storage.
     pub(super) host_storage: Option<HostStorage>,
 }
 
@@ -260,7 +260,7 @@ impl Additions {
 /// preparing phase beside a successor that adds `adds`, and the segments it
 /// keeps within it, of which `floor` it cannot give back. The requests in
 /// flight hold `in_flight_units`; an unmapped successor reserves their
-/// target representation. Fails for a worker that reports no ledger
+/// target representation. Fails for an executor that reports no ledger
 /// or no quota.
 pub(super) fn preparing(
     report: &CacheStorage,
@@ -271,7 +271,7 @@ pub(super) fn preparing(
 ) -> Result<Preparing, String> {
     let (Some(ledger), Some(scope), Some(world)) = (&report.ledger, &report.scope, report.world)
     else {
-        return Err("a worker that holds a split KV cache reports no storage ledger".to_owned());
+        return Err("an executor that holds a split KV cache reports no storage ledger".to_owned());
     };
     let quota = ledger.quota.ok_or_else(|| {
         format!(
@@ -510,7 +510,7 @@ pub(super) fn refusal(plans: &[Preparing]) -> String {
             successor.in_flight,
         ));
         lines.push(format!(
-            "  Transfer Server: {} bytes; other workers: {} bytes",
+            "  Transfer Server: {} bytes; other executors: {} bytes",
             plan.transfer, plan.others
         ));
         for entry in &plan.entries {
@@ -569,11 +569,11 @@ pub(super) struct Room {
 /// back the first `floor`: the cache keeps all it holds when the ledger's
 /// room and the device's free storage hold `bytes` already, and otherwise
 /// the largest prefix whose given-back tail makes the rest (each segment
-/// given back frees its bytes of both). Fails for a worker that reports no
+/// given back frees its bytes of both). Fails for an executor that reports no
 /// ledger or no quota.
 pub(super) fn room(report: &CacheStorage, bytes: u64, floor: u32) -> Result<Room, String> {
     let Some(ledger) = &report.ledger else {
-        return Err("a worker that holds a split KV cache reports no storage ledger".to_owned());
+        return Err("an executor that holds a split KV cache reports no storage ledger".to_owned());
     };
     let gpu = storage::protocol::gpu_name(&ledger.gpu);
     let quota = ledger

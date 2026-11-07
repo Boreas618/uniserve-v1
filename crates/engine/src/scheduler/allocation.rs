@@ -1,12 +1,12 @@
 //! Request backing and retained encoder exports owned by the scheduler.
 //!
-//! The scheduler owns the logical allocation of worker-side storage: it
+//! The scheduler owns the logical allocation of executor-side storage: it
 //! chooses request rows, cache pages, latent pages, and buffer byte spans, and
-//! workers use the addresses they are handed. Allocations follow a request
+//! executors use the addresses they are handed. Allocations follow a request
 //! from admission (`RequestAllocations`, `MediaAllocations`) through
-//! retirement: a finished request registered with its workers parks its
+//! retirement: a finished request registered with its executors parks its
 //! allocations in a `RetiringRequest` until its `Finish` command is
-//! acknowledged, so storage is reused only after the workers' physical readers
+//! acknowledged, so storage is reused only after the executors' physical readers
 //! have finished.
 
 use super::*;
@@ -27,8 +27,8 @@ pub(super) struct Storage {
     pub(super) latent_pool: LatentPool,
     /// Byte spans of persistent products in the runtime's buffer pool.
     pub(super) buffer_pool: BufferPool,
-    /// Per-worker row address spaces and per-rank buffer address spaces of
-    /// the media workers.
+    /// Per-executor row address spaces and per-rank buffer address spaces of
+    /// the media executors.
     pub(super) media_storage: HashMap<crate::ExecutorGroupId, MediaStorage>,
     /// Spans whose ownership moved from their producing request to
     /// encoder-cache retention, keyed by the cached product's buffer.
@@ -40,18 +40,18 @@ pub(super) struct Storage {
     pub(super) pending_buffer_frees: HashMap<BufferId, BufferSpan>,
 }
 
-/// A media allocation named a worker the scheduler holds no media storage for.
+/// A media allocation named an executor the scheduler holds no media storage for.
 ///
-/// Media storage exists for every loaded worker that serves a media call and
+/// Media storage exists for every loaded executor that serves a media call and
 /// every media allocation is taken from it, so this reports a scheduler defect.
 #[derive(Debug)]
-pub(super) struct UnknownMediaWorker(pub(super) crate::ExecutorGroupId);
+pub(super) struct UnknownMediaGroup(pub(super) crate::ExecutorGroupId);
 
-impl std::fmt::Display for UnknownMediaWorker {
+impl std::fmt::Display for UnknownMediaGroup {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "media allocation names worker {:?} without media storage",
+            "media allocation names executor {:?} without media storage",
             self.0
         )
     }
@@ -62,10 +62,10 @@ impl Storage {
         &mut self,
         worker: &crate::ExecutorGroupId,
         allocation: RequestSlot,
-    ) -> Result<(), UnknownMediaWorker> {
+    ) -> Result<(), UnknownMediaGroup> {
         self.media_storage
             .get_mut(worker)
-            .ok_or_else(|| UnknownMediaWorker(worker.clone()))?
+            .ok_or_else(|| UnknownMediaGroup(worker.clone()))?
             .requests
             .free(allocation);
         Ok(())
@@ -77,16 +77,16 @@ impl Storage {
         worker: &crate::ExecutorGroupId,
         rank: u32,
         allocation: BufferSpan,
-    ) -> Result<(), UnknownMediaWorker> {
+    ) -> Result<(), UnknownMediaGroup> {
         self.media_storage
             .get_mut(worker)
             .and_then(|storage| storage.buffers.get_mut(rank as usize))
-            .ok_or_else(|| UnknownMediaWorker(worker.clone()))?
+            .ok_or_else(|| UnknownMediaGroup(worker.clone()))?
             .free(allocation);
         Ok(())
     }
 
-    /// Returns the text prefix cache, which exists when the worker serves token
+    /// Returns the text prefix cache, which exists when the executor serves token
     /// generation; token requests are rejected at submission without it.
     pub(super) fn cache(&self) -> Option<&PrefixCacheManager> {
         self.cache.as_ref()
@@ -145,7 +145,7 @@ impl Storage {
 
     /// Buffers whose cache/reader lifetime extends beyond their producing request.
     ///
-    /// The `Finish` command for `request` lists them so its workers keep them
+    /// The `Finish` command for `request` lists them so its executors keep them
     /// readable until their own `Free`. The list is sorted by producer call,
     /// output index, and generation.
     pub(super) fn retained_buffers(&self, request: RequestKey) -> Vec<BufferId> {
@@ -188,7 +188,7 @@ pub(super) struct RequestAllocations {
     /// One block table per cache group.
     pub(super) prefix_cache: CacheAllocation,
     /// Latent pages of the current image trajectory, reserved by its latent
-    /// preparation or denoising call on a worker that tracks image latents
+    /// preparation or denoising call on an executor that tracks image latents
     /// and released when its image decoding completes or with the request's
     /// other allocations.
     pub(super) latent: Option<LatentPages>,
@@ -197,7 +197,7 @@ pub(super) struct RequestAllocations {
 }
 
 impl RequestAllocations {
-    /// Returns the request row, sent to workers as `request_pool_idx`.
+    /// Returns the request row, sent to executors as `request_pool_idx`.
     pub(super) fn request_slot(&self) -> u32 {
         self.request_slot.index()
     }
@@ -227,28 +227,28 @@ impl RequestAllocations {
     }
 }
 
-/// Storage one media request reserves at admission in the per-worker address
+/// Storage one media request reserves at admission in the per-executor address
 /// spaces of `Storage::media_storage`.
 pub(super) struct MediaAllocations {
     /// Declared results keyed by component name and output index.
     pub(super) tensors: HashMap<(String, u32), MediaTensorAllocation>,
-    /// The request's row on each worker of its route.
+    /// The request's row on each executor of its route.
     pub(super) request_slots: HashMap<crate::ExecutorGroupId, RequestSlot>,
 }
 
 /// A request reserves each declared result in the buffer pool of every rank
-/// that backs it, on every worker of its route. Video ranges occupy disjoint
-/// slices of the temporal result, independent of decoder Worker width.
+/// that backs it, on every executor of its route. Video ranges occupy disjoint
+/// slices of the temporal result, independent of decoder Executor width.
 pub(super) struct MediaTensorAllocation {
-    /// The span on each backing rank, keyed by worker and rank.
+    /// The span on each backing rank, keyed by executor and rank.
     pub(super) allocations: HashMap<(crate::ExecutorGroupId, u32), BufferSpan>,
     pub(super) dtype: DType,
     pub(super) shape_bound: ShapeBound,
 }
 
-/// Independent scheduler address spaces for one physical media ExecutorGroup.
-/// Replicas intentionally reuse row numbers and byte offsets in their own
-/// processes; the worker identity keeps those physical addresses distinct.
+/// Independent scheduler address spaces for one physical media group.
+/// Replicas intentionally reuse row numbers and byte offsets; the group
+/// identity keeps those physical addresses distinct.
 ///
 /// Request rows are one address space for the group. Each rank has its own
 /// buffer pool, holding only the results of the components it executes and of
@@ -266,11 +266,11 @@ impl MediaStorage {
     /// Builds the address spaces of a group whose ranks back `rank_bytes`.
     ///
     /// A rank backs a component's results when it is one of the component's
-    /// ranks in `components`, the placement the engine launched the group
-    /// with, or one of a reading component's, where readers follow the video
+    /// ranks in `components`, the group's placement, or one of a reading
+    /// component's, where readers follow the video
     /// graph's persistent product edges (`MediaCall::readers`) through the
-    /// deployment's `routing`; the worker sizes each rank's pool by the same
-    /// rule. A group launched with no components backs every result on every
+    /// deployment's `routing`; the executor sizes each rank's pool by the same
+    /// rule. A group placed with no components backs every result on every
     /// rank.
     pub(super) fn new(
         request_slots: usize,
@@ -365,14 +365,14 @@ impl MediaTensorAllocation {
 }
 
 impl MediaAllocations {
-    /// Releases the request rows, keeping the declared results the worker
+    /// Releases the request rows, keeping the declared results the executor
     /// still holds.
     ///
     /// A row is the scheduler's capacity, so it is handed back as soon as the
     /// `Finish` that closes it has been submitted; a tensor is a span the
-    /// worker writes and reads until it has seen that `Finish`, so it stays in
+    /// executor writes and reads until it has seen that `Finish`, so it stays in
     /// the record until the acknowledgement releases it.
-    pub(super) fn close_rows(&mut self, storage: &mut Storage) -> Result<(), UnknownMediaWorker> {
+    pub(super) fn close_rows(&mut self, storage: &mut Storage) -> Result<(), UnknownMediaGroup> {
         let mut released = Ok(());
         for (worker, allocation) in std::mem::take(&mut self.request_slots) {
             released = released.and(storage.free_media_request(&worker, allocation));
@@ -380,16 +380,16 @@ impl MediaAllocations {
         released
     }
 
-    /// Returns the request row assigned in one physical worker address space.
+    /// Returns the request row assigned in one physical executor address space.
     pub(super) fn request_slot(&self, worker: &crate::ExecutorGroupId) -> u32 {
         self.request_slots[worker].index()
     }
 
     /// Releases the owned request allocation.
     ///
-    /// Every allocation on a worker with media storage is released even when
-    /// another names an unknown worker; the first unknown worker is reported.
-    pub(super) fn free(self, storage: &mut Storage) -> Result<(), UnknownMediaWorker> {
+    /// Every allocation on an executor with media storage is released even when
+    /// another names an unknown executor; the first unknown executor is reported.
+    pub(super) fn free(self, storage: &mut Storage) -> Result<(), UnknownMediaGroup> {
         let mut released = Ok(());
         for tensor in self.tensors.into_values() {
             for ((worker, rank), allocation) in tensor.allocations {

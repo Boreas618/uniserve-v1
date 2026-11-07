@@ -53,7 +53,7 @@
 //! - `Snapshot::encodings`: `EncoderCacheManager` lists no entries, so no
 //!   encoding is ever a live `EncodingId`.
 //! - host KV pages (`PageView::on_host`): host KV pages live in the storage
-//!   servers, and the engine's offload manager holds only per-worker pools and
+//!   servers, and the engine's offload manager holds only per-executor pools and
 //!   fetch tags, so it lists none; no `PageId` is a live host page and a
 //!   `HostPages` shortage has no page victim until the storage side reports its
 //!   pages (an open item with `front`).
@@ -195,7 +195,7 @@ pub(crate) fn phase_call(kind: PhaseKind) -> Option<CallKind> {
     })
 }
 
-/// The blocks of a worker group: the component names its replicas bind, sorted
+/// The blocks of an executor group: the component names its replicas bind, sorted
 /// so a [`ComponentId`] means the same component in every view of the epoch.
 pub(crate) fn blocks(info: &MainProcessInfo) -> Vec<String> {
     let mut names: Vec<String> = info
@@ -217,7 +217,7 @@ pub(crate) fn block_id(blocks: &[String], name: &str) -> Option<ComponentId> {
         .map(|index| ComponentId(u32::try_from(index).unwrap_or(u32::MAX)))
 }
 
-/// The blocks of every worker of the world: the table `ComponentId`s number, so
+/// The blocks of every executor of the world: the table `ComponentId`s number, so
 /// a phase's block and a replica's block name the same component.
 pub(crate) fn world_blocks(world: &dyn super::submission::World) -> Vec<String> {
     let mut names = Vec::new();
@@ -229,7 +229,7 @@ pub(crate) fn world_blocks(world: &dyn super::submission::World) -> Vec<String> 
     names
 }
 
-/// The block that runs `kind` on this worker group: the component the worker
+/// The block that runs `kind` on this executor group: the component the executor
 /// reports for its media call, or the protocol's default component.
 fn block_of(table: &[String], info: &MainProcessInfo, kind: PhaseKind) -> ComponentId {
     let name = match phase_call(kind) {
@@ -242,7 +242,7 @@ fn block_of(table: &[String], info: &MainProcessInfo, kind: PhaseKind) -> Compon
     block_id(table, name).unwrap_or(ComponentId(0))
 }
 
-/// Every phase this worker group can run, in id order.
+/// Every phase this executor group can run, in id order.
 ///
 /// `Snapshot::phases`, built once per epoch: a policy reads a request's
 /// `PhaseId` here to learn its kind and its block.
@@ -250,7 +250,7 @@ pub(crate) fn phases(info: &MainProcessInfo) -> Vec<PhaseView> {
     phases_in(info, &blocks(info))
 }
 
-/// Every phase this worker group can run, numbered in the world's block table.
+/// Every phase this executor group can run, numbered in the world's block table.
 pub(crate) fn phases_in(info: &MainProcessInfo, table: &[String]) -> Vec<PhaseView> {
     PHASES
         .iter()
@@ -539,7 +539,7 @@ pub(crate) fn nanos_at(unix_secs: f64) -> Nanos {
 /// Free request slots: the sequence budget of the next admission.
 ///
 /// Admission stops at either bound today — the configured count of running
-/// requests, and the worker's request rows, which a running token request holds
+/// requests, and the executor's request rows, which a running token request holds
 /// through its allocations (`Storage::request_pool`). A slot is free only when
 /// both have room, so the room is their minimum.
 fn free_slots(scheduler: &Scheduler) -> usize {
@@ -573,7 +573,7 @@ pub(crate) fn room_facts(scheduler: &Scheduler, step: u64) -> RoomFacts {
         slots: free_slots(scheduler),
         token_budget: u32::try_from(scheduler.config.max_num_batched_tokens).unwrap_or(u32::MAX),
         call_budget: scheduler.config.max_batch,
-        // A worker fits a batch into its captured graphs itself; no tier list
+        // An executor fits a batch into its captured graphs itself; no tier list
         // reaches the scheduler.
         graph_tiers: Vec::new(),
         page_tokens: u32::try_from(page_tokens).unwrap_or(u32::MAX),
@@ -756,8 +756,8 @@ fn next_tokens(scheduler: &Scheduler, state: &RequestState, id: RequestId) -> u3
             u32::try_from(state.req.readout.len()).unwrap_or(u32::MAX)
         }
         // A canvas step spends a whole canvas of a step's token budget, the
-        // same bound the deployment's launch was checked against: it denoises
-        // text tokens on the worker's canvas, not an image of the request's
+        // same bound the deployment was checked against: it denoises text
+        // tokens on the executor's canvas, not an image of the request's
         // latent raster, so it is charged neither the image's latent units nor
         // its guidance branches.
         Some(CallKind::Forward(ForwardMode::TokenDenoising))
@@ -1122,7 +1122,7 @@ pub(crate) fn encodings(scheduler: &Scheduler) -> Vec<EncodingView> {
 // Replicas, ranks and experts
 // ---------------------------------------------------------------------------
 
-/// The distinct requests resident on one worker, by the request affinity the
+/// The distinct requests resident on one executor, by the request affinity the
 /// mechanism records when it places a call.
 fn resident_requests(placement: &Placement, worker: &crate::ExecutorGroupId) -> u32 {
     let mut requests = HashSet::new();
@@ -1171,7 +1171,7 @@ fn holds_request(
         .is_some_and(|owner| owner == worker)
 }
 
-/// The phase kinds a worker can run.
+/// The phase kinds an executor can run.
 fn worker_phases(info: &MainProcessInfo) -> Vec<PhaseKind> {
     let mut kinds: Vec<PhaseKind> = info
         .supported_calls
@@ -1187,8 +1187,8 @@ fn worker_phases(info: &MainProcessInfo) -> Vec<PhaseKind> {
 /// The replicas a `place` decision may choose for a request's call of `kind`,
 /// in the order the decision's answer indexes.
 ///
-/// The candidates are the workers that serve the call's component, minus the
-/// prefill-only workers for a decode-stage call: today's
+/// The candidates are the executors that serve the call's component, minus the
+/// prefill-only executors for a decode-stage call: today's
 /// `Placement::component_target` rule, presented instead of decided.
 pub(crate) fn replicas(
     scheduler: &Scheduler,
@@ -1201,15 +1201,15 @@ pub(crate) fn replicas(
         .collect()
 }
 
-/// The workers [`replicas`] offers, in the same order and of the same length:
+/// The executors [`replicas`] offers, in the same order and of the same length:
 /// the mechanism's half of a placement decision.
 ///
 /// A policy's `place` answers an index into [`replicas`]; the mechanism turns
-/// that index into the worker it binds. Both come from [`replica_facts`], so the
+/// that index into the executor it binds. Both come from [`replica_facts`], so the
 /// filter that decides which replicas are candidates cannot differ between the
-/// view a policy saw and the worker the mechanism picks. The second element is
-/// the component the worker binds for the call, which a placement records with
-/// the worker.
+/// view a policy saw and the executor the mechanism picks. The second element is
+/// the component the executor binds for the call, which a placement records with
+/// the executor.
 pub(crate) fn replica_targets(
     scheduler: &Scheduler,
     request: RequestKey,
@@ -1221,7 +1221,7 @@ pub(crate) fn replica_targets(
         .collect()
 }
 
-/// Every candidate replica of `request`'s call of `kind`, with the worker and
+/// Every candidate replica of `request`'s call of `kind`, with the executor and
 /// component it names. One construction of the filter, which [`replicas`] and
 /// [`replica_targets`] are two views of.
 fn replica_facts(
@@ -1239,11 +1239,11 @@ fn replica_facts(
     )
 }
 
-/// One replica view per candidate of `request`'s call, with the worker and
+/// One replica view per candidate of `request`'s call, with the executor and
 /// component it names.
 ///
 /// The candidates are the caller's list — a call kind's, or a named component's
-/// — so a policy's index and the mechanism's worker resolve against the same
+/// — so a policy's index and the mechanism's executor resolve against the same
 /// list, and the decode-stage filter is applied once, here, for every list.
 fn candidate_facts<'a>(
     scheduler: &'a Scheduler,
@@ -1267,7 +1267,7 @@ fn candidate_facts<'a>(
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(main_process_info),
                 resident_requests: resident_requests(&scheduler.placement, worker),
-                // The executor reports whether a worker's queue has room, not
+                // The executor reports whether an executor's queue has room, not
                 // how many rows that is; a plan may submit one call's worth.
                 capacity: u32::from(world.has_capacity(worker)),
                 holds_request: holds_request(
@@ -1296,15 +1296,15 @@ pub(crate) fn call(
     (!candidates.is_empty()).then(|| (call_view(request, kind), candidates))
 }
 
-/// One entry per worker the world reports, in the order `ExecutorGroup::spawn_all`
-/// returned them — the same length and order as the control thread's
+/// One entry per pool the world reports, in the order it states them — the
+/// same length and order as the control thread's
 /// `routing.slots`, so an index into this list and an index into that one name
 /// the same rank. The two are built on different threads and carry different
 /// fields (a rank's in-flight count and liveness exist only on the control
 /// thread), so this contract is stated here rather than enforced by a type.
 
 /// Every replica a `place` decision may choose, for `Snapshot::replicas`: one
-/// per worker of the world, in the executor's order.
+/// per executor of the world, in the executor's order.
 pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
     let world = &scheduler.executor;
     let table = world_blocks(world);
@@ -1334,7 +1334,7 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
 
 /// The load the experts are balanced against.
 ///
-/// No worker reports the tokens it routed to each expert, so an epoch's views
+/// No executor reports the tokens it routed to each expert, so an epoch's views
 /// carry none and the mechanism makes no expert decision.
 pub(crate) fn expert_load_of(scheduler: &Scheduler) -> Option<ExpertLoad> {
     // The routed tokens per expert are the executor's to measure; the
@@ -1718,14 +1718,14 @@ mod tests {
         let phases = phases(&info);
         let kinds: Vec<PhaseKind> = phases.iter().map(|phase| phase.kind).collect();
         // Prefill and decode are served, so a refill chunk of a decoding request
-        // is served too; a kind no worker reports is absent.
+        // is served too; a kind no executor reports is absent.
         assert!(kinds.contains(&PhaseKind::Prefill));
         assert!(kinds.contains(&PhaseKind::Decode));
         assert!(kinds.contains(&PhaseKind::Refill));
         assert!(kinds.contains(&PhaseKind::Denoise));
         assert!(!kinds.contains(&PhaseKind::ImageDecode));
 
-        // A phase's id is its kind's, and its block is the component the worker
+        // A phase's id is its kind's, and its block is the component the executor
         // binds for that call.
         let blocks = blocks(&info);
         for phase in &phases {
@@ -1734,12 +1734,12 @@ mod tests {
         let denoise = phases
             .iter()
             .find(|phase| phase.kind == PhaseKind::Denoise)
-            .expect("the worker serves denoising");
+            .expect("the executor serves denoising");
         assert_eq!(Some(denoise.block), block_id(&blocks, "denoiser"));
         let prefill = phases
             .iter()
             .find(|phase| phase.kind == PhaseKind::Prefill)
-            .expect("the worker serves prefill");
+            .expect("the executor serves prefill");
         assert_eq!(Some(prefill.block), block_id(&blocks, "model"));
     }
 

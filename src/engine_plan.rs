@@ -638,11 +638,10 @@ impl EpochPlan {
     /// The launch-file and build-config facts a scheduler derives an epoch's configuration from.
     ///
     /// Every fact this process can state is read from the source that owns it: the launch file the
-    /// daemon wrote (`group`, `rank`, `world`, `world_size`, `devices`, the watchdog), the epoch's
-    /// build config (`dtype`, `max_running_requests`, `max_model_len`, the host cache), the captured
-    /// catalog (`max_batch`, `max_num_batched_tokens`, `graph_tiers`; a batch larger than the
-    /// largest bucket is refused before a kernel runs, so the catalog is the admission bound), and,
-    /// for the page size and the cache dtype, what was opened rather than what was asked for.
+    /// daemon wrote (`group`, `rank`, `world`, `world_size`, `devices`), the epoch's build config
+    /// (`dtype`, `max_running_requests`, the host cache), and the captured catalog (`max_batch`,
+    /// `max_num_batched_tokens`, `graph_tiers`; a batch larger than the largest bucket is refused
+    /// before a kernel runs, so the catalog is the admission bound).
     ///
     /// Two facts are answered only as far as a launch file can answer them. `hosts` is one host
     /// name per rank in rank order: a world of one states this node's own, because one node is one
@@ -655,8 +654,8 @@ impl EpochPlan {
     /// facts, which neither the launch file nor the model's configuration states.
     /// `engine::EngineConfig::of` refuses each absent fact by name, so a deployment that needs one
     /// fails with the fact it is missing rather than planning against a made-up value.
-    pub(crate) fn rank_facts(&self, memory: &Memory, served: &Served) -> Result<engine::RankFacts> {
-        let Served::Text(model) = served else {
+    pub(crate) fn rank_facts(&self, served: &Served) -> Result<engine::RankFacts> {
+        let Served::Text(_) = served else {
             return self.media_rank_facts();
         };
         let (rows, tokens) = self.buckets.bounds();
@@ -695,12 +694,9 @@ impl EpochPlan {
                 1 => Some(vec![host_name()?]),
                 _ => None,
             },
-            peers: None,
             max_running_requests: Some(self.build.max_running_requests.get()),
             max_batch: Some(rows as usize),
             max_num_batched_tokens: Some(tokens as usize),
-            block_size: Some(cache_page_size(memory, model)?),
-            kv_cache_dtype: Some(cache_dtype(model, self.build.kv_cache.dtype)?),
             host_cache: match (self.build.kv_cache.host_ratio, self.build.kv_cache.host_gib) {
                 // A deployment that states neither keeps no host tier of its own, which is what a
                 // storage grant of `None` means.
@@ -723,8 +719,6 @@ impl EpochPlan {
             end_of_image: Some(0),
             // What one request may be given to generate on this model; see `understanding_limits`.
             generation_limits: Some(understanding_limits()),
-            max_model_len: self.build.max_model_len.map(|length| length.get()),
-            watchdog_timeout: Some(self.watchdog_timeout()),
         })
     }
 
@@ -991,11 +985,10 @@ impl EpochPlan {
 
     /// What a media rank advertises of itself: the facts its scheduler is configured from.
     ///
-    /// **A media rank keeps no paged key/value cache**, so the three facts that describe one are
-    /// absent rather than zero: `block_size`, `kv_cache_dtype` and the host tier describe a cache
-    /// this class does not hold, and stating a zero page would make a scheduler plan against a
-    /// pool that never exists. What replaces them is the deployment's media statement: the widest
-    /// batch it admits, the prompt capacity its encoder captures, and the length it states.
+    /// **A media rank keeps no paged key/value cache**, so the host tier is absent rather than
+    /// zero: stating one would make a scheduler plan against a pool that never exists. What
+    /// replaces it is the deployment's media statement: the widest batch it admits, the prompt
+    /// capacity its encoder captures, and the length it states.
     ///
     /// Every figure here is the deployment's, not a checkpoint's: a pipeline does not imply a
     /// prompt capacity or a clip length, and a default invented here would be a second statement of
@@ -1028,15 +1021,12 @@ impl EpochPlan {
                 1 => Some(vec![host_name()?]),
                 _ => None,
             },
-            peers: None,
             max_running_requests: Some(self.build.max_running_requests.get()),
             // One media computation per request: a batch's rows are the requests it carries, and
             // the deployment's admission bound is the number of them.
             max_batch: Some(self.build.max_running_requests.get()),
             max_num_batched_tokens: Some(tokens as usize),
-            // No paged cache: the three facts below describe one, and absence is their statement.
-            block_size: None,
-            kv_cache_dtype: None,
+            // No paged cache, so no host tier of one.
             host_cache: None,
             // A media rank captures graphs per bucket, and a bucket of this class is not sized by
             // tokens: the tiers a policy is checked against do not exist here, which is what an
@@ -1056,8 +1046,6 @@ impl EpochPlan {
                 max_cfg_branches: 1,
                 ..GenerationLimits::default()
             }),
-            max_model_len: self.build.max_model_len.map(|length| length.get()),
-            watchdog_timeout: Some(self.watchdog_timeout()),
         })
     }
 

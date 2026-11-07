@@ -13,8 +13,7 @@
 //! epoch must be built from the same sources. A [`Channel`] carries the
 //! frames over a stream connection: a Unix socket to a rank on the scheduler's
 //! node, TCP to a rank on another node. A rank's main process connects to the
-//! scheduler's, sends its [`Registration`] and receives its
-//! [`LaunchDescriptor`], and then serves its end until the connection closes.
+//! scheduler's and sends its [`PeerRegistration`].
 
 use std::collections::{HashMap, HashSet};
 
@@ -78,7 +77,6 @@ pub mod error;
 /// The unit a channel carries: a length and one encoded message.
 pub mod frame;
 pub mod launch;
-pub mod registration;
 
 /// Counter-based random draws of the rank's token sampler.
 pub mod philox;
@@ -86,8 +84,7 @@ pub mod philox;
 pub use channel::{Channel, Listener, Wake, Waker};
 pub use error::{EncodingError, IpcError, IpcResult, TransportError};
 pub use frame::Frame;
-pub use launch::{ExpertParallelDescriptor, LaunchDescriptor, ReceivedWeights, StorageLaunch};
-pub use registration::{Registration, VERSION};
+pub use launch::StorageLaunch;
 
 // Message types are split by concern and re-exported flat at the crate root;
 // each module takes the shared imports through `use super::*` and the
@@ -138,6 +135,6 @@ pub use request::*;
 pub use tensor::*;
 pub use transfer::*;
 pub use update::{ProgramStatus, UpdateFailure};
-pub use peer::{PeerAccepted, PeerRegistration};
+pub use peer::{PeerAccepted, PeerRegistration, VERSION};
 pub use phase::PhaseId;
 pub use program::ProgramCommand;
