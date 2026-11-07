@@ -841,10 +841,15 @@ impl InProcess {
             shape,
             columns,
             generation,
-            // The mechanism fills this from the batch's `CacheUnitAllocation` once the scheduler
-            // states it; the seam names it so a batch that reuses a cached prefix cannot be served
-            // without it.
-            cache_units: Vec::new(),
+            // What the mechanism allocated for every call's pages: the units each takes, which the
+            // runner resets before the forward writes them, and the copies a continuation's partial
+            // last page needs from the page its predecessor published. A batch without them reads
+            // that page from whatever its new unit held before.
+            cache_units: batch
+                .requests
+                .iter()
+                .flat_map(|(_, placement)| placement.new_cache_units.iter().cloned())
+                .collect(),
             // Every call's tables, flattened: the executor installs these into the cache's pooled
             // table before the replay, because the gather reads row `slot` of that table and a row
             // nobody wrote gathers another request's pages.
