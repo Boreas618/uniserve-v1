@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
-"""Dump the layout tables of one H3 request from today's implementation.
+"""Dump the layout tables of one H3 request from the reference implementation.
+
+**This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
+repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
+checkout of the last tree that held the package and that tree's interpreter, with the tree on the
+path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+
+    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
+        /workspace/uniserve-v1/.venv/bin/python <this file> ...
 
 The Rust side of the comparison is `crates/models/minimax-h3/examples/compare_blocks.rs`; the case
 format, the tensor container and how to read the report are in `notes/h3/numeric-diagnosis.md`.
 
-Run it from the repository root, with the repository's environment:
+Run it from the repository root:
 
-    .venv/bin/python crates/models/minimax-h3/tools/dump_tables.py --case <case.json> --out <dir>
+    python crates/models/minimax-h3/tools/dump_tables.py --case <case.json> --out <dir>
 
 It needs no checkpoint and no device: every table it writes is host arithmetic over the request's
 frame count, canvas and capacities.

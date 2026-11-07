@@ -561,7 +561,7 @@ mod tests {
     use crate::output::chat::{AssistantContentBlock, Error, Result};
     use crate::output::tools::Tool;
 
-    const QWEN3_0_6B_TEMPLATE: &str = include_str!("../../../../tests/templates/qwen3.jinja");
+    const QWEN3_TEMPLATE: &str = include_str!("../../../../tests/templates/qwen3.jinja");
 
     fn sample_request(messages: Vec<ChatMessage>) -> ChatRequest {
         ChatRequest {
@@ -932,7 +932,7 @@ mod tests {
             ChatMessage::text(ChatRole::User, "Tell me about Paris more."),
         ]);
 
-        let rendered = render(Some(QWEN3_0_6B_TEMPLATE), &request).unwrap();
+        let rendered = render(Some(QWEN3_TEMPLATE), &request).unwrap();
 
         expect![[r#"
             <|im_start|>user
@@ -950,7 +950,7 @@ mod tests {
     fn qwen3_template_renders_single_user_prompt() {
         let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
 
-        let rendered = render(Some(QWEN3_0_6B_TEMPLATE), &request).unwrap();
+        let rendered = render(Some(QWEN3_TEMPLATE), &request).unwrap();
 
         expect![[r#"
             <|im_start|>user
@@ -967,7 +967,7 @@ mod tests {
             ChatMessage::text(ChatRole::User, "hello"),
         ]);
 
-        let rendered = render(Some(QWEN3_0_6B_TEMPLATE), &request).unwrap();
+        let rendered = render(Some(QWEN3_TEMPLATE), &request).unwrap();
 
         expect![[r#"
             <|im_start|>system
@@ -987,7 +987,7 @@ mod tests {
         let request = sample_request(vec![ChatMessage::text(ChatRole::User, "hello")]);
 
         let rendered = HfChatRenderer::new(
-            Some(QWEN3_0_6B_TEMPLATE.to_string()),
+            Some(QWEN3_TEMPLATE.to_string()),
             HashMap::new(),
             ChatTemplateContentFormatOption::OpenAi,
         )
@@ -1018,7 +1018,7 @@ mod tests {
         ]);
         request.chat_options.generation_prompt_mode = GenerationPromptMode::NoGenerationPrompt;
 
-        let rendered = render(Some(QWEN3_0_6B_TEMPLATE), &request).unwrap();
+        let rendered = render(Some(QWEN3_TEMPLATE), &request).unwrap();
 
         expect![[r#"
             <|im_start|>user

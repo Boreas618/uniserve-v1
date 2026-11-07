@@ -704,8 +704,7 @@ impl Default for FlashInferOptions {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct WorkerOptions {
-    /// The `uniserve` executable that runs the workers, which runs
-    /// them in the Python environment it is installed in.
+    /// The `uniserve` executable the deployment's main processes run as.
     pub executable: PathBuf,
     /// Time a batch may run without rank progress before the worker group is
     /// replaced; a rank reports a stalled job after half of it.
@@ -751,11 +750,10 @@ impl Default for WorkerOptions {
     }
 }
 
-/// The `uniserve` executable of the Python environment this process runs
-/// in, which runs the engine process and the workers.
+/// The `uniserve` executable of the virtual environment this process runs
+/// in, which runs the main processes.
 ///
-/// The executable runs workers in the environment it is installed in, so a
-/// daemon built outside one, such as a development build, takes the active
+/// A daemon built outside one, such as a development build, takes the active
 /// environment's; without one, `uniserve` is looked up on the search path.
 fn default_executable() -> PathBuf {
     const EXECUTABLE: &str = "uniserve";

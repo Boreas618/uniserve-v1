@@ -47,11 +47,13 @@ weights cost the machine.
 A request's layout - frames aligned to `17n + 5`, the latent raster, the video and audio rows, the
 prompt and condition segments, the tile order, the kept tiles, and every table the denoiser reads -
 is host arithmetic in [`packing`](src/packing.rs). Two implementations of that arithmetic exist by design: this one
-and today's `uniserve/models/minimax_h3/packing.py`. They are compared, and the comparison is a
-diagnosis rather than an acceptance gate (`specs/worker.md` 10):
+and `uniserve/models/minimax_h3/packing.py` of the retired Python tree. They are compared, and the comparison
+is a diagnosis rather than an acceptance gate (`specs/worker.md` 10). `dump_tables.py` runs against a checkout
+of that tree, as its header states:
 
 ```sh
-.venv/bin/python crates/models/minimax-h3/tools/dump_tables.py \
+PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \
+    /workspace/uniserve-v1/.venv/bin/python crates/models/minimax-h3/tools/dump_tables.py \
     --case crates/models/minimax-h3/tools/cases/dense-fl2va.json --out /tmp/dump
 cargo run -p minimax-h3 --example compare_blocks -- --dumps /tmp/dump --out /tmp/report.md
 ```

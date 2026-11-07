@@ -29,9 +29,9 @@
 //!
 //! The process loads the CUPTI beside the CUDA runtime it already loaded
 //! ([`library`]): CUPTI belongs to a CUDA release, and both the toolkit and
-//! the Python environment's CUDA packages keep `libcupti.so.N` beside
-//! `libcudart.so.N`. A worker thereby loads the CUPTI its environment pins
-//! with the runtime PyTorch runs on. The toolkit's CUPTI 2025.3.0 stalled a
+//! the environment's CUDA packages keep `libcupti.so.N` beside
+//! `libcudart.so.N`. A worker thereby loads the CUPTI of the runtime it
+//! loaded. The toolkit's CUPTI 2025.3.0 stalled a
 //! serving worker that replayed CUDA graphs while kernels were recorded,
 //! within a minute of load; the environment's `nvidia-cuda-cupti` 13.0.85
 //! served the same load.

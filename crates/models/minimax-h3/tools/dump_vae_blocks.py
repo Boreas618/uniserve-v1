@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Dump one probe of a MiniMax-H3 VAE block from today's implementation.
+"""Dump one probe of a MiniMax-H3 VAE block from the reference implementation.
+
+**This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
+repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
+checkout of the last tree that held the package and that tree's interpreter, with the tree on the
+path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+
+    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
+        /workspace/uniserve-v1/.venv/bin/python <this file> ...
 
 The reference half of the block-by-block numeric comparison (`specs/worker.md` 10). The Rust half is the
 trace hook that writes `$UNISERVE_DIAG_DIR/<block>/<name>.npy` for the same request and seed, and
@@ -14,8 +22,8 @@ different way of reading the checkpoint. It never loads a state dict by hand.
 
 One probe per invocation, so a failure costs one tensor and not the batch:
 
-    .venv/bin/python crates/models/minimax-h3/tools/dump_vae_blocks.py --list
-    .venv/bin/python crates/models/minimax-h3/tools/dump_vae_blocks.py \\
+    python crates/models/minimax-h3/tools/dump_vae_blocks.py --list
+    python crates/models/minimax-h3/tools/dump_vae_blocks.py \\
         --checkpoint /opt/uv/models/MiniMax-H3 --probe video_decoder:decoder.decoder.layers.0.qkv \\
         --out artifacts/diagnosis/vae-blocks/ref
 
@@ -24,12 +32,12 @@ visible in the first screen. A **stage** probe (`--probe decode_out`) is the oth
 fixed input, and runs the reference's module on the input a candidate's stage wrote, so the
 comparison is about the reference's arithmetic and not about who drew the clip's latents.
 
-    .venv/bin/python crates/models/minimax-h3/tools/dump_vae_blocks.py --probe decode_out \\
+    python crates/models/minimax-h3/tools/dump_vae_blocks.py --probe decode_out \\
         --stack artifacts/h3-stage2/video_decoder --checkpoint /opt/uv/models/MiniMax-H3 \\
         --out artifacts/h3-stage2-ref --device cuda A probe is a module path, relative to the component's root module, and the
 value written is that module's output for a fixed input the options below make reproducible.
 
-Run it from the repository root with the repository's environment and the repository importable
+Run it from the repository root with the reference tree importable
 (`PYTHONPATH=.` unless the package is installed editable); it needs a machine where the reference's
 compiled extensions are built, which is the run host and not every sandbox. The plan is printed before
 the first import of the model, so a broken environment and a wrong probe path are different failures.

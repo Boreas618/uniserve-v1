@@ -20,7 +20,7 @@
 //! ```text
 //! cargo run -q -p minimax-h3 --example dit_rope -- --root /workspace/models/MiniMax-H3 \
 //!     --out artifacts/h3-dit-rope
-//! .venv/bin/python crates/models/minimax-h3/tools/compare_rope_factors.py --dit artifacts/h3-dit-rope \
+//! python crates/models/minimax-h3/tools/compare_rope_factors.py --dit artifacts/h3-dit-rope \
 //!     --checkpoint /workspace/models/MiniMax-H3
 //! ```
 

@@ -12,7 +12,7 @@
 //! ```text
 //! cargo run -q -p minimax-h3 --example positions -- --width 256 --height 256 --frames 22 \
 //!     --text-tokens 60 --text-rows 128 --condition-rows 192 --out artifacts/h3-positions
-//! .venv/bin/python uniserve/models/minimax_h3/tools/... # the reference side (dump_tables.py)
+//! python crates/models/minimax-h3/tools/dump_tables.py ... # the reference side, on the retired tree
 //! ```
 //!
 //! Our file is `positions.h3t` in the container the other dumps use, holding the **operator's own

@@ -146,7 +146,7 @@ Three backend-name fields the split names already exist in the code and are read
 | `format` | `"auto"` | Checkpoint reader: `auto`, `safetensors`, `pt`, `layered` (one layer at a time) or `dummy` (no weights read) |
 | `download_dir` | Hugging Face default | Cache root for repository models |
 | `threads` | Loader default | Concurrent checkpoint file readers |
-| `weights` | unset | A plugin's weight source (`scheme://...`, `docs/plugins.md`) that streams the checkpoint's tensors in place of its files; the model's configuration and tokenizer stay the checkpoint's. An in-place weight update from a source sets it |
+| `weights` | unset | A weight source (`scheme://...`) that streams the checkpoint's tensors in place of its files; the model's configuration and tokenizer stay the checkpoint's. An in-place weight update from a source sets it |
 | `parallel_degrees` | every degree up to the GPUs a worker sees | The tensor- and expert-parallel degrees the deployment's configurations use. Retained weight storage is allocated in chunks cut where any of these degrees divides a logical tensor, so an epoch of another of them maps the chunks it shares with the epoch before it on the same GPU instead of copying them (`docs/architecture.md`, Weights). State them when the deployment may grow beyond the GPUs its workers see |
 
 ### `kv_cache_config`

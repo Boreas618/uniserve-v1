@@ -145,7 +145,7 @@ representation the shipped performance profiles serve.
 `uniserve_eval/check_h3.toml` names the six cells **twice**, in two orders, and the two runs say
 different things.
 
-`check-h3` is the order today's implementation is measured in: `check-base-ref2va` first, because that
+`check-h3` is the order the reference implementation was measured in: `check-base-ref2va` first, because that
 implementation shares one Storage Server key between the two base servers on one checkpoint and a weight
 its loader computes has no file, so whichever of them runs second inherits the first's pages. Measured
 both ways: with the reference cell first, all six pass under `--reuse-deployment`; with it last, after the

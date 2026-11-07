@@ -1,7 +1,7 @@
 name: Nightly compute-sanitizer
 
 # Every optional derived state has a test of the serving path without it
-# (`missing_state`); these run with every worker under compute-sanitizer's
+# (`missing_state`); these run with every main process under compute-sanitizer's
 # memcheck, so that code assuming a state is present fails here first.
 
 on:
@@ -20,7 +20,7 @@ jobs:
         with:
           python-version: "3.12"
       - run: python -m pip install -U pip
-      - run: python -m pip install -e ".[test,gpu]"
+      - run: python -m pip install -e ".[test,bench,gpu]"
       - run: cargo build -p uniserve
       - run: mkdir -p sanitizer-logs
       - run: >-

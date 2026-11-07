@@ -12,12 +12,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModelDescription {
-    /// Qwen3 text-generation profile, serving dense, mixture-of-experts and
-    /// Qwen3.5 (`qwen3_5`, whose language model the workers serve)
-    /// checkpoints alike: they share tokenizer, chat template, output parsing
-    /// and autoregressive runtime, and differ only in worker numerics. A
-    /// checkpoint whose template asks for another tool-call format than the
-    /// Qwen3 parser reads serves no tool calls.
+    /// Qwen3 text-generation profile, whose checkpoints share tokenizer, chat
+    /// template, output parsing and autoregressive runtime. A checkpoint whose
+    /// template asks for another tool-call format than the Qwen3 parser reads
+    /// serves no tool calls.
     #[default]
     Qwen3,
     /// MiniMax H3 video-generation profile.
@@ -44,7 +42,7 @@ impl ModelDescription {
     /// declare, empty for a family that ships as a diffusers pipeline.
     const fn model_types(self) -> &'static [&'static str] {
         match self {
-            Self::Qwen3 => &["qwen3", "qwen3_moe", "qwen3_5"],
+            Self::Qwen3 => &["qwen3", "qwen3_moe"],
             Self::MiniMaxH3 => &[],
         }
     }

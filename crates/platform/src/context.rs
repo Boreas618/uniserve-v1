@@ -245,8 +245,8 @@ impl PrimaryContext {
 
     /// Arranges for [`Self::reset_all`] to run when this process exits by
     /// `exit`: returning from `main` or `std::process::exit`, as a test
-    /// harness does once every test has completed and a Python interpreter
-    /// does after its finalization. The first interprocess event a process
+    /// harness does once every test has completed. The first interprocess
+    /// event a process
     /// creates calls this ([`crate::EventFlags::interprocess`]): such a
     /// process would otherwise leave the events' shared memory behind, as
     /// the CUDA runtime's convention of calling `cudaDeviceReset` before

@@ -22,9 +22,8 @@ const CU_MEMHOSTREGISTER_READ_ONLY: u32 = 8;
 ///   allocation granularity.
 ///
 /// Dropping never calls CUDA on the dropping thread: the release is queued to
-/// the [`crate::reclaim`]er, which makes this safe inside a DLPack deleter
-/// that runs under the Python GIL. The owner guarantees that no device work
-/// still addresses the storage when the last reference drops.
+/// the [`crate::reclaim`]er. The owner guarantees that no device work still
+/// addresses the storage when the last reference drops.
 ///
 /// `Send + Sync` follow from the fields: the type holds only addresses,
 /// driver handles behind thread-safe owners, and no host-side views.

@@ -2,7 +2,7 @@
 
 UniServe serves FastH3 8-Step text-to-video-with-audio and keyframe-conditioned generation on NVIDIA Blackwell and Hopper GPUs. Each request returns a finished MP4: 1344×768 H.264 video at 24 fps with stereo 32-kHz AAC audio. The [UniServe FastH3 post](https://hao-ai-lab.github.io/blogs/uniserve-fasth3/) describes the design and its measurements, and the [FastH3 and MiniMax-H3 guide](docs/minimax_h3/minimax_h3.md) covers every deployment, precision and option. The same guide covers the base MiniMax-H3 checkpoint's text-to-video, keyframe and reference requests and FastH3 OmniRef reference requests.
 
-UniServe is a Rust serving system. Rust owns the control and data planes and the numerical computation alike: HTTP admission, scheduling, the main processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. The Python package `uniserve` is the reference implementation of the numerics the Rust executor performs; no Rust code loads it, and no serving process carries a Python interpreter.
+UniServe is a Rust serving system. Rust owns the control and data planes and the numerical computation alike: HTTP admission, scheduling, the main processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. No serving process carries a Python interpreter: Python appears in the Program Server alone, as the compiler of Triton and CuTe DSL kernel programs, and in the evaluation client `uniserve_eval`.
 
 The configured model descriptions are `qwen3` and `minimax_h3`. A server process loads exactly one description and exposes one served-model identity.
 
@@ -29,7 +29,7 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu
 source .venv/bin/activate
 ```
 
-The sync builds the `uniserve` executable and UniServe's native kernels, and installs the `gpu` extra's providers: FlashInfer and FlashAttention-4. Compiling the native kernels needs a CUDA toolkit compatible with PyTorch and a C++ compiler; they target the visible GPUs, or the architectures `TORCH_CUDA_ARCH_LIST` names. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
+The sync builds the `uniserve` executable, and the `gpu` extra installs the NCCL and CUPTI libraries serving loads. The Program Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/program-server/python` creates; it compiles the kernel programs with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 
@@ -164,41 +164,15 @@ The `justfile` exposes the canonical repository checks:
 just lint
 just test-rust
 just test-python-fast
-just test-python-integration
-just test-python-cuda
-just test-python-e2e
+just test-python-gpu
 ```
 
-The fast and integration suites run without a CUDA device; tests that need one carry the `gpu` marker, which `test-python-cuda` selects at the unit and integration layers. The FastH3 GPU tests load a complete checkpoint on four GPUs:
+`test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start a real server on a GPU, and `test-python-gpu` runs them with `UNISERVE_RUN_GPU_E2E=1`. The FastH3 GPU test loads a complete checkpoint on four GPUs:
 
 ```bash
 UNISERVE_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2 \
-  .venv/bin/python -m pytest \
-  tests/python/integration/model_loading/test_h3_parallel_latents.py \
-  tests/python/e2e/test_h3_parallel_http.py
+  .venv/bin/python -m pytest tests/python/e2e/test_h3_parallel_http.py
 ```
-
-Every optional derived state has a test of its missing case, and the GPU halves of those tests run under NVIDIA compute-sanitizer: the video executor's latent preparation from noise and restore of a stored trajectory (`test_video_executor.py`), and an encoder output computed and stored when the host encoder pool lacks it, then read back, of a video encoder (`test_video_encoder_outputs.py`) and of an image model's vision and latent encoders (`test_image_encoder_outputs.py`, over the stub model). Each run takes one GPU, given by `CUDA_VISIBLE_DEVICES`:
-
-```bash
-H3=/workspace/models/FastVideo-FastH3-8-Step-V2
-TESTS="tests/python/integration/executor/test_video_executor.py tests/python/integration/executor/test_video_encoder_outputs.py tests/python/integration/executor/test_image_encoder_outputs.py"
-
-# memcheck: accesses outside an allocation, misaligned accesses.
-PYTORCH_NO_CUDA_MEMORY_CACHING=1 UNISERVE_H3_MODEL=$H3 timeout 1800 \
-  compute-sanitizer --tool memcheck --show-backtrace device --report-api-errors no \
-  .venv/bin/python -m pytest -q $TESTS
-
-# initcheck: reads of storage nothing wrote, one test file per process.
-for TEST in $TESTS; do
-  PYTORCH_NO_CUDA_MEMORY_CACHING=1 UNISERVE_H3_MODEL=$H3 timeout 1800 \
-    compute-sanitizer --tool initcheck --check-api-storage-access no --show-backtrace device \
-    --report-api-errors no \
-    .venv/bin/python -m pytest -q -p tests.python.sanitizer.initcheck_marks $TEST -k "restored or missing"
-done
-```
-
-`PYTORCH_NO_CUDA_MEMORY_CACHING=1` gives every tensor an allocation of its own, so an access past a tensor's end is past an allocation's end. `--show-backtrace device` is required: the host backtraces the sanitizer saves at every kernel launch keep the Python frames of the launching calls alive, and with them their tensors, so the executor test's first denoising step holds 140 GiB instead of 43 GiB and its storage runs out on a GB200. initcheck does not record the stores of the cuBLAS GEMM kernels or of the SM100 block-sparse attention kernels on GB200, and reports every later read of their outputs; the `tests.python.sanitizer.initcheck_marks` plugin marks those outputs initialized through the NVTX API (it compiles `tests/python/sanitizer/mark_initialized.c` with the CUDA headers on first use), so marked outputs themselves are not checked. Under initcheck the two test files' checkpoints do not fit one GB200 in one process, so each file runs in a process of its own. `--check-api-storage-access no` leaves the copies of CUDA API calls unchecked: with them checked, initcheck reports one device-to-device copy of 3,483,648 bytes as reading uninitialized storage 129,304 times in the executor test and does not reach the tests within the timeout. The ignored `cuGetProcAddress_v2` API errors come from the CUDA Python bindings probing driver entry points.
 
 The serving evaluator runs HTTP workloads against serving models, measures performance, validates response correctness, and writes reproducible result bundles. Benchmark points are defined in [`uniserve_eval/profiles.toml`](uniserve_eval/profiles.toml).
 
@@ -216,7 +190,7 @@ crates/storage/         The Storage Server's protocol and client
 crates/storage-server/  The Storage Server, its Mooncake connector and its Transfer Server
 crates/nixl/            NIXL agents with the UCX backend, loaded at runtime
 crates/platform/        The CUDA boundary: driver, virtual memory, device memory and allocator, streams, events, graphs, kernels and NCCL
-crates/ops/             The interface between Rust and kernel programs: operators, launch code and the kernels a program compiles
+crates/ops/             The interface between Rust and kernel programs: operators, launch code and every kernel, one package per operator and backend under `kernels/`
 crates/nn/              The shared computation library: tensor views, numerical layers, capability traits and a loaded model's blocks
 crates/models/          The concrete models and the rules their requests carry
   rules/                Model-family request semantics: the family registry, checkpoint facts and prompt rules of Qwen3 and MiniMax-H3
@@ -230,17 +204,13 @@ crates/media/           H.264/AAC output encoding and MP4 muxing, conditional me
 crates/program-server/  The Program Server: compiles programs, keeps them and hands them out; one process per host
 crates/manager/         `uniserve-manager`: an optional multi-node manager, a client of each node's `/admin`
 src/                    The root package, `uniserve`: one module per command (`serve`, `frontend`, `engine`, `storage`, `program-server`, `rules`)
-uniserve/               The Python reference implementation of the numerics: layers, loading, resource binding and the checkpoint catalog; no serving process carries a Python interpreter
-  runner/               The Python half of each runner, as the reference the Rust executor's numerics are held to
-  worker.py             The TVM-FFI import-path entry (`uniserve.worker.import_path`) the Python tests use
-uniserve_kernels/       Native CUDA, Triton and CuTe kernels
 uniserve_eval/          Serving evaluator, profiles, and request workloads
 configs/                Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)
 docs/architecture.md    Processes, the rank planes and the request path
 docs/configuration.md   The serving option tree, configuration files and deployment files
 docs/admin.md           The admin API: a node's status, event log, deployment and configuration
-docs/profiling.md       Timeline, native and Python profiling
-docs/minimax_h3/        H3 serving, library and evaluation guides, container files
+docs/profiling.md       Timeline and native profiling
+docs/minimax_h3/        H3 serving and evaluation guides, container files
 docs/qwen3_moe/         Qwen3-MoE serving and its GSM8K quality confirmation
 ```
 
