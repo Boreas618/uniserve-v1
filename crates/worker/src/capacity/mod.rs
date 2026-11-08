@@ -16,7 +16,7 @@ pub mod device;
 mod plan;
 
 pub use plan::{
-    CacheGeometry, CapacityRequest, Plan, RankFacts, Report, TokenFacts, TokenPlan, plan_media,
+    CacheGeometry, CapacityRequest, MemoryConfig, RankFacts, Report, TokenFacts, plan_media,
     plan_rank, token_plan,
 };
 

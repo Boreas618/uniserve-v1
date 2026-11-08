@@ -76,12 +76,15 @@ pub struct Memory {
     pub pools: Arc<Mutex<crate::arena::Pools>>,
 }
 
-/// What the main process hands [`Memory::new`]: the sized plan and the
-/// deployment's own values, so the control thread never assembles the owners
-/// itself.
-pub struct MemoryRequest<'a> {
-    /// The capacity plan this rank resolved (`capacity::Plan`).
-    pub plan: &'a crate::capacity::Plan,
+/// What the main process hands [`Memory::new`]: the parts only the deployment
+/// knows, beside the memory the capacity negotiation resolved.
+///
+/// Everything the resolved memory carries is read from it - the slot count, the
+/// block-table width, the entry bytes of a product, the relay depth, the import
+/// workers - so a caller does not repeat a figure it already states.
+pub struct OpenMemory<'a> {
+    /// The memory [`capacity::plan_rank`](crate::capacity::plan_rank) resolved.
+    pub plan: &'a crate::capacity::MemoryConfig,
     /// The deployed blocks' slot fields, from the model.
     pub slots: &'a [self::request_slots::SlotField],
     /// The rank's device, or `None` for a host-only rank.
@@ -89,44 +92,6 @@ pub struct MemoryRequest<'a> {
     /// The device's stream: any reset the owners queue runs here, before the
     /// worker thread exists, and a stream accepts work without one.
     pub stream: Option<&'a Stream>,
-    /// The block-table width the batch plan holds.
-    pub width: u32,
-    /// The request slots the rank keeps.
-    pub request_pool_size: u32,
-    /// The devices the product store's arenas live on.
-    pub devices: Vec<crate::memory::allocation::MemoryKind>,
-    /// The bytes of one product store entry.
-    pub max_feature_bytes: u64,
-    /// The relay entries per request slot.
-    pub relay_depth: usize,
-    /// The cache import workers the pool runs.
-    pub import_capacity: usize,
-    /// The conversion program the import path launches.
-    pub conversion: Arc<dyn prefix_cache::conversion::PageConversion>,
-    /// The pool's completion events.
-    pub events: Arc<crate::stream::EventPool>,
-    /// The device's pools, which a paired forward's scratch page set is taken
-    /// from.
-    pub pools: Arc<Mutex<crate::arena::Pools>>,
-}
-
-/// What the main process hands [`open_memory`]: the parts only the deployment
-/// knows, beside the plan the capacity negotiation resolved.
-///
-/// Everything the plan carries is read from it - the slot count, the entry
-/// bytes of a product, the relay depth, the import workers - so a caller does
-/// not repeat a figure the plan already states.
-pub struct OpenMemory<'a> {
-    /// The plan [`capacity::token_plan`](crate::capacity::token_plan) resolved.
-    pub plan: &'a crate::capacity::Plan,
-    /// The deployed blocks' slot fields, from the model.
-    pub slots: &'a [self::request_slots::SlotField],
-    /// The rank's device, or `None` for a host-only rank.
-    pub device: Option<platform::DeviceId>,
-    /// The device's stream the owners' resets run on.
-    pub stream: Option<&'a Stream>,
-    /// The block-table width the batch plan holds.
-    pub width: u32,
     /// The devices the product store's arenas live on.
     pub devices: Vec<crate::memory::allocation::MemoryKind>,
     /// The conversion program the import path launches.
@@ -136,38 +101,6 @@ pub struct OpenMemory<'a> {
     /// The device's pools, which a paired forward's scratch page set is taken
     /// from.
     pub pools: Arc<Mutex<crate::arena::Pools>>,
-}
-
-/// Build every resident owner the plan sized: the cache planes and block
-/// tables, the latent pages, the product store, the request slots, the buffer
-/// pool and the page-locked blocks.
-///
-/// This is the epoch's budget becoming real: each owner is booked against the
-/// device's allowance as it is mapped, so the first `mapped <= budget` reading
-/// after warmup counts every byte the plan charged. `storage` stays the main
-/// process's client; `sleep` and `wake` are the only calls that reach the
-/// ledger.
-pub fn open_memory(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) -> Result<Memory> {
-    let plan = request.plan;
-    let info = &plan.info;
-    Memory::new(
-        MemoryRequest {
-            plan,
-            slots: request.slots,
-            device: request.device,
-            stream: request.stream,
-            width: request.width,
-            request_pool_size: info.request_slots,
-            devices: request.devices,
-            max_feature_bytes: info.encoder_entry_bytes,
-            relay_depth: plan.arena.relay_depth,
-            import_capacity: info.max_unresolved_calls as usize,
-            conversion: request.conversion,
-            events: request.events,
-            pools: request.pools,
-        },
-        storage,
-    )
 }
 
 /// Release the resident cache segments of `cache`, which the Storage Server
@@ -237,11 +170,15 @@ impl Memory {
     /// pages, the product store, the request slots, the buffer pool and the
     /// page-locked blocks.
     ///
+    /// This is the epoch's budget becoming real: each owner is booked against
+    /// the device's allowance as it is mapped, so the first `mapped <= budget`
+    /// reading after warmup counts every byte the plan charged.
+    ///
     /// `storage` is the rank's Storage Server client; it stays the main
     /// process's, so `sleep` and `wake` are the only calls that reach the
     /// ledger. The resets the owners queue run on `request.stream` before any
     /// worker thread exists.
-    pub fn new(request: MemoryRequest<'_>, storage: &mut dyn ExclusiveStorage) -> Result<Self> {
+    pub fn new(request: OpenMemory<'_>, storage: &mut dyn ExclusiveStorage) -> Result<Self> {
         let plan = request.plan;
         let info = &plan.info;
         let cache = match (plan.cache.as_ref(), plan.planes.as_ref()) {
@@ -256,9 +193,9 @@ impl Memory {
                     })?
                     .num_units,
                 layout,
-                request.request_pool_size,
-                request.width,
-                request.import_capacity,
+                info.request_slots,
+                plan.width,
+                info.max_unresolved_calls as usize,
                 request.device,
                 request.stream,
                 storage,
