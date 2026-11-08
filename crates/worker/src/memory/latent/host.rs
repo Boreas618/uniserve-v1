@@ -109,7 +109,7 @@ fn layout(pages: &BankPages) -> [u8; 32] {
 /// samples (`LatentPoolInfo::region`): the page encoding, the most pages a
 /// trajectory occupies and the statement of the rank's share (`region`: a
 /// video worker's statement of its plan and the rank's share of the
-/// denoiser, from its manifest; [`WHOLE_IMAGE`] for an image denoiser).
+/// denoiser).
 fn rank_region(pages: &BankPages, region: &str) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"uniserve-latent-region\0");
@@ -119,11 +119,6 @@ fn rank_region(pages: &BankPages, region: &str) -> [u8; 32] {
     digest.update(region.as_bytes());
     digest.finalize().into()
 }
-
-/// The share of an image denoising rank: every rank of an image denoiser
-/// holds every latent row of each trajectory, its pages in the order its
-/// calls name them.
-pub(crate) const WHOLE_IMAGE: &str = "image latent rows, whole on every rank";
 
 /// The digest that identifies the rank's pool (`PageShape::layout`): the
 /// byte layout of its pages, and the worker group and rank it serves, so
