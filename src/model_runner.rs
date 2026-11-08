@@ -363,16 +363,18 @@ impl ModelRunner {
         // cannot exceed. A bucket above either would be captured and never filled.
         let rows_bound = u32::try_from(build.max_running_requests.get())
             .context("more request slots than the protocol addresses")?;
-        let tokens_bound = match build.model.max_model_len {
-            Some(length) => length.get(),
-            None => u32::MAX,
-        };
+        // The leader resolved the context length from the checkpoint before it launched this
+        // process; a configuration that states none was not resolved.
+        if build.model.max_model_len == 0 {
+            bail!("the engine configuration states no resolved `max_model_len`");
+        }
+        let tokens_bound = build.model.max_model_len;
         // §4.5: a stated token tier above the bound that admits it is refused here, before the
         // catalogue is built and long before any weight is mapped; a stated decode tier above the
         // request bound is the clamp in `Scheduler::new`, not a refusal. `tier_refusal` is where
         // that asymmetry is stated and argued.
-        if let (Some(sizes), Some(length)) = (&tokens, build.model.max_model_len) {
-            if let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, length.get()) {
+        if let Some(sizes) = &tokens {
+            if let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, tokens_bound) {
                 bail!("{refusal}");
             }
         }
@@ -894,10 +896,20 @@ impl ModelRunner {
         host_kv_cache: bool,
     ) -> Result<(EngineArgs, scheduler::SchedulerConfig)> {
         let running = self.engine_config().max_running_requests.get();
-        let (facts, max_batch, max_num_batched_tokens, graph_tiers) = match served {
+        let mut args = launch.clone();
+        let model = &mut args.engine_config.model;
+        let (max_batch, max_num_batched_tokens, graph_tiers) = match served {
             Served::Text(_) => {
                 let (rows, tokens) = self.buckets.bounds();
                 let control = checkpoint_tokens(self.checkpoint())?;
+                // What one request may be given to generate on this model; see
+                // `understanding_limits`.
+                model.generation_limits = understanding_limits();
+                model.bos = control.bos;
+                model.eos = control.eos;
+                // A causal LM encodes no image, so no token closes encoded image content, and `0`
+                // stands for that absence rather than for an id.
+                model.end_of_image = 0;
                 let graph_tiers = self
                     .buckets
                     .iter()
@@ -905,52 +917,29 @@ impl ModelRunner {
                     .collect::<std::collections::BTreeSet<u32>>()
                     .into_iter()
                     .collect();
-                let facts = proto::config::ModelFacts {
-                    // What one request may be given to generate on this model; see
-                    // `understanding_limits`.
-                    limits: understanding_limits(),
-                    bos: control.bos,
-                    eos: control.eos,
-                    // A causal LM encodes no image, so no token closes encoded image content, and
-                    // `0` stands for that absence rather than for an id.
-                    end_of_image: 0,
-                    max_model_len: self.max_kv_len(served)?,
-                    canvas_sampling: None,
-                    prefill_outputs: true,
-                };
-                (facts, rows as usize, tokens as usize, graph_tiers)
+                (rows as usize, tokens as usize, graph_tiers)
             }
             Served::Media(_) => {
-                let longest = self.engine_config().model.max_model_len.map(|length| length.get()).context(
-                    "a deployment of the media class states no `max_model_len`: the pipeline keeps \
-                     no key/value cache, so no checkpoint figure implies one and the deployment's \
-                     own is what its prompt capacities are checked against",
-                )?;
-                let tokens = prompt_capacity(&self.engine_config().video, longest)?;
-                let facts = proto::config::ModelFacts {
-                    // A media request generates a clip, not tokens, so no understanding feature is
-                    // served; the engine still needs the two lower bounds, as the frontend's arm
-                    // for this class states them (`crates/frontend/src/model/generation.rs`).
-                    limits: GenerationLimits {
-                        latent_downsample: 1,
-                        max_cfg_branches: 1,
-                        ..GenerationLimits::default()
-                    },
-                    // The media class decodes no tokens, so no tokenizer fact reaches a scheduler
-                    // call: `0` stands for the absence of a token, and the list of terminating
-                    // tokens is empty.
-                    bos: 0,
-                    eos: Vec::new(),
-                    end_of_image: 0,
-                    max_model_len: longest,
-                    canvas_sampling: None,
-                    prefill_outputs: true,
+                let tokens = prompt_capacity(&self.engine_config().video, model.max_model_len)?;
+                // A media request generates a clip, not tokens, so no understanding feature is
+                // served; the engine still needs the two lower bounds, as the frontend's arm for
+                // this class states them (`crates/frontend/src/model/generation.rs`).
+                model.generation_limits = GenerationLimits {
+                    latent_downsample: 1,
+                    max_cfg_branches: 1,
+                    ..GenerationLimits::default()
                 };
-                (facts, running, tokens as usize, Vec::new())
+                // The media class decodes no tokens, so no tokenizer fact reaches a scheduler
+                // call: `0` stands for the absence of a token, and the list of terminating tokens
+                // is empty.
+                model.bos = 0;
+                model.eos = Vec::new();
+                model.end_of_image = 0;
+                (running, tokens as usize, Vec::new())
             }
         };
-        let mut args = launch.clone();
-        args.engine_config.model.facts = Some(facts);
+        model.canvas_sampling = None;
+        model.prefill_outputs = true;
         if !host_kv_cache {
             args.engine_config.kv_cache.host_tier = false;
         }
@@ -1014,10 +1003,7 @@ impl ModelRunner {
                 device.0
             );
         }
-        let longest = self.engine_config().model.max_model_len.map(|length| length.get()).context(
-            "a deployment of the media class states no `max_model_len`, and its prompt capacities \
-             are checked against it",
-        )?;
+        let longest = self.engine_config().model.max_model_len;
         let capacities = prompt_capacities(&self.engine_config().video, longest)?;
         // The checkpoint's own statement of what it serves, read once: the candidates are per task,
         // and a task the checkpoint does not serve gets no graph.
@@ -1481,15 +1467,7 @@ impl ModelRunner {
                 // request's text rows are its prompt rounded up to the attention unit's tile, and
                 // the layout's capacity is what the deployment prepared (`packing.py:557`,
                 // `denoiser.py:411`).
-                let longest = self
-                    .engine_config()
-                    .model
-                    .max_model_len
-                    .map(|length| length.get())
-                    .context(
-                        "a deployment of the media class states no `max_model_len`, and its prompt \
-                     capacities are checked against it",
-                    )?;
+                let longest = self.engine_config().model.max_model_len;
                 let capacities = prompt_capacities(&self.engine_config().video, longest)?;
                 let text_capacity = *capacities.last().context(
                     "this deployment states no prompt capacity, so no layout could hold a prompt",
@@ -1584,15 +1562,7 @@ impl ModelRunner {
         let (rows, tokens) = match served {
             Served::Text(_) => self.buckets.bounds(),
             Served::Media(_) => {
-                let longest = self
-                    .engine_config()
-                    .model
-                    .max_model_len
-                    .map(|length| length.get())
-                    .context(
-                        "a deployment of the media class states no `max_model_len`, and its prompt \
-                     capacities are checked against it",
-                    )?;
+                let longest = self.engine_config().model.max_model_len;
                 (
                     u32::try_from(self.engine_config().max_running_requests.get())
                         .context("more request slots than the protocol addresses")?,
@@ -1780,19 +1750,8 @@ impl ModelRunner {
     }
 
     /// The keys a row reads at most: the cache's bound, from the epoch's context length.
-    pub(crate) fn max_kv_len(&self, served: &Served) -> Result<u32> {
-        if let Some(length) = self.engine_config().model.max_model_len {
-            return Ok(length.get());
-        }
-        match served {
-            Served::Text(model) => u32::try_from(model.config().max_position_embeddings)
-                .context("the checkpoint's context length is wider than the protocol's"),
-            Served::Media(_) => bail!(
-                "this rank serves the media class and the deployment states no `max_model_len`: \
-                 the pipeline keeps no key/value cache, so a length that decides one is the \
-                 deployment's to state rather than a checkpoint's to imply"
-            ),
-        }
+    pub(crate) fn max_kv_len(&self, _served: &Served) -> Result<u32> {
+        Ok(self.engine_config().model.max_model_len)
     }
 }
 

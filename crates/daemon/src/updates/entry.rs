@@ -385,7 +385,8 @@ impl Leader {
                 .await
                 .map_err(UpdateError::Refused)?;
             let served = locked(&replicas[0].served).clone();
-            if served.is_some_and(|served| served.engine_config.model.facts != engine.model.facts) {
+            if served.is_some_and(|served| !served.engine_config.model.processes_as(&engine.model))
+            {
                 return Err(UpdateError::Refused(format!(
                     "the model at {} has other generation limits, control tokens or context \
                      length than the served model, which change how requests are processed: \
@@ -716,7 +717,7 @@ impl Replica {
             crate::leader::same_processing(&served_model.model, &target_engine.model.model)
                 .await
                 .map_err(UpdateError::Refused)?;
-            if served_model.facts != target_engine.model.facts {
+            if !served_model.processes_as(&target_engine.model) {
                 return Err(UpdateError::Refused(format!(
                     "the model at {} has other generation limits, control tokens or context \
                      length than the served model, which change how requests are processed: \

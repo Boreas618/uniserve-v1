@@ -892,20 +892,29 @@ impl Leader {
 
         // The options state the scheduler and the rank layout; the loaded model
         // completes what it determines.
+        // A media pipeline keeps no key/value cache, so no checkpoint figure
+        // implies a context length: the deployment states the length its
+        // prompt capacities are checked against.
+        anyhow::ensure!(
+            !matches!(model_config.parameters, ModelParameters::MiniMaxH3)
+                || config.max_model_len.is_some(),
+            "a deployment of the media class states no `max_model_len`: the pipeline keeps no \
+             key/value cache, so a length that decides one is the deployment's to state rather \
+             than a checkpoint's to imply"
+        );
         let mut engine = config.engine_config()?;
         let control_tokens = special_token_ids(&model_config);
-        engine.model.facts = Some(proto::config::ModelFacts {
-            limits: model_config.generation_limits(config.dtype),
-            bos: control_tokens.bos,
-            eos: control_tokens.eos,
-            end_of_image: control_tokens.end_of_image,
-            max_model_len,
-            // No model this daemon serves generates canvases: canvas sampling
-            // reaches a worker with the request that needs it, and every
-            // prefill returns the outputs its caller asked for.
-            canvas_sampling: None,
-            prefill_outputs: true,
-        });
+        let model = &mut engine.model;
+        model.max_model_len = max_model_len;
+        model.generation_limits = model_config.generation_limits(config.dtype);
+        model.bos = control_tokens.bos;
+        model.eos = control_tokens.eos;
+        model.end_of_image = control_tokens.end_of_image;
+        // No model this daemon serves generates canvases: canvas sampling
+        // reaches a worker with the request that needs it, and every prefill
+        // returns the outputs its caller asked for.
+        model.canvas_sampling = None;
+        model.prefill_outputs = true;
         // Video workers prepare exactly the canvases their denoiser names for
         // the configured resolutions and aspect ratios, refusing a pair it
         // does not generate, and report them back as the only canvases
@@ -3284,10 +3293,10 @@ impl Replica {
             let prepared = Leader::prepare(&config, &Stated::from_paths(Vec::new()))
                 .await
                 .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
-            let facts = locked(&self.served)
+            let served = locked(&self.served)
                 .as_ref()
-                .map(|args| args.engine_config.model.facts.clone());
-            if facts.is_some_and(|facts| facts != prepared.engine.model.facts) {
+                .map(|args| args.engine_config.model.clone());
+            if served.is_some_and(|served| !served.processes_as(&prepared.engine.model)) {
                 return Err(UpdateError::Refused(format!(
                     "the checkpoint at {model_path} has other model facts (generation limits, \
                      special tokens or context length) than the served model: deploy it instead"

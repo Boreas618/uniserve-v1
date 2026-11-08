@@ -64,20 +64,17 @@ pub fn sim_args(model: impl Into<String>) -> EngineArgs {
         executable: proto::BUILD.to_owned(),
         model: proto::config::ModelConfig {
             model: model.into(),
-            max_model_len: None,
+            max_model_len: 0,
             dtype: crate::ModelDtype::BFloat16,
             quantization: Default::default(),
-            facts: Some(proto::config::ModelFacts {
-                limits: crate::sim::SimEngine::generation_limits(),
-                bos: 0,
-                // `SimEngine` fabricates this end of text after `text_len` tokens; the
-                // scheduler must recognize it to finish a simulated request.
-                eos: vec![crate::sim::FAKE_EOS_TOKEN],
-                end_of_image: 0,
-                max_model_len: 0,
-                canvas_sampling: None,
-                prefill_outputs: true,
-            }),
+            generation_limits: crate::sim::SimEngine::generation_limits(),
+            bos: 0,
+            // `SimEngine` fabricates this end of text after `text_len` tokens; the
+            // scheduler must recognize it to finish a simulated request.
+            eos: vec![crate::sim::FAKE_EOS_TOKEN],
+            end_of_image: 0,
+            canvas_sampling: None,
+            prefill_outputs: true,
         },
         parallel: proto::config::ParallelConfig {
             tensor_parallel_size: NonZeroUsize::MIN,
@@ -116,25 +113,12 @@ pub fn sim_args(model: impl Into<String>) -> EngineArgs {
 }
 
 /// The control tokens a scheduler's requests are finished and bounded by: the model's.
-fn control_tokens(facts: &proto::config::ModelFacts) -> SpecialTokenIds {
+fn control_tokens(model: &proto::config::ModelConfig) -> SpecialTokenIds {
     SpecialTokenIds {
-        bos: facts.bos,
-        eos: facts.eos.clone(),
-        end_of_image: facts.end_of_image,
+        bos: model.bos,
+        eos: model.eos.clone(),
+        end_of_image: model.end_of_image,
     }
-}
-
-/// The facts of the model `engine` serves, which a scheduler is built from.
-///
-/// # Errors
-///
-/// Fails when the configuration states none: the process resolves them from the checkpoint
-/// before it starts a scheduler.
-fn model_facts(engine: &EngineConfig) -> anyhow::Result<&proto::config::ModelFacts> {
-    engine.model.facts.as_ref().context(
-        "the engine configuration states no model facts: the process reads them from the \
-         checkpoint before it starts a scheduler",
-    )
 }
 
 /// The host KV cache's size `kv_cache` states (`kv_cache_config.host_ratio` and `host_gib`).
@@ -173,11 +157,7 @@ impl SchedulerConfig {
                 .scheduler
                 .max_queued_requests
                 .map(std::num::NonZeroUsize::get),
-            canvas: engine
-                .model
-                .facts
-                .as_ref()
-                .and_then(|facts| facts.canvas_sampling.clone()),
+            canvas: engine.model.canvas_sampling.clone(),
             draft_tokens: engine.speculative.num_draft_tokens as usize,
             graph_tiers,
         }
@@ -257,7 +237,7 @@ impl SchedulerHandle {
     ///
     /// The scheduler reads the process's arguments `args`: its epoch, its host
     /// and its pool, and the engine configuration as the process resolved it
-    /// (the model and its facts, the KV cache, the worker groups' roles). It
+    /// (the model and what was read of its checkpoint, the KV cache, the worker groups' roles). It
     /// takes `limits`, the mechanism's bounds for the ranks it drives
     /// ([`SchedulerConfig::of`]). The pool's capabilities come from what the
     /// worker reports (`Batches::inventory`), and the batches go to `batches`
@@ -265,7 +245,7 @@ impl SchedulerHandle {
     /// daemon's first `Precopy` and `Switchover` install one (§7.3), and until
     /// then a step forms no batch.
     ///
-    /// Fails when the configuration states no model facts, when the worker
+    /// Fails when the worker
     /// reports no pool, pools that disagree about a component, or not the
     /// launch's pool, when a pool serves fewer request rows than the running
     /// requests need, or when the scheduler's thread cannot be started.
@@ -276,7 +256,6 @@ impl SchedulerHandle {
         progress: CommandWaker,
     ) -> anyhow::Result<Self> {
         let engine = &args.engine_config;
-        let facts = model_facts(engine)?;
         let info = crate::worker::WorkerInfo::from_inventory(batches.inventory())?;
         Self::check_pool(args, &info)?;
         let runtime = info.runtime_info()?;
@@ -285,10 +264,10 @@ impl SchedulerHandle {
         let waker = submissions.waker();
         let scheduler = Scheduler::new(
             submissions,
-            control_tokens(facts),
+            control_tokens(&engine.model),
             limits,
             engine.model.dtype,
-            facts.limits.clone(),
+            engine.model.generation_limits.clone(),
         )?;
         let mut scheduler = Self::configured(scheduler, args)?;
         scheduler.set_progress(progress);
@@ -314,13 +293,12 @@ impl SchedulerHandle {
         worker: Box<dyn Worker>,
     ) -> anyhow::Result<Self> {
         let engine = &args.engine_config;
-        let facts = model_facts(engine)?;
         let scheduler = Scheduler::new(
             crate::submissions(worker),
-            control_tokens(facts),
+            control_tokens(&engine.model),
             limits,
             engine.model.dtype,
-            facts.limits.clone(),
+            engine.model.generation_limits.clone(),
         )?;
         let scheduler = Self::configured(scheduler, args)?;
         Self::spawn(scheduler, engine.model.model.clone(), CommandWaker::noop())

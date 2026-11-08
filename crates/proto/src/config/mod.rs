@@ -807,34 +807,41 @@ impl Default for VideoJobConfig {
 pub struct ModelConfig {
     /// Local model directory or Hugging Face repository.
     pub model: String,
-    /// Longest sequence a request may reach, in tokens; the checkpoint's own limit when unset.
-    pub max_model_len: Option<NonZeroU32>,
+    /// Longest sequence a request may reach, in tokens: the configured `max_model_len`, else
+    /// what the model's files allow. The options state only the configured one (zero when
+    /// unset); the leader resolves it when it reads the checkpoint.
+    pub max_model_len: u32,
     /// Element type of parameters and activations.
     pub dtype: crate::request::ModelDtype,
     /// The checkpoint's quantization (`quantization`, SGLang's precision policy).
     pub quantization: serde_json::Map<String, Value>,
-    /// What the leader read from the checkpoint; unset until it has.
-    #[serde(default)]
-    pub facts: Option<ModelFacts>,
-}
-
-/// What the leader reads from a model's checkpoint and the engine would otherwise have to guess.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelFacts {
     /// The model's generation requirements, which the engine intersects with its workers'
-    /// capacities.
-    pub limits: crate::request::GenerationLimits,
+    /// capacities. The rest of the fields below are read from the checkpoint as well: they keep
+    /// their defaults until the leader, and then the engine process, read it.
+    pub generation_limits: crate::request::GenerationLimits,
     pub bos: u32,
     /// Every end-of-sequence token, the primary one first.
     pub eos: Vec<u32>,
     pub end_of_image: u32,
-    pub max_model_len: u32,
     /// A block-diffusion model's canvas sampling; absent for other models.
     pub canvas_sampling: Option<crate::request::CanvasSampling>,
     /// Whether a prompt's prefill returns outputs, which only conditioning prefills of
     /// block-diffusion models do not.
     pub prefill_outputs: bool,
+}
+
+impl ModelConfig {
+    /// Whether `other` processes requests as this model does: the same generation limits,
+    /// control tokens, context length and canvas sampling, read from the checkpoint.
+    pub fn processes_as(&self, other: &Self) -> bool {
+        self.generation_limits == other.generation_limits
+            && self.bos == other.bos
+            && self.eos == other.eos
+            && self.end_of_image == other.end_of_image
+            && self.max_model_len == other.max_model_len
+            && self.canvas_sampling == other.canvas_sampling
+            && self.prefill_outputs == other.prefill_outputs
+    }
 }
 
 /// How an epoch's ranks divide the model and the requests.

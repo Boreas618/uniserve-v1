@@ -548,10 +548,15 @@ impl ServerArgs {
             executable: proto::BUILD.to_owned(),
             model: proto::config::ModelConfig {
                 model: self.model().to_owned(),
-                max_model_len: self.max_model_len,
+                max_model_len: self.max_model_len.map_or(0, NonZeroU32::get),
                 dtype: self.dtype,
                 quantization: self.quantization.clone(),
-                facts: None,
+                generation_limits: Default::default(),
+                bos: 0,
+                eos: Vec::new(),
+                end_of_image: 0,
+                canvas_sampling: None,
+                prefill_outputs: true,
             },
             parallel: proto::config::ParallelConfig {
                 tensor_parallel_size: self.tensor_parallel_size,
