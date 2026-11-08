@@ -347,18 +347,18 @@ pub enum FramePosition {
 
 /// The probed facts of one condition's media.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MediaFacts {
+pub enum MediaMetadata {
     /// An image.
-    Image(ImageFacts),
+    Image(ImageMetadata),
     /// A video and its soundtrack.
-    Video(VideoFacts),
+    Video(VideoMetadata),
     /// An audio file.
-    Audio(AudioFacts),
+    Audio(AudioMetadata),
 }
 
 /// An image as displayed, after its EXIF orientation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ImageFacts {
+pub struct ImageMetadata {
     /// Displayed width in pixels.
     pub width: u32,
     /// Displayed height in pixels.
@@ -377,7 +377,7 @@ pub struct FrameRate {
 /// A video's display aspect and size, frame rate, frame count and
 /// soundtrack.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct VideoFacts {
+pub struct VideoMetadata {
     /// Width of the display aspect, in lowest terms. Only the ratio to
     /// `display_height` matters.
     pub display_width: u64,
@@ -394,12 +394,12 @@ pub struct VideoFacts {
     /// Frames a decoder outputs for the whole stream.
     pub frames: u64,
     /// The first audio stream, when the video has one.
-    pub soundtrack: Option<AudioFacts>,
+    pub soundtrack: Option<AudioMetadata>,
 }
 
 /// A soundtrack's native sample rate and decoded sample count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AudioFacts {
+pub struct AudioMetadata {
     /// Samples per second.
     pub sample_rate: u32,
     /// Samples per channel a decoder outputs.
@@ -1373,7 +1373,7 @@ fn start_offset(seconds: f64, rate: f64) -> u64 {
 /// the soundtrack and [`RuleError::AudioLength`] when its latents exceed
 /// `u32`.
 pub fn audio_clip(
-    media: &AudioFacts,
+    media: &AudioMetadata,
     start_seconds: f64,
     frames: u32,
     frame_rate: u32,
@@ -1435,7 +1435,7 @@ const fn gcd(mut a: u64, mut b: u64) -> u64 {
 /// offset, and the errors of [`audio_clip`],
 /// [`sample_video_frames`] and [`ProcessorConfig::video_grid`].
 pub fn video_reference(
-    media: &VideoFacts,
+    media: &VideoMetadata,
     start_seconds: f64,
     frames: u32,
     frame_rate: u32,
@@ -1841,16 +1841,16 @@ fn check_conditions(
 fn check_media(
     index: usize,
     condition: &ConditionSpec,
-    media: &MediaFacts,
+    media: &MediaMetadata,
 ) -> Result<(), VideoInputError> {
     let fits = matches!(
         (condition.condition_type, media),
-        (ConditionType::Image, MediaFacts::Image(_))
+        (ConditionType::Image, MediaMetadata::Image(_))
             | (
                 ConditionType::Video | ConditionType::VideoAudio,
-                MediaFacts::Video(_)
+                MediaMetadata::Video(_)
             )
-            | (ConditionType::Audio, MediaFacts::Audio(_))
+            | (ConditionType::Audio, MediaMetadata::Audio(_))
     );
     if !fits {
         return Err(VideoInputError::condition(
@@ -1858,7 +1858,8 @@ fn check_media(
             "the media does not match the condition type",
         ));
     }
-    if let (ConditionType::VideoAudio, MediaFacts::Video(video)) = (condition.condition_type, media)
+    if let (ConditionType::VideoAudio, MediaMetadata::Video(video)) =
+        (condition.condition_type, media)
         && video.soundtrack.is_none()
     {
         return Err(VideoInputError::condition(
@@ -1870,21 +1871,24 @@ fn check_media(
 }
 
 /// The soundtrack a reference conditions on, if any.
-fn soundtrack<'a>(condition: &ConditionSpec, media: &'a MediaFacts) -> Option<&'a AudioFacts> {
+fn soundtrack<'a>(
+    condition: &ConditionSpec,
+    media: &'a MediaMetadata,
+) -> Option<&'a AudioMetadata> {
     if condition.role == Role::Keyframe {
         return None;
     }
     match media {
-        MediaFacts::Audio(audio) => Some(audio),
-        MediaFacts::Video(video) => video.soundtrack.as_ref(),
-        MediaFacts::Image(_) => None,
+        MediaMetadata::Audio(audio) => Some(audio),
+        MediaMetadata::Video(video) => video.soundtrack.as_ref(),
+        MediaMetadata::Image(_) => None,
     }
 }
 
 /// The generated frame count, from the target or from the one soundtrack.
 fn resolve_frames(
     target: &Target<'_>,
-    soundtracks: &[(usize, &AudioFacts, f64)],
+    soundtracks: &[(usize, &AudioMetadata, f64)],
     limits: &PlanLimits,
 ) -> Result<(f64, u32), VideoInputError> {
     if let Some(seconds) = target.duration_seconds {
@@ -1936,7 +1940,7 @@ fn resolve_frames(
 fn target_canvas(
     task: VideoTask,
     target: &Target<'_>,
-    media: &[MediaFacts],
+    media: &[MediaMetadata],
     limits: &PlanLimits,
 ) -> Result<Canvas, VideoInputError> {
     if let Some(size) = named_canvas(task, target, &limits.canvases)? {
@@ -1953,7 +1957,7 @@ fn target_canvas(
             ),
         ));
     }
-    let Some(MediaFacts::Image(first)) = media.first() else {
+    let Some(MediaMetadata::Image(first)) = media.first() else {
         return Err(VideoInputError::condition(
             0,
             "the first keyframe is not an image",
@@ -1970,7 +1974,7 @@ fn target_canvas(
 fn plan_keyframe(
     index: usize,
     condition: &ConditionSpec,
-    image: &ImageFacts,
+    image: &ImageMetadata,
     size: Canvas,
     order: usize,
     task: VideoTask,
@@ -2009,7 +2013,7 @@ fn plan_keyframe(
 fn plan_reference(
     index: usize,
     condition: &ConditionSpec,
-    media: &MediaFacts,
+    media: &MediaMetadata,
     frames: u32,
     vision: &ProcessorConfig,
     limits: &PlanLimits,
@@ -2022,7 +2026,7 @@ fn plan_reference(
         audio_rows,
     };
     match media {
-        MediaFacts::Image(image) => {
+        MediaMetadata::Image(image) => {
             let size = reference_image_size(image.width, image.height, &limits.references)
                 .map_err(reject)?;
             let grid = vision.image_grid(size.height, size.width).map_err(reject)?;
@@ -2032,11 +2036,11 @@ fn plan_reference(
             });
             Ok(plan(Prepared::Image(size), Some(seen), 0))
         }
-        MediaFacts::Audio(audio) => {
+        MediaMetadata::Audio(audio) => {
             let clip = audio_clip(audio, 0.0, frames, limits.frame_rate).map_err(reject)?;
             Ok(plan(Prepared::Audio(clip), None, clip.rows()))
         }
-        MediaFacts::Video(video) => {
+        MediaMetadata::Video(video) => {
             let start = condition.start_seconds.unwrap_or(0.0);
             let (clip, seen) = video_reference(
                 video,
@@ -2073,7 +2077,7 @@ pub fn plan_request(
     task: VideoTask,
     target: &Target<'_>,
     conditions: &[ConditionSpec],
-    media: &[MediaFacts],
+    media: &[MediaMetadata],
     vision: &ProcessorConfig,
     limits: &PlanLimits,
 ) -> Result<VideoParams, VideoInputError> {
@@ -2101,7 +2105,7 @@ pub fn plan_request(
     let mut keyframes = 0;
     for (index, (condition, facts)) in conditions.iter().zip(media).enumerate() {
         let plan = match (condition.role, facts) {
-            (Role::Keyframe, MediaFacts::Image(image)) => {
+            (Role::Keyframe, MediaMetadata::Image(image)) => {
                 keyframes += 1;
                 plan_keyframe(index, condition, image, size, keyframes - 1, task, vision)?
             }
@@ -2136,10 +2140,10 @@ pub(super) mod tests {
     use super::super::presentation::present;
     use super::super::presentation::tests::CharacterTokenizer;
     use super::{
-        AudioClip, AudioFacts, Canvas, ConditionPlan, ConditionSpec, ConditionType, FrameClips,
-        FramePosition, FrameRate, ImageFacts, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
-        MediaFacts, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig, RequestField, Role,
-        Target, VideoFacts, VideoInputError, VideoParams, VideoTask, Vision, audio_clip, canvas,
+        AudioClip, AudioMetadata, Canvas, ConditionPlan, ConditionSpec, ConditionType, FrameClips,
+        FramePosition, FrameRate, ImageMetadata, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
+        MediaMetadata, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig, RequestField, Role,
+        Target, VideoInputError, VideoMetadata, VideoParams, VideoTask, Vision, audio_clip, canvas,
         check_request, cover_crop, gcd, plan_request, reference_bounds, reference_image_size,
         requested_frames, rows_per_frame, rule_canvases, video_frame_count, video_reference,
     };
@@ -2250,18 +2254,18 @@ pub(super) mod tests {
         Canvas { width, height }
     }
 
-    fn audio_facts(value: &Value) -> AudioFacts {
-        AudioFacts {
+    fn audio_facts(value: &Value) -> AudioMetadata {
+        AudioMetadata {
             sample_rate: value["sample_rate"].as_u64().unwrap() as u32,
             samples: value["samples"].as_u64().unwrap(),
         }
     }
 
-    fn video_facts(value: &Value) -> VideoFacts {
+    fn video_facts(value: &Value) -> VideoMetadata {
         let (numerator, denominator) = pair(&value["frame_rate"]);
         // The fixture states a video's displayed size as its aspect.
         let (width, height) = pair(&value["display"]);
-        VideoFacts {
+        VideoMetadata {
             display_width: value["display"][0].as_u64().unwrap(),
             display_height: value["display"][1].as_u64().unwrap(),
             width,
@@ -2278,16 +2282,16 @@ pub(super) mod tests {
         }
     }
 
-    fn media(value: &Value) -> MediaFacts {
+    fn media(value: &Value) -> MediaMetadata {
         if value.get("width").is_some() {
-            MediaFacts::Image(ImageFacts {
+            MediaMetadata::Image(ImageMetadata {
                 width: value["width"].as_u64().unwrap() as u32,
                 height: value["height"].as_u64().unwrap() as u32,
             })
         } else if value.get("display").is_some() {
-            MediaFacts::Video(video_facts(value))
+            MediaMetadata::Video(video_facts(value))
         } else {
-            MediaFacts::Audio(audio_facts(value))
+            MediaMetadata::Audio(audio_facts(value))
         }
     }
 
@@ -2297,7 +2301,7 @@ pub(super) mod tests {
         aspect_ratio: String,
         target: (u32, Option<f64>),
         conditions: Vec<ConditionSpec>,
-        media: Vec<MediaFacts>,
+        media: Vec<MediaMetadata>,
     }
 
     impl Request {
@@ -2808,7 +2812,7 @@ pub(super) mod tests {
                 ((3840, 1646), (24_000, 1001), 16_000),
             ] {
                 let divisor = gcd(u64::from(width), u64::from(height));
-                let facts = VideoFacts {
+                let facts = VideoMetadata {
                     display_width: u64::from(width) / divisor,
                     display_height: u64::from(height) / divisor,
                     width,
@@ -2818,7 +2822,7 @@ pub(super) mod tests {
                         denominator,
                     },
                     frames: 10_000,
-                    soundtrack: Some(AudioFacts {
+                    soundtrack: Some(AudioMetadata {
                         sample_rate,
                         samples: 10_000_000,
                     }),
@@ -2870,7 +2874,7 @@ pub(super) mod tests {
         let vision = vision(&fixture);
         let video = |width: u32, height: u32, config: &ReferenceConfig| {
             let divisor = gcd(u64::from(width), u64::from(height));
-            let facts = VideoFacts {
+            let facts = VideoMetadata {
                 display_width: u64::from(width) / divisor,
                 display_height: u64::from(height) / divisor,
                 width,

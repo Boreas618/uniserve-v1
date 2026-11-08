@@ -1815,8 +1815,7 @@ mod tests {
     fn update() -> crate::epoch::Update {
         crate::epoch::Update::new(
             1,
-            crate::epoch::Deployment::of(ServerArgs::default())
-                .expect("the configuration resolves"),
+            crate::epoch::Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
         )
     }
 
@@ -1828,8 +1827,8 @@ mod tests {
     fn a_switch_moves_every_main_process_through_the_generations_they_numbered() {
         let (processes, seen) =
             main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
-        let target = crate::epoch::Deployment::of(ServerArgs::default())
-            .expect("the configuration resolves");
+        let target =
+            crate::epoch::Epoch::of(ServerArgs::default()).expect("the configuration resolves");
         let mut switch = ProgramSwitch::new(
             &processes,
             vec![process("rank-0", 7), process("rank-1", 8)],
@@ -1897,8 +1896,8 @@ mod tests {
                 Answer::Refuses("the package has no module for this GPU".to_owned()),
             ),
         ]);
-        let target = crate::epoch::Deployment::of(ServerArgs::default())
-            .expect("the configuration resolves");
+        let target =
+            crate::epoch::Epoch::of(ServerArgs::default()).expect("the configuration resolves");
         let mut switch = ProgramSwitch::new(
             &processes,
             vec![process("rank-0", 7), process("rank-1", 8)],
@@ -1940,8 +1939,8 @@ mod tests {
                 })),
             }),
         )]);
-        let target = crate::epoch::Deployment::of(ServerArgs::default())
-            .expect("the configuration resolves");
+        let target =
+            crate::epoch::Epoch::of(ServerArgs::default()).expect("the configuration resolves");
         let mut switch = ProgramSwitch::new(&processes, vec![process("rank-0", 7)], update());
         let failure = switch
             .precopy(&target.programs.kernels, &target.programs.policy)
@@ -1974,8 +1973,8 @@ mod tests {
                 })),
             }),
         )]);
-        let target = crate::epoch::Deployment::of(ServerArgs::default())
-            .expect("the configuration resolves");
+        let target =
+            crate::epoch::Epoch::of(ServerArgs::default()).expect("the configuration resolves");
         let mut switch = ProgramSwitch::new(&processes, vec![process("rank-0", 7)], update());
         let failure = switch
             .precopy(&target.programs.kernels, &target.programs.policy)

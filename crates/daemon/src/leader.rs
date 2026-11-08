@@ -788,7 +788,7 @@ impl Leader {
         // `GET /admin/config` naming numbers no package has and a later
         // handover to a joining process (`Epochs::hand_to`) sending a revision
         // the store never built.
-        let deployment = crate::epoch::Deployment::with_programs(config.clone(), prepared.clone())?;
+        let deployment = crate::epoch::Epoch::with_programs(config.clone(), prepared.clone())?;
         let processes: Vec<crate::engine::control::EpochProcess> = engines
             .into_iter()
             .map(|engine| crate::engine::control::EpochProcess {
@@ -1768,7 +1768,7 @@ impl Leader {
                 UpdateError::Refused(format!("preparing the target's programs: {error:#}"))
             })?
         };
-        let next = crate::epoch::Deployment {
+        let next = crate::epoch::Epoch {
             config: target.clone(),
             engine,
             programs: prepared,
@@ -1933,8 +1933,8 @@ pub(crate) fn resolved(config: &ServerArgs) -> Result<proto::config::EngineConfi
 }
 
 /// The deployment `config` describes, refused as [`resolved`] refuses.
-pub(crate) fn deployment(config: &ServerArgs) -> Result<crate::epoch::Deployment, UpdateError> {
-    crate::epoch::Deployment::of(config.clone()).map_err(|error| {
+pub(crate) fn deployment(config: &ServerArgs) -> Result<crate::epoch::Epoch, UpdateError> {
+    crate::epoch::Epoch::of(config.clone()).map_err(|error| {
         UpdateError::Refused(format!("the configuration does not resolve: {error:#}"))
     })
 }

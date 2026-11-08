@@ -213,7 +213,7 @@ struct Fetched {
     prompt: String,
     seed: u64,
     specs: Vec<ConditionSpec>,
-    probes: Vec<plan::MediaFacts>,
+    probes: Vec<plan::MediaMetadata>,
     media: Vec<FetchedMedia>,
 }
 

@@ -1073,7 +1073,7 @@ fn adopted_epoch(
     options: &crate::options::ServerArgs,
     programs: Option<HandedPrograms>,
 ) -> anyhow::Result<(crate::epoch::EpochRecord, crate::epoch::ManagedProcess)> {
-    let deployment = crate::epoch::Deployment::of(options.clone())?;
+    let deployment = crate::epoch::Epoch::of(options.clone())?;
     let (kernels, policy) = match programs {
         Some(programs) => (programs.kernels.into_iter().collect(), programs.policy),
         None => (

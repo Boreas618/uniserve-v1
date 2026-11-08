@@ -31,7 +31,8 @@ use tokio::process::Command;
 use tokio::sync::Semaphore;
 
 use models::video::plan::{
-    AudioFacts, ConditionType, FrameRate, ImageFacts, MediaFacts, VideoFacts, VideoInputError,
+    AudioMetadata, ConditionType, FrameRate, ImageMetadata, MediaMetadata, VideoInputError,
+    VideoMetadata,
 };
 
 /// The largest image accepted, in pixels: Pillow, which decodes condition
@@ -54,7 +55,7 @@ const AUDIO_FORMATS: &str = "wav,mp3";
 ///
 /// Returns a message for another format, a malformed header, or more than
 /// [`MAX_IMAGE_PIXELS`] pixels.
-pub fn probe_image(bytes: &[u8]) -> Result<ImageFacts, String> {
+pub fn probe_image(bytes: &[u8]) -> Result<ImageMetadata, String> {
     let header = if bytes.starts_with(&[0xFF, 0xD8]) {
         jpeg_header(bytes)
     } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -78,12 +79,12 @@ pub fn probe_image(bytes: &[u8]) -> Result<ImageFacts, String> {
         .and_then(exif_orientation)
         .is_some_and(|orientation| (5..=8).contains(&orientation));
     Ok(if transposed {
-        ImageFacts {
+        ImageMetadata {
             width: height,
             height: width,
         }
     } else {
-        ImageFacts { width, height }
+        ImageMetadata { width, height }
     })
 }
 
@@ -326,7 +327,7 @@ impl MediaProber {
         index: usize,
         condition_type: ConditionType,
         bytes: &Bytes,
-    ) -> Result<MediaFacts, VideoInputError> {
+    ) -> Result<MediaMetadata, VideoInputError> {
         let reject = |message: String| VideoInputError::condition(index, message);
         let _permit = self
             .permits
@@ -340,7 +341,7 @@ impl MediaProber {
                 .map_err(|error| {
                     VideoInputError::internal(format!("image probe failed: {error}"))
                 })?;
-            return probed.map(MediaFacts::Image).map_err(reject);
+            return probed.map(MediaMetadata::Image).map_err(reject);
         }
 
         let scratch = self.scratch_copy(bytes).await?;
@@ -351,7 +352,7 @@ impl MediaProber {
             let samples = self
                 .decoded_samples(index, &path, AUDIO_FORMATS, stream.index)
                 .await?;
-            return Ok(MediaFacts::Audio(stream.facts(samples).map_err(reject)?));
+            return Ok(MediaMetadata::Audio(stream.facts(samples).map_err(reject)?));
         }
 
         let output = self.metadata(index, &path, VIDEO_FORMATS).await?;
@@ -374,7 +375,7 @@ impl MediaProber {
             (Some(track), Some(samples)) => Some(track.facts(samples).map_err(reject)?),
             _ => None,
         };
-        Ok(MediaFacts::Video(VideoFacts {
+        Ok(MediaMetadata::Video(VideoMetadata {
             display_width: video.display.0,
             display_height: video.display.1,
             width: video.size.0,
@@ -658,11 +659,11 @@ struct AudioStream {
 }
 
 impl AudioStream {
-    fn facts(self, samples: u64) -> Result<AudioFacts, String> {
+    fn facts(self, samples: u64) -> Result<AudioMetadata, String> {
         if samples == 0 {
             return Err("the audio stream has no samples".to_owned());
         }
-        Ok(AudioFacts {
+        Ok(AudioMetadata {
             sample_rate: self.sample_rate,
             samples,
         })
@@ -807,9 +808,9 @@ mod tests {
     use models::video::plan::RequestField;
 
     use super::{
-        AudioFacts, ConditionType, FrameRate, ImageFacts, MediaFacts, MediaProber, ProbeConfig,
-        ProbeOutput, VideoFacts, audio_stream, count_decoded_packets, exif_orientation,
-        probe_image, sum_frame_samples, video_streams,
+        AudioMetadata, ConditionType, FrameRate, ImageMetadata, MediaMetadata, MediaProber,
+        ProbeConfig, ProbeOutput, VideoMetadata, audio_stream, count_decoded_packets,
+        exif_orientation, probe_image, sum_frame_samples, video_streams,
     };
 
     /// A TIFF-structured EXIF block holding one orientation entry of the
@@ -1016,7 +1017,7 @@ mod tests {
         ] {
             assert_eq!(
                 probe_image(&encoded).unwrap(),
-                ImageFacts {
+                ImageMetadata {
                     width: 33,
                     height: 17
                 }
@@ -1024,7 +1025,7 @@ mod tests {
         }
         assert_eq!(
             probe_image(&lossy_webp(1920, 1080)).unwrap(),
-            ImageFacts {
+            ImageMetadata {
                 width: 1920,
                 height: 1080
             }
@@ -1261,11 +1262,11 @@ mod tests {
             "-f lavfi -i sine=frequency=440:sample_rate=48000:duration=3.3 -ac 2",
         );
 
-        let soundtrack = AudioFacts {
+        let soundtrack = AudioMetadata {
             sample_rate: 44100,
             samples: 110_250,
         };
-        let expected = MediaFacts::Video(VideoFacts {
+        let expected = MediaMetadata::Video(VideoMetadata {
             display_width: 16,
             display_height: 9,
             width: 320,
@@ -1279,7 +1280,7 @@ mod tests {
         });
         let probed = prober.probe(0, ConditionType::Video, &plain).await.unwrap();
         assert_eq!(probed, expected);
-        let MediaFacts::Video(probed) = prober
+        let MediaMetadata::Video(probed) = prober
             .probe(0, ConditionType::Video, &rotated)
             .await
             .unwrap()
@@ -1291,7 +1292,7 @@ mod tests {
 
         // An edit list that starts mid-GOP discards the leading frames; the
         // decoder's own count is the oracle.
-        let MediaFacts::Video(probed) = prober
+        let MediaMetadata::Video(probed) = prober
             .probe(0, ConditionType::Video, &trimmed)
             .await
             .unwrap()
@@ -1312,7 +1313,8 @@ mod tests {
         assert!(probed.frames < 75);
         assert!(probed.soundtrack.is_none());
 
-        let MediaFacts::Video(probed) = prober.probe(0, ConditionType::Video, &hevc).await.unwrap()
+        let MediaMetadata::Video(probed) =
+            prober.probe(0, ConditionType::Video, &hevc).await.unwrap()
         else {
             panic!("not a video");
         };
@@ -1322,7 +1324,7 @@ mod tests {
         );
 
         // MP3 encoder delay and padding are trimmed, as a decoder outputs.
-        let expected = MediaFacts::Audio(AudioFacts {
+        let expected = MediaMetadata::Audio(AudioMetadata {
             sample_rate: 44100,
             samples: 145_530,
         });
@@ -1330,7 +1332,7 @@ mod tests {
             prober.probe(1, ConditionType::Audio, &mp3).await.unwrap(),
             expected
         );
-        let expected = MediaFacts::Audio(AudioFacts {
+        let expected = MediaMetadata::Audio(AudioMetadata {
             sample_rate: 48000,
             samples: 158_400,
         });

@@ -25,7 +25,7 @@ use std::time::Instant;
 
 use serde_json::Value;
 
-use crate::epoch::{Deployment, Epochs, Failure};
+use crate::epoch::{Epoch, Epochs, Failure};
 use crate::interference::StepTime;
 use crate::leader::UpdateError;
 use crate::updates::change::Applied;
@@ -108,8 +108,8 @@ impl Driver {
     /// nothing) — the caller then takes its other path.
     pub(crate) fn apply(
         &self,
-        previous: &Deployment,
-        target: &Deployment,
+        previous: &Epoch,
+        target: &Epoch,
         change: EpochChange,
         dry_run: bool,
     ) -> Result<Option<Applied>, UpdateError> {
@@ -437,7 +437,7 @@ mod tests {
             target,
             update: Update::new(
                 7,
-                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+                Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
             ),
             group: "engine".to_owned(),
             start: Start {
@@ -496,10 +496,10 @@ mod tests {
         epochs.record(11, record());
         let (roster, feed) = Fake::with_feed();
         let driver = Driver::new(Arc::clone(&epochs), Box::new(roster));
-        let previous = Deployment::of(ServerArgs::default()).expect("the configuration resolves");
+        let previous = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
         let mut target_config = ServerArgs::default();
         target_config.worker_config.executable = "/opt/uniserve-b".into();
-        let target = Deployment::of(target_config).expect("the configuration resolves");
+        let target = Epoch::of(target_config).expect("the configuration resolves");
 
         // The switch's nodes are the target configuration's: one node here.
         let host = target.config.host_identity.clone();
