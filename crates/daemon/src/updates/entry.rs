@@ -942,11 +942,11 @@ mod tests {
     async fn the_status_reports_the_executing_engine_and_the_gpus_the_deployment_books() {
         use storage::protocol::Priority::Background;
 
-        let mut worker = engine::SimWorker::new(engine::SimEngine::new());
+        let mut worker = scheduler::SimWorker::new(scheduler::SimEngine::new());
         let nodes = worker.report_ledgers();
-        let core = engine::SchedulerHandle::with_worker(
-            &engine::sim_args(crate::test_support::SERVED_MODEL),
-            engine::SchedulerConfig::default(),
+        let core = scheduler::SchedulerHandle::with_worker(
+            &scheduler::sim_args(crate::test_support::SERVED_MODEL),
+            scheduler::SchedulerConfig::default(),
             Box::new(worker),
         )
         .expect("start a sim scheduler");

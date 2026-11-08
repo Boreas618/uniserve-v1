@@ -13,7 +13,7 @@
 //! with its peers. The epoch record then names the promoted generation, the
 //! old generation is stopped, and each node starts a new standby.
 //!
-//! The failure-domain rules are the engine's (`crates/engine/src/worker/
+//! The failure-domain rules are the engine's (`crates/scheduler/src/worker/
 //! group/{spawn,standby,relaunch}.rs`), carried over to main processes:
 //!
 //! - One domain holds every main process that shares a cross-node world; a

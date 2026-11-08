@@ -18,7 +18,7 @@ bytes.workspace = true
 clap.workspace = true
 platform.workspace = true
 # The rank layout a spec states, which the leader and an update read.
-engine.workspace = true
+scheduler.workspace = true
 fastokens.workspace = true
 fnv.workspace = true
 frontend.workspace = true
@@ -70,7 +70,7 @@ winnow.workspace = true
 criterion.workspace = true
 # The application crate's test fixtures, such as the byte tokenizer.
 frontend = { workspace = true, features = ["testing"] }
-engine = { workspace = true, features = ["testing"] }
+scheduler = { workspace = true, features = ["testing"] }
 # Tests drive the request interface with in-process schedulers and build
 # their worker values.
 ipc.workspace = true

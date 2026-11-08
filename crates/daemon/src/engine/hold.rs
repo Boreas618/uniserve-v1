@@ -322,11 +322,11 @@ impl RequestHold {
 mod tests {
     use std::time::Duration;
 
-    use engine::SimEngine;
     use proto::request::{
         Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, ImageParams,
         SamplingParams,
     };
+    use scheduler::SimEngine;
 
     use super::*;
     use crate::test_support::{SERVED_MODEL, sim_client, sim_core};
@@ -361,7 +361,7 @@ mod tests {
     /// A client of one simulated scheduler.
     fn client() -> Arc<EngineClient> {
         Arc::new(sim_client(vec![sim_core(
-            engine::sim_args(SERVED_MODEL),
+            scheduler::sim_args(SERVED_MODEL),
             SimEngine::new(),
         )]))
     }

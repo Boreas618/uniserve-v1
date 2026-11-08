@@ -744,12 +744,12 @@ impl Drop for RequestEvents {
 mod tests {
     use std::time::Duration;
 
-    use engine::{ContextLog, SimEngine};
     use proto::request::{
         DiffusionSamplingParams, FeedbackNextToken, GenerationConstraint, GenerationRequest,
         ImageEncoder, ImageEncoderInput, ImageGenerationConfig, ImageParams, ImageTrigger,
         RequestId, SamplingParams, Trajectory, wire,
     };
+    use scheduler::{ContextLog, SimEngine};
 
     use super::*;
     use crate::engine::client::EngineClient;
@@ -788,7 +788,7 @@ mod tests {
         let mut sim = SimEngine::new();
         sim.set_text_len(100_000);
         Arc::new(sim_client(vec![sim_core(
-            engine::sim_args(SERVED_MODEL),
+            scheduler::sim_args(SERVED_MODEL),
             sim,
         )]))
     }
@@ -1075,13 +1075,13 @@ mod tests {
 
     /// A simulated engine of the image tests, paced or not, with the log of
     /// what each request's calls wrote into its context.
-    fn image_engine(paced: bool) -> (Arc<EngineClient>, Option<engine::Pace>, ContextLog) {
+    fn image_engine(paced: bool) -> (Arc<EngineClient>, Option<scheduler::Pace>, ContextLog) {
         let mut sim = SimEngine::new();
         sim.set_text_len(100_000);
         let pace = paced.then(|| sim.pace());
         let log = sim.context_log();
         let client = Arc::new(sim_client(vec![sim_core(
-            engine::sim_args(SERVED_MODEL),
+            scheduler::sim_args(SERVED_MODEL),
             sim,
         )]));
         (client, pace, log)
@@ -1184,7 +1184,7 @@ mod tests {
     /// and the paced engine would run the request to its end unpaced, with
     /// nothing left for the test to preempt.
     async fn submit_stepped(
-        pace: &engine::Pace,
+        pace: &scheduler::Pace,
         what: &str,
         submitting: impl std::future::Future<Output = Result<(RequestEvents, Option<u32>), SubmitError>>,
     ) -> Result<(RequestEvents, Option<u32>), SubmitError> {
@@ -1210,7 +1210,7 @@ mod tests {
     /// `phase` names, reading every event on the way into `read`.
     async fn advance(
         events: &mut RequestEvents,
-        pace: &engine::Pace,
+        pace: &scheduler::Pace,
         phase: Phase,
         read: &mut Read,
     ) {
@@ -1269,7 +1269,7 @@ mod tests {
     /// preempted engine wrote, its images included; an image the request
     /// had begun starts again from noise, as these simulated engines map no
     /// host latent pools to store its trajectory in
-    /// (`crates/engine/tests/it/media_preemption.rs` stores it), and every
+    /// (`crates/scheduler/tests/it/media_preemption.rs` stores it), and every
     /// image is the one the uninterrupted request generates under that
     /// image index.
     async fn an_image_request_resumes(phase: Phase, sampled: bool, preemption: Preemption) {
@@ -1280,7 +1280,7 @@ mod tests {
         // simulator's tokens and images.
         let id = RequestId(first.next_request_id());
         assert_eq!(whole.next_request_id(), id.0);
-        let request = interleaved(engine::sim_text_token(id, 2), sampled);
+        let request = interleaved(scheduler::sim_text_token(id, 2), sampled);
 
         let hold = Arc::new(RequestHold::new());
         hold.serve(Arc::clone(&whole));

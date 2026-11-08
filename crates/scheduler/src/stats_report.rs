@@ -1,0 +1,650 @@
+//! Converts live engine counters into serializable scheduler snapshots.
+//!
+//! [`SchedulerStatsReporter`] retains cumulative baselines and reports interval
+//! deltas without resetting counters observed by other readers.
+//!
+//! A snapshot mixes two kinds of fields: interval deltas (admissions, queue
+//! wait totals, prefix-cache queries and hits, batch timing, domain call and
+//! time counters, worker forward counters) and point-in-time or lifetime
+//! values (running and waiting requests, the step counter, cache usage, maximum
+//! queue wait, active and peak domain credits).
+
+use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
+
+use crate::SchedulerStats;
+use crate::report;
+use crate::report::{BaseCacheStats, DomainSchedulerStats, PrefixCacheStats};
+use ipc::ForwardStats;
+
+/// Plain-value copy of one domain's `DomainStats` counters.
+#[derive(Clone, Copy, Debug, Default)]
+struct DomainCumulative {
+    active_credits: u64,
+    peak_credits: u64,
+    launched_calls: u64,
+    completed_calls: u64,
+    predicated_calls: u64,
+    error_calls: u64,
+    backpressure_events: u64,
+    reclaimed_credits: u64,
+    completed_batches: u64,
+    queue_us: u64,
+    launch_us: u64,
+    device_us: u64,
+    completion_us: u64,
+}
+
+/// Converts the scheduler's cumulative counters into per-update deltas for the
+/// snapshot shape (whose prefix-cache counters are increments, not totals).
+#[derive(Debug, Default)]
+pub struct SchedulerStatsReporter {
+    last_prefix_queries: u64,
+    last_prefix_hit_tokens: u64,
+    last_prefix_host_hit_tokens: u64,
+    last_queue_wait_count: u64,
+    last_queue_wait_us_total: u64,
+    last_worker_forward_stats: ForwardStats,
+    // Batch-timing baselines for per-update sums.
+    last_worker_exec_us_total: u64,
+    last_batch_roundtrip_us_total: u64,
+    last_batch_timing_count: u64,
+    last_batch_tokens_total: u64,
+    last_numerical_faults: u64,
+    // Indexed in the `ExecutionDomainStats::groups` order `domain_stats` reads.
+    last_domains: [DomainCumulative; super::stats::ExecutionDomainStats::COUNT],
+}
+
+impl SchedulerStatsReporter {
+    /// Captures the live counters in one `SchedulerStats` update.
+    ///
+    /// Advances the reporter's baselines, so each counter increment appears in
+    /// exactly one snapshot. The first snapshot reports everything counted
+    /// since the scheduler started.
+    pub fn snapshot(&mut self, stats: &SchedulerStats) -> report::SchedulerStats {
+        let num_units = stats.prefix_cache.num_units.load(Ordering::Relaxed);
+        let free_units = stats.prefix_cache.free_units.load(Ordering::Relaxed);
+        let prefix_cache_usage = if num_units > 0 {
+            1.0 - (free_units as f64 / num_units as f64)
+        } else {
+            0.0
+        };
+
+        let prefix_queries = stats.prefix.query_tokens.load(Ordering::Relaxed);
+        let prefix_hit_tokens = stats.prefix.hit_tokens.load(Ordering::Relaxed);
+        let delta_queries = prefix_queries.saturating_sub(self.last_prefix_queries);
+        let delta_hit_tokens = prefix_hit_tokens.saturating_sub(self.last_prefix_hit_tokens);
+        self.last_prefix_queries = prefix_queries;
+        self.last_prefix_hit_tokens = prefix_hit_tokens;
+        let prefix_host_hit_tokens = stats.prefix.host_hit_tokens.load(Ordering::Relaxed);
+        let delta_host_hit_tokens =
+            prefix_host_hit_tokens.saturating_sub(self.last_prefix_host_hit_tokens);
+        self.last_prefix_host_hit_tokens = prefix_host_hit_tokens;
+
+        let queue_wait_count = stats.timing.queue_wait_count.load(Ordering::Relaxed);
+        let queue_wait_us_total = stats.timing.queue_wait_us_total.load(Ordering::Relaxed);
+        let delta_queue_wait_count = queue_wait_count.saturating_sub(self.last_queue_wait_count);
+        let delta_queue_wait_us_total =
+            queue_wait_us_total.saturating_sub(self.last_queue_wait_us_total);
+        self.last_queue_wait_count = queue_wait_count;
+        self.last_queue_wait_us_total = queue_wait_us_total;
+        let avg_queue_wait_us = delta_queue_wait_us_total
+            .checked_div(delta_queue_wait_count)
+            .unwrap_or(0);
+
+        // Per-update deltas of the directly measured batch timing.
+        let worker_exec_us_total = stats.timing.worker_exec_us_total.load(Ordering::Relaxed);
+        let batch_roundtrip_us_total = stats
+            .timing
+            .batch_roundtrip_us_total
+            .load(Ordering::Relaxed);
+        let batch_timing_count = stats.timing.batch_timing_count.load(Ordering::Relaxed);
+        let batch_tokens_total = stats.timing.batch_tokens_total.load(Ordering::Relaxed);
+        let delta_worker_exec_us =
+            worker_exec_us_total.saturating_sub(self.last_worker_exec_us_total);
+        let delta_batch_roundtrip_us =
+            batch_roundtrip_us_total.saturating_sub(self.last_batch_roundtrip_us_total);
+        let delta_batch_count = batch_timing_count.saturating_sub(self.last_batch_timing_count);
+        let delta_batch_tokens = batch_tokens_total.saturating_sub(self.last_batch_tokens_total);
+        self.last_worker_exec_us_total = worker_exec_us_total;
+        self.last_batch_roundtrip_us_total = batch_roundtrip_us_total;
+        self.last_batch_timing_count = batch_timing_count;
+        self.last_batch_tokens_total = batch_tokens_total;
+        let numerical_faults = stats.general.numerical_faults.load(Ordering::Relaxed);
+        let delta_numerical_faults = numerical_faults.saturating_sub(self.last_numerical_faults);
+        self.last_numerical_faults = numerical_faults;
+
+        // The scheduler tracks no DP waves, prefix-cache request counts, or
+        // preemptions, so those fields are reported as zero.
+        report::SchedulerStats {
+            num_running_reqs: stats.general.running.load(Ordering::Relaxed) as u64,
+            num_waiting_reqs: stats.general.pending.load(Ordering::Relaxed) as u64,
+            step_counter: stats.general.steps.load(Ordering::Relaxed),
+            current_wave: 0,
+            prefix_cache_usage,
+            num_admitted_reqs: delta_queue_wait_count,
+            avg_queue_wait_us,
+            queue_wait_us_total: delta_queue_wait_us_total,
+            max_queue_wait_us: stats.timing.queue_wait_us_max.load(Ordering::Relaxed),
+            prefix_cache_stats: PrefixCacheStats {
+                base: BaseCacheStats {
+                    requests: 0,
+                    // Queries and hits both count prompt tokens.
+                    queries: delta_queries,
+                    hits: delta_hit_tokens,
+                },
+                host_hits: delta_host_hit_tokens,
+                preempted_requests: 0,
+                ..Default::default()
+            },
+            worker_forward_stats: self.worker_forward_stats(stats),
+            worker_exec_us: delta_worker_exec_us,
+            batch_roundtrip_us: delta_batch_roundtrip_us,
+            batch_count: delta_batch_count,
+            batch_tokens: delta_batch_tokens,
+            domain_stats: self.domain_stats(stats),
+            numerical_faults: delta_numerical_faults,
+        }
+    }
+
+    /// Converts cumulative per-domain counters into interval deltas.
+    ///
+    /// Credit counts are reported as current values: `active_credits` is the
+    /// present count and `peak_credits` the lifetime maximum.
+    fn domain_stats(&mut self, stats: &SchedulerStats) -> Vec<DomainSchedulerStats> {
+        let domains = stats.domains.groups();
+        domains
+            .into_iter()
+            .enumerate()
+            .map(|(index, (name, stats))| {
+                let current = domain_cumulative(stats);
+                let previous = self.last_domains[index];
+                self.last_domains[index] = current;
+                DomainSchedulerStats {
+                    domain: name.to_string(),
+                    active_credits: current.active_credits,
+                    peak_credits: current.peak_credits,
+                    launched_calls: current
+                        .launched_calls
+                        .saturating_sub(previous.launched_calls),
+                    completed_calls: current
+                        .completed_calls
+                        .saturating_sub(previous.completed_calls),
+                    predicated_calls: current
+                        .predicated_calls
+                        .saturating_sub(previous.predicated_calls),
+                    error_calls: current.error_calls.saturating_sub(previous.error_calls),
+                    backpressure_events: current
+                        .backpressure_events
+                        .saturating_sub(previous.backpressure_events),
+                    reclaimed_credits: current
+                        .reclaimed_credits
+                        .saturating_sub(previous.reclaimed_credits),
+                    completed_batches: current
+                        .completed_batches
+                        .saturating_sub(previous.completed_batches),
+                    queue_us: current.queue_us.saturating_sub(previous.queue_us),
+                    launch_us: current.launch_us.saturating_sub(previous.launch_us),
+                    device_us: current.device_us.saturating_sub(previous.device_us),
+                    completion_us: current.completion_us.saturating_sub(previous.completion_us),
+                }
+            })
+            .collect()
+    }
+
+    /// Returns worker forward counters accumulated since the previous snapshot,
+    /// or `None` when nothing changed.
+    fn worker_forward_stats(&mut self, stats: &SchedulerStats) -> Option<ForwardStats> {
+        let current = worker_forward_stats_snapshot(stats);
+        let delta = delta_worker_forward_stats(&current, &self.last_worker_forward_stats);
+        self.last_worker_forward_stats = current;
+        (!delta.is_empty()).then_some(delta)
+    }
+}
+
+/// Loads one domain's cumulative counters.
+fn domain_cumulative(stats: &crate::DomainStats) -> DomainCumulative {
+    DomainCumulative {
+        active_credits: stats.active_credits.load(Ordering::Relaxed) as u64,
+        peak_credits: stats.peak_credits.load(Ordering::Relaxed) as u64,
+        launched_calls: stats.launched_calls.load(Ordering::Relaxed),
+        completed_calls: stats.completed_calls.load(Ordering::Relaxed),
+        predicated_calls: stats.predicated_calls.load(Ordering::Relaxed),
+        error_calls: stats.error_calls.load(Ordering::Relaxed),
+        backpressure_events: stats.backpressure_events.load(Ordering::Relaxed),
+        reclaimed_credits: stats.reclaimed_credits.load(Ordering::Relaxed),
+        completed_batches: stats.completed_batches.load(Ordering::Relaxed),
+        queue_us: stats.queue_us.load(Ordering::Relaxed),
+        launch_us: stats.launch_us.load(Ordering::Relaxed),
+        device_us: stats.device_us.load(Ordering::Relaxed),
+        completion_us: stats.completion_us.load(Ordering::Relaxed),
+    }
+}
+
+/// Copies the cumulative worker forward-pass counters into plain values.
+///
+/// Each map and counter is read separately while the scheduler may be merging
+/// a new report, so the copy can reflect part of one report. Because every
+/// counter only grows, the remainder appears in the next interval's delta.
+/// A poisoned lock is read anyway.
+fn worker_forward_stats_snapshot(stats: &SchedulerStats) -> ForwardStats {
+    let path_counts = stats
+        .worker
+        .spec_verify_path_counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let spec_verify_path_counts = path_counts.clone();
+    let mode_counts = stats
+        .worker
+        .forward_mode_counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mode_tokens = stats
+        .worker
+        .forward_mode_tokens
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let mode_us = stats
+        .worker
+        .forward_mode_us
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let component_us = stats
+        .worker
+        .forward_component_us
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let stream_us = stats
+        .worker
+        .stream_us
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let blocking_calls = stats
+        .worker
+        .blocking_calls
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let attention_backend_counts = stats
+        .worker
+        .attention_backend_counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let fence_us = stats
+        .worker
+        .fence_us
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let profile = stats
+        .worker
+        .profile
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    let cuda_graph_runtime_mode_counts = stats
+        .worker
+        .cuda_graph_runtime_mode_counts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    ForwardStats {
+        mode_counts,
+        mode_tokens,
+        mode_us,
+        component_us,
+        stream_us,
+        blocking_calls,
+        fence_us,
+        fence_records_lost: stats.worker.fence_records_lost.load(Ordering::Relaxed),
+        profile,
+        attention_launches: stats.worker.attention_launches.load(Ordering::Relaxed),
+        attention_us: stats.worker.attention_us.load(Ordering::Relaxed),
+        attention_backend_counts,
+        cuda_graph_runtime_mode_counts,
+        cuda_graph_captures: stats.worker.cuda_graph_captures.load(Ordering::Relaxed),
+        cuda_graph_replays: stats.worker.cuda_graph_replays.load(Ordering::Relaxed),
+        cuda_graph_misses: stats.worker.cuda_graph_misses.load(Ordering::Relaxed),
+        cuda_graph_fallbacks: stats.worker.cuda_graph_fallbacks.load(Ordering::Relaxed),
+        cuda_graph_unpadded_tokens: stats
+            .worker
+            .cuda_graph_unpadded_tokens
+            .load(Ordering::Relaxed),
+        cuda_graph_padded_tokens: stats
+            .worker
+            .cuda_graph_padded_tokens
+            .load(Ordering::Relaxed),
+        text_decode_token_relay_hits: stats
+            .worker
+            .text_decode_token_relay_hits
+            .load(Ordering::Relaxed),
+        text_decode_token_relay_misses: stats
+            .worker
+            .text_decode_token_relay_misses
+            .load(Ordering::Relaxed),
+        text_decode_position_relay_hits: stats
+            .worker
+            .text_decode_position_relay_hits
+            .load(Ordering::Relaxed),
+        text_decode_position_relay_misses: stats
+            .worker
+            .text_decode_position_relay_misses
+            .load(Ordering::Relaxed),
+        flashinfer_decode_plan_calls: stats
+            .worker
+            .flashinfer_decode_plan_calls
+            .load(Ordering::Relaxed),
+        flashinfer_decode_plan_reuses: stats
+            .worker
+            .flashinfer_decode_plan_reuses
+            .load(Ordering::Relaxed),
+        flashinfer_decode_plan_rows: stats
+            .worker
+            .flashinfer_decode_plan_rows
+            .load(Ordering::Relaxed),
+        flashinfer_decode_plan_indices: stats
+            .worker
+            .flashinfer_decode_plan_indices
+            .load(Ordering::Relaxed),
+        flashinfer_decode_graph_plan_calls: stats
+            .worker
+            .flashinfer_decode_graph_plan_calls
+            .load(Ordering::Relaxed),
+        flashinfer_decode_graph_plan_reuses: stats
+            .worker
+            .flashinfer_decode_graph_plan_reuses
+            .load(Ordering::Relaxed),
+        spec_verify_rows: stats.worker.spec_verify_rows.load(Ordering::Relaxed),
+        spec_verify_draft_tokens: stats
+            .worker
+            .spec_verify_draft_tokens
+            .load(Ordering::Relaxed),
+        spec_verify_accepted_tokens: stats
+            .worker
+            .spec_verify_accepted_tokens
+            .load(Ordering::Relaxed),
+        spec_verify_rejected_tokens: stats
+            .worker
+            .spec_verify_rejected_tokens
+            .load(Ordering::Relaxed),
+        spec_verify_committed_tokens: stats
+            .worker
+            .spec_verify_committed_tokens
+            .load(Ordering::Relaxed),
+        spec_verify_path_counts,
+    }
+}
+
+/// Computes saturating interval deltas between two worker counter snapshots.
+fn delta_worker_forward_stats(current: &ForwardStats, previous: &ForwardStats) -> ForwardStats {
+    ForwardStats {
+        mode_counts: delta_map(&current.mode_counts, &previous.mode_counts),
+        mode_tokens: delta_map(&current.mode_tokens, &previous.mode_tokens),
+        mode_us: delta_map(&current.mode_us, &previous.mode_us),
+        component_us: delta_map(&current.component_us, &previous.component_us),
+        stream_us: delta_map(&current.stream_us, &previous.stream_us),
+        blocking_calls: delta_map(&current.blocking_calls, &previous.blocking_calls),
+        fence_us: current
+            .fence_us
+            .iter()
+            .filter_map(|(key, histogram)| {
+                let delta = match previous.fence_us.get(key) {
+                    Some(earlier) => histogram.since(earlier),
+                    None => histogram.clone(),
+                };
+                (delta.count() > 0).then(|| (key.clone(), delta))
+            })
+            .collect(),
+        fence_records_lost: current
+            .fence_records_lost
+            .saturating_sub(previous.fence_records_lost),
+        profile: delta_map(&current.profile, &previous.profile),
+        attention_launches: current
+            .attention_launches
+            .saturating_sub(previous.attention_launches),
+        attention_us: current.attention_us.saturating_sub(previous.attention_us),
+        attention_backend_counts: delta_map(
+            &current.attention_backend_counts,
+            &previous.attention_backend_counts,
+        ),
+        cuda_graph_runtime_mode_counts: delta_map(
+            &current.cuda_graph_runtime_mode_counts,
+            &previous.cuda_graph_runtime_mode_counts,
+        ),
+        cuda_graph_captures: current
+            .cuda_graph_captures
+            .saturating_sub(previous.cuda_graph_captures),
+        cuda_graph_replays: current
+            .cuda_graph_replays
+            .saturating_sub(previous.cuda_graph_replays),
+        cuda_graph_misses: current
+            .cuda_graph_misses
+            .saturating_sub(previous.cuda_graph_misses),
+        cuda_graph_fallbacks: current
+            .cuda_graph_fallbacks
+            .saturating_sub(previous.cuda_graph_fallbacks),
+        cuda_graph_unpadded_tokens: current
+            .cuda_graph_unpadded_tokens
+            .saturating_sub(previous.cuda_graph_unpadded_tokens),
+        cuda_graph_padded_tokens: current
+            .cuda_graph_padded_tokens
+            .saturating_sub(previous.cuda_graph_padded_tokens),
+        text_decode_token_relay_hits: current
+            .text_decode_token_relay_hits
+            .saturating_sub(previous.text_decode_token_relay_hits),
+        text_decode_token_relay_misses: current
+            .text_decode_token_relay_misses
+            .saturating_sub(previous.text_decode_token_relay_misses),
+        text_decode_position_relay_hits: current
+            .text_decode_position_relay_hits
+            .saturating_sub(previous.text_decode_position_relay_hits),
+        text_decode_position_relay_misses: current
+            .text_decode_position_relay_misses
+            .saturating_sub(previous.text_decode_position_relay_misses),
+        flashinfer_decode_plan_calls: current
+            .flashinfer_decode_plan_calls
+            .saturating_sub(previous.flashinfer_decode_plan_calls),
+        flashinfer_decode_plan_reuses: current
+            .flashinfer_decode_plan_reuses
+            .saturating_sub(previous.flashinfer_decode_plan_reuses),
+        flashinfer_decode_plan_rows: current
+            .flashinfer_decode_plan_rows
+            .saturating_sub(previous.flashinfer_decode_plan_rows),
+        flashinfer_decode_plan_indices: current
+            .flashinfer_decode_plan_indices
+            .saturating_sub(previous.flashinfer_decode_plan_indices),
+        flashinfer_decode_graph_plan_calls: current
+            .flashinfer_decode_graph_plan_calls
+            .saturating_sub(previous.flashinfer_decode_graph_plan_calls),
+        flashinfer_decode_graph_plan_reuses: current
+            .flashinfer_decode_graph_plan_reuses
+            .saturating_sub(previous.flashinfer_decode_graph_plan_reuses),
+        spec_verify_rows: current
+            .spec_verify_rows
+            .saturating_sub(previous.spec_verify_rows),
+        spec_verify_draft_tokens: current
+            .spec_verify_draft_tokens
+            .saturating_sub(previous.spec_verify_draft_tokens),
+        spec_verify_accepted_tokens: current
+            .spec_verify_accepted_tokens
+            .saturating_sub(previous.spec_verify_accepted_tokens),
+        spec_verify_rejected_tokens: current
+            .spec_verify_rejected_tokens
+            .saturating_sub(previous.spec_verify_rejected_tokens),
+        spec_verify_committed_tokens: current
+            .spec_verify_committed_tokens
+            .saturating_sub(previous.spec_verify_committed_tokens),
+        spec_verify_path_counts: delta_map(
+            &current.spec_verify_path_counts,
+            &previous.spec_verify_path_counts,
+        ),
+    }
+}
+
+/// Computes per-key deltas between cumulative snapshots.
+///
+/// Keys whose count did not grow are omitted, so an idle interval yields an
+/// empty map and `ForwardStats::is_empty` can detect it.
+fn delta_map(
+    current: &BTreeMap<String, u64>,
+    previous: &BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    current
+        .iter()
+        .filter_map(|(key, value)| {
+            let delta = value.saturating_sub(*previous.get(key).unwrap_or(&0));
+            (delta > 0).then(|| (key.clone(), delta))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The first snapshot reports every counter as a delta from zero and
+    /// derives cache usage and average queue wait. A second snapshot over
+    /// unchanged counters reports zero deltas and no worker stats, while the
+    /// lifetime maximum queue wait persists.
+    #[test]
+    fn snapshot_reports_deltas_and_usage() {
+        let stats = SchedulerStats::default();
+        stats.prefix_cache.num_units.store(100, Ordering::Relaxed);
+        stats.prefix_cache.free_units.store(75, Ordering::Relaxed);
+        stats.general.running.store(3, Ordering::Relaxed);
+        stats.general.pending.store(2, Ordering::Relaxed);
+        stats.prefix.query_tokens.store(2_560, Ordering::Relaxed);
+        stats.prefix.hit_tokens.store(512, Ordering::Relaxed);
+        stats.timing.queue_wait_count.store(3, Ordering::Relaxed);
+        stats
+            .timing
+            .queue_wait_us_total
+            .store(15_003, Ordering::Relaxed);
+        stats
+            .timing
+            .queue_wait_us_max
+            .store(9_000, Ordering::Relaxed);
+        stats
+            .worker
+            .flashinfer_decode_plan_calls
+            .store(5, Ordering::Relaxed);
+        stats
+            .worker
+            .flashinfer_decode_plan_reuses
+            .store(120, Ordering::Relaxed);
+        stats
+            .worker
+            .forward_component_us
+            .lock()
+            .unwrap()
+            .insert("text_model_forward".into(), 42);
+        stats.worker.spec_verify_rows.store(4, Ordering::Relaxed);
+        stats
+            .worker
+            .spec_verify_accepted_tokens
+            .store(7, Ordering::Relaxed);
+        stats
+            .worker
+            .spec_verify_path_counts
+            .lock()
+            .unwrap()
+            .insert("greedy_device".into(), 4);
+
+        let mut reporter = SchedulerStatsReporter::default();
+        let snapshot = reporter.snapshot(&stats);
+
+        assert_eq!(snapshot.num_running_reqs, 3);
+        assert_eq!(snapshot.num_waiting_reqs, 2);
+        assert!((snapshot.prefix_cache_usage - 0.25).abs() < 1e-9);
+        assert_eq!(snapshot.num_admitted_reqs, 3);
+        assert_eq!(snapshot.avg_queue_wait_us, 5_001);
+        assert_eq!(snapshot.queue_wait_us_total, 15_003);
+        assert_eq!(snapshot.max_queue_wait_us, 9_000);
+        assert_eq!(snapshot.prefix_cache_stats.base.queries, 2_560);
+        assert_eq!(snapshot.prefix_cache_stats.base.hits, 512);
+        let worker = snapshot.worker_forward_stats.expect("worker stats present");
+        assert_eq!(worker.component_us.get("text_model_forward"), Some(&42));
+        assert_eq!(worker.flashinfer_decode_plan_calls, 5);
+        assert_eq!(worker.flashinfer_decode_plan_reuses, 120);
+        assert_eq!(worker.spec_verify_rows, 4);
+        assert_eq!(worker.spec_verify_accepted_tokens, 7);
+        assert_eq!(
+            worker.spec_verify_path_counts.get("greedy_device"),
+            Some(&4)
+        );
+
+        // Second snapshot with unchanged counters reports zero deltas.
+        let second_snapshot = reporter.snapshot(&stats);
+        assert_eq!(second_snapshot.num_admitted_reqs, 0);
+        assert_eq!(second_snapshot.avg_queue_wait_us, 0);
+        assert_eq!(second_snapshot.queue_wait_us_total, 0);
+        assert_eq!(second_snapshot.max_queue_wait_us, 9_000);
+        assert_eq!(second_snapshot.prefix_cache_stats.base.queries, 0);
+        assert_eq!(second_snapshot.prefix_cache_stats.base.hits, 0);
+        assert!(second_snapshot.worker_forward_stats.is_none());
+    }
+
+    /// Directly measured worker compute and host round-trip latency must
+    /// surface as per-update deltas so they reach Prometheus.
+    #[test]
+    fn snapshot_surfaces_batch_timing() {
+        let stats = SchedulerStats::default();
+        stats
+            .timing
+            .worker_exec_us_total
+            .store(1_200, Ordering::Relaxed);
+        stats
+            .timing
+            .batch_roundtrip_us_total
+            .store(1_500, Ordering::Relaxed);
+        stats.timing.batch_timing_count.store(3, Ordering::Relaxed);
+
+        let mut reporter = SchedulerStatsReporter::default();
+        let snapshot = reporter.snapshot(&stats);
+
+        assert_eq!(snapshot.worker_exec_us, 1_200);
+        assert_eq!(snapshot.batch_roundtrip_us, 1_500);
+        assert_eq!(snapshot.batch_count, 3);
+
+        // Unchanged counters yield zero deltas on the next snapshot.
+        let second_snapshot = reporter.snapshot(&stats);
+        assert_eq!(second_snapshot.worker_exec_us, 0);
+        assert_eq!(second_snapshot.batch_roundtrip_us, 0);
+        assert_eq!(second_snapshot.batch_count, 0);
+    }
+
+    #[test]
+    fn snapshot_surfaces_attention_backend_and_cuda_graph_runtime_mode_counts() {
+        let stats = SchedulerStats::default();
+        stats
+            .worker
+            .attention_backend_counts
+            .lock()
+            .unwrap()
+            .insert("flashinfer".into(), 9);
+        stats
+            .worker
+            .cuda_graph_runtime_mode_counts
+            .lock()
+            .unwrap()
+            .insert("graph".into(), 5);
+
+        let mut reporter = SchedulerStatsReporter::default();
+        let snapshot = reporter.snapshot(&stats);
+
+        let worker = snapshot.worker_forward_stats.expect("worker stats present");
+        assert_eq!(worker.attention_backend_counts.get("flashinfer"), Some(&9));
+        assert_eq!(worker.cuda_graph_runtime_mode_counts.get("graph"), Some(&5));
+
+        // Unchanged maps produce no delta, so the second snapshot omits worker
+        // stats entirely.
+        let second_snapshot = reporter.snapshot(&stats);
+        assert!(second_snapshot.worker_forward_stats.is_none());
+    }
+}

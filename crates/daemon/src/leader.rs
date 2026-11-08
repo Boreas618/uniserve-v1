@@ -206,14 +206,14 @@ pub(crate) fn replica_configs(
         .transfer
         .as_deref()
         .unwrap_or_default()
-        .parse::<engine::TransferConfig>()
+        .parse::<scheduler::TransferConfig>()
         .context("invalid `device_config.transfer`")?;
     groups
         .chunks(groups.len() / count)
         .map(|groups| {
             let contains =
                 |id: &proto::config::WorkerGroupId| groups.iter().any(|group| &group.id == id);
-            let mut local = engine::TransferConfig::default();
+            let mut local = scheduler::TransferConfig::default();
             for edge in &transfers.edges {
                 let source = contains(&edge.source_worker);
                 let destination = contains(&edge.destination_worker);
@@ -3250,7 +3250,7 @@ impl Replica {
     /// `update_weights_from_disk` does, or from a plugin's weight source
     /// (`scheme://...`) that streams the served checkpoint's tensors, and
     /// returns what each worker reported. New requests wait; the requests
-    /// in flight continue as `in_flight` says (`engine::WeightsInFlight`):
+    /// in flight continue as `in_flight` says (`scheduler::WeightsInFlight`):
     /// on the new weights with the KV cache they reached, recomputed with
     /// the new weights once the others finish, or aborted. A relaunch or an
     /// update after loads the new checkpoint.
@@ -3562,12 +3562,12 @@ mod tests {
     use std::time::Duration;
 
     use crate::metrics::METRICS;
-    use engine::{SchedulerHandle, SimEngine, SimWorker, Worker};
     use futures::{StreamExt as _, poll};
     use proto::request::{
         Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request,
     };
     use proto::request::{ImageParams, SamplingParams};
+    use scheduler::{SchedulerHandle, SimEngine, SimWorker, Worker};
 
     use super::{EngineState, Leader, keeps_standby};
     use crate::input::GenerateRequest;
@@ -3588,7 +3588,7 @@ mod tests {
     /// The scheduler's model name labels the process-wide request metrics,
     /// so a test that reads them names its own engine.
     fn qwen3_engine(worker: SimEngine, engine_model: &str) -> Leader {
-        let core = sim_core(engine::sim_args(engine_model), worker);
+        let core = sim_core(scheduler::sim_args(engine_model), worker);
         sim_engine_over(ModelParameters::Qwen3, vec![core])
     }
 
@@ -3664,7 +3664,7 @@ mod tests {
     /// loss.
     #[tokio::test]
     async fn a_lost_engine_fails_later_requests() {
-        let core = sim_core(engine::sim_args("lost-engine-model"), SimEngine::new());
+        let core = sim_core(scheduler::sim_args("lost-engine-model"), SimEngine::new());
         let client = Arc::new(sim_client(vec![core]));
         let engine = leader_over(
             sim_model(ModelParameters::Qwen3),
@@ -3702,7 +3702,7 @@ mod tests {
         // answers the leader never gave.
         let mut clients = Vec::new();
         for _ in 0..2 {
-            let core = sim_core(engine::sim_args("sim-model"), SimEngine::new());
+            let core = sim_core(scheduler::sim_args("sim-model"), SimEngine::new());
             clients.push(Arc::new(sim_client(vec![core])));
         }
         let engine = leader_over(
@@ -3798,15 +3798,15 @@ mod tests {
     }
 
     impl Worker for GatedCloseWorker {
-        fn info(&self) -> &engine::WorkerInfo {
+        fn info(&self) -> &scheduler::WorkerInfo {
             self.inner.info()
         }
 
-        fn is_ready(&self, worker: &engine::WorkerGroupId) -> bool {
+        fn is_ready(&self, worker: &scheduler::WorkerGroupId) -> bool {
             self.inner.is_ready(worker)
         }
 
-        fn has_capacity(&self, worker: &engine::WorkerGroupId) -> bool {
+        fn has_capacity(&self, worker: &scheduler::WorkerGroupId) -> bool {
             self.inner.has_capacity(worker)
         }
 
@@ -3816,19 +3816,19 @@ mod tests {
 
         fn submit(
             &mut self,
-            batch: engine::ExecutionBatch,
-        ) -> Result<(), engine::WorkerSubmitError> {
+            batch: scheduler::ExecutionBatch,
+        ) -> Result<(), scheduler::WorkerSubmitError> {
             self.inner.submit(batch)
         }
 
         fn poll(
             &mut self,
             timeout: Duration,
-        ) -> Result<Option<engine::BatchResult>, engine::WorkerError> {
+        ) -> Result<Option<scheduler::BatchResult>, scheduler::WorkerError> {
             self.inner.poll(timeout)
         }
 
-        fn close(&mut self) -> Result<(), engine::WorkerError> {
+        fn close(&mut self) -> Result<(), scheduler::WorkerError> {
             // The wait is bounded so that a blocked runtime fails the test
             // instead of hanging it.
             let released = self.release.recv_timeout(Duration::from_secs(5)).is_ok();
@@ -3845,8 +3845,8 @@ mod tests {
         let (release_tx, release) = std::sync::mpsc::channel();
         let released = Arc::new(AtomicBool::new(false));
         let core = SchedulerHandle::with_worker(
-            &engine::sim_args("sim-model"),
-            engine::SchedulerConfig::default(),
+            &scheduler::sim_args("sim-model"),
+            scheduler::SchedulerConfig::default(),
             Box::new(GatedCloseWorker {
                 inner: SimWorker::new(SimEngine::new()),
                 release,
@@ -3986,7 +3986,7 @@ mod tests {
     async fn request_metrics_name_the_engine_core_that_served_each_request() {
         let engine_model = "core-metrics-model";
         let cores = (0..2)
-            .map(|_| sim_core(engine::sim_args(engine_model), SimEngine::new()))
+            .map(|_| sim_core(scheduler::sim_args(engine_model), SimEngine::new()))
             .collect();
         let engine = sim_engine_over(ModelParameters::Qwen3, cores);
 

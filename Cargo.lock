@@ -904,7 +904,6 @@ dependencies = [
  "bytes",
  "clap",
  "criterion",
- "engine",
  "expect-test",
  "fastokens",
  "fnv",
@@ -929,6 +928,7 @@ dependencies = [
  "prost",
  "proto",
  "reqwest",
+ "scheduler",
  "serde",
  "serde-json-fmt",
  "serde_ignored",
@@ -1173,38 +1173,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75030f3c4f45dafd7586dd6780965a8c7e8e285a5ecb86713e63a79c5b2766f3"
 dependencies = [
  "cfg-if",
-]
-
-[[package]]
-name = "engine"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "crossbeam-channel",
- "engine",
- "fnv",
- "ipc",
- "libc",
- "models",
- "nn",
- "png",
- "program-server",
- "proto",
- "scheduling",
- "serde",
- "serde_json",
- "sha2",
- "storage",
- "storage-server",
- "tempfile",
- "thiserror",
- "tokio",
- "toml",
- "tracing",
- "uuid",
- "wat",
- "worker",
 ]
 
 [[package]]
@@ -3672,6 +3640,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "scheduler"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "base64 0.22.1",
+ "crossbeam-channel",
+ "fnv",
+ "ipc",
+ "libc",
+ "models",
+ "nn",
+ "png",
+ "program-server",
+ "proto",
+ "scheduler",
+ "scheduling",
+ "serde",
+ "serde_json",
+ "sha2",
+ "storage",
+ "storage-server",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "toml",
+ "tracing",
+ "uuid",
+ "wat",
+ "worker",
+]
+
+[[package]]
 name = "scheduling"
 version = "2.0.0"
 dependencies = [
@@ -4651,7 +4651,6 @@ dependencies = [
  "clap",
  "crossbeam-channel",
  "daemon",
- "engine",
  "frontend",
  "ipc",
  "libc",
@@ -4666,6 +4665,7 @@ dependencies = [
  "proto",
  "qwen3-moe",
  "rustix",
+ "scheduler",
  "serde",
  "serde_json",
  "storage",
