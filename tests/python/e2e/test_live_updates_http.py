@@ -411,13 +411,20 @@ def _requests_running(base_url: str) -> float:
     )
 
 
-def _wait_until(predicate, timeout_s: float, what: str) -> None:
+def _wait_until(
+    predicate, timeout_s: float, what: str, interval_s: float = 1.0
+) -> None:
     deadline = time.monotonic() + timeout_s
     while time.monotonic() < deadline:
         if predicate():
             return
-        time.sleep(1.0)
+        time.sleep(interval_s)
     raise TimeoutError(f"{what} within {timeout_s} s")
+
+
+#: How often a case reads a stream it acts in the middle of: a kill or a switch
+#: lands a few tokens after the count it waits for, not up to a second after.
+STREAM_POLL_S = 0.01
 
 
 @contextmanager
@@ -1643,8 +1650,13 @@ RECOVERY_BOUND_S = 120.0
 
 #: The count a recovery case streams across its kill: long enough that the kill
 #: lands in the middle of the response, short enough to be compared whole.
+#:
+#: A count to 60 is about 230 tokens, which a single request on one GB200 now
+#: streams in under a second, so a kill made after the eighth number landed
+#: after the response had ended and no request was left to migrate. A count to
+#: 300 streams for several seconds, which the kill and a switch both land inside.
 RECOVERY_PROMPT = (
-    "Count from 1 to 60, separated by commas and spaces. "
+    "Count from 1 to 300, separated by commas and spaces. "
     "Write only the numbers."
 )
 
@@ -1739,7 +1751,10 @@ def _lose_the_serving_engine(
     )
     streaming.start()
     _wait_until(
-        lambda: len(_numbers(read)) >= 8, 300, "the count did not stream"
+        lambda: len(_numbers(read)) >= 8,
+        300,
+        "the count did not stream",
+        STREAM_POLL_S,
     )
     before = len(_numbers(read))
     killed = _serving_engine(log)
@@ -1783,7 +1798,7 @@ def _lose_the_serving_engine(
     assert numbers == list(range(1, len(numbers) + 1)), (
         f"the response lost or repeated a count across the loss: {numbers[:40]}"
     )
-    assert len(numbers) >= 60, f"the count stopped at {len(numbers)} numbers"
+    assert len(numbers) >= 300, f"the count stopped at {len(numbers)} numbers"
     assert reasons == ["stop"], f"the count ended {reasons}"
 
     after = _chat(base_url, name, RECOVERY_PROMPT, tokens=RECOVERY_TOKENS)[
@@ -1988,7 +2003,10 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
         )
         streaming.start()
         _wait_until(
-            lambda: len(_numbers(read)) >= 8, 300, "the count did not stream"
+            lambda: len(_numbers(read)) >= 8,
+            300,
+            "the count did not stream",
+            STREAM_POLL_S,
         )
         report = _change_epoch(
             base_url, f"worker_config.executable={successor}"
