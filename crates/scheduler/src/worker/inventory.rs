@@ -16,7 +16,6 @@ use std::collections::BTreeMap;
 use anyhow::ensure;
 use ipc::MainProcessInfo;
 
-use crate::WorkerGroupId;
 use crate::worker::codecs::video_unit_codecs;
 use crate::worker::{RankEncoderPools, WorkerInfo};
 
@@ -323,6 +322,7 @@ fn named(group: &str) -> &str {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::WorkerGroupId;
     use ipc::{MainProcessEndpoint, MediaCall};
     use proto::config::BlockConfig;
     use std::collections::BTreeSet;
