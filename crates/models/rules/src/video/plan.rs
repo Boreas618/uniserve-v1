@@ -1029,7 +1029,7 @@ pub enum Prepared {
 
 /// How one condition is prepared and what it contributes.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct ConditionPlan {
+pub struct ConditionInput {
     /// Position of the condition in the request.
     pub index: usize,
     /// The preparation of its media.
@@ -1040,7 +1040,7 @@ pub struct ConditionPlan {
     pub audio_rows: u32,
 }
 
-impl ConditionPlan {
+impl ConditionInput {
     /// The condition's described role and what the media reader decodes its
     /// bytes into. `canvas` is the generated canvas, which a keyframe is
     /// fitted to.
@@ -1216,7 +1216,7 @@ pub struct VideoParams {
     /// Generated frames, a frame count of the denoiser's frame rule.
     pub num_frames: u32,
     /// One plan per condition, in request order.
-    pub conditions: Vec<ConditionPlan>,
+    pub conditions: Vec<ConditionInput>,
 }
 
 impl VideoParams {
@@ -1245,7 +1245,7 @@ impl VideoParams {
     /// that round is full rather than leaving ranks idle behind its whole
     /// images.
     pub fn image_bands(&self, round_units: u32) -> Vec<u32> {
-        let is_image = |plan: &ConditionPlan| matches!(plan.prepared, Prepared::Image(_));
+        let is_image = |plan: &ConditionInput| matches!(plan.prepared, Prepared::Image(_));
         let images = self.conditions.iter().filter(|plan| is_image(plan)).count() as u32;
         let mut bands = vec![(round_units / images.max(1)).max(1); self.conditions.len()];
         let only_images = self
@@ -1979,7 +1979,7 @@ fn plan_keyframe(
     order: usize,
     task: VideoTask,
     vision: &ProcessorConfig,
-) -> Result<ConditionPlan, VideoInputError> {
+) -> Result<ConditionInput, VideoInputError> {
     let position = if condition.frame_index == Some(0) {
         FramePosition::First
     } else {
@@ -1999,7 +1999,7 @@ fn plan_keyframe(
     } else {
         None
     };
-    Ok(ConditionPlan {
+    Ok(ConditionInput {
         index,
         prepared: Prepared::Keyframe(KeyframeFit {
             position,
@@ -2017,9 +2017,9 @@ fn plan_reference(
     frames: u32,
     vision: &ProcessorConfig,
     limits: &PlanLimits,
-) -> Result<ConditionPlan, VideoInputError> {
+) -> Result<ConditionInput, VideoInputError> {
     let reject = |error: RuleError| VideoInputError::condition(index, error.to_string());
-    let plan = |prepared, seen, audio_rows| ConditionPlan {
+    let plan = |prepared, seen, audio_rows| ConditionInput {
         index,
         prepared,
         vision: seen,
@@ -2140,7 +2140,7 @@ pub(super) mod tests {
     use super::super::presentation::present;
     use super::super::presentation::tests::CharacterTokenizer;
     use super::{
-        AudioClip, AudioMetadata, Canvas, ConditionPlan, ConditionSpec, ConditionType, FrameClips,
+        AudioClip, AudioMetadata, Canvas, ConditionInput, ConditionSpec, ConditionType, FrameClips,
         FramePosition, FrameRate, ImageMetadata, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
         MediaMetadata, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig, RequestField, Role,
         Target, VideoInputError, VideoMetadata, VideoParams, VideoTask, Vision, audio_clip, canvas,
@@ -2368,7 +2368,7 @@ pub(super) mod tests {
 
     /// A condition plan in the vectors' layout; `canvas` is the generated
     /// canvas. A condition's video rows are its encoder units' rows.
-    fn condition_json(plan: &ConditionPlan, canvas: Canvas) -> Value {
+    fn condition_json(plan: &ConditionInput, canvas: Canvas) -> Value {
         let vision = match &plan.vision {
             None => Value::Null,
             Some(Vision::Image(seen)) => json!({
@@ -2551,7 +2551,7 @@ pub(super) mod tests {
             width: 1344,
             height: 768,
         };
-        let video = ConditionPlan {
+        let video = ConditionInput {
             index: 0,
             prepared: Prepared::Video(super::VideoClip {
                 canvas,
@@ -2576,12 +2576,12 @@ pub(super) mod tests {
             width: 3648,
             height: 2048,
         };
-        let image = ConditionPlan {
+        let image = ConditionInput {
             prepared: Prepared::Image(size),
             ..video.clone()
         };
         assert_eq!(image.latent_units(canvas, 1), [7296]);
-        let keyframe = ConditionPlan {
+        let keyframe = ConditionInput {
             prepared: Prepared::Keyframe(KeyframeFit {
                 position: FramePosition::First,
                 cover_crop: None,
@@ -2601,7 +2601,7 @@ pub(super) mod tests {
             width: 3648,
             height: 2048,
         };
-        let image = ConditionPlan {
+        let image = ConditionInput {
             index: 0,
             prepared: Prepared::Image(size),
             vision: None,
@@ -2612,7 +2612,7 @@ pub(super) mod tests {
         assert_eq!(image.latent_units(size, 0), [64 * 114]);
         assert_eq!(image.latent_units(size, 100), [114; 64]);
 
-        let keyframe = ConditionPlan {
+        let keyframe = ConditionInput {
             prepared: Prepared::Keyframe(KeyframeFit {
                 position: FramePosition::First,
                 cover_crop: None,
@@ -2627,7 +2627,7 @@ pub(super) mod tests {
     /// share.
     #[test]
     fn reference_images_share_the_latent_round() {
-        let image = ConditionPlan {
+        let image = ConditionInput {
             index: 0,
             prepared: Prepared::Image(Canvas {
                 width: 2048,
@@ -2636,7 +2636,7 @@ pub(super) mod tests {
             vision: None,
             audio_rows: 0,
         };
-        let audio = ConditionPlan {
+        let audio = ConditionInput {
             prepared: Prepared::Audio(AudioClip {
                 sample_rate: 32_000,
                 start_sample: 0,
@@ -2647,7 +2647,7 @@ pub(super) mod tests {
             audio_rows: 80,
             ..image.clone()
         };
-        let plan = |conditions: Vec<ConditionPlan>| VideoParams {
+        let plan = |conditions: Vec<ConditionInput>| VideoParams {
             task: VideoTask::Ref2va,
             canvas: Canvas {
                 width: 1344,

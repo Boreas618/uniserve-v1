@@ -43,7 +43,7 @@ mod tests;
 
 /// Where an image reference is put on its raster.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ImagePlan {
+pub struct ImageTransform {
     /// The `(width, height)` the decoded image is resized to.
     pub resized: (u32, u32),
     /// The kept `(left, top, width, height)` of the resized image.
@@ -52,7 +52,7 @@ pub struct ImagePlan {
 
 /// Which samples of an audio track are kept and where they are resampled to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct AudioPlan {
+pub struct AudioTransform {
     /// The rate the track was probed at; a track that decodes at another rate
     /// fails the request.
     pub native_rate: u32,
@@ -110,11 +110,11 @@ pub struct ConditionRead<'a> {
     /// The condition's media.
     pub source: ConditionSource<'a>,
     /// The image's fit plan when the condition is an image.
-    pub image: Option<ImagePlan>,
+    pub image: Option<ImageTransform>,
     /// The clip plan when the condition is a reference video.
     pub video: Option<VideoClip>,
     /// The track's plan when the condition carries audio.
-    pub audio: Option<AudioPlan>,
+    pub audio: Option<AudioTransform>,
     /// The condition's rows of the `condition_pixels` product: RGB24 pixels,
     /// three bytes each.
     pub pixels: std::ops::Range<usize>,
@@ -198,7 +198,7 @@ fn decode_rgb(encoded: &[u8]) -> Result<Rgb24> {
 /// [`crate::Error::Plan`] when the plan's extent cannot be addressed, the
 /// image decodes to another raster than planned, or `out` has another length;
 /// [`crate::Error::Codec`] when decoding fails.
-pub fn read_image(encoded: &[u8], plan: &ImagePlan, out: &mut [u8]) -> Result<()> {
+pub fn read_image(encoded: &[u8], plan: &ImageTransform, out: &mut [u8]) -> Result<()> {
     let (left, top, width, height) = plan.window;
     let expected = (width as usize)
         .checked_mul(height as usize)
@@ -280,7 +280,7 @@ pub fn read_image(encoded: &[u8], plan: &ImagePlan, out: &mut [u8]) -> Result<()
 /// [`crate::Error::Plan`] when the plan's extent cannot be addressed, the track
 /// has no audio stream, another rate, too few samples, or resamples to another
 /// count; [`crate::Error::Codec`] when decoding fails.
-pub fn read_audio(source: &[u8], plan: &AudioPlan, out: &mut [f32]) -> Result<()> {
+pub fn read_audio(source: &[u8], plan: &AudioTransform, out: &mut [f32]) -> Result<()> {
     let out_samples = plan.samples.checked_mul(2).ok_or_else(|| {
         Error::Plan(format!(
             "a condition track's plan of {} samples exceeds the host's address space",

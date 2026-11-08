@@ -64,7 +64,7 @@ pub use config::MediaConfig;
 pub use error::{Error, Result};
 pub use mux::{Container, MuxSession};
 pub use read::{
-    AudioPlan, ConditionProducts, ConditionRead, DecodedVideo, ImagePlan, VideoClip, read_audio,
-    read_conditions, read_image, read_video,
+    AudioTransform, ConditionProducts, ConditionRead, DecodedVideo, ImageTransform, VideoClip,
+    read_audio, read_conditions, read_image, read_video,
 };
 pub use runner::MediaRunner;
