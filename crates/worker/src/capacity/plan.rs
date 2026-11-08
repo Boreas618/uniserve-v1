@@ -1,118 +1,71 @@
-//! Startup capacity planning: block size, request slots, cache units, latent
-//! pages and the [`MainProcessInfo`] the rank reports.
+//! Startup memory planning: request slots, cache units and the
+//! [`MainProcessInfo`] the rank reports.
 //!
 //! Planning runs after the model is loaded, so measured device storage
 //! includes the weights. Every quantity the engine schedules against must be
-//! identical on the ranks of a group, so the block size, the request-slot fit
-//! and the cache unit count are agreed over the group's [`HostGroup`] with a
-//! minimum reduction.
+//! identical on the ranks of a group, so the cache unit count is agreed over
+//! the group's [`HostGroup`] with a minimum reduction.
 //!
-//! Token workers (text, diffusion LM, image) place a cache pool beside fixed
-//! storage: the buffer pool, the tensor store's products, the latent pool and
-//! the storage the worker's computations and the prefix cache reserve (the
-//! bytes the worker's manifest states, block tables, importer scratch).
-//! Automatic cache sizing gives the pool the grant left after those and a
-//! graph-capture reservation. Media workers (video) size request slots instead,
-//! because every resident request keeps its whole media state.
+//! A rank that keeps a paged cache places its pool beside fixed storage: the
+//! product store's relay arenas and the storage the prefix cache reserves
+//! (block tables, request-slot banks, importer scratch). A pool sized from
+//! storage takes the grant left after those, the graph range and the scratch
+//! region. A media rank keeps no paged cache: every resident request keeps its
+//! whole media state, so nothing is fitted.
 
 use std::collections::BTreeMap;
 
 use std::sync::Arc;
 
 use ipc::{CallKind, ComponentInfo, MainProcessEndpoint, MainProcessInfo, MediaCall};
+use proto::config::EngineConfig;
 
 use super::{ArenaCapacity, CacheCapacity, CacheDemand, TokenBounds, call_window};
 use crate::config::Device;
+use crate::memory::CachePlan;
+use crate::memory::prefix_cache::PrefixCache;
 use crate::memory::prefix_cache::planes::{PlaneLayout, UnitColumn};
-use crate::memory::{CachePlan, LatentPlan};
+use crate::parallel::host::HostGroup;
+use crate::{Error, Result};
 
 /// Unit columns the computations over the prefix cache bind beside the import
 /// workers': one, on the device's primary stream.
 const COMPUTATION_COLUMNS: usize = 1;
-use crate::parallel::host::HostGroup;
-use crate::{Error, Result};
 
-/// The launch values capacity plans with, built by the engine from the launch
-/// configuration it already reads.
+/// What a rank states about itself to the memory planner, beside the
+/// deployment's [`EngineConfig`]: where it runs, what its captured catalog
+/// admits, the cache its model reads and the planes it adopts.
 ///
-/// Capacity is a pure computation over these: nothing here is a policy of its
-/// own. The bucket sizes are the graph plan's, the device is where the rank
-/// runs, and the pool and segment values are the deployment's cache decision.
-#[derive(Clone, Debug, PartialEq)]
-pub struct CapacityRequest {
+/// Every figure is one the engine process owns or has already agreed; nothing
+/// is inferred, because a wrong admission bound is a silently smaller cache
+/// rather than an error.
+pub struct MemoryRequest {
     /// The device this rank serves.
     pub device: Device,
-    /// Tokens per logical cache page, when the deployment fixed it.
-    pub block_size: Option<usize>,
-    /// Bytes the rank's share of the device grants for the cache pool.
-    pub pool_storage_bytes: Option<usize>,
-    /// The bytes it grants once nothing else holds the device.
-    pub pool_storage_full_bytes: Option<usize>,
-    /// Fraction of the device's total storage the process may hold.
-    pub mem_fraction_static: f64,
-    /// Most calls one batch may carry.
-    pub max_batch_calls: usize,
-    /// Most tokens one batch may carry.
-    pub max_batch_tokens: usize,
-    /// Most tokens a request may hold, when the deployment fixed it.
-    pub max_total_tokens: Option<usize>,
-    /// Request slots the rank keeps.
-    pub max_request_pool_size: usize,
-    /// Encoder cache entries the rank keeps.
-    pub encoder_cache_entries: usize,
-    /// The exact cache segments the rank's planes are made of.
-    pub segments: Option<ipc::CacheTable>,
-    /// Whether warmup storage is mapped writable and the pool's remaining
-    /// virtual addresses are reserved for staged transfer.
-    pub stage_cache: bool,
-    /// The predecessor epoch's cache, whose segments the planes map read-only.
-    pub predecessor: Option<ipc::PredecessorCache>,
-    /// This rank's epoch.
+    /// The epoch whose cache planes the rank lays out: its own, or the epoch a
+    /// standby adopts the planes of.
     pub epoch: u64,
-    /// Ranks of the deployment.
-    pub world_size: usize,
-    /// Decode graph batch sizes, from the graph plan.
-    pub decode_graph_batch_sizes: Vec<usize>,
-    /// Prefill graph token sizes, from the graph plan.
-    pub prefill_graph_token_sizes: Vec<usize>,
-    /// Flow graph shapes `(tokens, latent)` the media graph plan captures.
-    pub flow_graph_shapes: Vec<(usize, usize)>,
+    /// Requests the scheduler may have in flight, which the daemon places.
+    pub queue_depth: usize,
+    /// Most calls one batch may carry: the largest bucket of the rank's
+    /// catalog, which is its admission bound because a larger batch is refused
+    /// before a kernel runs.
+    pub max_batch_calls: usize,
+    /// Most tokens one batch may carry, bounded the same way.
+    pub max_batch_tokens: usize,
+    /// The paged cache the rank's model reads, at the model's own page size, or
+    /// `None` for a rank that keeps no paged cache - a media rank, whose
+    /// resident state is each request's own whole footprint rather than pages
+    /// a scheduler addresses.
+    pub cache: Option<Arc<CachePlan>>,
+    /// The planes a standby adopts: the cache of the epoch it stands by for,
+    /// which it maps and did not size. `None` for a rank that lays its planes
+    /// out itself.
+    pub segments: Option<ipc::CacheTable>,
+    /// Device bytes the rank's expert transport takes at its first capture,
+    /// after the cache is fitted, or zero for a rank that exchanges no experts.
+    pub transport_bytes: u64,
 }
-
-/// The largest KV block size the rank resolves to unless the launch
-/// presets one ([`resolve_block_size`]). It also bounds the latent rows of
-/// an image denoiser's latent page, one KV block of them
-/// ([`LatentPlan::image`]), by which the worker sizes its denoising
-/// workspace (`uniserve.worker.image._MAX_PAGE_UNITS`).
-pub(crate) const MAX_BLOCK_SIZE: usize = 64;
-
-/// The largest block size of at most [`MAX_BLOCK_SIZE`] tokens that every
-/// resident layer's attention reads, agreed over `group` as the minimum.
-///
-/// A preset size is used unchanged and needs no agreement: every rank was
-/// launched with it. `readable` plans the pool for one candidate size.
-pub(crate) fn resolve_block_size(
-    preset: Option<usize>,
-    mut readable: impl FnMut(usize) -> Result<bool>,
-    group: &HostGroup,
-) -> Result<usize> {
-    if let Some(size) = preset {
-        return Ok(size);
-    }
-    let mut size = MAX_BLOCK_SIZE;
-    while !readable(size)? {
-        size /= 2;
-        if size == 0 {
-            return Err(Error::Unsupported(format!(
-                "no KV block size of at most {MAX_BLOCK_SIZE} tokens is read by the attention of every resident cache layer"
-            )));
-        }
-    }
-    let agreed = group.all_reduce_min(&[size as i64])?;
-    Ok(agreed[0] as usize)
-}
-
-impl LatentPlan {}
 
 /// Model-independent values of the report.
 pub struct Report {
@@ -126,21 +79,9 @@ pub struct Report {
     pub components: Vec<ComponentInfo>,
 }
 
-/// Inputs of the token layout taken from the loaded model.
-pub struct TokenFacts {
-    /// The model has an image processor (it encodes request images).
-    pub image_processor: bool,
-    /// Bytes of one encoded image's vision features.
-    pub vision_feature_bytes: u64,
-    /// Bytes of one image's latent features (image flow).
-    pub latent_feature_bytes: u64,
-    /// The latent pool of an image flow.
-    pub latent: Option<LatentPlan>,
-}
-
 /// The resolved memory of a rank: what the main process builds its resident
 /// memory from, with the figures no owner states - the widest block table a
-/// request needs, which follows from the block size the plan chose, and the two
+/// request needs, which follows from the cache's page size, and the two
 /// reservations the rank takes out of its grant before a cache unit is fitted
 /// (the graph range and the shadow region beside it), which the fit takes as an
 /// input and would otherwise not be readable back.
@@ -152,16 +93,13 @@ pub struct MemoryConfig {
     pub(crate) arena: ArenaCapacity,
     /// Fixed bytes by device, beside the cache pool.
     pub fixed_device_bytes: BTreeMap<Device, u64>,
-    /// The latent pool of a rank that stores one.
-    pub latent: Option<LatentPlan>,
     /// The cache layout, with the agreed unit count in `info.prefix_cache`.
     pub cache: Option<Arc<CachePlan>>,
     /// The segments a device pool's planes are made of; `None` for planes
     /// that do not split.
     pub planes: Option<PlaneLayout>,
-    /// Writable units used by the worker's largest warmup phase.
-    pub warmup_units: u32,
-    /// The widest block table a request of the model's length needs.
+    /// The widest block table a request of the model's length needs, or zero
+    /// for a rank that keeps no paged cache.
     pub width: u32,
     /// The graph range the rank reserves: one pool per generation a preparation
     /// may hold, mapped whole at the first capture.
@@ -174,7 +112,7 @@ fn narrow(value: usize, name: &str) -> Result<u32> {
     u32::try_from(value).map_err(|_| Error::Invalid(format!("{name} exceeds the protocol range")))
 }
 
-fn base_info(report: Report, request: &CapacityRequest) -> Result<MainProcessInfo> {
+fn base_info(report: Report, request: &MemoryRequest, slots: usize) -> Result<MainProcessInfo> {
     Ok(MainProcessInfo {
         media_components: report.media_components,
         video_denoiser: None,
@@ -184,7 +122,7 @@ fn base_info(report: Report, request: &CapacityRequest) -> Result<MainProcessInf
         supported_calls: report.supported_calls,
         max_batch_calls: narrow(request.max_batch_calls, "max batch calls")?,
         max_batch_tokens: narrow(request.max_batch_tokens, "max batch tokens")?,
-        request_slots: narrow(request.max_request_pool_size, "request slots")?,
+        request_slots: narrow(slots, "request slots")?,
         prefix_cache: None,
         latent_page_units: 0,
         latent_pages: 0,
@@ -208,72 +146,6 @@ fn base_info(report: Report, request: &CapacityRequest) -> Result<MainProcessInf
         diffusion_lm_step_rows: 0,
         image_unconditional_token_ids: None,
     })
-}
-
-/// A token worker's layout before the cache pool is fitted.
-pub(crate) struct TokenLayout {
-    info: MainProcessInfo,
-    arena: ArenaCapacity,
-    fixed: BTreeMap<Device, u64>,
-    feature_bytes: u64,
-    latent: Option<LatentPlan>,
-    planes: Option<PlaneLayout>,
-    warmup_units: u32,
-}
-
-/// The three numbers a dense cache's geometry is stated by, as
-/// [`CacheDescription::dense`](crate::memory::CacheDescription::dense)
-/// takes them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CacheGeometry {
-    pub layers: u32,
-    pub kv_heads: u32,
-    pub head_dim: u32,
-}
-
-/// Everything the engine states about the rank it starts.
-///
-/// Every figure here is one the engine owns or has already agreed; nothing is
-/// inferred, because a wrong admission bound or memory fraction is a silently
-/// smaller cache rather than an error.
-pub struct RankFacts<'a> {
-    pub device: Device,
-    /// The rank's host endpoint, as it advertises itself.
-    pub host: &'a str,
-    pub epoch: u64,
-    /// The deployment's rank count, which no peer list states.
-    pub world_size: usize,
-    /// Requests the scheduler may have in flight, which the daemon places.
-    pub queue_depth: usize,
-    /// Tokens per logical cache page, when the deployment fixed it.
-    pub block_size: Option<u32>,
-    /// Most calls and most tokens one batch may carry: the largest bucket of
-    /// the rank's catalog, which is its admission bound because a larger batch
-    /// is refused before a kernel runs.
-    pub max_batch_calls: usize,
-    pub max_batch_tokens: usize,
-    /// Request slots the rank keeps.
-    pub max_request_pool_size: usize,
-    /// The model's longest request.
-    pub max_model_len: usize,
-    /// The tokens the deployment fixed the cache at (`kv_cache_config.max_tokens`), or `None` to
-    /// size it from storage.
-    pub max_total_tokens: Option<usize>,
-    /// The planes a standby adopts: the cache of the epoch it stands by for, which it maps and did
-    /// not size. `None` for a rank that lays its planes out itself.
-    pub segments: Option<ipc::CacheTable>,
-    /// Fraction of the device's storage the epoch may hold.
-    pub mem_fraction_static: f64,
-    /// The paged key/value geometry this rank keeps, or `None` for a rank that keeps no paged
-    /// cache at all - a media rank, whose resident state is the request's own whole footprint
-    /// rather than pages a scheduler addresses. `plan_rank` plans the first and `plan_media` the
-    /// second, and each refuses the other's value by name: a plan fitted for one is not a plan the
-    /// other can honour, and the two would differ silently if a zero stood for absence.
-    pub cache: Option<CacheGeometry>,
-    pub kv_dtype: ipc::PrefixCacheDtype,
-    /// Device bytes the rank's expert transport takes at its first capture, after the cache is
-    /// fitted, or zero for a rank that exchanges no experts.
-    pub transport_bytes: u64,
 }
 
 /// One region of device storage a rank's plan books (design 4.1 and 4.5).
@@ -418,379 +290,180 @@ impl MemoryConfig {
     }
 }
 
-/// Resolve a token rank's capacity plan: the buffers, products and latents
-/// sized, the block size agreed over `group`, the cache pool fitted to the
-/// device grant.
-///
-/// `cache` is the model's geometry: called with a candidate block size, it
-/// answers that size's plan, or `None` when the model cannot serve it. It is
-/// called at least once per candidate size until the ranks agree, so a caller
-/// memoizes it.
-///
-/// `width` is the widest block table a request of the model's length needs,
-/// which the caller derives from its own `max_model_len`; `total_bytes` is the
-/// storage the rank may plan into - what the device has left at plan time, not
-/// the size it has, because the weights are mapped outside every pool - zero on
-/// CPU, which states no grant; `reserved_bytes` is the storage the rank maps
-/// beside the cache and out of its own grant, so that no unit is fitted into it:
-/// the graph range and the scratch region, which `Pools::new` reserves as
-/// separate pools; `granularity` is the device's allocation granularity, in
-/// whose granules a device pool splits its planes.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the request, the measured report, the model's facts and the agreement"
-)]
-pub fn token_plan(
-    request: &CapacityRequest,
-    report: Report,
-    facts: &TokenFacts,
-    queue_depth: usize,
-    width: u32,
-    total_bytes: u64,
-    reserved_bytes: u64,
-    granularity: Option<u64>,
-    group: &HostGroup,
-    mut cache: impl FnMut(usize) -> Result<Option<Arc<CachePlan>>>,
-) -> Result<MemoryConfig> {
-    let mut layout = TokenLayout::new(report, request, queue_depth, facts)?;
-    // A rank that fits no cache keeps no paged request, so nothing reads a page size and none is
-    // agreed: `plan_media` is that rank (`src/model_runner.rs` reaches this for the media class).
-    // The halving loop must not see it - it asks every resident layer's attention for a size the
-    // rank never addresses, halves to zero and reports "no block size is read" about a block size
-    // nothing reads. One probe answers which rank this is; a preset needs none.
-    if request.block_size.is_none() && cache(MAX_BLOCK_SIZE)?.is_none() {
-        return Ok(layout.finish(None));
-    }
-    let block_size =
-        resolve_block_size(request.block_size, |size| Ok(cache(size)?.is_some()), group)?;
-    let plan = cache(block_size)?.ok_or_else(|| {
-        Error::Invariant(format!(
-            "the model served block size {block_size} while the ranks agreed it"
-        ))
-    })?;
-
-    // The cache's fixed storage beside its units: block tables, import scratch
-    // and the request-slot banks. Every unit index column is charged with each
-    // unit instead, because the unit count is not known until the pool is
-    // fitted - so no column may be charged here as well.
-    let fixed = crate::memory::prefix_cache::PrefixCache::fixed_bytes(
-        &plan,
-        0,
-        layout.info().request_slots,
-        width,
-        layout.info().max_unresolved_calls as usize,
-        0,
-    )?;
-    layout.reserve(request.device, fixed);
-
-    // Every unit index column holds one index per unit and is charged with each
-    // unit: the import workers' columns and the streams the computations over
-    // the cache bind. Charging them here and not in the fixed figure is what
-    // keeps a unit's bytes the same whether the pool is fitted before or after
-    // its size is known.
-    let workers = crate::memory::prefix_cache::PrefixCache::import_workers(
-        layout.info().max_unresolved_calls as usize,
-    ) as u64;
-    let unit_overhead = (workers + COMPUTATION_COLUMNS as u64) * UnitColumn::bytes(1);
-    layout.fit_cache(
-        &plan,
-        unit_overhead,
-        request,
-        total_bytes,
-        reserved_bytes,
-        granularity,
-        group,
-    )?;
-    Ok(layout.finish(Some(plan)))
-}
-
-/// Resolve a token rank's plan from what the engine states, agreeing the block
-/// size and the slot count over `group` and fitting the cache pool to the
-/// device's grant.
-///
-/// The cache geometry is the model's own three numbers: the plan's page size
-/// may come out lower than the requested one, because every layer's attention
-/// must be able to read it, and the answer states the width a batch's block
-/// table needs at that page size.
-pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<MemoryConfig> {
-    let cache = facts.cache.ok_or_else(|| {
-        Error::Invalid(
-            "this rank states no paged key/value geometry, so no cache can be planned for it: \
-             `plan_media` is the planner for a rank that keeps none"
-                .into(),
-        )
-    })?;
-    plan(facts, report, group, Some(cache))
-}
-
-/// What a rank that keeps **no paged key/value cache** plans: the same regions, no cache fitted.
-///
-/// A media rank's resident state is each request's own whole footprint - a layout's conditioning
-/// rows, its latent trajectory and its clip - not pages a scheduler addresses, so there is nothing
-/// to fit and nothing to divide into units. What it does book is what every rank books: the graph
-/// storage the captures reserve, the scratch region the shadow and the state group's snapshot share,
-/// and the fixed storage the rank's owners allocate. The plan's `cache` and the worker info's
-/// `prefix_cache` are then absent, which is what a scheduler reads to know this rank takes no
-/// paged request.
-pub fn plan_media(
-    facts: &RankFacts<'_>,
-    report: Report,
-    group: &HostGroup,
-) -> Result<MemoryConfig> {
-    if facts.cache.is_some() {
-        return Err(Error::Invalid(
-            "this rank states a paged key/value geometry and the media class keeps no paged \
-             cache: `plan_rank` is the planner for a rank that keeps one, and a geometry here \
-             would fit a cache nothing addresses"
-                .into(),
-        ));
-    }
-    plan(facts, report, group, None)
-}
-
 /// What a rank's process maps after its plan and beside its pools: the modules a precopy loads and
 /// the workspaces of the native libraries they call. A rank measured 2.26 GB of it serving
 /// Qwen3-30B-A3B over twelve graphs; a cache sized from storage leaves it this room, because the
 /// ledger refuses a rank whose process does not fit beside its cache.
 const PROCESS_ALLOWANCE: u64 = 4 << 30;
 
-/// The one planner both entry points share: what differs between them is only the cache fitted.
-fn plan(
-    facts: &RankFacts<'_>,
+/// Resolve a rank's memory from what it states and the deployment's configuration: the arenas
+/// sized and, for a rank that keeps a paged cache, the pool fitted to the device's grant and its
+/// unit count agreed over `group`.
+///
+/// What the rank may plan into is measured here. A cache sized from storage takes what the
+/// deployment's quota (`mem_fraction_static` of the device) leaves: the quota less what is mapped by
+/// now, which is the weights and the process, and less what the process has yet to map. Nothing
+/// else bounds it, so the fraction binds here or nowhere.
+pub fn plan_rank(
+    config: &EngineConfig,
+    request: &MemoryRequest,
     report: Report,
     group: &HostGroup,
-    cache: Option<CacheGeometry>,
 ) -> Result<MemoryConfig> {
-    // What the rank may plan into is what is LEFT: the weights are already on the device, so the
-    // pools fit into the free bytes and not into the device's total.
-    let total_bytes = match facts.device {
-        Device::Cuda(index) => crate::capacity::device::available_bytes(index)?,
-        Device::Cpu => 0,
+    let (device_total, grant, granularity) = match request.device {
+        Device::Cuda(index) => {
+            let storage = index.memory_info()?;
+            let held = storage.total.saturating_sub(storage.free);
+            let quota = crate::capacity::quota(storage.total, config.mem_fraction_static);
+            let grant = quota
+                .saturating_sub(held.saturating_add(PROCESS_ALLOWANCE))
+                .min(storage.free);
+            // A device's cache is split into segments of whole allocation granules, which is
+            // what lets it give storage back while every address stays valid (7.6).
+            let granularity = platform::HandleType::Descriptor.granularity(index)? as u64;
+            (storage.total, Some(grant), Some(granularity))
+        }
+        Device::Cpu => (0, None, None),
     };
-    // The graph storage is the one figure that is a share of the DEVICE and not of what is left: a
-    // rank reserves two pools of address space at open, one per generation a preparation may hold,
-    // and books their mappings against the device's total.
+    fit(
+        config,
+        request,
+        report,
+        device_total,
+        grant,
+        granularity,
+        group,
+    )
+}
+
+/// The planner over measured figures: `device_total` is the device's size, from which the graph
+/// range and the scratch region are reserved; `grant` is the storage a cache sized from storage
+/// may take, `None` where the device states none; `granularity` is the device's allocation
+/// granularity, in whose granules a device pool splits its planes, `None` on CPU.
+fn fit(
+    config: &EngineConfig,
+    request: &MemoryRequest,
+    report: Report,
+    device_total: u64,
+    grant: Option<u64>,
+    granularity: Option<u64>,
+    group: &HostGroup,
+) -> Result<MemoryConfig> {
+    let slots = config.max_running_requests.get();
+    let device_exports = report.device_exports;
+    let mut info = base_info(report, request, slots)?;
+    info.max_unresolved_calls = narrow(
+        call_window(request.queue_depth, request.max_batch_calls)?,
+        "unresolved calls",
+    )?;
+    // The product store's relay arenas and the export pool live on the primary device, beside
+    // every binding.
+    let arena = ArenaCapacity::for_tokens(&TokenBounds {
+        depth: request.queue_depth,
+        calls: request.max_batch_calls,
+        requests: slots,
+        device_exports,
+    })?;
+    info.host_task_capacity = narrow(arena.host_task_inflight, "host task capacity")?;
+    info.transfer_tickets = narrow(arena.transfer_tickets, "transfer tickets")?;
     // The graph range and the scratch region are one reservation (4.1, 4.5): the graph pools the
     // rank captures into and the shadow a replaced operator runs in, both reserved at spawn and
     // both out of the grant the cache is fitted into. `reserved_bytes` answers them as one figure
     // so a caller cannot pass half of it - a plan fitted into the bytes the shadow will take leaves
     // the rank to map past the device at its first shadow, after the model load and after every
-    // module installed.
-    // The two halves are also kept apart, because a reader of the finished plan
-    // has to be able to compare each region with the pool that maps it: the graph
-    // range is the graph pool's whole reservation, and the scratch region is the
-    // shadow plus, for a model with a state group, the snapshot.
-    let (reserved_bytes, graph_bytes) = match facts.device {
-        Device::Cuda(index) => {
-            let total = crate::capacity::device::total_bytes(index)?;
-            let graph = crate::capacity::graph_storage_bytes(total as i64, true, false);
-            (crate::capacity::reserved_bytes(total, true), graph)
-        }
-        Device::Cpu => (0, 0),
+    // module installed. The two halves are also kept apart, because a reader of the finished plan
+    // has to be able to compare each region with the pool that maps it: the graph range is the
+    // graph pool's whole reservation, and the scratch region is the shadow plus, for a model with a
+    // state group, the snapshot.
+    let reserved = crate::capacity::reserved_bytes(device_total, true);
+    let graph = crate::capacity::graph_storage_bytes(device_total as i64, true, false);
+    let mut memory = MemoryConfig {
+        info,
+        arena,
+        fixed_device_bytes: BTreeMap::from([(request.device, arena.deferred_device_bytes())]),
+        cache: None,
+        planes: None,
+        width: 0,
+        reserved: graph,
+        shadow: reserved - graph,
     };
-    // A cache sized from storage takes what the deployment's quota leaves: the device's share less
-    // what is mapped by now, which is the weights and the process, and less what the process has yet
-    // to map. Nothing else bounds it, so the fraction binds here or nowhere.
-    let grant = match (facts.device, &cache) {
-        (Device::Cuda(index), Some(_)) => {
-            let storage = index.memory_info()?;
-            let held = storage.total.saturating_sub(storage.free);
-            let quota = crate::capacity::device::quota(storage.total, facts.mem_fraction_static);
-            let grant = quota
-                .saturating_sub(held.saturating_add(PROCESS_ALLOWANCE))
-                .min(storage.free);
-            Some(usize::try_from(grant).unwrap_or(usize::MAX))
-        }
-        _ => None,
+    // A rank that keeps no paged cache fits nothing: its plan states an absent cache rather than a
+    // cache of zero units, which is what a scheduler reads to know this rank takes no paged
+    // request.
+    let Some(cache) = &request.cache else {
+        return Ok(memory);
     };
-    let request = CapacityRequest {
-        device: facts.device,
-        block_size: facts.block_size.map(|size| size as usize),
-        pool_storage_bytes: grant,
-        pool_storage_full_bytes: None,
-        mem_fraction_static: facts.mem_fraction_static,
-        max_batch_calls: facts.max_batch_calls,
-        max_batch_tokens: facts.max_batch_tokens,
-        // A rank without a paged cache plans its request's whole footprint, whose bound is the
-        // longest request.
-        max_total_tokens: match &cache {
-            Some(_) => facts.max_total_tokens,
-            None => Some(facts.max_model_len),
-        },
-        max_request_pool_size: facts.max_request_pool_size,
-        encoder_cache_entries: 0,
-        segments: facts.segments.clone(),
-        stage_cache: false,
-        predecessor: None,
-        epoch: facts.epoch,
-        world_size: facts.world_size,
-        decode_graph_batch_sizes: Vec::new(),
-        prefill_graph_token_sizes: Vec::new(),
-        flow_graph_shapes: Vec::new(),
-    };
-    let token_facts = TokenFacts {
-        image_processor: false,
-        vision_feature_bytes: 0,
-        latent_feature_bytes: 0,
-        latent: None,
-    };
-    // A device's cache is split into segments of whole allocation granules, which is what lets it
-    // give storage back while every address stays valid (7.6).
-    let granularity = match facts.device {
-        Device::Cuda(index) => Some(platform::HandleType::Descriptor.granularity(index)? as u64),
-        Device::Cpu => None,
-    };
-    let plan = token_plan(
-        &request,
-        report,
-        &token_facts,
-        facts.queue_depth,
+    // The scratch region holds the shadow beside the snapshot, so the shadow is what the
+    // reservation has left once the snapshot is taken out of it.
+    memory.shadow -= cache.state_snapshot_bytes();
+    let block_size = cache
+        .groups
+        .first()
+        .map(|group| group.block_size)
+        .filter(|size| *size > 0)
+        .ok_or_else(|| Error::Invalid("the model's cache states no page size".into()))?;
+    memory.width = config.model.max_model_len.div_ceil(block_size);
+    // The cache's fixed storage beside its units: block tables of the width a request of the
+    // model's length needs, import scratch and the request-slot banks. Every unit index column is
+    // charged with each unit instead, because the unit count is not known until the pool is fitted
+    // - so no column may be charged here as well.
+    let fixed = PrefixCache::fixed_bytes(
+        cache,
         0,
-        total_bytes,
-        // The transport is created at the first capture, when a program exists, so the cache is
-        // fitted around what it will take.
-        reserved_bytes + facts.transport_bytes,
+        memory.info.request_slots,
+        memory.width,
+        memory.info.max_unresolved_calls as usize,
+        0,
+    )?;
+    *memory.fixed_device_bytes.entry(request.device).or_default() += fixed;
+    // The transport is created at the first capture, when a program exists, so the cache is
+    // fitted around what it will take.
+    memory.fit_cache(
+        cache,
+        config,
+        request,
+        reserved + request.transport_bytes,
+        grant,
         granularity,
         group,
-        |size| match &cache {
-            Some(geometry) => Ok(Some(Arc::new(crate::memory::CachePlan::new(
-                crate::memory::CacheDescription::dense(
-                    size as u32,
-                    geometry.layers,
-                    geometry.kv_heads,
-                    geometry.head_dim,
-                    facts.kv_dtype,
-                ),
-            )?))),
-            // No cache: the closure answers that the rank fits none, which is what makes the plan
-            // state an absent cache rather than a cache of zero units.
-            None => Ok(None),
-        },
     )?;
-    let mut answer = plan;
-    answer.reserved = graph_bytes;
-    // The scratch region holds the shadow beside the snapshot the plan's own
-    // `state_snapshot_bytes` answers, so the shadow is what the reservation has
-    // left once the snapshot is taken out of it.
-    answer.shadow = reserved_bytes - graph_bytes - answer.state_snapshot_bytes();
-    let block = answer.block_size().max(1);
-    answer.width = u32::try_from(facts.max_model_len.div_ceil(block as usize))
-        .map_err(|_| Error::Invalid("the model's length states too many pages".into()))?;
-    Ok(answer)
+    memory.cache = Some(Arc::clone(cache));
+    Ok(memory)
 }
 
-impl TokenLayout {
-    /// Size the buffer pool, product store and latent pool.
-    pub(crate) fn new(
-        report: Report,
-        request: &CapacityRequest,
-        queue_depth: usize,
-        facts: &TokenFacts,
-    ) -> Result<Self> {
-        let device_exports = report.device_exports;
-        let mut info = base_info(report, request)?;
-        let latent_bytes = facts
-            .latent
-            .map(|plan| plan.bytes())
-            .transpose()?
-            .unwrap_or(0);
-        let feature_bytes = facts.latent_feature_bytes.max(facts.vision_feature_bytes);
-        info.encoder_cache_entries = if facts.image_processor {
-            narrow(request.encoder_cache_entries, "encoder cache entries")?
-        } else {
-            0
-        };
-        info.encoder_entry_bytes = if info.encoder_cache_entries == 0 {
-            0
-        } else {
-            feature_bytes
-        };
-        info.buffer_pool_bytes = (u64::from(info.encoder_cache_entries) + 1) * feature_bytes;
-        info.max_unresolved_calls = narrow(
-            call_window(queue_depth, request.max_batch_calls)?,
-            "unresolved calls",
-        )?;
-        if let Some(plan) = &facts.latent {
-            info.latent_page_units = narrow(plan.page_units, "latent page units")?;
-            info.latent_pages = narrow(plan.num_pages, "latent pages")?;
-        }
-
-        // Products, their buffer pool and the latent pool live on the primary
-        // device, beside every binding; a generation tower holds only the
-        // module weights placed on it.
-        let arena = ArenaCapacity::for_tokens(&TokenBounds {
-            depth: queue_depth,
-            calls: request.max_batch_calls,
-            requests: request.max_request_pool_size,
-            transfer_bytes_per_read: feature_bytes,
-            device_exports,
-        })?;
-        let mut fixed = BTreeMap::new();
-        fixed.insert(
-            request.device,
-            info.buffer_pool_bytes + arena.deferred_device_bytes() + latent_bytes,
-        );
-        info.host_task_capacity = narrow(arena.host_task_inflight, "host task capacity")?;
-        info.transfer_tickets = narrow(arena.transfer_tickets, "transfer tickets")?;
-        Ok(Self {
-            info,
-            arena,
-            fixed,
-            feature_bytes,
-            latent: facts.latent,
-            planes: None,
-            warmup_units: 0,
-        })
-    }
-
-    pub(crate) fn info(&self) -> &MainProcessInfo {
-        &self.info
-    }
-
-    /// Record fixed storage an owner of the rank allocates on `device`.
-    pub(crate) fn reserve(&mut self, device: Device, bytes: u64) {
-        *self.fixed.entry(device).or_default() += bytes;
-    }
-
+impl MemoryConfig {
     /// Fit the cache pool beside the fixed storage and agree its unit count.
     ///
-    /// The pool takes the grant left after the storage the rank reserved
-    /// (`reserved_bytes`: the graph range and the shadow region, and this plan's
-    /// own state snapshot, charged here because the scratch holds one beside the
-    /// other) and the fixed storage, in whole units. Every rank reserves that storage, whatever its
-    /// graph policy: graph
-    /// capture grows into it, and so do the eager allocations warmup makes
-    /// (operator workspaces such as an expert kernel's), which a rank that
-    /// serves every call eagerly makes too. Graph padding
-    /// takes no unit: padding rows read the sentinel unit and write no K/V.
-    /// A configured token capacity sizes the pool instead. `total_bytes` is
-    /// what the device has left to plan into, zero on CPU. `reserved_bytes` is
-    /// the storage the rank reserved - two pools of the device's 10% when a
-    /// preparation may hold a second generation, plus the shadow region - which
-    /// is what the pools reserve at open, so no unit is fitted into storage they
-    /// will take; the state snapshot joins it below, when the plan holds one - and
-    /// `unit_overhead` is device
-    /// storage other owners keep per unit (unit index columns), charged with
-    /// each unit; `total_bytes` is the storage the rank may plan into, the
-    /// grant when the request states none. `granularity` is the device's
-    /// allocation granularity, in
-    /// whose granules a device pool splits its planes into segments; `None`
-    /// on CPU.
+    /// The pool takes the grant left after the storage the rank reserved (`reserved_bytes`: the
+    /// graph range, the shadow region and the expert transport, and this plan's own state
+    /// snapshot, charged here because the scratch holds one beside the other) and the fixed
+    /// storage, in whole units. Every rank reserves that storage, whatever its graph policy: graph
+    /// capture grows into it, and so do the eager allocations warmup makes (operator workspaces
+    /// such as an expert kernel's), which a rank that serves every call eagerly makes too. Graph
+    /// padding takes no unit: padding rows read the sentinel unit and write no K/V. A configured
+    /// token capacity (`kv_cache_config.max_tokens`) sizes the pool instead.
+    ///
+    /// Every unit index column holds one index per unit and is charged with each unit: the import
+    /// workers' columns and the streams the computations over the cache bind. Charging them here
+    /// and not in the fixed figure is what keeps a unit's bytes the same whether the pool is fitted
+    /// before or after its size is known.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the plan, the request, the device's figures and the agreement"
+        reason = "the cache, the configuration, the request, the device's figures and the agreement"
     )]
-    pub(crate) fn fit_cache(
+    fn fit_cache(
         &mut self,
         cache: &CachePlan,
-        unit_overhead: u64,
-        request: &CapacityRequest,
-        total_bytes: u64,
+        config: &EngineConfig,
+        request: &MemoryRequest,
         reserved_bytes: u64,
+        grant: Option<u64>,
         granularity: Option<u64>,
         group: &HostGroup,
-    ) -> Result<CacheCapacity> {
-        let unit_bytes = cache.unit_bytes + unit_overhead;
+    ) -> Result<()> {
+        let workers = PrefixCache::import_workers(self.info.max_unresolved_calls as usize) as u64;
+        let unit_bytes =
+            cache.unit_bytes + (workers + COMPUTATION_COLUMNS as u64) * UnitColumn::bytes(1);
         let pages: Vec<(u32, u32)> = cache
             .groups
             .iter()
@@ -802,38 +475,19 @@ impl TokenLayout {
         let share = reserved_bytes.saturating_add(cache.state_snapshot_bytes());
         let reserved_units = share.div_ceil(unit_bytes)
             + self
-                .fixed
+                .fixed_device_bytes
                 .get(&request.device)
                 .copied()
                 .unwrap_or(0)
                 .div_ceil(unit_bytes);
 
-        let cuda = request.device.is_cuda();
-        let tokens = request.max_total_tokens.map(|tokens| tokens as u64);
-        // The grant the pool is fitted into: the host storage a deployment states for it, or -
-        // when it states none - the storage the device has left, which is `total_bytes` here
-        // because the weights are mapped by handle outside every pool and so never count against
-        // a budget that would otherwise size the cache into bytes the weights already hold. A
-        // device that states neither cannot be sized automatically, below.
-        let available = request
-            .pool_storage_bytes
-            .map(|bytes| bytes as u64)
-            .or(Some(total_bytes).filter(|bytes| *bytes > 0));
-        if cuda && tokens.is_none() && available.is_none() {
+        let tokens = config.kv_cache.max_tokens.map(|tokens| tokens.get());
+        if request.device.is_cuda() && tokens.is_none() && grant.is_none() {
             return Err(Error::Invalid(
                 "automatic CUDA KV sizing requires a host storage grant".into(),
             ));
         }
-        // A successor epoch maps its predecessor's segments beside units of
-        // its own, which alone its grant pays for; a standby rank group's
-        // worker adopts the segments of the worker it stands by for.
-        let inherited: u64 = request.predecessor.as_ref().map_or(0, |predecessor| {
-            predecessor
-                .segments
-                .iter()
-                .map(|segment| u64::from(segment.units))
-                .sum()
-        });
+        // A standby rank group's worker adopts the segments of the worker it stands by for.
         let adopted = request.segments.as_ref().map(|table| {
             table
                 .segments
@@ -841,19 +495,14 @@ impl TokenLayout {
                 .map(|segment| u64::from(segment.units))
                 .sum::<u64>()
         });
+        let slots = u64::from(self.info.request_slots);
         let mut capacity = CacheCapacity::derive(&CacheDemand {
             pages: &pages,
-            token_units: tokens
-                .map(|tokens| cache.token_units(tokens, request.max_request_pool_size as u64)),
+            token_units: tokens.map(|tokens| cache.token_units(tokens, slots)),
             units: adopted,
             unit_bytes,
-            available_bytes: available,
+            available_bytes: grant,
             reserved_units,
-            // A successor's own units are what a configured capacity
-            // leaves past the inherited ones, as far as its grant holds them
-            // now, or what the grant holds.
-            successor: request.predecessor.is_some() || request.stage_cache,
-            inherited_units: inherited,
         })?;
         // Every member allocates the same logical unit ids, bounded by the
         // smallest grant.
@@ -866,21 +515,9 @@ impl TokenLayout {
         if let Some(granularity) = granularity {
             let own = u32::try_from(capacity.num_units)
                 .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
-            planes = match (&request.segments, &request.predecessor) {
-                (Some(table), _) => Some(PlaneLayout::adopted(table)),
-                (None, predecessor) if predecessor.is_some() || request.stage_cache => {
-                    Some(self.successor_layout(
-                        cache,
-                        request,
-                        predecessor.as_ref(),
-                        own,
-                        unit_bytes,
-                        reserved_units,
-                        granularity,
-                        group,
-                    )?)
-                }
-                (None, _) => {
+            planes = match &request.segments {
+                Some(table) => Some(PlaneLayout::adopted(table)),
+                None => {
                     // A cache fitted to a capacity rounds up to whole segments: it holds the tokens
                     // it was asked for, where the storage has room. One fitted to the storage
                     // rounds down into it.
@@ -889,7 +526,7 @@ impl TokenLayout {
                         cache.plane_bytes,
                         granularity,
                     );
-                    let fits = available.is_none_or(|bytes| {
+                    let fits = grant.is_none_or(|bytes| {
                         (u64::from(above) + reserved_units).saturating_mul(unit_bytes) <= bytes
                     });
                     let rounded = if fits {
@@ -913,10 +550,6 @@ impl TokenLayout {
             if let Some(layout) = &planes {
                 capacity.num_units = u64::from(layout.units());
             }
-        } else if inherited > 0 {
-            return Err(Error::Invalid(
-                "a host pool inherits no predecessor's segments".into(),
-            ));
         }
         let num_units = u32::try_from(capacity.num_units)
             .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
@@ -935,104 +568,16 @@ impl TokenLayout {
         // since one read may carry a whole pool's export. The budget is
         // accounting: cache exports name the pages where they lie and
         // occupy no storage of their own.
-        self.arena.transfer_bytes = (capacity.num_units * cache.unit_bytes)
-            .max(self.feature_bytes)
-            .max(1)
-            * self.arena.transfer_tickets as u64;
-        Ok(capacity)
-    }
-
-    /// A successor's writable head holds the sentinel, its worker's
-    /// warmup scratch and request progress. Optional predecessor segments
-    /// follow read-only, then the target's tail at its full grant. Host
-    /// staging reserves the tail without creating it; other successors
-    /// create as many segments as their present grant holds.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one successor pool's plan, its grants and its group"
-    )]
-    fn successor_layout(
-        &self,
-        cache: &CachePlan,
-        request: &CapacityRequest,
-        predecessor: Option<&ipc::PredecessorCache>,
-        now: u32,
-        unit_bytes: u64,
-        reserved_units: u64,
-        granularity: u64,
-        group: &HostGroup,
-    ) -> Result<PlaneLayout> {
-        let inherited: u32 = predecessor
-            .into_iter()
-            .flat_map(|predecessor| &predecessor.segments)
-            .map(|segment| segment.units)
-            .sum();
-        let full = match (request.max_total_tokens, request.pool_storage_full_bytes) {
-            (Some(tokens), _) => {
-                cache.token_units(tokens as u64, request.max_request_pool_size as u64)
-            }
-            (None, Some(bytes)) => (bytes as u64 / unit_bytes).saturating_sub(reserved_units),
-            (None, None) => u64::from(now) + u64::from(inherited),
-        };
-        let agreed = group.all_reduce_min(&[full as i64])?;
-        let full = u32::try_from(agreed[0].max(0))
-            .map_err(|_| Error::Invalid("KV pool exceeds the unit index range".into()))?;
-        let head = PlaneLayout::whole_granules(
-            1 + self.warmup_units + cache.progress_units(),
-            cache.plane_bytes,
-            granularity,
-        );
-        let tail = crate::memory::prefix_cache::planes::segmented_units(
-            full.saturating_sub(head + inherited),
-            cache.plane_bytes,
-            granularity,
-        );
-        let mut layout = PlaneLayout::successor(
-            request.epoch,
-            head,
-            tail,
-            cache.plane_bytes,
-            granularity,
-            predecessor,
-        )?;
-        let created = match layout.tail_segment_units().filter(|_| !request.stage_cache) {
-            Some(units) => (now.saturating_sub(head) / units) as usize,
-            None => 0,
-        };
-        layout.defer_tail(created);
-        tracing::info!(
-            head,
-            inherited,
-            tail,
-            created_tail_segments = created,
-            "laid out a successor epoch's KV cache"
-        );
-        if now < head {
-            return Err(Error::Resource(
-                "the device holds less than a successor epoch's head cache segment",
-            ));
-        }
-        Ok(layout)
-    }
-
-    pub(crate) fn finish(self, cache: Option<Arc<CachePlan>>) -> MemoryConfig {
-        MemoryConfig {
-            info: self.info,
-            arena: self.arena,
-            fixed_device_bytes: self.fixed,
-            latent: self.latent,
-            cache,
-            planes: self.planes,
-            warmup_units: self.warmup_units,
-            width: 0,
-            reserved: 0,
-            shadow: 0,
-        }
+        self.arena.transfer_bytes =
+            (capacity.num_units * cache.unit_bytes).max(1) * self.arena.transfer_tickets as u64;
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::num::{NonZeroU64, NonZeroUsize};
+
     use super::*;
     use crate::config::Device;
     use crate::memory::{CacheDescription, CachePlan, Checkpoint};
@@ -1058,151 +603,165 @@ mod tests {
         }
     }
 
-    fn request() -> CapacityRequest {
-        CapacityRequest {
-            device: Device::Cuda(DeviceId(0)),
-            block_size: Some(64),
-            pool_storage_bytes: None,
-            pool_storage_full_bytes: None,
+    /// The deployment's configuration with the four values the planner reads: eight request
+    /// slots, a 4096-token context, half the device, and `max_tokens` as the configured token
+    /// capacity of the cache (`None` sizes it from the grant).
+    fn config(max_tokens: Option<u64>) -> EngineConfig {
+        EngineConfig {
+            executable: "test".to_owned(),
+            model: proto::config::ModelConfig {
+                model: "model".to_owned(),
+                max_model_len: 4096,
+                dtype: proto::request::ModelDtype::BFloat16,
+                quantization: Default::default(),
+                generation_limits: Default::default(),
+                bos: 0,
+                eos: Vec::new(),
+                end_of_image: 0,
+                canvas_sampling: None,
+                prefill_outputs: true,
+            },
+            parallel: proto::config::ParallelConfig {
+                tensor_parallel_size: NonZeroUsize::MIN,
+                data_parallel_size: NonZeroUsize::MIN,
+                engine_host: "localhost".to_owned(),
+                worker_groups: Vec::new(),
+            },
+            deployment: String::new(),
+            max_running_requests: NonZeroUsize::new(8).expect("eight slots"),
+            max_num_batched_tokens: None,
+            attention_backend: String::new(),
+            prefill_attention_backend: None,
+            decode_attention_backend: None,
+            moe_runner_backend: None,
+            device: Default::default(),
+            scheduler: Default::default(),
+            media: Default::default(),
             mem_fraction_static: 0.5,
-            max_batch_calls: 16,
-            max_batch_tokens: 2048,
-            max_total_tokens: Some(4096),
-            max_request_pool_size: 8,
-            encoder_cache_entries: 0,
-            segments: None,
-            stage_cache: false,
-            predecessor: None,
-            epoch: 0,
-            world_size: 1,
-            decode_graph_batch_sizes: Vec::new(),
-            prefill_graph_token_sizes: Vec::new(),
-            flow_graph_shapes: Vec::new(),
+            load: Default::default(),
+            kv_cache: proto::config::KvCacheConfig {
+                max_tokens: max_tokens.map(|tokens| NonZeroU64::new(tokens).expect("a capacity")),
+                ..Default::default()
+            },
+            moe: Default::default(),
+            cuda_graph: Default::default(),
+            worker: Default::default(),
+            speculative: Default::default(),
+            video: Default::default(),
+            profiling: Default::default(),
         }
     }
 
-    fn facts() -> TokenFacts {
-        TokenFacts {
-            image_processor: false,
-            vision_feature_bytes: 0,
-            latent_feature_bytes: 0,
-            latent: None,
-        }
-    }
-
-    fn dense(facts: CacheGeometry) -> impl FnMut(usize) -> Result<Option<Arc<CachePlan>>> {
-        move |size| {
-            Ok(Some(Arc::new(CachePlan::new(CacheDescription::dense(
-                size as u32,
-                facts.layers,
-                facts.kv_heads,
-                facts.head_dim,
+    /// A dense cache of 64-token pages over `layers` layers of four 64-wide heads.
+    fn dense(layers: u32) -> Arc<CachePlan> {
+        Arc::new(
+            CachePlan::new(CacheDescription::dense(
+                64,
+                layers,
+                4,
+                64,
                 ipc::PrefixCacheDtype::BFloat16,
-            ))?)))
-        }
+            ))
+            .expect("a dense cache is a plan"),
+        )
     }
 
-    fn geometry() -> CacheGeometry {
-        CacheGeometry {
-            layers: 2,
-            kv_heads: 4,
-            head_dim: 64,
-        }
-    }
-
-    /// The rank facts a planner is given, with the cache geometry as the class states it.
-    fn rank_facts(cache: Option<CacheGeometry>) -> RankFacts<'static> {
-        RankFacts {
+    /// What a rank states, with the cache its model reads.
+    fn request(cache: Option<Arc<CachePlan>>) -> MemoryRequest {
+        MemoryRequest {
             device: Device::Cuda(DeviceId(0)),
-            host: "rank",
             epoch: 0,
-            world_size: 1,
-            queue_depth: 2,
-            block_size: Some(64),
+            queue_depth: 1,
             max_batch_calls: 16,
             max_batch_tokens: 2048,
-            max_request_pool_size: 8,
-            max_model_len: 4096,
-            max_total_tokens: Some(4096),
-            segments: None,
-            mem_fraction_static: 0.5,
             cache,
-            kv_dtype: ipc::PrefixCacheDtype::BFloat16,
+            segments: None,
             transport_bytes: 0,
         }
     }
 
-    /// The two planners are told apart by whether the rank keeps a paged cache, and each refuses
-    /// the other's value by name. A zero geometry standing for absence would be fitted rather than
-    /// refused, which is the failure this makes unrepresentable: the plan would then book a cache
-    /// the class never addresses.
-    ///
-    /// Both refusals are answered before the device is read, so neither needs one.
-    #[test]
-    fn a_planner_refuses_the_other_class_explicitly() {
-        let group = HostGroup::single(0);
-        let absent = rank_facts(None);
-        let Err(refused) = plan_rank(&absent, report(), &group) else {
-            panic!("a rank that states no geometry must not be planned a cache");
-        };
-        let said = format!("{refused}");
-        assert!(
-            said.contains("plan_media"),
-            "a rank with no geometry must be pointed at `plan_media`, and the refusal said {said:?}"
-        );
-
-        let present = rank_facts(Some(geometry()));
-        let Err(refused) = plan_media(&present, report(), &group) else {
-            panic!("a rank that keeps a paged cache must not be planned by the media planner");
-        };
-        let said = format!("{refused}");
-        assert!(
-            said.contains("plan_rank"),
-            "a rank with a geometry must be pointed at `plan_rank`, and the refusal said {said:?}"
-        );
+    /// The grant of `TOTAL` at the configuration's fraction.
+    fn grant() -> u64 {
+        crate::capacity::quota(TOTAL, config(None).mem_fraction_static)
     }
 
-    /// A rank that fits no cache plans no page size, and is not asked for one: the media class
-    /// keeps no paged request, so the halving loop would report that no block size is read - a
-    /// statement about a number nothing in the plan reads.
+    /// A rank that keeps no paged cache plans none: it states an absent cache rather than a cache
+    /// of no units, and no block table width, and still reserves the graph range and the shadow.
     #[test]
-    fn a_rank_that_fits_no_cache_is_asked_for_no_block_size() {
-        let mut request = request();
-        request.block_size = None;
-        let planned = token_plan(
-            &request,
+    fn a_rank_that_keeps_no_paged_cache_fits_none() {
+        let planned = fit(
+            &config(Some(4096)),
+            &request(None),
             report(),
-            &facts(),
-            1,
-            /* width */ 64,
             TOTAL,
-            crate::capacity::graph_storage_budget_bytes(TOTAL as i64),
+            Some(grant()),
             None,
             &HostGroup::single(0),
-            |_| Ok(None),
-        )
-        .unwrap_or_else(|error| panic!("a rank that fits no cache must plan without one: {error}"));
-        assert!(
-            planned.cache.is_none(),
-            "a cacheless rank states no cache rather than a cache of no units"
-        );
-    }
-
-    fn plan(geometry: CacheGeometry) -> MemoryConfig {
-        token_plan(
-            &request(),
-            report(),
-            &facts(),
-            1,
-            /* width */ 64,
-            TOTAL,
-            crate::capacity::graph_storage_budget_bytes(TOTAL as i64),
-            None,
-            &HostGroup::single(0),
-            dense(geometry),
         )
         .unwrap_or_else(|error| {
-            panic!("token_plan refused a dense plan of an 8 GiB device: {error}")
+            panic!("a rank that keeps no cache must plan without one: {error}")
+        });
+        assert!(
+            planned.cache.is_none() && planned.info.prefix_cache.is_none(),
+            "a cacheless rank states no cache rather than a cache of no units"
+        );
+        assert_eq!(planned.width, 0, "a cacheless rank addresses no pages");
+        assert_eq!(
+            planned.reserved + planned.shadow,
+            crate::capacity::reserved_bytes(TOTAL, true),
+            "a cacheless rank still reserves the graph range and the shadow region"
+        );
+    }
+
+    /// The block table width is the pages of the model's context at the cache's page size, and
+    /// the fixed storage the plan books holds tables of that width.
+    #[test]
+    fn the_block_tables_are_charged_at_the_models_width() {
+        let planned = plan(2);
+        assert_eq!(
+            planned.width,
+            4096 / 64,
+            "the width of a 4096-token context"
+        );
+        let tables = PrefixCache::fixed_bytes(
+            &dense(2),
+            0,
+            planned.info.request_slots,
+            planned.width,
+            planned.info.max_unresolved_calls as usize,
+            0,
+        )
+        .expect("the cache's fixed storage");
+        let narrow = PrefixCache::fixed_bytes(
+            &dense(2),
+            0,
+            planned.info.request_slots,
+            0,
+            planned.info.max_unresolved_calls as usize,
+            0,
+        )
+        .expect("the cache's fixed storage without tables");
+        assert!(tables > narrow, "block tables of width 64 take storage");
+        assert_eq!(
+            planned.fixed_device_bytes[&Device::Cuda(DeviceId(0))],
+            planned.arena.deferred_device_bytes() + tables,
+            "the plan books the tables at the width it states"
+        );
+    }
+
+    /// A plan of a dense cache over `layers` layers, sized by the configured token capacity.
+    fn plan(layers: u32) -> MemoryConfig {
+        fit(
+            &config(Some(4096)),
+            &request(Some(dense(layers))),
+            report(),
+            TOTAL,
+            Some(grant()),
+            None,
+            &HostGroup::single(0),
+        )
+        .unwrap_or_else(|error| {
+            panic!("the planner refused a dense plan of an 8 GiB device: {error}")
         })
     }
 
@@ -1213,7 +772,7 @@ mod tests {
     /// the caller charges them the same way - which is the point of the rule.
     #[test]
     fn the_pool_and_its_fixed_storage_stay_inside_the_grant() {
-        let plan = plan(geometry());
+        let plan = plan(2);
         let cache = plan.cache.as_ref().expect("the model's cache is planned");
         let units = u64::from(
             plan.info
@@ -1224,10 +783,10 @@ mod tests {
         );
         let fixed = plan.fixed_device_bytes[&Device::Cuda(DeviceId(0))];
         let booked = fixed + units * cache.unit_bytes;
-        let grant = crate::capacity::quota(TOTAL, request().mem_fraction_static);
         assert!(
-            booked <= grant,
-            "the pool books {booked} bytes of a {grant}-byte grant"
+            booked <= grant(),
+            "the pool books {booked} bytes of a {}-byte grant",
+            grant()
         );
     }
 
@@ -1247,20 +806,22 @@ mod tests {
         let device = Device::Cuda(DeviceId(0));
         let reserved = crate::capacity::reserved_bytes(E2E_TOTAL, /* prepares */ true);
         let graph = crate::capacity::graph_storage_bytes(E2E_TOTAL as i64, true, false);
-        let plan = fitted(E2E_TOTAL, reserved).expect("the deployment's device fits a dense plan");
-        let mut booked_plan = plan;
-        booked_plan.reserved = graph;
-        let snapshot = booked_plan.state_snapshot_bytes();
-        booked_plan.shadow = reserved - graph - snapshot;
+        let plan = fitted(E2E_TOTAL, E2E_TOTAL).expect("the deployment's device fits a dense plan");
+        let snapshot = plan.state_snapshot_bytes();
+        assert_eq!(plan.reserved, graph, "the plan reserves the graph range");
+        assert_eq!(
+            plan.shadow,
+            reserved - graph - snapshot,
+            "the plan's shadow is the scratch region less the snapshot"
+        );
         // What a rank maps before the plan runs, stated here because the plan is
         // fitted into the bytes the weights leave.
         let weights = 1 << 30;
-        let booked = booked_plan.booked(device, weights);
+        let booked = plan.booked(device, weights);
 
-        let cache = booked_plan.cache.as_ref().expect("the cache is planned");
+        let cache = plan.cache.as_ref().expect("the cache is planned");
         let units = u64::from(
-            booked_plan
-                .info
+            plan.info
                 .prefix_cache
                 .as_ref()
                 .expect("the rank advertises its cache")
@@ -1272,7 +833,7 @@ mod tests {
             (Region::Graph, graph),
             (Region::Shadow, reserved - graph - snapshot),
             (Region::Snapshot, snapshot),
-            (Region::Fixed, booked_plan.fixed_device_bytes[&device]),
+            (Region::Fixed, plan.fixed_device_bytes[&device]),
         ];
         assert_eq!(
             booked.regions().collect::<Vec<_>>(),
@@ -1308,23 +869,17 @@ mod tests {
     /// (`graph_reservation=39579549696`), so the device is five times that.
     const E2E_TOTAL: u64 = 5 * 39_579_549_696;
 
-    /// One plan of `total_bytes` with `reserved` bytes set aside before any unit.
-    fn fitted(total_bytes: u64, reserved: u64) -> Result<MemoryConfig> {
-        token_plan(
-            &CapacityRequest {
-                max_total_tokens: None,
-                mem_fraction_static: 0.7,
-                ..request()
-            },
+    /// One plan of a device of `device_total` bytes whose grant is `grant` bytes, sized from the
+    /// grant.
+    fn fitted(device_total: u64, grant: u64) -> Result<MemoryConfig> {
+        fit(
+            &config(None),
+            &request(Some(dense(2))),
             report(),
-            &facts(),
-            1,
-            /* width */ 64,
-            total_bytes,
-            reserved,
+            device_total,
+            Some(grant),
             None,
             &HostGroup::single(0),
-            dense(geometry()),
         )
     }
 
@@ -1332,15 +887,14 @@ mod tests {
     /// grant with the shadow region added admits the cache.
     ///
     /// The figures are the caller's deployment, not a made-up device: `E2E_TOTAL` is the device the
-    /// runs plan into, the graph range is the two pools the run logged, and `mem_fraction_static`
-    /// is 0.7 as the run's own rank layout stated.
+    /// runs plan into and the graph range is the two pools the run logged.
     ///
     /// What this case models is a plan whose grant binds - no token capacity, so the pool is sized
     /// by the storage left rather than by the model's context. The served deployment is not that
-    /// shape: `plan_rank` states the model's context length, so its cache is demand-bound at about
-    /// 4 GB and the device keeps tens of gigabytes of slack. This case exists for the shape where
-    /// the grant does bind, and for the invariant that a plan reserves what the pools map before it
-    /// fits a unit - not as a reproduction of the deployment's plan.
+    /// shape: it states the model's context length, so its cache is demand-bound at about 4 GB and
+    /// the device keeps tens of gigabytes of slack. This case exists for the shape where the grant
+    /// does bind, and for the invariant that a plan reserves what the pools map before it fits a
+    /// unit - not as a reproduction of the deployment's plan.
     #[test]
     fn a_grant_that_holds_the_graph_range_without_the_scratch_is_refused() {
         let graph = crate::capacity::graph_storage_bytes(E2E_TOTAL as i64, true, false);
@@ -1360,7 +914,7 @@ mod tests {
             "the storage a rank reserves on this device: the graph range and the shadow region"
         );
         // A generous grant, only to learn the plan's own fixed storage and unit size.
-        let planned = fitted(E2E_TOTAL, reserved)
+        let planned = fitted(E2E_TOTAL, E2E_TOTAL)
             .expect("the deployment's device holds its own graph range and scratch");
         let fixed = planned.fixed_device_bytes[&Device::Cuda(DeviceId(0))];
         let unit = planned
@@ -1374,12 +928,12 @@ mod tests {
         let with = fixed + reserved + 2 * least;
         let without = with - shadow;
         assert!(
-            fitted(without, reserved).is_err(),
+            fitted(E2E_TOTAL, without).is_err(),
             "a grant of {without} bytes holds the graph range and the fixed storage, and not the \
              {shadow}-byte shadow region: it must be refused, not fitted"
         );
         let admitted =
-            fitted(with, reserved).expect("the same grant with the shadow region holds the cache");
+            fitted(E2E_TOTAL, with).expect("the same grant with the shadow region holds the cache");
         let units = admitted
             .info
             .prefix_cache
@@ -1403,13 +957,7 @@ mod tests {
     /// the whole startup.
     #[test]
     fn a_state_snapshot_is_reserved_out_of_the_grant_before_the_units() {
-        // No token capacity and no stated pool storage: the fit is bounded by the grant alone, so
-        // a byte reserved for the scratch is a byte no unit is fitted into.
-        let request = CapacityRequest {
-            max_total_tokens: None,
-            ..request()
-        };
-        let reserved = crate::capacity::graph_storage_budget_bytes(TOTAL as i64);
+        let reserved = crate::capacity::reserved_bytes(TOTAL, true);
         let mut state = CacheDescription::dense(64, 2, 4, 64, ipc::PrefixCacheDtype::BFloat16);
         state.groups[0].state = true;
         state.checkpoints = vec![Checkpoint {
@@ -1417,28 +965,25 @@ mod tests {
             planes: 8,
             fields: Vec::new(),
         }];
-        let snapshot = CachePlan::new(state.clone())
-            .expect("a state group with its checkpoints is a plan")
-            .state_snapshot_bytes();
-        let unit_bytes = CachePlan::new(state.clone())
-            .expect("a state group with its checkpoints is a plan")
-            .unit_bytes;
+        let state =
+            Arc::new(CachePlan::new(state).expect("a state group with its checkpoints is a plan"));
+        let snapshot = state.state_snapshot_bytes();
+        let unit_bytes = state.unit_bytes;
         assert!(
             snapshot > unit_bytes,
             "the case is only falsifying when the snapshot costs more than one unit: {snapshot} \
              bytes of snapshot against a {unit_bytes}-byte unit"
         );
-        let planned = token_plan(
-            &request,
+        // No token capacity: the fit is bounded by the grant alone, so a byte reserved for the
+        // scratch is a byte no unit is fitted into.
+        let planned = fit(
+            &config(None),
+            &request(Some(state)),
             report(),
-            &facts(),
-            1,
-            /* width */ 64,
             TOTAL,
-            reserved,
+            Some(TOTAL),
             None,
             &HostGroup::single(0),
-            |_size| Ok(Some(Arc::new(CachePlan::new(state.clone())?))),
         )
         .expect("an 8 GiB device plans a state-group cache");
         let cache = planned
@@ -1467,29 +1012,20 @@ mod tests {
     /// Every unit a layer's planes are made of is charged: a deeper model holds
     /// fewer units in the same grant and a larger fixed figure.
     ///
-    /// The grant decides the pool here, so the request states no token demand:
-    /// a plan that states one is fitted to the demand and both models fit the
-    /// same units of it, which is a different question.
+    /// The grant decides the pool here, so the configuration states no token
+    /// demand: a plan that states one is fitted to the demand and both models
+    /// fit the same units of it, which is a different question.
     #[test]
     fn a_deeper_model_holds_fewer_units_of_a_larger_unit() {
         let plan = |layers: u32| {
-            token_plan(
-                &CapacityRequest {
-                    max_total_tokens: None,
-                    ..request()
-                },
+            fit(
+                &config(None),
+                &request(Some(dense(layers))),
                 report(),
-                &facts(),
-                1,
-                /* width */ 64,
                 TOTAL,
-                crate::capacity::graph_storage_budget_bytes(TOTAL as i64),
+                Some(grant()),
                 None,
                 &HostGroup::single(0),
-                dense(CacheGeometry {
-                    layers,
-                    ..geometry()
-                }),
             )
             .expect("the device has room for this cache")
         };
@@ -1512,22 +1048,16 @@ mod tests {
     #[test]
     fn more_import_workers_hold_fewer_units_of_the_same_grant() {
         let plan = |calls: usize| {
-            let mut request = CapacityRequest {
-                max_total_tokens: None,
-                ..request()
-            };
+            let mut request = request(Some(dense(2)));
             request.max_batch_calls = calls;
-            token_plan(
+            fit(
+                &config(None),
                 &request,
                 report(),
-                &facts(),
-                1,
-                64,
                 TOTAL,
-                crate::capacity::graph_storage_budget_bytes(TOTAL as i64),
+                Some(grant()),
                 None,
                 &HostGroup::single(0),
-                dense(geometry()),
             )
             .expect("the device has room for this cache")
         };

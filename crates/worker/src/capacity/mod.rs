@@ -7,18 +7,14 @@
 //! the GPU's ledger. A rank's grant is the quota less everything the ledger
 //! books beside the rank's own process, and less what the process holds now.
 //!
-//! The plan that sizes the weights, the cache, the products and the graph
-//! pools from those figures is [`plan`]; it takes the rank's launch
-//! parameters as [`CapacityRequest`], which the engine builds from the launch
-//! description it already holds.
+//! The plan that sizes the cache, the products and the graph pools from those
+//! figures is [`plan_rank`]; it reads the deployment's configuration and what
+//! the rank states about itself as a [`MemoryRequest`].
 
 pub mod device;
 mod plan;
 
-pub use plan::{
-    CacheGeometry, CapacityRequest, MemoryConfig, RankFacts, Report, TokenFacts, plan_media,
-    plan_rank, token_plan,
-};
+pub use plan::{MemoryConfig, MemoryRequest, Report, plan_rank};
 
 use ipc::Call;
 
@@ -51,24 +47,12 @@ pub(crate) struct CacheDemand<'a> {
     pub available_bytes: Option<u64>,
     /// Units' worth of the grant that other storage occupies.
     pub reserved_units: u64,
-    /// Whether the rank's epoch succeeds another on its devices: its pool
-    /// is laid out beside the predecessor's segments, and the part of a
-    /// configured capacity its grant does not hold yet is created as the
-    /// predecessor's storage frees (its deferred tail segments).
-    pub successor: bool,
-    /// The units of a configured token capacity that a successor epoch maps
-    /// from its predecessor's segments rather than allocates: the grant pays
-    /// for the rest alone, since the ledger books those once, for the
-    /// predecessor.
-    pub inherited_units: u64,
 }
 
 impl CacheCapacity {
     /// Explicit token capacity counts whole pages of every K/V group and a
-    /// state checkpoint per request slot. A successor epoch's own units are
-    /// those of the capacity past the ones it inherits, of which it creates
-    /// now what its grant holds beside the reserved ones; the grant of any
-    /// other epoch must hold the whole capacity.
+    /// state checkpoint per request slot, and the grant must hold the whole
+    /// capacity.
     /// Automatic sizing gives the pool the complete units the grant holds
     /// beside the reserved ones; without a grant the pool takes
     /// [`DEFAULT_NUM_UNITS`]. Every mode leaves room for the sentinel unit
@@ -81,8 +65,6 @@ impl CacheCapacity {
             unit_bytes,
             available_bytes,
             reserved_units,
-            successor,
-            inherited_units,
         } = *demand;
         if pages.is_empty()
             || pages
@@ -113,21 +95,6 @@ impl CacheCapacity {
                 return Err(Error::Invalid(
                     "configured KV token capacity must be positive".into(),
                 ));
-            }
-            if successor {
-                // The units past those it inherits are its own; the grant
-                // pays for what it creates of them now, and the rest of its
-                // tail follows as the predecessor's storage frees.
-                let own = units.saturating_sub(inherited_units);
-                let num_units = match available_bytes {
-                    Some(available) => {
-                        own.min(granted(available, unit_bytes, reserved_units, minimum)?)
-                    }
-                    None => own,
-                };
-                return Ok(Self {
-                    num_units: minimum.max(num_units),
-                });
             }
             minimum.max(units)
         } else if let Some(available) = available_bytes {
@@ -234,8 +201,6 @@ pub(crate) struct TokenBounds {
     pub calls: usize,
     /// Request slots.
     pub requests: usize,
-    /// Bytes one read of a product carries, at least one.
-    pub transfer_bytes_per_read: u64,
     /// Whether the rank exports device products over CUDA VMM.
     pub device_exports: bool,
 }
@@ -246,14 +211,13 @@ impl ArenaCapacity {
     /// oldest of them still reads on the device as its predicate, and one
     /// transfer ticket and one host-pool task per queued call (`depth`
     /// batches of up to `calls` calls are in flight at once, and a call holds
-    /// at most one of each), each ticket budgeted for the largest single
-    /// read.
+    /// at most one of each). The plan budgets each ticket for the largest
+    /// single read once the cache is fitted.
     pub(crate) fn for_tokens(bounds: &TokenBounds) -> Result<Self> {
         let TokenBounds {
             depth,
             calls,
             requests,
-            transfer_bytes_per_read,
             device_exports,
         } = *bounds;
         let window = call_window(depth, calls)?;
@@ -264,7 +228,9 @@ impl ArenaCapacity {
         Ok(Self {
             relay_depth,
             device_product_bytes,
-            transfer_bytes: transfer_bytes_per_read.max(1) * transfer_tickets as u64,
+            // One byte per ticket until the cache is fitted, whose largest export a read may
+            // carry.
+            transfer_bytes: transfer_tickets as u64,
             transfer_tickets,
             export_pool_bytes: if device_exports {
                 export_pool_bytes(device_product_bytes)
@@ -370,8 +336,6 @@ mod tests {
             unit_bytes: 1024,
             available_bytes: Some(1024 * 100),
             reserved_units: 0,
-            successor: false,
-            inherited_units: 0,
         }
     }
 
@@ -418,8 +382,6 @@ mod tests {
                 unit_bytes: 1024,
                 available_bytes: None,
                 reserved_units: 0,
-                successor: false,
-                inherited_units: 0,
             })
             .is_err()
         );
@@ -431,8 +393,6 @@ mod tests {
                 unit_bytes: 1024,
                 available_bytes: None,
                 reserved_units: 0,
-                successor: false,
-                inherited_units: 0,
             })
             .is_err()
         );
