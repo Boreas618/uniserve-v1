@@ -580,7 +580,7 @@ mod tests {
 
     use super::*;
     use crate::config::Device;
-    use crate::memory::{CacheDescription, CachePlan, Checkpoint};
+    use crate::memory::{CachePlan, Checkpoint};
     use crate::parallel::host::HostGroup;
     use platform::DeviceId;
 
@@ -655,14 +655,9 @@ mod tests {
     /// A dense cache of 64-token pages over `layers` layers of four 64-wide heads.
     fn dense(layers: u32) -> Arc<CachePlan> {
         Arc::new(
-            CachePlan::new(CacheDescription::dense(
-                64,
-                layers,
-                4,
-                64,
-                ipc::PrefixCacheDtype::BFloat16,
-            ))
-            .expect("a dense cache is a plan"),
+            (CachePlan::dense(64, layers, 4, 64, ipc::PrefixCacheDtype::BFloat16))
+                .validated()
+                .expect("a dense cache is a plan"),
         )
     }
 
@@ -958,15 +953,18 @@ mod tests {
     #[test]
     fn a_state_snapshot_is_reserved_out_of_the_grant_before_the_units() {
         let reserved = crate::capacity::reserved_bytes(TOTAL, true);
-        let mut state = CacheDescription::dense(64, 2, 4, 64, ipc::PrefixCacheDtype::BFloat16);
+        let mut state = CachePlan::dense(64, 2, 4, 64, ipc::PrefixCacheDtype::BFloat16);
         state.groups[0].state = true;
         state.checkpoints = vec![Checkpoint {
             first_plane: 0,
             planes: 8,
             fields: Vec::new(),
         }];
-        let state =
-            Arc::new(CachePlan::new(state).expect("a state group with its checkpoints is a plan"));
+        let state = Arc::new(
+            state
+                .validated()
+                .expect("a state group with its checkpoints is a plan"),
+        );
         let snapshot = state.state_snapshot_bytes();
         let unit_bytes = state.unit_bytes;
         assert!(
