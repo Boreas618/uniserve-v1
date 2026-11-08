@@ -35,6 +35,7 @@ use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
 use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
+use crate::memory::encoders::EncoderHostPool;
 use crate::plan::{Bucket, Buckets, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, Region, encode_i32};
@@ -161,6 +162,15 @@ pub struct EncoderRunner<M: Encoder + Send + Sync> {
     diag: crate::runners::diag::Diag,
     /// The tensor group this runner's rank reduces over, absent when one rank holds the encoder.
     group: Option<Arc<nn::Group>>,
+    /// The host encoder pool of this runner's device, which a request's encoded states are read
+    /// from instead of computed when the engine found them stored, and written to when it reserved
+    /// pages for them. `None` on a device that maps none.
+    host_pool: Option<Arc<EncoderHostPool>>,
+    /// Whether this device writes the rows it computed to the pool: every rank of a tensor group
+    /// holds the whole states, so one of them writes them for all.
+    writes_outputs: bool,
+    /// The host outputs of the batch staged last, by request.
+    host_outputs: Vec<(ipc::RequestKey, ipc::HostOutput)>,
 }
 
 /// A prompt's vision blocks, as its conditioning states them.
@@ -236,7 +246,99 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             vision: None,
             diag: crate::runners::diag::Diag::from_env(),
             group: None,
+            host_pool: None,
+            writes_outputs: false,
+            host_outputs: Vec::new(),
         })
+    }
+
+    /// This runner with its device's host encoder pool: a request's encoded states are read from it
+    /// when the engine found them stored, and, when `writes` is set, written to it when the engine
+    /// reserved pages for them.
+    #[must_use]
+    pub fn with_host_outputs(mut self, pool: Arc<EncoderHostPool>, writes: bool) -> Self {
+        self.host_pool = Some(pool);
+        self.writes_outputs = writes;
+        self
+    }
+
+    /// The host output of `request` in the batch staged last, when it has one.
+    fn host_output(&self, request: ipc::RequestKey) -> Option<&ipc::HostOutput> {
+        self.host_outputs
+            .iter()
+            .find(|(key, _)| *key == request)
+            .map(|(_, output)| output)
+    }
+
+    /// Whether every request of the batch staged last reads its states from the host encoder pool,
+    /// so the encode computes nothing.
+    fn imports_all(&self) -> bool {
+        self.host_pool.is_some()
+            && !self.pending.is_empty()
+            && self.pending.iter().all(|(request, _, _)| {
+                self.host_output(*request)
+                    .is_some_and(|output| output.import)
+            })
+    }
+
+    /// Copies between each pending request's rows of the hidden column and its stored output's pages:
+    /// from the pages when `import`, to them otherwise. The copies have completed when this returns,
+    /// before the call's result lets the engine release or commit the pages.
+    fn copy_host_outputs(&self, import: bool) -> Result<()> {
+        let Some(pool) = self.host_pool.as_ref() else {
+            return Ok(());
+        };
+        let element = u64::from(self.shape.dtype.bytes().ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", self.shape.dtype))
+        })?);
+        let width = u64::from(self.shape.hidden.max(1));
+        let row_bytes = width * element;
+        let mut copied = false;
+        for (request, first, rows) in &self.pending {
+            let Some(output) = self.host_output(*request) else {
+                continue;
+            };
+            if output.import != import || (!import && !self.writes_outputs) {
+                continue;
+            }
+            if output.pool != pool.pool() || output.row_bytes != row_bytes {
+                return Err(Error::Invalid(format!(
+                    "a host output of pool {} with rows of {} bytes reached a runner of pool {} \
+                     whose rows are {row_bytes} bytes",
+                    output.pool,
+                    output.row_bytes,
+                    pool.pool()
+                )));
+            }
+            let stored = u64::from(output.rows[1] - output.rows[0]);
+            let count = u64::from(*rows).min(stored);
+            let base = self.columns.hidden.device.ptr.address() + u64::from(*first) * row_bytes;
+            for copy in crate::memory::encoders::page_copies(
+                output.rows[0],
+                0..count,
+                row_bytes,
+                pool.page_bytes(),
+            ) {
+                // An export leaves a page the pool holds already as it is.
+                let Some(slot) = output.slots.get(copy.page).copied().flatten() else {
+                    continue;
+                };
+                let page = pool.view(slot)?.address() + copy.offset;
+                let row = base + copy.output;
+                let (destination, source) = if import { (row, page) } else { (page, row) };
+                // SAFETY: the pages stay pinned or reserved until this call's result, and the
+                // copies complete before this returns; the hidden column is this runner's, which
+                // no other launch writes while it serves this batch.
+                unsafe {
+                    platform::memcpy_async(destination, source, copy.bytes as usize, &self.stream)
+                }?;
+                copied = true;
+            }
+        }
+        if copied {
+            self.stream.synchronize()?;
+        }
+        Ok(())
     }
 
     /// This runner over the tensor `group`: every forward it runs carries the group.
@@ -784,6 +886,7 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
             ))
         })?;
         self.stage(&batch, bucket)?;
+        self.host_outputs.clone_from(&batch.host_outputs);
         self.calls.clone_from(&batch.calls);
         Ok(Jobs::new([Job::Replay {
             runner: self.id,
@@ -868,9 +971,26 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
             Job::Replay {
                 bucket, generation, ..
             } => {
+                // Every request's states are stored: they are read from the host encoder pool into
+                // the rows the encode would have written, and nothing is computed.
+                if self.imports_all() {
+                    let launched = std::time::Instant::now();
+                    self.vision = None;
+                    self.copy_host_outputs(true)?;
+                    self.publish()?;
+                    return Ok(BatchOutput {
+                        calls: answered(&mut self.calls),
+                        timing: TimingCounters {
+                            copy_us: launched.elapsed().as_micros() as u64,
+                            ..Default::default()
+                        },
+                        forward_stats: None,
+                    });
+                }
                 if let Some(prompt) = self.vision.take() {
                     let launched = std::time::Instant::now();
                     self.encode_vision(*bucket, *generation, prompt)?;
+                    self.copy_host_outputs(false)?;
                     self.publish()?;
                     return Ok(BatchOutput {
                         calls: answered(&mut self.calls),
@@ -908,7 +1028,9 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                 }
                 // The encoded states are a product a denoise step of the same request reads, so
                 // they are named for it after this launch wrote them: the stream's order is what
-                // makes them readable, and the wait is the worker's on the runner's stream.
+                // makes them readable, and the wait is the worker's on the runner's stream. The ones
+                // the engine reserved pages for are written there first.
+                self.copy_host_outputs(false)?;
                 self.publish()?;
                 Ok(BatchOutput {
                     calls: answered(&mut self.calls),
@@ -936,12 +1058,12 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
                 "an encoder runner compares no operator, and the device asked it to shadow \
                  {operator} {key}"
             ))),
-            // A host call is no device work: the media stage performs it, and a device runner
-            // handed one was given a job another runner returned.
             Job::Prepare { call, .. } => Err(Error::Invariant(format!(
                 "a runner that steps no trajectory was asked to prepare call {}",
                 call.0
             ))),
+            // A host call is no device work: the media stage performs it, and a device runner
+            // handed one was given a job another runner returned.
             Job::Host { call, .. } => Err(Error::Invariant(format!(
                 "a runner that serves device work was asked for host call {}",
                 call.0

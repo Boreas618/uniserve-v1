@@ -568,12 +568,12 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
                 "an audio decoder runner compares no operator, and the device asked it to shadow \
                  {operator} {key}"
             ))),
-            // A host call is no device work: the media stage performs it, and a device runner
-            // handed one was given a job another runner returned.
             Job::Prepare { call, .. } => Err(Error::Invariant(format!(
                 "a runner that steps no trajectory was asked to prepare call {}",
                 call.0
             ))),
+            // A host call is no device work: the media stage performs it, and a device runner
+            // handed one was given a job another runner returned.
             Job::Host { call, .. } => Err(Error::Invariant(format!(
                 "a runner that serves device work was asked for host call {}",
                 call.0

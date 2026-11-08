@@ -897,6 +897,16 @@ impl InProcess {
                             .map(|restore| (call.request_key, restore))
                     })
                     .collect(),
+                // An encoder call's output in the host encoder pool: read from it, or written to it.
+                host_outputs: batch
+                    .requests
+                    .iter()
+                    .filter_map(|(call, _)| {
+                        call.host_output
+                            .clone()
+                            .map(|output| (call.request_key, output))
+                    })
+                    .collect(),
                 media: Some(media),
             };
             return Ok((device, calls));
@@ -987,6 +997,7 @@ impl InProcess {
                 .map(|offloads| offloads.pages.clone())
                 .unwrap_or_default(),
             latent_restores: Vec::new(),
+            host_outputs: Vec::new(),
             // A token forward carries no media columns: the media arm above is where a media
             // batch's are passed through, and this arm refuses a media call by name.
             media: None,

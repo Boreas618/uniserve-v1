@@ -33,7 +33,7 @@ const PAGE_ENCODING: u32 = 1;
 /// The bytes of one page. A stored output's last page holds the remainder of
 /// its bytes, so the pool's pages exceed the outputs' bytes by less than a
 /// page each.
-pub(crate) const PAGE_BYTES: u64 = 256 << 10;
+pub const PAGE_BYTES: u64 = 256 << 10;
 
 /// The names of a video request's encoder outputs, whose largest bytes
 /// size the pool of a video encoding rank.
@@ -57,7 +57,7 @@ pub(crate) const OUTPUTS: [&str; 4] = [
 /// images mostly smaller than the largest, whose features take fewer
 /// pages. An output evicted beyond that is a miss, and its encoder computes
 /// it again.
-pub(crate) fn pool_pages(largest: &[u64], request_slots: usize) -> u64 {
+pub fn pool_pages(largest: &[u64], request_slots: usize) -> u64 {
     let request: u64 = largest.iter().map(|bytes| bytes.div_ceil(PAGE_BYTES)).sum();
     2 * request_slots as u64 * request
 }
@@ -73,7 +73,7 @@ fn layout() -> [u8; 32] {
 
 /// The rank's view of its host's encoder pool, mapped and registered for
 /// device copies.
-pub(crate) struct EncoderHostPool {
+pub struct EncoderHostPool {
     pool: u64,
     storage: Arc<Storage>,
     slots: u64,
@@ -87,7 +87,7 @@ impl EncoderHostPool {
     /// (the weights' values and the modules' identities), and `endpoint` is
     /// where an engine on another host reaches the server. Returns the pool
     /// and what the rank reports of it.
-    pub(crate) fn start(
+    pub fn start(
         retained: &Retained,
         device: DeviceId,
         pages: u64,

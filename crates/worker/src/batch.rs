@@ -204,6 +204,11 @@ pub struct Batch {
     /// into its trajectory before the call completes (`ipc::Call::latent_restore`). A preparation
     /// with none opens its trajectory at step zero.
     pub latent_restores: Vec<(ipc::RequestKey, ipc::LatentRestore)>,
+    /// The encoder outputs of the batch's requests in the host encoder pool, by request
+    /// (`ipc::Call::host_output`): an import reads the output's rows from the pages instead of
+    /// computing them, and an export writes the rows it computed to the reserved pages before the
+    /// call completes.
+    pub host_outputs: Vec<(ipc::RequestKey, ipc::HostOutput)>,
     /// A media computation's columns, and `None` for every causal-LM batch.
     ///
     /// One batch is one computation (2.4): a media batch states its inputs here and carries no token
