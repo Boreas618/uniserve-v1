@@ -1701,10 +1701,20 @@ impl ModelRunner {
                     .or(pipeline.transformer_ref())
                     .filter(|denoiser| denoiser.places_encoders())
                     .map_or(0, |denoiser| denoiser.rules().arrangement().condition_rows);
+                let states = match self.engine_config().model.dtype {
+                    proto::request::ModelDtype::Float16 => ipc::DType::F16,
+                    proto::request::ModelDtype::BFloat16 => ipc::DType::BF16,
+                    proto::request::ModelDtype::Float32 => ipc::DType::F32,
+                };
                 let bounds = MediaBounds {
                     prompt_tokens: self.engine_config().model.max_model_len,
                     video_units: clips.units(clips.align_up(frames as u32)),
                     condition_rows,
+                    conditioning_row: (
+                        states,
+                        u32::try_from(self.media_config()?.text_encoder.hidden_size)
+                            .context("the text encoder's width exceeds a u32")?,
+                    ),
                 };
                 let denoiser = if pipeline.transformer_ref().is_some() {
                     "transformer_ref"
@@ -1829,6 +1839,9 @@ struct MediaBounds {
     video_units: u32,
     /// The denoiser rows a request's conditions may take: what its layout reserves for them.
     condition_rows: u32,
+    /// One row of the prompt's encoded states: the element type and the width the text encoder
+    /// writes, which the engine sizes a stored encoding by.
+    conditioning_row: (ipc::DType, u32),
 }
 
 impl MediaBounds {
@@ -1877,9 +1890,25 @@ fn media_outputs(component: &str, bounds: &MediaBounds) -> Vec<ipc::OutputInfo> 
         },
         raster_axes: None,
     };
+    // The prompt's encoded states are rows of the text encoder's width: the engine stores and finds
+    // them in the host encoder pool by their bytes, so the row is stated whole.
+    let (states, width) = bounds.conditioning_row;
+    let conditioning = ipc::OutputInfo {
+        name: product::CONDITIONING.to_owned(),
+        dtype: states,
+        shape_bound: ipc::ShapeBound {
+            dims: vec![
+                ipc::DimBound::Device {
+                    max: bounds.prompt_tokens,
+                },
+                ipc::DimBound::Static(width),
+            ],
+        },
+        raster_axes: None,
+    };
     match component {
         "text_encoder" => vec![
-            output(product::CONDITIONING, Some(bounds.prompt_tokens)),
+            conditioning,
             output(product::VISION_FEATURES, Some(bounds.prompt_tokens)),
         ],
         "transformer" | "transformer_ref" => vec![
