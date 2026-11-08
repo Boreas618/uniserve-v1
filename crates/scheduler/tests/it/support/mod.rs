@@ -217,7 +217,7 @@ pub(crate) fn scheduler(
         worker,
         special_tokens,
         SchedulerConfig {
-            max_batch,
+            max_batch: proto::config::positive(max_batch),
             ..Default::default()
         },
     )
@@ -234,7 +234,7 @@ pub(crate) fn scheduler_with_depth(
         worker,
         special_tokens,
         SchedulerConfig {
-            max_batch,
+            max_batch: proto::config::positive(max_batch),
             ..Default::default()
         },
     )

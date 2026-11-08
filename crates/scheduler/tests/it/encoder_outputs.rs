@@ -65,7 +65,7 @@ impl Encoders {
             Box::new(inner),
             SimEngine::special_tokens(),
             SchedulerConfig {
-                max_batch: 32,
+                max_batch: proto::config::positive(32),
                 ..Default::default()
             },
         )

@@ -140,7 +140,9 @@ impl Scheduler {
         // flight; the merged record carries the narrowest.
         let transfer_capacity = info.transfer_tickets as usize;
 
-        config.max_queued_requests = config.max_queued_requests.map(|bound| bound.max(1));
+        config.max_queued_requests = config
+            .max_queued_requests
+            .map(|bound| bound.max(proto::config::positive(1)));
 
         // The request pool also holds the rows the runtime keeps outside
         // `max_running_requests` (`guidance_prefix_rows`).
@@ -179,7 +181,7 @@ impl Scheduler {
             );
         }
         config.max_num_batched_tokens = config.max_num_batched_tokens.max(1).min(max_batch_tokens);
-        if max_batch_calls > 0 && config.max_batch > max_batch_calls {
+        if max_batch_calls > 0 && config.max_batch > proto::config::positive(max_batch_calls) {
             tracing::warn!(
                 option = "max_batch",
                 stated = config.max_batch,
@@ -188,7 +190,9 @@ impl Scheduler {
             );
         }
         if max_batch_calls > 0 {
-            config.max_batch = config.max_batch.min(max_batch_calls.max(1));
+            config.max_batch = config
+                .max_batch
+                .min(proto::config::positive(max_batch_calls.max(1)));
         }
 
         // A canvas step and a block commit each spend a whole canvas of one
@@ -358,8 +362,8 @@ impl Scheduler {
             ));
         }
         let calls = info.max_batch_calls as usize;
-        if calls > 0 && limits.max_batch > calls {
-            return Err(beyond("max_batch", limits.max_batch, calls));
+        if calls > 0 && limits.max_batch > proto::config::positive(calls) {
+            return Err(beyond("max_batch", limits.max_batch.get(), calls));
         }
         if let Some(canvas) = self.config.canvas
             && canvas.canvas_length as usize > limits.max_num_batched_tokens.max(1)
@@ -375,11 +379,16 @@ impl Scheduler {
         // nothing — the next plan does.
         let graph_tiers = std::mem::take(&mut self.config.graph_tiers);
         self.config = SchedulerConfig {
-            max_batch: limits.max_batch.max(1),
+            policy: Default::default(),
+            max_batch: limits.max_batch.max(proto::config::positive(1)),
             max_num_batched_tokens: limits.max_num_batched_tokens.max(1),
             max_running_requests: limits.max_running_requests.max(1),
-            chunked_prefill_size: limits.chunked_prefill_size.max(1),
-            max_queued_requests: limits.max_queued_requests.map(|bound| bound.max(1)),
+            chunked_prefill_size: limits
+                .chunked_prefill_size
+                .max(std::num::NonZeroUsize::new(1)),
+            max_queued_requests: limits
+                .max_queued_requests
+                .map(|bound| bound.max(proto::config::positive(1))),
             canvas: self.config.canvas,
             // The draft limit is the epoch's; the refill policy is a
             // scheduling choice.

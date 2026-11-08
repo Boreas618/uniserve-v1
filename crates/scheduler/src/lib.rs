@@ -132,14 +132,9 @@ pub(crate) fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, 
 }
 
 mod completion;
-mod config;
 mod stats;
 pub(crate) mod stats_report;
 
-pub use config::{
-    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
-    DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
-};
 pub use epoch::{GroupCache, ParkedCache};
 use ipc::{ForwardMode, TransferMode};
 #[cfg(feature = "testing")]
@@ -148,6 +143,10 @@ pub use policy::{
     Arrival, BatchCapacity, Candidate, Limits, PREFETCH_FLOOR_TOKENS, Parameters, PolicyBytes,
     PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress,
     RoutePolicy, RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
+};
+pub use proto::config::{
+    DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
+    DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
 pub(crate) use run::guidance_prefix_rows;
 /// The phases the scheduler plans with, and the id each is numbered with: a rank's plan, a policy's

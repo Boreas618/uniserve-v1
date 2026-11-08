@@ -265,8 +265,8 @@ fn serve_through(
         worker,
         SimEngine::special_tokens(),
         SchedulerConfig {
-            max_batch: 32,
-            max_queued_requests,
+            max_batch: proto::config::positive(32),
+            max_queued_requests: max_queued_requests.and_then(std::num::NonZeroUsize::new),
             ..Default::default()
         },
     )

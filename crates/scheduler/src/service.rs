@@ -2127,17 +2127,21 @@ fn policy_usage(
 /// Fails on a policy the engine does not know.
 fn scheduler_limits(scheduling: &Scheduling) -> anyhow::Result<SchedulerConfig> {
     Ok(SchedulerConfig {
-        max_batch: scheduling.max_batch.max(1) as usize,
+        policy: Default::default(),
+        max_batch: proto::config::positive(scheduling.max_batch.max(1) as usize),
         max_num_batched_tokens: scheduling
             .max_num_batched_tokens
             .map_or(DEFAULT_MAX_NUM_BATCHED_TOKENS, |tokens| tokens as usize),
         max_running_requests: scheduling.max_running_requests.max(1) as usize,
-        chunked_prefill_size: scheduling
-            .chunked_prefill_size
-            .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
+        chunked_prefill_size: std::num::NonZeroUsize::new(
+            scheduling
+                .chunked_prefill_size
+                .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, |size| size as usize),
+        ),
         max_queued_requests: scheduling
             .max_queued_requests
-            .map(|requests| requests as usize),
+            .map(|requests| requests as usize)
+            .and_then(std::num::NonZeroUsize::new),
         canvas: None,
         draft_tokens: 0,
         // A `Configure` command states the scheduling limits, not the
