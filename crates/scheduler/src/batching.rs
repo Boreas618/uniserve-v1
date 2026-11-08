@@ -268,7 +268,7 @@ impl Scheduler {
         let row_capacity = (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
         let mut rows_left = PassRows {
             canvas: row_capacity,
-            context: row_capacity.min(self.config.max_batch),
+            context: row_capacity.min(self.config.max_batch.get()),
         };
         // What the media calls in flight occupy — their component's media
         // units and the host task pools preparing their units — built when the
@@ -281,7 +281,7 @@ impl Scheduler {
         let mut selected = 0usize;
         for (id, phase, wanted) in work.iter().copied() {
             let id = id;
-            if selected >= self.config.max_batch {
+            if selected >= self.config.max_batch.get() {
                 break;
             }
             // The phase names the call kind this entry runs. A phase this epoch

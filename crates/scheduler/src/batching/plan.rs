@@ -114,7 +114,7 @@ impl Scheduler {
                 // Chunked prefill with the clip rule: the chunk is bounded by
                 // the remaining step budget and the long-prefill threshold.
                 let chunk_cap = (n - cursor)
-                    .min(self.config.chunked_prefill_size)
+                    .min(self.config.prefill_chunk())
                     .min(budget.max(1));
                 let end = (cursor + chunk_cap.max(1)).min(n);
                 // A speculating deployment's prompt chunk writes its draft
@@ -676,7 +676,7 @@ impl Scheduler {
         // Select the next chunk: prompt tokens up to the budget, and each
         // encoded vision block they reach whole. A latent block or a block
         // not yet encoded ends the chunk.
-        let limit = budget.max(1).min(self.config.chunked_prefill_size);
+        let limit = budget.max(1).min(self.config.prefill_chunk());
         let (end, blocks, block_tokens) = {
             let state = self.running.get(&id)?;
             // A context rebuild writes its next image after the prompt
@@ -905,7 +905,7 @@ impl Scheduler {
             return None;
         }
         let cursor = self.num_scheduled_prompt_tokens(id)? as usize;
-        let reach = cursor.saturating_add(self.config.chunked_prefill_size);
+        let reach = cursor.saturating_add(self.config.prefill_chunk());
         let mut block = state.block_cursor();
         let mut encoded = 0;
         while let Some((image, input)) = state.input_block(block) {

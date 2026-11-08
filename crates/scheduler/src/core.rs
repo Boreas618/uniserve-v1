@@ -131,38 +131,6 @@ fn host_cache(
     })
 }
 
-impl SchedulerConfig {
-    /// The mechanism's limits of a scheduler of `engine` whose ranks' captured catalog bounds a
-    /// step to `max_batch` calls and `max_num_batched_tokens` tokens, `graph_tiers` being the
-    /// catalog's sizes in tokens, ascending (§4.4, §4.5).
-    ///
-    /// The rest is the configuration's: its running requests, its waiting queue and its prefill
-    /// chunk, the model's canvas sampling, and the drafter's tokens.
-    pub fn of(
-        engine: &EngineConfig,
-        max_batch: usize,
-        max_num_batched_tokens: usize,
-        graph_tiers: Vec<u32>,
-    ) -> Self {
-        Self {
-            max_batch,
-            max_num_batched_tokens,
-            max_running_requests: engine.max_running_requests.get(),
-            chunked_prefill_size: engine
-                .scheduler
-                .chunked_prefill_size
-                .map_or(crate::DEFAULT_CHUNKED_PREFILL_SIZE, |size| size.get()),
-            max_queued_requests: engine
-                .scheduler
-                .max_queued_requests
-                .map(std::num::NonZeroUsize::get),
-            canvas: engine.model.canvas_sampling.clone(),
-            draft_tokens: engine.speculative.num_draft_tokens as usize,
-            graph_tiers,
-        }
-    }
-}
-
 /// One DP rank's scheduler, running on a thread of its own, and the front
 /// door through which its requests are submitted and controlled.
 ///

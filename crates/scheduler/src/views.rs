@@ -426,7 +426,7 @@ pub(crate) fn room(scheduler: &Scheduler, step: u64) -> Room {
         kv_units: scheduler.storage.free_units() as u64,
         slots: free_slots(scheduler),
         token_budget: u32::try_from(scheduler.config.max_num_batched_tokens).unwrap_or(u32::MAX),
-        call_budget: scheduler.config.max_batch,
+        call_budget: scheduler.config.max_batch.get(),
         // A worker fits a batch into its captured graphs itself; no tier list
         // reaches the scheduler.
         graph_tiers: Vec::new(),

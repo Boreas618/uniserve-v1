@@ -224,7 +224,22 @@ impl MooncakeConfig {
     }
 }
 
-/// Admission and batching (`scheduler_config`).
+/// Default maximum calls selected by one generation scheduling pass.
+pub const DEFAULT_MAX_BATCH: usize = 128;
+/// Default token budget for one generation scheduling pass.
+pub const DEFAULT_MAX_NUM_BATCHED_TOKENS: usize = 8192;
+/// Default maximum number of concurrently running requests.
+pub const DEFAULT_MAX_RUNNING_REQUESTS: usize = 128;
+/// Default token threshold above which a prefill is chunked.
+pub const DEFAULT_CHUNKED_PREFILL_SIZE: usize = DEFAULT_MAX_NUM_BATCHED_TOKENS;
+
+/// Admission and batching (`scheduler_config`), and the limits a scheduler runs with once the
+/// engine resolved them.
+///
+/// The section states the policy, the waiting queue, the prefill chunk and the batch. When the
+/// engine starts a scheduler it resolves the rest from the configuration and the ranks' captured
+/// catalog ([`SchedulerConfig::of`]): those fields are never read from a configuration file and
+/// never written to one.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SchedulerConfig {
@@ -236,9 +251,34 @@ pub struct SchedulerConfig {
     /// Prompt tokens one request prefills in one step, 8192 when unset;
     /// token models only.
     pub chunked_prefill_size: Option<NonZeroUsize>,
-    /// Calls assembled into one forward batch, clamped to what the workers
-    /// accept.
+    /// Calls assembled into one forward batch; once resolved, the largest bucket of the ranks'
+    /// catalog, which is what the workers accept.
     pub max_batch: NonZeroUsize,
+    /// Token budget of one generation scheduling pass, resolved: the configuration's
+    /// `max_num_batched_tokens`, or what the ranks' catalog bounds a step to. Each selected call is
+    /// charged its token work, which for a denoising call covers its latent units and guidance
+    /// branches.
+    #[serde(skip)]
+    pub max_num_batched_tokens: usize,
+    /// Maximum concurrently running requests, token and media together, resolved from the
+    /// configuration's `max_running_requests`.
+    #[serde(skip)]
+    pub max_running_requests: usize,
+    /// Block-diffusion sampling of every canvas the deployment generates, resolved from the model.
+    /// A block-diffusion runtime has no autoregressive decode, so each request it does not read
+    /// out runs under this sampling; without it the runtime serves readouts only.
+    #[serde(skip)]
+    pub canvas: Option<crate::request::CanvasSampling>,
+    /// The most draft tokens a verification carries per request
+    /// (`speculative_config.num_draft_tokens`); zero when the deployment does not speculate.
+    #[serde(skip)]
+    pub draft_tokens: usize,
+    /// The captured graph sizes the ranks state, in tokens, ascending and without duplicates:
+    /// `Room.graph_tiers`, the bound a plan's batch must fit. Empty when they state none, and on a
+    /// reconfigure, which carries no graph catalog: a worker then runs its own captured catalog or
+    /// eagerly, and the tier bound is honest but vacuous.
+    #[serde(skip)]
+    pub graph_tiers: Vec<u32>,
 }
 
 impl Default for SchedulerConfig {
@@ -247,8 +287,51 @@ impl Default for SchedulerConfig {
             policy: SchedulingPolicy::Fcfs,
             max_queued_requests: None,
             chunked_prefill_size: None,
-            max_batch: positive(128),
+            max_batch: positive(DEFAULT_MAX_BATCH),
+            max_num_batched_tokens: DEFAULT_MAX_NUM_BATCHED_TOKENS,
+            max_running_requests: DEFAULT_MAX_RUNNING_REQUESTS,
+            canvas: None,
+            draft_tokens: 0,
+            graph_tiers: Vec::new(),
         }
+    }
+}
+
+impl SchedulerConfig {
+    /// The limits of a scheduler of `engine` whose ranks' captured catalog bounds a step to
+    /// `max_batch` calls and `max_num_batched_tokens` tokens, `graph_tiers` being the catalog's
+    /// sizes in tokens, ascending (§4.4, §4.5).
+    ///
+    /// The rest is the configuration's: its running requests, its waiting queue and its prefill
+    /// chunk, the model's canvas sampling, and the drafter's tokens.
+    pub fn of(
+        engine: &EngineConfig,
+        max_batch: usize,
+        max_num_batched_tokens: usize,
+        graph_tiers: Vec<u32>,
+    ) -> Self {
+        Self {
+            policy: engine.scheduler.policy,
+            max_queued_requests: engine.scheduler.max_queued_requests,
+            chunked_prefill_size: Some(
+                engine
+                    .scheduler
+                    .chunked_prefill_size
+                    .unwrap_or(positive(DEFAULT_CHUNKED_PREFILL_SIZE)),
+            ),
+            max_batch: positive(max_batch),
+            max_num_batched_tokens,
+            max_running_requests: engine.max_running_requests.get(),
+            canvas: engine.model.canvas_sampling.clone(),
+            draft_tokens: engine.speculative.num_draft_tokens as usize,
+            graph_tiers,
+        }
+    }
+
+    /// The prefill chunk, as resolved: the configured one, or the default.
+    pub fn prefill_chunk(&self) -> usize {
+        self.chunked_prefill_size
+            .map_or(DEFAULT_CHUNKED_PREFILL_SIZE, NonZeroUsize::get)
     }
 }
 

@@ -206,7 +206,7 @@ impl Denoiser {
         shares: &[(u64, u64)],
     ) -> Self {
         let config = SchedulerConfig {
-            max_batch: 32,
+            max_batch: proto::config::positive(32),
             ..Default::default()
         };
         Self::start_with(server, pool, identity, gate, shares, config)
@@ -747,7 +747,7 @@ fn a_resumed_video_request_is_admitted_before_one_that_starts() {
     let (server, pool) = server();
     let gate = Arc::new(Gate::default());
     let config = SchedulerConfig {
-        max_batch: 32,
+        max_batch: proto::config::positive(32),
         max_running_requests: 1,
         ..Default::default()
     };

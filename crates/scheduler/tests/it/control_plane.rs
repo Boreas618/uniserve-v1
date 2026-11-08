@@ -692,9 +692,9 @@ fn guidance_prefix_holder_progresses_while_older_images_wait() {
         Box::new(SimWorker::new(sim)),
         special_tokens(),
         SchedulerConfig {
-            max_batch: 32,
+            max_batch: proto::config::positive(32),
             max_num_batched_tokens: 4096,
-            chunked_prefill_size: 64,
+            chunked_prefill_size: std::num::NonZeroUsize::new(64),
             ..Default::default()
         },
     )
@@ -835,7 +835,7 @@ fn scheduler_clamps_max_batch_to_main_process_info() {
     sim.mut_info_for_test().max_batch_calls = 3;
     let sched = support::scheduler(Box::new(SimWorker::new(sim)), special_tokens(), 32).unwrap();
 
-    assert_eq!(sched.config().max_batch, 3);
+    assert_eq!(sched.config().max_batch, proto::config::positive(3));
 }
 
 /// Serves four concurrent requests that open their image branches on the
@@ -1483,8 +1483,8 @@ fn hybrid_groups_share_one_unit_pool() {
         Box::new(worker),
         special_tokens(),
         SchedulerConfig {
-            max_batch: 32,
-            chunked_prefill_size: 64,
+            max_batch: proto::config::positive(32),
+            chunked_prefill_size: std::num::NonZeroUsize::new(64),
             ..Default::default()
         },
     )
@@ -2097,9 +2097,9 @@ fn chunked_prefill_progresses_with_decode() {
         worker,
         special_tokens(),
         SchedulerConfig {
-            max_batch: 32,
+            max_batch: proto::config::positive(32),
             // Caps a prefill chunk at 64 tokens.
-            chunked_prefill_size: 64,
+            chunked_prefill_size: std::num::NonZeroUsize::new(64),
             // Leaves room for other decodes per step.
             max_num_batched_tokens: 256,
             ..Default::default()
@@ -2734,7 +2734,7 @@ fn a_vision_block_beyond_the_step_budget_is_refused() {
         Box::new(SimWorker::new(sim)),
         special_tokens(),
         SchedulerConfig {
-            max_batch: 32,
+            max_batch: proto::config::positive(32),
             max_num_batched_tokens: STEP_BUDGET as usize,
             ..Default::default()
         },
@@ -4042,7 +4042,7 @@ fn scheduler_takes_limits_in_place_within_its_workers_batch() {
     sim.set_text_len(1 << 20);
     let worker = Box::new(SimWorker::new(sim));
     let base = SchedulerConfig {
-        max_batch: 32,
+        max_batch: proto::config::positive(32),
         ..Default::default()
     };
     let sched = support::scheduler_with(worker, special_tokens(), base.clone()).unwrap();

@@ -33,7 +33,7 @@ fn main() -> anyhow::Result<()> {
         scheduler::Submissions::new(worker),
         SimEngine::special_tokens(),
         SchedulerConfig {
-            max_batch: 32,
+            max_batch: proto::config::positive(32),
             ..Default::default()
         },
         ModelDtype::BFloat16,

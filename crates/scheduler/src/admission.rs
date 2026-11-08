@@ -128,7 +128,7 @@ impl Scheduler {
         if self
             .config
             .max_queued_requests
-            .is_some_and(|bound| waiting >= bound)
+            .is_some_and(|bound| waiting >= bound.get())
         {
             let _ = event_tx.send(Event::Rejected {
                 kind: RejectionKind::Overloaded,
@@ -709,7 +709,7 @@ impl Scheduler {
         if self
             .config
             .max_queued_requests
-            .is_some_and(|bound| waiting >= bound)
+            .is_some_and(|bound| waiting >= bound.get())
         {
             reject(
                 RejectionKind::Overloaded,
@@ -1520,7 +1520,7 @@ impl Scheduler {
                 // and `max_num_batched_tokens` and holds at least one token.
                 let chunk_limit = self
                     .config
-                    .chunked_prefill_size
+                    .prefill_chunk()
                     .min(self.config.max_num_batched_tokens)
                     .max(1);
                 let cached_tokens = prefix_hit.cached_tokens.min(n);

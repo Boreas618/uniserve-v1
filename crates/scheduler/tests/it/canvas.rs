@@ -588,7 +588,7 @@ fn a_stop_token_ends_the_request_inside_its_block() {
 fn a_canvas_beyond_the_step_budget_fails_to_start() {
     let config = SchedulerConfig {
         max_num_batched_tokens: 8,
-        chunked_prefill_size: 8,
+        chunked_prefill_size: std::num::NonZeroUsize::new(8),
         ..config()
     };
     let worker = SimWorker::new(worker(40));
@@ -629,7 +629,7 @@ fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
     sim.set_results_on_wait(true);
     let config = SchedulerConfig {
         max_num_batched_tokens: 64,
-        chunked_prefill_size: 64,
+        chunked_prefill_size: std::num::NonZeroUsize::new(64),
         ..config()
     };
     // Both requests are queued before the scheduler starts, so the first
