@@ -1,4 +1,4 @@
-//! What one forward borrows from the executor: the stream, the loaded kernels, the activation
+//! What one forward borrows from the worker: the stream, the loaded kernels, the activation
 //! arena and the communicator.
 //!
 //! A layer receives [`Forward`] and nothing else about the runtime: it cannot create a stream,
@@ -8,16 +8,16 @@
 //!
 //! ## The arena
 //!
-//! The design puts the concrete `Arena` of specs/worker.md 4.5 with the executor — a region of the
-//! graph pool plus one static activation plan per captured bucket — but the executor also owns
-//! `Forward`'s borrow of it, and the crate dependency runs `executor → nn`, so the type itself
-//! lives here and the executor fills it. [`Arena`] is the bump region of one forward: the executor
+//! The design puts the concrete `Arena` of specs/worker.md 4.5 with the worker — a region of the
+//! graph pool plus one static activation plan per captured bucket — but the worker also owns
+//! `Forward`'s borrow of it, and the crate dependency runs `worker → nn`, so the type itself
+//! lives here and the worker fills it. [`Arena`] is the bump region of one forward: the worker
 //! resets it at the start of a forward, every layer takes its activations from it in a fixed order,
 //! and because a captured bucket always executes the same sequence of layers on the same extents,
 //! the sequence of reservations is the same on capture and on every replay. Replaying a graph
 //! therefore touches exactly the addresses the plan recorded, and no step allocates.
 //!
-//! A single-threaded executor is what makes the interior cursor sound: one executor thread issues
+//! A single-threaded worker is what makes the interior cursor sound: one worker thread issues
 //! every job of its device, so two forwards never share an arena at one time.
 
 use std::cell::{Cell, RefCell};
@@ -47,8 +47,8 @@ pub struct Arena {
 impl Arena {
     /// The arena of `bytes` bytes starting at `base`, aligned up to [`ALIGNMENT`].
     ///
-    /// `base` is a region the executor reserved in the graph pool for this captured bucket; the
-    /// executor keeps it alive for as long as any graph that addresses it may replay.
+    /// `base` is a region the worker reserved in the graph pool for this captured bucket; the
+    /// worker keeps it alive for as long as any graph that addresses it may replay.
     ///
     /// The base is aligned **up** to [`ALIGNMENT`] and the same number of bytes is taken off the
     /// region's size, so that every reservation is 256-byte aligned whatever the allocator answered.
@@ -85,7 +85,7 @@ impl Arena {
 
     /// Start the next forward at the region's first address.
     ///
-    /// The executor calls this once at the start of every forward, before the first layer runs. The
+    /// The worker calls this once at the start of every forward, before the first layer runs. The
     /// reservations that follow are the ones the static plan recorded for this bucket.
     pub fn reset(&self) {
         self.cursor.set(0);

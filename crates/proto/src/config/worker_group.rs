@@ -26,7 +26,7 @@ pub const VIDEO_DECODER_BLOCK: &str = "video_decoder";
 /// deployment names no distribution for it.
 pub const VIDEO_CODEC_BLOCK: &str = "video_codec";
 
-/// Stable identity of one explicitly configured physical executor pool.
+/// Stable identity of one explicitly configured physical worker pool.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WorkerGroupId(pub String);
@@ -43,7 +43,7 @@ impl WorkerGroupId {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         {
-            anyhow::bail!("invalid executor id {value:?}");
+            anyhow::bail!("invalid worker id {value:?}");
         }
         Ok(Self(value))
     }
@@ -66,11 +66,11 @@ pub struct WorkerRank {
     /// Host identity: the daemon of the node with this host identity starts
     /// the rank.
     pub host: String,
-    /// Device string, such as `cuda:0` for a GPU rank or `cpu` for a CPU executor.
+    /// Device string, such as `cuda:0` for a GPU rank or `cpu` for a CPU worker.
     pub device: String,
 }
 
-/// The numerical work an executor group owns in a deployment.
+/// The numerical work a worker group owns in a deployment.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkerGroupRole {
@@ -337,17 +337,17 @@ impl WorkerGroupConfig {
         WorkerGroupId::new(self.id.0.clone())?;
         anyhow::ensure!(
             self.queue_depth > 0,
-            "executor {} queue depth must be positive",
+            "worker {} queue depth must be positive",
             self.id
         );
         if let Some(fraction) = self.mem_fraction_static {
             Self::validate_mem_fraction_static(fraction)
-                .map_err(|error| anyhow::anyhow!("executor {}: {error}", self.id))?;
+                .map_err(|error| anyhow::anyhow!("worker {}: {error}", self.id))?;
         }
         Self::validate_members(&self.ranks, &self.blocks)?;
         anyhow::ensure!(
             self.blocks.is_empty() != self.role.serves_requests(),
-            "model executors require blocks; expert executors have no request blocks"
+            "model workers require blocks; expert workers have no request blocks"
         );
         Ok(())
     }
@@ -369,7 +369,7 @@ impl WorkerGroupConfig {
     ///
     /// Ranks must be nonempty, name a host and a device, and not repeat a
     /// `(host, device)` pair unless the device is `cpu`. Components must be
-    /// valid for their executor role; each needs a nonempty name, a nonempty list of distinct
+    /// valid for their worker role; each needs a nonempty name, a nonempty list of distinct
     /// in-range rank indices, a `parallel_config` whose
     /// `BlockConfig::world_size` succeeds, and a positive `units_per_rank`.
     /// A block without a distribution must have a parallel world size
@@ -379,7 +379,7 @@ impl WorkerGroupConfig {
         ranks: &[WorkerRank],
         blocks: &BTreeMap<String, BlockConfig>,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(!ranks.is_empty(), "executor requires rank members");
+        anyhow::ensure!(!ranks.is_empty(), "worker requires rank members");
         let mut devices = BTreeSet::new();
         for rank in ranks {
             anyhow::ensure!(
@@ -390,7 +390,7 @@ impl WorkerGroupConfig {
             // `cpu`, which several ranks on one host may share.
             anyhow::ensure!(
                 devices.insert((&rank.host, &rank.device)) || rank.device == "cpu",
-                "executor repeats a physical device"
+                "worker repeats a physical device"
             );
         }
         for (name, entry) in blocks {
@@ -413,14 +413,11 @@ impl WorkerGroupConfig {
     /// Physical devices may repeat across groups; only `validate_members`
     /// checks device reuse, and it does so within one group.
     pub fn validate_all(workers: &[Self]) -> anyhow::Result<()> {
-        anyhow::ensure!(!workers.is_empty(), "engine requires executors");
+        anyhow::ensure!(!workers.is_empty(), "engine requires workers");
         let mut ids = BTreeSet::new();
         for worker in workers {
             worker.validate()?;
-            anyhow::ensure!(
-                ids.insert(&worker.id),
-                "executor group identity is repeated"
-            );
+            anyhow::ensure!(ids.insert(&worker.id), "worker group identity is repeated");
         }
         // A request prefilled on a prefill group decodes on a decode group,
         // which holds the same text model and nothing else.
@@ -436,7 +433,7 @@ impl WorkerGroupConfig {
             ) {
                 anyhow::ensure!(
                     worker.blocks.keys().eq([DEFAULT_BLOCK]),
-                    "executor {}: a prefill or decode group places the `{DEFAULT_BLOCK}` block alone",
+                    "worker {}: a prefill or decode group places the `{DEFAULT_BLOCK}` block alone",
                     worker.id
                 );
             }
@@ -446,7 +443,7 @@ impl WorkerGroupConfig {
 
     /// One block tensor-parallel over every rank.
     ///
-    /// The `uniserve` CLI uses this rank layout when no `--executor-groups` configuration
+    /// The `uniserve` CLI uses this rank layout when no `--worker-groups` configuration
     /// is given, and the default engine settings and the simulation use it. A
     /// deployment with several blocks, or with other partitions, writes
     /// its own configuration.
@@ -840,7 +837,7 @@ mod tests {
         }
     }
 
-    /// Every deployment the repository publishes for `--executor-groups` places.
+    /// Every deployment the repository publishes for `--worker-groups` places.
     #[test]
     fn published_deployments_place() {
         let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs");

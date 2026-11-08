@@ -975,7 +975,7 @@ impl Qwen3Moe {
         Ok((input, residual, buffers))
     }
 
-    /// The model as the executor sees it: one causal-LM block named `backbone`.
+    /// The model as the worker sees it: one causal-LM block named `backbone`.
     pub fn into_model(self) -> Model {
         Model::new(vec![(
             BlockName::new("backbone"),

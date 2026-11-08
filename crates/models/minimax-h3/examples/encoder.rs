@@ -1246,7 +1246,7 @@ fn stage_encode(args: &Args) -> Result<()> {
     let ids_view = upload_i32(&stream, &arena, Shape::new(&[tokens64]), &signed)?;
     let output = arena.tensor(dtype, Shape::new(&[u64::from(layout.rows), hidden]))?;
 
-    // 7. The encode, with the executor's own recorder installed for its duration: the walk is what
+    // 7. The encode, with the worker's own recorder installed for its duration: the walk is what
     //    proves every program the forward binds is in the store's list.
     let mut walk = Walk(Vec::new());
     let outcome = {

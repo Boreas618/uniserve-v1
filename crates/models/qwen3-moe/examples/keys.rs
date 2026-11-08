@@ -40,7 +40,7 @@ struct Deployment {
     /// Tokens one prefix-cache page holds, and the dtype the activations have.
     page: u32,
     dtype: DType,
-    /// The row counts the executor captures, which the dense packed product is compiled per entry of.
+    /// The row counts the worker captures, which the dense packed product is compiled per entry of.
     buckets: Vec<u32>,
     /// The representation the caller states, when the checkpoint cannot: `None` is the checkpoint's
     /// own statement or, on a dense checkpoint, no statement at all.
@@ -196,9 +196,9 @@ fn run(root: &Path, deployment: &Deployment) -> Result<(), String> {
         }
         (declared, _) => (declared.is_encoded(), "declaration"),
     };
-    // A packed projection's product is compiled per row count, so without the executor's buckets the
+    // A packed projection's product is compiled per row count, so without the worker's buckets the
     // rows cannot be named — and a row at an invented `m` would build a store for a forward the
-    // executor never forms. The products are left out and the omission is printed.
+    // worker never forms. The products are left out and the omission is printed.
     let projections_packed = packed && !deployment.buckets.is_empty();
     if packed && deployment.buckets.is_empty() {
         println!(
@@ -265,7 +265,7 @@ fn usage(message: &str) -> ExitCode {
          \x20   [--capacity rows] [--page tokens] [--buckets N,N,…]\n\n\
          Prints the deployment, then one `<operator>\\t<key>` line per program the model launches, \
          sorted and unique. --capacity is the exchange's rows per rank and is read only when \
-         --expert-parallel is above 1; --buckets is the executor's captured row counts, and an \
+         --expert-parallel is above 1; --buckets is the worker's captured row counts, and an \
          empty list is legitimate only when no packed projection is named."
     );
     ExitCode::from(2)

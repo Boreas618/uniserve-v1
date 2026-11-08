@@ -1,5 +1,5 @@
 //! The engine's integration tests: its scheduler over the simulator, and over
-//! an in-process stand-in for the executor's batch path.
+//! an in-process stand-in for the worker's batch path.
 
 #![cfg(test)]
 // A case that loses its `#[test]` compiles as a private function and runs nothing;

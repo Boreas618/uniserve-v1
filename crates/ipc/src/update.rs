@@ -41,7 +41,7 @@ pub enum UpdateFailure {
         /// The batch that was in flight on it, if any.
         batch: Option<u64>,
     },
-    /// A job stayed inside one executor past half the watchdog timeout (§2.4).
+    /// A job stayed inside one worker past half the watchdog timeout (§2.4).
     Stalled {
         /// The job's batch and how long it has run.
         stall: Stall,

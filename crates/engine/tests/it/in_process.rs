@@ -1,9 +1,9 @@
-//! The scheduler over the executor crate's batch path: `SchedulerHandle::over_batches`
+//! The scheduler over the worker crate's batch path: `SchedulerHandle::over_batches`
 //! builds the handle the launched path builds, over a pool this process did not
 //! launch, and refuses what it cannot serve.
 //!
 //! The pool here answers no batch: these tests state the constructor's contract —
-//! the capabilities come from what the executor reports, the command surface is
+//! the capabilities come from what the worker reports, the command surface is
 //! the launched path's, and a pool whose facts are absent is refused rather than
 //! guessed.
 
@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use engine::{SchedulerConfig, SchedulerHandle};
-use executor::batch::{Batch, Batches, Inventory, Submission};
 use proto::config::EngineArgs;
+use worker::batch::{Batch, Batches, Inventory, Submission};
 
 /// How long a command answer may take.
 ///
@@ -48,22 +48,22 @@ impl Pool {
 }
 
 impl Batches for Pool {
-    fn submit(&self, batch: Batch) -> Result<Submission, executor::Error> {
+    fn submit(&self, batch: Batch) -> Result<Submission, worker::Error> {
         self.submitted
             .lock()
             .expect("the pool's batches")
             .push(batch);
-        Err(executor::Error::Invalid(
+        Err(worker::Error::Invalid(
             "this test's pool serves no batch".to_owned(),
         ))
     }
 
-    fn shadow(&self, batch: Batch) -> Result<Submission, executor::Error> {
+    fn shadow(&self, batch: Batch) -> Result<Submission, worker::Error> {
         self.submitted
             .lock()
             .expect("the pool's batches")
             .push(batch);
-        Err(executor::Error::Invalid(
+        Err(worker::Error::Invalid(
             "this test's pool runs no shadow batch".to_owned(),
         ))
     }
@@ -113,19 +113,19 @@ fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
             .lock()
             .expect("the pool's batches")
             .is_empty(),
-        "no batch reached the executor before a policy serves"
+        "no batch reached the worker before a policy serves"
     );
     handle.shutdown();
 }
 
 #[test]
-fn a_launch_of_ranks_the_executor_does_not_serve_is_refused() {
+fn a_launch_of_ranks_the_worker_does_not_serve_is_refused() {
     let (mut args, limits) = config();
     args.world_size = 2;
     let batches: Arc<dyn Batches> = Arc::new(Pool::new(vec![crate::support::pool("model")]));
     let refused = SchedulerHandle::over_batches(&args, limits, batches)
         .err()
-        .expect("the launch and the executor state one pool");
+        .expect("the launch and the worker state one pool");
     let refused = format!("{refused:#}");
     assert!(refused.contains("2 ranks"), "{refused}");
 }
@@ -149,14 +149,14 @@ fn a_pool_that_states_no_ranks_is_refused_by_name() {
 }
 
 #[test]
-fn an_executor_that_states_no_pool_is_refused_rather_than_guessed() {
+fn an_worker_that_states_no_pool_is_refused_rather_than_guessed() {
     let batches: Arc<dyn Batches> = Arc::new(Pool::new(Vec::new()));
     let refused = {
         let (args, limits) = config();
         SchedulerHandle::over_batches(&args, limits, batches)
     }
     .err()
-    .expect("an executor states its pools");
+    .expect("a worker states its pools");
     let refused = format!("{refused:#}");
     assert!(refused.contains("at least one pool"), "{refused}");
 }

@@ -7,7 +7,7 @@
 //! clamped into `[0, 255]` and rounded to the nearest byte with ties to even.
 //!
 //! The constants are the checkpoint's, and they never change: they are two published weights, so a
-//! captured graph replays them from the arena rather than from a launch argument the executor would
+//! captured graph replays them from the arena rather than from a launch argument the worker would
 //! have to upload per step. The geometry is the views' — frames, rows and columns are the request's
 //! — so no descriptor field states them.
 

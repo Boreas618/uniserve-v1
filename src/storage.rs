@@ -40,8 +40,8 @@ pub(crate) enum StorageCommand {
         /// the starter once listening.
         #[arg(long)]
         daemon: bool,
-        /// The size of a host page pool whose executor states none, in GiB.
-        /// The executors that copy through a pool pin it, so it is allocated
+        /// The size of a host page pool whose worker states none, in GiB.
+        /// The workers that copy through a pool pin it, so it is allocated
         /// whole when the first one maps it.
         #[arg(long, default_value_t = storage_server::DEFAULT_POOL_BYTES >> 30)]
         page_pool_gib: u64,

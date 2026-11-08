@@ -22,14 +22,14 @@
 //! entries  [steps, groups]                 i32    the entry each (step, group) reads
 //! ```
 //!
-//! A step is a **device** value: the executor writes the step's index into a `[1]` i32 table, the
+//! A step is a **device** value: the worker writes the step's index into a `[1]` i32 table, the
 //! cache gathers that row of `entries` to get `[groups]` entry ids, and each layer gathers its own
 //! rows by those ids. One captured graph therefore serves every step of the schedule.
 //!
 //! Within a step's rows, a token's row is `3 · group + tag`: the group is the timestep the token is
 //! conditioned on (the generated video's, the generated audio's, a visual condition's, an audio
 //! reference's) and the tag is the modality the token belongs to (video 0, text 1, audio 2). The
-//! executor's per-request `modulation_indices` table holds that value for every packed row, and the
+//! worker's per-request `modulation_indices` table holds that value for every packed row, and the
 //! layers of [`crate::transformer`] index with it.
 
 use nn::Shape;
@@ -78,7 +78,7 @@ impl Groups {
 
 /// The affine row a token selects inside one step's modulation matrix: `3 · group + tag`.
 ///
-/// This is the value the executor writes into the per-request `modulation_indices` table, and the
+/// This is the value the worker writes into the per-request `modulation_indices` table, and the
 /// only request-dependent input of the conditioning.
 pub const fn row(group: u32, tag: u32) -> u32 {
     TAGS * group + tag
@@ -204,7 +204,7 @@ impl AdaLnCache {
 
     /// The entry ids one step reads: `[1, groups]` i32, gathered from the entry table's `step` row.
     ///
-    /// `step` is `[1]` i32 - the step index, which the executor writes - and `out` a `[1, groups]`
+    /// `step` is `[1]` i32 - the step index, which the worker writes - and `out` a `[1, groups]`
     /// i32 scratch view it overwrites with the entries.
     pub fn entries_of(&self, f: &Forward, step: TensorView, out: TensorView) -> Result<()> {
         Ok(gather_rows(f, self.entries.view(), step, out)?)

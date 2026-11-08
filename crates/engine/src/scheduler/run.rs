@@ -1,20 +1,20 @@
 //! Engine-loop construction, event parking, and owner-thread execution.
 //!
 //! Construction clamps the requested scheduler configuration and model
-//! generation limits to the capacities the loaded executors report, then builds
+//! generation limits to the capacities the loaded workers report, then builds
 //! the single-owner `Scheduler`. `Scheduler::run` is the owner-thread loop:
 //! drain commands, take one nonblocking scheduling step, and park in the
-//! executor only when the step made no progress.
+//! worker only when the step made no progress.
 
 use std::sync::Arc;
 
 use super::*;
 use ipc::{ForwardMode, MediaCall};
 
-/// Applies the loaded executors' served features and capacities to the model's
+/// Applies the loaded workers' served features and capacities to the model's
 /// sizing facts.
 ///
-/// The executors state which generation features are served: a feature is
+/// The workers state which generation features are served: a feature is
 /// available when every call kind it needs is in the aggregate
 /// `supported_calls`, whatever the model description lists. Numeric limits
 /// are clamped to the reported latent, batch-token, encoder-entry,
@@ -42,7 +42,7 @@ fn resolve_generation_limits(
     {
         available.insert(crate::GenerationFeatures::IMAGE_GENERATION);
     }
-    // A canvas denoises over a prompt the same executor's prefill cached.
+    // A canvas denoises over a prompt the same worker's prefill cached.
     if supports(CallKind::Forward(ForwardMode::Prefill))
         && supports(CallKind::Forward(ForwardMode::TokenDenoising))
     {
@@ -71,7 +71,7 @@ fn resolve_generation_limits(
 ///
 /// A cache runtime with denoising keeps a row for a running request's
 /// text-unconditional guidance prefix, and another for its
-/// image-unconditional prefix when the executor states one for its model
+/// image-unconditional prefix when the worker states one for its model
 /// (`MainProcessInfo::image_unconditional_token_ids`): each prefix
 /// (`Scheduler::ensure_guidance_prefix`) allocates its own row from the same
 /// request pool. Other runtimes keep none.
@@ -89,9 +89,9 @@ pub(crate) fn guidance_prefix_rows(info: &MainProcessInfo) -> usize {
 impl Scheduler {
     /// Constructs an engine loop from explicit scheduler and model capabilities.
     ///
-    /// Executor limits clamp scheduler concurrency and resource capacities.
+    /// Worker limits clamp scheduler concurrency and resource capacities.
     ///
-    /// Fails when the executor exposes an invalid aggregate capacity view.
+    /// Fails when the worker exposes an invalid aggregate capacity view.
     pub fn new(
         submissions: super::submission::Submissions,
         special_tokens: SpecialTokenIds,
@@ -133,10 +133,10 @@ impl Scheduler {
             })
             .collect();
 
-        // Queue and batch limits cannot exceed the physical executor envelope.
+        // Queue and batch limits cannot exceed the physical worker envelope.
         let max_batch_calls = info.max_batch_calls as usize;
         let max_batch_tokens = info.max_batch_tokens as usize;
-        // Each executor reports the transfer entries its transport holds in
+        // Each worker reports the transfer entries its transport holds in
         // flight; the merged record carries the narrowest.
         let transfer_capacity = info.transfer_tickets as usize;
 
@@ -146,14 +146,14 @@ impl Scheduler {
         // `max_running_requests` (`guidance_prefix_rows`).
         // `SchedulerHandle::over_batches_telling` refuses a token runtime whose
         // ranks hold too few, so this clamp lowers the limit only for a
-        // supplied executor or for ranks that fit their request pools to
+        // supplied worker or for ranks that fit their request pools to
         // device storage.
         let request_pool_capacity = info.request_slots as usize;
         let main_request_capacity = request_pool_capacity
             .saturating_sub(guidance_prefix_rows(&info))
             .max(1);
 
-        // A stated bound the executor cannot hold is lowered here, never refused, when nothing
+        // A stated bound the worker cannot hold is lowered here, never refused, when nothing
         // checks a decision against it: these three size a batch. A policy's own limits are the
         // mechanism's check and are refused instead, before weights
         // (`crate::model_runner`'s `tier_refusal`). Each clamp names the option, the figure the
@@ -166,7 +166,7 @@ impl Scheduler {
                 stated = requested_seqs,
                 captured = main_request_capacity,
                 request_rows = info.request_slots,
-                "the executors' request rows lower the running-request limit"
+                "the workers' request rows lower the running-request limit"
             );
         }
         config.max_running_requests = requested_seqs.min(main_request_capacity);
@@ -175,7 +175,7 @@ impl Scheduler {
                 option = "max_num_batched_tokens",
                 stated = config.max_num_batched_tokens,
                 captured = max_batch_tokens,
-                "the executor's token capacity lowers the token budget"
+                "the worker's token capacity lowers the token budget"
             );
         }
         config.max_num_batched_tokens = config.max_num_batched_tokens.max(1).min(max_batch_tokens);
@@ -206,7 +206,7 @@ impl Scheduler {
             );
         }
 
-        // Storage and scheduler statistics share the resolved executor capacities.
+        // Storage and scheduler statistics share the resolved worker capacities.
         let cache = PrefixCacheManager::from_main_process_info(&info);
         let stats = Arc::new(SchedulerStats::default());
         stats.prefix_cache.num_units.store(
@@ -214,10 +214,10 @@ impl Scheduler {
             Ordering::Relaxed,
         );
 
-        // Runtime state remains single-owner; executors receive immutable batch
+        // Runtime state remains single-owner; workers receive immutable batch
         // inputs assembled from these queues and request records.
         Ok(Self {
-            executor: submissions,
+            worker: submissions,
             inflight: inflight::Inflight::new(),
             dispatch: dispatch::Dispatch::default(),
             storage: allocation::Storage {
@@ -321,7 +321,7 @@ impl Scheduler {
     }
 
     /// Takes `limits`' scheduling limits and policy from the next step on;
-    /// the canvas stays. The limits must lie within the batch the executors
+    /// the canvas stays. The limits must lie within the batch the workers
     /// were started for: the running requests within their request rows,
     /// a step's tokens and calls within their batch. A change of policy
     /// reorders the waiting queue by it, as if each request had been queued
@@ -329,7 +329,7 @@ impl Scheduler {
     ///
     /// # Errors
     ///
-    /// Names the first limit beyond the executors' batch, or the canvas the
+    /// Names the first limit beyond the workers' batch, or the canvas the
     /// step budget no longer holds; the scheduler keeps its limits.
     pub(super) fn reconfigure(&mut self, limits: SchedulerConfig) -> Result<(), String> {
         let info = &self.info;
@@ -390,7 +390,7 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The executor groups that prefill only (`WorkerGroupRole::Prefill`),
+    /// The worker groups that prefill only (`WorkerGroupRole::Prefill`),
     /// whose requests hand their KV cache to a decode group.
     pub fn set_prefill_groups(&mut self, groups: impl IntoIterator<Item = crate::WorkerGroupId>) {
         self.dispatch.prefill_groups = groups.into_iter().collect();
@@ -415,7 +415,7 @@ impl Scheduler {
         self.state_interval = tokens.max(1);
     }
 
-    /// Copy prompt pages of the executor groups whose ranks all map a page
+    /// Copy prompt pages of the worker groups whose ranks all map a page
     /// pool for every cache group through the host KV cache, as a head of
     /// `world` of `deployment` on `host` (what a world on trial commits is
     /// its own until its commit): ranks on `host` through its Storage Server's
@@ -456,7 +456,7 @@ impl Scheduler {
                 return Ok(());
             }
         };
-        let mut rank_caches = self.executor.info().rank_caches.clone();
+        let mut rank_caches = self.worker.info().rank_caches.clone();
         let Some(demand) = crate::kv_cache::HostCacheDemand::of(&rank_caches, size.ratio) else {
             return Ok(());
         };
@@ -480,7 +480,7 @@ impl Scheduler {
             tokens = tokens.min(held);
         }
         tracing::info!(asked, tokens, "sized the world's host KV cache");
-        for (worker, results) in self.executor.map_host_cache(tokens)? {
+        for (worker, results) in self.worker.map_host_cache(tokens)? {
             let Some(ranks) = rank_caches.get_mut(&worker) else {
                 continue;
             };
@@ -514,10 +514,10 @@ impl Scheduler {
 
     /// Stores the trajectories of preempted requests (a video request's,
     /// and the image a token request is generating) in the host latent
-    /// pools of the denoiser's executor group, reached through the Storage
+    /// pools of the denoiser's worker group, reached through the Storage
     /// Server at `socket` for the ranks on `host` (the engine's) and over
     /// the TCP address another host's rank reports, when every rank that
-    /// executes the denoiser reports one (`ExecutorInfo::rank_latents`), as
+    /// executes the denoiser reports one (`WorkerInfo::rank_latents`), as
     /// a head of `deployment` in `world`, whose trajectories the servers
     /// keep its own while it is on trial. The denoiser is the component
     /// that serves denoising calls, or the protocol's default component of
@@ -536,7 +536,7 @@ impl Scheduler {
             .get(&MediaCall::Denoising)
             .cloned()
             .unwrap_or_else(|| DEFAULT_BLOCK.to_owned());
-        let info = self.executor.info();
+        let info = self.worker.info();
         let mut denoisers = Vec::new();
         for (worker, ranks) in &info.rank_latents {
             // The ranks that hold trajectories: those the denoiser's component
@@ -591,10 +591,10 @@ impl Scheduler {
     }
 
     /// Stores the outputs of the video encoders in the host encoder pools of
-    /// their executor groups, reached through the Storage Server at `socket`
+    /// their worker groups, reached through the Storage Server at `socket`
     /// for the ranks on `host` (the engine's) and over the TCP address
     /// another host's rank reports, for each group whose ranks executing an
-    /// encoder report the same pool (`ExecutorInfo::rank_encoders`), as a
+    /// encoder report the same pool (`WorkerInfo::rank_encoders`), as a
     /// head of `deployment` in `world`. Without them every request's
     /// encoders compute its outputs.
     pub fn enable_encoder_store(
@@ -604,7 +604,7 @@ impl Scheduler {
         world: u64,
         host: &str,
     ) {
-        let info = self.executor.info();
+        let info = self.worker.info();
         let groups: Vec<(
             crate::WorkerGroupId,
             Vec<(u32, crate::encoder_outputs::RankEncoders<'_>)>,
@@ -660,16 +660,16 @@ impl Scheduler {
             .map_or(0, crate::trajectories::TrajectoryStore::seed)
     }
 
-    /// Returns the executor's aggregate executor capabilities.
+    /// Returns the worker's aggregate worker capabilities.
     pub fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 
-    /// Returns the first executor group with a prefix cache, whose units the
+    /// Returns the first worker group with a prefix cache, whose units the
     /// pool allocates and whose identity names its index for a successor
     /// world.
     pub fn cache_group(&self) -> Option<String> {
-        self.executor
+        self.worker
             .info()
             .workers
             .iter()
@@ -677,19 +677,19 @@ impl Scheduler {
             .map(|(group, _)| group.to_string())
     }
 
-    /// Returns the model limits supported by the loaded execution executors.
+    /// Returns the model limits supported by the loaded execution workers.
     pub fn generation_limits(&self) -> &crate::GenerationLimits {
         &self.generation_limits
     }
 
     /// Returns the media units one call of each routed media call covers at
-    /// once (`ExecutorInfo::media_units`).
+    /// once (`WorkerInfo::media_units`).
     ///
     /// # Errors
     ///
-    /// Fails when the executor's media routing is inconsistent.
+    /// Fails when the worker's media routing is inconsistent.
     pub fn media_units(&self) -> anyhow::Result<std::collections::BTreeMap<ipc::MediaCall, u32>> {
-        let info = self.executor.info();
+        let info = self.worker.info();
         Ok(info
             .media_routing()?
             .into_keys()
@@ -774,11 +774,11 @@ impl Scheduler {
 
     /// Runs the owner-thread control loop, blocking only when fully idle.
     ///
-    /// Returns `true` if the engine died (executor or executor failure) rather
+    /// Returns `true` if the engine died (worker or worker failure) rather
     /// than shutting down on a `Shutdown` command or command-channel
     /// disconnect. Either way, every queued or running request is finished
     /// with `Aborted`, every receiver still open can read its complete event
-    /// stream through its terminal event, and the executor is closed before
+    /// stream through its terminal event, and the worker is closed before
     /// returning.
     pub fn run(mut self, rx: Receiver<Command>) -> bool {
         loop {
@@ -799,9 +799,7 @@ impl Scheduler {
                 self.park_for_progress();
             }
             if self.fatal {
-                let _ = self
-                    .failure
-                    .set("the executor or an executor failed".to_owned());
+                let _ = self.failure.set("the worker or a worker failed".to_owned());
                 tracing::error!(
                     failure = self.failure.get().map_or("", String::as_str),
                     "engine fatal: stopping the control loop"
@@ -810,23 +808,23 @@ impl Scheduler {
                     self.hand_back_requests();
                 }
                 self.abort_all_requests();
-                let _ = self.executor.close();
+                let _ = self.worker.close();
                 return true;
             }
         }
         // Finish everything still queued or running with `Aborted` before
-        // closing the executor, so every open consumer receives a terminal
+        // closing the worker, so every open consumer receives a terminal
         // event rather than only a closed channel. The pages published so
         // far reach the host KV cache first.
         self.flush_offloads();
         self.abort_all_requests();
-        let _ = self.executor.close();
+        let _ = self.worker.close();
         false
     }
 
     /// Offload to the host KV cache every page reserved for it that is not
-    /// there yet, before the executors close: let the batches in flight
-    /// complete, which carry offloads and settle them, then carry each executor
+    /// there yet, before the workers close: let the batches in flight
+    /// complete, which carry offloads and settle them, then carry each worker
     /// group's remaining reserved offloads in a batch of page offloads alone,
     /// and wait for their commits. The scheduler admits and schedules nothing more.
     /// Gives up after `PAGE_FLUSH_TIMEOUT` or when the engine fails, leaving
@@ -854,7 +852,7 @@ impl Scheduler {
                         return;
                     };
                     let pages = kv_offload.take_offloads(&worker, batch.id);
-                    batch.page_offloads = Some(crate::executor::PageOffloads {
+                    batch.page_offloads = Some(crate::worker::PageOffloads {
                         worker,
                         pages,
                         latents: Vec::new(),
@@ -871,7 +869,7 @@ impl Scheduler {
             }
             if self.fatal || Instant::now() >= deadline {
                 tracing::warn!(
-                    "published pages did not all reach the host KV cache before the executors close"
+                    "published pages did not all reach the host KV cache before the workers close"
                 );
                 return;
             }
@@ -881,9 +879,9 @@ impl Scheduler {
         }
     }
 
-    /// Runs the executor hook `name` with `payload` on every executor
-    /// (`Executor::hook`) once the batches in flight complete, admitting
-    /// and scheduling nothing meanwhile, and returns each executor's result.
+    /// Runs the worker hook `name` with `payload` on every worker
+    /// (`Worker::hook`) once the batches in flight complete, admitting
+    /// and scheduling nothing meanwhile, and returns each worker's result.
     pub(super) fn run_hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, String> {
         let closing = std::mem::replace(&mut self.closing, true);
         let drained = self.drain_batches();
@@ -892,7 +890,7 @@ impl Scheduler {
         self.hook_workers(name, payload)
     }
 
-    /// Runs the executor hook `name` as [`Self::run_hook`] does, together
+    /// Runs the worker hook `name` as [`Self::run_hook`] does, together
     /// with the engine's other schedulers (`HookBarrier`): it runs once
     /// every scheduler's batches in flight completed, and this scheduler
     /// schedules again only once every one ran it. Meanwhile its ranks go on
@@ -934,7 +932,7 @@ impl Scheduler {
     /// caller set `closing`.
     ///
     /// The drain is unbounded in what it may wait for and bounded only in
-    /// silence: a batch the executor never answers, and never finishes,
+    /// silence: a batch the worker never answers, and never finishes,
     /// would otherwise hold the hook the drain serves for ever. Whenever a
     /// batch or a submission leaves the pending set the drain has made
     /// progress and its silence clock restarts, so a scheduler that keeps
@@ -970,7 +968,7 @@ impl Scheduler {
         Ok(())
     }
 
-    /// What a drain still waits on: the batches the executor holds, and the
+    /// What a drain still waits on: the batches the worker holds, and the
     /// batches it has not accepted.
     fn drain_pending(&self) -> (usize, usize) {
         (
@@ -979,32 +977,28 @@ impl Scheduler {
         )
     }
 
-    /// Runs the executor hook on every executor, its batches complete.
+    /// Runs the worker hook on every worker, its batches complete.
     fn hook_workers(&mut self, name: &str, payload: &str) -> Result<Vec<String>, String> {
         let results = self
-            .executor
+            .worker
             .hook(name, payload)
             .map_err(|error| format!("{error:#}"))?;
-        tracing::info!(
-            hook = name,
-            workers = results.len(),
-            "ran the executor hook"
-        );
+        tracing::info!(hook = name, workers = results.len(), "ran the worker hook");
         Ok(results)
     }
 
-    /// Parks until a result, command, executor death, CPU continuation, or output-capacity wake.
+    /// Parks until a result, command, worker death, CPU continuation, or output-capacity wake.
     ///
-    /// Waits in `Executor::poll` and applies at most one returned result.
+    /// Waits in `Worker::poll` and applies at most one returned result.
     /// Commands and consumer reads fire the engine's `CommandWaker`. A real
     /// waker, such as `Submissions::waker`, ends the poll early.
-    /// With the no-op waker, a command waits for the executor's own wake
+    /// With the no-op waker, a command waits for the worker's own wake
     /// sources or the timeout. The timeout (`IDLE_LIVENESS_POLL`) is solely a
     /// liveness deadline.
     pub(super) fn park_for_progress(&mut self) {
         let _span = tracing::trace_span!("scheduler.park").entered();
         // Answers of the host KV cache and of the host latent and encoder
-        // pools arrive on connections the executor does not wait on: while
+        // pools arrive on connections the worker does not wait on: while
         // some are awaited, the park is short.
         // So is the park of a closing scheduler, which awaits its last
         // page commits.
@@ -1026,13 +1020,13 @@ impl Scheduler {
         } else {
             IDLE_LIVENESS_POLL
         };
-        match self.executor.poll(timeout) {
+        match self.worker.poll(timeout) {
             Ok(Some(result)) => {
                 self.apply_result(result);
                 self.progress.wake();
             }
             Ok(None) => {}
-            Err(error) => self.on_executor_error(error),
+            Err(error) => self.on_worker_error(error),
         }
         self.stats
             .general
@@ -1048,10 +1042,10 @@ impl Scheduler {
 }
 
 /// Names what a drain that stopped progressing still holds: each batch with its
-/// age and the requests it carries, and the submissions the executor never
+/// age and the requests it carries, and the submissions the worker never
 /// accepted.
 ///
-/// A batch the executor never answered and never finished is named by id, with
+/// A batch the worker never answered and never finished is named by id, with
 /// how long it has been in flight and which requests it carries, so a hook that
 /// stopped can be diagnosed from its error alone.
 fn abandoned_drain(inflight: &super::inflight::Inflight, held: (usize, usize)) -> String {
@@ -1155,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn a_drain_that_stopped_names_the_submission_the_executor_never_took() {
+    fn a_drain_that_stopped_names_the_submission_the_worker_never_took() {
         let mut inflight = Inflight::new();
         inflight.pending_submissions.push_back(ExecutionBatch::new(
             11,

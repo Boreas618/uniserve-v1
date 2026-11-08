@@ -1220,7 +1220,7 @@ fn overlaps(left: DeviceRange, right: DeviceRange) -> bool {
 
 /// A cuDNN handle for one device's primary context.
 ///
-/// A handle is used by one thread at a time: the executor creates one per
+/// A handle is used by one thread at a time: the worker creates one per
 /// device on that device's thread and keeps it.
 pub struct Cudnn {
     api: &'static Api,

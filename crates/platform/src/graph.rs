@@ -412,7 +412,7 @@ pub enum Space {
     Host(u64),
     /// Device memory, at the address the driver gave.
     Device(u64),
-    /// An array object, which a capture of this executor's work has not produced.
+    /// An array object, which a capture of this worker's work has not produced.
     Array,
     /// A spelling this binding does not name, as the driver's number.
     Other(i32, u64),
@@ -712,7 +712,7 @@ pub fn open_captures() -> usize {
 ///
 /// It begins the driver's stream capture and keeps the device's context
 /// current on this thread until it ends, so it is not `Send`: a capture is
-/// begun, recorded and ended on one thread, as the executor that runs it is
+/// begun, recorded and ended on one thread, as the worker that runs it is
 /// one thread per device.
 ///
 /// [`Capture::record`] is called after each operation the owner issues: it
@@ -735,7 +735,7 @@ pub struct Capture {
 }
 
 /// `CUstreamCaptureMode`: how a capture interacts with CUDA calls from other
-/// threads of the process, such as the other devices' executors.
+/// threads of the process, such as the other devices' workers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CaptureMode {
     /// `CU_STREAM_CAPTURE_MODE_GLOBAL`: an unsafe call from any thread
@@ -746,8 +746,8 @@ pub enum CaptureMode {
     /// unsafe calls invalidate the capture.
     ThreadLocal,
     /// `CU_STREAM_CAPTURE_MODE_RELAXED`: other threads' calls are neither
-    /// captured nor invalidating. The executor captures in this mode: its
-    /// device's stream is its own, and the process's other executors keep
+    /// captured nor invalidating. The worker captures in this mode: its
+    /// device's stream is its own, and the process's other workers keep
     /// working meanwhile.
     Relaxed,
 }

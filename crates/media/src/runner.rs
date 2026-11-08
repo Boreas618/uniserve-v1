@@ -1,11 +1,11 @@
-//! The runner side of media work: what the main process's executor calls.
+//! The runner side of media work: what the main process's worker calls.
 //!
-//! The executor runs every method of [`MediaRunner`] on its blocking thread
+//! The worker runs every method of [`MediaRunner`] on its blocking thread
 //! pool (`specs/worker.md` §2.4, §4.5): media work touches no stream and
-//! schedules no job on a device. The executor owns the copies around it: it
+//! schedules no job on a device. The worker owns the copies around it: it
 //! stages device frames and decoded audio in host storage, hands the host
 //! bytes here, and copies what the readers produce to the device products on
-//! its own stream. The crate therefore knows nothing about executors, jobs,
+//! its own stream. The crate therefore knows nothing about workers, jobs,
 //! leases or completion reports.
 //!
 //! One request's mux calls are serialized by the caller, as they are today:

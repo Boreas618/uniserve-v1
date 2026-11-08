@@ -4,7 +4,7 @@
 //!
 //! Requests travel through the server's router (`http::router`) into a real
 //! `Leader`, whose client submits them over the request interface to
-//! schedulers that drive `SimEngine` through `SimExecutor`; the schedulers
+//! schedulers that drive `SimEngine` through `SimWorker`; the schedulers
 //! serve the interface on a thread of this process, as an engine process
 //! serves it. The default simulator provides no video media components, so
 //! the engine refuses every video submission as an invalid request.
@@ -17,7 +17,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
-use engine::{SchedulerHandle, SimEngine, SimExecutor};
+use engine::{SchedulerHandle, SimEngine, SimWorker};
 use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
@@ -80,10 +80,10 @@ pub(crate) fn sim_engine(parameters: ModelParameters) -> Leader {
 /// epoch's policy installed ([`policy_on`]): a scheduler with no policy decides
 /// nothing, and a fixture's engine has no Program Server to give it one.
 pub(crate) fn sim_core(args: proto::config::EngineArgs, worker: SimEngine) -> SchedulerHandle {
-    let core = SchedulerHandle::with_executor(
+    let core = SchedulerHandle::with_worker(
         &args,
         engine::SchedulerConfig::default(),
-        Box::new(SimExecutor::new(worker)),
+        Box::new(SimWorker::new(worker)),
     )
     .expect("start a sim scheduler");
     policy_on(&core);

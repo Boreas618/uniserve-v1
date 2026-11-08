@@ -1,4 +1,4 @@
-//! Reference-counted cache of executor-resident encoder products: the device
+//! Reference-counted cache of worker-resident encoder products: the device
 //! tier of image requests' encoder outputs, nearer than the host encoder
 //! pools (`crate::encoder_outputs`).
 //!
@@ -6,9 +6,9 @@
 //! what the encoding read: the image's digest, the encoder's output and, for
 //! an encoder that samples, the request's draw) map to immutable product
 //! references. The scheduler owns this bookkeeping; the tensors themselves
-//! live in executor buffers. Requests pin the entries they read, unpinned
+//! live in worker buffers. Requests pin the entries they read, unpinned
 //! entries participate in LRU eviction, and every operation that gives up
-//! executor storage returns the product so the scheduler can queue a `Free` for
+//! worker storage returns the product so the scheduler can queue a `Free` for
 //! its buffer.
 
 use ipc::TensorRef;
@@ -48,12 +48,12 @@ pub(crate) struct EncoderCacheStats {
 /// Callers keep every pin balanced: each successful `acquire` is matched by
 /// one `release` with the same key and product, and every product returned by
 /// `insert`, `evict_one`, `invalidate_buffers`, or `release` must have its
-/// executor buffer freed.
+/// worker buffer freed.
 pub(crate) struct EncoderCacheManager {
     budget: usize,                       // max cached entries
     entries: HashMap<EncoderKey, Entry>, // content key -> entry
     // `invalidate_buffers` removes entries from lookup immediately, but a
-    // executor-side tensor cannot be reclaimed while an in-flight request still
+    // worker-side tensor cannot be reclaimed while an in-flight request still
     // holds a reference. Those entries remain here until their final pin is
     // released. Inserting the identical product under the same hash, while no
     // active entry holds that hash, reactivates the retired entry with its
@@ -83,7 +83,7 @@ impl EncoderCacheManager {
         }
     }
 
-    /// Returns the number of entries holding executor storage: active entries
+    /// Returns the number of entries holding worker storage: active entries
     /// plus retired entries that are still pinned.
     pub(crate) fn len(&self) -> usize {
         self.entries.len() + self.retired.values().map(Vec::len).sum::<usize>()
@@ -157,7 +157,7 @@ impl EncoderCacheManager {
     }
 
     /// Removes the least-recently-used unpinned entry and returns its product,
-    /// whose executor buffer the caller must free.
+    /// whose worker buffer the caller must free.
     ///
     /// Returns `None` when no active entry is unpinned. The scheduler calls it
     /// when a persistent buffer allocation fails, to return cache-held space
@@ -183,7 +183,7 @@ impl EncoderCacheManager {
     }
 
     /// Frees the entry `key` names when nothing pins it, returning the product
-    /// whose executor buffer the caller must free.
+    /// whose worker buffer the caller must free.
     ///
     /// Returns `None` when the entry is absent or pinned, so a policy's
     /// `Victim::Encoding` frees exactly what it named and nothing else. This is
@@ -213,7 +213,7 @@ impl EncoderCacheManager {
     ///
     /// `budget` is a soft bound on the live set (`len`): an insert of a new key
     /// at budget evicts at most one unpinned entry and never refuses. The
-    /// encoder output already exists on the executor by the time it reaches here
+    /// encoder output already exists on the worker by the time it reaches here
     /// and the caller pins it immediately for the in-flight request, so a
     /// freshly-computed handle can never be dropped on the floor. When the cache
     /// is at budget and every entry is pinned (`ref_cnt > 0`), there is no victim
@@ -316,7 +316,7 @@ impl EncoderCacheManager {
     }
 
     /// Releases a reference. Active entries become evictable at zero references;
-    /// retired entries are removed and return their executor handle for reclaim.
+    /// retired entries are removed and return their worker handle for reclaim.
     ///
     /// The pin is matched by both `hash` and `product`, so a request that
     /// pinned a since-invalidated product releases the retired entry, not an

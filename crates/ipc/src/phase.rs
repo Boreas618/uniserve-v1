@@ -1,7 +1,7 @@
 //! The scheduler's name for one phase (`specs/worker.md` §4.5).
 //!
 //! A phase is one block's computation on one kind of call — prefill, decode,
-//! one denoising step. The scheduling mechanism addresses the executor's work by
+//! one denoising step. The scheduling mechanism addresses the worker's work by
 //! it: a batch names the phase it is, and a runner declares the phases it
 //! serves. The engine owns the mapping from a model's `(BlockName, PhaseKind)`
 //! to a [`PhaseId`]; nothing on the other side of the crossing needs to know a

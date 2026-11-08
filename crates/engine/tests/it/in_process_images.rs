@@ -1,4 +1,4 @@
-//! Image understanding and generation on the simulated executor.
+//! Image understanding and generation on the simulated worker.
 //!
 //! These tests run a scheduler (`SchedulerHandle`) over the simulator, so every
 //! image call the engine plans executes in the simulator's image and text
@@ -103,13 +103,12 @@ fn logged_engine(
     sim.overstate_published_media(media_overstatement);
     sim.place_components(components);
     let context = sim.context_log();
-    let executor = engine::SimExecutor::new(sim);
-    let rank = engine::Executor::info(&executor)
+    let worker = engine::SimWorker::new(sim);
+    let rank = engine::Worker::info(&worker)
         .runtime_info()
         .expect("the sim states its rank");
-    let handle =
-        SchedulerHandle::with_executor(&args, SchedulerConfig::default(), Box::new(executor))
-            .expect("the simulated executor serves");
+    let handle = SchedulerHandle::with_worker(&args, SchedulerConfig::default(), Box::new(worker))
+        .expect("the simulated worker serves");
     crate::support::install_policy_on(&handle, engine::BatchCapacity::of(&rank));
     Ok((handle, context))
 }
@@ -474,9 +473,9 @@ fn an_input_image_is_encoded_into_its_prompt() -> anyhow::Result<()> {
 }
 
 /// A request that generated an image and left its engine continues on
-/// another from its facts, through the executor's own feedback computation:
+/// another from its facts, through the worker's own feedback computation:
 /// the engine writes the carried image's decoded values into its context
-/// by the request's feedback encoder, which the executor prepares as it
+/// by the request's feedback encoder, which the worker prepares as it
 /// prepares the decoded product, and the request generates the images and
 /// text the uninterrupted request generates after it, numbered after the
 /// carried image, with a usage that counts every token and image.

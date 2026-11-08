@@ -29,7 +29,7 @@
 //! ## The draws are inputs
 //!
 //! The layer never generates randomness. `draws` is `[rows]` f32 in `[0, 1)`, computed by the
-//! executor from the request's seed and the token position it is sampling (Philox, addressed per
+//! worker from the request's seed and the token position it is sampling (Philox, addressed per
 //! element), so a restored or replayed step draws the same number.
 //!
 //! ## Greedy rows
@@ -37,7 +37,7 @@
 //! A row whose temperature is zero is **not** a draw: it is [`Self::argmax`]'s row. The shaper
 //! divides such a row by one rather than by zero (`ops::sampler`'s doc cites the rule), so the row's
 //! shaped logits keep the logits' order and its largest candidate is the temperature-zero token. The
-//! temperature of each row is a request parameter, so the executor knows which rows are greedy and
+//! temperature of each row is a request parameter, so the worker knows which rows are greedy and
 //! routes them: `argmax` over the row's logits for those, this path's draw for the rest. No draw can
 //! replace that step, because the draw path's candidates are sorted by token id before the CDF (the
 //! step the reference takes at `uniserve/sampling/top_k.py:307-314`), so a draw of zero selects the
@@ -48,9 +48,9 @@
 //! `filter_candidates` reports, per row, whether the row's kept candidates form a usable
 //! distribution (a row can end up empty when a nucleus or min-p threshold and a top-k width leave
 //! nothing). The layer does not branch on it — the value is device data and the layer is inside a
-//! captured graph — but leaves it in the candidate working set's `valid` row for the executor, and
+//! captured graph — but leaves it in the candidate working set's `valid` row for the worker, and
 //! samples the row as its first candidate, which is deterministic and reproducible. Whether such a
-//! request continues, is retried with different parameters, or fails is the executor's decision, not
+//! request continues, is retried with different parameters, or fails is the worker's decision, not
 //! a numerical one.
 
 /// Lanes one candidate program walks at a time: a chunk of the row, not the row.
@@ -78,7 +78,7 @@ use crate::layers::launch;
 
 /// The request state a sampling step reads.
 ///
-/// The executor owns it and writes it in the layout the operators read: one row of parameters per
+/// The worker owns it and writes it in the layout the operators read: one row of parameters per
 /// row being sampled, the slot whose history penalizes the row, and the slot's counts.
 pub struct SamplerState {
     /// `[slots, vocabulary]` i32: how many times each slot has already seen each token.
@@ -86,7 +86,7 @@ pub struct SamplerState {
     /// `[rows, PARAMETER_COLUMNS]` f32: temperature, top-k width, top-p, min-p, repetition,
     /// frequency and presence in [`ops::sampler::PARAMETER_COLUMNS`] order.
     ///
-    /// That order is the operators' and the executor writes it. The reference's own table
+    /// That order is the operators' and the worker writes it. The reference's own table
     /// (`uniserve/sampling/top_k.py:41-43`) is `temperature, top-p, min-p, typical-p, repetition,
     /// frequency, presence, top-k`, so it agrees on the four columns this layer's shaper reads
     /// (0, 4, 5, 6) and differs on the three its cutoffs read: our 1 is the top-k width where the
@@ -236,7 +236,7 @@ impl Sampler {
     /// them.
     ///
     /// `logits` is `[rows, vocabulary]` in the head's output dtype; `draws` is `[rows]` f32 in
-    /// `[0, 1)` from the executor. The step's working set comes from the forward's arena, so the
+    /// `[0, 1)` from the worker. The step's working set comes from the forward's arena, so the
     /// call is inside a captured bucket's plan.
     ///
     /// The candidates reach [`InverseCdf`] in ascending token id order: [`TopK`] writes them by
@@ -598,7 +598,7 @@ impl Sampler {
     /// This is the reference's greedy step (`torch.max` over the shaped row, `uniserve/sampling/
     /// greedy.py`), for the rows whose temperature is zero. It runs the same shaper as [`Self::forward`]
     /// and nothing else: no candidate set, no cutoffs, no draw. It is a separate launch sequence
-    /// rather than a branch inside `forward`, because the executor's buckets are homogeneous in the
+    /// rather than a branch inside `forward`, because the worker's buckets are homogeneous in the
     /// path their rows take and a bucket's captured plan is one of the two.
     pub fn greedy(
         &self,

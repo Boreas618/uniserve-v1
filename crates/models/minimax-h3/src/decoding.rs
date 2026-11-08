@@ -6,7 +6,7 @@
 //! audio VAE decodes one
 //! channel-major stereo latent timeline. This module owns that arithmetic and the output layouts, and
 //! nothing that touches a device: the packed latents, the decoded clip frames and the PCM are borrowed
-//! views the executor hands in and out.
+//! views the worker hands in and out.
 //!
 //! ## The timeline
 //!
@@ -136,13 +136,13 @@ impl Track {
 
 /// One scratch buffer of a decoder's forward, with the element type it holds.
 ///
-/// The executor sizes the arena from these; the model never allocates. Names are the ones the arena
+/// The worker sizes the arena from these; the model never allocates. Names are the ones the arena
 /// plan in `notes/h3/decoders-interface.md` uses, so a mismatch is visible in one place - **and the order
 /// is the order the model reserves them in**, because the arena is one cursor: a buffer listed before
 /// another is also reserved before it, and anything the code reserves inside a loop is multiplied.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Buffer {
-    /// The buffer's name, unique within its plan: the executor keys storage by it.
+    /// The buffer's name, unique within its plan: the worker keys storage by it.
     pub name: String,
     /// Its element type: `f16`, `f32` or `u8`.
     pub element: &'static str,

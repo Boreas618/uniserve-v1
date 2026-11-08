@@ -76,7 +76,7 @@
 //! `prefill_attention_backend`.
 //!
 //! The workspace is the program's `workspace_size` argument (512 MiB for trtllm-gen), a transient
-//! region the executor allocates from its scratch pool and zeroes before its first use: trtllm-gen
+//! region the worker allocates from its scratch pool and zeroes before its first use: trtllm-gen
 //! keeps its multi-CTA reduction counters there across launches.
 
 pub mod dense;

@@ -1,5 +1,5 @@
-//! A simulated video executor and its requests, shared by the tests of video
-//! scheduling: the executor's components, their products and the ranks each
+//! A simulated video worker and its requests, shared by the tests of video
+//! scheduling: the worker's components, their products and the ranks each
 //! component is launched on.
 
 use std::collections::BTreeMap;
@@ -106,7 +106,7 @@ pub(crate) fn media_units(name: &str, units: u32) -> OutputInfo {
     }
 }
 
-/// A video executor whose text encoder, denoiser, audio decoder and muxer live on
+/// A video worker whose text encoder, denoiser, audio decoder and muxer live on
 /// rank 0 and whose video decoder and video codec are distributed over
 /// `decoder_ranks` ranks, each reconstructing and encoding one media unit per
 /// round.
@@ -126,7 +126,7 @@ pub(crate) fn video_worker_denoising_on(
     denoising_ranks: usize,
 ) -> SimEngine {
     let mut sim = SimEngine::new();
-    // A deep executor queue keeps queue capacity from bounding which calls
+    // A deep worker queue keeps queue capacity from bounding which calls
     // are in flight together, leaving that to the occupancy rules under test.
     sim.set_queue_depth(64);
     sim.set_results_on_wait(true);

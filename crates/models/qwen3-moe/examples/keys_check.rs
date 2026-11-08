@@ -13,11 +13,11 @@
 //!
 //! - **a row the walk names and the fixture lacks** — the store cannot hold a program the model
 //!   launches, so this is a failure;
-//! - **a row the fixture holds that is neither the walk's nor the executor's** — an invented row, or
+//! - **a row the fixture holds that is neither the walk's nor the worker's** — an invented row, or
 //!   one whose operator moved ownership; a failure, because the fixture claims to be a statement of
 //!   what is launched;
-//! - **the executor's rows**, which are listed and counted but not refused: their geometry is the
-//!   executor's request and schedule state, and the walk never names them.
+//! - **the worker's rows**, which are listed and counted but not refused: their geometry is the
+//!   worker's request and schedule state, and the walk never names them.
 //!
 //! The first comparison is by **operator and row class**: the packed product's key carries the class
 //! its module was compiled for, that class is the deployment's bucket bound, and a fixture generated
@@ -39,9 +39,9 @@ use std::process::ExitCode;
 use qwen3_moe::keys::keys;
 use qwen3_moe::{Config, Partition};
 
-/// The operators whose rows the executor's request and schedule state decide, so the model's walk
+/// The operators whose rows the worker's request and schedule state decide, so the model's walk
 /// never names them: the sampler's chain and the logits gathers.
-const EXECUTOR_OWNED: [&str; 10] = [
+const WORKER_OWNED: [&str; 10] = [
     "argmax",
     "candidate_order",
     "filter_candidates",
@@ -237,12 +237,12 @@ fn main() -> ExitCode {
         let unowned: Vec<&String> = present
             .iter()
             .filter(|operator| {
-                !named.contains(*operator) && !EXECUTOR_OWNED.contains(&operator.as_str())
+                !named.contains(*operator) && !WORKER_OWNED.contains(&operator.as_str())
             })
             .collect();
         for operator in &unowned {
             failures.push(format!(
-                "the fixture holds `{operator}`, which is neither the walk's nor the executor's"
+                "the fixture holds `{operator}`, which is neither the walk's nor the worker's"
             ));
         }
         // An operator's presence is not its row set. The packed product's key carries the row class
@@ -261,20 +261,20 @@ fn main() -> ExitCode {
                  whose bucket rows are {bound}"
             ));
         }
-        let executor: Vec<&String> = present
+        let worker: Vec<&String> = present
             .iter()
-            .filter(|operator| EXECUTOR_OWNED.contains(&operator.as_str()))
+            .filter(|operator| WORKER_OWNED.contains(&operator.as_str()))
             .collect();
         println!(
-            "    {} the walk names, {} the executor's, {} unaccounted",
+            "    {} the walk names, {} the worker's, {} unaccounted",
             named.intersection(&present).count(),
-            executor.len(),
+            worker.len(),
             unowned.len()
         );
     }
 
     if failures.is_empty() {
-        println!("# the fixture is the walk's rows plus the executor's, and nothing else");
+        println!("# the fixture is the walk's rows plus the worker's, and nothing else");
         ExitCode::SUCCESS
     } else {
         for failure in &failures {

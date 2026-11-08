@@ -3562,7 +3562,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::metrics::METRICS;
-    use engine::{Executor, SchedulerHandle, SimEngine, SimExecutor};
+    use engine::{SchedulerHandle, SimEngine, SimWorker, Worker};
     use futures::{StreamExt as _, poll};
     use proto::request::{
         Event, GenerationConstraint, GenerationRequest, ImageGenerationConfig, Request,
@@ -3789,16 +3789,16 @@ mod tests {
         }
     }
 
-    /// Simulated executor whose teardown lasts until another task releases
+    /// Simulated worker whose teardown lasts until another task releases
     /// it, as closing worker processes that drain and exit takes time.
-    struct GatedCloseExecutor {
-        inner: SimExecutor,
+    struct GatedCloseWorker {
+        inner: SimWorker,
         release: std::sync::mpsc::Receiver<()>,
         released: Arc<AtomicBool>,
     }
 
-    impl Executor for GatedCloseExecutor {
-        fn info(&self) -> &engine::ExecutorInfo {
+    impl Worker for GatedCloseWorker {
+        fn info(&self) -> &engine::WorkerInfo {
             self.inner.info()
         }
 
@@ -3817,18 +3817,18 @@ mod tests {
         fn submit(
             &mut self,
             batch: engine::ExecutionBatch,
-        ) -> Result<(), engine::ExecutorSubmitError> {
+        ) -> Result<(), engine::WorkerSubmitError> {
             self.inner.submit(batch)
         }
 
         fn poll(
             &mut self,
             timeout: Duration,
-        ) -> Result<Option<engine::BatchResult>, engine::ExecutorError> {
+        ) -> Result<Option<engine::BatchResult>, engine::WorkerError> {
             self.inner.poll(timeout)
         }
 
-        fn close(&mut self) -> Result<(), engine::ExecutorError> {
+        fn close(&mut self) -> Result<(), engine::WorkerError> {
             // The wait is bounded so that a blocked runtime fails the test
             // instead of hanging it.
             let released = self.release.recv_timeout(Duration::from_secs(5)).is_ok();
@@ -3837,18 +3837,18 @@ mod tests {
         }
     }
 
-    /// Shutdown waits for executor teardown without holding the runtime
+    /// Shutdown waits for worker teardown without holding the runtime
     /// thread: on a single-threaded runtime, the task that ends the teardown
     /// runs while `shutdown` is pending.
     #[tokio::test(flavor = "current_thread")]
-    async fn shutdown_leaves_the_runtime_free_during_executor_teardown() {
+    async fn shutdown_leaves_the_runtime_free_during_worker_teardown() {
         let (release_tx, release) = std::sync::mpsc::channel();
         let released = Arc::new(AtomicBool::new(false));
-        let core = SchedulerHandle::with_executor(
+        let core = SchedulerHandle::with_worker(
             &engine::sim_args("sim-model"),
             engine::SchedulerConfig::default(),
-            Box::new(GatedCloseExecutor {
-                inner: SimExecutor::new(SimEngine::new()),
+            Box::new(GatedCloseWorker {
+                inner: SimWorker::new(SimEngine::new()),
                 release,
                 released: Arc::clone(&released),
             }),
@@ -3864,7 +3864,7 @@ mod tests {
 
         assert!(
             released.load(Ordering::SeqCst),
-            "executor teardown held the runtime thread"
+            "worker teardown held the runtime thread"
         );
     }
 

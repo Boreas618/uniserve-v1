@@ -2,7 +2,7 @@
 //! on its own interval, checks the answer, and hands it to the point that
 //! applies it.
 //!
-//! The load is the executor's to measure, so the test states it: the routed
+//! The load is the worker's to measure, so the test states it: the routed
 //! tokens per expert are published through the scheduler's handle, a step asks
 //! the policy about them, and the layout it answers is what
 //! `take_expert_order` hands to the world setup (§7.6). The programs are toy
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use engine::{CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimExecutor};
+use engine::{CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimWorker};
 use scheduling::guest::decision::Plan;
 use scheduling::guest::limits::Limits;
 use scheduling::guest::view::{ExpertLoad, ExpertOrder};
@@ -92,7 +92,7 @@ fn escape(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// The load the executor publishes: two experts, two ranks, a skew toward the
+/// The load the worker publishes: two experts, two ranks, a skew toward the
 /// first expert.
 fn load() -> ExpertLoad {
     ExpertLoad {
@@ -112,7 +112,7 @@ impl World {
         let mut sim = SimEngine::new();
         sim.set_text_len(16);
         let scheduler = support::scheduler(
-            Box::new(SimExecutor::new(sim)),
+            Box::new(SimWorker::new(sim)),
             SimEngine::special_tokens(),
             8,
         )
@@ -183,7 +183,7 @@ fn a_published_load_is_asked_about_and_the_order_reaches_the_handoff() {
     // and the one the world setup would apply.
     let world = World::start(ExpertOrder { layout: vec![1, 0] });
 
-    // Until the executor publishes the routed tokens there is nothing to
+    // Until the worker publishes the routed tokens there is nothing to
     // decide, so no order is waiting.
     assert!(
         world.handle.take_expert_order().is_none(),

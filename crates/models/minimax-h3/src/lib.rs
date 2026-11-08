@@ -25,12 +25,12 @@
 //!
 //! [`partition::Partition`] is the deployment's *mathematical* split - the denoiser's Ulysses
 //! sequence degree and the text encoder's tensor-parallel position - not a runner, a communicator
-//! or a rank layout. The layers apply it; the executor owns every runtime object.
+//! or a rank layout. The layers apply it; the worker owns every runtime object.
 //!
 //! ## The model
 //!
 //! [`load`](fn@crate::load) composes the blocks the checkpoint holds into `nn::Model`; `uniserve engine` is the one
-//! place a model class is named, and it hands the model to the executor, which serves each block by
+//! place a model class is named, and it hands the model to the worker, which serves each block by
 //! the capability it implements.
 
 pub mod attention;

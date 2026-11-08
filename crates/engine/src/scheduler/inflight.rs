@@ -6,7 +6,7 @@
 //! completions queued until their call may apply, deferred terminal events,
 //! lifecycle commands awaiting a batch, and the transfer reservation count.
 //!
-//! Results arrive in executor order, but a request's calls apply in submission
+//! Results arrive in worker order, but a request's calls apply in submission
 //! order: a queued completion is released only when its call is at the front
 //! of the request's queue. The exception is an independent call, one with
 //! `InflightInput::Media` that does not advance state, which applies as soon
@@ -70,9 +70,9 @@ pub(super) struct PendingBatch {
     /// invalid; the final result must leave this set empty.
     pub(super) calls: HashSet<(RequestKey, CallId)>,
     /// Lifecycle commands other than `Start`, in batch order, so a position
-    /// here is the executor's `CommandResult::command_index`.
+    /// here is the worker's `CommandResult::command_index`.
     pub(super) commands: Vec<BatchCommand>,
-    /// Executor execution time accumulated across partial results, in
+    /// Worker execution time accumulated across partial results, in
     /// microseconds.
     pub(super) worker_exec_us: u64,
     /// Whether the batch carries a `BatchKind::Prefill` call, which the room
@@ -81,7 +81,7 @@ pub(super) struct PendingBatch {
     /// The query tokens of the batch's calls, which the once-a-second report
     /// states beside its batch time.
     pub(super) tokens: u64,
-    /// The kind of step the batch's executor time measures, if any.
+    /// The kind of step the batch's worker time measures, if any.
     pub(super) measured: Option<speculation::MeasuredStep>,
 }
 
@@ -96,7 +96,7 @@ fn query_tokens(call: &ipc::Call) -> u64 {
 
 /// Owns submitted identities and their lifetime through ordered reconciliation.
 pub(super) struct Inflight {
-    /// Planned batches the executor has not accepted yet, in dispatch order.
+    /// Planned batches the worker has not accepted yet, in dispatch order.
     pub(super) pending_submissions: VecDeque<ExecutionBatch>,
     /// Transfer calls (nonzero `max_transfer_bytes`) holding a reservation,
     /// bounded by `Scheduler::transfer_capacity`.
@@ -117,10 +117,10 @@ pub(super) struct Inflight {
     pub(super) pending_batches: HashMap<u64, PendingBatch>,
     /// `Finish` and `Free` commands awaiting a batch to carry them.
     pub(super) pending_commands: VecDeque<BatchCommand>,
-    /// Requests an executor refused whose calls were still in flight: their
+    /// Requests a worker refused whose calls were still in flight: their
     /// later calls, submitted before the refusal arrived, fail for want of
     /// the refused call's products, and such a failure is the refusal's,
-    /// not an executor fault (`Scheduler::on_executor_error`). A request
+    /// not a worker fault (`Scheduler::on_worker_error`). A request
     /// leaves once none of its calls is in flight.
     pub(super) refused: HashSet<RequestKey>,
 }
@@ -144,7 +144,7 @@ impl Inflight {
     /// Registers the call identities and command receipts owned by one
     /// scheduled batch.
     ///
-    /// `Start` admissions are left out of the receipts because the executor
+    /// `Start` admissions are left out of the receipts because the worker
     /// numbers command results without them.
     pub(super) fn register_pending_batch(&mut self, batch: &ExecutionBatch, started: Instant) {
         self.pending_batches.insert(
@@ -312,11 +312,11 @@ impl Inflight {
         Some(inflight)
     }
 
-    /// Removes one call an executor failure retired, regardless of its queue
+    /// Removes one call a worker failure retired, regardless of its queue
     /// position, and releases its transfer reservation.
     ///
     /// Returns `None` when the batch is unknown or no longer owns the call, or
-    /// when the request's queue does not hold it; the executor-failure path
+    /// when the request's queue does not hold it; the worker-failure path
     /// treats that as engine-fatal. Once the call has left the batch's
     /// `calls`, a missing queue entry is reported without restoring it.
     pub(super) fn retire_call(

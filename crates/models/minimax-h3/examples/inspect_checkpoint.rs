@@ -111,7 +111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Which keys each block asks for, checked against the checkpoint's index without loading it.
     //
-    // `load` publishes every tensor through `RetainedWeights`, which only the executor implements,
+    // `load` publishes every tensor through `RetainedWeights`, which only the worker implements,
     // so no test in this crate can execute a block's load path; the failure that hides there is the
     // narrow one: a key the loader names that the checkpoint does not hold. The index states every
     // tensor's name whether or not its shard is present, so that failure is a host fact and this

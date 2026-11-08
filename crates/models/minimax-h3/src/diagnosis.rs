@@ -10,7 +10,7 @@
 //! **Nothing here is a diagnostic hook.** No model launch reaches this module: it encodes bytes a
 //! caller already has on the host, and a run that names no `--diag` never calls it. A hook in the
 //! model would put a file write in the control path of every request, which is why the protocol puts
-//! the runner's dumps in the executor and leaves the model pure arithmetic.
+//! the runner's dumps in the worker and leaves the model pure arithmetic.
 
 use ops::DType;
 use std::path::Path;

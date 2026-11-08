@@ -23,7 +23,7 @@
 //! The layer holds the geometry — tile rows, heads, features, the rotation's extent — and the
 //! epsilon of the Q/K normalization. Every activation, every score and every derived table is the
 //! caller's view: the block composes this layer with its attention projections and its cache, and
-//! the executor owns the buffers.
+//! the worker owns the buffers.
 
 use ops::descriptor::Float;
 use ops::segments::{self, MAX_MEMBERS};

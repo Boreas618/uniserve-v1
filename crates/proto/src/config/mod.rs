@@ -363,7 +363,7 @@ impl CudaGraphConfig {
     /// These are the bounds the engine admits a batch under and the bounds a
     /// scheduling policy's declared limits must fit inside
     /// (`crate::catalog::largest_tier`, which both ends read). Absent when the
-    /// deployment states no catalog: the executor's own catalogue then bounds
+    /// deployment states no catalog: the worker's own catalogue then bounds
     /// the batch, and there is no stated figure to hold a policy against.
     pub fn tiers(&self) -> crate::catalog::Tiers {
         let sizes = |values: &Option<Vec<NonZeroU32>>| -> Vec<u32> {

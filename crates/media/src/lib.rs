@@ -1,10 +1,10 @@
 //! H.264/AAC output encoding and MP4 muxing, conditional media reading, and
 //! the host resamplers a model conditions media on.
 //!
-//! The design places this crate under the executor: media work is blocking
+//! The design places this crate under the worker: media work is blocking
 //! host work, run on the main process's blocking thread pool beside module
 //! loading and transfer reads (`specs/worker.md` §2.4, §4.5). The crate holds
-//! no executor types: the executor copies device results into host buffers,
+//! no worker types: the worker copies device results into host buffers,
 //! hands them here, and copies what the readers produce back to the device.
 //!
 //! A video request's output is assembled from independently encoded media

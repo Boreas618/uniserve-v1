@@ -9,18 +9,18 @@
 //!
 //! A request's KV lives in physical cache units. One logical page of a cache
 //! group holds `block_size` tokens and occupies `units_per_page` units
-//! (`ipc::CacheGroup`, reported by the executor at handshake and kept in
+//! (`ipc::CacheGroup`, reported by the worker at handshake and kept in
 //! `MainProcessInfo`). The KV-write kernels address one row of the cache planes per
 //! token and store it themselves as `unit * block_size + position % block_size`,
 //! the number this module states in the batch's slot column. Nothing else
-//! derives it: the executor submits the column, it does not build it.
+//! derives it: the worker submits the column, it does not build it.
 //!
 //! A captured decode's metadata - rows, block tables, positions - reaches the
 //! device as the batch's columns each step, gathered on the host here. A
 //! device-side gather (`ops/kernels/attention_gather_rows` and
 //! `attention_gather_decode_inputs`, which exist once the runners replay a
 //! capture whose rows moved) would read the same tables on the device instead;
-//! which shape the executor captures is its decision, and either reads the slot
+//! which shape the worker captures is its decision, and either reads the slot
 //! numbers this module computes.
 //!
 //! The mapping is a pure function of a table, the group's page geometry and the
@@ -29,7 +29,7 @@
 
 use std::ops::Range;
 
-/// A cache group's page shape, as the executor reported it (`ipc::CacheGroup`).
+/// A cache group's page shape, as the worker reported it (`ipc::CacheGroup`).
 ///
 /// Only `block_size` is needed to turn a position into a slot; `units_per_page`
 /// is carried so the mapping can refuse a page shape it cannot address (see
@@ -59,7 +59,7 @@ pub(crate) struct PageGeometry {
 ///   A page of several units holds different layers' columns in each unit, so
 ///   one slot number per token addresses one of them; the kernels index one unit
 ///   per page today, and a multi-unit page needs a column per unit, which is a
-///   decision for the executor rather than a guess here.
+///   decision for the worker rather than a guess here.
 pub(crate) fn slot_mapping(
     table: &ipc::BlockTable,
     page: PageGeometry,

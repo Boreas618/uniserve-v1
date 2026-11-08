@@ -2,7 +2,7 @@
 //!
 //! A canvas-generating request prefills its prompt without sampling, then
 //! generates text one block at a time: token-denoising steps run on the
-//! executor-resident canvas of the block until a step stops it and reports the
+//! worker-resident canvas of the block until a step stops it and reports the
 //! block's tokens, which are published and, unless they end the request,
 //! committed to the context by a causal prefill before the next block
 //! starts. The simulator stops block `b` of request `r` at step
@@ -10,8 +10,8 @@
 //! text `sim_text_token(r, i)` followed by EOS, so the expected output is
 //! known exactly. A step may be queued behind the one still in flight,
 //! predicated on its completion; behind the step that stops the block it is
-//! a no-op. Tests observe calls at the executor boundary, the protocol the
-//! executor consumes.
+//! a no-op. Tests observe calls at the worker boundary, the protocol the
+//! worker consumes.
 
 use crate::support;
 
@@ -19,7 +19,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use engine::{
-    BatchEvent, CommandSender, EventRx, ExecutionBatch, SchedulerConfig, SimEngine, SimExecutor,
+    BatchEvent, CommandSender, EventRx, ExecutionBatch, SchedulerConfig, SimEngine, SimWorker,
     sim_canvas_stop_step, sim_text_token,
 };
 use engine::{
@@ -53,7 +53,7 @@ fn config() -> SchedulerConfig {
     }
 }
 
-/// A block-diffusion executor with 16-token cache pages whose synthetic text
+/// A block-diffusion worker with 16-token cache pages whose synthetic text
 /// holds `text_len` tokens before EOS.
 fn worker(text_len: usize) -> SimEngine {
     let mut sim = SimEngine::new();
@@ -96,7 +96,7 @@ fn canvas_request(request_id: u64, prompt_len: u32, max_tokens: usize) -> Genera
 }
 
 /// A block-diffusion scheduler running on its own thread, with the batches
-/// its executor accepts.
+/// its worker accepts.
 struct Running {
     handle: CommandSender,
     batches: crossbeam_channel::Receiver<BatchEvent>,
@@ -105,11 +105,10 @@ struct Running {
 
 impl Running {
     fn start(sim: SimEngine, config: SchedulerConfig) -> Self {
-        let mut executor = SimExecutor::new(sim);
-        let batches = executor.observe();
+        let mut worker = SimWorker::new(sim);
+        let batches = worker.observe();
         let scheduler =
-            support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config)
-                .unwrap();
+            support::scheduler_with(Box::new(worker), SimEngine::special_tokens(), config).unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = CommandSender::new(tx);
         let thread = thread::spawn(move || scheduler.run(rx));
@@ -135,7 +134,7 @@ impl Running {
             .collect()
     }
 
-    /// Stops the scheduler and returns its executor's submissions and
+    /// Stops the scheduler and returns its worker's submissions and
     /// resolutions, in order.
     fn stop_events(self) -> Vec<BatchEvent> {
         self.handle.shutdown();
@@ -592,8 +591,8 @@ fn a_canvas_beyond_the_step_budget_fails_to_start() {
         chunked_prefill_size: 8,
         ..config()
     };
-    let executor = SimExecutor::new(worker(40));
-    let error = support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config)
+    let worker = SimWorker::new(worker(40));
+    let error = support::scheduler_with(Box::new(worker), SimEngine::special_tokens(), config)
         .err()
         .expect("a 16-token canvas exceeds an 8-token step budget");
     assert!(error.to_string().contains("step budget"), "{error}");
@@ -639,10 +638,10 @@ fn a_waiting_prompt_is_prefilled_while_a_block_denoises() {
     let generating = canvas_request(2, 16, CANVAS as usize);
     assert_eq!(sim_canvas_stop_step(RequestId(2), 0, MAX_STEPS), 2);
     let waiting = canvas_request(3, 200, CANVAS as usize);
-    let mut executor = SimExecutor::new(sim);
-    let observed = executor.observe();
+    let mut worker = SimWorker::new(sim);
+    let observed = worker.observe();
     let scheduler =
-        support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config).unwrap();
+        support::scheduler_with(Box::new(worker), SimEngine::special_tokens(), config).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let generating_events = handle.submit(generating).unwrap();

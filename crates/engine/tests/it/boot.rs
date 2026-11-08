@@ -1,6 +1,6 @@
 //! The in-process boot: a main process that holds its own devices starts its
 //! scheduler from its launch arguments and the limits of its pool
-//! (`SchedulerConfig::of`), and serves over the executor's own batch path
+//! (`SchedulerConfig::of`), and serves over the worker's own batch path
 //! (`SchedulerHandle::over_batches`), here with no device.
 //!
 //! This test states what that composition has to produce: a handle the epoch's
@@ -8,7 +8,7 @@
 //! inventory is the only statement of what it serves, and one request served
 //! through it to a token the pool itself sampled.
 //!
-//! The pool stands in for the executor only: it is handed the mechanism's batch
+//! The pool stands in for the worker only: it is handed the mechanism's batch
 //! and answers its calls. What the boot derives — the group, the budgets, the
 //! cache geometry, the tokenizer's bounds — is the code under test.
 
@@ -19,13 +19,13 @@ use engine::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerConfig,
     SchedulerHandle, Stage,
 };
-use executor::batch::{
+use ipc::{ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams, TimingCounters};
+use proto::config::BlockConfig;
+use worker::batch::{
     Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
     SubmissionId,
 };
-use executor::completion::Outcome;
-use ipc::{ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams, TimingCounters};
-use proto::config::BlockConfig;
+use worker::completion::Outcome;
 
 /// How long a command answer may take.
 ///
@@ -67,7 +67,7 @@ fn rank(host: &str) -> MainProcessInfo {
         max_batch_calls: 16,
         max_batch_tokens: 512,
         // A text pool serves token generation, so it advertises the paged KV
-        // pool every such executor has (`MainProcessInfo::default`): an executor with no
+        // pool every such worker has (`MainProcessInfo::default`): a worker with no
         // prefix cache is refused a token request at submission, which is the
         // rule for a media-only rank and not for this one.
         buffer_pool_bytes: 1 << 20,
@@ -75,7 +75,7 @@ fn rank(host: &str) -> MainProcessInfo {
     }
 }
 
-/// A text pool of one rank named `model`: what the executor reports of itself.
+/// A text pool of one rank named `model`: what the worker reports of itself.
 fn pool() -> Inventory {
     Inventory {
         group: "model".to_owned(),
@@ -199,12 +199,12 @@ impl Serving {
 }
 
 impl Batches for Serving {
-    fn submit(&self, batch: Batch) -> Result<Submission, executor::Error> {
+    fn submit(&self, batch: Batch) -> Result<Submission, worker::Error> {
         *self.submitted.lock().expect("the pool's batches") += 1;
         Ok(self.serve(batch))
     }
 
-    fn shadow(&self, batch: Batch) -> Result<Submission, executor::Error> {
+    fn shadow(&self, batch: Batch) -> Result<Submission, worker::Error> {
         Ok(self.serve(batch))
     }
 
@@ -252,7 +252,7 @@ fn install(handle: &SchedulerHandle, pool: &Serving) {
 fn the_facts_boot_a_main_process_that_serves_a_request() {
     let serving = Arc::new(Serving::new(vec![pool()]));
     let batches: Arc<dyn Batches> = serving.clone();
-    // The boot's whole shape: the facts of a launch file, the executor's batch
+    // The boot's whole shape: the facts of a launch file, the worker's batch
     // path, one handle. Nothing is launched: the pool is the rank.
     let (args, limits) = launch();
     let handle = SchedulerHandle::over_batches(&args, limits, batches)
@@ -296,6 +296,6 @@ fn the_facts_boot_a_main_process_that_serves_a_request() {
     );
     assert!(
         *serving.submitted.lock().expect("the pool's batches") > 0,
-        "the executor was handed the work the facts' budgets admit"
+        "the worker was handed the work the facts' budgets admit"
     );
 }

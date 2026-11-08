@@ -1,13 +1,13 @@
 //! The communicator a partitioned block runs its collectives through.
 //!
 //! The design's [`Forward`](crate::Forward) carries `Option<&Communicator>` (specs/worker.md 4.3):
-//! a non-owning borrowing of the NCCL communicator the executor created for this rank. The CUDA
+//! a non-owning borrowing of the NCCL communicator the worker created for this rank. The CUDA
 //! boundary's collectives take `&mut Communicator` because NCCL calls into one communicator must
-//! not interleave, while a forward holds its resources immutably. [`Group`] is the box the executor
-//! puts its communicator in: it owns the communicator, serializes access to it on the one executor
+//! not interleave, while a forward holds its resources immutably. [`Group`] is the box the worker
+//! puts its communicator in: it owns the communicator, serializes access to it on the one worker
 //! thread, and offers the collectives a layer needs through `&self`.
 //!
-//! One executor thread issues every job of its device (specs/worker.md 2.4), so the lock here is not
+//! One worker thread issues every job of its device (specs/worker.md 2.4), so the lock here is not
 //! contention: it is the type-level statement that a forward borrows the group and does not own it,
 //! and it is what lets the runners of one device share a group by `Arc` across the move to their
 //! device thread.

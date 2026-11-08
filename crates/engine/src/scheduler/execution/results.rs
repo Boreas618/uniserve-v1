@@ -7,7 +7,7 @@ use super::*;
 use crate::scheduler::completion::{BatchReport, CallCompletion};
 use ipc::{ForwardMode, MediaCall, TransferMode};
 
-/// Describes a rejected executor result for the request's terminal error and
+/// Describes a rejected worker result for the request's terminal error and
 /// its error finish's log line: the rejection, then the call it answered.
 fn rejection_cause(call: &Call, error: &generation::GenerationResultError) -> String {
     format!(
@@ -40,14 +40,14 @@ impl Scheduler {
         if !known || duplicate {
             if let Some(state) = self.media_state_mut(id) {
                 state.terminal_intent =
-                    TerminalIntent::Failure("executor returned an unknown media call".to_string());
+                    TerminalIntent::Failure("worker returned an unknown media call".to_string());
             } else if self.running.contains_key(&id) {
                 self.finish(id, FinishReason::Error);
             }
             return;
         }
 
-        // Output storage the executor could not claim fails the call rather
+        // Output storage the worker could not claim fails the call rather
         // than dropping its completion, so request-local ordering still sees
         // the call return.
         // The claim moves into the pending completion, which keeps its storage
@@ -89,9 +89,9 @@ impl Scheduler {
     ///
     /// A result is valid when it succeeded, names the submitted call, carries
     /// an artifact exactly when it is the final muxing call, and, for a
-    /// denoising step, advances the trajectory's completed steps the executor
+    /// denoising step, advances the trajectory's completed steps the worker
     /// reports. The first valid result marks
-    /// the request registered with its executors. An invalid result records a
+    /// the request registered with its workers. An invalid result records a
     /// failure intent instead of advancing anything. A valid result of a
     /// request that has not already failed frees the products the call
     /// consumed. Once no call of the request remains in flight, a terminal
@@ -121,7 +121,7 @@ impl Scheduler {
         } else {
             media.is_none()
         };
-        // The executor reports the steps it has completed; a denoising result
+        // The worker reports the steps it has completed; a denoising result
         // that does not advance the trajectory would be scheduled again
         // without end. A latent preparation opens the trajectory at the step
         // it restored, or at zero.
@@ -145,9 +145,9 @@ impl Scheduler {
             && step_valid;
         if valid
             && let Some(state) = self.media_state_mut(id)
-            && state.admission_state == ExecutorRegistration::InFlight
+            && state.admission_state == WorkerRegistration::InFlight
         {
-            state.admission_state = ExecutorRegistration::Registered;
+            state.admission_state = WorkerRegistration::Registered;
         }
         // A completed call is the request advancing, so its deadline restarts: a media request
         // emits no token, and without this one that outlives the policy's timeout reads as starved.
@@ -159,7 +159,7 @@ impl Scheduler {
         }
 
         // A request that already failed only drains its remaining calls. A
-        // executor that refuses the request states why, and the client is told.
+        // worker that refuses the request states why, and the client is told.
         if !already_failed {
             if !valid {
                 tracing::warn!(
@@ -178,7 +178,7 @@ impl Scheduler {
                 if let Some(state) = self.media_state_mut(id) {
                     state.terminal_intent = match refusal {
                         Some(reason) => TerminalIntent::Rejected(reason),
-                        None => TerminalIntent::Failure("media executor call failed".to_string()),
+                        None => TerminalIntent::Failure("media worker call failed".to_string()),
                     };
                 }
             } else if let Some(state) = self.media_state_mut(id) {
@@ -383,7 +383,7 @@ impl Scheduler {
         self.watchdog.finished(request);
         self.running_order.retain(|candidate| *candidate != id);
         // The pins of its stored trajectory end, and a store not yet carried
-        // to its executors is aborted; so do its encoder outputs' pins and
+        // to its workers is aborted; so do its encoder outputs' pins and
         // reservations.
         if let Some(store) = self.trajectories.as_mut() {
             store.forget(id);
@@ -430,9 +430,9 @@ impl Scheduler {
         }
         self.output.retire(id, state.output);
 
-        // No executor holds state for a request whose admission was never
+        // No worker holds state for a request whose admission was never
         // placed in a batch, so there is nothing to retire remotely.
-        if state.admission_state == ExecutorRegistration::Unsubmitted {
+        if state.admission_state == WorkerRegistration::Unsubmitted {
             if let Err(unknown) = state.allocations.free(&mut self.storage) {
                 self.invariant_broken(&unknown.to_string());
             }
@@ -456,7 +456,7 @@ impl Scheduler {
         );
     }
 
-    /// Removes the in-flight call an executor result names, releasing its
+    /// Removes the in-flight call a worker result names, releasing its
     /// transfer reservation and its domain credit.
     ///
     /// The call must be at the front of its request's queue, unless it is an
@@ -533,10 +533,10 @@ impl Scheduler {
         if !self.inflight.pending_batches.contains_key(&result_batch_id) {
             tracing::error!(
                 batch_id = result_batch_id,
-                "executor returned a result for an unknown logical batch"
+                "worker returned a result for an unknown logical batch"
             );
             self.fatal = true;
-            self.fail_all_running("executor returned a result for an unknown logical batch");
+            self.fail_all_running("worker returned a result for an unknown logical batch");
             return;
         }
 
@@ -583,7 +583,7 @@ impl Scheduler {
                     batch_id = result_batch_id,
                     request_id = record.request_key.request_id.0,
                     call_id = ?record.call_id,
-                    "executor returned a duplicate or unknown call result"
+                    "worker returned a duplicate or unknown call result"
                 );
                 invalid_result = true;
                 continue;
@@ -636,7 +636,7 @@ impl Scheduler {
         }
         if invalid_result {
             self.fatal = true;
-            self.fail_all_running("executor returned an invalid call result");
+            self.fail_all_running("worker returned an invalid call result");
             return;
         }
 
@@ -692,7 +692,7 @@ impl Scheduler {
             for (index, command) in pending.commands.into_iter().enumerate() {
                 let failed = report.command_results.iter().any(|result| {
                     result.command_index == index as u32
-                        && result.outcome == crate::executor::CommandOutcome::Failed
+                        && result.outcome == crate::worker::CommandOutcome::Failed
                 });
                 if failed {
                     match command {
@@ -715,7 +715,7 @@ impl Scheduler {
                 .timing
                 .last_worker_exec_us
                 .store(worker_us, Ordering::Relaxed);
-            // An executor that reports its execution time measures the step.
+            // A worker that reports its execution time measures the step.
             if let Some(step) = measured.filter(|_| worker_us > 0) {
                 self.speculation_meter.observe_step(step, worker_us);
             }
@@ -743,7 +743,7 @@ impl Scheduler {
             self.record_worker_forward_stats(Some(stats));
         }
 
-        // Queuing decouples executor arrival order from request-local dependency
+        // Queuing decouples worker arrival order from request-local dependency
         // order. `take_ready_completions` releases only completions whose call
         // is at the front of its request's queue, or independent media calls
         // whose input producers have resolved; applying one can make others
@@ -770,7 +770,7 @@ impl Scheduler {
                 let Some((call, input)) = self.pop_inflight(record.request_key, call_id) else {
                     if let Some(state) = self.media_state_mut(id) {
                         state.terminal_intent = TerminalIntent::Failure(
-                            "executor returned an out-of-order media call".to_string(),
+                            "worker returned an out-of-order media call".to_string(),
                         );
                     } else if self.running.contains_key(&id) {
                         self.finish(id, FinishReason::Error);
@@ -893,7 +893,7 @@ impl Scheduler {
                     }
                 }
 
-                // Decoding closes the executor's latent trajectory. If that
+                // Decoding closes the worker's latent trajectory. If that
                 // call completes during migration, publish its image before
                 // retiring the request: the daemon can carry the completed
                 // image, but those released latent pages cannot be stored.
@@ -905,7 +905,7 @@ impl Scheduler {
                     && record.status == CallStatus::Ok;
                 // Other terminal requests take no further semantic effect.
                 // A preempted image's denoising progress still follows the
-                // executor's committed trajectory, which its store continues.
+                // worker's committed trajectory, which its store continues.
                 let semantic_blocked = self
                     .running
                     .get(&id)
@@ -1076,7 +1076,7 @@ impl Scheduler {
             }
 
             // Resolve semantic effects in lifecycle priority and stable arrival
-            // order, independent of the executor's physical completion order.
+            // order, independent of the worker's physical completion order.
             to_resolve.sort_by_key(|(priority, seq_index, ..)| (*priority, *seq_index));
             for (_priority, _seq_index, id, call, record, media, public_tokens_before) in to_resolve
             {
@@ -1121,7 +1121,7 @@ impl Scheduler {
         }
     }
 
-    /// Merges optional executor forward-pass counters into scheduler statistics.
+    /// Merges optional worker forward-pass counters into scheduler statistics.
     pub(in crate::scheduler) fn record_worker_forward_stats(&self, stats: Option<&ForwardStats>) {
         let Some(stats) = stats else {
             return;

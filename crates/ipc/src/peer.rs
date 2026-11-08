@@ -30,7 +30,7 @@ pub const VERSION: &str = proto::BUILD;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub struct PeerRegistration {
-    /// The executor rank this main process serves within the epoch. The
+    /// The worker rank this main process serves within the epoch. The
     /// scheduler node's fan-out and an expert group's agreement address ranks
     /// by it.
     pub rank: u32,

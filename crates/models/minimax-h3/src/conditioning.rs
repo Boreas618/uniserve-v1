@@ -3,7 +3,7 @@
 //! The text encoder's Qwen hidden states are `text_dim` wide; the refiner projects them to the
 //! transformer's width and refines each document with dense bidirectional attention and a
 //! pre-normalized SwiGLU (`uniserve/models/minimax_h3/conditioning.py`). It runs once per request -
-//! the executor keeps its output in the request's state and hands it to every denoising step - so
+//! the worker keeps its output in the request's state and hands it to every denoising step - so
 //! it is a plain block of the transformer component, not a schedule.
 //!
 //! ## Documents in one batch

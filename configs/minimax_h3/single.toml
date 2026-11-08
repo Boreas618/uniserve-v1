@@ -4,7 +4,7 @@
 # run uses, because nothing about it depends on a second device.
 #
 # Every component is placed on this rank, the media ones included: `video_codec`, `muxer` and
-# `media_reader` encode and assemble on the host inside the main process (the executor's `Media`
+# `media_reader` encode and assemble on the host inside the main process (the worker's `Media`
 # lane, `MediaStage`), and a main process serves CUDA devices only - a rank on `cpu` is refused
 # when the node is launched. So a media component is a component of this group; what it runs on
 # is the host, and where it is placed is this rank.

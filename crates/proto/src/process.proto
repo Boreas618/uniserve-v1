@@ -492,10 +492,10 @@ message Report {
     // `Purge` took effect: no batch or graph uses a generation older than
     // `generation` (§7.3 step 6).
     Purged purged = 6;
-    // A job ran past half the watchdog timeout in an executor (§2.4).
+    // A job ran past half the watchdog timeout in a worker (§2.4).
     Stalled stalled = 7;
     // A failure the main process itself observed, such as an error that
-    // makes an executor unusable (§7.3 step 4).
+    // makes a worker unusable (§7.3 step 4).
     Fault fault = 8;
     // The precopy failed: the new generation was not loaded, trialled or
     // prepared, and is dropped; service goes on with the current one (§7.3
@@ -583,11 +583,11 @@ message Purged {
   uint64 generation = 1;
 }
 
-// A job ran past half the watchdog timeout in an executor (§2.4): the epoch
-// it belongs to, the executor's batch (not a scheduler step), the job kind
+// A job ran past half the watchdog timeout in a worker (§2.4): the epoch
+// it belongs to, the worker's batch (not a scheduler step), the job kind
 // and how long it has run. `job` is one of `forward`, `replay`, `capture`,
 // `rebind`, `copy`, `fence`; a string rather than an enum keeps the
-// executor's kinds extensible without a protocol revision, and a daemon of
+// worker's kinds extensible without a protocol revision, and a daemon of
 // another build records what its main process says.
 message Stalled {
   uint64 generation = 1;

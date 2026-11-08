@@ -1,14 +1,14 @@
 //! The in-process path serving a request, without a device.
 //!
 //! `in_process.rs` states what `SchedulerHandle::over_batches` refuses; this
-//! states what it does. The pool here is `executor::batch::Batches` and answers
+//! states what it does. The pool here is `worker::batch::Batches` and answers
 //! every batch it is handed with the mechanism's own values — one
 //! `CallOutput::completed` per call it was given, and the batch's timing — so
 //! the whole path runs: the policy admits, the mechanism assembles columns and
-//! a shape, the arm states them to the executor and files the report it gets
+//! a shape, the arm states them to the worker and files the report it gets
 //! back, and the request emits a token.
 //!
-//! What the stub does not stand in for: the device. A real executor captures
+//! What the stub does not stand in for: the device. A real worker captures
 //! graphs, stages columns into its arena and derives the token from the model;
 //! this one is handed the mechanism's batch and answers it. Everything between
 //! those two points is the code under test.
@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use engine::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
 };
-use executor::batch::{Batch, Batches};
 use ipc::{ImageParams, SamplingParams};
+use worker::batch::{Batch, Batches};
 
 use crate::support::SAMPLED;
 
@@ -112,7 +112,7 @@ fn install(handle: &SchedulerHandle, pool: &crate::support::Serving) {
 }
 
 #[test]
-fn a_request_is_served_through_the_executors_own_batch_path() {
+fn a_request_is_served_through_the_workers_own_batch_path() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
         "model",
     )]));
@@ -139,7 +139,7 @@ fn a_request_is_served_through_the_executors_own_batch_path() {
         .expect("the request is submitted");
 
     // The request emits a token: the mechanism admitted it, assembled a batch,
-    // the arm stated it to the executor, and the report came back through the
+    // the arm stated it to the worker, and the report came back through the
     // completion path to the request.
     let deadline = Instant::now() + FIRST_TOKEN;
     let mut first_token = None;
@@ -249,7 +249,7 @@ fn a_request_that_does_not_fit_a_slot_waits_for_one() {
 /// A request that ended leaves nothing for a boundary to wait on.
 ///
 /// The batch that closes a request carries lifecycle commands alone, and the
-/// in-process arm answers those itself: no executor ever reports that batch. A
+/// in-process arm answers those itself: no worker ever reports that batch. A
 /// window that kept it would never empty again, so every boundary that needs an
 /// empty window, a policy stage first of all, would wait for a result no one
 /// will send.
@@ -303,7 +303,7 @@ fn a_policy_stage_applies_after_a_request_ended() {
 /// no policy — `fcfs` included — can plan the work that would prefilled it, and
 /// the epoch dispatches nothing while requests queue behind it. This case
 /// states the mechanism's half: one text request, the real `fcfs` program, and
-/// a batch handed to the executor with no other help.
+/// a batch handed to the worker with no other help.
 #[test]
 fn an_admitted_request_is_prefilled_on_the_next_step() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
@@ -363,23 +363,23 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
 /// head scores them alike; only the nucleus differs.
 #[test]
 fn logprobs_report_the_model_distribution_under_a_cutoff() {
-    use engine::{Executor, SchedulerConfig, SchedulerHandle, SimEngine, SimExecutor};
+    use engine::{SchedulerConfig, SchedulerHandle, SimEngine, SimWorker, Worker};
     use std::thread;
 
     let candidates = |top_p: f32| -> Vec<ipc::TokenLogprob> {
         let mut sim = SimEngine::new();
         sim.set_text_len(8);
-        let executor = SimExecutor::new(sim);
-        let rank = executor
+        let worker = SimWorker::new(sim);
+        let rank = worker
             .info()
             .runtime_info()
             .expect("the sim states its rank");
-        let engine = SchedulerHandle::with_executor(
+        let engine = SchedulerHandle::with_worker(
             &engine::sim_args("logprobs"),
             SchedulerConfig::default(),
-            Box::new(executor),
+            Box::new(worker),
         )
-        .expect("the simulated executor serves");
+        .expect("the simulated worker serves");
         crate::support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
 
         let mut request = text_request(1, 2, 7);

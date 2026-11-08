@@ -3,7 +3,7 @@
 //! The head is a column-parallel projection across the tensor-parallel ranks: each rank holds a
 //! contiguous slice of the vocabulary rows, projects into its slice, the ranks all-gather the
 //! slices, and the padded tail the sharding added is removed (specs/worker.md 9, "lm_head 与
-//! logits"; the current `VocabParallelHead`). The row selection itself is the executor's: it
+//! logits"; the current `VocabParallelHead`). The row selection itself is the worker's: it
 //! gathers the rows whose logits the batch asks for before calling the head, so the head reads a
 //! `[rows, hidden]` view and a graph replays over a fixed row count.
 
@@ -262,7 +262,7 @@ impl ParallelLMHead {
 
 /// Gather `rows` of `hidden` into a `[rows, hidden]` view, for the head.
 ///
-/// The executor calls this when it assembles a batch's logits requests: the operator moves whole
+/// The worker calls this when it assembles a batch's logits requests: the operator moves whole
 /// rows, so two implementations agree bit for bit.
 pub fn gather_rows(
     f: &Forward,

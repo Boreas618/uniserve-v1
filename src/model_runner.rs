@@ -1,12 +1,12 @@
 //! Each rank's model runner: how a main process loads, sizes and captures one rank of the epoch's
 //! engine configuration.
 //!
-//! `src/engine_main.rs` is the main process itself: the control thread, the device executors, the
+//! `src/engine_main.rs` is the main process itself: the control thread, the device workers, the
 //! schedulers and the hot update. Everything it needs *before* it can start a thread comes from an
 //! epoch's configuration - which devices, which buckets are captured, how much of each device the
 //! graphs may map, which blocking pools exist, which Program Server socket and targets this rank
 //! speaks to - and none of that belongs in `proto::config::EngineConfig`: the config fixes the epoch
-//! and must not learn how the executor assembles its devices, its buckets or its graphs. It also
+//! and must not learn how the worker assembles its devices, its buckets or its graphs. It also
 //! does not hold every input, because half of what the main process needs is a property of the node
 //! it runs on (`EngineArgs`) or of the devices it measured.
 //!
@@ -18,7 +18,7 @@
 //!
 //! The capacity plan - what the rank's resident memory is - is not here: it is resolved from a
 //! measured device against the reported capacity, which is the capacity negotiation's own area
-//! (`executor::memory::Memory::new`'s caller).
+//! (`worker::memory::Memory::new`'s caller).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -26,28 +26,28 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use executor::blocking::{BlockingKind, LaneLimits, Limits};
-use executor::capacity::{graph_storage_budget_bytes, graph_storage_bytes, quota};
-use executor::device::GraphStorage;
-use executor::memory::Memory;
-use executor::plan::{Buckets, Variant};
-use executor::runner::{Binding, NamedRunner, RunnerId};
-use executor::runners::causal_lm::{CausalLmRunner, Geometry, KvProvider, Shared};
-use executor::runners::resident::ResidentCache;
-use executor::stream::EventPool;
 use ipc::PhaseId;
 use ops::DType;
 use ops::Generation;
 use platform::DeviceId;
 use program_server::Target;
 use proto::request::{GenerationFeatures, GenerationLimits, GraphPolicy};
+use worker::blocking::{BlockingKind, LaneLimits, Limits};
+use worker::capacity::{graph_storage_budget_bytes, graph_storage_bytes, quota};
+use worker::device::GraphStorage;
+use worker::memory::Memory;
+use worker::plan::{Buckets, Variant};
+use worker::runner::{Binding, NamedRunner, RunnerId};
+use worker::runners::causal_lm::{CausalLmRunner, Geometry, KvProvider, Shared};
+use worker::runners::resident::ResidentCache;
+use worker::stream::EventPool;
 
 use proto::config::EngineArgs;
 
 /// One deployment's output and the media lane its stages run on.
 type SharedCodec = (
-    Arc<executor::runners::media::Output>,
-    executor::host::Lane<executor::runners::media::MediaWork>,
+    Arc<worker::runners::media::Output>,
+    worker::host::Lane<worker::runners::media::MediaWork>,
 );
 
 /// The buckets of a member of an expert union: each causal bucket, and the join, captured for the
@@ -71,7 +71,7 @@ fn expert_classes(buckets: &Buckets, capacity: u64) -> Buckets {
         buckets
             .iter()
             .copied()
-            .chain(std::iter::once(executor::plan::Bucket::expert_join()))
+            .chain(std::iter::once(worker::plan::Bucket::expert_join()))
             .flat_map(|bucket| {
                 // A step this graph would serve is within a quarter of the whole capacity, where the
                 // smaller shape saves little and the capture still costs its warmup's time.
@@ -83,7 +83,7 @@ fn expert_classes(buckets: &Buckets, capacity: u64) -> Buckets {
                 // A decode beside a peer's prefill of a few prompts: the step is that prefill's
                 // rows, which a graph of the whole capacity would shape every expert layer for.
                 let beside = bucket.variant.is_decode()
-                    || bucket.variant == executor::plan::Variant::ExpertJoin;
+                    || bucket.variant == worker::plan::Variant::ExpertJoin;
                 if beside && small < PREFILL_BESIDE && PREFILL_BESIDE.saturating_mul(4) <= capacity
                 {
                     classes.push(bucket.at_capacity(PREFILL_BESIDE));
@@ -168,10 +168,10 @@ impl RankModel {
     }
 }
 
-impl executor::data_plane::ModelLoad for RankModel {
+impl worker::data_plane::ModelLoad for RankModel {
     fn load(
         &self,
-        target: &executor::data_plane::Target,
+        target: &worker::data_plane::Target,
         weights: &mut dyn nn::RetainedWeights,
     ) -> std::result::Result<(), String> {
         let mut model_runner = self.model_runner.clone();
@@ -221,7 +221,7 @@ pub(crate) struct ModelRunner {
     /// (§7.2), the checkpoint, the world and the node's interfaces. A model runner that loads another
     /// checkpoint holds its own copy, whose configuration names that checkpoint.
     launch: Arc<EngineArgs>,
-    /// This rank's devices, as the executor's names for them.
+    /// This rank's devices, as the worker's names for them.
     devices: Vec<DeviceId>,
     /// The targets this rank resolves a module for (§5.3).
     targets: Vec<Target>,
@@ -242,7 +242,7 @@ pub(crate) struct ModelRunner {
     /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the model runner.
     mapping: Mapping,
     /// The expert union of this node's ranks, on a deployment whose experts are split.
-    union: Option<Arc<executor::runners::experts::Union>>,
+    union: Option<Arc<worker::runners::experts::Union>>,
 }
 
 /// A rank's places in its deployment's parallel groups.
@@ -413,7 +413,7 @@ impl ModelRunner {
     }
 
     /// One model runner per rank this process serves (§2.1: one main process drives every device of its
-    /// node, one executor each).
+    /// node, one worker each).
     ///
     /// A media deployment's ranks are its devices: a rank holds its own partition of the model on
     /// its own device, so each is planned, loaded and opened as a rank of its own. The text class
@@ -468,7 +468,7 @@ impl ModelRunner {
         // attention, its share of the experts, and a member of the union that runs their steps. A
         // deployment of dedicated expert ranks puts its attention ranks first in the union.
         let union = text.then(|| {
-            executor::runners::experts::Union::new(usize::try_from(union_ranks).unwrap_or(0))
+            worker::runners::experts::Union::new(usize::try_from(union_ranks).unwrap_or(0))
         });
         if text && count != union_ranks as usize {
             bail!(
@@ -536,11 +536,11 @@ impl ModelRunner {
         &self,
         device: DeviceId,
         model: &qwen3_moe::Qwen3Moe,
-    ) -> Result<Option<executor::runners::experts::Member>> {
+    ) -> Result<Option<worker::runners::experts::Member>> {
         let Some(union) = &self.union else {
             return Ok(None);
         };
-        let member = executor::runners::experts::Member::new(
+        let member = worker::runners::experts::Member::new(
             Arc::clone(union),
             self.transport_shape(device, model)?,
         );
@@ -584,8 +584,8 @@ impl ModelRunner {
             .device_bytes(model.experts_encoded()))
     }
 
-    /// The expert union this rank's executor answers wakes for.
-    pub(crate) fn union(&self) -> Option<(&Arc<executor::runners::experts::Union>, usize)> {
+    /// The expert union this rank's worker answers wakes for.
+    pub(crate) fn union(&self) -> Option<(&Arc<worker::runners::experts::Union>, usize)> {
         self.union
             .as_ref()
             .map(|union| (union, self.mapping.union_rank as usize))
@@ -604,7 +604,7 @@ impl ModelRunner {
 
     /// This rank as the one pool the scheduler plans against.
     ///
-    /// The ranks of a group run one batch together, and `executor::batch::Executors` hands it to
+    /// The ranks of a group run one batch together, and `worker::batch::Workers` hands it to
     /// each of them, so a scheduler sees the deployment as one rank whose batches are the group's.
     pub(crate) fn scheduled(&self) -> Self {
         let mut rank_runner = self.clone();
@@ -662,8 +662,8 @@ impl ModelRunner {
     /// The deployment's one output and media lane, which every rank's media stage shares.
     fn codec(
         &self,
-        rates: executor::runners::media::Rates,
-        blocking: &executor::blocking::ThreadPool,
+        rates: worker::runners::media::Rates,
+        blocking: &worker::blocking::ThreadPool,
     ) -> Result<SharedCodec> {
         let mut codec = self
             .codec
@@ -673,8 +673,8 @@ impl ModelRunner {
             return Ok(shared.clone());
         }
         let shared = (
-            Arc::new(executor::runners::media::Output::from_env(rates)?),
-            blocking.lane::<executor::runners::media::MediaWork>(BlockingKind::Media)?,
+            Arc::new(worker::runners::media::Output::from_env(rates)?),
+            blocking.lane::<worker::runners::media::MediaWork>(BlockingKind::Media)?,
         );
         *codec = Some(shared.clone());
         Ok(shared)
@@ -745,19 +745,19 @@ impl ModelRunner {
         &self.devices
     }
 
-    /// The device's completion events: one pool per rank, shared by its executors (§2.4).
+    /// The device's completion events: one pool per rank, shared by its workers (§2.4).
     pub(crate) fn events(&self) -> Arc<EventPool> {
         EventPool::new()
     }
 
     /// The device's graph storage: the buckets it captures and the pools' reservations (4.1).
     ///
-    /// The figures are capacity planning, so the derivation stays in the executor's capacity
+    /// The figures are capacity planning, so the derivation stays in the worker's capacity
     /// module and this reads its two answers: the graph reservation is the share of a device a
     /// rank may map for captured graphs, and the budget is the rank's quota of the device. The
     /// scratch reservation is a fraction of the graph pool, which the paired forward's page set and
     /// the shadow pair's region are carved from (7.3). The resident pool is reserved by whoever
-    /// carves it - `Memory`, through `Executor::pools()` - so the graph storage asks for none: a
+    /// carves it - `Memory`, through `Worker::pools()` - so the graph storage asks for none: a
     /// second figure here would be a second claim on the same bytes.
     /// `snapshot` is the state group's snapshot (`CachePlan::state_snapshot_bytes`, design 4.5),
     /// which the scratch pool has to hold beside the shadow region. The **reservation** is one
@@ -842,7 +842,7 @@ impl ModelRunner {
             // A count short of the streams that actually map is not a tuning error: the first
             // streams take the range whole and the next one is refused at `Pools::pool` with
             // "cannot give out N more", which reads as an allocator fault rather than a plan.
-            // `Executor::spawn` therefore refuses a device whose runners outnumber the streams the
+            // `Worker::spawn` therefore refuses a device whose runners outnumber the streams the
             // range was divided for, by name, before any capture.
             streams,
             scratch,
@@ -996,14 +996,14 @@ impl ModelRunner {
         device: DeviceId,
         pipeline: &Arc<minimax_h3::load::MinimaxH3>,
         generation: &Arc<Generation>,
-        blocking: &executor::blocking::ThreadPool,
+        blocking: &worker::blocking::ThreadPool,
         groups: &RankGroups,
     ) -> Result<Vec<NamedRunner>> {
-        use executor::runners::decoder as media_decoder;
-        use executor::runners::denoiser as media_denoiser;
-        use executor::runners::encoder as media_encoder;
-        use executor::runners::media as media_host;
         use nn::capability::Denoiser as _;
+        use worker::runners::decoder as media_decoder;
+        use worker::runners::denoiser as media_denoiser;
+        use worker::runners::encoder as media_encoder;
+        use worker::runners::media as media_host;
 
         if Some(&device) != self.devices.first() {
             bail!(
@@ -1033,12 +1033,12 @@ impl ModelRunner {
         // The buckets the deployment captures: an encode bucket per (rows, prompt capacity) and a
         // decode bucket per canvas. A denoiser derives its own from the candidates it walks, so the
         // set here is what the encoder and the decoder are bound with.
-        let mut encode_buckets: Vec<executor::plan::Bucket> = Vec::new();
+        let mut encode_buckets: Vec<worker::plan::Bucket> = Vec::new();
         let rows = u32::try_from(self.engine_config().max_running_requests.get())
             .context("more request slots than the protocol addresses")?;
         for capacity in &capacities {
             for row in 1..=rows {
-                encode_buckets.push(executor::plan::Bucket::prefill(
+                encode_buckets.push(worker::plan::Bucket::prefill(
                     row,
                     *capacity,
                     Variant::Encode,
@@ -1051,9 +1051,9 @@ impl ModelRunner {
         // whole clip asked one decode call for a raster no decoder produces.
         let window = minimax_h3::video_vae::decode_latents(&config.video_vae)
             * config.video_vae.temporal_compression();
-        let mut decode_buckets: Vec<executor::plan::Bucket> = Vec::new();
+        let mut decode_buckets: Vec<worker::plan::Bucket> = Vec::new();
         for candidate in &candidates {
-            let bucket = executor::plan::Bucket::clip(window, candidate.height, candidate.width);
+            let bucket = worker::plan::Bucket::clip(window, candidate.height, candidate.width);
             if !decode_buckets.contains(&bucket) {
                 decode_buckets.push(bucket);
             }
@@ -1091,12 +1091,12 @@ impl ModelRunner {
             Arc::clone(generation),
         )?
         .in_group(groups.tensor.clone());
-        let warm = executor::runners::warm::distinct(&**denoiser, &candidates);
+        let warm = worker::runners::warm::distinct(&**denoiser, &candidates);
         // The denoiser's own buckets are the layouts those candidates collapse to: its phase is
         // derived from them rather than named, so a rank that captures no denoise bucket states no
         // denoise phase.
         let denoise_set = Buckets::new(warm.iter().map(|candidate| {
-            executor::plan::Bucket::denoise(1, denoiser.layout(&candidate.view())).serving(
+            worker::plan::Bucket::denoise(1, denoiser.layout(&candidate.view())).serving(
                 candidate.frames,
                 candidate.width,
                 candidate.height,
@@ -1107,11 +1107,11 @@ impl ModelRunner {
         // no track; the track's extent is the layout the denoiser already states, and two canvases
         // of one duration collapse onto one track. A deployment that prepares no audio at all states
         // none, and then no audio runner is bound rather than one that could serve nothing.
-        let audio_buckets: Vec<executor::plan::Bucket> = {
+        let audio_buckets: Vec<worker::plan::Bucket> = {
             let mut seen: Vec<(u32, u32)> = Vec::new();
             let mut buckets = Vec::new();
             for bucket in denoise_set.iter() {
-                let executor::plan::Extent::Latents(layout) = bucket.extent else {
+                let worker::plan::Extent::Latents(layout) = bucket.extent else {
                     continue;
                 };
                 let Some(audio) = layout.audio else {
@@ -1121,7 +1121,7 @@ impl ModelRunner {
                     continue;
                 }
                 seen.push((audio.frames, audio.channels));
-                let mut track = executor::plan::Bucket::audio(1, layout);
+                let mut track = worker::plan::Bucket::audio(1, layout);
                 track.serves = bucket.serves;
                 buckets.push(track);
             }
@@ -1176,7 +1176,7 @@ impl ModelRunner {
         )?;
         if self.serves_track() && !audio_buckets.is_empty() {
             let audio_set = Buckets::new(audio_buckets);
-            let audio = executor::runners::AudioDecoderRunner::new(
+            let audio = worker::runners::AudioDecoderRunner::new(
                 Binding {
                     id: RunnerId(3),
                     phases: served_phases(&audio_set),
@@ -1234,7 +1234,7 @@ impl ModelRunner {
     /// The streams `device` maps graphs on: one per runner it serves, plus one for a preparation.
     ///
     /// The count is the number of `NamedRunner`s [`ModelRunner::runners`] builds for this class, and
-    /// the two are checked against each other where the runners exist: `Executor::spawn` refuses a
+    /// the two are checked against each other where the runners exist: `Worker::spawn` refuses a
     /// device whose runners outnumber the streams its graph range was divided for, naming both
     /// figures. That refusal is what keeps this constant honest - a runner added without the count
     /// following it stops at the spawn instead of at a capture nobody can read.
@@ -1266,7 +1266,7 @@ impl ModelRunner {
         served: &Served,
         memory: &mut Memory,
         generation: &Arc<Generation>,
-        blocking: &executor::blocking::ThreadPool,
+        blocking: &worker::blocking::ThreadPool,
         groups: &RankGroups,
     ) -> Result<Vec<NamedRunner>> {
         let Served::Text(model) = served else {
@@ -1393,8 +1393,8 @@ impl ModelRunner {
     pub(crate) fn load_and_open(
         &self,
         weights: &mut dyn nn::RetainedWeights,
-        storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-        host_group: &executor::parallel::host::HostGroup,
+        storage: &mut dyn worker::memory::retained::ExclusiveStorage,
+        host_group: &worker::parallel::host::HostGroup,
         experts: &qwen3_moe::load::ExpertOrder,
     ) -> Result<(Served, Memory, ipc::MainProcessInfo, GraphStorage)> {
         let served = self.load_model(weights, experts)?;
@@ -1564,8 +1564,8 @@ impl ModelRunner {
     pub(crate) fn open_memory(
         &self,
         served: &Served,
-        storage: &mut dyn executor::memory::retained::ExclusiveStorage,
-        group: &executor::parallel::host::HostGroup,
+        storage: &mut dyn worker::memory::retained::ExclusiveStorage,
+        group: &worker::parallel::host::HostGroup,
     ) -> Result<(Memory, ipc::MainProcessInfo, GraphStorage)> {
         let device = *self
             .devices
@@ -1610,7 +1610,7 @@ impl ModelRunner {
                 // shape this build cannot state is refused by name rather than planned with a
                 // literal.
                 let config = model.config();
-                let cache = executor::capacity::CacheGeometry {
+                let cache = worker::capacity::CacheGeometry {
                     layers: narrow(config.num_hidden_layers, "num_hidden_layers")?,
                     // A tensor rank stores the heads its attention holds.
                     kv_heads: narrow(
@@ -1619,8 +1619,8 @@ impl ModelRunner {
                     )?,
                     head_dim: narrow(config.head_dim, "head_dim")?,
                 };
-                let facts = executor::capacity::RankFacts {
-                    device: executor::config::Device::Cuda(device),
+                let facts = worker::capacity::RankFacts {
+                    device: worker::config::Device::Cuda(device),
                     host: &host,
                     world: self.cache_world.unwrap_or(self.launch.world),
                     world_size: self.world_size,
@@ -1648,8 +1648,8 @@ impl ModelRunner {
                 (facts, rank_report(device, host)?)
             }
             Served::Media(_) => {
-                let facts = executor::capacity::RankFacts {
-                    device: executor::config::Device::Cuda(device),
+                let facts = worker::capacity::RankFacts {
+                    device: worker::config::Device::Cuda(device),
                     host: &host,
                     world: self.launch.world,
                     world_size: self.world_size,
@@ -1706,8 +1706,8 @@ impl ModelRunner {
         // The ranks of this process agree over the group the main process formed at start, and a
         // world of one rank is a group of one member.
         let planned = match served {
-            Served::Text(_) => executor::capacity::plan_rank(&facts, report, group)?,
-            Served::Media(_) => executor::capacity::plan_media(&facts, report, group)?,
+            Served::Text(_) => worker::capacity::plan_rank(&facts, report, group)?,
+            Served::Media(_) => worker::capacity::plan_media(&facts, report, group)?,
         };
         // The keys and values the plan fitted are the process's resident pool: a unit is a cache
         // unit, and the plan charged them all against the same device allowance the pools are
@@ -1727,11 +1727,11 @@ impl ModelRunner {
         };
         let snapshot = planned.state_snapshot_bytes();
         let graph = self.graph(device, resident, snapshot, Self::streams_on(served))?;
-        let pools = executor::device::Executor::open(device, &graph)?;
+        let pools = worker::device::Worker::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;
-        let memory = executor::memory::open_memory(
-            executor::memory::OpenMemory {
+        let memory = worker::memory::open_memory(
+            worker::memory::OpenMemory {
                 plan: &planned.plan,
                 // A causal-language rank keeps no per-slot bank: its per-request state is the KV
                 // pages in the cache, and the sampler's parameters travel in the batch's columns.
@@ -1739,10 +1739,10 @@ impl ModelRunner {
                 device: Some(device),
                 stream: Some(&stream),
                 width: planned.width,
-                devices: vec![executor::memory::allocation::MemoryKind::Cuda(device)],
+                devices: vec![worker::memory::allocation::MemoryKind::Cuda(device)],
                 // A rank that takes no other rank's export states that as the absence of a
                 // program: a conversion that reaches it is a mistake, and it says so by name.
-                conversion: Arc::new(executor::memory::prefix_cache::conversion::Unimported),
+                conversion: Arc::new(worker::memory::prefix_cache::conversion::Unimported),
                 events: self.events(),
                 pools,
             },
@@ -1802,11 +1802,11 @@ impl ModelRunner {
 /// returns through the batch, not as an exported tensor), so no device product is exported and no
 /// media component is routed: the deployment is one class of computation, and saying otherwise
 /// would make the engine reserve storage for exports that never happen.
-pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<executor::capacity::Report> {
+pub(crate) fn rank_report(device: DeviceId, host: &str) -> Result<worker::capacity::Report> {
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos() as u64);
-    Ok(executor::capacity::Report {
+    Ok(worker::capacity::Report {
         endpoint: ipc::MainProcessEndpoint {
             host: host.to_owned(),
             // The address space this rank's tensors live in: one main process, one pid.
@@ -1934,7 +1934,7 @@ fn media_rank_report(
     host: &str,
     bounds: MediaBounds,
     denoiser: &str,
-) -> Result<executor::capacity::Report> {
+) -> Result<worker::capacity::Report> {
     use ipc::MediaCall;
     let at = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1972,7 +1972,7 @@ fn media_rank_report(
             outputs: media_outputs(name, &bounds),
         })
         .collect();
-    Ok(executor::capacity::Report {
+    Ok(worker::capacity::Report {
         endpoint: ipc::MainProcessEndpoint {
             host: host.to_owned(),
             address_space: std::process::id().to_string(),
@@ -2364,7 +2364,7 @@ fn media_candidates(
     video: &daemon::options::VideoConfig,
     capacities: &[u32],
     ladder: &[u32],
-) -> Result<Vec<executor::runners::denoiser::WarmRequest>> {
+) -> Result<Vec<worker::runners::denoiser::WarmRequest>> {
     use minimax_h3::config::{FPS, NAMED_CANVASES};
     let mut candidates = Vec::new();
     let frames = (video.max_seconds * f64::from(FPS)).round();
@@ -2432,7 +2432,7 @@ fn media_candidates(
                 for frames in timelines.iter().copied() {
                     for capacity in capacities {
                         for rung in rungs.iter().copied() {
-                            candidates.push(executor::runners::denoiser::WarmRequest {
+                            candidates.push(worker::runners::denoiser::WarmRequest {
                                 task,
                                 width: canvas.width,
                                 height: canvas.height,
@@ -2967,17 +2967,17 @@ impl Mapping {
 /// The kinds come from the buckets - what this rank's model runner can launch - and the ids from
 /// `engine::phase_id`, the table the scheduler's `Plan` numbers a request's work with. Never from a
 /// literal: a model runner that stated `PhaseId(0)` for its device (text encoding) served no phase the
-/// scheduler ever planned, and the executor refused the deployment's first completion with `no
+/// scheduler ever planned, and the worker refused the deployment's first completion with `no
 /// device of this rank serves phase PhaseId(3)`.
 /// The frames of each video unit of a `frames`-frame timeline, as the model states them.
 ///
 /// The host stage is handed this rather than given the arithmetic: a unit's length is the
 /// checkpoint's (`CLIP_FRAMES` and the seam a successor fades against), the model's postprocessor is
-/// its one home, and an executor that recomputed it would be a second.
-fn video_units(frames: u32) -> executor::Result<Vec<u32>> {
+/// its one home, and a worker that recomputed it would be a second.
+fn video_units(frames: u32) -> worker::Result<Vec<u32>> {
     minimax_h3::output::VideoPostprocessor::splices_of(frames)
         .map(|splices| splices.into_iter().map(|splice| splice.keep).collect())
-        .map_err(|error| executor::Error::Invalid(format!("a video unit's frames: {error}")))
+        .map_err(|error| worker::Error::Invalid(format!("a video unit's frames: {error}")))
 }
 
 /// The phases the artifact's three host calls are planned as.
@@ -3046,7 +3046,7 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
     kinds.dedup();
     kinds
         .into_iter()
-        // The scheduler numbers a phase with the world's `u32` and the executor names one with the
+        // The scheduler numbers a phase with the world's `u32` and the worker names one with the
         // wire's `u16`: the plan is where the two meet, and a kind that did not fit would be a table
         // this process cannot state rather than a phase to serve quietly.
         .map(|kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits")))
@@ -3311,7 +3311,7 @@ mod tests {
     /// A model runner serves the phases its buckets are launched as, in the scheduler's numbering, and no
     /// phase it does not run.
     ///
-    /// The defect this pins: the model runner stated `PhaseId(0)` for its device, so the executor refused
+    /// The defect this pins: the model runner stated `PhaseId(0)` for its device, so the worker refused
     /// the deployment's first completion with `no device of this rank serves phase PhaseId(3)`.
     /// `PhaseId(3)` is a whole-prompt forward and `PhaseId(0)` is text encoding: the model runner and the
     /// scheduler were numbering phases in two tables.

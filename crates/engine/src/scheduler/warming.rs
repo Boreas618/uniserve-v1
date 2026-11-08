@@ -39,7 +39,7 @@ impl Warming {
 
 impl Scheduler {
     /// Fence the current batches, mutate page ownership, and return concrete
-    /// executor storage views. Device copies run later at the Transfer Server.
+    /// worker storage views. Device copies run later at the Transfer Server.
     pub(super) fn warm_cache(
         &mut self,
         operation: Operation,
@@ -129,7 +129,7 @@ impl Scheduler {
                     .collect();
                 let payload = serde_json::to_string(&pages).map_err(|error| error.to_string())?;
                 if !host {
-                    self.executor
+                    self.worker
                         .hook("uniserve.cache_publish", &payload)
                         .map_err(|error| format!("{error:#}"))?;
                 }
@@ -191,7 +191,7 @@ impl Scheduler {
         } else {
             let payload = serde_json::to_string(&storage::manifest::cache::Pages { pages, host })
                 .map_err(|error| error.to_string())?;
-            self.executor
+            self.worker
                 .hook("uniserve.cache_manifest", &payload)
                 .map_err(|error| format!("{error:#}"))?
                 .into_iter()
@@ -209,7 +209,7 @@ impl Scheduler {
             page_tokens: self.page_tokens(),
             prefixes,
             ranks,
-            nodes: self.executor.storage_nodes(),
+            nodes: self.worker.storage_nodes(),
         })
     }
 
@@ -371,12 +371,12 @@ impl Scheduler {
             return Ok(Vec::new());
         };
         let (group_name, worker) = self
-            .executor
+            .worker
             .info()
             .workers
             .iter()
             .find(|(_, worker)| worker.prefix_cache.is_some())
-            .ok_or("no cache executor owns the target pages")?;
+            .ok_or("no cache worker owns the target pages")?;
         let endpoint = Arc::new(worker.endpoint.clone());
         let mut targets = Vec::new();
         let mut reserved = Vec::new();
@@ -481,7 +481,7 @@ impl Scheduler {
                     resume: Some(resume),
                 };
                 prefix.cached = self
-                    .executor
+                    .worker
                     .info()
                     .workers
                     .iter()

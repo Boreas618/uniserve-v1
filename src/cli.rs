@@ -43,7 +43,7 @@ pub(crate) struct LogLevels {
 pub(crate) enum Command {
     /// Run this node's daemon; on the leader (node rank 0), also the
     /// UniServe OpenAI server, whose Rust engine and scheduler run
-    /// in-process and drive forward-only executors. Without a model, a
+    /// in-process and drive forward-only workers. Without a model, a
     /// single-node daemon serves its admin API alone until `PUT
     /// /admin/config` brings a deployment up.
     #[command(

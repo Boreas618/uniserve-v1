@@ -8,21 +8,20 @@
 //! request's events on its `EventRx` (`handle`). On its thread, the
 //! `Scheduler` admits requests, assigns cache pages (`kv_cache`) and other
 //! storage (`allocation`), and submits batches through `Submissions`
-//! (`scheduler`) to the executor crate's `Batches`.
+//! (`scheduler`) to the worker crate's `Batches`.
 //!
-//! The `testing` feature additionally exports `SimExecutor`, `SimEngine`, and
-//! `BatchEvent` (`sim`), a GPU-free executor for scheduler and frontend tests,
-//! which plugs in through the `Executor` trait, and `serve_requests`
+//! The `testing` feature additionally exports `SimWorker`, `SimEngine`, and
+//! `BatchEvent` (`sim`), a GPU-free worker for scheduler and frontend tests,
+//! which plugs in through the `Worker` trait, and `serve_requests`
 //! (`service`), which serves the request interface over simulated schedulers
 //! for the daemon's tests.
 
-/// Scheduler-owned allocation of executor storage; only its `OutOfStorage`
+/// Scheduler-owned allocation of worker storage; only its `OutOfStorage`
 /// error is public.
 pub mod allocation;
 mod clock;
 mod core;
 mod encoder_outputs;
-mod executor;
 mod handle;
 mod host_tier;
 mod kv_cache;
@@ -33,22 +32,23 @@ mod service;
 mod sim;
 mod trajectories;
 mod warmup;
+mod worker;
 
 #[cfg(feature = "testing")]
 pub use crate::core::sim_args;
 pub use crate::core::{SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, WorkerRank};
-#[cfg(feature = "testing")]
-pub use crate::executor::{BatchResult, CallResult, Executor};
-pub use crate::executor::{
-    BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ExecuteError, ExecutionBatch,
-    ExecutorError, ExecutorFailure, ExecutorInfo, ExecutorSubmitError, PageOffloads, PoolLayout,
-    RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel, TransferBackend,
-    TransferConfig, TransferConfigError, TransferEdge, WorkerGroupId,
-};
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
     EventSendError, EventTx, HookBarrier, PolicyPrograms, PolicySlotHandle, StageApplied,
     StreamCancelCause, Submission, SubmitError, Wake, WeightsInFlight,
+};
+#[cfg(feature = "testing")]
+pub use crate::worker::{BatchResult, CallResult, Worker};
+pub use crate::worker::{
+    BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ExecuteError, ExecutionBatch,
+    PageOffloads, PoolLayout, RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel,
+    TransferBackend, TransferConfig, TransferConfigError, TransferEdge, WorkerError, WorkerFailure,
+    WorkerGroupId, WorkerInfo, WorkerSubmitError,
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
@@ -62,11 +62,11 @@ pub use crate::scheduler::testing::packaged_policy;
 pub use crate::scheduler::{
     Arrival, BatchCapacity, Candidate, DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH,
     DEFAULT_MAX_NUM_BATCHED_TOKENS, DEFAULT_MAX_RUNNING_REQUESTS, DomainStats, EncoderStats,
-    ExecutionDomainStats, ExecutorStats, GeneralStats, GroupCache, Limits, PREFETCH_FLOOR_TOKENS,
-    Parameters, ParkedCache, PhaseKind, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot,
-    PolicySource, PolicyUsage, PrefixCacheUsage, PrefixStats, ProgramSource, Progress, RoutePolicy,
-    RouteTrial, Scheduler, SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage,
-    TimingStats, TrialState, Validators, arrival_view, ceilings_of, phase_id,
+    ExecutionDomainStats, GeneralStats, GroupCache, Limits, PREFETCH_FLOOR_TOKENS, Parameters,
+    ParkedCache, PhaseKind, PolicyBytes, PolicyProgram, PolicyReverted, PolicySlot, PolicySource,
+    PolicyUsage, PrefixCacheUsage, PrefixStats, ProgramSource, Progress, RoutePolicy, RouteTrial,
+    Scheduler, SchedulerConfig, SchedulerStats, SchedulerStatsReporter, Stage, TimingStats,
+    TrialState, Validators, WorkerStats, arrival_view, ceilings_of, phase_id,
 };
 #[cfg(feature = "testing")]
 pub use crate::service::{EpochPolicy, serve_requests};
@@ -76,12 +76,12 @@ pub use crate::service::{EpochPolicy, serve_requests};
 // not there.
 #[cfg(feature = "testing")]
 pub use crate::sim::{
-    BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimExecutor, SimSpeculation,
+    BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimSpeculation, SimWorker,
     sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
 };
 pub use ipc::{MediaCall, VideoDenoiserInfo, VideoTaskInfo};
 pub use proto::config::DEFAULT_BLOCK;
-/// Serializable scheduler, cache, and executor performance snapshots.
+/// Serializable scheduler, cache, and worker performance snapshots.
 pub use proto::report;
 pub use proto::request::{
     ArtifactEvent, ArtifactMedia, CachePolicy, ConditionExtent, DiffusionRequest,

@@ -430,7 +430,7 @@ impl SchedulerMetrics {
         registry.register(
             "uniserve:worker_blocking_calls",
             "Driver calls that made a serving worker thread wait for the device, by thread and \
-             call; a serving call of the executor that made one failed.",
+             call; a serving call of the worker that made one failed.",
             worker_blocking_calls.clone(),
         );
         let worker_fence_step_seconds: Family<EngineFenceLabels, super::CountedHistogram> =

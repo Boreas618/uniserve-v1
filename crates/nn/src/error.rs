@@ -3,7 +3,7 @@
 //! A layer propagates an operator's failure unchanged; it never falls back to another path. The
 //! loading boundary adds the failures of reading a checkpoint and converting a weight, and the
 //! forward's arena adds the one failure a static activation plan can have: a request that does not
-//! fit the region the executor reserved.
+//! fit the region the worker reserved.
 
 use std::path::PathBuf;
 

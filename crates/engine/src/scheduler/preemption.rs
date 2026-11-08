@@ -4,7 +4,7 @@
 //! A request's trajectory is derived state: the samples of its committed
 //! step, which the request's facts and the step count determine. Whatever
 //! preempts a request (a world's park, a sleep, an in-place weight update,
-//! a shrink of the KV cache, the loss of its executors) preempts it the same
+//! a shrink of the KV cache, the loss of its workers) preempts it the same
 //! way, and a resumed request is the same whether it resumes on this world
 //! or on another:
 //!
@@ -14,11 +14,11 @@
 //!    whole is not preempted: it finishes, as its remaining work is
 //!    bounded. A token request leaves after every token and image it
 //!    generated; the denoising steps its calls in flight complete advance
-//!    the trajectory of the image it was generating, as its executor commits
+//!    the trajectory of the image it was generating, as its worker commits
 //!    them, and its client reads their progress.
 //! 2. **Store.** At that boundary, a trajectory past its first step and
 //!    not past its last, on a denoiser whose ranks map host latent pools,
-//!    is written to them (`crate::trajectories`); a lost executor's is not.
+//!    is written to them (`crate::trajectories`); a lost worker's is not.
 //! 3. **Leave.** The request ends as migratable with the steps stored
 //!    (zero for none) and the record of where their pages lie and how each
 //!    stored rank laid its part out, and the daemon submits it again with
@@ -49,7 +49,7 @@ use crate::trajectories::{Offloaded, Restored, image_trajectory};
 /// What [`Scheduler::store_preempted`] reads of a preempted request.
 struct Preempted {
     request_key: RequestKey,
-    /// Whether the request's executors hold it.
+    /// Whether the request's workers hold it.
     registered: bool,
     /// The identity that keys its trajectory; zero for a request no engine
     /// stores a trajectory of.
@@ -119,7 +119,7 @@ impl Scheduler {
         }
     }
 
-    /// The executor group that holds `request_key`'s trajectory: the replica
+    /// The worker group that holds `request_key`'s trajectory: the replica
     /// its denoising calls are placed on, as the component that serves them
     /// binds there.
     fn denoiser_worker(&self, request_key: RequestKey) -> Option<WorkerGroupId> {
@@ -131,7 +131,7 @@ impl Scheduler {
             .map_or(DEFAULT_BLOCK, String::as_str);
         let (_, bound, _) = self
             .dispatch
-            .component_candidates(&self.executor, kind, component)
+            .component_candidates(&self.worker, kind, component)
             .next()?;
         self.dispatch
             .affinity
@@ -143,7 +143,7 @@ impl Scheduler {
     /// its calls completed (`preempted`), when it reached a step worth
     /// storing: past its first step and not past its last, of a request the
     /// daemon gave a trajectory identity, preempted by a drain while its
-    /// executors hold it. `offloading` states whether the host latent pools
+    /// workers hold it. `offloading` states whether the host latent pools
     /// are storing it already, whose answer then decides how it leaves.
     fn store_preempted(
         &mut self,
@@ -164,7 +164,7 @@ impl Scheduler {
                 None => Retirement::Waiting,
             };
         }
-        // A lost executor's trajectory is gone with it; a trajectory at step
+        // A lost worker's trajectory is gone with it; a trajectory at step
         // zero is the request's noise, which any engine draws again.
         let stores = cause == MigrationCause::Drain
             && preempted.trajectory != 0
@@ -201,7 +201,7 @@ impl Scheduler {
         };
         let preempted = Preempted {
             request_key: state.admission.request_key,
-            registered: state.admission_state == ExecutorRegistration::Registered,
+            registered: state.admission_state == WorkerRegistration::Registered,
             trajectory: state.request.trajectory.id,
             completed: state.denoising.completed(),
             steps: state.denoising.steps(),
@@ -275,7 +275,7 @@ impl Scheduler {
 
     /// Applies the trajectory progress of `call`, an image trajectory call
     /// of preempted token request `id` (`TerminalIntent::Migrate`) that
-    /// completed with `record`, which takes no other effect: the executor
+    /// completed with `record`, which takes no other effect: the worker
     /// committed it, so the trajectory a preemption stores continues after
     /// it. A latent preparation opens the trajectory at the step it
     /// restored (or zero) and states how the denoising ranks hold it; a
@@ -324,7 +324,7 @@ impl Scheduler {
 
     /// Takes the host latent pools' answers: a resumed request's restore
     /// resolves, and the copies of a preempted request's trajectory leave
-    /// in a batch of latent offloads alone to its denoiser's executor group.
+    /// in a batch of latent offloads alone to its denoiser's worker group.
     /// Returns whether anything moved on.
     pub(super) fn poll_trajectories(&mut self) -> bool {
         let Some(store) = self.trajectories.as_mut() else {
@@ -393,7 +393,7 @@ impl Scheduler {
             }
         }
         // The copies wait for nothing on the device: every call of the
-        // request completed, and the executor orders them behind the batches
+        // request completed, and the worker orders them behind the batches
         // that used the latent banks.
         let queued = self
             .trajectories
@@ -413,7 +413,7 @@ impl Scheduler {
             else {
                 continue;
             };
-            batch.page_offloads = Some(crate::executor::PageOffloads {
+            batch.page_offloads = Some(crate::worker::PageOffloads {
                 worker,
                 pages: Vec::new(),
                 latents: vec![offload],
@@ -478,7 +478,7 @@ impl Scheduler {
         let stored = state.req.trajectory.clone();
         let trajectory = image_trajectory(stored.id, state.image_id);
         let worker = self.dispatch.place(
-            &self.executor,
+            &self.worker,
             &self.info,
             request_key,
             CallKind::Media(MediaCall::LatentPreparation),

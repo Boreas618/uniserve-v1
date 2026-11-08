@@ -12,20 +12,20 @@
 //! predecessor resolves. Each planned call then reserves its storage, is
 //! registered as in flight, and joins the pass's batch for its phase and
 //! component: one batch per `(phase, component)`, each a single numerical call
-//! on one component, because an executor's batch carries one phase.
+//! on one component, because a worker's batch carries one phase.
 //!
 //! Token calls and media calls are planned in the same pass: a token call by
 //! the next-call planner, a media call of a video, image, or audio request by
 //! `plan_media_call`, which owns that flow's numerical extent, decoder ranges,
-//! and executor admission. The plan names both, so one policy decides the whole
+//! and worker admission. The plan names both, so one policy decides the whole
 //! step.
 //!
 //! A pass's prefill calls, and likewise its decode calls, travel as one
 //! numerical call, bounded by the batch's call and token budgets and the
-//! executors' pools; an executor replays a captured graph for a call one holds
+//! workers' pools; a worker replays a captured graph for a call one holds
 //! and runs any other eagerly. A context prefill with vision blocks stages
 //! several forward rows; a pass's prefill rows, like its canvas rows, stay
-//! within the rows an executor stages per call (`PassRows`).
+//! within the rows a worker stages per call (`PassRows`).
 
 mod call;
 pub(crate) mod columns;
@@ -38,7 +38,7 @@ use ipc::{ForwardMode, MediaCall, TransferMode};
 use scheduling::guest::{PhaseId, PhaseKind, Plan};
 
 /// Forward rows a pass may still add to its numerical calls, within the rows
-/// an executor stages per call: canvas rows across its token-denoising calls,
+/// a worker stages per call: canvas rows across its token-denoising calls,
 /// and context rows across its prefill calls.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct PassRows {
@@ -86,8 +86,8 @@ impl Scheduler {
     ///
     /// The policy sees the candidates exactly as `views::replicas` shows them
     /// and answers one of their indices; `views::replica_targets` names the same
-    /// executors in the same order, both built from one filter in `views.rs`, so
-    /// an index becomes an executor without two candidate lists that could
+    /// workers in the same order, both built from one filter in `views.rs`, so
+    /// an index becomes a worker without two candidate lists that could
     /// disagree. A policy that fails here fails as any decision does: the call
     /// waits this step and the previous policy decides the next one.
     fn place_call(&mut self, call: &Call) -> Option<dispatch::Choice> {
@@ -143,7 +143,7 @@ impl Scheduler {
     /// Returns the call's output buffer spans, in `Call::buffer_outputs`
     /// order, or `None` when the call cannot run now: the guidance prefix of a
     /// denoising call cannot be allocated, transfer capacity is exhausted,
-    /// the request is not running, `Dispatch::worker_target` finds no executor,
+    /// the request is not running, `Dispatch::worker_target` finds no worker,
     /// a buffer or latent-page allocation fails, or (after latching
     /// engine-fatal) the request holds no allocations.
     ///
@@ -167,7 +167,7 @@ impl Scheduler {
             .get(&id)
             .map(|state| RequestKey::new(self.engine_id, id, state.request_epoch))?;
         self.dispatch.worker_target(
-            &self.executor,
+            &self.worker,
             &self.info,
             request_key,
             call.kind,
@@ -183,7 +183,7 @@ impl Scheduler {
                         self.storage.buffer_pool.free(allocation);
                     }
                     // The evicted product's span returns to the pool only
-                    // when executors acknowledge the queued `Free` command.
+                    // when workers acknowledge the queued `Free` command.
                     if let Some(product) = self.storage.encoder_cache.evict_one() {
                         self.free_buffers([product.buffer_id()]);
                     }
@@ -193,7 +193,7 @@ impl Scheduler {
             buffer_allocations.push(allocation);
         }
 
-        // Latent pages are reserved only when the executor advertises a paged
+        // Latent pages are reserved only when the worker advertises a paged
         // latent pool (`worker_tracks_image_latent`). They grow in place
         // across the trajectory's calls; a failed grow leaves the existing
         // pages allocated.
@@ -251,7 +251,7 @@ impl Scheduler {
     ) -> Vec<ExecutionBatch> {
         // One batch per (phase, component): a batch is one numerical call of one
         // phase on one component, so a rank receives a homogeneous group and
-        // the executor's phase column names it exactly. The plan's order is the
+        // the worker's phase column names it exactly. The plan's order is the
         // order the first call of each pair was selected in.
         let mut kind_order: Vec<(PhaseId, String)> = Vec::new();
         let mut kind_batches: HashMap<(PhaseId, String), ExecutionBatch> = HashMap::new();
@@ -263,7 +263,7 @@ impl Scheduler {
         // numerical calls keep their normal scheduling budgets.
         let mut prefill_budget = self.warming.prefill_tokens.unwrap_or(usize::MAX);
         // Context calls expand into one forward row per text/image segment.
-        // The executor's input buffers and the pass's call bound limit those
+        // The worker's input buffers and the pass's call bound limit those
         // numerical rows, independently of the number of requests batched.
         let row_capacity = (self.info.max_batch_calls.min(self.info.request_slots) as usize).max(1);
         let mut rows_left = PassRows {
@@ -274,7 +274,7 @@ impl Scheduler {
         // units and the host task pools preparing their units — built when the
         // pass meets its first media call and charged with each one it selects.
         let mut media_occupancy: Option<super::execution::Occupancy> = None;
-        // A media request's executor admission, queued by `plan_media_call`:
+        // A media request's worker admission, queued by `plan_media_call`:
         // it travels with the batch of the first call of that request in this
         // pass.
         let mut admissions: Vec<NewRequest> = Vec::new();
@@ -341,7 +341,7 @@ impl Scheduler {
             }
             // A media call is planned by the media flow, not by the token
             // planner: the call's numerical extent, its decoder ranges, and its
-            // executor admission are that flow's. Its batch is made first, since
+            // worker admission are that flow's. Its batch is made first, since
             // the call's id names it, and the component is known before
             // planning because a media call's kind fixes it.
             // A media request's call is planned by the media flow. A token
@@ -354,8 +354,8 @@ impl Scheduler {
                 && let Some(state) = self.media_state(id)
             {
                 // A request offers nothing further while the call carrying its
-                // executor admission is in flight.
-                if state.admission_state == ExecutorRegistration::InFlight
+                // worker admission is in flight.
+                if state.admission_state == WorkerRegistration::InFlight
                     || !self.ready_calls(state).contains(&media_call)
                 {
                     continue;
@@ -566,7 +566,7 @@ impl Scheduler {
                             )
                         });
                     let Some(Ok(admission)) = admission else {
-                        self.invariant_broken("a running request forms a valid executor admission");
+                        self.invariant_broken("a running request forms a valid worker admission");
                         return Vec::new();
                     };
                     if !hand_off {
@@ -599,7 +599,7 @@ impl Scheduler {
         }
         // A media request's admission travels with the batch holding the first
         // call of that request in this pass, so the request is registered on
-        // the executor that runs its first call.
+        // the worker that runs its first call.
         for request in admissions {
             let owner = kind_order
                 .iter()
@@ -679,15 +679,15 @@ impl Scheduler {
     }
 
     /// Attaches the batch's columns in the layout the kernels read (design
-    /// §4.3): the batch carries them, so the submission hands an executor one
+    /// §4.3): the batch carries them, so the submission hands a worker one
     /// value and nothing re-derives the layout from the calls.
     ///
-    /// `max_kv_len` is the batch's executor group's `max_model_len`: the longest
+    /// `max_kv_len` is the batch's worker group's `max_model_len`: the longest
     /// sequence the model was built for, not the longest this batch carries,
     /// because a KV view's shape must not move between steps.
     ///
     /// A fact the mechanism cannot state leaves the batch without columns: an
-    /// unusable page geometry, an executor group the mechanism has no info for, or
+    /// unusable page geometry, a worker group the mechanism has no info for, or
     /// a call whose request state is gone. Such a batch is not servable, which
     /// is what its `None` says; it is never filled with plausible values.
     fn attach_columns(&self, batch: &mut ExecutionBatch) {
@@ -719,12 +719,12 @@ impl Scheduler {
             block_size,
             units_per_page,
         };
-        // The attention descriptor's static bound: the executor states it once,
+        // The attention descriptor's static bound: the worker states it once,
         // since a KV view's shape must not move per batch.
-        let max_kv_len = self.executor.info().max_model_len;
+        let max_kv_len = self.worker.info().max_model_len;
         if max_kv_len == 0 {
             tracing::debug!(
-                "a batch is dropped: the executor states no model length, so a KV view has no \
+                "a batch is dropped: the worker states no model length, so a KV view has no \
                  static bound to be shaped to"
             );
             return;
@@ -733,7 +733,7 @@ impl Scheduler {
         let mut sampling = Vec::with_capacity(batch.requests.len());
         let mut draws = Vec::with_capacity(batch.requests.len());
         let mut tables = Vec::with_capacity(batch.requests.len());
-        // Mutable, because the resolved table is written back to the dispatch: the executor
+        // Mutable, because the resolved table is written back to the dispatch: the worker
         // installs the table the batch states, so a batch that stated only the wire's delta left a
         // decode's row uninstalled and its gather read whatever the slot held before. One value,
         // one statement - the table this batch addresses.
@@ -790,7 +790,7 @@ impl Scheduler {
             } else {
                 declared
             };
-            // The dispatch now states the table this batch addresses, so the executor installs it
+            // The dispatch now states the table this batch addresses, so the worker installs it
             // and the columns address it: a decode that declared nothing no longer travels with an
             // empty statement while its rows read the request's pages.
             placed.block_tables = resolved.clone();
@@ -824,13 +824,13 @@ impl Scheduler {
     /// (2.4, 4.5).
     ///
     /// The call kind is the plan's - the phases this pass selected - and the extent is the
-    /// executor's own answer: `Batches::media` names the bucket its runner planned the computation
+    /// worker's own answer: `Batches::media` names the bucket its runner planned the computation
     /// into, and a batch captured for one canvas serves no other, so the mechanism asks instead of
-    /// deriving. A computation the executor states no bucket for, or a request whose state this
+    /// deriving. A computation the worker states no bucket for, or a request whose state this
     /// scheduler no longer holds, leaves the batch without columns; it is then refused at
     /// submission by name rather than served at a canvas nothing captured.
     ///
-    /// The per-request record is `executor::batch::StagedRequest`: the request's conditioning
+    /// The per-request record is `worker::batch::StagedRequest`: the request's conditioning
     /// exactly as the model family planned it, and the step, seed and canvas the request states.
     /// What the model prepares on the device - the encoded conditioning rows, the latent
     /// trajectory - is not here, because the mechanism cannot read it and a placeholder for it
@@ -888,9 +888,9 @@ impl Scheduler {
         let extent = self
             .running_media
             .get(&first.request_key.request_id)
-            .map_or(executor::plan::Extent::None, |state| {
+            .map_or(worker::plan::Extent::None, |state| {
                 let sampling = &state.request.sampling;
-                executor::plan::Extent::Request {
+                worker::plan::Extent::Request {
                     frames: sampling.num_frames,
                     width: sampling.width,
                     height: sampling.height,
@@ -899,15 +899,15 @@ impl Scheduler {
                     condition_rows: sampling.condition_rows,
                 }
             });
-        let mut stated = executor::plan::Computation {
+        let mut stated = worker::plan::Computation {
             call: media_call,
             rows,
             tokens,
             extent,
         };
-        // The executor's answer is the authority on the extent: it is the bucket its own runner
+        // The worker's answer is the authority on the extent: it is the bucket its own runner
         // planned the computation into, and a batch captured for one canvas serves no other.
-        let Some(bucket) = self.executor.media(phase, &stated) else {
+        let Some(bucket) = self.worker.media(phase, &stated) else {
             tracing::debug!(
                 "a media batch is dropped: no device of this rank serves a {:?} computation of \
                  {rows} row(s) and {tokens} token(s) at phase {}",
@@ -927,7 +927,7 @@ impl Scheduler {
                 );
                 return;
             };
-            requests.push(executor::batch::StagedRequest {
+            requests.push(worker::batch::StagedRequest {
                 request: call.request_key,
                 conditioning: state.request.conditioning.clone(),
                 step: self.step_of(call.request_key.request_id, call.call_id, state),
@@ -940,7 +940,7 @@ impl Scheduler {
                 unit: placed.decode.as_ref().map_or(0, |range| range.cursor),
             });
         }
-        batch.media = Some(executor::batch::MediaColumns::staged(stated, &requests));
+        batch.media = Some(worker::batch::MediaColumns::staged(stated, &requests));
         batch.columns = prompts;
     }
 
@@ -966,8 +966,8 @@ impl Scheduler {
     ///
     /// `None` when the batch names a request this scheduler is not running, which the caller has
     /// the same answer for as for any other media batch it cannot state.
-    fn prompt_columns(&self, batch: &ExecutionBatch) -> Option<executor::batch::BatchColumns> {
-        let mut columns = executor::batch::BatchColumns::default();
+    fn prompt_columns(&self, batch: &ExecutionBatch) -> Option<worker::batch::BatchColumns> {
+        let mut columns = worker::batch::BatchColumns::default();
         columns.rows.query_offsets.push(0);
         for (call, _) in &batch.requests {
             let state = self.running_media.get(&call.request_key.request_id)?;
@@ -1084,13 +1084,13 @@ impl Scheduler {
         mut batch: ExecutionBatch,
         submit_at: Instant,
     ) -> ExecutionBatch {
-        // Command-only batches from `refill_executor` arrive with id zero.
+        // Command-only batches from `refill_worker` arrive with id zero.
         if batch.id == 0 {
             batch.id = self.inflight.next_batch_id();
         }
 
-        // A text batch of one executor group carries the page offloads the
-        // host KV cache reserved for that group: the executor copies them on
+        // A text batch of one worker group carries the page offloads the
+        // host KV cache reserved for that group: the worker copies them on
         // its copy stream beside its forward, and its output settles them.
         if let Some(kv_offload) = self.kv_offload.as_mut()
             && let Some((_, first)) = batch.requests.first()
@@ -1106,7 +1106,7 @@ impl Scheduler {
             let worker = first.worker.clone();
             let pages = kv_offload.take_offloads(&worker, batch.id);
             if !pages.is_empty() {
-                batch.page_offloads = Some(crate::executor::PageOffloads {
+                batch.page_offloads = Some(crate::worker::PageOffloads {
                     worker,
                     pages,
                     latents: Vec::new(),
@@ -1115,7 +1115,7 @@ impl Scheduler {
         }
 
         // Snapshot scheduler gauges at the batch boundary before ownership moves
-        // into the executor.
+        // into the worker.
         self.stats
             .general
             .peak_calls

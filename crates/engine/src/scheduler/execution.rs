@@ -1,16 +1,16 @@
 //! Batch submission, completion application, and allocation reclamation.
 //!
-//! This part of the scheduler sits between request state and the executor:
+//! This part of the scheduler sits between request state and the worker:
 //!
-//! - Refill and dispatch: `refill_executor` admits requests, asks the
+//! - Refill and dispatch: `refill_worker` admits requests, asks the
 //!   generation assembler (`assemble`) and the video media planner
 //!   for batches while a rank queue has room, and
-//!   `dispatch_submissions` hands them to the executor in order per executor,
+//!   `dispatch_submissions` hands them to the worker in order per worker,
 //!   each after the batches producing its inputs.
 //! - Video media scheduling: a video request runs the calls of its graph
 //!   (`graph::VideoGraph`, built at admission from its task and conditions),
 //!   offered by `ready_calls` as their inputs become available. Calls occupy
-//!   their components' capacity on their executors and, for media reading,
+//!   their components' capacity on their workers and, for media reading,
 //!   encoding and muxing, host task pools, tracked by the media occupancy,
 //!   and `plan_media_call` builds one call with its products, buffer
 //!   bindings, latent pages and reading components.
@@ -21,8 +21,8 @@
 //! - Result reconciliation: `apply_result` validates every returned call
 //!   identity against the in-flight window before any completion is applied,
 //!   stages completions, and applies them in request-local dependency order.
-//! - Failure reconciliation: `on_executor_error` retires only the work a
-//!   `ExecutorFailure` invalidates. Any other executor error, and an executor
+//! - Failure reconciliation: `on_worker_error` retires only the work a
+//!   `WorkerFailure` invalidates. Any other worker error, and a worker
 //!   failure classified as a control-plane invariant violation, is
 //!   engine-fatal.
 //!
@@ -57,21 +57,21 @@ impl Scheduler {
     /// Dispatches queued work while preserving order at every shared destination
     /// and after every product it reads.
     /// The caller retains blocked destinations for the whole scheduling tick, so
-    /// assembling more work cannot repeatedly retry an unavailable executor.
+    /// assembling more work cannot repeatedly retry an unavailable worker.
     ///
     /// Each queued batch is tried once per invocation; a batch that cannot be
     /// submitted goes back to the end of the queue. Returns whether any batch
     /// was submitted, or `true` after a terminal submission failure, which is
-    /// handed to `on_executor_error` and stops dispatching.
+    /// handed to `on_worker_error` and stops dispatching.
     fn dispatch_submissions(
         &mut self,
         blocked_workers: &mut HashSet<crate::WorkerGroupId>,
     ) -> bool {
         let mut progressed = false;
         // Products of the batches held back in this pass. A call may be
-        // submitted before its inputs' producers complete, since its executor
+        // submitted before its inputs' producers complete, since its worker
         // waits on them, but not before they are submitted, which is when the
-        // executor learns where each product is published. A consumer is
+        // worker learns where each product is published. A consumer is
         // queued after its producer and held batches keep their order, so the
         // producer is always tried first.
         let mut held_products = HashSet::new();
@@ -104,14 +104,14 @@ impl Scheduler {
             // The `Finish` commands this batch carries close the rows of the
             // requests they name once it is submitted: batches reach a rank in
             // submission order, so no later `Start` can name a row before the
-            // executor has seen its close.
+            // worker has seen its close.
             // The in-process arm has nothing to tell: the rows and buffers a
             // lifecycle command closes are this scheduler's own
             // pools, so the command is answered here, where it would have been
             // submitted. Its `Finish` and `Free` have nothing left to reach.
-            if batch.requests.is_empty() && self.executor.serves_in_process() {
+            if batch.requests.is_empty() && self.worker.serves_in_process() {
                 self.acknowledge_commands(&batch.commands);
-                // Nothing went to an executor, so no result will ever end this batch: it leaves
+                // Nothing went to a worker, so no result will ever end this batch: it leaves
                 // the in-flight window here, or every boundary that waits for an empty window (a
                 // policy stage, a park, a drain) waits for it forever.
                 self.inflight.pending_batches.remove(&batch.id);
@@ -126,7 +126,7 @@ impl Scheduler {
                     _ => None,
                 })
                 .collect();
-            match self.executor.submit(batch) {
+            match self.worker.submit(batch) {
                 Ok(()) => {
                     progressed = true;
                     for request_key in finishing {
@@ -141,24 +141,24 @@ impl Scheduler {
                             .columns
                             .as_ref()
                             .map(crate::scheduler::batching::columns::batch_shape);
-                        match self.executor.shadow(shadow_batch, generation) {
+                        match self.worker.shadow(shadow_batch, generation) {
                             Ok(()) => self.note_shadowed(shape),
-                            Err(ExecutorSubmitError::Failed(error)) => {
+                            Err(WorkerSubmitError::Failed(error)) => {
                                 self.shadow_failed(format!("{error:#}"));
                             }
-                            Err(ExecutorSubmitError::WouldBlock(_)) => {}
+                            Err(WorkerSubmitError::WouldBlock(_)) => {}
                         }
                     }
                 }
-                Err(ExecutorSubmitError::WouldBlock(batch)) => {
+                Err(WorkerSubmitError::WouldBlock(batch)) => {
                     blocked_workers.extend(targets);
                     held_products.extend(batch_products(&batch));
                     self.inflight.pending_submissions.push_back(*batch);
                 }
-                Err(ExecutorSubmitError::Failed(error)) => {
+                Err(WorkerSubmitError::Failed(error)) => {
                     // Failure reconciliation owns the pending identities until
                     // every affected call has been retired.
-                    self.on_executor_error(error);
+                    self.on_worker_error(error);
                     return true;
                 }
             }
@@ -169,15 +169,15 @@ impl Scheduler {
     /// Returns whether any rank queue can still accept a batch.
     ///
     /// `queue_depth` bounds the batches in flight on one rank, not across the
-    /// executor group: a batch carries one call kind to one component, so a media
+    /// worker group: a batch carries one call kind to one component, so a media
     /// pass occupies a slot on each component it touches rather than a single
     /// shared slot. Assembling stops once every rank queue is full.
     fn a_rank_queue_admits(&self) -> bool {
-        self.executor
+        self.worker
             .info()
             .workers
             .iter()
-            .any(|(worker, _)| self.executor.has_capacity(worker))
+            .any(|(worker, _)| self.worker.has_capacity(worker))
     }
 
     /// Closes the scheduler-owned half of a retiring request's record.
@@ -186,8 +186,8 @@ impl Scheduler {
     /// scheduler's own capacity: they return as soon as the `Finish` that names
     /// the request has been submitted, because every later batch on that rank
     /// is ordered behind it and no admission can reuse the row before the
-    /// executor has seen the close. The buffers stay in the record until the
-    /// acknowledgement, because they are spans the executor still holds.
+    /// worker has seen the close. The buffers stay in the record until the
+    /// acknowledgement, because they are spans the worker still holds.
     fn close_retiring_row(&mut self, request_key: RequestKey) {
         let Some(retiring) = self
             .retiring_requests
@@ -219,38 +219,38 @@ impl Scheduler {
         }
     }
 
-    /// Advances scheduler and executor work, blocking only for an outstanding result.
+    /// Advances scheduler and worker work, blocking only for an outstanding result.
     ///
     /// Serving drives `run`; `step` lets tests and examples advance the
     /// scheduler deterministically from the calling thread.
     ///
     /// Drains `commands` first; a shutdown command or a disconnected channel
-    /// aborts every request, closes the executor and returns `false`. When the
+    /// aborts every request, closes the worker and returns `false`. When the
     /// nonblocking tick makes no progress while batches are in flight, this
     /// waits a bounded time for one result.
     ///
-    /// Returns whether the loop made progress or handled an executor outcome.
+    /// Returns whether the loop made progress or handled a worker outcome.
     #[cfg(feature = "testing")]
     pub fn step(&mut self, commands: &Receiver<Command>) -> bool {
         let (stop, handled) = self.drain_commands(commands);
         if stop {
             self.abort_all_requests();
-            let _ = self.executor.close();
+            let _ = self.worker.close();
             return false;
         }
         let progressed = self.step_nonblocking() || handled;
         if progressed || self.inflight.pending_batches.is_empty() {
             return progressed;
         }
-        match self.executor.poll(Duration::from_secs(300)) {
+        match self.worker.poll(Duration::from_secs(300)) {
             Ok(Some(result)) => {
                 self.apply_result(result);
-                self.refill_executor();
+                self.refill_worker();
                 self.publish_cache_stats();
             }
             Ok(None) => return false,
             Err(error) => {
-                self.on_executor_error(error);
+                self.on_worker_error(error);
                 self.publish_cache_stats();
             }
         }
@@ -259,13 +259,13 @@ impl Scheduler {
 
     /// Advances one nonblocking schedule-ahead tick for the owner-thread reactor. It
     /// flushes output journals, resolves at most one ready result, reaps
-    /// cancellations, and fills available executor slots, but leaves any
+    /// cancellations, and fills available worker slots, but leaves any
     /// blocking result wait to `run`.
     /// Strips a retiring request's queued calls, and the admissions among its
-    /// commands, from the batches the executor has not accepted yet.
+    /// commands, from the batches the worker has not accepted yet.
     ///
     /// A batch is planned from the state of the step that named it, and a
-    /// executor queue deeper than one batch keeps it queued while later steps
+    /// worker queue deeper than one batch keeps it queued while later steps
     /// run. A request that ends in that window leaves calls behind that no
     /// result will resolve, and a batch that still carries one can no longer
     /// state the layout its kernels read: the request's allocation is gone, so
@@ -273,7 +273,7 @@ impl Scheduler {
     /// other work, and one left with nothing is forgotten - the pending
     /// identity goes with it, so no step waits for a result it will never see.
     /// Its `Finish` and `Free` commands stay: they are what settles the
-    /// executor's state for the request.
+    /// worker's state for the request.
     pub(super) fn retire_queued_calls(&mut self, id: RequestId) {
         let requests: HashSet<RequestKey> = self
             .inflight
@@ -335,7 +335,7 @@ impl Scheduler {
             .as_mut()
             .is_some_and(crate::encoder_outputs::EncoderStore::poll);
 
-        let submitted = self.refill_executor();
+        let submitted = self.refill_worker();
         progressed |= submitted;
         self.poll_resize();
         self.recompute_starved(submitted);
@@ -376,11 +376,11 @@ impl Scheduler {
     }
 
     /// Dispatches queued batches, reaps cancellations, admits requests, and
-    /// fills every available executor slot.
+    /// fills every available worker slot.
     ///
     /// Returns whether it queued or submitted a batch or handled a submission
     /// failure. Stops early once the engine-fatal latch is set.
-    pub(super) fn refill_executor(&mut self) -> bool {
+    pub(super) fn refill_worker(&mut self) -> bool {
         let mut progressed = false;
         // Drop residency for requests that are no longer running or retiring.
         // A retiring request keeps its entries because
@@ -454,7 +454,7 @@ impl Scheduler {
                     break;
                 };
                 let pages = kv_offload.take_offloads(&worker, batch.id);
-                batch.page_offloads = Some(crate::executor::PageOffloads {
+                batch.page_offloads = Some(crate::worker::PageOffloads {
                     worker,
                     pages,
                     latents: Vec::new(),
@@ -502,7 +502,7 @@ impl Scheduler {
     /// switch serves on under the previous policy, or the epoch stops.
     fn schedule_batches(&mut self) -> Vec<ExecutionBatch> {
         // A closing scheduler lets what is in flight drain before its
-        // executors close; a sleeping one runs nothing.
+        // workers close; a sleeping one runs nothing.
         if self.closing || self.asleep || self.held {
             return Vec::new();
         }
@@ -582,7 +582,7 @@ impl Scheduler {
 
     /// Frees the one thing a victim names.
     ///
-    /// An encoder entry leaves the encoder cache and its executor buffer goes with
+    /// An encoder entry leaves the encoder cache and its worker buffer goes with
     /// it; a device page goes to the host KV cache, exactly as a withdrawal's
     /// pages do, and the units it held return when the copy completes (or at
     /// once when the host cache has nowhere to put it).
@@ -709,7 +709,7 @@ impl Scheduler {
     /// the step count and a program never reads time. Rebalancing experts costs
     /// a collective on every rank, so the period is long compared with a step.
     ///
-    /// A load the executor publishes in between is asked about at the next
+    /// A load the worker publishes in between is asked about at the next
     /// step: waiting a full interval to look at new numbers would leave a rank
     /// hot for no reason.
     const EXPERT_REBALANCE_STEPS: u64 = 64;
@@ -723,7 +723,7 @@ impl Scheduler {
         // that completes mid-step must not split one step across two worlds
         // (4.2, 7.3).
         let generation = self.serving_generation();
-        self.executor.set_generation(generation);
+        self.worker.set_generation(generation);
         // The pages that appeared and went since the previous step, then
         // everything else that changed, in the order it happened, closed before
         // this step's dispatch. The room, the live state, and the plan's checks
@@ -794,10 +794,10 @@ impl Scheduler {
         if let Err(error) = policy.observe(&events) {
             return self.policy_failed(policy, error);
         }
-        // §4.4's periodic row: the mechanism owns the interval, the executor
+        // §4.4's periodic row: the mechanism owns the interval, the worker
         // publishes the load, and the order is checked and handed to the world
         // setup that applies it (§7.6). No load means nothing to decide, not a
-        // zero one: the executor has published no routed tokens yet.
+        // zero one: the worker has published no routed tokens yet.
         let experts_due = self.expert_load_new
             || self.expert_asked.is_none_or(|asked| {
                 self.step.saturating_sub(asked) >= Self::EXPERT_REBALANCE_STEPS
@@ -1189,8 +1189,8 @@ impl Scheduler {
         self.recorder.encoded(entry);
     }
 
-    /// The executor's routed-token counts per expert, which the mechanism asks
-    /// about on its own interval. The executor's edge publishes them; `None`
+    /// The worker's routed-token counts per expert, which the mechanism asks
+    /// about on its own interval. The worker's edge publishes them; `None`
     /// withdraws them.
     pub(super) fn set_expert_load(&mut self, load: Option<scheduling::guest::ExpertLoad>) {
         self.expert_load_new = load.is_some();
@@ -1198,8 +1198,8 @@ impl Scheduler {
     }
 
     /// The expert layout the policy last answered, taken by the point that
-    /// applies it: the executor's world setup (§7.6), which commits it with
-    /// `Executor::commit_experts` — the executor's own method for retaining an
+    /// applies it: the worker's world setup (§7.6), which commits it with
+    /// `Worker::commit_experts` — the worker's own method for retaining an
     /// expert order. Taking it once is the handoff, so a layout is applied
     /// once; the mechanism keeps no second copy.
     pub(super) fn take_expert_order(&mut self) -> Option<scheduling::guest::ExpertOrder> {
@@ -1300,14 +1300,14 @@ impl Scheduler {
     /// before another completion is consumed.
     pub(super) fn poll_one_result(&mut self) -> bool {
         let _span = tracing::trace_span!("scheduler.poll_one_result").entered();
-        match self.executor.poll(Duration::ZERO) {
+        match self.worker.poll(Duration::ZERO) {
             Ok(Some(result)) => {
                 self.apply_result(result);
                 true
             }
             Ok(None) => false,
             Err(error) => {
-                self.on_executor_error(error);
+                self.on_worker_error(error);
                 true
             }
         }

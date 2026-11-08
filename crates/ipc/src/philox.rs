@@ -6,7 +6,7 @@
 //! depth, completion order, and replay.
 //!
 //! The engine simulator draws through this module; the rank's token sampler
-//! (`uniserve.executor.text.philox`) draws bit-identical values for the same
+//! (`uniserve.worker.text.philox`) draws bit-identical values for the same
 //! coordinates.
 //!
 //! Layout:

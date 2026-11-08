@@ -16,7 +16,7 @@
 //!   request in flight continues from, whose pages it forgets, since the
 //!   successor writes them on trial. Its storage and the rest of its index
 //!   stay as they were, so a rollback resumes it.
-//! - **Promote** (the successor): its executors copy the predecessor's cache
+//! - **Promote** (the successor): its workers copy the predecessor's cache
 //!   flags and scales of the units they inherit and map the lent segments
 //!   writable (`uniserve.adopt_cache`), its pool imports the predecessor's
 //!   pages into those units, from which migrated requests reuse their
@@ -24,11 +24,11 @@
 //! - **Resume** (the parked world, at a rollback): it admits and executes
 //!   again, with the index it parked with, and allocates the units it lent
 //!   once the world on trial writes none of them any more.
-//! - **Commit** (the successor, once the predecessor is gone): its executors
+//! - **Commit** (the successor, once the predecessor is gone): its workers
 //!   take the segments they mapped read-only (`uniserve.take_cache`), and its
 //!   pool allocates the inherited units.
 //!
-//! Until its commit a successor is on trial: an executor fault or non-finite
+//! Until its commit a successor is on trial: a worker fault or non-finite
 //! logits fail it as a whole rather than being repaired, and its requests
 //! that resume from their generated tokens leave as migratable
 //! (`Scheduler::hand_back_requests`), for the daemon to continue on the
@@ -37,7 +37,7 @@
 use super::*;
 use crate::kv_cache::IndexedPage;
 
-/// One executor group's KV cache as a world that succeeds this one maps it:
+/// One worker group's KV cache as a world that succeeds this one maps it:
 /// its segments in unit order, the leading ones it holds, the units of its
 /// planes and the warmup scratch it lent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,7 +49,7 @@ pub struct GroupCache {
     pub scratch: u32,
 }
 
-/// What an executor reports of its KV cache (`uniserve.cache_storage`).
+/// What a worker reports of its KV cache (`uniserve.cache_storage`).
 #[derive(serde::Deserialize)]
 struct CacheReport {
     #[serde(default)]
@@ -313,8 +313,8 @@ impl Scheduler {
         let Some(cache) = self.storage.cache() else {
             return Vec::new();
         };
-        // Every executor splits the planes alike (`Self::describe_cache`).
-        let Some(segments) = self.executor.info().workers.iter().find_map(|(_, info)| {
+        // Every worker splits the planes alike (`Self::describe_cache`).
+        let Some(segments) = self.worker.info().workers.iter().find_map(|(_, info)| {
             info.prefix_cache
                 .as_ref()
                 .map(|cache| cache.segments.clone())
@@ -355,10 +355,10 @@ impl Scheduler {
         lent
     }
 
-    /// Promotes a successor scheduler: its executors adopt the predecessor's
+    /// Promotes a successor scheduler: its workers adopt the predecessor's
     /// cache flags of the units they inherit and map the segments the
     /// predecessor lent writable, its pool imports the predecessor's
-    /// published pages, each unit moved to where the executors map it, and
+    /// published pages, each unit moved to where the workers map it, and
     /// allocates the lent units as its own.
     ///
     /// Fails, changing nothing, when the world's KV cache limit in the
@@ -403,7 +403,7 @@ impl Scheduler {
             };
         let own_free = cache.block_pool.free_units() as u32;
         // The segments the predecessor lent, in this pool's units, where the
-        // executors map the predecessor's planes after the world's head.
+        // workers map the predecessor's planes after the world's head.
         let inherited = cache.block_pool.inherited();
         let borrowed: Vec<std::ops::Range<u32>> = parked
             .lent
@@ -467,7 +467,7 @@ impl Scheduler {
         });
         self.run_hook("uniserve.adopt_cache", &adopt.to_string())?;
         let source = self
-            .executor
+            .worker
             .info()
             .workers
             .iter()
@@ -477,7 +477,7 @@ impl Scheduler {
                     .is_some_and(|cache| cache.inherited() == inherited)
             })
             .map(|(_, info)| Arc::new(info.endpoint.clone()))
-            .ok_or_else(|| "no executor maps the inherited cache units".to_owned())?;
+            .ok_or_else(|| "no worker maps the inherited cache units".to_owned())?;
         let Some(cache) = self.storage.cache() else {
             return Ok(());
         };
@@ -493,9 +493,9 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Commits a successor scheduler: its executors take the predecessor's
+    /// Commits a successor scheduler: its workers take the predecessor's
     /// segments they mapped read-only, and its pool allocates their units.
-    /// Returns what each executor reported.
+    /// Returns what each worker reported.
     pub(super) fn commit(&mut self) -> Result<Vec<String>, String> {
         let closing = std::mem::replace(&mut self.closing, true);
         while !(self.inflight.pending_batches.is_empty()
@@ -510,10 +510,7 @@ impl Scheduler {
             }
         }
         self.closing = closing;
-        let results = self
-            .executor
-            .commit()
-            .map_err(|error| format!("{error:#}"))?;
+        let results = self.worker.commit().map_err(|error| format!("{error:#}"))?;
         if let Some(cache) = self.storage.cache() {
             cache.block_pool.take_inherited();
         }
@@ -525,11 +522,11 @@ impl Scheduler {
         Ok(results)
     }
 
-    /// The KV cache every executor group holds now, as a successor maps it;
+    /// The KV cache every worker group holds now, as a successor maps it;
     /// the ranks of a group agree on it.
     pub(super) fn describe_cache(&mut self) -> Result<Vec<GroupCache>, String> {
         let units: BTreeMap<String, u32> = self
-            .executor
+            .worker
             .info()
             .workers
             .iter()
@@ -553,7 +550,7 @@ impl Scheduler {
         }
         self.closing = closing;
         let reports = self
-            .executor
+            .worker
             .hook_groups("uniserve.cache_storage", "")
             .map_err(|error| format!("{error:#}"))?;
         let mut groups = Vec::new();
@@ -564,13 +561,13 @@ impl Scheduler {
             let mut described: Option<CacheReport> = None;
             for result in &results {
                 let report: CacheReport = serde_json::from_str(result)
-                    .map_err(|error| format!("an executor's cache report: {error}"))?;
+                    .map_err(|error| format!("a worker's cache report: {error}"))?;
                 match &described {
                     Some(first)
                         if (&first.segments, first.held) != (&report.segments, report.held) =>
                     {
                         return Err(format!(
-                            "the ranks of executor group {group} hold different cache segments"
+                            "the ranks of worker group {group} hold different cache segments"
                         ));
                     }
                     Some(_) => {}

@@ -25,14 +25,14 @@ pub(crate) struct StorageServer {
     stop: Arc<AtomicBool>,
     wake: OwnedFd,
     thread: Option<std::thread::JoinHandle<()>>,
-    /// The executor connections that created the pools: the server keeps a
-    /// pool's pages for its deployment while an executor of it is connected.
+    /// The worker connections that created the pools: the server keeps a
+    /// pool's pages for its deployment while a worker of it is connected.
     _workers: Vec<Client>,
     _directory: tempfile::TempDir,
 }
 
 impl StorageServer {
-    /// Starts a server whose page pools hold `pool_bytes` unless an executor
+    /// Starts a server whose page pools hold `pool_bytes` unless a worker
     /// asks for another size.
     pub(crate) fn start(pool_bytes: u64) -> Self {
         let directory = tempfile::tempdir().unwrap();
@@ -68,20 +68,20 @@ impl StorageServer {
         &self.socket
     }
 
-    /// A page pool of pages of `page_bytes` bytes, as rank 0 of executor group
+    /// A page pool of pages of `page_bytes` bytes, as rank 0 of worker group
     /// `group` maps it for its latent pages, holding `slots` pages.
     pub(crate) fn latent_pool(&mut self, group: &str, page_bytes: u64, slots: u64) -> u64 {
         self.page_pool(group, Key([7; 32]), page_bytes, slots)
     }
 
-    /// A page pool of pages of `page_bytes` bytes, as rank 0 of executor group
+    /// A page pool of pages of `page_bytes` bytes, as rank 0 of worker group
     /// `group` maps it for its encoder outputs, holding `slots` pages.
     pub(crate) fn encoder_pool(&mut self, group: &str, page_bytes: u64, slots: u64) -> u64 {
         self.page_pool(group, Key([8; 32]), page_bytes, slots)
     }
 
     /// A page pool of pages laid out as `layout` says, which rank 0 of
-    /// executor group `group` maps.
+    /// worker group `group` maps.
     fn page_pool(&mut self, group: &str, layout: Key, page_bytes: u64, slots: u64) -> u64 {
         let mut worker = Client::connect(
             &self.socket,

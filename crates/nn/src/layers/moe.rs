@@ -1756,7 +1756,7 @@ impl Moe {
     /// experts, and sums the ranks' partial results back into its own rows (`combine`,
     /// specs/worker.md 9's expert rows, `uniserve/backends/experts/alltoall.py` today).
     ///
-    /// `exchange` is the executor's bundle for this group: the package's transport and the views of
+    /// `exchange` is the worker's bundle for this group: the package's transport and the views of
     /// its workspace — the rows this rank received at dispatch, with their ids and weights, in the
     /// package's capacity-sized layout. The layer never allocates or owns any of it.
     ///

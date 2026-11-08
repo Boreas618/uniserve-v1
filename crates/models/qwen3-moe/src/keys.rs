@@ -17,12 +17,12 @@
 //! - `cache_dtype`, the planes the cache holds;
 //! - `capacity`, the exchange's rows per rank on a deployment that shards the experts, which the
 //!   exchange path refuses as zero because that is the size of its buffers;
-//! - `buckets`, the row counts the executor captures, because **the dense packed product is compiled
+//! - `buckets`, the row counts the worker captures, because **the dense packed product is compiled
 //!   per row class**: its grid is `m` rows, so a module serves one `m`, a count rounds up to the
 //!   smallest class that holds it (`nn::layers::PACKED_M_CLASSES`), and the deployment states the
 //!   finite set it pads to (`specs/replaceable-processes.md`: "a forward no bucket holds is an error,
 //!   never an eager fallback"). An empty list is refused when the projections are packed, because a
-//!   store built from it would hold no product for any row count the executor runs.
+//!   store built from it would hold no product for any row count the worker runs.
 //!
 //! The asymmetry is worth reading twice: the **expert** products' grid is over *routes*
 //! (tokens × top, computed at launch) and their keys carry no row count, so `buckets` does not
@@ -32,8 +32,8 @@
 //! # What is not here
 //!
 //! Two families of programs are not the model's, and this walk does not invent them: the sampler's,
-//! which the executor builds from its request's sampling settings, and the batch's, which the
-//! executor's own columns decide.
+//! which the worker builds from its request's sampling settings, and the batch's, which the
+//! worker's own columns decide.
 
 use nn::DType;
 use nn::layers::{
@@ -127,7 +127,7 @@ pub fn keys(
         return Err(Error::Config(
             "this deployment's projections are packed NVFP4, whose product is compiled per row \
              count, and the bucket list given is empty: a store built from it would hold no product \
-             for any row count the executor captures, and a forward no bucket holds is an error \
+             for any row count the worker captures, and a forward no bucket holds is an error \
              rather than an eager fallback"
                 .to_owned(),
         ));

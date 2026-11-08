@@ -1,7 +1,7 @@
 //! Video media scheduling: a video request runs the calls of its graph
 //! (`graph::VideoGraph`, built at admission from its task and conditions),
 //! offered by `ready_calls` as their inputs become available. Calls occupy
-//! their components' capacity on their executors and, for media reading,
+//! their components' capacity on their workers and, for media reading,
 //! encoding and muxing, host task pools, tracked by the media occupancy
 //! ([`Occupancy`]); `plan_media_call` builds one call with its products,
 //! buffer bindings, latent pages and reading components, and
@@ -31,14 +31,14 @@ fn video_output(name: &'static str) -> crate::encoder_outputs::OutputId {
 /// exclusively, one request at a time. `cpu_workers` names the host task
 /// pools the call places tasks on.
 pub(in crate::scheduler) struct Demand {
-    /// The executor and component whose capacity the call occupies, taken
+    /// The worker and component whose capacity the call occupies, taken
     /// from the request's dispatch (`Dispatch::affinity`). Admission places
-    /// a media request on an executor for every media component, so a request's
+    /// a media request on a worker for every media component, so a request's
     /// first call is checked against its component too. `None` when no
     /// component serves the call or the request holds no dispatch for it.
     component: Option<(crate::WorkerGroupId, String)>,
     units: u32,
-    /// Host task pools this call occupies, each named by its executor and rank
+    /// Host task pools this call occupies, each named by its worker and rank
     /// with the number of tasks the call places on it: one per media unit
     /// the rank encodes, one for any other host call.
     cpu_workers: Vec<(crate::WorkerGroupId, usize, u32)>,
@@ -57,7 +57,7 @@ pub(in crate::scheduler) struct Occupancy {
     /// Media units in flight on each unit-measured component.
     units: HashMap<(crate::WorkerGroupId, String), u32>,
     /// Each rank owns one host task pool, so occupancy is counted per rank
-    /// of each executor.
+    /// of each worker.
     host: HashMap<(crate::WorkerGroupId, usize), u32>,
 }
 
@@ -136,12 +136,12 @@ impl Scheduler {
     /// advance as calls are scheduled, so a unit group only becomes ready
     /// once its predecessor is submitted.
     ///
-    /// A conditioned request first reads its media on a CPU executor. The calls
+    /// A conditioned request first reads its media on a CPU worker. The calls
     /// reading those host products wait until the read has completed, so a
-    /// model executor's queue never holds a call blocked on a host task. Then
+    /// model worker's queue never holds a call blocked on a host task. Then
     /// the vision encoding precedes the text encoding that splices its
     /// features in, on the same component; the text encoding waits until
-    /// those features are produced, because a distributed executor starts its
+    /// those features are produced, because a distributed worker starts its
     /// batches in submission order and one waiting for an input would hold
     /// back every later one. Meanwhile the latent encoding covers the visual
     /// condition units in rounds and then the audio tracks, each call on the
@@ -426,13 +426,13 @@ impl Scheduler {
         self.info.media_components.get(&media_call).cloned()
     }
 
-    /// Returns the executor serving `component` for one request, with the
+    /// Returns the worker serving `component` for one request, with the
     /// component's dispatch there.
     ///
-    /// The executor is the request's owner of `component` when it has one,
+    /// The worker is the request's owner of `component` when it has one,
     /// otherwise the first candidate that can execute `work`. Returns `None`
-    /// when no such executor is loaded or its bound component has no binding
-    /// on that executor.
+    /// when no such worker is loaded or its bound component has no binding
+    /// on that worker.
     fn placed_component<'a>(
         &'a self,
         request: RequestKey,
@@ -442,9 +442,9 @@ impl Scheduler {
         let owner = self.dispatch.affinity.get(&(request, component.to_owned()));
         let (worker, bound, _) = self
             .dispatch
-            .component_candidates(&self.executor, work, component)
+            .component_candidates(&self.worker, work, component)
             .find(|(worker, _, _)| owner.is_none_or(|owner| *worker == owner))?;
-        let config = self.executor.info().component_config(worker, bound)?;
+        let config = self.worker.info().component_config(worker, bound)?;
         Some((worker, config))
     }
 
@@ -452,7 +452,7 @@ impl Scheduler {
     ///
     /// A distributed component reconstructs `units_per_rank` media units on
     /// each of its ranks per round; any other component counts one unit per
-    /// rank, on the executor `placed_component` names.
+    /// rank, on the worker `placed_component` names.
     ///
     /// Returns `None` when the component has no dispatch or the width does
     /// not fit in `u32`.
@@ -483,7 +483,7 @@ impl Scheduler {
     /// A latent encoder whose members encode together has no deal: its call
     /// covers the component's width and names no rank.
     ///
-    /// Returns `None` as well when no component or executor serves latent
+    /// Returns `None` as well when no component or worker serves latent
     /// encoding.
     fn latent_round(&self, state: &MediaFlowState) -> Option<(u32, Vec<u32>)> {
         let request = state.admission.request_key;
@@ -502,7 +502,7 @@ impl Scheduler {
             return Some((units, Vec::new()));
         }
 
-        // A call in flight on this executor holds the ranks it was dealt to,
+        // A call in flight on this worker holds the ranks it was dealt to,
         // or every rank of its component when it names none.
         let mut held = std::collections::HashSet::new();
         // The vision and text encodings run one after the other on the text
@@ -535,7 +535,7 @@ impl Scheduler {
                     held.extend(range.ranks.iter().map(|rank| *rank as usize));
                 }
                 _ => held.extend(
-                    self.executor
+                    self.worker
                         .info()
                         .component_config(worker, name)
                         .into_iter()
@@ -572,7 +572,7 @@ impl Scheduler {
     /// Returns `None` for an exclusively held component, and when `worker`
     /// was launched without a component named `component`.
     fn component_units(&self, worker: &crate::WorkerGroupId, component: &str) -> Option<u32> {
-        let config = self.executor.info().component_config(worker, component)?;
+        let config = self.worker.info().component_config(worker, component)?;
         config
             .distribution
             .as_ref()
@@ -625,16 +625,16 @@ impl Scheduler {
     }
 
     /// Returns the host task pools one call of a component occupies, each
-    /// named by the executor holding the component and the rank within it,
+    /// named by the worker holding the component and the rank within it,
     /// with the tasks the call places there.
     ///
     /// A distributed component's round runs on as many of its ranks as it has
     /// media units, each rank taking one task per unit it encodes; any other
     /// component runs one task on each of its ranks.
     ///
-    /// The executor is the request's owner of the component, or the first
-    /// loaded executor holding it before the request is placed. Returns no
-    /// pools when `component` is `None` or that executor is not loaded or does
+    /// The worker is the request's owner of the component, or the first
+    /// loaded worker holding it before the request is placed. Returns no
+    /// pools when `component` is `None` or that worker is not loaded or does
     /// not hold the component.
     fn host_task_workers(
         &self,
@@ -646,12 +646,12 @@ impl Scheduler {
             return Vec::new();
         };
         let owner = self.dispatch.affinity.get(&(request, component.to_owned()));
-        let executor = self.executor.info();
-        let Some((worker, config)) = executor.workers.iter().find_map(|(id, _)| {
+        let worker = self.worker.info();
+        let Some((worker, config)) = worker.workers.iter().find_map(|(id, _)| {
             if owner.is_some_and(|owner| id != owner) {
                 return None;
             }
-            executor
+            worker
                 .component_config(id, component)
                 .map(|config| (id, config))
         }) else {
@@ -678,10 +678,10 @@ impl Scheduler {
             .collect()
     }
 
-    /// Returns how many tasks the host task pool of each rank of one executor
+    /// Returns how many tasks the host task pool of each rank of one worker
     /// admits at once.
     fn host_task_capacity(&self, worker: &crate::WorkerGroupId) -> u32 {
-        self.executor
+        self.worker
             .info()
             .workers
             .iter()
@@ -692,10 +692,10 @@ impl Scheduler {
     /// Returns the host task pools one encoder call carrying inline image
     /// bytes occupies.
     ///
-    /// The executor prepares an inline input image (decoding, resizing,
+    /// The worker prepares an inline input image (decoding, resizing,
     /// normalization) as one host task on each rank of the component that
     /// encodes it, and the call holds those tasks until its result returns.
-    /// The component is the one the executor routes `media_call` to, or the
+    /// The component is the one the worker routes `media_call` to, or the
     /// default component, as `Dispatch::worker_target` resolves it.
     pub(in crate::scheduler) fn image_demand(
         &self,
@@ -746,10 +746,10 @@ impl Scheduler {
     /// Returns whether the rank group that owns one call can accept a batch.
     ///
     /// Returns `false` when no component serves `media_call` or
-    /// `Dispatch::component_target` selects no executor. Residency narrows
+    /// `Dispatch::component_target` selects no worker. Residency narrows
     /// that choice: a request already placed on the component is checked only
-    /// against its owning executor's queue, and one resident on a candidate
-    /// executor for another component only against that executor's queue.
+    /// against its owning worker's queue, and one resident on a candidate
+    /// worker for another component only against that worker's queue.
     pub(in crate::scheduler) fn call_has_queue_capacity(
         &self,
         request: RequestKey,
@@ -761,7 +761,7 @@ impl Scheduler {
             .is_some_and(|component| {
                 self.dispatch
                     .component_target(
-                        &self.executor,
+                        &self.worker,
                         request,
                         CallKind::Media(media_call),
                         component,
@@ -816,13 +816,13 @@ impl Scheduler {
     ///
     /// Selection checked the request's readiness for `media_call`, so an error
     /// names the readiness invariant that no longer holds. A request's first
-    /// call also queues its executor admission onto `admissions`.
+    /// call also queues its worker admission onto `admissions`.
     ///
-    /// Planning advances the request's scheduling cursors, selects the executor
+    /// Planning advances the request's scheduling cursors, selects the worker
     /// (recording the request's residency there), binds every product to its
-    /// reserved buffer on that executor, names the components that read the
+    /// reserved buffer on that worker, names the components that read the
     /// call's products from the request's graph, and registers the call as in
-    /// flight. The cursors advance before the executor is selected, so an error
+    /// flight. The cursors advance before the worker is selected, so an error
     /// can leave the request partially planned; `assemble_batch` latches
     /// engine-fatal on any error.
     ///
@@ -1121,9 +1121,9 @@ impl Scheduler {
         let state = self
             .media_state_mut(id)
             .ok_or("a media candidate is running")?;
-        if state.admission_state == ExecutorRegistration::Unsubmitted {
+        if state.admission_state == WorkerRegistration::Unsubmitted {
             admissions.push(state.admission.clone());
-            state.admission_state = ExecutorRegistration::InFlight;
+            state.admission_state = WorkerRegistration::InFlight;
         }
         for (product, ((component, index), start)) in call.outputs.iter().zip(output_starts) {
             let replaced = state
@@ -1216,16 +1216,11 @@ impl Scheduler {
         }
 
         // Place the call, recording the request's residency on the selected
-        // executor, then bind each distinct input and output buffer to its
+        // worker, then bind each distinct input and output buffer to its
         // reserved span in the buffer pool of each rank that backs it.
         let (worker, selected_component) = self
             .dispatch
-            .select_worker(
-                &self.executor,
-                &self.info,
-                &call,
-                &dispatch::Choice::Existing,
-            )
+            .select_worker(&self.worker, &self.info, &call, &dispatch::Choice::Existing)
             .ok_or("a planned call retains an executable component")?;
         call.component = selected_component;
         let state = self
@@ -1243,7 +1238,7 @@ impl Scheduler {
             })
             .collect();
 
-        // Request slots are allocated per executor; the denoiser derives the
+        // Request slots are allocated per worker; the denoiser derives the
         // latent pages of its slot from its own pool.
         let request_pool_idx = state.allocations.request_slot(&worker);
 

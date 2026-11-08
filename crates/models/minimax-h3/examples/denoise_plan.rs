@@ -213,7 +213,7 @@ fn run() -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         let reserved = arena_reservation(&plan);
         // **Two routes to one number**, which is the only kind of agreement worth having: the plan
-        // this tool sums, and the answer the executor's capability call gives. A capability no one
+        // this tool sums, and the answer the worker's capability call gives. A capability no one
         // calls is a declaration, so the tool calls it here and refuses when the two disagree.
         let stated = Denoiser::arena_bytes(&denoiser, &request)
             .map_err(|error| format!("{}x{}: {error}", case.height, case.width))?;

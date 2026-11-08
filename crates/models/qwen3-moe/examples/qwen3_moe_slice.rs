@@ -1,8 +1,8 @@
 //! Qwen3-MoE on a GPU, with no scheduler: the first place this rewrite's operators are launched.
 //!
 //! A runner builds a device, an allocator, an arena and a `Generation` of loaded kernels before a
-//! model computes anything; the executor owns all four. This example builds exactly those four by
-//! hand, so a model can be driven with nothing of the executor in the way, and it stages the run so
+//! model computes anything; the worker owns all four. This example builds exactly those four by
+//! hand, so a model can be driven with nothing of the worker in the way, and it stages the run so
 //! that the first failure names one thing rather than thirty:
 //!
 //! ```text
@@ -3396,7 +3396,7 @@ struct Encoded {
 
 /// The operators `Qwen3Moe`'s own forward launches, in the order a layer composes them.
 ///
-/// The fixture's remaining keys belong to the executor (the cache, the slot commit, the gathers) and
+/// The fixture's remaining keys belong to the worker (the cache, the slot commit, the gathers) and
 /// to the sampling chain, which this harness computes on the host from the logits row.
 const MODEL_OPERATORS: &[&str] = &[
     "embedding",

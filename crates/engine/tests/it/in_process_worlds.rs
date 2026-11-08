@@ -19,8 +19,8 @@ use std::time::{Duration, Instant};
 use engine::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, SchedulerHandle, Stage,
 };
-use executor::batch::Batches;
 use ipc::{ImageParams, RequestId, SamplingParams};
+use worker::batch::Batches;
 
 use crate::support::{self, Serving};
 

@@ -2,7 +2,7 @@
 //!
 //! Once a step's tokens are chosen, one launch folds them into the slots: the next input token, the
 //! continuation and stop predicate, the three lengths a slot tracks, and the penalty counts that bias
-//! later sampling. The state is the executor's — `ops` names it and writes it, allocates nothing and
+//! later sampling. The state is the worker's — `ops` names it and writes it, allocates nothing and
 //! keeps nothing (`uniserve/sampling/state.py`; specs/worker.md 9, the slot-state row).
 //!
 //! ```text

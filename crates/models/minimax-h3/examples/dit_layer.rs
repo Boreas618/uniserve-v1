@@ -1,8 +1,8 @@
 //! MiniMax-H3's diffusion transformer on a GPU, one stage of it at a time.
 //!
 //! A runner builds a device, an allocator, an arena and a `Generation` of loaded kernels before a
-//! model computes anything, and the executor owns all four. This example builds exactly those four
-//! by hand so the stack can be driven with nothing of the executor in the way, and it stages the run
+//! model computes anything, and the worker owns all four. This example builds exactly those four
+//! by hand so the stack can be driven with nothing of the worker in the way, and it stages the run
 //! so that the first failure names one thing:
 //!
 //! ```text
@@ -53,7 +53,7 @@ use minimax_h3::partition::Partition;
 use minimax_h3::schedule::{Modality, Schedule};
 use minimax_h3::transformer::{Transformer, rotated_axes};
 // The block's capability methods: `draw_noise`, `layout`, `state_tables` and the rest are the
-// trait's, and the stage that drives the whole block calls them the way the executor does.
+// trait's, and the stage that drives the whole block calls them the way the worker does.
 use nn::capability::Denoiser as _;
 use nn::capability::{VideoRequest, VideoTask};
 use nn::{
@@ -841,7 +841,7 @@ fn stage_denoise(args: &Args) -> Result<()> {
 
     // 6. The constants the block fills once after a load, then the request's own tables, whose host
     //    bytes only the model writes. The evaluation's word is one of them, and this harness is the
-    //    executor that writes it before each evaluation.
+    //    worker that writes it before each evaluation.
     let constants = allocate_tables(&arena, &constant_specs)?;
     block.prepare_constants(&forward, &constants)?;
     let mut hosts = host_tables(&state_specs)?;
@@ -971,8 +971,8 @@ fn stage_denoise(args: &Args) -> Result<()> {
                     step.index
                 )));
             }
-            // The solver's coefficient is device data the executor writes before each replay; this
-            // harness is that executor, so it writes the one word the step table holds.
+            // The solver's coefficient is device data the worker writes before each replay; this
+            // harness is that worker, so it writes the one word the step table holds.
             let word = i32::try_from(index)
                 .map_err(|_| Failure::message(format!("evaluation {index} of a step table")))?;
             upload_bytes(&stream, state[step_table], &word.to_le_bytes())?;
@@ -1155,7 +1155,7 @@ fn write_sample(
 /// The video raster's extents, as the case writes them.
 /// Stage 2: one stack layer's arithmetic on a device.
 ///
-/// The order is the executor's, done by hand: the device and its stream, the kernels, the weights,
+/// The order is the worker's, done by hand: the device and its stream, the kernels, the weights,
 /// the arena, the modulation cache's one post-load computation, then the forward. Each step's failure
 /// names itself and nothing else, which is the point of the staging.
 fn stage_block(args: &Args) -> Result<()> {
@@ -1784,7 +1784,7 @@ fn clear_trajectory(directory: &std::path::Path) -> Result<usize> {
 ///
 /// A captured graph replays without calling `operate`, so a sink installed around a replay records
 /// nothing; the stage this walks is an eager forward, which is why the walk belongs here. The
-/// recorder is the executor's own mechanism (`ops::capture`), installed for the duration of the
+/// recorder is the worker's own mechanism (`ops::capture`), installed for the duration of the
 /// forward and removed whether it succeeds or fails: a sink left installed would be reported to by
 /// every later launch on the thread.
 ///

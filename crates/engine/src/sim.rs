@@ -1,19 +1,19 @@
-//! GPU-free executor for scheduler and frontend behavior.
+//! GPU-free worker for scheduler and frontend behavior.
 //!
-//! [`SimExecutor`] implements the `Executor` trait the scheduler drives, over
+//! [`SimWorker`] implements the `Worker` trait the scheduler drives, over
 //! a background thread that runs a [`SimEngine`]. It consumes the scheduler's
 //! typed admissions, lifecycle commands, and calls, bounds the batches in
 //! flight by a queue depth, and tracks admitted requests and live products for
 //! `command_has_capacity`.
 //!
-//! [`SimEngine`] keeps the per-request progress an executor tracks:
+//! [`SimEngine`] keeps the per-request progress a worker tracks:
 //! positions, cache extent, denoising step, and predicate values. It enforces
 //! request identity, lifecycle, call coordinates, and predicate dependencies,
 //! and reports deterministic tokens, cache extents, denoising progress, and
 //! synthetic media published through POSIX shared memory. The module is built
 //! only with the `testing` feature; engine and server tests and the engine's
 //! `control_plane` example drive the scheduler through it in place of GPU
-//! executors.
+//! workers.
 
 use ipc::{ForwardMode, MediaCall, TransferMode};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -22,11 +22,11 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::CommandWaker;
-use crate::executor::{
-    BatchResult, BlockConfig, CallResult, CommandOutcome, CommandResult, ExecutionBatch, Executor,
-    ExecutorFailure, ExecutorInfo, ExecutorSubmitError, PoolLayout, WorkerGroupId,
-};
 use crate::scheduler::SpecialTokenIds;
+use crate::worker::{
+    BatchResult, BlockConfig, CallResult, CommandOutcome, CommandResult, ExecutionBatch,
+    PoolLayout, Worker, WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
+};
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
 use ipc::philox;
@@ -129,32 +129,32 @@ enum Job {
     Shutdown,
 }
 
-/// Runs the deterministic model simulator on a bounded asynchronous executor seam.
-/// Reports a simulated deployment's executor group lost: the group closes, and
-/// the executor answers its next poll with the loss instead of a result.
+/// Runs the deterministic model simulator on a bounded asynchronous worker seam.
+/// Reports a simulated deployment's worker group lost: the group closes, and
+/// the worker answers its next poll with the loss instead of a result.
 ///
 /// The scheduler stops when every model group is closed. Without this a
-/// simulated executor's executors never die, so no case could state what
+/// simulated worker's workers never die, so no case could state what
 /// happens when they all do.
 #[derive(Clone, Default)]
 pub struct SimLoss {
-    /// The group reported lost: it stays lost for the executor's lifetime, so
+    /// The group reported lost: it stays lost for the worker's lifetime, so
     /// it reports not ready after the report has been answered.
     group: Arc<Mutex<Option<WorkerGroupId>>>,
     /// Whether the lost group is closed as well as lost: a group that cannot
     /// be replaced closes, while one whose replacement is starting is not
     /// ready but not closed.
     closed: Arc<Mutex<bool>>,
-    /// The report the executor's next poll answers with, taken once: the
+    /// The report the worker's next poll answers with, taken once: the
     /// group, why it failed, and the requests whose work is gone.
     pending: Arc<Mutex<Option<(WorkerGroupId, String, Vec<ipc::RequestKey>)>>>,
-    /// Wakes a scheduler parked on this executor, so the loss is answered
+    /// Wakes a scheduler parked on this worker, so the loss is answered
     /// without waiting out its park.
     wake: Arc<Mutex<Option<CommandWaker>>>,
 }
 
 impl SimLoss {
-    /// Reports `group` lost for `message`; the executor's next poll answers
+    /// Reports `group` lost for `message`; the worker's next poll answers
     /// with the loss, and `group` reports not ready and closed from then on.
     ///
     /// # Panics
@@ -189,7 +189,7 @@ impl SimLoss {
     }
 
     /// Reports `group` failed by the stall `stall` names, as a rank whose
-    /// builder thread stayed inside one job reports it: the executor's next
+    /// builder thread stayed inside one job reports it: the worker's next
     /// poll answers with that failure, naming the forward the job belongs to
     /// and the requests whose calls it held.
     ///
@@ -272,7 +272,7 @@ impl SimLoss {
     }
 
     /// Wakes `waker` when a loss is reported, so a scheduler parked on this
-    /// executor answers it rather than waiting out its park.
+    /// worker answers it rather than waiting out its park.
     fn watch(&self, waker: CommandWaker) {
         *self
             .wake
@@ -294,8 +294,8 @@ impl SimLoss {
     }
 }
 
-pub struct SimExecutor {
-    executor_info: ExecutorInfo,
+pub struct SimWorker {
+    worker_info: WorkerInfo,
     /// Maximum batches submitted whose results `poll` has not yet returned.
     depth: usize,
     to_worker: Sender<Job>,
@@ -315,10 +315,10 @@ pub struct SimExecutor {
     /// observes them: `true` for a halving, `false` for a restoration.
     throttles: Option<Sender<bool>>,
     /// The storage reports of the deployment's nodes a test has the
-    /// executor answer with (`Executor::ledgers`), as node daemons report
+    /// worker answer with (`Worker::ledgers`), as node daemons report
     /// them; none when unset.
     ledgers: Option<std::sync::Arc<std::sync::Mutex<Vec<String>>>>,
-    /// The simulator thread; `None` once the executor is closed.
+    /// The simulator thread; `None` once the worker is closed.
     handle: Option<JoinHandle<()>>,
     /// The simulator's stop flag: set before the thread is joined, so that a
     /// batch waiting for a permit cannot hold the join open.
@@ -336,20 +336,20 @@ pub struct SimExecutor {
     held: Option<(BatchResult, Vec<ipc::BatchCommand>)>,
 }
 
-/// What the simulated executor observed at its boundary, in the order it
+/// What the simulated worker observed at its boundary, in the order it
 /// happened: a batch the scheduler submitted and a result it was handed back.
 #[derive(Debug, Clone, PartialEq)]
 pub enum BatchEvent {
-    /// A batch as the executor accepted it.
+    /// A batch as the worker accepted it.
     Submitted(ExecutionBatch),
-    /// The executor handed this batch's result to the scheduler.
+    /// The worker handed this batch's result to the scheduler.
     Resolved {
         /// Logical batch identity assigned at submission.
         batch_id: u64,
     },
 }
 
-impl SimExecutor {
+impl SimWorker {
     /// Starts an asynchronous simulator that admits as many batches in
     /// flight as the pool's queue depth.
     ///
@@ -374,7 +374,7 @@ impl SimExecutor {
         let (results_tx, from_worker) = crossbeam_channel::unbounded();
         let (progress_tx, progress_rx) = crossbeam_channel::bounded(1);
         let handle = std::thread::Builder::new()
-            .name("uniserve-sim-executor".into())
+            .name("uniserve-sim-worker".into())
             .spawn(move || {
                 // Batches execute one at a time in submission order. Each
                 // returns whole, as one terminal result carrying an `Applied`
@@ -395,10 +395,10 @@ impl SimExecutor {
                     }
                 }
             })
-            .expect("spawn sim executor thread");
-        let mut executor = Self {
-            executor_info: {
-                ExecutorInfo {
+            .expect("spawn sim worker thread");
+        let mut worker = Self {
+            worker_info: {
+                WorkerInfo {
                     workers: groups
                         .iter()
                         .map(|group| (group.clone(), info.clone()))
@@ -427,7 +427,7 @@ impl SimExecutor {
                             .map(|group| (group.clone(), encoder_pools.clone()))
                             .collect()
                     },
-                    ..ExecutorInfo::default()
+                    ..WorkerInfo::default()
                 }
             },
             depth,
@@ -447,16 +447,16 @@ impl SimExecutor {
             products: HashSet::new(),
             held: None,
         };
-        // A loss wakes the scheduler parked on this executor, so it is
+        // A loss wakes the scheduler parked on this worker, so it is
         // answered on the next poll rather than at the end of the park.
-        executor.loss.watch(executor.command_waker());
-        executor
+        worker.loss.watch(worker.command_waker());
+        worker
     }
 
-    /// Reports every batch this executor accepts and every result it hands
+    /// Reports every batch this worker accepts and every result it hands
     /// back, in order, to the returned receiver.
     ///
-    /// The receiver disconnects when the executor is dropped, so a reader can
+    /// The receiver disconnects when the worker is dropped, so a reader can
     /// drain the complete record after the scheduler has closed.
     pub fn observe(&mut self) -> Receiver<BatchEvent> {
         let (sender, receiver) = crossbeam_channel::unbounded();
@@ -464,8 +464,8 @@ impl SimExecutor {
         receiver
     }
 
-    /// Reports every throttle of the deployment's transfers the executor
-    /// takes (`Executor::throttle`), `true` for a halving and `false` for a
+    /// Reports every throttle of the deployment's transfers the worker
+    /// takes (`Worker::throttle`), `true` for a halving and `false` for a
     /// restoration, in order, to the returned receiver. The simulator runs
     /// no transfer: a throttle changes nothing else.
     pub fn observe_throttles(&mut self) -> Receiver<bool> {
@@ -474,8 +474,8 @@ impl SimExecutor {
         receiver
     }
 
-    /// Has the executor report, as the deployment's nodes' storage reports
-    /// (`Executor::ledgers`), whatever the returned list holds when the
+    /// Has the worker report, as the deployment's nodes' storage reports
+    /// (`Worker::ledgers`), whatever the returned list holds when the
     /// engine reads them: a test writes each node's JSON (`{"host",
     /// "ledgers", "host_storage", "transfers"}`) as it means the nodes'
     /// Storage Servers to answer.
@@ -485,7 +485,7 @@ impl SimExecutor {
         ledgers
     }
 
-    /// Returns a waker that interrupts executor polling after command enqueue.
+    /// Returns a waker that interrupts worker polling after command enqueue.
     pub fn command_waker(&self) -> CommandWaker {
         let progress = self.progress_tx.clone();
         CommandWaker::new(move || {
@@ -494,7 +494,7 @@ impl SimExecutor {
     }
 }
 
-impl SimExecutor {
+impl SimWorker {
     /// Waits up to `timeout` for the next batch result and the commands its
     /// batch was submitted with.
     ///
@@ -520,11 +520,11 @@ impl SimExecutor {
         let result = crossbeam_channel::select! {
             recv(self.from_worker) -> result => match result {
                 Ok(result) => Ok(Some(result?)),
-                Err(_) => Err(anyhow::anyhow!("sim executor thread disconnected")),
+                Err(_) => Err(anyhow::anyhow!("sim worker thread disconnected")),
             },
             recv(self.progress_rx) -> wake => match wake {
                 Ok(()) => Ok(None),
-                Err(_) => Err(anyhow::anyhow!("sim executor progress channel disconnected")),
+                Err(_) => Err(anyhow::anyhow!("sim worker progress channel disconnected")),
             },
             default(timeout) => Ok(None),
         }?;
@@ -534,10 +534,10 @@ impl SimExecutor {
         Ok(result)
     }
 
-    /// A handle that reports one of this executor's groups lost, which the
-    /// executor answers on its next poll and reports through `is_ready`.
+    /// A handle that reports one of this worker's groups lost, which the
+    /// worker answers on its next poll and reports through `is_ready`.
     ///
-    /// The handle outlives the executor's move into a scheduler, so a test
+    /// The handle outlives the worker's move into a scheduler, so a test
     /// states a loss at the moment it means it.
     pub fn loss(&self) -> SimLoss {
         self.loss.clone()
@@ -547,7 +547,7 @@ impl SimExecutor {
     /// buffers those calls would have produced, and the reason of each request
     /// the simulated model refused.
     /// `None` when every call of the result succeeded.
-    fn call_failure(&self, result: &BatchResult) -> Option<ExecutorFailure> {
+    fn call_failure(&self, result: &BatchResult) -> Option<WorkerFailure> {
         let failed = || {
             result
                 .results
@@ -576,14 +576,14 @@ impl SimExecutor {
             .map(TensorRef::buffer_id)
             .filter(|buffer| calls.contains(&(buffer.owner, buffer.producer_call_id)))
             .collect::<HashSet<_>>();
-        Some(ExecutorFailure {
+        Some(WorkerFailure {
             worker_id: WorkerGroupId("sim".to_owned()),
             endpoints: Vec::new(),
             requests: requests.into_iter().collect(),
             refusals,
             retired: Vec::new(),
             buffers: buffers.into_iter().collect(),
-            execution: crate::executor::ExecuteError::non_finite(
+            execution: crate::worker::ExecuteError::non_finite(
                 result.batch_id,
                 result.results.iter().map(|completion| &completion.output),
             ),
@@ -591,7 +591,7 @@ impl SimExecutor {
         })
     }
 
-    /// Closes the simulated physical executor.
+    /// Closes the simulated physical worker.
     fn shutdown(&mut self) -> anyhow::Result<()> {
         // A batch waiting for its permit would otherwise never return, and
         // the join below would wait for it forever.
@@ -604,7 +604,7 @@ impl SimExecutor {
     }
 }
 
-impl Executor for SimExecutor {
+impl Worker for SimWorker {
     fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
         self.is_ready(worker) && self.in_flight < self.depth
     }
@@ -636,16 +636,12 @@ impl Executor for SimExecutor {
     fn is_ready(&self, worker: &WorkerGroupId) -> bool {
         self.handle.is_some()
             && !self.loss.is_lost(worker)
-            && self
-                .executor_info
-                .workers
-                .iter()
-                .any(|(id, _)| id == worker)
+            && self.worker_info.workers.iter().any(|(id, _)| id == worker)
     }
 
     /// Records the throttle for an observer; the simulator throttles no
     /// host.
-    fn throttle(&mut self, halve: bool) -> Result<Vec<String>, crate::executor::ExecutorError> {
+    fn throttle(&mut self, halve: bool) -> Result<Vec<String>, crate::worker::WorkerError> {
         if let Some(throttles) = &self.throttles {
             let _ = throttles.send(halve);
         }
@@ -654,7 +650,7 @@ impl Executor for SimExecutor {
 
     /// The storage reports a test set (`Self::report_ledgers`); none
     /// otherwise.
-    fn ledgers(&mut self) -> Result<Vec<String>, crate::executor::ExecutorError> {
+    fn ledgers(&mut self) -> Result<Vec<String>, crate::worker::WorkerError> {
         Ok(self.ledgers.as_ref().map_or_else(Vec::new, |ledgers| {
             ledgers
                 .lock()
@@ -663,35 +659,35 @@ impl Executor for SimExecutor {
         }))
     }
 
-    /// Returns the executor metadata.
-    fn info(&self) -> &ExecutorInfo {
-        &self.executor_info
+    /// Returns the worker metadata.
+    fn info(&self) -> &WorkerInfo {
+        &self.worker_info
     }
 
     /// Validates a logical batch and queues it for the simulator thread.
     ///
     /// Returns `WouldBlock` with the batch while `depth` batches are in
-    /// flight. Returns `Failed` when the executor is closed, a dispatch names
-    /// an executor other than the simulator, the batch fails validation, or the
+    /// flight. Returns `Failed` when the worker is closed, a dispatch names
+    /// a worker other than the simulator, the batch fails validation, or the
     /// simulator thread is gone. The batch's admissions and products are
     /// recorded before it is queued and are not rolled back if queuing fails.
-    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
         if self.handle.is_none() {
-            return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
-                "Executor is closed"
+            return Err(WorkerSubmitError::Failed(anyhow::anyhow!(
+                "Worker is closed"
             )));
         }
         for (_, dispatch) in &batch.requests {
             if !self.is_ready(&dispatch.worker) {
-                return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
-                    "Executor cannot accept this request"
+                return Err(WorkerSubmitError::Failed(anyhow::anyhow!(
+                    "Worker cannot accept this request"
                 )));
             }
         }
         if self.in_flight >= self.depth {
-            return Err(ExecutorSubmitError::WouldBlock(Box::new(batch)));
+            return Err(WorkerSubmitError::WouldBlock(Box::new(batch)));
         }
-        batch.validate().map_err(ExecutorSubmitError::Failed)?;
+        batch.validate().map_err(WorkerSubmitError::Failed)?;
 
         self.admissions
             .extend(batch.admissions().map(|request| request.request_key));
@@ -704,9 +700,9 @@ impl Executor for SimExecutor {
         if let Some(observer) = &self.observer {
             let _ = observer.send(BatchEvent::Submitted(batch.clone()));
         }
-        self.to_worker.send(Job::Batch(batch)).map_err(|_| {
-            ExecutorSubmitError::Failed(anyhow::anyhow!("sim executor thread gone"))
-        })?;
+        self.to_worker
+            .send(Job::Batch(batch))
+            .map_err(|_| WorkerSubmitError::Failed(anyhow::anyhow!("sim worker thread gone")))?;
         self.in_flight += 1;
         Ok(())
     }
@@ -718,7 +714,7 @@ impl Executor for SimExecutor {
         // closed group's loss is engine-fatal when no other model group
         // serves.
         if let Some((worker_id, message, requests)) = self.loss.take() {
-            return Err(anyhow::Error::new(ExecutorFailure {
+            return Err(anyhow::Error::new(WorkerFailure {
                 worker_id,
                 endpoints: Vec::new(),
                 requests,
@@ -744,7 +740,7 @@ impl Executor for SimExecutor {
         };
         for receipt in &result.command_results {
             // A failed command keeps its physical ownership.
-            if receipt.outcome == crate::executor::CommandOutcome::Failed {
+            if receipt.outcome == crate::worker::CommandOutcome::Failed {
                 continue;
             }
             // Receipts number lifecycle commands with `Start` admissions
@@ -793,11 +789,11 @@ impl Executor for SimExecutor {
         self.shutdown()
     }
 
-    /// Answers the engine's own executor hooks as an executor without a device
+    /// Answers the engine's own worker hooks as a worker without a device
     /// does: its cache is not split into segments, it gives back no storage,
     /// it has no fence probes, and a profiling session it takes part in runs
     /// no collector and writes no file. It loads and unloads LoRA adapters
-    /// as an executor with a LoRA plugin does, answering the slot; other plugin
+    /// as a worker with a LoRA plugin does, answering the slot; other plugin
     /// hooks fail, as no plugin is loaded.
     fn hook(&mut self, name: &str, payload: &str) -> anyhow::Result<Vec<String>> {
         let result = match name {
@@ -823,7 +819,7 @@ impl Executor for SimExecutor {
                     .map(|collector| {
                         (
                             collector.as_str().to_owned(),
-                            serde_json::json!("unavailable: the simulated executor has no device"),
+                            serde_json::json!("unavailable: the simulated worker has no device"),
                         )
                     })
                     .collect();
@@ -852,13 +848,13 @@ impl Executor for SimExecutor {
                 let payload: serde_json::Value = serde_json::from_str(payload)?;
                 serde_json::json!({ "adapter": payload["adapter"] })
             }
-            other => anyhow::bail!("no plugin implements the executor hook {other}"),
+            other => anyhow::bail!("no plugin implements the worker hook {other}"),
         };
         Ok(vec![result.to_string()])
     }
 }
 
-impl Drop for SimExecutor {
+impl Drop for SimWorker {
     /// Stops and joins the simulator thread.
     fn drop(&mut self) {
         let _ = self.shutdown();
@@ -886,7 +882,7 @@ struct SimRequestState {
     /// continue after them.
     history: usize,
     /// The step index of the request's trajectory: the solver steps it has
-    /// completed. Image decoding resets it to zero, as it does on an executor
+    /// completed. Image decoding resets it to zero, as it does on a worker
     /// rank.
     step_index: u16,
     /// Boolean values of the request's resolved products that later calls
@@ -898,7 +894,7 @@ struct SimRequestState {
     /// Committed penalty counts in ascending token order.
     ///
     /// Each generated token folds in during execution, allowing a successor to
-    /// observe it before the predecessor is host-visible. Device executors encode
+    /// observe it before the predecessor is host-visible. Device workers encode
     /// the same state as a resident count tensor plus per-call deltas.
     penalty_counts: BTreeMap<u32, u32>,
     /// The latest state-advancing call that completed with status OK, or the
@@ -1152,27 +1148,27 @@ fn select_token(
     })
 }
 
-/// Deterministic local model engine that implements the executor lifecycle protocol.
-/// How the simulated executor speculates: what its drafter proposes and the
-/// executor time each step reports.
+/// Deterministic local model engine that implements the worker lifecycle protocol.
+/// How the simulated worker speculates: what its drafter proposes and the
+/// worker time each step reports.
 #[derive(Clone, Copy, Debug)]
 pub struct SimSpeculation {
     /// The leading drafts of each proposal that are the request's next
     /// tokens; the drafts after them are wrong.
     pub accepted: usize,
-    /// Executor time of a decoding step none of whose verifications carries
+    /// Worker time of a decoding step none of whose verifications carries
     /// drafts, in microseconds.
     pub decode_us: u64,
-    /// Executor time of a decoding step one of whose verifications carries
+    /// Worker time of a decoding step one of whose verifications carries
     /// drafts, in microseconds.
     pub verify_us: u64,
-    /// Executor time of a prompt step per token it evaluates, in
+    /// Worker time of a prompt step per token it evaluates, in
     /// microseconds.
     pub prompt_token_us: u64,
 }
 
 impl SimSpeculation {
-    /// The executor time of a step of `calls`: its prompt tokens' and, with
+    /// The worker time of a step of `calls`: its prompt tokens' and, with
     /// decodes or verifications among them, one decoding step's.
     fn step_us<'a>(&self, calls: impl Iterator<Item = &'a Call>) -> u64 {
         let mut prompt_tokens = 0;
@@ -1206,11 +1202,11 @@ impl SimSpeculation {
 pub struct SimEngine {
     info: MainProcessInfo,
     /// How the simulated pool is placed: its queue depth and its components'
-    /// layout, which `SimExecutor` states to the scheduler.
+    /// layout, which `SimWorker` states to the scheduler.
     layout: PoolLayout,
     /// The longest sequence the simulated pool serves: the model's context
-    /// length, which `SimExecutor` states to the scheduler as
-    /// `ExecutorInfo::max_model_len`.
+    /// length, which `SimWorker` states to the scheduler as
+    /// `WorkerInfo::max_model_len`.
     ///
     /// The mechanism bounds every attention row by it, so a pool that states
     /// none is refused rather than shaped to a bound nobody gave.
@@ -1223,11 +1219,11 @@ pub struct SimEngine {
     vocab: usize,
     results_on_wait: bool,
     /// Readout candidate whose log-probability is reported as NaN, as a
-    /// executor with a numerical defect reports it.
+    /// worker with a numerical defect reports it.
     non_finite_candidate: Option<u32>,
-    /// Block-diffusion sampling the simulated executor runs under.
+    /// Block-diffusion sampling the simulated worker runs under.
     canvas_sampling: Option<ipc::CanvasSampling>,
-    /// How the simulated executor speculates, when it runs a drafter.
+    /// How the simulated worker speculates, when it runs a drafter.
     speculation: Option<SimSpeculation>,
     /// Bytes each published media artifact declares beyond what it stores.
     ///
@@ -1235,7 +1231,7 @@ pub struct SimEngine {
     /// object by that statement; a test states the disagreement a rank can
     /// report and cannot store ([`SimEngine::overstate_published_media`]).
     media_overstatement: u64,
-    /// The executor groups the simulated deployment runs: one named `sim` unless
+    /// The worker groups the simulated deployment runs: one named `sim` unless
     /// a test names more.
     ///
     /// A deployment's groups serve different components and fail
@@ -1248,9 +1244,9 @@ pub struct SimEngine {
     /// Permits for batches: each batch executes only after taking one, or
     /// once the sender is dropped ([`SimEngine::pace`]).
     pace: Option<Receiver<()>>,
-    /// Set when the executor that drives this simulator shuts down: a batch
+    /// Set when the worker that drives this simulator shuts down: a batch
     /// waiting for a permit gives up instead of holding the thread its
-    /// executor joins on.
+    /// worker joins on.
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Admitted requests by id, removed when a `Finish` for the same request
     /// key executes.
@@ -1260,14 +1256,14 @@ pub struct SimEngine {
     /// rank reports a request whose size its model does not serve.
     refused: HashMap<RequestId, String>,
     /// The host latent pools of the simulated pool's ranks, with each
-    /// rank's host (`ExecutorInfo::rank_latents`); empty without them.
+    /// rank's host (`WorkerInfo::rank_latents`); empty without them.
     latent_pools: Vec<(String, Option<ipc::LatentPoolInfo>)>,
     /// How each simulated denoising rank holds a request's samples, which
     /// every video latent preparation reports (`CallOutput::latent_layouts`).
     latent_layouts: Vec<ipc::RankLatentLayout>,
     /// The host encoder pools of the simulated pool's ranks, with each
-    /// rank's host (`ExecutorInfo::rank_encoders`); empty without them.
-    encoder_pools: crate::executor::RankEncoderPools,
+    /// rank's host (`WorkerInfo::rank_encoders`); empty without them.
+    encoder_pools: crate::worker::RankEncoderPools,
 
     /// What each request's calls wrote into its context, shared with the
     /// test that reads it ([`SimEngine::context_log`]).
@@ -1296,7 +1292,7 @@ impl Pace {
 }
 
 /// One write a simulated request's call made to its context: the KV cache a
-/// executor holds for it, in write order. Two requests whose logs are equal
+/// worker holds for it, in write order. Two requests whose logs are equal
 /// hold the same context, whichever calls wrote it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextWrite {
@@ -1372,7 +1368,7 @@ impl SimEngine {
     /// Model limits of a deployment without a model-imposed bound.
     ///
     /// The scheduler takes the served features from the call kinds the
-    /// simulated executor reports and clamps these limits to its capacities.
+    /// simulated worker reports and clamps these limits to its capacities.
     pub fn generation_limits() -> crate::GenerationLimits {
         crate::GenerationLimits {
             max_latent_units: u64::MAX,
@@ -1380,7 +1376,7 @@ impl SimEngine {
             max_vae_grid_tokens: u32::MAX,
             max_vit_grid_tokens: u32::MAX,
             // One latent unit of the simulated image: 256 MiB over the
-            // simulated executor's 65,536 latent units.
+            // simulated worker's 65,536 latent units.
             latent_bytes_per_unit: 4096,
             max_latent_feature_bytes: 256 << 20,
             max_vision_feature_bytes: 256 << 20,
@@ -1441,7 +1437,7 @@ impl SimEngine {
     }
 
     /// The longest sequence this simulated pool serves: the number
-    /// `SimExecutor` states as `ExecutorInfo::max_model_len`.
+    /// `SimWorker` states as `WorkerInfo::max_model_len`.
     pub const fn max_model_len(&self) -> u32 {
         self.max_model_len
     }
@@ -1885,7 +1881,7 @@ impl SimEngine {
                             .map(|canvas| canvas.max_steps)
                             .ok_or_else(|| {
                                 anyhow::anyhow!(
-                                    "canvas call for an executor launched without canvas sampling"
+                                    "canvas call for a worker launched without canvas sampling"
                                 )
                             })?;
                     let request_id = call.request_key.request_id;
@@ -1985,7 +1981,7 @@ impl SimEngine {
                 }
             }
             CallKind::Media(MediaCall::ImageDecoding) => {
-                // An executor's image decoding releases the request's
+                // A worker's image decoding releases the request's
                 // latent and resets its denoising step to zero.
                 request.step_index = 0;
                 if let Some(image) = request.image().cloned() {
@@ -1996,7 +1992,7 @@ impl SimEngine {
                     };
                     // A decoding that writes the request's feedback image
                     // product publishes its values after the PNG, as a
-                    // executor does.
+                    // worker does.
                     let seed = image.seed.unwrap_or(call.request_key.request_id.0);
                     let mut media =
                         synthetic_png_b64(width, height, seed, request.image_index)?.into_bytes();
@@ -2061,7 +2057,7 @@ impl SimEngine {
         self.layout.queue_depth = (depth as usize).max(1);
     }
 
-    /// Names the executor groups this deployment runs, replacing the single
+    /// Names the worker groups this deployment runs, replacing the single
     /// `sim` group.
     ///
     /// Each group reports the same layout, ranks and pools: what differs
@@ -2073,7 +2069,7 @@ impl SimEngine {
             .collect();
     }
 
-    /// Places the pool's components, as a deployment places an executor
+    /// Places the pool's components, as a deployment places a worker
     /// group's, and gives the pool the ranks they span.
     pub fn place_components(&mut self, components: BTreeMap<String, BlockConfig>) {
         self.layout.ranks = components
@@ -2104,7 +2100,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated executor does not expose a prefix cache.
+    /// Panics when the simulated worker does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2113,7 +2109,7 @@ impl SimEngine {
         self.info
             .prefix_cache
             .as_mut()
-            .expect("sim AR executor has a prefix cache")
+            .expect("sim AR worker has a prefix cache")
             .groups = groups;
     }
 
@@ -2121,7 +2117,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated executor does not expose a prefix cache.
+    /// Panics when the simulated worker does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2130,7 +2126,7 @@ impl SimEngine {
         self.info
             .prefix_cache
             .as_mut()
-            .expect("sim AR executor has a prefix cache")
+            .expect("sim AR worker has a prefix cache")
             .num_units = count;
     }
 
@@ -2140,7 +2136,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated executor does not expose a prefix cache.
+    /// Panics when the simulated worker does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2150,7 +2146,7 @@ impl SimEngine {
             .info
             .prefix_cache
             .as_mut()
-            .expect("sim AR executor has a prefix cache");
+            .expect("sim AR worker has a prefix cache");
         cache.segments = (0..segments)
             .map(|ordinal| ipc::CacheSegment {
                 world: if (1..=inherited).contains(&ordinal) {
@@ -2173,7 +2169,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated executor does not expose a prefix cache.
+    /// Panics when the simulated worker does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2183,7 +2179,7 @@ impl SimEngine {
             .info
             .prefix_cache
             .as_mut()
-            .expect("sim AR executor has a prefix cache");
+            .expect("sim AR worker has a prefix cache");
         let first = cache.groups[0].clone();
         let layer = cache
             .groups
@@ -2207,7 +2203,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated executor does not expose a prefix cache.
+    /// Panics when the simulated worker does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2217,7 +2213,7 @@ impl SimEngine {
             .info
             .prefix_cache
             .as_mut()
-            .expect("sim AR executor has a prefix cache")
+            .expect("sim AR worker has a prefix cache")
             .groups
         {
             group.block_size = tokens;
@@ -2226,7 +2222,7 @@ impl SimEngine {
 
     /// Speculates as `speculation` states: the simulated drafter proposes
     /// for the calls that ask for drafts, verifications accept the drafts
-    /// that are the model's tokens, and every step reports its executor time.
+    /// that are the model's tokens, and every step reports its worker time.
     pub fn set_speculation(&mut self, speculation: SimSpeculation) {
         self.speculation = Some(speculation);
     }
@@ -2236,7 +2232,7 @@ impl SimEngine {
     ///
     /// # Panics
     ///
-    /// Panics when the simulated executor does not expose a prefix cache.
+    /// Panics when the simulated worker does not expose a prefix cache.
     #[expect(
         clippy::expect_used,
         reason = "a test setter whose missing prefix cache is documented under Panics"
@@ -2246,7 +2242,7 @@ impl SimEngine {
             .info
             .prefix_cache
             .as_mut()
-            .expect("sim AR executor has a prefix cache");
+            .expect("sim AR worker has a prefix cache");
         let first = cache.groups[0].clone();
         let layer = cache
             .groups
@@ -2263,7 +2259,7 @@ impl SimEngine {
         });
     }
 
-    /// Launches the simulated executor with block-diffusion sampling: a canvas
+    /// Launches the simulated worker with block-diffusion sampling: a canvas
     /// step stops its block no later than the sampling's step limit.
     pub fn set_canvas_sampling(&mut self, sampling: ipc::CanvasSampling) {
         self.canvas_sampling = Some(sampling);
@@ -2276,7 +2272,7 @@ impl SimEngine {
     }
 
     /// Holds every batch that skips a predicated call until the returned
-    /// sender releases it, as an executor whose skipped step is still running
+    /// sender releases it, as a worker whose skipped step is still running
     /// holds its batch's result: each message releases one held batch, and
     /// dropping the sender releases the rest.
     pub fn hold_predicated_batches(&mut self) -> Sender<()> {
@@ -2327,7 +2323,7 @@ impl SimEngine {
 
     /// States how each simulated denoising rank's request slot pages hold a
     /// request's samples, which every video latent preparation reports, as
-    /// the ranks' executors declare it for every request.
+    /// the ranks' workers declare it for every request.
     pub fn set_latent_layouts(&mut self, layouts: Vec<ipc::RankLatentLayout>) {
         self.latent_layouts = layouts;
     }
@@ -2336,7 +2332,7 @@ impl SimEngine {
     /// with the rank's host, as ranks executing video encoder calls report
     /// them. The simulator copies no bytes: an encoder call whose output it
     /// reads from the pool completes as one that computes it.
-    pub fn set_encoder_pools(&mut self, pools: crate::executor::RankEncoderPools) {
+    pub fn set_encoder_pools(&mut self, pools: crate::worker::RankEncoderPools) {
         self.encoder_pools = pools;
     }
 
@@ -2375,7 +2371,7 @@ fn digest(values: &[u8]) -> u64 {
 }
 
 /// What `call`, which completed with `record`, wrote into `request`'s
-/// context, as an executor's KV cache holds it, and the provenance of the image
+/// context, as a worker's KV cache holds it, and the provenance of the image
 /// products it made.
 fn context_writes(
     call: &Call,
@@ -2571,7 +2567,7 @@ impl Default for SimEngine {
 }
 
 impl SimEngine {
-    /// Returns the executor metadata.
+    /// Returns the worker metadata.
     fn info(&self) -> &MainProcessInfo {
         &self.info
     }
@@ -2592,8 +2588,8 @@ impl SimEngine {
     /// keep their effects on request state.
     fn execute(&mut self, batch: ExecutionBatch) -> anyhow::Result<BatchOutput> {
         // A paced simulator waits for its permit; a dropped sender frees it,
-        // and so does its executor's shutdown, so that a batch waiting for a
-        // permit cannot hold the thread the executor joins on.
+        // and so does its worker's shutdown, so that a batch waiting for a
+        // permit cannot hold the thread the worker joins on.
         if let Some(pace) = self.pace.clone() {
             loop {
                 if self.stop.load(std::sync::atomic::Ordering::Acquire) {
@@ -2609,7 +2605,7 @@ impl SimEngine {
                 }
             }
         }
-        // `SimExecutor::submit` validated the batch.
+        // `SimWorker::submit` validated the batch.
         let batch_id = batch.id;
         let closed = batch
             .commands
@@ -2700,7 +2696,7 @@ impl SimEngine {
                 })
                 .transpose()?;
 
-            // As on an executor, a chained call releases the products of
+            // As on a worker, a chained call releases the products of
             // the call it follows, and a predicate is released once its
             // consumer has read it. The predicate value is read above, before
             // these releases, because it may be a product of the predecessor.
@@ -2808,7 +2804,7 @@ mod tests {
         Bounds, CallId, DType, ForwardBatch, GenerationParams, RequestKey, ShapeBound, TensorRef,
     };
 
-    /// The pool states the longest sequence it serves, and `SimExecutor`
+    /// The pool states the longest sequence it serves, and `SimWorker`
     /// hands that number to the mechanism: a batch is shaped to
     /// a bound the pool declared, and a pool that declares none hands over a
     /// zero the mechanism refuses rather than a guessed bound.
@@ -2816,21 +2812,21 @@ mod tests {
     fn a_simulated_pool_states_the_model_length_it_was_launched_for() {
         let launched = SimEngine::new().max_model_len();
         assert!(launched > 0, "a launched pool states its model's length");
-        let executor = SimExecutor::new(SimEngine::new());
-        assert_eq!(executor.info().max_model_len, launched);
+        let worker = SimWorker::new(SimEngine::new());
+        assert_eq!(worker.info().max_model_len, launched);
 
         let mut silent = SimEngine::new();
         silent.set_max_model_len(0);
-        let executor = SimExecutor::new(silent);
+        let worker = SimWorker::new(silent);
         assert_eq!(
-            executor.info().max_model_len,
+            worker.info().max_model_len,
             0,
             "a world that states none states none: the mechanism, not the simulator, refuses it"
         );
 
         let mut longer = SimEngine::new();
         longer.set_max_model_len(65_536);
-        assert_eq!(SimExecutor::new(longer).info().max_model_len, 65_536);
+        assert_eq!(SimWorker::new(longer).info().max_model_len, 65_536);
     }
 
     fn request_key() -> RequestKey {
@@ -2916,7 +2912,7 @@ mod tests {
             batch_id,
             vec![(
                 call,
-                crate::executor::RequestDispatch {
+                crate::worker::RequestDispatch {
                     worker: WorkerGroupId("sim".into()),
                     request_pool_idx: None,
                     block_tables: Vec::new(),
@@ -2938,7 +2934,7 @@ mod tests {
 
     #[test]
     fn same_request_calls_preserve_coordinates_and_sequential_tokens() {
-        let mut executor = SimExecutor::new(SimEngine::new());
+        let mut worker = SimWorker::new(SimEngine::new());
         let mut selected = batch(1, 3);
         let mut successor = batch(1, 4).requests.remove(0);
         // The selected prompt covers two positions, so its successor in the
@@ -2950,8 +2946,8 @@ mod tests {
         };
         selected.requests.push(successor);
 
-        executor.submit(selected).expect("submit logical batch");
-        let report = executor
+        worker.submit(selected).expect("submit logical batch");
+        let report = worker
             .poll(Duration::from_secs(5))
             .expect("poll")
             .expect("result");
@@ -2973,7 +2969,7 @@ mod tests {
         assert_eq!(outputs[0].committed_tokens, vec![1063]);
         assert_eq!(outputs[1].committed_tokens, vec![1064]);
         assert_eq!(outputs[1].cache_visible_len, 4);
-        executor.close().expect("close simulator");
+        worker.close().expect("close simulator");
     }
 
     #[test]

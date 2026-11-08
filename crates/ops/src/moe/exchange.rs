@@ -12,7 +12,7 @@
 //! # Who owns the transport
 //!
 //! The transport is a device-resident workspace shared between the ranks of one expert group. It is
-//! an execution resource, so the executor creates it through the package's own lifecycle entries
+//! an execution resource, so the worker creates it through the package's own lifecycle entries
 //! ([`Transport`]), keeps it across a standby's suspend and restore, and hands it to this operator as
 //! a borrowed handle ([`ExchangeTransport`]); `ops` launches over a handle and never sizes one.
 //!
@@ -77,7 +77,7 @@ impl fmt::Display for Mode {
 /// The transport an exchange runs over: a borrowed, non-owning handle.
 ///
 /// The package's lifecycle entries create it on the device and keep it for the life of the expert
-/// group; the executor owns that lifetime and passes the handle here. A handle is only valid on the
+/// group; the worker owns that lifetime and passes the handle here. A handle is only valid on the
 /// device and with the group it was created for, and only between its creation and its release.
 #[derive(Clone, Copy)]
 pub struct ExchangeTransport {
@@ -164,7 +164,7 @@ impl fmt::Display for Descriptor {
 /// layer's expert operands in `fused`. Views a mode does not read are empty (`[0]`-element) views.
 #[derive(Clone, Copy)]
 pub struct ExchangeArgs {
-    /// The group's transport, created and owned by the executor through the package.
+    /// The group's transport, created and owned by the worker through the package.
     pub transport: ExchangeTransport,
     /// Rows of this launch's extent: the captured bucket's, of which `live` are the batch's.
     pub tokens: u32,
@@ -267,9 +267,9 @@ fn message(error: &[u8; 512]) -> Option<&str> {
     std::str::from_utf8(&error[..end]).ok()
 }
 
-/// The executor's host channel to the group, as a package sees it.
+/// The worker's host channel to the group, as a package sees it.
 ///
-/// One instance per rank and group, built by the executor and alive for the transport's whole life.
+/// One instance per rank and group, built by the worker and alive for the transport's whole life.
 /// Mirrored by hand in the same header as `UniserveGroup`.
 #[repr(C)]
 pub struct Group {
@@ -301,7 +301,7 @@ pub const GROUP_LAYOUT: CallLayout = CallLayout {
 const _: () = assert!(std::mem::size_of::<Group>() == GROUP_LAYOUT.size);
 const _: () = assert!(std::mem::offset_of!(Group, error) == GROUP_LAYOUT.error);
 
-/// What the executor states about a transport it creates.
+/// What the worker states about a transport it creates.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct TransportShape {
     /// Ranks of the group.
@@ -337,7 +337,7 @@ impl TransportShape {
     /// The device bytes a rank's transport holds at most, for the capacity plan.
     ///
     /// The plan fits the cache before the process holds a program, so this cannot ask a package:
-    /// it is a bound the executor compares with what the transport took when it is created. A
+    /// it is a bound the worker compares with what the transport took when it is created. A
     /// backend whose experts run in the exchange (`fused`) holds its staged rows; any other holds
     /// the rows received and computed beside a window of the rows in flight.
     #[must_use]
@@ -453,7 +453,7 @@ pub struct TransportViews {
     pub fused: bool,
 }
 
-/// A transport the executor owns: what the package's `create` returned, and the entries that drive
+/// A transport the worker owns: what the package's `create` returned, and the entries that drive
 /// it through its life.
 pub struct Transport {
     /// Keeps the module loaded while the handle lives.

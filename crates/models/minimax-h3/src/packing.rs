@@ -2,7 +2,7 @@
 //! holds, and the tile order a sparse layout walks them in.
 //!
 //! `uniserve/models/minimax_h3/packing.py` is the released plan. Nothing here touches a device: the
-//! executor uploads the tables this module computes into the batches its kernels read, so a
+//! worker uploads the tables this module computes into the batches its kernels read, so a
 //! captured graph addresses them unchanged from capture to replay (specs/worker.md 4.5).
 //!
 //! ## The timeline

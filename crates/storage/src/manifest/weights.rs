@@ -73,7 +73,7 @@ pub struct PlannedRank {
 
 /// What a successor rank must hold on its GPU before it can serve.
 /// Weight bytes are filled from the concrete transfer manifest; the other
-/// quantities come from the target rank's numerical and executor layouts.
+/// quantities come from the target rank's numerical and worker layouts.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RankBudget {
     pub quota: u64,

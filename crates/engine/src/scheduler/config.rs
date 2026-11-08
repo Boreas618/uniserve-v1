@@ -1,8 +1,8 @@
 //! Configured queue, token, and batch limits for scheduling.
 //!
 //! These are requested limits: `Scheduler::new` clamps the token
-//! and sequence limits, and the batch limit when the executor advertises a
-//! nonzero call limit, to the executor's capacity.
+//! and sequence limits, and the batch limit when the worker advertises a
+//! nonzero call limit, to the worker's capacity.
 
 /// Default maximum calls selected by one generation scheduling pass.
 pub const DEFAULT_MAX_BATCH: usize = 128;
@@ -46,7 +46,7 @@ pub struct SchedulerConfig {
     /// fit.
     ///
     /// Empty when the deployment states none, and on a reconfigure, which carries no
-    /// graph catalog: an executor then runs its own captured catalog or
+    /// graph catalog: a worker then runs its own captured catalog or
     /// eagerly, and the tier bound is honest but vacuous.
     pub graph_tiers: Vec<u32>,
 }

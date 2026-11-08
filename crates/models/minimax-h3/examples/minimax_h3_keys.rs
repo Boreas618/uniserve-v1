@@ -911,7 +911,7 @@ fn header(
     // The second category of a row that varies with the request, distinct from a deployment's type.
     // A store built from this file serves the canvases and lengths its rows describe; a key derived
     // from the request's own numbers cannot be enumerated here at all, and a *value* that varies with
-    // a layout is not a program key but a table the executor uploads - the distinction matters,
+    // a layout is not a program key but a table the worker uploads - the distinction matters,
     // because only one of the two belongs in a list of programs.
     println!(
         "# generator needs the checkpoint: the video encoder's rows are derived from `vae/config.json` under `--root` (or MINIMAX_H3_CHECKPOINT), because its frame operators key on classes the raster derives and every canvas the model offers must be served."
@@ -1194,7 +1194,7 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
         (deployment, 18 * HIDDEN),
         (deployment, 2 * HIDDEN),
         // The solver's step coefficient: `[steps, 1]` FP32, gathered at the evaluation the
-        // executor's `step` table names, so one staging word serves every step (`solver.rs`).
+        // worker's `step` table names, so one staging word serves every step (`solver.rs`).
         (DType::F32, 1),
         (DType::I32, 1),
         (DType::I32, 2),
@@ -2546,7 +2546,7 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
     //   width), so its call sites are 1024, 512, 256, 128, 64, 32, 16 and 8; the video VAE's widths
     //   come from its own stage list once that decoder is composed. `residual` and `residual_bias`
     //   decide the key, and they are how the block folds its residual — the layer's, not the config's.
-    // - `paged_attention`: the decode attention is trtllm-gen, and its key follows the executor's
+    // - `paged_attention`: the decode attention is trtllm-gen, and its key follows the worker's
     //   page geometry (page size, pages per sequence), which is scheduling and not the model's.
     // - `vsa_select_tiles` is above with the other four tile passes: its block is the tile bound's
     //   power of two, which the deployment allocates, and `attention_sparse.rs` launches it once per

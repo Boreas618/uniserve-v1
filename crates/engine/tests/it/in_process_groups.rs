@@ -4,7 +4,7 @@
 //! group's failure domain starts another launch, and the engine keeps taking
 //! work for that group — which waits until the replacement's ranks install and
 //! then completes on them. Here the group is the simulator's one group and both
-//! events are told to the executor by the test (`SimLoss`), so what is under
+//! events are told to the worker by the test (`SimLoss`), so what is under
 //! test is the scheduler's part: admission while the group is not ready, and
 //! service once the replacement stands.
 
@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use engine::{
     CachePolicy, CommandSender, Event, GenerationConstraint, GenerationRequest,
-    ImageGenerationConfig, MultimodalInputs, SimEngine, SimExecutor,
+    ImageGenerationConfig, MultimodalInputs, SimEngine, SimWorker,
 };
 use ipc::{ImageParams, RequestId, SamplingParams};
 
@@ -58,11 +58,11 @@ fn request(id: u64, length: u32, first: u32) -> GenerationRequest {
 fn an_engine_serves_once_its_only_group_is_replaced() {
     let mut sim = SimEngine::new();
     sim.set_text_len(16);
-    let executor = SimExecutor::new(sim);
-    let loss = executor.loss();
+    let worker = SimWorker::new(sim);
+    let loss = worker.loss();
     let group = engine::WorkerGroupId("sim".to_owned());
-    let scheduler = support::scheduler(Box::new(executor), SimEngine::special_tokens(), 8)
-        .expect("the scheduler is built over the simulated executor");
+    let scheduler = support::scheduler(Box::new(worker), SimEngine::special_tokens(), 8)
+        .expect("the scheduler is built over the simulated worker");
     let (tx, rx) = crossbeam_channel::unbounded();
     let commands = CommandSender::new(tx);
     let scheduler_thread = thread::spawn(move || scheduler.run(rx));
@@ -108,47 +108,47 @@ fn an_engine_serves_once_its_only_group_is_replaced() {
     let _ = scheduler_thread.join();
 }
 
-/// A group whose replacement is starting does not take the whole executor
+/// A group whose replacement is starting does not take the whole worker
 /// with it: the deployment's other group keeps its capacity and its readiness
 /// while the first is not ready, and the first takes work again once its
 /// replacement stands.
 #[test]
-fn a_group_being_replaced_leaves_its_executor_serving_the_others() {
-    use engine::{Executor, WorkerGroupId};
+fn a_group_being_replaced_leaves_its_worker_serving_the_others() {
+    use engine::{Worker, WorkerGroupId};
 
     let mut sim = SimEngine::new();
     sim.name_groups(&["model", "vision"]);
-    let executor = SimExecutor::new(sim);
-    let loss = executor.loss();
+    let worker = SimWorker::new(sim);
+    let loss = worker.loss();
     let model = WorkerGroupId("model".to_owned());
     let vision = WorkerGroupId("vision".to_owned());
 
-    assert!(executor.is_ready(&model) && executor.is_ready(&vision));
-    assert!(executor.has_capacity(&model) && executor.has_capacity(&vision));
+    assert!(worker.is_ready(&model) && worker.is_ready(&vision));
+    assert!(worker.has_capacity(&model) && worker.has_capacity(&vision));
 
     // The model group's rank died and its replacement is starting.
     loss.lose_to_replace(model.clone(), "the launch was lost");
     assert!(
-        !executor.is_ready(&model),
+        !worker.is_ready(&model),
         "a group whose replacement is starting is not ready"
     );
     assert!(
-        !executor.is_closed(&model),
+        !worker.is_closed(&model),
         "a group whose replacement is starting is not closed"
     );
     assert!(
-        executor.is_ready(&vision) && executor.has_capacity(&vision),
+        worker.is_ready(&vision) && worker.has_capacity(&vision),
         "the other group keeps serving while the replacement starts"
     );
     assert!(
-        !executor.has_capacity(&model),
+        !worker.has_capacity(&model),
         "the lost group takes no work until its replacement stands"
     );
 
     // The replacement stands.
     loss.restore(&model);
     assert!(
-        executor.is_ready(&model) && executor.has_capacity(&model),
+        worker.is_ready(&model) && worker.has_capacity(&model),
         "the replacement takes work"
     );
 }
@@ -170,7 +170,7 @@ fn generate(
     groups: &[(&str, engine::WorkerGroupRole)],
     requests: Vec<GenerationRequest>,
 ) -> Vec<Vec<u32>> {
-    use engine::{Executor, SchedulerConfig, SchedulerHandle, WorkerGroupId};
+    use engine::{SchedulerConfig, SchedulerHandle, Worker, WorkerGroupId};
 
     let mut sim = SimEngine::new();
     sim.set_text_len(16);
@@ -178,8 +178,8 @@ fn generate(
         let names: Vec<&str> = groups.iter().map(|(name, _)| *name).collect();
         sim.name_groups(&names);
     }
-    let executor = SimExecutor::new(sim);
-    let rank = executor
+    let worker = SimWorker::new(sim);
+    let rank = worker
         .info()
         .runtime_info()
         .expect("the sim states its rank");
@@ -200,8 +200,8 @@ fn generate(
             })
             .collect();
     }
-    let engine = SchedulerHandle::with_executor(&args, limits, Box::new(executor))
-        .expect("the simulated executor serves");
+    let engine = SchedulerHandle::with_worker(&args, limits, Box::new(worker))
+        .expect("the simulated worker serves");
     support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
 
     let mut streams: Vec<_> = requests
@@ -239,22 +239,22 @@ fn generate(
 /// admitting work.
 #[test]
 fn losing_every_worker_stops_request_admission() {
-    use engine::{Executor, SchedulerConfig, SchedulerHandle, SubmitError, WorkerGroupId};
+    use engine::{SchedulerConfig, SchedulerHandle, SubmitError, Worker, WorkerGroupId};
 
     let mut sim = SimEngine::new();
     sim.set_text_len(4);
-    let executor = SimExecutor::new(sim);
-    let loss = executor.loss();
-    let rank = executor
+    let worker = SimWorker::new(sim);
+    let loss = worker.loss();
+    let rank = worker
         .info()
         .runtime_info()
         .expect("the sim states its rank");
-    let engine = SchedulerHandle::with_executor(
+    let engine = SchedulerHandle::with_worker(
         &engine::sim_args("sim-model"),
         SchedulerConfig::default(),
-        Box::new(executor),
+        Box::new(worker),
     )
-    .expect("the simulated executor serves");
+    .expect("the simulated worker serves");
     support::install_policy_on(&engine, engine::BatchCapacity::of(&rank));
 
     // The engine serves while its group is live.

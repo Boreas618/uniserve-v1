@@ -18,7 +18,7 @@ distribution = "temporal_units"
 distribution = "temporal_units"
 
 # The media components are placed on this group's CUDA ranks: the codecs encode and assemble on
-# the host inside the main process (the executor's `Media` lane), and a main process serves CUDA
+# the host inside the main process (the worker's `Media` lane), and a main process serves CUDA
 # devices only. `video_codec` takes one unit per rank (the resolver inserts its temporal
 # distribution), so each rank encodes the units of the requests it serves.
 [worker_groups.blocks.video_codec]
