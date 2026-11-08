@@ -94,15 +94,18 @@ struct InProcess {
     /// carries it to the update. The scheduler reads them in `shadow_status`,
     /// which is why a submission is kept until it has finished.
     shadows: Vec<Submission>,
-    /// The pools each unresolved batch holds a slot of, by batch.
+    /// The pool devices each unresolved batch holds a slot of, by batch.
     ///
-    /// A pool admits `queue_depth` batches at once, and that bound is what makes a step a batch:
-    /// a request becomes ready when its own batch ends, so a mechanism that refills at once sends
-    /// it alone, the batch after it carries one row again, and requests that run together never
-    /// meet in a step. While the slots are taken the ready requests wait for each other.
-    unresolved: HashMap<u64, Vec<WorkerGroupId>>,
-    /// How many batches hold a slot of each pool.
-    occupied: HashMap<WorkerGroupId, usize>,
+    /// A device of a pool admits `queue_depth` batches at once, and that bound is what makes a step
+    /// a batch: a request becomes ready when its own batch ends, so a mechanism that refills at
+    /// once sends it alone, the batch after it carries one row again, and requests that run
+    /// together never meet in a step. While the slots are taken the ready requests wait for each
+    /// other. The bound is each device's, as the capacity plan reserves it: a batch takes a slot
+    /// on every device it runs on, so a step that runs on all of them takes one everywhere, and
+    /// the clips a media request decodes on different devices go out together.
+    unresolved: HashMap<u64, Vec<(WorkerGroupId, usize)>>,
+    /// How many batches hold a slot of each device of each pool.
+    occupied: HashMap<(WorkerGroupId, usize), usize>,
 }
 
 /// The state of the shadow submissions an update's pass asked for (7.3 step 2).
@@ -606,17 +609,23 @@ impl InProcess {
         }
     }
 
-    /// Whether `worker` is a stated pool with a slot free.
+    /// Whether `worker` is a stated pool with a slot free on some device: a batch may still be
+    /// formed for it, and `submit` holds back one whose own devices are full.
     fn has_room(&self, worker: &WorkerGroupId) -> bool {
-        if !self.info.workers.iter().any(|(id, _)| id == worker) {
-            return false;
-        }
+        self.info.workers.iter().any(|(id, _)| id == worker)
+            && (0..self.batches.device_count().max(1))
+                .any(|device| self.slot_free(&(worker.clone(), device)))
+    }
+
+    /// Whether one device of a pool has a slot free: fewer of its batches unresolved than the
+    /// pool's `queue_depth`.
+    fn slot_free(&self, slot: &(WorkerGroupId, usize)) -> bool {
         let depth = self
             .info
             .layouts
-            .get(worker)
+            .get(&slot.0)
             .map_or(1, |layout| layout.queue_depth.max(1));
-        self.occupied.get(worker).copied().unwrap_or(0) < depth
+        self.occupied.get(slot).copied().unwrap_or(0) < depth
     }
 
     /// The pools `batch` takes a slot of: those its calls and its page offloads run on.
@@ -689,19 +698,28 @@ impl InProcess {
                     ))
                 });
         }
-        let pools = Self::pools(&batch);
-        if !pools.iter().all(|pool| self.has_room(pool)) {
+        let (device, calls) = self.describe(&batch).map_err(WorkerSubmitError::Failed)?;
+        let devices = self
+            .batches
+            .devices(&device)
+            .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
+        let slots: Vec<(WorkerGroupId, usize)> = Self::pools(&batch)
+            .into_iter()
+            .flat_map(|pool| devices.iter().map(move |index| (pool.clone(), *index)))
+            .collect();
+        if !slots.iter().all(|slot| {
+            self.info.workers.iter().any(|(id, _)| *id == slot.0) && self.slot_free(slot)
+        }) {
             return Err(WorkerSubmitError::WouldBlock(Box::new(batch)));
         }
-        let (device, calls) = self.describe(&batch).map_err(WorkerSubmitError::Failed)?;
         let submission = self
             .batches
             .submit(device)
             .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
-        for pool in &pools {
-            *self.occupied.entry(pool.clone()).or_default() += 1;
+        for slot in &slots {
+            *self.occupied.entry(slot.clone()).or_default() += 1;
         }
-        self.unresolved.insert(batch.id, pools);
+        self.unresolved.insert(batch.id, slots);
         self.queue
             .send(Pending {
                 batch: batch.id,
@@ -720,8 +738,8 @@ impl InProcess {
         if !report.done {
             return;
         }
-        for pool in self.unresolved.remove(&report.batch_id).unwrap_or_default() {
-            if let Some(count) = self.occupied.get_mut(&pool) {
+        for slot in self.unresolved.remove(&report.batch_id).unwrap_or_default() {
+            if let Some(count) = self.occupied.get_mut(&slot) {
                 *count = count.saturating_sub(1);
             }
         }
@@ -1041,6 +1059,9 @@ mod tests {
         inventory: Vec<Inventory>,
         bucket: Option<Bucket>,
         delivered: Arc<Mutex<Vec<Delivered>>>,
+        /// The devices the double runs batches on: a video decode on its unit's, in turn, and
+        /// any other batch on all of them, as `Workers` routes.
+        devices: usize,
     }
 
     impl Devices {
@@ -1060,9 +1081,20 @@ mod tests {
                     inventory: vec![inventory],
                     bucket,
                     delivered: Arc::clone(&delivered),
+                    devices: 1,
                 }),
                 delivered,
             )
+        }
+
+        /// The double over `devices` devices.
+        fn several(
+            bucket: Option<Bucket>,
+            devices: usize,
+        ) -> (Arc<Self>, Arc<Mutex<Vec<Delivered>>>) {
+            let (one, delivered) = Self::one(bucket);
+            let one = Arc::into_inner(one).expect("the double has one owner");
+            (Arc::new(Self { devices, ..one }), delivered)
         }
     }
 
@@ -1096,6 +1128,19 @@ mod tests {
 
         fn inventory(&self) -> &[Inventory] {
             &self.inventory
+        }
+
+        fn devices(&self, batch: &DeviceBatch) -> ::worker::Result<Vec<usize>> {
+            match &batch.media {
+                Some(media) if media.computation.call == MediaCall::VideoDecoding => {
+                    Ok(vec![media.request(0)?.unit as usize % self.devices])
+                }
+                _ => Ok((0..self.devices).collect()),
+            }
+        }
+
+        fn device_count(&self) -> usize {
+            self.devices
         }
     }
 
@@ -1276,6 +1321,57 @@ mod tests {
         // the batches all the same, so the slots come back.
         let _ = submissions.poll(Duration::from_secs(5));
         assert!(submissions.has_capacity(&pool), "a report frees its slot");
+    }
+
+    /// A device holds `queue_depth` unresolved batches of its own: the clips of a video decoded on
+    /// different devices go out together beside a step that runs on all of them, and a clip whose
+    /// device is full waits while the other devices' clips do not.
+    ///
+    /// Four devices at depth two hold one denoising step (a slot on each) and the first four clips
+    /// (one each); the fifth clip is the first device's again and waits for a report. Counted
+    /// against the pool as a whole, the depth would admit the step and one clip.
+    #[test]
+    fn each_device_holds_its_own_queue_depth() {
+        let (devices, delivered) = Devices::several(Some(denoise_bucket()), 4);
+        let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
+        let pool = submissions.info().workers[0].0.clone();
+        let decode = |id: u64, unit: u32| {
+            let mut batch = media_batch(id, MediaCall::VideoDecoding, 1);
+            let computation = batch.media.as_ref().expect("a media batch").computation;
+            batch.media = Some(MediaColumns::staged(
+                computation,
+                &[StagedRequest { unit, ..staged() }],
+            ));
+            batch
+        };
+
+        submissions
+            .submit(media_batch(1, MediaCall::Denoising, 1))
+            .expect("a step on every device is taken");
+        for unit in 0..4 {
+            submissions
+                .submit(decode(2 + u64::from(unit), unit))
+                .expect("a clip on a device with a free slot is taken");
+        }
+        assert!(
+            !submissions.has_capacity(&pool),
+            "every device holds the step and one clip"
+        );
+        let refused = submissions.submit(decode(6, 4));
+        assert!(
+            matches!(refused, Err(WorkerSubmitError::WouldBlock(_))),
+            "the fifth clip waits for its device"
+        );
+        assert_eq!(
+            delivered
+                .lock()
+                .expect("the recorder is not poisoned")
+                .len(),
+            5,
+            "the step and four clips reached the devices"
+        );
+        let _ = submissions.poll(Duration::from_secs(5));
+        assert!(submissions.has_capacity(&pool), "a report frees its slots");
     }
 
     /// The generation is the step's, for every batch of the step: a switchover mid-step cannot
