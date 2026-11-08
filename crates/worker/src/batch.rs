@@ -199,6 +199,11 @@ pub struct Batch {
     /// Published pages the batch copies to the host KV cache beside its forward; the batch's output
     /// waits for the copies, and the mechanism commits the pages once it read that output.
     pub page_offloads: Vec<ipc::PageCopy>,
+    /// The stored trajectories the batch's latent preparations open at, by request: the pages of
+    /// the host latent pools the engine pinned for each resumed request, which the denoiser copies
+    /// into its trajectory before the call completes (`ipc::Call::latent_restore`). A preparation
+    /// with none opens its trajectory at step zero.
+    pub latent_restores: Vec<(ipc::RequestKey, ipc::LatentRestore)>,
     /// A media computation's columns, and `None` for every causal-LM batch.
     ///
     /// One batch is one computation (2.4): a media batch states its inputs here and carries no token
@@ -668,6 +673,18 @@ pub enum Job {
         /// The call this job answers.
         call: CallId,
     },
+    /// Performs one latent preparation on the denoiser that will step the trajectory: the call
+    /// states how the denoiser's pages hold the request's samples and, for a resumed request,
+    /// copies the stored pages the engine pinned into the trajectory on the denoiser's stream.
+    ///
+    /// The job carries no bucket because a preparation captures no graph; the runner noted the
+    /// request's layout when it submitted the batch.
+    Prepare {
+        /// The runner that prepares the trajectory.
+        runner: crate::runner::RunnerId,
+        /// The call this job answers.
+        call: CallId,
+    },
 }
 
 impl Job {
@@ -705,6 +722,7 @@ impl Job {
                 bucket.tokens, bucket.rows
             ),
             Self::Host { call, .. } => format!("serving call {} on the host", call.0),
+            Self::Prepare { call, .. } => format!("preparing the trajectory of call {}", call.0),
         }
     }
 
@@ -716,6 +734,7 @@ impl Job {
             Self::Rebind { .. } => JobKind::Rebind,
             Self::Shadow { .. } => JobKind::Shadow,
             Self::Host { .. } => JobKind::Host,
+            Self::Prepare { .. } => JobKind::Prepare,
         }
     }
 
@@ -735,7 +754,8 @@ impl Job {
             | Self::Capture { runner, .. }
             | Self::Rebind { runner, .. }
             | Self::Shadow { runner, .. }
-            | Self::Host { runner, .. } => Some(*runner),
+            | Self::Host { runner, .. }
+            | Self::Prepare { runner, .. } => Some(*runner),
         }
     }
 }
@@ -795,6 +815,11 @@ impl std::fmt::Debug for Job {
                 .finish(),
             Self::Host { runner, call } => formatter
                 .debug_struct("Host")
+                .field("runner", runner)
+                .field("call", call)
+                .finish(),
+            Self::Prepare { runner, call } => formatter
+                .debug_struct("Prepare")
                 .field("runner", runner)
                 .field("call", call)
                 .finish(),
@@ -878,6 +903,16 @@ pub trait Batches: Send + Sync {
     fn copy_pages(&self, _offloads: Vec<ipc::PageCopy>) -> Result<Submission> {
         Err(crate::Error::Invalid(
             "this worker keeps no host KV cache to copy pages to".to_owned(),
+        ))
+    }
+
+    /// Copies the trajectories of preempted requests to the host latent pools the engine reserved
+    /// slots in, with no batch to carry them (`ipc::LatentOffload`): every call of each request
+    /// completed, so each copy waits only for the batches that advanced the trajectory. The
+    /// submission's output means the copies finished.
+    fn offload_latents(&self, _offloads: Vec<ipc::LatentOffload>) -> Result<Submission> {
+        Err(crate::Error::Invalid(
+            "this worker maps no host latent pool to offload a trajectory to".to_owned(),
         ))
     }
 }
@@ -1152,6 +1187,35 @@ impl Batches for Workers {
         Ok(first.joined(submissions))
     }
 
+    fn offload_latents(&self, offloads: Vec<ipc::LatentOffload>) -> Result<Submission> {
+        // A page copy names the rank that makes it, and a rank is a device here.
+        let mut submissions = self
+            .workers
+            .iter()
+            .enumerate()
+            .map(|(rank, worker)| {
+                let own = offloads
+                    .iter()
+                    .map(|offload| ipc::LatentOffload {
+                        request_key: offload.request_key,
+                        pages: offload
+                            .pages
+                            .iter()
+                            .filter(|copy| copy.rank as usize == rank)
+                            .cloned()
+                            .collect(),
+                    })
+                    .filter(|offload| !offload.pages.is_empty())
+                    .collect();
+                worker.offload_latents(own)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let first = submissions
+            .pop()
+            .ok_or_else(|| crate::Error::Invalid("this rank holds no device".to_owned()))?;
+        Ok(first.joined(submissions))
+    }
+
     fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>> {
         match &self.data {
             Some(data) => data.operate(name, payload),
@@ -1205,6 +1269,10 @@ pub enum JobKind {
     Sleep,
     /// Mapping the host KV cache's page pools, or copying pages to them with no batch to ride on.
     HostCache,
+    /// A latent preparation: stating a trajectory's pages, and restoring a stored one into them.
+    Prepare,
+    /// Copying preempted requests' trajectories to the host latent pool.
+    LatentOffload,
     /// Mapping the released cache segments again, with the unit resets that follow (2.5).
     Wake,
     /// A change of the rank's profiling session.
@@ -1231,6 +1299,8 @@ impl JobKind {
             Self::Discard => "discard",
             Self::Sleep => "sleep",
             Self::HostCache => "host cache",
+            Self::Prepare => "prepare",
+            Self::LatentOffload => "latent offload",
             Self::Wake => "wake",
             Self::Profile => "profile",
             Self::After => "after",

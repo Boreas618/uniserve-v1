@@ -638,6 +638,32 @@ impl InProcess {
     }
 
     fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
+        // A preempted request's trajectory waits for nothing on the device but the batches that
+        // advanced it, and rides no forward: it is a batch of its own, whose end commits the pool
+        // slots the engine reserved.
+        if batch.requests.is_empty()
+            && let Some(offloads) = batch
+                .page_offloads
+                .as_ref()
+                .filter(|offloads| !offloads.latents.is_empty())
+        {
+            let submission = self
+                .batches
+                .offload_latents(offloads.latents.clone())
+                .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
+            return self
+                .queue
+                .send(Pending {
+                    batch: batch.id,
+                    submission,
+                    calls: Vec::new(),
+                })
+                .map_err(|error| {
+                    WorkerSubmitError::Failed(anyhow::anyhow!(
+                        "the in-process waiting thread has gone: {error}"
+                    ))
+                });
+        }
         // Pages that wait while nothing runs ride no forward: they are a batch of their own, which
         // the mechanism reads the end of as it reads any other.
         if batch.requests.is_empty()
@@ -860,6 +886,17 @@ impl InProcess {
                 block_tables: Vec::new(),
                 page_loads: Vec::new(),
                 page_offloads: Vec::new(),
+                // A resumed request's latent preparation opens at the stored trajectory its restore
+                // pinned, which the denoiser copies in before the call completes.
+                latent_restores: batch
+                    .requests
+                    .iter()
+                    .filter_map(|(call, _)| {
+                        call.latent_restore
+                            .clone()
+                            .map(|restore| (call.request_key, restore))
+                    })
+                    .collect(),
                 media: Some(media),
             };
             return Ok((device, calls));
@@ -949,6 +986,7 @@ impl InProcess {
                 .as_ref()
                 .map(|offloads| offloads.pages.clone())
                 .unwrap_or_default(),
+            latent_restores: Vec::new(),
             // A token forward carries no media columns: the media arm above is where a media
             // batch's are passed through, and this arm refuses a media call by name.
             media: None,

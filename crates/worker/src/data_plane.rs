@@ -208,7 +208,7 @@ fn held(planes: Option<&Arc<CachePlanes>>) -> serde_json::Value {
 
 /// The digest a set of weights is known by: what roots the prefix hash chains of the pages computed
 /// with them, so a page of another checkpoint never matches.
-fn identity_of(log: &[LoadedWeight]) -> String {
+pub fn identity_of(log: &[LoadedWeight]) -> String {
     let mut digest = Sha256::new();
     for weight in log {
         let text = weight.key.to_string();

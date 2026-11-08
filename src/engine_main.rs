@@ -1107,8 +1107,13 @@ impl MainProcess {
             let shadow = graph.shadow;
             let products: Arc<dyn worker::runners::products::Products> =
                 Arc::new(RankProducts::new(Arc::clone(&group_products), rank_index));
+            // What the rank's trajectories are computed with, which keys the pages of its host latent
+            // pool: the weights it loaded.
+            let identity = worker::data_plane::identity_of(&weights);
             for device in rank_runner.devices() {
                 let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
+                // The scheduler counts this process's ranks as one, the first rank's report, so the
+                // first rank states the host latent pool for all of them.
                 let runners = rank_runner.runners(
                     *device,
                     &model,
@@ -1116,6 +1121,9 @@ impl MainProcess {
                     &generation,
                     &blocking,
                     &groups,
+                    &client,
+                    &identity,
+                    (rank_index == 0).then_some(&mut inventory),
                 )?;
                 let worker = Worker::spawn(
                     *device,

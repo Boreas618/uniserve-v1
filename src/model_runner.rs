@@ -981,6 +981,10 @@ impl ModelRunner {
     /// **The buckets are the deployment's canvases and prompt capacities**, not the checkpoint's: a
     /// bucket is a captured graph, and a deployment that captures a canvas it does not serve would
     /// pay a capture for nothing.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "what `runners` takes, for the media class"
+    )]
     fn media_runners(
         &self,
         device: DeviceId,
@@ -988,6 +992,9 @@ impl ModelRunner {
         generation: &Arc<Generation>,
         blocking: &worker::blocking::ThreadPool,
         groups: &RankGroups,
+        client: &Arc<worker::memory::retained::Retained>,
+        identity: &str,
+        report: Option<&mut ipc::MainProcessInfo>,
     ) -> Result<Vec<NamedRunner>> {
         use nn::capability::Denoiser as _;
         use worker::runners::decoder as media_decoder;
@@ -1114,10 +1121,14 @@ impl ModelRunner {
             }
             buckets
         };
+        // A latent preparation opens the trajectory the denoiser steps, so the denoiser serves its
+        // phase beside its steps.
+        let mut denoise_phases = served_phases(&denoise_set);
+        denoise_phases.push(phase(scheduler::PhaseKind::LatentPrepare));
         let denoise = media_denoiser::DenoiserRunner::new(
             Binding {
                 id: RunnerId(1),
-                phases: served_phases(&denoise_set),
+                phases: denoise_phases,
                 device,
                 stream: stream("denoiser")?,
             },
@@ -1133,6 +1144,33 @@ impl ModelRunner {
             Arc::clone(generation),
         )?
         .in_group(self.rank, groups.sequence.clone());
+        // The host latent pool a preempted request's trajectory is written to and a resumed one's
+        // read from (§7.4), at this rank's Storage Server, its pages sized for the denoiser's
+        // largest trajectory. The engine counts this process's ranks as one rank of the worker
+        // group, so every device reads stored pages as that rank, and the first states its pool.
+        let trajectory = denoise.trajectory_bytes()?;
+        let page_bytes = u64::from(LATENT_PAGE_VALUES) * 4;
+        let pages = worker::memory::latent::host::BankPages {
+            dtype: worker::memory::allocation::ElementType::F32,
+            page_values: LATENT_PAGE_VALUES,
+            trajectory_pages: u32::try_from(trajectory.div_ceil(page_bytes))
+                .context("a trajectory of more pages than a u32 counts")?,
+            pages: trajectory.div_ceil(page_bytes),
+        };
+        let (pool, pool_info) = worker::memory::latent::host::LatentHostPool::start(
+            client,
+            device,
+            pages,
+            identity,
+            WHOLE_SAMPLES,
+            None,
+        )
+        .context("mapping the host latent pool")?;
+        let reports = report.is_some();
+        if let Some(report) = report {
+            report.latent_pool = Some(Box::new(pool_info));
+        }
+        let denoise = denoise.with_host_latents(Arc::new(pool), 0, reports);
         let decoder = pipeline
             .video_decoder()
             .context("the checkpoint holds no video decoder, so no clip could be decoded")?;
@@ -1247,6 +1285,14 @@ impl ModelRunner {
     /// ([`ModelRunner::load_and_open`]), so this builds the runner that class needs from the model it
     /// is handed. Everything downstream - the buckets, the arena, the sampler, the graphs - is
     /// written against `nn`'s capability traits.
+    ///
+    /// A media rank also maps the host latent pool its denoiser writes preempted trajectories to,
+    /// at its Storage Server through `client`, keyed by `identity`, the weights it loaded; `report`
+    /// is the report that states the pool for the worker group, given to the rank that states it.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the device, the model and its memory, the generation, the lanes, the groups, and the host latent pool's storage"
+    )]
     pub(crate) fn runners(
         &self,
         device: DeviceId,
@@ -1255,12 +1301,17 @@ impl ModelRunner {
         generation: &Arc<Generation>,
         blocking: &worker::blocking::ThreadPool,
         groups: &RankGroups,
+        client: &Arc<worker::memory::retained::Retained>,
+        identity: &str,
+        report: Option<&mut ipc::MainProcessInfo>,
     ) -> Result<Vec<NamedRunner>> {
         let Served::Text(model) = served else {
             let Served::Media(pipeline) = served else {
                 unreachable!("Served has two variants");
             };
-            return self.media_runners(device, pipeline, generation, blocking, groups);
+            return self.media_runners(
+                device, pipeline, generation, blocking, groups, client, identity, report,
+            );
         };
         let mut runners: Vec<NamedRunner> = Vec::new();
         // One model per rank is loaded and mapped on the rank's first device, and a kernel on a
@@ -2880,12 +2931,24 @@ fn unit_phases() -> Vec<PhaseId> {
     )]
 }
 
+/// The phase id `kind` is planned as.
+fn phase(kind: scheduler::PhaseKind) -> PhaseId {
+    PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"))
+}
+
+/// The values of one page of a host latent pool: a mebibyte of the denoiser's float32 samples.
+const LATENT_PAGE_VALUES: u32 = 1 << 18;
+
+/// The share of every request's samples a denoising rank of this build holds: the whole video and
+/// audio latents, because the velocity is gathered to every rank of a sequence group before the
+/// solver's update.
+const WHOLE_SAMPLES: &str = "video and audio latents, whole on every rank";
+
 fn host_phases() -> Vec<PhaseId> {
     [
         scheduler::PhaseKind::VideoEncode,
         scheduler::PhaseKind::AudioEncode,
         scheduler::PhaseKind::Mux,
-        scheduler::PhaseKind::LatentPrepare,
         scheduler::PhaseKind::MediaRead,
         scheduler::PhaseKind::VisionEncoding,
         scheduler::PhaseKind::LatentEncoding,

@@ -1208,9 +1208,8 @@ fn staged(
         Variant::AudioEncode => Ok((Stage::Track, Some(Product::Track))),
         Variant::Mux if handed > 0 => Ok((Stage::Hand, None)),
         Variant::Mux => Ok((Stage::Mux, None)),
-        // A trajectory's opening computes nothing, and neither does an encoder whose work the call
-        // that consumes it runs.
-        Variant::LatentPrepare | Variant::ConditionEncode => Ok((Stage::Open, None)),
+        // An encoder whose work the call that consumes it runs computes nothing of its own.
+        Variant::ConditionEncode => Ok((Stage::Open, None)),
         Variant::MediaRead => Ok((Stage::Read, None)),
         other => Err(crate::Error::Invalid(format!(
             "the media stage serves the artifact's three calls and was asked for a {other:?} batch"
@@ -1307,7 +1306,6 @@ impl Runner for MediaStage {
             Variant::VideoEncode,
             Variant::AudioEncode,
             Variant::Mux,
-            Variant::LatentPrepare,
             Variant::MediaRead,
             Variant::ConditionEncode,
         ]
