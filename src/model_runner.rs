@@ -1683,7 +1683,7 @@ impl ModelRunner {
         // The keys and values the plan fitted are the process's resident pool: a unit is a cache
         // unit, and the plan charged them all against the same device allowance the pools are
         // booked against. A plan that fitted no cache (a rank that serves none) states zero.
-        let resident = match (&planned.plan.cache, planned.plan.info.prefix_cache.as_ref()) {
+        let resident = match (&planned.cache, planned.info.prefix_cache.as_ref()) {
             (Some(cache), Some(info)) => u64::from(info.num_units) * cache.unit_bytes,
             // A media rank keeps no cache, and its resident pool holds the tables its model
             // declares per layout. The reservation is addresses and not storage: a table books the
@@ -1701,15 +1701,14 @@ impl ModelRunner {
         let pools = worker::device::Worker::open(device, &graph)?;
         let stream = platform::Stream::new(device)
             .with_context(|| format!("creating device {}'s stream", device.0))?;
-        let memory = worker::memory::open_memory(
+        let memory = worker::memory::Memory::new(
             worker::memory::OpenMemory {
-                plan: &planned.plan,
+                plan: &planned,
                 // A causal-language rank keeps no per-slot bank: its per-request state is the KV
                 // pages in the cache, and the sampler's parameters travel in the batch's columns.
                 slots: &[],
                 device: Some(device),
                 stream: Some(&stream),
-                width: planned.width,
                 devices: vec![worker::memory::allocation::MemoryKind::Cuda(device)],
                 // A rank that takes no other rank's export states that as the absence of a
                 // program: a conversion that reaches it is a mistake, and it says so by name.
@@ -1726,7 +1725,7 @@ impl ModelRunner {
         // deployment's other ranks report, so the scheduler plans against one description of a
         // rank rather than a second one derived here. A media rank adds what its denoiser serves,
         // which the frontend plans a request against and no capacity figure implies.
-        let mut info = planned.plan.info.clone();
+        let mut info = planned.info.clone();
         if let Served::Media(pipeline) = served {
             let config = self.media_config()?;
             info.video_denoiser = Some(denoiser_report(

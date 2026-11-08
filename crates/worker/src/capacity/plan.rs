@@ -138,9 +138,13 @@ pub struct TokenFacts {
     pub latent: Option<LatentPlan>,
 }
 
-/// The resolved capacity of a rank: what the main process builds its resident
-/// memory from.
-pub struct Plan {
+/// The resolved memory of a rank: what the main process builds its resident
+/// memory from, with the figures no owner states - the widest block table a
+/// request needs, which follows from the block size the plan chose, and the two
+/// reservations the rank takes out of its grant before a cache unit is fitted
+/// (the graph range and the shadow region beside it), which the fit takes as an
+/// input and would otherwise not be readable back.
+pub struct MemoryConfig {
     /// The capacity the rank reports to the engine.
     pub info: MainProcessInfo,
     /// The host and device arenas of its calls: read where a rank's arenas are
@@ -157,6 +161,13 @@ pub struct Plan {
     pub planes: Option<PlaneLayout>,
     /// Writable units used by the worker's largest warmup phase.
     pub warmup_units: u32,
+    /// The widest block table a request of the model's length needs.
+    pub width: u32,
+    /// The graph range the rank reserves: one pool per generation a preparation
+    /// may hold, mapped whole at the first capture.
+    pub reserved: u64,
+    /// The shadow region a replaced operator runs in, reserved beside it.
+    pub shadow: u64,
 }
 
 fn narrow(value: usize, name: &str) -> Result<u32> {
@@ -265,21 +276,6 @@ pub struct RankFacts<'a> {
     pub transport_bytes: u64,
 }
 
-/// A rank's plan with the figures no owner states: the widest block table a
-/// request needs, which follows from the block size the plan chose, and the two
-/// reservations the rank takes out of its grant before a cache unit is fitted -
-/// the graph range and the shadow region beside it - which the fit takes as an
-/// input and would otherwise not be readable back from the plan.
-pub struct TokenPlan {
-    pub plan: Plan,
-    pub width: u32,
-    /// The graph range the rank reserves: one pool per generation a preparation
-    /// may hold, mapped whole at the first capture.
-    pub reserved: u64,
-    /// The shadow region a replaced operator runs in, reserved beside it.
-    pub shadow: u64,
-}
-
 /// One region of device storage a rank's plan books (design 4.1 and 4.5).
 ///
 /// The list is the plan's own: a region a plan books and this enum does not name
@@ -375,7 +371,7 @@ impl Booked {
     }
 }
 
-impl TokenPlan {
+impl MemoryConfig {
     /// The device storage this plan books of `device`, region by region.
     ///
     /// `weights` is the checkpoint's mapped bytes, which the plan cannot know:
@@ -383,12 +379,10 @@ impl TokenPlan {
     /// what the fit's grant already excludes.
     pub fn booked(&self, device: Device, weights: u64) -> Booked {
         let cache = self
-            .plan
             .cache
             .as_ref()
             .map(|cache| {
                 let units = self
-                    .plan
                     .info
                     .prefix_cache
                     .as_ref()
@@ -402,12 +396,7 @@ impl TokenPlan {
         bytes[Region::Graph.slot()] = self.reserved;
         bytes[Region::Shadow.slot()] = self.shadow;
         bytes[Region::Snapshot.slot()] = self.state_snapshot_bytes();
-        bytes[Region::Fixed.slot()] = self
-            .plan
-            .fixed_device_bytes
-            .get(&device)
-            .copied()
-            .unwrap_or(0);
+        bytes[Region::Fixed.slot()] = self.fixed_device_bytes.get(&device).copied().unwrap_or(0);
         Booked(bytes)
     }
 
@@ -415,16 +404,14 @@ impl TokenPlan {
     /// shadow region (design 4.5): the cache plan's own figure, and zero when the model keeps no
     /// state per unit.
     pub fn state_snapshot_bytes(&self) -> u64 {
-        self.plan
-            .cache
+        self.cache
             .as_ref()
             .map_or(0, |cache| cache.state_snapshot_bytes())
     }
 
     /// The tokens one page of the served cache holds.
     pub fn block_size(&self) -> u32 {
-        self.plan
-            .cache
+        self.cache
             .as_ref()
             .and_then(|cache| cache.groups.first().map(|group| group.block_size))
             .unwrap_or(0)
@@ -464,7 +451,7 @@ pub fn token_plan(
     granularity: Option<u64>,
     group: &HostGroup,
     mut cache: impl FnMut(usize) -> Result<Option<Arc<CachePlan>>>,
-) -> Result<Plan> {
+) -> Result<MemoryConfig> {
     let mut layout = TokenLayout::new(report, request, queue_depth, facts)?;
     // A rank that fits no cache keeps no paged request, so nothing reads a page size and none is
     // agreed: `plan_media` is that rank (`src/model_runner.rs` reaches this for the media class).
@@ -525,7 +512,7 @@ pub fn token_plan(
 /// may come out lower than the requested one, because every layer's attention
 /// must be able to read it, and the answer states the width a batch's block
 /// table needs at that page size.
-pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<TokenPlan> {
+pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<MemoryConfig> {
     let cache = facts.cache.ok_or_else(|| {
         Error::Invalid(
             "this rank states no paged key/value geometry, so no cache can be planned for it: \
@@ -545,7 +532,11 @@ pub fn plan_rank(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Re
 /// and the fixed storage the rank's owners allocate. The plan's `cache` and the worker info's
 /// `prefix_cache` are then absent, which is what a scheduler reads to know this rank takes no
 /// paged request.
-pub fn plan_media(facts: &RankFacts<'_>, report: Report, group: &HostGroup) -> Result<TokenPlan> {
+pub fn plan_media(
+    facts: &RankFacts<'_>,
+    report: Report,
+    group: &HostGroup,
+) -> Result<MemoryConfig> {
     if facts.cache.is_some() {
         return Err(Error::Invalid(
             "this rank states a paged key/value geometry and the media class keeps no paged \
@@ -569,7 +560,7 @@ fn plan(
     report: Report,
     group: &HostGroup,
     cache: Option<CacheGeometry>,
-) -> Result<TokenPlan> {
+) -> Result<MemoryConfig> {
     // What the rank may plan into is what is LEFT: the weights are already on the device, so the
     // pools fit into the free bytes and not into the device's total.
     let total_bytes = match facts.device {
@@ -676,12 +667,8 @@ fn plan(
             None => Ok(None),
         },
     )?;
-    let mut answer = TokenPlan {
-        plan,
-        width: 0,
-        reserved: graph_bytes,
-        shadow: 0,
-    };
+    let mut answer = plan;
+    answer.reserved = graph_bytes;
     // The scratch region holds the shadow beside the snapshot the plan's own
     // `state_snapshot_bytes` answers, so the shadow is what the reservation has
     // left once the snapshot is taken out of it.
@@ -1028,8 +1015,8 @@ impl TokenLayout {
         Ok(layout)
     }
 
-    pub(crate) fn finish(self, cache: Option<Arc<CachePlan>>) -> Plan {
-        Plan {
+    pub(crate) fn finish(self, cache: Option<Arc<CachePlan>>) -> MemoryConfig {
+        MemoryConfig {
             info: self.info,
             arena: self.arena,
             fixed_device_bytes: self.fixed,
@@ -1037,6 +1024,9 @@ impl TokenLayout {
             cache,
             planes: self.planes,
             warmup_units: self.warmup_units,
+            width: 0,
+            reserved: 0,
+            shadow: 0,
         }
     }
 }
@@ -1198,7 +1188,7 @@ mod tests {
         );
     }
 
-    fn plan(geometry: CacheGeometry) -> Plan {
+    fn plan(geometry: CacheGeometry) -> MemoryConfig {
         token_plan(
             &request(),
             report(),
@@ -1258,30 +1248,18 @@ mod tests {
         let reserved = crate::capacity::reserved_bytes(E2E_TOTAL, /* prepares */ true);
         let graph = crate::capacity::graph_storage_bytes(E2E_TOTAL as i64, true, false);
         let plan = fitted(E2E_TOTAL, reserved).expect("the deployment's device fits a dense plan");
-        let booked_plan = TokenPlan {
-            plan,
-            width: 0,
-            reserved: graph,
-            shadow: 0,
-        };
+        let mut booked_plan = plan;
+        booked_plan.reserved = graph;
         let snapshot = booked_plan.state_snapshot_bytes();
-        let booked_plan = TokenPlan {
-            shadow: reserved - graph - snapshot,
-            ..booked_plan
-        };
+        booked_plan.shadow = reserved - graph - snapshot;
         // What a rank maps before the plan runs, stated here because the plan is
         // fitted into the bytes the weights leave.
         let weights = 1 << 30;
         let booked = booked_plan.booked(device, weights);
 
-        let cache = booked_plan
-            .plan
-            .cache
-            .as_ref()
-            .expect("the cache is planned");
+        let cache = booked_plan.cache.as_ref().expect("the cache is planned");
         let units = u64::from(
             booked_plan
-                .plan
                 .info
                 .prefix_cache
                 .as_ref()
@@ -1294,7 +1272,7 @@ mod tests {
             (Region::Graph, graph),
             (Region::Shadow, reserved - graph - snapshot),
             (Region::Snapshot, snapshot),
-            (Region::Fixed, booked_plan.plan.fixed_device_bytes[&device]),
+            (Region::Fixed, booked_plan.fixed_device_bytes[&device]),
         ];
         assert_eq!(
             booked.regions().collect::<Vec<_>>(),
@@ -1331,7 +1309,7 @@ mod tests {
     const E2E_TOTAL: u64 = 5 * 39_579_549_696;
 
     /// One plan of `total_bytes` with `reserved` bytes set aside before any unit.
-    fn fitted(total_bytes: u64, reserved: u64) -> Result<Plan> {
+    fn fitted(total_bytes: u64, reserved: u64) -> Result<MemoryConfig> {
         token_plan(
             &CapacityRequest {
                 max_total_tokens: None,
@@ -1517,7 +1495,7 @@ mod tests {
         };
         let shallow = plan(2);
         let deep = plan(16);
-        let units = |plan: &Plan| plan.info.prefix_cache.as_ref().unwrap().num_units;
+        let units = |plan: &MemoryConfig| plan.info.prefix_cache.as_ref().unwrap().num_units;
         assert!(units(&deep) < units(&shallow));
         assert!(
             deep.cache.as_ref().unwrap().unit_bytes > shallow.cache.as_ref().unwrap().unit_bytes
@@ -1555,7 +1533,7 @@ mod tests {
         };
         let narrow = plan(1);
         let wide = plan(16);
-        let units = |plan: &Plan| plan.info.prefix_cache.as_ref().unwrap().num_units;
+        let units = |plan: &MemoryConfig| plan.info.prefix_cache.as_ref().unwrap().num_units;
         assert!(
             units(&wide) < units(&narrow),
             "a rank admitting 16 calls fits {} units, one admitting 1 fits {}: the import \
