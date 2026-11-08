@@ -21,7 +21,6 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ipc::{CallStatus, ErrorCode, MainProcessInfo, PhaseId, TimingCounters};
-use proto::config::BlockConfig;
 
 use crate::completion::Outcome;
 use crate::plan::{Bucket, Shape};

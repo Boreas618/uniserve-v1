@@ -28,7 +28,6 @@ use crate::guidance_prefix_rows;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::worker::Worker;
-use crate::worker::WorkerGroupId;
 use crate::{CommandWaker, GenerationLimits, Request};
 use crate::{Scheduler, SpecialTokenIds};
 use crate::{SchedulerConfig, SchedulerStats};
@@ -409,9 +408,11 @@ impl SchedulerHandle {
         // Denoising ranks that map host latent pools report them: a
         // preempted request's trajectory (a video's, or an image's) is
         // stored there.
+        // Both pools are the deployment's, mapped by its ranks under its claim, so the stores reach
+        // them under the deployment's name whether or not this scheduler keeps a host KV tier.
         scheduler.enable_trajectory_store(
             &storage::socket::default_socket(),
-            &scope,
+            &engine.deployment,
             args.epoch,
             &args.host,
         );
@@ -419,7 +420,7 @@ impl SchedulerHandle {
         // them: a request's encoder outputs are stored and found there.
         scheduler.enable_encoder_store(
             &storage::socket::default_socket(),
-            &scope,
+            &engine.deployment,
             args.epoch,
             &args.host,
         );
@@ -1029,6 +1030,7 @@ impl Drop for SchedulerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::WorkerGroupId;
 
     /// A host takes a contiguous block of the ranks, the first hosts take the
     /// remainder, and a rank's device is its local index on its own host.
