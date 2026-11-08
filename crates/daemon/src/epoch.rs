@@ -156,9 +156,6 @@ pub struct EpochRecord {
     /// process's identity: that is [`ManagedProcess::generation`], the
     /// launch generation, allocated by [`Epochs::next_generation`].
     pub generation: Option<u64>,
-    /// The deployment's world allocation this epoch executes (§7.4), which
-    /// the epoch's launch file and its Storage Server claim carry.
-    pub world: u64,
 }
 
 /// The role of a process a node's daemon manages (§2.1).
@@ -631,8 +628,9 @@ impl Epochs {
     }
 
     /// Records epoch `epoch` as serving the `deployment` this node installed
-    /// at startup: its build config and programs, the generation its main
-    /// processes numbered, and the world it executes (§7.4). The daemon
+    /// at startup: its build config and programs and the generation its main
+    /// processes numbered (§7.4). The epoch's number is the world it executes,
+    /// as a switch's target and an adopted epoch are numbered. The daemon
     /// records nothing it did not install, so this is called with what the
     /// main processes answered, not with what the configuration asked for.
     ///
@@ -641,7 +639,6 @@ impl Epochs {
         &self,
         epoch: u64,
         deployment: &Deployment,
-        world: u64,
         generations: &[u64],
     ) -> u64 {
         self.record(
@@ -654,7 +651,6 @@ impl Epochs {
                 previous_policy: None,
                 status: Status::Serving,
                 generation: generations.first().copied(),
-                world,
             },
         );
         epoch
@@ -1103,7 +1099,6 @@ fn record_report(epoch: u64, record: &EpochRecord) -> Value {
         "previous_kernels": previous,
         "previous_policy": record.previous_policy.as_ref().map(program_report),
         "generation": record.generation,
-        "world": record.world,
         "status": match record.status {
             Status::Precopy => "precopy",
             Status::Serving => "serving",
@@ -1520,7 +1515,6 @@ mod tests {
             previous_policy: None,
             status: Status::Serving,
             generation: None,
-            world: 3,
         }
     }
 
@@ -1605,7 +1599,7 @@ mod tests {
         let epochs = Epochs::new();
         let config = ServerArgs::default();
         let serving = Deployment::of(config.clone()).expect("the configuration resolves");
-        epochs.install(0, &serving, 3, &[10]);
+        epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
         // A change that moves only the programs: one operator's backend.
@@ -1630,10 +1624,10 @@ mod tests {
         let program = epochs.program_update().expect("the update is in flight");
         assert_eq!(program.update.number, 1);
         assert_eq!(program.update.state, UpdateState::Probation);
-        assert_eq!(program.epoch, 0);
+        assert_eq!(program.epoch, 3);
         let prepared: Vec<u64> = program.prepared.iter().map(|p| p.generation).collect();
         assert_eq!(prepared, vec![11, 12]);
-        let serving_epoch = epochs.get(0).expect("the epoch is recorded");
+        let serving_epoch = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Probation);
         assert_eq!(serving_epoch.policy, programs.policy);
         assert!(serving_epoch.previous_policy.is_some());
@@ -1644,7 +1638,7 @@ mod tests {
                 .expect("both main processes committed"),
             "a program-layer update is committed here"
         );
-        let serving_epoch = epochs.get(0).expect("the epoch is recorded");
+        let serving_epoch = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Serving);
         assert!(serving_epoch.previous_policy.is_none());
         assert!(
@@ -1683,7 +1677,7 @@ mod tests {
         let epochs = Epochs::new();
         let config = ServerArgs::default();
         let serving = Deployment::of(config.clone()).expect("the configuration resolves");
-        epochs.install(0, &serving, 3, &[10]);
+        epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
         let mut target = serving.clone();
@@ -1714,7 +1708,7 @@ mod tests {
 
         // The previous generation serves again, nothing is in flight, and the
         // update is unavailable for the failure that caused the revert.
-        let record = epochs.get(0).expect("the epoch is recorded");
+        let record = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(record.status, Status::Serving);
         assert_eq!(record.policy, serving.programs.policy);
         assert!(record.previous_policy.is_none());
@@ -1755,7 +1749,7 @@ mod tests {
         let epochs = Epochs::new();
         let config = ServerArgs::default();
         let serving = Deployment::of(config.clone()).expect("the configuration resolves");
-        epochs.install(0, &serving, 3, &[10]);
+        epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
         let mut first = serving.clone();
@@ -1769,7 +1763,7 @@ mod tests {
             .apply_programs(Update::new(1, first), vec![process("rank-0", 7)], false)
             .expect("the first update switches over");
         let last_resort = epochs
-            .get(0)
+            .get(3)
             .expect("the epoch is recorded")
             .previous_policy
             .clone();
@@ -1802,7 +1796,7 @@ mod tests {
         );
         assert_eq!(
             epochs
-                .get(0)
+                .get(3)
                 .expect("the epoch is recorded")
                 .previous_policy,
             last_resort
@@ -1820,7 +1814,7 @@ mod tests {
         let epochs = Epochs::new();
         let config = ServerArgs::default();
         let serving = Deployment::of(config.clone()).expect("the configuration resolves");
-        epochs.install(0, &serving, 3, &[10]);
+        epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
         let mut target = serving.clone();
@@ -1839,7 +1833,7 @@ mod tests {
                 .expect("the revert was answered")
         );
 
-        let serving_epoch = epochs.get(0).expect("the epoch is recorded");
+        let serving_epoch = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Serving);
         assert_eq!(
             serving_epoch.policy, serving.programs.policy,
@@ -1866,7 +1860,7 @@ mod tests {
         let epochs = Epochs::new();
         let config = ServerArgs::default();
         let serving = Deployment::of(config.clone()).expect("the configuration resolves");
-        epochs.install(0, &serving, 3, &[10]);
+        epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
         let mut target = serving.clone();
@@ -1933,7 +1927,7 @@ mod tests {
         let epochs = Epochs::new();
         let config = ServerArgs::default();
         let serving = Deployment::of(config.clone()).expect("the configuration resolves");
-        epochs.install(0, &serving, 3, &[10]);
+        epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
         assert!(!epochs.commit_programs().expect("nothing to commit"));
 
@@ -1949,7 +1943,7 @@ mod tests {
             .expect_err("a refused precopy fails the update");
         assert_eq!(failure.kind, "precopy_failed");
         assert!(epochs.program_update().is_none());
-        let serving_epoch = epochs.get(0).expect("the epoch is recorded");
+        let serving_epoch = epochs.get(3).expect("the epoch is recorded");
         assert_eq!(serving_epoch.status, Status::Serving);
         assert_eq!(serving_epoch.policy, serving.programs.policy);
     }

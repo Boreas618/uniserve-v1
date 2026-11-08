@@ -413,7 +413,7 @@ mod tests {
         }
     }
 
-    fn record(world: u64) -> EpochRecord {
+    fn record() -> EpochRecord {
         EpochRecord {
             config: ServerArgs::default()
                 .engine_config()
@@ -428,7 +428,6 @@ mod tests {
             previous_policy: None,
             status: Status::Serving,
             generation: Some(4),
-            world,
         }
     }
 
@@ -494,7 +493,7 @@ mod tests {
     #[test]
     fn the_epoch_layer_runs_from_reports_and_frees_its_slot() {
         let epochs = Arc::new(Epochs::new());
-        epochs.record(11, record(11));
+        epochs.record(11, record());
         let (roster, feed) = Fake::with_feed();
         let driver = Driver::new(Arc::clone(&epochs), Box::new(roster));
         let previous = Deployment::of(ServerArgs::default()).expect("the configuration resolves");

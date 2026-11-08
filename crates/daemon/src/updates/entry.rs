@@ -331,7 +331,7 @@ impl Leader {
         let control = replicas[0].control.get().ok_or(UpdateError::NoEngine)?;
         let serving_client = replicas[0].hold().client().ok_or(UpdateError::NoEngine)?;
         let epochs = self.updates.epochs();
-        let (previous_epoch, serving) = epochs.serving().ok_or_else(|| {
+        let (previous_epoch, _) = epochs.serving().ok_or_else(|| {
             UpdateError::Refused("no epoch serves: there is nothing to switch from".to_owned())
         })?;
         // The previous epoch's processes are addressed by their LAUNCH
@@ -348,7 +348,7 @@ impl Leader {
             UpdateError::Refused(format!(
                 "the main process serving epoch {} has no launch generation: this daemon neither \
                  started nor adopted it",
-                serving.world
+                previous_epoch
             ))
         })?;
         // One number for the whole deployment: every rank's counter is
@@ -361,13 +361,13 @@ impl Leader {
             .map(|rank| epochs.next_generation(group, rank))
             .max()
             .unwrap_or(0);
-        // The epoch's number is the world it executes, so it is above every epoch and world the
-        // daemon knows: an epoch a revert retired keeps its number, a world's storage ends with the
-        // world it was claimed for, and the first epoch's world is its first engine's, not 0.
+        // The epoch's number is the world it executes, so it is above every epoch the daemon
+        // knows: an epoch a revert retired keeps its number, and a world's storage ends with the
+        // world it was claimed for.
         let target_epoch = epochs
             .records()
             .iter()
-            .map(|(epoch, record)| (*epoch).max(record.world))
+            .map(|(epoch, _)| *epoch)
             .max()
             .unwrap_or(previous_epoch)
             .max(previous_epoch)
@@ -423,7 +423,7 @@ impl Leader {
             start: control
                 .epoch_start(&args, spawn_generation)
                 .map_err(UpdateError::Failed)?,
-            previous_world: serving.world,
+            previous_world: previous_epoch,
             previous_generation,
             spawn_generation,
             keeps: update.previous_world,

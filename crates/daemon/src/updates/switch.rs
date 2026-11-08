@@ -1482,7 +1482,6 @@ mod tests {
             generation: None,
             // The record is kept under epsilon 12 in this test's switch, and
             // `apply` fills the world allocation with the epoch number.
-            world: 12,
         }
     }
 

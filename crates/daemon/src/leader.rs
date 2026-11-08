@@ -831,8 +831,8 @@ impl Leader {
         // the programs its main processes took, with the number they gave
         // them (`EpochRecord::generation`), which `GET /admin/config`
         // reports and a later update is routed against (§7.2, §7.4).
-        // The first epoch of a daemon is epoch 0 (§7.4).
-        let epoch = self.epochs().install(0, &deployment, world, &generations);
+        // The epoch's number is the world it executes, as every later epoch's is (§7.4).
+        let epoch = self.epochs().install(world, &deployment, &generations);
         // The process table names every main process this daemon manages, and
         // the serving one is the first (§7.4): a switch addresses the process it
         // replaces by this generation, `GET /admin/config` lists it, and without
@@ -2828,13 +2828,13 @@ impl Replica {
         else {
             return true;
         };
-        let Some((_, record)) = driver.epochs().serving() else {
+        let Some((epoch, _)) = driver.epochs().serving() else {
             return true;
         };
         let Some(served) = locked(&self.served).as_ref().map(|args| args.world) else {
             return true;
         };
-        record.world == served
+        epoch == served
     }
 
     /// Ends the parked standby, if one is live: dropping its client closes the
