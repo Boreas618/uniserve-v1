@@ -5,7 +5,7 @@
 
 use minimax_h3::packing::{self, Condition, Frame, Role};
 use models::video::plan::{
-    AudioClip, ConditionPlan, FramePosition, KeyframeFit, Prepared, VideoClip,
+    AudioClip, ConditionInput, FramePosition, KeyframeFit, Prepared, VideoClip,
 };
 use models::video::{Canvas, ConditionPacking, FrameClips};
 
@@ -36,7 +36,7 @@ fn canvas(width: u32, height: u32) -> minimax_h3::config::Canvas {
     }
 }
 
-fn rule_rows(plan: &ConditionPlan, tile: u32) -> u32 {
+fn rule_rows(plan: &ConditionInput, tile: u32) -> u32 {
     let (time, height, width) = packing::tile_shape(tile).unwrap();
     plan.packed_rows(
         TARGET,
@@ -67,8 +67,8 @@ fn audio(latents: u32) -> AudioClip {
     }
 }
 
-fn plan(prepared: Prepared, audio_rows: u32) -> ConditionPlan {
-    ConditionPlan {
+fn plan(prepared: Prepared, audio_rows: u32) -> ConditionInput {
+    ConditionInput {
         index: 0,
         prepared,
         vision: None,

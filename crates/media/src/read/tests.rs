@@ -10,8 +10,8 @@
 use std::path::{Path, PathBuf};
 
 use super::{
-    AudioPlan, ConditionProducts, ConditionRead, ConditionSource, ImagePlan, VideoClip, read_audio,
-    read_conditions, read_image, read_video,
+    AudioTransform, ConditionProducts, ConditionRead, ConditionSource, ImageTransform, VideoClip,
+    read_audio, read_conditions, read_image, read_video,
 };
 
 /// The committed reading fixtures.
@@ -23,7 +23,7 @@ fn fixtures() -> PathBuf {
 struct ImageCase {
     name: String,
     media: Vec<u8>,
-    plan: ImagePlan,
+    plan: ImageTransform,
     tolerance: u8,
     expected: Vec<u8>,
 }
@@ -32,7 +32,7 @@ struct ImageCase {
 struct AudioCase {
     name: String,
     media: Vec<u8>,
-    plan: AudioPlan,
+    plan: AudioTransform,
     expected: Vec<f32>,
 }
 
@@ -58,7 +58,7 @@ fn image_cases() -> Vec<ImageCase> {
             .collect();
         cases.push(ImageCase {
             media: std::fs::read(directory.join(fields[1])).unwrap(),
-            plan: ImagePlan {
+            plan: ImageTransform {
                 resized: (values[0], values[1]),
                 window: (values[2], values[3], values[4], values[5]),
             },
@@ -84,7 +84,7 @@ fn audio_cases() -> Vec<AudioCase> {
             .collect();
         cases.push(AudioCase {
             media: std::fs::read(directory.join(fields[1])).unwrap(),
-            plan: AudioPlan {
+            plan: AudioTransform {
                 native_rate: values[0] as u32,
                 start: values[1],
                 source_samples: values[2],
@@ -469,7 +469,7 @@ fn conditions_read_a_reference_videos_soundtrack_from_its_file() {
         .split_whitespace()
         .map(|value| value.parse().unwrap())
         .collect();
-    let plan = AudioPlan {
+    let plan = AudioTransform {
         native_rate: values[0] as u32,
         start: values[1],
         source_samples: values[2],
@@ -522,7 +522,7 @@ fn readers_refuse_a_plan_the_host_cannot_address() {
     // A plan comes from a peer: an extent whose byte count overflows must fail
     // the request instead of panicking in the arithmetic that sizes buffers.
     let image = &image_cases()[0];
-    let huge = ImagePlan {
+    let huge = ImageTransform {
         resized: (u32::MAX, u32::MAX),
         window: (0, 0, u32::MAX, u32::MAX),
     };

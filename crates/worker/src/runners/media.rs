@@ -587,7 +587,9 @@ fn read_conditions(
     format: &dyn MediaFormat,
     regions: &mut ConditionRegions,
 ) -> Result<()> {
-    use media::read::{AudioPlan, ConditionProducts, ConditionSource, ImagePlan, VideoClip};
+    use media::read::{
+        AudioTransform, ConditionProducts, ConditionSource, ImageTransform, VideoClip,
+    };
     use models::video::ConditionMedia;
 
     let conditions = &conditioning.conditions;
@@ -612,12 +614,12 @@ fn read_conditions(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let audio_plan = |track: &models::video::AudioClip| -> Result<AudioPlan> {
+    let audio_transform = |track: &models::video::AudioClip| -> Result<AudioTransform> {
         let index = |value: u64| {
             usize::try_from(value)
                 .map_err(|_| crate::Error::Invalid("a track is larger than memory".into()))
         };
-        Ok(AudioPlan {
+        Ok(AudioTransform {
             native_rate: track.sample_rate,
             start: index(track.start_sample)?,
             source_samples: index(track.source_samples)?,
@@ -630,7 +632,7 @@ fn read_conditions(
     for (index, condition) in conditions.iter().enumerate() {
         let (image, video) = match &condition.media {
             ConditionMedia::Image(fit) => (
-                Some(ImagePlan {
+                Some(ImageTransform {
                     resized: (fit.resized.width, fit.resized.height),
                     window: (fit.left, fit.top, fit.size.width, fit.size.height),
                 }),
@@ -650,7 +652,7 @@ fn read_conditions(
         };
         let pixels = usize::try_from(condition.pixel_bytes() / 3)
             .map_err(|_| crate::Error::Invalid("a condition is larger than memory".into()))?;
-        let audio = condition.media.audio().map(audio_plan).transpose()?;
+        let audio = condition.media.audio().map(audio_transform).transpose()?;
         let samples = audio.map_or(0, |plan| plan.samples);
         let source = match files[index].as_ref() {
             Some(file) => ConditionSource::File(file),
