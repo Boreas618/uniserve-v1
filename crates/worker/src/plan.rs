@@ -177,7 +177,6 @@ impl Variant {
             Self::VideoEncode
                 | Self::AudioEncode
                 | Self::Mux
-                | Self::LatentPrepare
                 | Self::MediaRead
                 | Self::ConditionEncode
         )

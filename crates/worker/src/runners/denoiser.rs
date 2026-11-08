@@ -28,12 +28,18 @@
 //! **The seam from the mechanism.** A media batch's columns state, per request, what the mechanism
 //! owns: the request's conditioning exactly as the model family planned it, and the step, seed and
 //! canvas the request states ([`crate::batch::StagedRequest`], written by the scheduler's media
-//! arm). A step also reads two things the mechanism cannot state, because they are device products
-//! of the model's own preparation: the request's latent trajectory and its encoded conditioning
-//! rows. Those are the model's, and this runner reads them from [`Prepared`], a set no capability
-//! prepares yet - so a batch is refused by name at the point where it would need one, rather than
-//! served with a step index and no latents. When a residency layer for a request's media products
-//! lands, it fills `prepared()` and `stage_request` keeps its body.
+//! arm). A step also reads its encoded conditioning rows, which the encoder published to the
+//! product store, and the request's latent trajectory, which this runner owns.
+//!
+//! **The trajectory lives in the runner's latent columns from the request's opening to its last
+//! step.** The scheduler holds the denoiser for one request from its latent preparation to its last
+//! step, so the columns hold that request's trajectory throughout. The latent preparation is served
+//! here: it states how the columns hold the request's samples (`ipc::RankLatentLayout`) and, for a
+//! request resumed from a stored trajectory, copies the stored pages of the host latent pool into
+//! the columns (`ipc::LatentRestore`). The request's first step on this runner then folds its
+//! conditioning and draws its noise, or continues from the restored trajectory. A preempted
+//! request's trajectory is written from the columns to the host latent pool
+//! (`ipc::LatentOffload`, [`Runner::offload_latents`]).
 
 use std::sync::{Arc, Mutex};
 
@@ -42,8 +48,12 @@ use nn::capability::{Conditioning, Denoiser, LatentShape, Latents, Layout, Step,
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
+use ::storage::manifest::{Encoding, Field, Logical, Segment, Span, StorageLayout};
+
 use crate::arena::{Pools, StreamId};
 use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
+use crate::memory::latent::host::LatentHostPool;
+use crate::memory::latent::restore;
 use crate::plan::{Bucket, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
@@ -596,6 +606,37 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync> {
     /// The steps those calls' trajectories have completed once the replay ran: a call reports it,
     /// and that report is what moves the request to its next step.
     steps_completed: u32,
+    /// The request whose trajectory the latent columns hold, and the bucket it is laid out in: the
+    /// request whose first step this runner ran last. A step of any other request opens that
+    /// request first ([`Self::first_step`]). The scheduler holds the denoiser for one request from
+    /// its latent preparation to its last step, so a trajectory is never displaced mid-schedule.
+    opened: Option<(ipc::RequestKey, Bucket)>,
+    /// The request a latent preparation restored a stored trajectory for, and the step that
+    /// trajectory stands at: its first step continues from the columns instead of drawing noise.
+    restored: Option<(ipc::RequestKey, u32)>,
+    /// The latent preparations of the batch submitted last, which its jobs perform.
+    preparations: Vec<Preparation>,
+    /// The host latent pool of this runner's device: a preempted request's trajectory is written to
+    /// it and a resumed one's read through it. `None` on a device that maps none.
+    host_pool: Option<Arc<LatentHostPool>>,
+    /// The rank of the worker group this device belongs to, which the engine's page copies and
+    /// restore readers name.
+    pool_rank: u32,
+    /// Whether this device states a trajectory's page layout for its rank: every device of a
+    /// sequence group holds the whole samples, so one of them states them for all.
+    reports_layout: bool,
+}
+
+/// One latent preparation of a submitted batch.
+struct Preparation {
+    /// The call it answers.
+    call: CallId,
+    /// The request whose trajectory it opens.
+    request: ipc::RequestKey,
+    /// The denoising bucket the request's steps run in, whose layout the trajectory has.
+    bucket: Bucket,
+    /// The stored trajectory it opens at, for a resumed request.
+    restore: Option<ipc::LatentRestore>,
 }
 
 impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
@@ -665,6 +706,12 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
             group: None,
             calls: Vec::new(),
             steps_completed: 0,
+            opened: None,
+            restored: None,
+            preparations: Vec::new(),
+            host_pool: None,
+            pool_rank: 0,
+            reports_layout: false,
         })
     }
 
@@ -673,6 +720,37 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     pub fn in_group(mut self, rank: u32, group: Option<Arc<nn::Group>>) -> Self {
         self.diag = std::mem::replace(&mut self.diag, Diag::from_env()).for_rank(rank);
         self.group = group;
+        self
+    }
+
+    /// The bytes of the largest trajectory this runner holds: the video and audio latents of its
+    /// largest layout, which a host latent pool's trajectory pages are sized for.
+    pub fn trajectory_bytes(&self) -> Result<u64> {
+        let element = u64::from(self.shape.sample.bytes().ok_or_else(|| {
+            Error::Invalid(format!("{} has no whole-byte size", self.shape.sample))
+        })?);
+        let mut largest = 0;
+        for plan in &self.buckets {
+            let layout = layout_of(plan.bucket)?;
+            let audio = layout.audio.as_ref().map_or(Ok(0), numel)?;
+            largest = largest.max((numel(&layout.video)? + audio) * element);
+        }
+        Ok(largest)
+    }
+
+    /// This runner with its device's host latent pool, as a device of rank `rank` of its worker
+    /// group: preempted trajectories are written to the pool and resumed ones read through it, and
+    /// when `reports` is set this device states the trajectory's page layout for the rank.
+    #[must_use]
+    pub fn with_host_latents(
+        mut self,
+        pool: Arc<LatentHostPool>,
+        rank: u32,
+        reports: bool,
+    ) -> Self {
+        self.host_pool = Some(pool);
+        self.pool_rank = rank;
+        self.reports_layout = reports;
         self
     }
 
@@ -916,9 +994,10 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                  rather than a request's conditioning"
             )));
         }
-        // The encoder's rows stay in `source` for the request's life, and only the first step folds
-        // them: a later step's copy would write bytes no launch reads.
-        if self.staged_step != Some(0) {
+        // The encoder's rows stay in `source` for the request's life, and only the step that opens
+        // the request on this runner folds them: a later step's copy would write bytes no launch
+        // reads.
+        if !self.opens() {
             return Ok(());
         }
         self.zero_rows(bucket)?;
@@ -1052,11 +1131,30 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
     /// range serves a replay. That is what makes the draw affordable here - its reservations are
     /// the walk's own, and the graph's nodes address their recorded offsets above a column the draw
     /// writes rather than above scratch it overwrites. A later step needs none of this: its
-    /// trajectory is the column the previous replay advanced in place, which is why only step zero
-    /// draws.
+    /// trajectory is the column the previous replay advanced in place.
+    ///
+    /// **This runs for the step that opens a request on this runner**, which is step zero for a
+    /// request that starts here and the stored step for one a latent preparation restored. A
+    /// restored request's columns already hold its trajectory at that step, so it draws no noise
+    /// and starts no schedule; its conditioner, its condition draws and its state tables are
+    /// computed again from the request, which is all they depend on.
     fn first_step(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        if self.staged_step != Some(0) || self.pending.is_empty() {
+        if !self.opens() {
             return Ok(());
+        }
+        let request = self.pending[0].request;
+        let restored = match self.restored {
+            Some((stored, steps)) if stored == request => Some(steps),
+            _ => None,
+        };
+        let stands = restored.unwrap_or(0);
+        if self.staged_step != Some(stands) {
+            return Err(Error::Invalid(format!(
+                "request {request:?} opens on this denoiser at step {:?} and its trajectory here \
+                 stands at step {stands}: a request that continues past its first step on another \
+                 runner has nothing to continue from unless its latent preparation restored it",
+                self.staged_step
+            )));
         }
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
@@ -1088,7 +1186,9 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                 condition_elements: self.model.layout(&row.stated.view()).condition_elements,
                 ..layout
             };
-            self.model.draw_noise(&forward, row.seed, drawn, latents)?;
+            if restored.is_none() {
+                self.model.draw_noise(&forward, row.seed, drawn, latents)?;
+            }
             // **The conditioner, eager and once per request, outside the graph.** `text` holds the
             // encoder's rows as `seed` copied them; this folds `source` into it in place, so every
             // replay of the bucket reads rows refined for its own request. It is not a graph node
@@ -1116,8 +1216,209 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
                     self.dump("state", table.name, *view);
                 }
             }
-            self.model.prepare_latents(&forward, cond, latents)?;
+            if restored.is_none() {
+                self.model.prepare_latents(&forward, cond, latents)?;
+            }
         }
+        self.opened = Some((request, bucket));
+        self.restored = None;
+        Ok(())
+    }
+
+    /// Whether the pending request's step opens it on this runner: the step whose host work folds
+    /// its conditioning and writes its state tables before the graph runs.
+    fn opens(&self) -> bool {
+        match self.pending.as_slice() {
+            [row] => self
+                .opened
+                .is_none_or(|(request, _)| request != row.request),
+            _ => false,
+        }
+    }
+
+    /// Notes the latent preparations of `batch`: each opens a trajectory of the denoising bucket
+    /// whose layout the request's shape selected, and a resumed request's opens at the stored
+    /// trajectory the engine pinned.
+    fn submit_preparation(
+        &mut self,
+        batch: &Batch,
+        media: &crate::batch::MediaColumns,
+    ) -> Result<Jobs> {
+        let computation = media.computation;
+        let bucket = self
+            .buckets
+            .iter()
+            .map(|plan| plan.bucket)
+            .find(|bucket| bucket.extent == computation.extent)
+            .ok_or_else(|| {
+                Error::Invalid(format!(
+                    "a latent preparation names a layout no denoising bucket of this runner holds \
+                     ({:?})",
+                    computation.extent
+                ))
+            })?;
+        if media.inputs.len() != batch.calls.len() {
+            return Err(Error::Invalid(format!(
+                "a latent preparation batch of {} call(s) carries {} row(s) of staged inputs",
+                batch.calls.len(),
+                media.inputs.len()
+            )));
+        }
+        self.preparations.clear();
+        for (index, call) in batch.calls.iter().enumerate() {
+            let stated = media.request(index)?;
+            let restore = batch
+                .latent_restores
+                .iter()
+                .find(|(request, _)| *request == stated.request)
+                .map(|(_, restore)| restore.clone());
+            self.preparations.push(Preparation {
+                call: *call,
+                request: stated.request,
+                bucket,
+                restore,
+            });
+        }
+        Ok(Jobs::new(batch.calls.iter().map(|call| Job::Prepare {
+            runner: self.id,
+            call: *call,
+        })))
+    }
+
+    /// Performs the latent preparation of `call`: a new trajectory begins on this runner, its page
+    /// layout is stated for the engine, and a resumed request's stored pages are copied into it.
+    ///
+    /// Whatever request the columns held is finished or was preempted and stored, because the
+    /// scheduler holds the denoiser for one request at a time.
+    fn prepare(&mut self, call: CallId) -> Result<BatchOutput> {
+        let index = self
+            .preparations
+            .iter()
+            .position(|preparation| preparation.call == call)
+            .ok_or_else(|| {
+                Error::Invariant(format!(
+                    "a preparation job names call {}, which the batch submitted last did not \
+                     prepare",
+                    call.0
+                ))
+            })?;
+        let preparation = self.preparations.remove(index);
+        let layout = trajectory_layout(&layout_of(preparation.bucket)?, self.shape.sample)?;
+        self.opened = None;
+        self.restored = None;
+        let step = match &preparation.restore {
+            Some(restore) => {
+                self.restore(preparation.bucket, &layout, restore)?;
+                self.restored = Some((preparation.request, restore.steps));
+                tracing::info!(
+                    request = ?preparation.request,
+                    steps = restore.steps,
+                    "restored a stored trajectory into the denoiser"
+                );
+                restore.steps
+            }
+            None => 0,
+        };
+        let mut output = CallOutput::completed(
+            call,
+            Vec::new(),
+            RowState {
+                step_index: step,
+                ..RowState::default()
+            },
+        );
+        if self.reports_layout && self.host_pool.is_some() {
+            output.latent_layouts.push(ipc::RankLatentLayout {
+                rank: self.pool_rank,
+                layout: serde_json::to_string(&layout).map_err(|error| {
+                    Error::Invalid(format!(
+                        "a trajectory's page layout does not serialize: {error}"
+                    ))
+                })?,
+            });
+        }
+        Ok(BatchOutput {
+            calls: vec![output],
+            ..BatchOutput::default()
+        })
+    }
+
+    /// Copies the stored pages `restore` names into the trajectory of `bucket`, laid out in this
+    /// runner's columns as `layout` states: the copy manifest from the stored ranks' pages this
+    /// rank reads to the rank's own (`crate::memory::latent::restore`), which copies a page laid out
+    /// alike whole. The copies have completed when this returns, before the engine releases the
+    /// pages it pinned.
+    fn restore(
+        &self,
+        bucket: Bucket,
+        layout: &StorageLayout,
+        restore: &ipc::LatentRestore,
+    ) -> Result<()> {
+        let pool = self.host_pool.as_ref().ok_or_else(|| {
+            Error::Invalid(
+                "a latent preparation restores a stored trajectory on a device that maps no host \
+                 latent pool"
+                    .into(),
+            )
+        })?;
+        let sources: Vec<&ipc::LatentSource> = restore
+            .sources
+            .iter()
+            .filter(|source| source.readers.contains(&self.pool_rank))
+            .collect();
+        if sources.is_empty() {
+            return Err(Error::Invalid(format!(
+                "a latent restore names no stored pages rank {} reads",
+                self.pool_rank
+            )));
+        }
+        let stored = sources
+            .iter()
+            .map(|source| {
+                Ok(restore::Stored {
+                    layout: serde_json::from_str(&source.layout).map_err(|error| {
+                        Error::Invalid(format!("a stored trajectory's page layout: {error}"))
+                    })?,
+                    page_bytes: source.pool.page_bytes,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let target = restore::Stored {
+            layout: layout.clone(),
+            page_bytes: pool.page_bytes(),
+        };
+        let gpu = self.device.uuid()?.0;
+        let copies = restore::copies(&stored, &target, restore.content, gpu)?;
+        let regions = trajectory_regions(&self.latents(bucket, 0)?)?;
+        let total: u64 = regions.iter().map(|(_, bytes)| bytes).sum();
+        for copy in &copies {
+            // A page laid out alike is copied whole, and the trajectory's last page holds fewer
+            // bytes than a page: what lies past the trajectory is no value of it, and the columns
+            // end there for the largest layout.
+            if copy.target >= total {
+                continue;
+            }
+            let length = copy.bytes.min(total - copy.target);
+            let source = sources[copy.source];
+            let slot = *source.slots.get(copy.page as usize).ok_or_else(|| {
+                Error::Invalid(format!(
+                    "a latent restore copies stored page {} of a source of {} pages",
+                    copy.page,
+                    source.slots.len()
+                ))
+            })?;
+            let page = pool.source(&source.pool, slot)?;
+            let from = page.address() + copy.offset;
+            for (address, offset, bytes) in pieces(&regions, copy.target, length)? {
+                // SAFETY: the stored page stays pinned until this call's result, and the copies
+                // complete before this returns; the destination lies in this runner's column, which
+                // no graph reads while the denoiser serves this preparation.
+                unsafe {
+                    platform::memcpy_async(address, from + offset, bytes as usize, &self.stream)
+                }?;
+            }
+        }
+        self.stream.synchronize()?;
         Ok(())
     }
 
@@ -1626,9 +1927,12 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
         })?;
         media.check()?;
         let computation = media.computation;
+        if computation.variant() == Some(Variant::LatentPrepare) {
+            return self.submit_preparation(&batch, &media);
+        }
         if computation.variant() != Some(Variant::Denoise) {
             return Err(Error::Invalid(format!(
-                "a denoiser runner serves a denoise; this batch states a {:?}",
+                "a denoiser runner serves a denoise or a latent preparation; this batch states a {:?}",
                 computation.call
             )));
         }
@@ -1716,7 +2020,19 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
     }
 
     fn media_plan(&self) -> Vec<Bucket> {
-        self.capture_order()
+        // A latent preparation opens a trajectory of a layout this runner steps, so each denoising
+        // bucket has a preparation bucket of the same extent and the request's shape selects both
+        // alike. A preparation captures no graph, so `capture_plan` names the denoising buckets
+        // alone.
+        let steps = self.capture_order();
+        let preparations: Vec<Bucket> = steps
+            .iter()
+            .map(|bucket| Bucket {
+                variant: Variant::LatentPrepare,
+                ..*bucket
+            })
+            .collect();
+        steps.into_iter().chain(preparations).collect()
     }
 
     fn capture_plan(&self) -> Vec<Bucket> {
@@ -1902,8 +2218,163 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 "a runner that serves device work was asked for host call {}",
                 call.0
             ))),
+            Job::Prepare { call, .. } => self.prepare(*call),
         }
     }
+
+    fn offload_latents(&mut self, offloads: &[ipc::LatentOffload]) -> Result<bool> {
+        if offloads.is_empty() {
+            return Ok(false);
+        }
+        let Some(pool) = self.host_pool.clone() else {
+            return Ok(false);
+        };
+        let page_bytes = pool.page_bytes();
+        for offload in offloads {
+            let Some((_, bucket)) = self
+                .opened
+                .filter(|(request, _)| *request == offload.request_key)
+            else {
+                return Err(Error::Invariant(format!(
+                    "the engine asked for the trajectory of {:?} and this denoiser's columns hold \
+                     {:?}'s: the denoiser is held for one request from its preparation to its \
+                     last step, so a preempted request's trajectory is the one it holds",
+                    offload.request_key,
+                    self.opened.map(|(request, _)| request)
+                )));
+            };
+            let regions = trajectory_regions(&self.latents(bucket, 0)?)?;
+            let total: u64 = regions.iter().map(|(_, bytes)| bytes).sum();
+            for copy in &offload.pages {
+                let start = u64::from(copy.page) * page_bytes;
+                if start >= total {
+                    return Err(Error::Invalid(format!(
+                        "latent page {} lies past a trajectory of {total} bytes in pages of \
+                         {page_bytes}",
+                        copy.page
+                    )));
+                }
+                let destination = pool.address(copy)?;
+                for (address, offset, bytes) in
+                    pieces(&regions, start, page_bytes.min(total - start))?
+                {
+                    // SAFETY: the slot is reserved for this rank until the engine commits it after
+                    // this command's output, which waits for the copies below; the columns are
+                    // not written while the denoiser is held for the preempted request.
+                    unsafe {
+                        platform::memcpy_async(
+                            destination + offset,
+                            address,
+                            bytes as usize,
+                            &self.stream,
+                        )
+                    }?;
+                }
+            }
+            tracing::info!(
+                request = ?offload.request_key,
+                pages = offload.pages.len(),
+                "offloading a preempted trajectory to the host latent pool"
+            );
+        }
+        self.stream.synchronize()?;
+        Ok(true)
+    }
+}
+
+/// How a runner's latent columns hold one request's trajectory, as the copy manifest library reads
+/// it: the whole video latent, then the whole audio latent when the layout has a soundtrack, back to
+/// back from the first byte. Every rank of a sequence group holds the whole samples (the velocity is
+/// gathered to every rank before the solver's update), so two ranks or epochs whose layouts agree
+/// lay out every page alike.
+fn trajectory_layout(layout: &Layout, dtype: DType) -> Result<StorageLayout> {
+    let element = u64::from(
+        dtype
+            .bytes()
+            .ok_or_else(|| Error::Invalid(format!("{dtype} has no whole-byte size")))?,
+    );
+    let field = |tensor: &str, shape: &LatentShape, offset: u64| {
+        let dims = [
+            u64::from(shape.channels),
+            u64::from(shape.frames),
+            u64::from(shape.height),
+            u64::from(shape.width),
+        ];
+        let strides = [dims[1] * dims[2] * dims[3], dims[2] * dims[3], dims[3], 1];
+        Field {
+            tensor: tensor.to_owned(),
+            source: String::new(),
+            dtype: dtype.to_string(),
+            element,
+            offset,
+            shape: dims.to_vec(),
+            strides: strides.to_vec(),
+            logical: Logical {
+                shape: dims.to_vec(),
+                dims: ["channel", "frame", "row", "column"]
+                    .map(str::to_owned)
+                    .to_vec(),
+                // No parallel configuration divides a sample: every rank holds it whole.
+                units: vec![0; 4],
+                segments: dims
+                    .iter()
+                    .map(|extent| {
+                        vec![Segment {
+                            span: Span::range(0, *extent),
+                            local: 0,
+                        }]
+                    })
+                    .collect(),
+            },
+            encoding: Encoding::Affine,
+        }
+    };
+    let video = numel(&layout.video)? * element;
+    let mut fields = vec![field("video_latents", &layout.video, 0)];
+    let mut bytes = video;
+    if let Some(audio) = &layout.audio {
+        fields.push(field("audio_latents", audio, video));
+        bytes += numel(audio)? * element;
+    }
+    Ok(StorageLayout { bytes, fields })
+}
+
+/// The device ranges a trajectory's bytes lie in, in the order [`trajectory_layout`] lays them back
+/// to back: the video latent, then the audio latent.
+fn trajectory_regions(latents: &Latents) -> Result<Vec<(u64, u64)>> {
+    let region = |view: &TensorView| -> Result<(u64, u64)> {
+        let bytes = view
+            .dtype
+            .bytes()
+            .ok_or_else(|| Error::Invalid(format!("{} has no whole-byte size", view.dtype)))?;
+        Ok((view.ptr.address(), view.shape.numel() * u64::from(bytes)))
+    };
+    let mut regions = vec![region(&latents.video)?];
+    if let Some(audio) = &latents.audio {
+        regions.push(region(audio)?);
+    }
+    Ok(regions)
+}
+
+/// The pieces of the byte range `start..start + bytes` of a trajectory laid back to back over
+/// `regions`: each piece's device address, its offset from `start` and its length.
+fn pieces(regions: &[(u64, u64)], start: u64, bytes: u64) -> Result<Vec<(u64, u64, u64)>> {
+    let end = start + bytes;
+    let mut pieces = Vec::new();
+    let mut base = 0;
+    for (address, length) in regions {
+        let (first, last) = (start.max(base), end.min(base + length));
+        if first < last {
+            pieces.push((address + (first - base), first - start, last - first));
+        }
+        base += length;
+    }
+    if base < end {
+        return Err(Error::Invalid(format!(
+            "bytes {start}..{end} lie past a trajectory of {base} bytes"
+        )));
+    }
+    Ok(pieces)
 }
 
 impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
@@ -1939,6 +2410,68 @@ fn layout_of(bucket: Bucket) -> Result<Layout> {
 mod tests {
     use super::*;
     use nn::capability::{Seed, StateTable};
+
+    /// A trajectory's bytes lie back to back over the video and the audio column, so a range that
+    /// straddles the two is two pieces, and a range past the trajectory is refused.
+    #[test]
+    fn a_range_across_the_two_latents_is_two_pieces() {
+        let regions = [(0x1000_u64, 100_u64), (0x9000, 50)];
+        assert_eq!(pieces(&regions, 0, 100).unwrap(), vec![(0x1000, 0, 100)]);
+        assert_eq!(
+            pieces(&regions, 90, 20).unwrap(),
+            vec![(0x1000 + 90, 0, 10), (0x9000, 10, 10)]
+        );
+        assert_eq!(
+            pieces(&regions, 140, 10).unwrap(),
+            vec![(0x9000 + 40, 0, 10)]
+        );
+        assert!(pieces(&regions, 140, 11).is_err());
+    }
+
+    /// A trajectory stored by a rank of the same layout is restored page by page and whole: every
+    /// copy is a whole stored page into the same page of the trajectory, and the pages cover every
+    /// byte the trajectory holds.
+    #[test]
+    fn a_trajectory_of_the_same_layout_restores_whole_pages() {
+        let mut layout = layout(24, 37, 48, 84, 1024);
+        layout.audio = Some(LatentShape {
+            channels: 64,
+            frames: 251,
+            height: 1,
+            width: 1,
+        });
+        let stored = trajectory_layout(&layout, DType::F32).unwrap();
+        stored.validate().unwrap();
+        assert_eq!(stored.bytes, (24 * 37 * 48 * 84 + 64 * 251) * 4);
+        let page = 1 << 20;
+        let copies = restore::copies(
+            &[restore::Stored {
+                layout: stored.clone(),
+                page_bytes: page,
+            }],
+            &restore::Stored {
+                layout: stored.clone(),
+                page_bytes: page,
+            },
+            [7; 32],
+            [1; 16],
+        )
+        .unwrap();
+        assert!(
+            copies.iter().all(|copy| copy.offset == 0
+                && copy.bytes == page
+                && copy.target == copy.page * page),
+            "a page laid out alike is copied whole into its own place: {copies:?}"
+        );
+        let mut targets: Vec<u64> = copies.iter().map(|copy| copy.target).collect();
+        targets.sort_unstable();
+        assert_eq!(
+            targets,
+            (0..stored.bytes.div_ceil(page))
+                .map(|index| index * page)
+                .collect::<Vec<_>>()
+        );
+    }
 
     /// A layout whose video latent is `channels x frames x height x width`.
     fn layout(channels: u32, frames: u32, height: u32, width: u32, text_rows: u32) -> Layout {

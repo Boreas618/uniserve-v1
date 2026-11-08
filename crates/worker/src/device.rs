@@ -543,6 +543,12 @@ impl Worker {
         self.storage_command(Command::CopyPages(offloads), JobKind::HostCache)
     }
 
+    /// Copies preempted requests' trajectories to the host latent pool in queue order, behind the
+    /// batches that advanced them, with no batch to carry them.
+    pub fn offload_latents(&self, offloads: Vec<ipc::LatentOffload>) -> Result<Submission> {
+        self.storage_command(Command::OffloadLatents(offloads), JobKind::LatentOffload)
+    }
+
     /// Gives the cache's segments from `from` on back to the Storage Server (7.6).
     pub fn release_cache(&self, from: u32) -> Result<Submission> {
         self.storage_command(Command::ReleaseCache { from }, JobKind::Sleep)
@@ -1193,6 +1199,22 @@ impl Device {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner) =
                         setup.map(&client, &mut cache, *tokens)?;
+                }
+                Ok(Step::Done(BatchOutput::default()))
+            }
+            Command::OffloadLatents(offloads) => {
+                // The runner that holds a request's trajectory writes it; a device that is given
+                // pages no runner holds would leave reserved slots unwritten and the engine would
+                // commit them, so that is refused.
+                let mut written = false;
+                for named in &mut self.runners {
+                    written |= named.runner.offload_latents(offloads)?;
+                }
+                if !written && offloads.iter().any(|offload| !offload.pages.is_empty()) {
+                    return Err(Error::Invariant(
+                        "no runner of this device holds the trajectories it was asked to offload"
+                            .into(),
+                    ));
                 }
                 Ok(Step::Done(BatchOutput::default()))
             }

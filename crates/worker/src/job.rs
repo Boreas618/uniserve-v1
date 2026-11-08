@@ -106,6 +106,8 @@ pub(crate) enum Command {
     },
     /// Copy published pages to the host KV cache, with no batch to carry them.
     CopyPages(Vec<ipc::PageCopy>),
+    /// Copy preempted requests' trajectories to the host latent pool, with no batch to carry them.
+    OffloadLatents(Vec<ipc::LatentOffload>),
     /// Give the cache's segments from `from` on back to the Storage Server (7.6). The scheduler
     /// withdrew their units and waited for every request that held one.
     ReleaseCache {
@@ -152,6 +154,10 @@ impl Command {
                 format!("mapping a host KV cache of {tokens} tokens")
             }
             Self::CopyPages(pages) => format!("copying {} pages to the host KV cache", pages.len()),
+            Self::OffloadLatents(offloads) => format!(
+                "copying {} preempted trajectories to the host latent pool",
+                offloads.len()
+            ),
             Self::Wake { limit } => match limit {
                 Some(limit) => format!("waking {limit} segments of the resident cache planes"),
                 None => "waking every released segment of the resident cache planes".to_owned(),
@@ -564,6 +570,10 @@ pub(crate) fn jobs_of(runner: crate::runner::RunnerId, jobs: crate::batch::Jobs)
                 runner,
                 call: *call,
             },
+            Job::Prepare { call, .. } => Job::Prepare {
+                runner,
+                call: *call,
+            },
         })
         .collect()
 }
@@ -591,6 +601,7 @@ mod tests {
         Batch {
             page_loads: Vec::new(),
             page_offloads: Vec::new(),
+            latent_restores: Vec::new(),
             id: crate::batch::BatchId(1),
             phase: ipc::PhaseId(0),
             calls: Vec::new(),

@@ -736,6 +736,21 @@ impl Scheduler {
                 );
             }
         }
+        // A denoiser holds one request's trajectory in its columns from the request's latent
+        // preparation to its last step, so the request keeps the denoiser across the gaps between
+        // its calls as well: another request's preparation or step in such a gap would open its own
+        // trajectory over the first one's. A preempted request keeps it until it leaves, which is
+        // after its trajectory was written to the host latent pool.
+        for (id, state) in &self.running_media {
+            if state.latent_preparation_scheduled
+                && state.denoising.completed() < state.denoising.steps()
+            {
+                occupancy.occupy(
+                    &self.media_demand(state.admission.request_key, MediaCall::Denoising, 1),
+                    *id,
+                );
+            }
+        }
         occupancy
     }
 

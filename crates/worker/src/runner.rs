@@ -103,6 +103,15 @@ pub trait Runner: Send {
         Ok(())
     }
 
+    /// Writes the trajectories of preempted requests that this runner holds to the host latent pool
+    /// slots the engine reserved (`ipc::LatentOffload`), and answers whether it held them. It runs
+    /// on the device thread behind every batch that advanced the trajectories, and the copies have
+    /// completed when it returns. A runner that holds no trajectory answers `false`.
+    fn offload_latents(&mut self, offloads: &[ipc::LatentOffload]) -> Result<bool> {
+        let _ = offloads;
+        Ok(false)
+    }
+
     /// Hands the runner the device's record of the operators a program-layer update could not
     /// compare (7.3 step 2).
     ///

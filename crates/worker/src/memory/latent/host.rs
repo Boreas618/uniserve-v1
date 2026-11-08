@@ -59,18 +59,18 @@ fn pool_pages(pages: BankPages) -> u64 {
     2 * pages.pages
 }
 
-/// The latent pages of a rank's banks.
+/// The latent pages a rank holds trajectories in.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct BankPages {
+pub struct BankPages {
     /// The element type of the values.
-    pub(crate) dtype: ElementType,
+    pub dtype: ElementType,
     /// The values one page holds.
-    pub(crate) page_values: u32,
+    pub page_values: u32,
     /// The most pages one trajectory occupies.
-    pub(crate) trajectory_pages: u32,
-    /// The pages of one bank that hold trajectories: every page but the
-    /// padding page.
-    pub(crate) pages: u64,
+    pub trajectory_pages: u32,
+    /// The pages that hold trajectories at once: the trajectory pages of every trajectory the rank
+    /// holds.
+    pub pages: u64,
 }
 
 impl BankPages {
@@ -82,7 +82,7 @@ impl BankPages {
 
 /// The rank's host latent pool, mapped and registered for device copies,
 /// and the pools of other ranks it read stored pages from.
-pub(crate) struct LatentHostPool {
+pub struct LatentHostPool {
     pool: LatentPoolRef,
     storage: Arc<Storage>,
     slots: u64,
@@ -186,7 +186,7 @@ impl LatentHostPool {
     /// share of a request's samples, and `endpoint` is where an engine on
     /// another host reaches the server. Returns the pool and what the rank
     /// reports of it.
-    pub(crate) fn start(
+    pub fn start(
         retained: &Arc<Retained>,
         device: DeviceId,
         pages: BankPages,
