@@ -602,6 +602,7 @@ mod tests {
             page_loads: Vec::new(),
             page_offloads: Vec::new(),
             latent_restores: Vec::new(),
+            host_outputs: Vec::new(),
             id: crate::batch::BatchId(1),
             phase: ipc::PhaseId(0),
             calls: Vec::new(),

@@ -1085,6 +1085,30 @@ impl ModelRunner {
             Arc::clone(generation),
         )?
         .in_group(groups.tensor.clone());
+        // The host encoder pool a prompt's encoded states are stored in and found again by a
+        // resumed request: one per host, shared by its ranks and epochs. This encoder writes the
+        // conditioning alone; the vision and latent features are computed inside the calls that
+        // read them, so they are no output of their own. The engine counts this process's ranks as
+        // one, and the first writes the states it computed.
+        let reports = report.is_some();
+        let longest = u64::from(capacities.iter().copied().max().unwrap_or(0));
+        let element = u64::from(
+            dtype
+                .bytes()
+                .context("the encoder's states have no whole-byte element")?,
+        );
+        let (encoder_pool, encoder_info) = worker::memory::encoders::EncoderHostPool::start(
+            client,
+            device,
+            worker::memory::encoders::pool_pages(
+                &[longest * u64::from(hidden) * element],
+                self.engine_config().max_running_requests.get(),
+            ),
+            BTreeMap::from([(ipc::product::CONDITIONING.to_owned(), identity.to_owned())]),
+            None,
+        )
+        .context("mapping the host encoder pool")?;
+        let encoder = encoder.with_host_outputs(Arc::new(encoder_pool), reports);
         let warm = worker::runners::warm::distinct(&**denoiser, &candidates);
         // The denoiser's own buckets are the layouts those candidates collapse to: its phase is
         // derived from them rather than named, so a rank that captures no denoise bucket states no
@@ -1166,9 +1190,9 @@ impl ModelRunner {
             None,
         )
         .context("mapping the host latent pool")?;
-        let reports = report.is_some();
         if let Some(report) = report {
             report.latent_pool = Some(Box::new(pool_info));
+            report.encoder_pool = Some(Box::new(encoder_info));
         }
         let denoise = denoise.with_host_latents(Arc::new(pool), 0, reports);
         let decoder = pipeline
