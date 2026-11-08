@@ -686,7 +686,6 @@ fn join_leader(options: &DaemonOptions) -> anyhow::Result<Connection> {
     };
     connection.send(&Hello {
         major: proto::PROTOCOL_MAJOR,
-        minor: proto::PROTOCOL_MINOR,
         build: proto::BUILD.to_owned(),
         peer: Some(hello::Peer::Join(Join {
             node_rank: options.node_rank,
@@ -768,7 +767,6 @@ mod tests {
         engine
             .send(&Hello {
                 major: proto::PROTOCOL_MAJOR,
-                minor: proto::PROTOCOL_MINOR,
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(Engine {
                     deployment: "model".to_owned(),

@@ -120,7 +120,6 @@ struct Prepare {
     processes: String,
     /// Whether the configuration listens on another address than the
     /// daemon's listener: the successor binds it before the handover.
-    #[serde(default)]
     rebind: bool,
 }
 
@@ -131,7 +130,6 @@ struct Prepare {
 struct Takeover {
     /// The responses in flight, which the successor takes over before it
     /// serves; their sockets follow the other descriptors, in this order.
-    #[serde(default)]
     streams: Vec<streams::StreamHandoff>,
     listener: HandedListener,
     replicas: Vec<ReplicaHandoff>,
@@ -145,7 +143,6 @@ struct Takeover {
     /// successor's gate starts as the predecessor's ended: a hot restart must
     /// not reopen admissions (§7.5.1), and the in-process hold alone would
     /// reopen them once the frontend serves.
-    #[serde(default)]
     frontend_paused: bool,
     /// The programs the serving epoch runs. A configuration names a part of
     /// them and the store fills the rest, so the successor cannot derive them.

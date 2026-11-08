@@ -55,10 +55,6 @@ pub struct Got {
 /// A connection to the Storage Server of this host.
 pub struct Client {
     connection: Connection,
-    /// The protocol version the connection speaks: this build's, or an
-    /// earlier one an operator's connection to an earlier server said hello
-    /// with ([`Client::connect_operator`]).
-    version: u32,
     next: u64,
     /// Answers received and not yet taken, by request.
     answers: HashMap<u64, Answer>,
@@ -116,16 +112,17 @@ impl Client {
         )
     }
 
-    fn open(connection: Connection, role: Role) -> Result<Self> {
-        Self::open_version(connection, role, VERSION)
-    }
-
-    fn open_version(mut connection: Connection, role: Role, version: u32) -> Result<Self> {
-        connection.send(&ClientMessage::Hello(Hello { version, role }), &[])?;
+    fn open(mut connection: Connection, role: Role) -> Result<Self> {
+        connection.send(
+            &ClientMessage::Hello(Hello {
+                version: VERSION,
+                role,
+            }),
+            &[],
+        )?;
         match connection.recv::<ServerMessage>()?.0 {
             ServerMessage::Welcome(Welcome::Accepted { .. }) => Ok(Self {
                 connection,
-                version,
                 next: 1,
                 answers: HashMap::new(),
                 events: VecDeque::new(),
@@ -161,7 +158,6 @@ impl Client {
     pub fn resume(descriptor: OwnedFd, next: u64) -> Self {
         Self {
             connection: Connection::new(UnixStream::from(descriptor)),
-            version: VERSION,
             next,
             answers: HashMap::new(),
             events: VecDeque::new(),
@@ -582,7 +578,7 @@ pub struct Ledgers {
     /// What the host admits of new host storage.
     pub host: HostStorage,
     /// What the transfer tasks of the client's deployment copied on the
-    /// host, by priority; empty from a server of protocol 17 or earlier.
+    /// host, by priority.
     pub transfers: Vec<TransferTotal>,
 }
 

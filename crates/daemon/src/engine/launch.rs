@@ -146,8 +146,7 @@ mod tests {
     /// The launch file states exactly the engine's fields, the epoch's engine
     /// configuration and the handover state among them, and the engine reads
     /// it back as the one type both sides use (`proto::config::EngineArgs`).
-    /// A key a newer daemon adds is read past rather than refused, so an
-    /// engine of an older build still starts from it.
+    /// A key the engine does not know is refused.
     #[test]
     fn a_launch_file_states_exactly_the_engines_fields() {
         let directory = scratch("keys");
@@ -200,11 +199,10 @@ mod tests {
         let read: EngineArgs = serde_json::from_str(&text).expect("the launch file reads back");
         assert_eq!(read, launch());
 
-        // A key this build does not know is read past.
+        // A key this build does not know is refused.
         let mut extra = value;
         extra["generation"] = json!(7);
-        let read: EngineArgs = serde_json::from_value(extra).expect("an unknown key is read past");
-        assert_eq!(read, launch());
+        serde_json::from_value::<EngineArgs>(extra).expect_err("an unknown key is refused");
         let _ = std::fs::remove_dir_all(&directory);
     }
 

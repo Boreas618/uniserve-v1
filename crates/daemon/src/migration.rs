@@ -936,7 +936,7 @@ mod tests {
     /// A video request leaves its engine naming the trajectory steps the
     /// engine stored and where they lie: it is submitted again with them
     /// and its trajectory's identity, reading the stored trajectory under
-    /// the next epoch's own latent seed, or under the parked epoch's when a
+    /// the next epoch's own latent seed, or under the parked epoch's when an
     /// epoch change keeps the state of the requests in flight. A migration
     /// that stored nothing submits the request naming what it named before.
     #[test]

@@ -293,7 +293,6 @@ impl Joins {
                 });
             let welcome = Welcome {
                 major: proto::PROTOCOL_MAJOR,
-                minor: proto::PROTOCOL_MINOR,
                 build: proto::BUILD.to_owned(),
                 refusal: refusal.clone().unwrap_or_default(),
                 nodes: Vec::new(),
@@ -774,7 +773,6 @@ pub(crate) fn run_leader(
                             }
                             let welcome = Welcome {
                                 major: proto::PROTOCOL_MAJOR,
-                                minor: proto::PROTOCOL_MINOR,
                                 build: proto::BUILD.to_owned(),
                                 refusal: refusal.clone().unwrap_or_default(),
                                 nodes: nodes.clone(),

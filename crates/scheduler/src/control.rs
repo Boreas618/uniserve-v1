@@ -69,7 +69,7 @@ impl StageAnswer {
     }
 }
 
-/// An update's ask that the following step's batches also run in shadow for a
+/// An update's ask that the following step's batches also run in shadow for an
 /// epoch generation (§7.3 step 2), with the answer that waits for the step which
 /// shadows them.
 ///
@@ -430,7 +430,7 @@ impl Scheduler {
     ///
     /// §7.3's two stages run here on the calling thread: the precopy
     /// instantiates the program on this boundary's state and trials every
-    /// decision of §4.4's table against it, and the switchover puts it in. A
+    /// decision of §4.4's table against it, and the switchover puts it in. An
     /// epoch with no control thread — the integration tests, and a simulated
     /// engine's — has no other way to have a policy, and a scheduler with no
     /// policy decides nothing, so without this such an epoch schedules no work

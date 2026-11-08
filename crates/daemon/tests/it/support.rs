@@ -64,7 +64,6 @@ impl Engine {
         connection
             .send(&Hello {
                 major,
-                minor: proto::PROTOCOL_MINOR,
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Engine(EnginePeer {
                     deployment: "deployment".into(),

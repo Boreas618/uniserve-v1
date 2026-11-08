@@ -21,7 +21,7 @@ use super::{Epoch, Gpu, Rank, Storage};
 use crate::Key;
 use crate::protocol::{Access, LinkBandwidth, Listing, Location};
 
-/// The name a rank's manifest is retained under, by which the manifests a
+/// The name a rank's manifest is retained under, by which the manifests an
 /// epoch retains are found.
 pub const NAME: &str = "weights manifest";
 

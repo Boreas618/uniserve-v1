@@ -37,7 +37,7 @@
 //!
 //! The scheduler plans an output's encoder calls only once its lookup
 //! resolved, so all of them import, or all compute. Like the host latent
-//! pools, the store connects as a head of its engine's epoch, so what a
+//! pools, the store connects as a head of its engine's epoch, so what an
 //! epoch on trial stores stays its own until its commit, and requests to the
 //! servers never block the scheduler.
 

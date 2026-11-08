@@ -141,20 +141,10 @@ impl ServerArgs {
     }
 }
 
-/// A TOML tree of options as `T`, refusing a key no option takes.
-///
-/// The configuration sections do not refuse unknown fields themselves: the same types travel to
-/// the frontend and the engine processes, which may be of another build than this daemon
-/// (`proto::config`). The file is where a key nothing reads is a mistake, so it is refused here,
-/// by its path.
+/// A TOML tree of options as `T`; a key no option takes is refused by the option types, by its
+/// path.
 fn deserialize_options<T: serde::de::DeserializeOwned>(tree: Table) -> anyhow::Result<T> {
-    let mut unknown = Vec::new();
-    let mut record = |path: serde_ignored::Path<'_>| unknown.push(path.to_string());
-    let parsed: Result<T, _> = serde_path_to_error::deserialize(serde_ignored::Deserializer::new(
-        Value::Table(tree),
-        &mut record,
-    ));
-    let parsed = parsed.map_err(|error| {
+    serde_path_to_error::deserialize(Value::Table(tree)).map_err(|error| {
         let path = error.path().to_string();
         let cause = error.into_inner();
         if path == "." {
@@ -162,26 +152,13 @@ fn deserialize_options<T: serde::de::DeserializeOwned>(tree: Table) -> anyhow::R
         } else {
             anyhow!("invalid option `{path}`: {cause}")
         }
-    })?;
-    if let Some(path) = unknown.first() {
-        return Err(anyhow!("unknown option `{path}`: no option takes it"));
-    }
-    Ok(parsed)
+    })
 }
 
 /// The configuration of a TOML tree of options, with the paths it states.
 fn configured(tree: Table) -> anyhow::Result<(ServerArgs, Stated)> {
     let stated = Stated::of(&tree);
     let mut config: ServerArgs = deserialize_options(tree)?;
-    // A retired option's name is refused here, with the configuration, rather
-    // than left unknown: an unknown field names the mistake but not the way
-    // out, and a table nothing reads would be silent. The field that parses it
-    // is never serialized, so a dump cannot carry it back.
-    anyhow::ensure!(
-        config.retired_quantization_config.is_none(),
-        "`quantization_config` is retired: state the precision policy as `quantization` \
-         (`--set quantization.mode=...`, or `[quantization]` in --config)"
-    );
     // The environment supplies the key the configuration leaves unset or
     // blank.
     config.server_config.api_key =
@@ -493,38 +470,6 @@ mod tests {
             let error = resolved(&args).unwrap_err();
             assert!(format!("{error:#}").contains(named), "{args:?}: {error:#}");
         }
-    }
-
-    /// The precision policy's retired name is refused with the name to state
-    /// instead, whether it arrives as a table, as a path into one, or in the
-    /// configuration file.
-    #[test]
-    fn the_retired_quantization_option_is_refused_by_name() {
-        for args in [
-            vec!["m", "--set", "quantization_config.mode=performance"],
-            vec![
-                "m",
-                "--set",
-                "quantization_config={ mode = \"performance\" }",
-            ],
-        ] {
-            let error = resolved(&args).unwrap_err();
-            let message = format!("{error:#}");
-            assert!(
-                message.contains("`quantization_config` is retired"),
-                "{args:?}: {message}"
-            );
-            assert!(
-                message.contains("`--set quantization.mode=...`"),
-                "{args:?}: {message}"
-            );
-        }
-        let error = resolve_text("[quantization_config]\nmode = \"performance\"\n", &[])
-            .expect_err("the retired name is refused in a configuration file too");
-        assert!(
-            format!("{error:#}").contains("`quantization_config` is retired"),
-            "{error:#}"
-        );
     }
 
     /// The stated paths are what the invocation named, tables and options

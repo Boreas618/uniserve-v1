@@ -14,8 +14,7 @@
 //!   workers, JSON in worker hooks.
 //!
 //! Each connection opens with a hello exchange that compares
-//! [`PROTOCOL_MAJOR`]; a peer never sends a field the other's
-//! [`PROTOCOL_MINOR`] does not know. [`Connection`] carries the messages,
+//! [`PROTOCOL_MAJOR`]. [`Connection`] carries the messages,
 //! one frame each, over a Unix socket on one node or TCP between nodes.
 
 pub mod catalog;
@@ -44,39 +43,9 @@ pub mod handoff {
     include!(concat!(env!("OUT_DIR"), "/uniserve.handoff.rs"));
 }
 
-/// The interfaces' major version: peers of different majors refuse each
-/// other. It changes only when a field is removed or changes meaning, which
-/// takes a planned restart of every daemon.
-///
-/// Major 2 removes the scheduling policy's name and draft-cache refill
-/// parameters from `request::Scheduling` and the FlashInfer provider's table
-/// from `request::EngineSpec`: those values are the programs' arguments
-/// (`specs/worker.md` §5.1, §7.7), and the engine spec no longer carries a
-/// second copy of them.
-///
-/// Major 3 removes the engine spec: what an engine process starts from is in
-/// its launch file (`config::EngineArgs`), and the welcome no longer carries
-/// it, so an engine of an earlier major would find no host identity there.
-pub const PROTOCOL_MAJOR: u32 = 3;
-
-/// The interfaces' minor version: the additions this build knows. Minor 1
-/// adds the leader's answer of the nodes it knows now (`NodesQuery`). Minor 2
-/// adds explicit publication of committed epochs' immutable pages. Minor 3
-/// carries generated artifacts over TCP in bounded parts. Minor 4 adds the
-/// management of a main process's epoch: the commands parking, promotion and
-/// program switch (`Park`, `Promote`, `Precopy`, `Switchover`, `Commit`,
-/// `Revert`, `Purge`), the programs those commands carry, and the main
-/// process's reports (`Precopied`, `PolicyReverted`), and the acknowledgements
-/// and fault reports the main process answers a command with (`Switched`,
-/// `Committed`, `Reverted`, `Purged`, `Stalled`, `Fault`, `PrecopyFailed`,
-/// `NonFiniteLogits`); the frontend's peer registration and the daemon's
-/// commands to it (`Serve`, `Drain`, `Pause`, `Drained`); and the main
-/// process's `/metrics` counters (`FromEngine::Metrics`). Minor 5 states the
-/// program generation a promotion serves (`Promoted.program_generation`), so
-/// the daemon can compare it with the epoch's own before it moves the
-/// frontend; unstated is a process that holds none, which is minor 4's
-/// behaviour.
-pub const PROTOCOL_MINOR: u32 = 6;
+/// The interfaces' version: peers of different versions refuse each other.
+/// It changes whenever a message changes.
+pub const PROTOCOL_MAJOR: u32 = 4;
 
 /// The build this crate is compiled in: the package version, then `+` and a
 /// digest of the workspace sources every artifact of the build is compiled

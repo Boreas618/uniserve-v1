@@ -201,7 +201,6 @@ impl EngineControl {
         };
         writer.send(&wire::Welcome {
             major: proto::PROTOCOL_MAJOR,
-            minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
         })?;
@@ -307,7 +306,6 @@ impl EngineControl {
         };
         writer.send(&wire::Welcome {
             major: proto::PROTOCOL_MAJOR,
-            minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
         })?;
@@ -379,7 +377,6 @@ impl EngineControl {
         };
         writer.send(&wire::Welcome {
             major: proto::PROTOCOL_MAJOR,
-            minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
             refusal: refusal.clone(),
         })?;
@@ -420,7 +417,6 @@ impl EngineControl {
             .with_context(|| format!("connecting to the daemon at {}", self.processes))?;
         control.send(&process::Hello {
             major: proto::PROTOCOL_MAJOR,
-            minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
             peer: Some(hello::Peer::Engine(process::Engine {
                 deployment: self.deployment.clone(),

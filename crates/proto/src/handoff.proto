@@ -194,12 +194,6 @@ message Parser {
     PARSER_KIND_NONE = 0;
     // Qwen3's `<think>` reasoning and Qwen2.5's JSON tool calls.
     PARSER_KIND_QWEN3 = 1;
-    // Removed with the families that used them. The numbers and the names stay
-    // reserved so no later parser can claim either: a peer on an older build
-    // still sends 2 and 3, and a number reused for a different kind would be
-    // read as a kind it never was.
-    reserved 2, 3;
-    reserved "PARSER_KIND_GEMMA4", "PARSER_KIND_SENSE_NOVA";
   }
 
   Kind kind = 1;
@@ -306,12 +300,6 @@ message ToolStage {
   oneof parser {
     JsonToolCall json = 3;
   }
-  // The removed Gemma4 parser's state field. Reserved rather than renumbered,
-  // for the same reason as `Kind`'s numbers - and the name with it, because a
-  // text-format or JSON record keys on the name where a binary one keys on the
-  // number, as `request.proto` reserves each removed field's pair.
-  reserved 4;
-  reserved "gemma4";
 }
 
 // The marker-wrapped JSON tool-call parser's state.
@@ -354,12 +342,6 @@ message JsonObjectScan {
   }
   Phase phase = 5;
 }
-
-// `Gemma4ToolCall` is removed with the family it parsed. Its fields 1-5 and its
-// nested `Phase` went with it; the message name cannot be reserved, because
-// proto3 reserves names only for fields and enum values, inside their owner -
-// so the name is protected by nothing more than the compiler refusing a second
-// definition of it.
 
 // The assistant blocks a chat response assembled.
 message Assembly {

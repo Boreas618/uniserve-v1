@@ -153,11 +153,6 @@ pub struct ServerArgs {
     /// selections under `components`; empty selects the model's default.
     #[arg(skip)]
     pub quantization: serde_json::Map<String, Value>,
-    /// The retired name of `quantization`. A configuration that states it is
-    /// refused with the name to state instead, and it is never written back.
-    #[serde(rename = "quantization_config", skip_serializing)]
-    #[arg(skip)]
-    pub retired_quantization_config: Option<Value>,
     /// Options of the model's multimodal processor; the processor refuses
     /// one it does not take.
     #[arg(skip)]
@@ -326,7 +321,6 @@ impl Default for ServerArgs {
             max_model_len: None,
             dtype: ModelDtype::BFloat16,
             quantization: serde_json::Map::new(),
-            retired_quantization_config: None,
             mm_processor_kwargs: serde_json::Map::new(),
             attention_backend: "auto".to_owned(),
             prefill_attention_backend: None,
