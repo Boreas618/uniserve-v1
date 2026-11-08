@@ -176,10 +176,7 @@ pub(crate) fn groups(
     limits: &crate::GenerationLimits,
     mut next_id: impl FnMut() -> ipc::RequestId,
 ) -> anyhow::Result<Vec<Group>> {
-    let facts =
-        args.engine_config.model.facts.as_ref().context(
-            "the engine configuration states no model facts to warm the serving path with",
-        )?;
+    let facts = &args.engine_config.model;
     let supports = |kind| info.supported_calls.contains(&kind);
     // Keeps the requests clients could submit, naming what it leaves out.
     let servable = |what: &str, requests: Vec<GenerationRequest>| {
@@ -467,13 +464,9 @@ mod tests {
         groups
     }
 
-    /// The model facts `args` states, which a test adjusts.
-    fn facts(args: &mut EngineArgs) -> &mut proto::config::ModelFacts {
-        args.engine_config
-            .model
-            .facts
-            .as_mut()
-            .expect("the simulated arguments state the model's facts")
+    /// The model configuration `args` states, which a test adjusts.
+    fn facts(args: &mut EngineArgs) -> &mut proto::config::ModelConfig {
+        &mut args.engine_config.model
     }
 
     fn shape(height: u32, width: u32, branches: u8, negative_token_ids: Vec<u32>) -> ImageWarmup {
@@ -590,7 +583,7 @@ mod tests {
             ]),
             // At most two guidance branches: no client can submit the
             // three-branch shape either.
-            |args| facts(args).limits.max_cfg_branches = 2,
+            |args| facts(args).generation_limits.max_cfg_branches = 2,
         );
         let images: Vec<&str> = groups
             .iter()
@@ -628,9 +621,9 @@ mod tests {
 
         let groups = groups_of(sim, |args| {
             let facts = facts(args);
-            facts.limits = GenerationLimits {
+            facts.generation_limits = GenerationLimits {
                 features: GenerationFeatures::UNDERSTANDING | GenerationFeatures::TOKEN_DENOISING,
-                ..facts.limits.clone()
+                ..facts.generation_limits.clone()
             };
             facts.canvas_sampling = Some(canvas);
         });

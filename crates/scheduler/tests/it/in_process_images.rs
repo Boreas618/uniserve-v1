@@ -52,13 +52,8 @@ fn logged_engine(
         .map(|name| (name.to_owned(), BlockConfig::parallel(vec![0])))
         .collect();
     let mut args = scheduler::sim_args("stub");
-    let facts = args
-        .engine_config
-        .model
-        .facts
-        .as_mut()
-        .expect("the simulated arguments state the model's facts");
-    facts.limits = GenerationLimits {
+    let facts = &mut args.engine_config.model;
+    facts.generation_limits = GenerationLimits {
         features: GenerationFeatures::UNDERSTANDING
             | GenerationFeatures::VISION_ENCODE
             | GenerationFeatures::LATENT_ENCODE
