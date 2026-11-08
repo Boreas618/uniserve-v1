@@ -652,7 +652,11 @@ pub(crate) fn run(
                 "the main process ends: the epoch failed"
             )
         }
-        Err(error) => tracing::warn!(%error, "the main process ends: the control thread failed"),
+        // The whole chain: the outer context names the stage, and only the causes say what failed.
+        Err(error) => tracing::warn!(
+            error = %format!("{error:#}"),
+            "the main process ends: the control thread failed"
+        ),
     }
     if let Some(failure) = ending? {
         bail!("the main process ended: {}", failure.reason());
