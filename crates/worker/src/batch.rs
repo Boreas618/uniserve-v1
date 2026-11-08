@@ -865,6 +865,22 @@ pub trait Batches: Send + Sync {
         Ok(None)
     }
 
+    /// The devices `batch` runs on, each by its place among [`Batches::device_count`] devices.
+    ///
+    /// A device runs the batches it is handed from a queue of its own, and the launch's
+    /// `queue_depth` bounds that queue, as the capacity plan reserves each device's in-flight calls
+    /// by it. A mechanism that counted every batch of a rank against one bound would hold one
+    /// device's clip behind another device's, so it counts the devices a batch takes. A worker of
+    /// one device runs every batch there.
+    fn devices(&self, _batch: &Batch) -> Result<Vec<usize>> {
+        Ok(vec![0])
+    }
+
+    /// How many devices run this worker's batches, one queue each.
+    fn device_count(&self) -> usize {
+        1
+    }
+
     /// The pools this worker serves (4.2, 7.3): what the mechanism schedules against.
     ///
     /// The mechanism builds its `WorkerInfo` from this and nothing else, so a pool whose ranks,
@@ -1129,6 +1145,31 @@ impl Batches for Workers {
         computation: &crate::plan::Computation,
     ) -> Result<Option<crate::plan::Bucket>> {
         Ok(self.route(phase)?.media(computation))
+    }
+
+    fn devices(&self, batch: &Batch) -> Result<Vec<usize>> {
+        // The same two routes `submit` takes: a unit-measured call's one device, or every device
+        // that serves the phase, refused by name when none does.
+        if let Some(worker) = self.device_of_unit(batch)? {
+            return Ok(self
+                .workers
+                .iter()
+                .position(|held| Arc::ptr_eq(held, worker))
+                .into_iter()
+                .collect());
+        }
+        self.route(batch.phase)?;
+        Ok(self
+            .workers
+            .iter()
+            .enumerate()
+            .filter(|(_, worker)| worker.serves(batch.phase))
+            .map(|(index, _)| index)
+            .collect())
+    }
+
+    fn device_count(&self) -> usize {
+        self.workers.len()
     }
 
     fn submit(&self, batch: Batch) -> Result<Submission> {
