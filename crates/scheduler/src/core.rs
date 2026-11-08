@@ -323,29 +323,37 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Refuses a worker that does not serve the launch's pool: the process's
-    /// own group (`EngineArgs::group`), on its world's ranks.
+    /// Refuses a worker whose pools are not worker groups of the deployment, as the engine
+    /// configuration states them.
     ///
-    /// A scheduler started for a pool the worker does not serve, or for a
-    /// rank count it does not serve, would place calls on ranks it does not
-    /// have; the launch and the worker are two statements of one process,
-    /// so they are compared before anything runs.
+    /// A scheduler places calls on a group's ranks and blocks, which it reads from the
+    /// configuration; a worker that serves another group, or the same group over other ranks,
+    /// would be handed calls for ranks it does not have, so the two are compared before anything
+    /// runs.
     fn check_pool(args: &EngineArgs, info: &crate::worker::WorkerInfo) -> anyhow::Result<()> {
-        let group = WorkerGroupId(args.group.clone());
-        anyhow::ensure!(
-            info.workers.iter().any(|(served, _)| *served == group),
-            "the launch names the pool {}, which the worker does not serve",
-            group.0
-        );
-        // `from_inventory` states every pool's rank count; a worker
-        // that reports none places the pool on one rank.
-        let served = info.layouts.get(&group).map_or(1, |layout| layout.ranks);
-        anyhow::ensure!(
-            u32::try_from(served).is_ok_and(|served| served == args.world_size),
-            "the launch places {} ranks of pool {}, but the worker serves {served}",
-            args.world_size,
-            group.0
-        );
+        anyhow::ensure!(!info.workers.is_empty(), "the worker serves no pool");
+        for (served, _) in &info.workers {
+            let stated = args
+                .engine_config
+                .parallel
+                .worker_groups
+                .iter()
+                .find(|group| group.id == *served)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "the worker serves pool {}, which is no worker group of the deployment",
+                        served.0
+                    )
+                })?;
+            let placed = info.layouts.get(served).map(|group| &group.ranks);
+            anyhow::ensure!(
+                placed == Some(&stated.ranks),
+                "the worker serves pool {} over ranks {placed:?}, and the deployment places it \
+                 over {:?}",
+                served.0,
+                stated.ranks
+            );
+        }
         Ok(())
     }
 

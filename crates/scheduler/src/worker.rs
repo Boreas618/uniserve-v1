@@ -38,22 +38,6 @@ pub(crate) mod inventory;
 
 pub use batch::{ExecutionBatch, PageOffloads, RankBuffer, RequestDispatch};
 
-/// How one pool is placed.
-///
-/// The deployment decides these values, so the ranks' reports do not carry
-/// them.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct PoolLayout {
-    /// Unresolved physical batches the pool admits at once, counted as at
-    /// least one.
-    pub queue_depth: usize,
-    /// Ranks the pool holds, counted as at least one.
-    pub ranks: usize,
-    /// The pool's components by name, each with its member ranks, parallel
-    /// degrees and distribution.
-    pub components: BTreeMap<String, BlockConfig>,
-}
-
 /// Concrete pool information reported through the execution boundary.
 #[derive(Debug, Clone, Default)]
 pub struct WorkerInfo {
@@ -68,7 +52,7 @@ pub struct WorkerInfo {
     ///
     /// `from_inventory` and `SimWorker` fill this; `from_workers` leaves it
     /// empty.
-    pub layouts: BTreeMap<WorkerGroupId, PoolLayout>,
+    pub layouts: BTreeMap<WorkerGroupId, proto::config::WorkerGroupConfig>,
     /// For each worker that decodes video, the encoder replicas whose rank
     /// dealing keeps every media unit on the host that decoded it. A decoder
     /// absent from the map places no host constraint on its encoder.
@@ -85,7 +69,7 @@ pub struct WorkerInfo {
     ///
     /// `from_inventory` fills this from its ranks; a pool absent from it, as
     /// `from_workers` and `SimWorker` leave every pool, has its placed ranks
-    /// (`PoolLayout::ranks`, one when it has no layout), each backing
+    /// (its group's ranks, one when it has no group), each backing
     /// its reported `buffer_pool_bytes`.
     pub rank_buffer_bytes: BTreeMap<WorkerGroupId, Vec<u64>>,
     /// For each pool, each rank's prefix cache as the rank reported it, with
@@ -154,7 +138,7 @@ impl WorkerInfo {
     /// Returns the configuration the engine placed component `name` with on
     /// `worker`, or `None` when the pool holds no such component.
     pub fn component_config(&self, worker: &WorkerGroupId, name: &str) -> Option<&BlockConfig> {
-        self.layouts.get(worker)?.components.get(name)
+        self.layouts.get(worker)?.blocks.get(name)
     }
 
     /// The persistent buffer bytes each rank of `worker` backs, in rank
@@ -166,7 +150,7 @@ impl WorkerInfo {
         let ranks = self
             .layouts
             .get(worker)
-            .map_or(1, |layout| layout.ranks.max(1));
+            .map_or(1, |layout| layout.ranks.len().max(1));
         self.workers
             .iter()
             .find(|(id, _)| id == worker)
@@ -1213,13 +1197,18 @@ mod tests {
         // A pool placing each named component as configured.
         let pool = |id: &str, routes: &[(MediaCall, &str)], configs: Vec<(&str, BlockConfig)>| {
             let (id, info) = media_pool(id, routes, 0);
-            let layout = PoolLayout {
-                queue_depth: 1,
-                ranks: 8,
-                components: configs
-                    .into_iter()
-                    .map(|(name, config)| (name.to_owned(), config))
-                    .collect(),
+            let layout = proto::config::WorkerGroupConfig {
+                id: id.clone(),
+                ..proto::config::WorkerGroupConfig::placed(
+                    &["localhost".to_owned()],
+                    "cpu",
+                    8,
+                    1,
+                    configs
+                        .into_iter()
+                        .map(|(name, config)| (name.to_owned(), config))
+                        .collect(),
+                )
             };
             ((id.clone(), info), (id, layout))
         };
@@ -1232,7 +1221,7 @@ mod tests {
         };
         let round_units = |pools: Vec<(
             (WorkerGroupId, MainProcessInfo),
-            (WorkerGroupId, PoolLayout),
+            (WorkerGroupId, proto::config::WorkerGroupConfig),
         )>| {
             let (workers, layouts) = pools.into_iter().unzip();
             WorkerInfo {

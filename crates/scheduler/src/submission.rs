@@ -615,7 +615,7 @@ impl InProcess {
             .info
             .layouts
             .get(worker)
-            .map_or(1, |layout| layout.queue_depth.max(1));
+            .map_or(1, |group| group.queue_depth.max(1));
         self.occupied.get(worker).copied().unwrap_or(0) < depth
     }
 
@@ -1023,7 +1023,7 @@ mod tests {
 
     use super::*;
     use ::worker::batch::SubmissionId;
-    use ::worker::batch::{BatchOutput, Inventory, MediaColumns, PoolLayout, StagedRequest};
+    use ::worker::batch::{BatchOutput, Inventory, MediaColumns, StagedRequest};
     use ::worker::plan::{Bucket, Computation, Extent, Variant};
     use ipc::{Call, CallKind, MediaCall};
 
@@ -1047,12 +1047,17 @@ mod tests {
         fn one(bucket: Option<Bucket>) -> (Arc<Self>, Arc<Mutex<Vec<Delivered>>>) {
             let delivered = Arc::new(Mutex::new(Vec::new()));
             let inventory = Inventory {
-                group: "gpu".to_owned(),
-                ranks: vec![ipc::MainProcessInfo::default()],
-                layout: PoolLayout {
-                    queue_depth: 2,
-                    ..PoolLayout::default()
+                group: proto::config::WorkerGroupConfig {
+                    id: proto::config::WorkerGroupId("gpu".to_owned()),
+                    ..proto::config::WorkerGroupConfig::placed(
+                        &["localhost".to_owned()],
+                        "cpu",
+                        1,
+                        2,
+                        BTreeMap::new(),
+                    )
                 },
+                ranks: vec![ipc::MainProcessInfo::default()],
                 max_model_len: 4096,
             };
             (
