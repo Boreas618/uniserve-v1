@@ -301,22 +301,24 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
             if output.import != import || (!import && !self.writes_outputs) {
                 continue;
             }
-            if output.pool != pool.pool() || output.row_bytes != row_bytes {
+            if output.pool != pool.pool() || output.row_bytes == 0 {
                 return Err(Error::Invalid(format!(
-                    "a host output of pool {} with rows of {} bytes reached a runner of pool {} \
-                     whose rows are {row_bytes} bytes",
+                    "a host output of pool {} with rows of {} bytes reached a runner of pool {}",
                     output.pool,
                     output.row_bytes,
                     pool.pool()
                 )));
             }
+            // The stored output's rows are the engine's unit, which need not be this encoder's:
+            // the request's rows of the hidden column are as many of the stored output's bytes as
+            // they fill, from its first stored row on.
             let stored = u64::from(output.rows[1] - output.rows[0]);
-            let count = u64::from(*rows).min(stored);
+            let units = (u64::from(*rows) * row_bytes / output.row_bytes).min(stored);
             let base = self.columns.hidden.device.ptr.address() + u64::from(*first) * row_bytes;
             for copy in crate::memory::encoders::page_copies(
                 output.rows[0],
-                0..count,
-                row_bytes,
+                0..units,
+                output.row_bytes,
                 pool.page_bytes(),
             ) {
                 // An export leaves a page the pool holds already as it is.
