@@ -108,8 +108,13 @@ impl Scheduler {
             // The in-process arm has nothing to tell: the rows and buffers a
             // lifecycle command closes are this scheduler's own
             // pools, so the command is answered here, where it would have been
-            // submitted. Its `Finish` and `Free` have nothing left to reach.
-            if batch.requests.is_empty() && self.worker.serves_in_process() {
+            // submitted. Its `Finish` and `Free` have nothing left to reach. A batch that carries
+            // page offloads, of the host KV cache or of a preempted trajectory, is work for the
+            // worker and goes to it.
+            if batch.requests.is_empty()
+                && batch.page_offloads.is_none()
+                && self.worker.serves_in_process()
+            {
                 self.acknowledge_commands(&batch.commands);
                 // Nothing went to a worker, so no result will ever end this batch: it leaves
                 // the in-flight window here, or every boundary that waits for an empty window (a
