@@ -1,0 +1,49 @@
+[package]
+name = "scheduler"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+crossbeam-channel.workspace = true
+worker.workspace = true
+fnv.workspace = true
+ipc.workspace = true
+nn.workspace = true
+proto.workspace = true
+scheduling.workspace = true
+program-server.workspace = true
+png = { workspace = true, optional = true }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+storage.workspace = true
+tempfile = { workspace = true, optional = true }
+thiserror.workspace = true
+# A test-only policy module is written as WebAssembly text, so the `testing`
+# feature states it as text instead of shipping a compiled policy package.
+wat = { version = "1", optional = true }
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[features]
+# Exposes the GPU-free simulated worker to control-plane tests and examples.
+# It is never part of a serving build.
+testing = ["dep:png", "dep:tempfile", "dep:wat"]
+
+[dev-dependencies]
+storage-server.workspace = true
+base64.workspace = true
+scheduler = { path = ".", features = ["testing"] }
+libc.workspace = true
+# Tests state video requests as the frontend plans them.
+models.workspace = true
+png.workspace = true
+
+[lints]
+workspace = true

@@ -17,8 +17,8 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::{HeaderMap, StatusCode};
-use engine::{SchedulerHandle, SimEngine, SimWorker};
 use models::video::plan::{MAX_VIDEO_SECONDS, ProcessorConfig, canvas};
+use scheduler::{SchedulerHandle, SimEngine, SimWorker};
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt as _;
 
@@ -72,7 +72,7 @@ pub(crate) fn router_with(engine: Leader, server: &ServerConfig) -> Router {
 /// API's longest duration capacity, as a default video deployment does.
 pub(crate) fn sim_engine(parameters: ModelParameters) -> Leader {
     let model = sim_model(parameters);
-    let core = sim_core(engine::sim_args(SERVED_MODEL), SimEngine::new());
+    let core = sim_core(scheduler::sim_args(SERVED_MODEL), SimEngine::new());
     engine_over(model, configured_tokenizer(), vec![core])
 }
 
@@ -82,7 +82,7 @@ pub(crate) fn sim_engine(parameters: ModelParameters) -> Leader {
 pub(crate) fn sim_core(args: proto::config::EngineArgs, worker: SimEngine) -> SchedulerHandle {
     let core = SchedulerHandle::with_worker(
         &args,
-        engine::SchedulerConfig::default(),
+        scheduler::SchedulerConfig::default(),
         Box::new(SimWorker::new(worker)),
     )
     .expect("start a sim scheduler");
@@ -101,13 +101,13 @@ pub(crate) fn sim_core(args: proto::config::EngineArgs, worker: SimEngine) -> Sc
 /// the ceilings the mechanism checks them against, so the precopy is answered
 /// with success rather than a refusal that would hide behind a fixture.
 ///
-/// Requires `SCHED_POLICY_WASM`; see [`engine::packaged_policy`], whose panic
+/// Requires `SCHED_POLICY_WASM`; see [`scheduler::packaged_policy`], whose panic
 /// states the command that builds the module.
 pub(crate) fn policy_on(core: &SchedulerHandle) {
-    let capacity = engine::BatchCapacity::of(core.info());
+    let capacity = scheduler::BatchCapacity::of(core.info());
     let (program, module) = packaged_policy(capacity);
-    let source: std::sync::Arc<dyn engine::PolicySource + Send + Sync> =
-        std::sync::Arc::new(engine::PolicyBytes::new(module));
+    let source: std::sync::Arc<dyn scheduler::PolicySource + Send + Sync> =
+        std::sync::Arc::new(scheduler::PolicyBytes::new(module));
     core.precopy_policy(program, source)
         .recv_timeout(POLICY_ANSWER)
         .expect("the policy precopy is answered within the bound")
@@ -139,15 +139,17 @@ pub(crate) const POLICY_ANSWER: std::time::Duration = std::time::Duration::from_
 /// fixture looks like a deadlock in the daemon.
 pub(crate) const POLICY_BUILD: std::time::Duration = std::time::Duration::from_secs(600);
 
-/// [`engine::packaged_policy`] under a bound, so a stalled build names itself.
+/// [`scheduler::packaged_policy`] under a bound, so a stalled build names itself.
 ///
 /// The build is blocking and its thread cannot be cancelled; the thread is left
 /// to finish rather than joined, which is what a test fixture can do and a
 /// service cannot.
-pub(crate) fn packaged_policy(capacity: engine::BatchCapacity) -> (engine::PolicyProgram, Vec<u8>) {
+pub(crate) fn packaged_policy(
+    capacity: scheduler::BatchCapacity,
+) -> (scheduler::PolicyProgram, Vec<u8>) {
     let (answered, answer) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = answered.send(engine::packaged_policy(capacity));
+        let _ = answered.send(scheduler::packaged_policy(capacity));
     });
     answer.recv_timeout(POLICY_BUILD).unwrap_or_else(|_| {
         panic!(
@@ -196,17 +198,17 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
     // the engine installs it here for the route. Without one the engine has no
     // policy to route a request with and refuses every submission.
     let policy = {
-        let (program, module) = packaged_policy(engine::BatchCapacity::of(first.info()));
-        engine::EpochPolicy {
+        let (program, module) = packaged_policy(scheduler::BatchCapacity::of(first.info()));
+        scheduler::EpochPolicy {
             program,
-            module: std::sync::Arc::new(engine::PolicyBytes::new(module)),
+            module: std::sync::Arc::new(scheduler::PolicyBytes::new(module)),
         }
     };
     let (daemon, engine) = UnixStream::pair().expect("a socket pair");
     std::thread::Builder::new()
         .name("sim-engine".into())
         .spawn(move || {
-            if let Err(error) = engine::serve_requests(engine, cores, Some(policy)) {
+            if let Err(error) = scheduler::serve_requests(engine, cores, Some(policy)) {
                 // A simulated engine that ends is the whole of a test's failure and
                 // otherwise leaves no line: the client reports only that its process
                 // ended, and the reason - a frame the engine refused, a scheduler that

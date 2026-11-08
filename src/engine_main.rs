@@ -7,7 +7,7 @@
 //!
 //! - the [`Control`] thread, which serves the daemon's request interface and the
 //!   epoch's peer main processes and never waits for a job (§2.3, §2.4);
-//! - one `engine::Scheduler` per DP rank, on the node that holds them;
+//! - one `scheduler::Scheduler` per DP rank, on the node that holds them;
 //! - one `worker::device::Worker` per device, the only thread that issues to
 //!   that device's streams;
 //! - the node's resident memory ([`Memory`]);
@@ -26,7 +26,7 @@
 //! Each of these is one named publisher, and the code is written against the
 //! name so the merge is a compile rather than a rewrite:
 //!
-//! - **sched** (`crates/engine`): `SchedulerHandle::{start(config,
+//! - **sched** (`crates/scheduler`): `SchedulerHandle::{start(config,
 //!   Arc<dyn Batches>), submit, shadow, stage, command, engine_command,
 //!   counters, stop}` (M505, M714). `stage(Stage, generation)` applies §7.3
 //!   steps 3-6 at a batch boundary and answers the step it applied at, because
@@ -94,7 +94,6 @@ use std::time::{Duration, Instant};
 use anyhow::{Context as _, Result, bail};
 
 use crate::model_runner::{ModelRunner, PrefillCatalogue};
-use engine::{PolicyProgram, PolicySource, ProgramSource};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
@@ -102,6 +101,7 @@ use program_server::{
     Client, Descriptors, PhaseKind, PrepareRequest, Program, ProgramRequest, ProgramSlot, Selector,
     Target,
 };
+use scheduler::{PolicyProgram, PolicySource, ProgramSource};
 use worker::batch::Submission;
 use worker::blocking::{BlockingKind, ThreadPool};
 use worker::completion::Outcome;
@@ -699,7 +699,7 @@ struct Served {
     /// The scheduler rank a command for the request is routed to.
     rank: usize,
     /// What the request produced.
-    events: engine::EventRx,
+    events: scheduler::EventRx,
     /// The daemon front it belongs to: 0 is the daemon that launched this
     /// process, and each attached daemon adds one.
     front: usize,
@@ -734,7 +734,7 @@ pub(crate) struct MainProcess {
     /// This node's schedulers, one per DP rank. The handle is the interface: each scheduler's thread
     /// owns the instance, so every call the control thread makes goes through the handle and the
     /// command channel carries the mutation (§2.4).
-    schedulers: Vec<engine::SchedulerHandle>,
+    schedulers: Vec<scheduler::SchedulerHandle>,
     /// The expert union of this node's ranks, ended before their device threads are.
     union: Option<Arc<worker::runners::experts::Union>>,
     /// One statistics reporter per scheduler, in the schedulers' order.
@@ -743,7 +743,7 @@ pub(crate) struct MainProcess {
     /// reported, so each increment appears in exactly one snapshot: the same
     /// reporter must see every pass (§2.3's `/metrics`, `uniserve:num_requests_running`
     /// and its kind).
-    stats_reporters: Vec<engine::SchedulerStatsReporter>,
+    stats_reporters: Vec<scheduler::SchedulerStatsReporter>,
     /// CUPTI's always-on counters, for as long as the process serves.
     _counters: Option<worker::profiling::counters::Counters>,
     /// The control thread's driver calls that waited for the device, as of its last report.
@@ -815,7 +815,7 @@ pub(crate) struct MainProcess {
     warming_since: Option<Instant>,
     /// When the next check for a serving policy is due, and since when none serves (§7.3 step 3).
     ///
-    /// `crates/engine`'s first switchover with no prepared candidate adopts no policy, calls
+    /// `crates/scheduler`'s first switchover with no prepared candidate adopts no policy, calls
     /// `note_policy_serves` never, raises nothing and answers `Ok(None)`; a scheduler with no policy
     /// forms no batch, so the epoch would sit with nothing running while the daemon believes the
     /// cut-over succeeded. The check asks each scheduler's policy slot, which answers within its own
@@ -895,7 +895,7 @@ pub(crate) struct MainProcess {
     /// What each scheduler parked with, in `schedulers` order: kept from the drain to the resume,
     /// which adopts it, so a resumed epoch reuses the pages it still holds instead of reading them
     /// again.
-    parked: Option<Vec<engine::ParkedCache>>,
+    parked: Option<Vec<scheduler::ParkedCache>>,
     /// A drain in progress: its schedulers park on the passes that follow (`advance_drain`).
     draining: Option<Draining>,
     /// The frontend's admission gate, the `/admin/pause_generation` of §2.3: submissions are
@@ -1241,7 +1241,7 @@ impl MainProcess {
             !epoch.profiling.graph_pc_sampling,
         );
         let stats_reporters = (0..schedulers.len())
-            .map(|_| engine::SchedulerStatsReporter::default())
+            .map(|_| scheduler::SchedulerStatsReporter::default())
             .collect();
         let mut process = Self {
             control: control
@@ -1795,7 +1795,7 @@ impl MainProcess {
                         }
                         Err(error) => {
                             let kind = match error {
-                                engine::SubmitError::Closed | engine::SubmitError::Dead => {
+                                scheduler::SubmitError::Closed | scheduler::SubmitError::Dead => {
                                     proto::request::RejectionKind::Overloaded
                                 }
                             };
@@ -4313,7 +4313,7 @@ impl MainProcess {
                     .into_iter()
                     .map(|(module, order)| (module, order.experts))
                     .collect();
-                let together = engine::HookBarrier::new(self.schedulers.len());
+                let together = scheduler::HookBarrier::new(self.schedulers.len());
                 let answers = self
                     .schedulers
                     .iter()
@@ -4461,7 +4461,7 @@ impl MainProcess {
         if !matches!(operation, Operation::Prefill { .. } | Operation::Warmed) {
             return hooked(Vec::new(), PAGES_THROUGH_HOST.to_owned());
         }
-        let together = engine::HookBarrier::new(self.schedulers.len());
+        let together = scheduler::HookBarrier::new(self.schedulers.len());
         let answers: Vec<_> = self
             .schedulers
             .iter()
@@ -4744,10 +4744,10 @@ impl MainProcess {
                     Ok(event) => {
                         let terminal = matches!(
                             event,
-                            engine::Event::Finished { .. }
-                                | engine::Event::Rejected { .. }
-                                | engine::Event::Error { .. }
-                                | engine::Event::Migratable { .. }
+                            scheduler::Event::Finished { .. }
+                                | scheduler::Event::Rejected { .. }
+                                | scheduler::Event::Error { .. }
+                                | scheduler::Event::Migratable { .. }
                         );
                         let (wire, media) = event.to_wire(proto::request::RequestId(id));
                         // The position this event is written at, and the copy a takeover from an
@@ -4996,7 +4996,7 @@ struct WeightUpdate {
     id: u64,
     front: usize,
     path: String,
-    in_flight: engine::WeightsInFlight,
+    in_flight: scheduler::WeightsInFlight,
     stage: WeightStage,
     /// Whether this update put the schedulers to sleep, so it wakes them.
     slept: bool,
@@ -5228,7 +5228,7 @@ impl MainProcess {
             self.refuse(front, resize.id, LEDGERS.to_owned());
             return;
         }
-        let change = match engine::CacheChange::from_wire(resize) {
+        let change = match scheduler::CacheChange::from_wire(resize) {
             Ok(change) => change,
             Err(error) => {
                 self.refuse(front, resize.id, error);
@@ -5237,8 +5237,8 @@ impl MainProcess {
         };
         tracing::info!(?change, "changing the KV cache storage");
         let then = match change {
-            engine::CacheChange::Sleep => Owing::Sleep(true),
-            engine::CacheChange::Wake => Owing::Sleep(false),
+            scheduler::CacheChange::Sleep => Owing::Sleep(true),
+            scheduler::CacheChange::Wake => Owing::Sleep(false),
             _ => Owing::Storage,
         };
         let answers = self
@@ -5252,11 +5252,11 @@ impl MainProcess {
     /// Starts an in-place weight update (§7.6, `docs/admin.md`).
     fn start_weight_update(&mut self, front: usize, update: proto::request::wire::UpdateWeights) {
         let in_flight = match proto::request::wire::WeightsInFlight::try_from(update.in_flight) {
-            Ok(proto::request::wire::WeightsInFlight::Keep) => engine::WeightsInFlight::Keep,
+            Ok(proto::request::wire::WeightsInFlight::Keep) => scheduler::WeightsInFlight::Keep,
             Ok(proto::request::wire::WeightsInFlight::Recompute) => {
-                engine::WeightsInFlight::Recompute
+                scheduler::WeightsInFlight::Recompute
             }
-            Ok(proto::request::wire::WeightsInFlight::Abort) => engine::WeightsInFlight::Abort,
+            Ok(proto::request::wire::WeightsInFlight::Abort) => scheduler::WeightsInFlight::Abort,
             Err(_) => {
                 self.refuse(
                     front,
@@ -5423,15 +5423,15 @@ impl MainProcess {
             return Ok(Vec::new());
         }
         let change = match update.in_flight {
-            engine::WeightsInFlight::Recompute => {
+            scheduler::WeightsInFlight::Recompute => {
                 update.slept = true;
-                engine::CacheChange::Sleep
+                scheduler::CacheChange::Sleep
             }
-            engine::WeightsInFlight::Abort => {
+            scheduler::WeightsInFlight::Abort => {
                 update.slept = true;
-                engine::CacheChange::SleepAborting
+                scheduler::CacheChange::SleepAborting
             }
-            engine::WeightsInFlight::Keep => {
+            scheduler::WeightsInFlight::Keep => {
                 let bytes = planned.bytes();
                 let rooms = self.data.room().map_err(|error| error.to_string())?;
                 let graphs = self.data.graph_bytes();
@@ -5453,7 +5453,7 @@ impl MainProcess {
                     ));
                 }
                 update.suspended = true;
-                engine::CacheChange::Hold { held: true }
+                scheduler::CacheChange::Hold { held: true }
             }
         };
         Ok(self
@@ -5509,9 +5509,9 @@ impl MainProcess {
     /// Lets the schedulers run again, when this update stilled them.
     fn release_schedulers(&mut self, mut update: WeightUpdate) {
         let change = if update.slept {
-            engine::CacheChange::Wake
+            scheduler::CacheChange::Wake
         } else if update.suspended {
-            engine::CacheChange::Hold { held: false }
+            scheduler::CacheChange::Hold { held: false }
         } else {
             return self.finish_weights(update);
         };
@@ -5869,9 +5869,9 @@ struct Draining {
     /// The epoch `Drained` names.
     epoch: u64,
     /// The schedulers still to answer, in order.
-    answers: Vec<crossbeam_channel::Receiver<std::result::Result<engine::ParkedCache, String>>>,
+    answers: Vec<crossbeam_channel::Receiver<std::result::Result<scheduler::ParkedCache, String>>>,
     /// What the ones that answered parked with, in the schedulers' order.
-    parked: Vec<engine::ParkedCache>,
+    parked: Vec<scheduler::ParkedCache>,
     /// When the drain began, which the stall bound is measured from.
     since: Instant,
 }
@@ -8065,7 +8065,7 @@ fn schedulers(
     memory: &Memory,
     control: ipc::Wake,
     data: &Arc<worker::data_plane::DataPlane>,
-) -> Result<Vec<engine::SchedulerHandle>> {
+) -> Result<Vec<scheduler::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
     }
@@ -8106,7 +8106,7 @@ fn schedulers(
                 .components
                 .iter()
                 .flat_map(|component| {
-                    engine::WorkerGroupConfig::single_component(
+                    scheduler::WorkerGroupConfig::single_component(
                         &component.name,
                         model_runner.world_size(),
                     )
@@ -8127,8 +8127,9 @@ fn schedulers(
     let batches: Arc<dyn worker::batch::Batches> = Arc::new(stated);
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.
-    let progress = engine::CommandWaker::new(move || control.wake());
-    let handle = engine::SchedulerHandle::over_batches_telling(&args, limits, batches, progress)?;
+    let progress = scheduler::CommandWaker::new(move || control.wake());
+    let handle =
+        scheduler::SchedulerHandle::over_batches_telling(&args, limits, batches, progress)?;
     Ok(vec![handle])
 }
 

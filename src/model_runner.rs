@@ -287,13 +287,13 @@ pub(crate) struct RankGroups {
 ///
 /// - **The token bound is a contract a policy is checked against.** `ceilings_of` gives the
 ///   scheduler's policy `max_num_batched_tokens` from the catalogue's captured token bound
-///   (`crates/engine/src/scheduler/policy.rs`), and a policy that declares more is refused by the
+///   (`crates/scheduler/src/scheduler/policy.rs`), and a policy that declares more is refused by the
 ///   mechanism. A token tier capture drops therefore changes what a deployment's policy may
 ///   declare, and the deployment would find that out at its precopy - after weights, from a
 ///   sentence about two numbers its own file does not contain. It is refused here instead.
 /// - **The row bound only sizes a batch.** A decode tier above the request bound changes no
 ///   policy's declaration: `Scheduler::new` lowers the limit, names both figures and keeps serving
-///   (`crates/engine/src/scheduler/run.rs`), which is what a deployment whose limits move in place
+///   (`crates/scheduler/src/scheduler/run.rs`), which is what a deployment whose limits move in place
 ///   relies on - its tiers outlive one setting of the bound. It refuses nothing.
 ///
 /// A zero states no size at all and is dropped, as it always was.
@@ -516,8 +516,9 @@ impl ModelRunner {
     /// the ranks of every group that is not an expert group, and zero without one.
     fn attention_ranks(&self) -> Result<u32> {
         let groups = &self.engine_config().parallel.worker_groups;
-        let experts =
-            |group: &&engine::WorkerGroupConfig| group.role == engine::WorkerGroupRole::Experts;
+        let experts = |group: &&scheduler::WorkerGroupConfig| {
+            group.role == scheduler::WorkerGroupRole::Experts
+        };
         if !groups.iter().any(|group| experts(&group)) {
             return Ok(0);
         }
@@ -872,9 +873,9 @@ impl ModelRunner {
             && self.engine_config().kv_cache.prefix_caching
     }
 
-    /// What this rank's scheduler starts with ([`engine::SchedulerHandle::over_batches_telling`]):
+    /// What this rank's scheduler starts with ([`scheduler::SchedulerHandle::over_batches_telling`]):
     /// the process's arguments `launch`, with the engine configuration as this process resolves it,
-    /// and the mechanism's limits for this rank ([`engine::SchedulerConfig::of`]).
+    /// and the mechanism's limits for this rank ([`scheduler::SchedulerConfig::of`]).
     ///
     /// The configuration takes the facts of the model this rank serves, read where they are
     /// stated: the control tokens from the checkpoint (`checkpoint_tokens`), since a launch file
@@ -891,7 +892,7 @@ impl ModelRunner {
         launch: &EngineArgs,
         served: &Served,
         host_kv_cache: bool,
-    ) -> Result<(EngineArgs, engine::SchedulerConfig)> {
+    ) -> Result<(EngineArgs, scheduler::SchedulerConfig)> {
         let running = self.engine_config().max_running_requests.get();
         let (facts, max_batch, max_num_batched_tokens, graph_tiers) = match served {
             Served::Text(_) => {
@@ -953,7 +954,7 @@ impl ModelRunner {
         if !host_kv_cache {
             args.engine_config.kv_cache.host_tier = false;
         }
-        let limits = engine::SchedulerConfig::of(
+        let limits = scheduler::SchedulerConfig::of(
             &args.engine_config,
             max_batch,
             max_num_batched_tokens,
@@ -1368,7 +1369,7 @@ impl ModelRunner {
     /// The command-line shorthand places the whole model on every group, and a deployment file may
     /// as well. Such a deployment states no block to split, so it states no sequence degree and
     /// chooses no network of a checkpoint that holds two.
-    fn capability_groups(&self) -> Option<&[engine::WorkerGroupConfig]> {
+    fn capability_groups(&self) -> Option<&[scheduler::WorkerGroupConfig]> {
         let groups = &self.engine_config().parallel.worker_groups;
         groups
             .iter()
@@ -2708,7 +2709,7 @@ pub(crate) struct Mapping {
 /// page has no such statement, so it serves what the checkpoint states when that is one network's.
 fn served_tasks(
     stated: &[nn::VideoTask],
-    groups: Option<&[engine::WorkerGroupConfig]>,
+    groups: Option<&[scheduler::WorkerGroupConfig]>,
     checkpoint: &Path,
 ) -> Result<Vec<nn::VideoTask>> {
     if stated.is_empty() {
@@ -2775,7 +2776,7 @@ const REFERENCE_COMPONENT: &str = "transformer_ref";
 const TEXT_COMPONENT: &str = "text_encoder";
 
 fn media_parallel(
-    groups: Option<&[engine::WorkerGroupConfig]>,
+    groups: Option<&[scheduler::WorkerGroupConfig]>,
     group: &str,
     rank: u32,
     tensor_parallel: u32,
@@ -2807,7 +2808,7 @@ fn media_parallel(
     // answer: **which group places this class's component?** A media rank serves the denoiser, and a
     // group that places no transformer is another engine's.
     let named = groups.iter().find(|candidate| candidate.id.0 == group);
-    let denoisers: Vec<&engine::WorkerGroupConfig> = groups
+    let denoisers: Vec<&scheduler::WorkerGroupConfig> = groups
         .iter()
         .filter(|candidate| {
             candidate.blocks.contains_key(DENOISER_COMPONENT)
@@ -2965,7 +2966,7 @@ impl Mapping {
 /// kind this rank's own buckets are launched as.
 ///
 /// The kinds come from the buckets - what this rank's model runner can launch - and the ids from
-/// `engine::phase_id`, the table the scheduler's `Plan` numbers a request's work with. Never from a
+/// `scheduler::phase_id`, the table the scheduler's `Plan` numbers a request's work with. Never from a
 /// literal: a model runner that stated `PhaseId(0)` for its device (text encoding) served no phase the
 /// scheduler ever planned, and the worker refused the deployment's first completion with `no
 /// device of this rank serves phase PhaseId(3)`.
@@ -2987,69 +2988,70 @@ fn video_units(frames: u32) -> worker::Result<Vec<u32>> {
 /// The one host call every rank serves: the encode of the units it decoded.
 fn unit_phases() -> Vec<PhaseId> {
     vec![PhaseId(
-        u16::try_from(engine::phase_id(engine::PhaseKind::VideoEncode).0).expect("a phase id fits"),
+        u16::try_from(scheduler::phase_id(scheduler::PhaseKind::VideoEncode).0)
+            .expect("a phase id fits"),
     )]
 }
 
 fn host_phases() -> Vec<PhaseId> {
     [
-        engine::PhaseKind::VideoEncode,
-        engine::PhaseKind::AudioEncode,
-        engine::PhaseKind::Mux,
-        engine::PhaseKind::LatentPrepare,
-        engine::PhaseKind::MediaRead,
-        engine::PhaseKind::VisionEncoding,
-        engine::PhaseKind::LatentEncoding,
+        scheduler::PhaseKind::VideoEncode,
+        scheduler::PhaseKind::AudioEncode,
+        scheduler::PhaseKind::Mux,
+        scheduler::PhaseKind::LatentPrepare,
+        scheduler::PhaseKind::MediaRead,
+        scheduler::PhaseKind::VisionEncoding,
+        scheduler::PhaseKind::LatentEncoding,
     ]
     .into_iter()
-    .map(|kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits")))
+    .map(|kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits")))
     .collect()
 }
 
 fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
-    let mut kinds: Vec<engine::PhaseKind> = buckets
+    let mut kinds: Vec<scheduler::PhaseKind> = buckets
         .iter()
         .map(|bucket| match bucket.variant {
             Variant::PrefillWrite | Variant::PrefillOutput | Variant::PrefillGreedy => {
-                engine::PhaseKind::Prefill
+                scheduler::PhaseKind::Prefill
             }
-            Variant::DecodeGreedy | Variant::DecodeSampled => engine::PhaseKind::Decode,
-            Variant::Encode => engine::PhaseKind::TextEncoding,
-            Variant::Denoise => engine::PhaseKind::Denoise,
+            Variant::DecodeGreedy | Variant::DecodeSampled => scheduler::PhaseKind::Decode,
+            Variant::Encode => scheduler::PhaseKind::TextEncoding,
+            Variant::Denoise => scheduler::PhaseKind::Denoise,
             // The scheduler plans a clip's decode as `VideoDecode` and a track's as `AudioDecode`
             // (`call_phase`), so a device that advertised `ImageDecode` for either served no phase
             // the scheduler ever planned - the same defect this function's doc records.
-            Variant::Decode => engine::PhaseKind::VideoDecode,
-            Variant::AudioDecode => engine::PhaseKind::AudioDecode,
+            Variant::Decode => scheduler::PhaseKind::VideoDecode,
+            Variant::AudioDecode => scheduler::PhaseKind::AudioDecode,
             // The artifact's three host calls are calls the mechanism submits and waits on, so the
             // device states the phases they run in even though no graph serves them.
-            Variant::VideoEncode => engine::PhaseKind::VideoEncode,
-            Variant::AudioEncode => engine::PhaseKind::AudioEncode,
-            Variant::Mux => engine::PhaseKind::Mux,
-            Variant::LatentPrepare => engine::PhaseKind::LatentPrepare,
-            Variant::MediaRead => engine::PhaseKind::MediaRead,
+            Variant::VideoEncode => scheduler::PhaseKind::VideoEncode,
+            Variant::AudioEncode => scheduler::PhaseKind::AudioEncode,
+            Variant::Mux => scheduler::PhaseKind::Mux,
+            Variant::LatentPrepare => scheduler::PhaseKind::LatentPrepare,
+            Variant::MediaRead => scheduler::PhaseKind::MediaRead,
             // The two encoders whose work a later call computes are answered as they arrive, under
             // the phase of either: a bucket of this variant names no one of them.
-            Variant::ConditionEncode => engine::PhaseKind::VisionEncoding,
+            Variant::ConditionEncode => scheduler::PhaseKind::VisionEncoding,
             // A join is no phase a scheduler plans: a peer opens the step, and the union wakes
             // this rank for it.
-            Variant::ExpertJoin => engine::PhaseKind::Decode,
+            Variant::ExpertJoin => scheduler::PhaseKind::Decode,
         })
         .collect();
     // A refill chunk is a prefill-class chunk of a decoding request and runs wherever a prefill
     // chunk does, so the device that serves prefill states it as well: the scheduler may name a
     // refill and the batch then routes here.
-    if kinds.contains(&engine::PhaseKind::Prefill) {
-        kinds.push(engine::PhaseKind::Refill);
+    if kinds.contains(&scheduler::PhaseKind::Prefill) {
+        kinds.push(scheduler::PhaseKind::Refill);
     }
-    kinds.sort_by_key(|kind| engine::phase_id(*kind).0);
+    kinds.sort_by_key(|kind| scheduler::phase_id(*kind).0);
     kinds.dedup();
     kinds
         .into_iter()
         // The scheduler numbers a phase with the world's `u32` and the worker names one with the
         // wire's `u16`: the plan is where the two meet, and a kind that did not fit would be a table
         // this process cannot state rather than a phase to serve quietly.
-        .map(|kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits")))
+        .map(|kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits")))
         .collect()
 }
 
@@ -3130,12 +3132,12 @@ mod tests {
     }
 
     /// A deployment page as written, parsed and placed on this host.
-    fn page(toml: &str) -> Vec<engine::WorkerGroupConfig> {
+    fn page(toml: &str) -> Vec<scheduler::WorkerGroupConfig> {
         proto::config::WorkerGroupConfig::parse_file(toml, "localhost").expect("the page places")
     }
 
     /// A deployment page holding one group named `model`, with the components it names.
-    fn groups(components: &str) -> Vec<engine::WorkerGroupConfig> {
+    fn groups(components: &str) -> Vec<scheduler::WorkerGroupConfig> {
         page(&format!(
             "[[worker_groups]]\nid = \"model\"\nranks = [\"cuda:0-3\"]\nqueue_depth = 2\n{components}"
         ))
@@ -3319,21 +3321,22 @@ mod tests {
     fn a_model_runner_serves_the_phases_its_buckets_are_planned_as() {
         let buckets = Buckets::causal_lm(&[8], &[64], true);
         let phases = served_phases(&buckets);
-        let id = |kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits"));
+        let id =
+            |kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"));
         assert!(
-            phases.contains(&id(engine::PhaseKind::Prefill)),
+            phases.contains(&id(scheduler::PhaseKind::Prefill)),
             "a prefill batch routes to this node's device: {phases:?}"
         );
         assert!(
-            phases.contains(&id(engine::PhaseKind::Decode)),
+            phases.contains(&id(scheduler::PhaseKind::Decode)),
             "a decode batch routes to this node's device: {phases:?}"
         );
         assert!(
-            !phases.contains(&id(engine::PhaseKind::TextEncoding)),
+            !phases.contains(&id(scheduler::PhaseKind::TextEncoding)),
             "this node encodes no request itself: {phases:?}"
         );
         assert!(
-            !phases.contains(&id(engine::PhaseKind::Denoise)),
+            !phases.contains(&id(scheduler::PhaseKind::Denoise)),
             "a batch this plan has no bucket for is not served: {phases:?}"
         );
     }

@@ -526,7 +526,7 @@ impl BatchColumns {
         let tokens = self.rows.tokens();
         // Two counts, and a column belongs to one of them: `slots`, `parameters`, `seq_lens` and
         // `logits_rows` are per **row** (a verify or branch call carries several rows for one call),
-        // while the commit table states one row per **call** (`crates/engine`'s `columns.rs`).
+        // while the commit table states one row per **call** (`crates/scheduler`'s `columns.rs`).
         // Sizing one against the other refuses a valid multi-row call and lets a wrong commit table
         // through.
         let rows = self.rows();

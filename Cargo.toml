@@ -7,7 +7,7 @@ resolver = "3"
 members = [
     "crates/platform",
     "crates/daemon",
-    "crates/engine",
+    "crates/scheduler",
     "crates/worker",
     "crates/frontend",
     "crates/ipc",
@@ -41,7 +41,7 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 daemon.workspace = true
-engine.workspace = true
+scheduler.workspace = true
 worker.workspace = true
 frontend.workspace = true
 ipc.workspace = true
@@ -88,7 +88,7 @@ readme = "README.md"
 [workspace.dependencies]
 platform = { path = "crates/platform" }
 daemon = { path = "crates/daemon" }
-engine = { path = "crates/engine" }
+scheduler = { path = "crates/scheduler" }
 worker = { path = "crates/worker" }
 frontend = { path = "crates/frontend" }
 ipc = { path = "crates/ipc" }

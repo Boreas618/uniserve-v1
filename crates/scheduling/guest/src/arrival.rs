@@ -856,7 +856,7 @@ mod tests {
     /// and an invented one would execute a call the mechanism never named.
     ///
     /// The absence is therefore **the mechanism's defect, not the policy's
-    /// answer**: `crates/engine`'s `views::next_phase` answers `None` when
+    /// answer**: `crates/scheduler`'s `views::next_phase` answers `None` when
     /// `peek_next_call_variant(id)` names no call, and a resident request with
     /// prompt left always has one to name. Every helper in this module admitted
     /// a request with `phase: Some(..)` already, which is why no case could

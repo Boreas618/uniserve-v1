@@ -2,7 +2,7 @@
 //! (§4.4).
 //!
 //! The scheduler is split the way `sched_ext` splits the Linux scheduler: the
-//! mechanism (`crates/engine`) owns request state, storage, the hard limits and
+//! mechanism (`crates/scheduler`) owns request state, storage, the hard limits and
 //! execution, and the policy decides. The mechanism hands the policy its events
 //! when state changes and asks it for one decision at each decision point; the
 //! policy holds its own soft state, and the mechanism validates and executes
