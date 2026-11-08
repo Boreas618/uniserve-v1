@@ -29,6 +29,7 @@ use crate::guidance_prefix_rows;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::worker::Worker;
+use crate::worker::WorkerGroupId;
 use crate::{CommandWaker, GenerationLimits, Request};
 use crate::{Scheduler, SpecialTokenIds};
 use crate::{SchedulerConfig, SchedulerStats};
@@ -293,35 +294,31 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Refuses a worker whose pools are not worker groups of the deployment, or that serves one
-    /// over another number of ranks than the launch's world.
+    /// Refuses a worker that does not serve the launch's pool: the process's
+    /// own group (`EngineArgs::group`), on its world's ranks.
     ///
+    /// The pool is the process, named as the launch names it: the cache segments a successor
+    /// adopts, the storage the process claims and the epoch's records all key it by that name.
     /// A scheduler started for a pool the worker does not serve, or for a
     /// rank count it does not serve, would place calls on ranks it does not
     /// have; the launch and the worker are two statements of one process,
     /// so they are compared before anything runs.
     fn check_pool(args: &EngineArgs, info: &crate::worker::WorkerInfo) -> anyhow::Result<()> {
-        anyhow::ensure!(!info.workers.is_empty(), "the worker serves no pool");
-        for (group, _) in &info.workers {
-            anyhow::ensure!(
-                args.engine_config
-                    .parallel
-                    .worker_groups
-                    .iter()
-                    .any(|stated| stated.id == *group),
-                "the worker serves pool {}, which is no worker group of the deployment",
-                group.0
-            );
-            // `from_inventory` states every pool's rank count; a worker
-            // that reports none places the pool on one rank.
-            let served = info.layouts.get(group).map_or(1, |layout| layout.ranks);
-            anyhow::ensure!(
-                u32::try_from(served).is_ok_and(|served| served == args.world_size),
-                "the launch places {} ranks of pool {}, but the worker serves {served}",
-                args.world_size,
-                group.0
-            );
-        }
+        let group = WorkerGroupId(args.group.clone());
+        anyhow::ensure!(
+            info.workers.iter().any(|(served, _)| *served == group),
+            "the launch names the pool {}, which the worker does not serve",
+            group.0
+        );
+        // `from_inventory` states every pool's rank count; a worker
+        // that reports none places the pool on one rank.
+        let served = info.layouts.get(&group).map_or(1, |layout| layout.ranks);
+        anyhow::ensure!(
+            u32::try_from(served).is_ok_and(|served| served == args.world_size),
+            "the launch places {} ranks of pool {}, but the worker serves {served}",
+            args.world_size,
+            group.0
+        );
         Ok(())
     }
 
@@ -999,7 +996,6 @@ impl Drop for SchedulerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::worker::WorkerGroupId;
 
     /// A host takes a contiguous block of the ranks, the first hosts take the
     /// remainder, and a rank's device is its local index on its own host.

@@ -444,11 +444,15 @@ fn load_rank(
     launch: &EngineArgs,
     epoch: &Epoch,
 ) -> Result<LoadedRank> {
+    // A process that succeeds an epoch maps the cache segments its predecessor serves from: a
+    // standby takes them over when it is promoted, and a switch's target serves from them under the
+    // predecessor's epoch, as the target's own planes would otherwise need a second cache's storage
+    // beside the serving epoch and its standby. Only a standby keys its cache by the predecessor's
+    // epoch, because only a standby becomes that epoch's process.
     let adopted = epoch
         .predecessor_cache
         .iter()
-        .find(|cache| cache.worker_group == launch.group)
-        .filter(|_| launch.standby())
+        .find(|cache| cache.worker_group == launch.group && !cache.segments.is_empty())
         .map(|cache| ipc::CacheTable {
             segments: cache
                 .segments
@@ -1215,7 +1219,6 @@ impl MainProcess {
                     launch,
                     &models[index],
                     &workers[index..=index],
-                    Some(index),
                     &inventories[index],
                     &memories[index],
                     connected.wake(),
@@ -1229,7 +1232,6 @@ impl MainProcess {
                 launch,
                 &models[0],
                 &workers,
-                None,
                 &inventories[0],
                 &memories[0],
                 connected.wake(),
@@ -8069,16 +8071,11 @@ fn device_command(
 /// node's workers through `worker::Batches`: the scheduler forms a batch, the worker issues
 /// it, and the scheduler reads the result - nothing crosses threads except the batch and its
 /// result.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the rank, the launch, the model, its devices, its group, its report, its memory, the wake and the data plane"
-)]
 fn schedulers(
     model_runner: &ModelRunner,
     launch: &EngineArgs,
     model: &crate::model_runner::Served,
     workers: &[Arc<Worker>],
-    replica: Option<usize>,
     rank: &ipc::MainProcessInfo,
     memory: &Memory,
     control: ipc::Wake,
@@ -8111,28 +8108,8 @@ fn schedulers(
     // holds, not what it was launched for), and its longest sequence is the model's bound. The
     // inventory is the worker's to hold and the boot's to state, because neither number can be
     // derived from a batch (4.4).
-    // The pool is named as the deployment names its worker group: an expert union's ranks are each
-    // a scheduler's, one data-parallel group each, in the order the deployment states them, and any
-    // other process serves the deployment's one group.
-    let groups = &launch.engine_config.parallel.worker_groups;
-    let group = match replica {
-        Some(index) => groups.get(index).with_context(|| {
-            format!(
-                "the deployment states {} worker groups and no group {index}",
-                groups.len()
-            )
-        })?,
-        None => match groups.as_slice() {
-            [group] => group,
-            _ => bail!(
-                "this process serves one worker group and the deployment states {}: {:?}",
-                groups.len(),
-                groups.iter().map(|group| &group.id.0).collect::<Vec<_>>()
-            ),
-        },
-    };
     let inventory = worker::batch::Inventory {
-        group: group.id.0.clone(),
+        group: launch.group.clone(),
         ranks: vec![rank.clone()],
         layout: worker::batch::PoolLayout {
             queue_depth: model_runner.queue_depth(),
