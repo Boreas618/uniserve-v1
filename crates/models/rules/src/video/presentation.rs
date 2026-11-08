@@ -18,7 +18,7 @@
 
 use std::borrow::Cow;
 
-use super::plan::{Prepared, RequestField, RequestPlan, VideoInputError, Vision};
+use super::plan::{Prepared, RequestField, VideoInputError, VideoParams, Vision};
 use crate::Vocabulary;
 
 /// The AdaLN tag of a vision token.
@@ -63,7 +63,7 @@ pub enum Segment<'a> {
 }
 
 /// Lists the presentation of a planned request, prompt last.
-pub fn segments<'a>(plan: &RequestPlan, prompt: &'a str) -> Vec<Segment<'a>> {
+pub fn segments<'a>(plan: &VideoParams, prompt: &'a str) -> Vec<Segment<'a>> {
     let mut segments = Vec::new();
     let (mut pictures, mut videos, mut audios) = (0, 0, 0);
     let text = |value: String| Segment::Text(Cow::Owned(value));
@@ -127,7 +127,7 @@ pub struct Presentation {
 /// configuration declares, which a prompt may contain.
 pub fn present(
     tokenizer: &dyn Vocabulary,
-    plan: &RequestPlan,
+    plan: &VideoParams,
     prompt: &str,
 ) -> Result<Presentation, VideoInputError> {
     if prompt.trim().is_empty() {

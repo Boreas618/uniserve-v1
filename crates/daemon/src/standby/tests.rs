@@ -24,13 +24,13 @@ fn process(host: &str, epoch: Option<u64>) -> MainProcess {
 }
 
 /// Facts of nodes whose devices have the share a serving process leaves.
-fn roomy(hosts: &[&str]) -> BTreeMap<String, StorageFacts> {
+fn roomy(hosts: &[&str]) -> BTreeMap<String, StandbyRoom> {
     hosts
         .iter()
         .map(|host| {
             (
                 (*host).to_owned(),
-                StorageFacts {
+                StandbyRoom {
                     crowded: false,
                     fits_suspended: true,
                 },

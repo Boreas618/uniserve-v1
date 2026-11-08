@@ -498,7 +498,7 @@ impl Conditioning {
 /// denoiser packs row for row: its tile is one row. What a request takes is
 /// therefore the denoiser's arithmetic and not its rows' sum, and it decides
 /// both whether the deployment serves the request and which of its graphs
-/// does ([`plan::RequestPlan::condition_rows`]).
+/// does ([`plan::VideoParams::condition_rows`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ConditionPacking {
     /// Rows one request's conditions may take: the deployment's capacity,

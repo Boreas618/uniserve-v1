@@ -63,7 +63,7 @@ pub struct MainProcess {
 
 /// What a node's devices can keep of a parked standby.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StorageFacts {
+pub struct StandbyRoom {
     /// Whether a device of the node is short of the share of its storage a
     /// serving main process leaves beside it for graphs and activations.
     pub crowded: bool,
@@ -312,7 +312,7 @@ impl Roster {
         &mut self,
         status: Status,
         options: StandbyOptions,
-        facts: &BTreeMap<String, StorageFacts>,
+        facts: &BTreeMap<String, StandbyRoom>,
     ) -> Vec<Action> {
         if !options.enabled || status != Status::Serving {
             return Vec::new();
@@ -326,7 +326,7 @@ impl Roster {
             if live.is_empty() {
                 continue;
             }
-            let observed: Option<Vec<StorageFacts>> = live
+            let observed: Option<Vec<StandbyRoom>> = live
                 .iter()
                 .map(|&node| facts.get(&self.nodes[node].process.host).copied())
                 .collect();
@@ -781,7 +781,7 @@ impl Phase {
 
 /// The one storage mode a domain's standby children take, or `None` when no
 /// member can keep one.
-fn storage(mode: StandbyStorage, observed: &[StorageFacts]) -> Option<Storage> {
+fn storage(mode: StandbyStorage, observed: &[StandbyRoom]) -> Option<Storage> {
     let mode = match mode {
         StandbyStorage::Resident => Storage::Resident,
         StandbyStorage::Suspended => Storage::Suspended,

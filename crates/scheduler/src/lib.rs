@@ -79,10 +79,10 @@ pub use crate::handle::{
 #[cfg(feature = "testing")]
 pub use crate::worker::{BatchResult, CallResult, Worker};
 pub use crate::worker::{
-    BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ExecuteError, ExecutionBatch,
-    PageOffloads, PoolLayout, RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel,
-    TransferBackend, TransferConfig, TransferConfigError, TransferEdge, WorkerError, WorkerFailure,
-    WorkerGroupId, WorkerInfo, WorkerSubmitError,
+    BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ConnectorConfig,
+    ConnectorConfigError, ConnectorEdge, ExecuteError, ExecutionBatch, PageOffloads, PoolLayout,
+    RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel, TransferBackend, WorkerError,
+    WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
 };
 // The engine schedules requests in the request vocabulary its daemon
 // submits them in.
