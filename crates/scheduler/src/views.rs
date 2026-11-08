@@ -35,9 +35,9 @@
 //! # What a scheduler cannot tell a view
 //!
 //! - `Room::graph_tiers` is the mechanism's: it holds the build config's
-//!   captured tiers. It builds the facts with [`room_facts`], fills the tiers,
-//!   and turns them into the `Room` with [`room_view`]; [`room`] leaves them
-//!   empty. (`Room::warming` is read here, from the claimed precopy pages.)
+//!   captured tiers, which the mechanism fills in the `Room` that [`room`]
+//!   builds with none. (`Room::warming` is read here, from the claimed precopy
+//!   pages.)
 //! - `Snapshot::ranks` and a trial's `arrival` need the ranks' load, which the
 //!   routing table on the control thread holds and a scheduler does not: a
 //!   scheduler knows one rank's load, its own. [`trial_state`] therefore trips
@@ -331,149 +331,9 @@ pub(crate) fn encoding_id(key: &[u8; 32]) -> EncodingId {
 // Views from facts
 // ---------------------------------------------------------------------------
 
-/// The features of one request, as [`request_view`] turns them into a view.
-#[derive(Clone, Debug)]
-pub(crate) struct RequestFacts {
-    pub id: ViewRequestId,
-    pub standing: Standing,
-    pub phase: Option<PhaseId>,
-    pub priority: i32,
-    pub arrived_at: Nanos,
-    pub admitted_at: Option<Nanos>,
-    pub prompt_tokens: u32,
-    pub prefill_tokens: u32,
-    pub generated_tokens: u32,
-    pub cached_prefix_tokens: u32,
-    pub prefilled_tokens: u32,
-    pub cached_pages: u32,
-    pub last_emitted_at: Option<Nanos>,
-    pub class: RequestClass,
-    pub waiting_transfer: bool,
-    pub next_tokens: u32,
-    pub reservation_units: u64,
-    pub prefetch_tokens: u32,
-    pub refill_tokens: Option<u32>,
-    pub remaining_tokens: u32,
-    pub migratable: bool,
-    pub cache_rank: Option<usize>,
-}
-
-/// The view of one request.
-pub(crate) fn request_view(facts: RequestFacts) -> RequestView {
-    RequestView {
-        id: facts.id,
-        state: facts.standing,
-        phase: facts.phase,
-        priority: facts.priority,
-        arrived_at: facts.arrived_at,
-        admitted_at: facts.admitted_at,
-        prompt_tokens: facts.prompt_tokens,
-        prefill_tokens: facts.prefill_tokens,
-        generated_tokens: facts.generated_tokens,
-        cached_prefix_tokens: facts.cached_prefix_tokens,
-        prefilled_tokens: facts.prefilled_tokens,
-        cached_pages: facts.cached_pages,
-        last_emitted_at: facts.last_emitted_at,
-        class: facts.class,
-        waiting_transfer: facts.waiting_transfer,
-        next_tokens: facts.next_tokens,
-        reservation_units: facts.reservation_units,
-        prefetch_tokens: facts.prefetch_tokens,
-        refill_tokens: facts.refill_tokens,
-        remaining_tokens: facts.remaining_tokens,
-        migratable: facts.migratable,
-        cache_rank: facts.cache_rank,
-    }
-}
-
-/// The features of one page, as [`page_view`] turns them into a view.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct PageFacts {
-    pub id: PageId,
-    pub tokens: u32,
-    pub last_used: Nanos,
-    pub on_host: bool,
-    pub evictable: bool,
-}
-
-/// The view of one page.
-pub(crate) fn page_view(facts: PageFacts) -> PageView {
-    PageView {
-        id: facts.id,
-        tokens: facts.tokens,
-        last_used: facts.last_used,
-        on_host: facts.on_host,
-        evictable: facts.evictable,
-    }
-}
-
 /// The view of one encoder cache entry.
 pub(crate) fn encoding_view(id: EncodingId, last_used: Nanos) -> EncodingView {
     EncodingView { id, last_used }
-}
-
-/// The features of one replica, as [`replica_view`] turns them into a view.
-#[derive(Clone, Debug)]
-pub(crate) struct ReplicaFacts {
-    pub index: usize,
-    pub block: ComponentId,
-    pub kinds: Vec<PhaseKind>,
-    pub resident_requests: u32,
-    pub capacity: u32,
-    pub holds_request: bool,
-    pub prefills_only: bool,
-    pub holds_component: bool,
-}
-
-/// The view of one replica.
-pub(crate) fn replica_view(facts: ReplicaFacts) -> ReplicaView {
-    ReplicaView {
-        index: facts.index,
-        block: facts.block,
-        kinds: facts.kinds,
-        resident_requests: facts.resident_requests,
-        capacity: facts.capacity,
-        holds_request: facts.holds_request,
-        prefills_only: facts.prefills_only,
-        holds_component: facts.holds_component,
-    }
-}
-
-/// The features of one step's room, as [`room_view`] turns them into a `Room`.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct RoomFacts {
-    pub step: u64,
-    pub kv_units: u64,
-    pub slots: usize,
-    pub token_budget: u32,
-    pub call_budget: usize,
-    pub graph_tiers: Vec<u32>,
-    pub page_tokens: u32,
-    pub prefill_tokens: Option<u32>,
-    pub batches: u32,
-    pub prefill_batches: u32,
-    pub capacity_units: u64,
-    pub warming: Vec<WarmingView>,
-}
-
-/// This step's room.
-pub(crate) fn room_view(facts: RoomFacts) -> Room {
-    Room {
-        step: facts.step,
-        kv_units: facts.kv_units,
-        slots: facts.slots,
-        token_budget: facts.token_budget,
-        call_budget: facts.call_budget,
-        graph_tiers: facts.graph_tiers,
-        page_tokens: facts.page_tokens,
-        prefill_tokens: facts.prefill_tokens,
-        inflight: InflightView {
-            batches: facts.batches,
-            prefill_batches: facts.prefill_batches,
-        },
-        capacity_units: facts.capacity_units,
-        warming: facts.warming,
-    }
 }
 
 /// The call a `place` decision is about.
@@ -554,20 +414,14 @@ fn free_slots(scheduler: &Scheduler) -> usize {
 
 /// This step's room.
 ///
-/// The captured graph tiers and the precopy's warming order are the
-/// mechanism's, not the scheduler's; it builds the facts, fills those two, and
-/// turns them into the `Room` with `room_view`.
+/// The captured graph tiers are the mechanism's, not the scheduler's: the
+/// mechanism fills them.
 pub(crate) fn room(scheduler: &Scheduler, step: u64) -> Room {
-    room_view(room_facts(scheduler, step))
-}
-
-/// The facts of this step's room.
-pub(crate) fn room_facts(scheduler: &Scheduler, step: u64) -> RoomFacts {
     let page_tokens = scheduler
         .storage
         .cache()
         .map_or(1, |cache| cache.coordinator.max_block_size());
-    RoomFacts {
+    Room {
         step,
         kv_units: scheduler.storage.free_units() as u64,
         slots: free_slots(scheduler),
@@ -581,16 +435,18 @@ pub(crate) fn room_facts(scheduler: &Scheduler, step: u64) -> RoomFacts {
             .warming
             .prefill_tokens
             .map(|tokens| u32::try_from(tokens).unwrap_or(u32::MAX)),
-        batches: u32::try_from(scheduler.inflight.pending_batches.len()).unwrap_or(u32::MAX),
-        prefill_batches: u32::try_from(
-            scheduler
-                .inflight
-                .pending_batches
-                .values()
-                .filter(|batch| batch.prefill)
-                .count(),
-        )
-        .unwrap_or(u32::MAX),
+        inflight: InflightView {
+            batches: u32::try_from(scheduler.inflight.pending_batches.len()).unwrap_or(u32::MAX),
+            prefill_batches: u32::try_from(
+                scheduler
+                    .inflight
+                    .pending_batches
+                    .values()
+                    .filter(|batch| batch.prefill)
+                    .count(),
+            )
+            .unwrap_or(u32::MAX),
+        },
         capacity_units: scheduler.storage.capacity_units() as u64,
         warming: warming(scheduler),
     }
@@ -879,9 +735,9 @@ pub(crate) fn request(
     let prefilled = state
         .num_computed_prompt_tokens
         .max(recorded.cached_prefix_tokens);
-    request_view(RequestFacts {
+    RequestView {
         id: ViewRequestId(state.req.request_id.0),
-        standing,
+        state: standing,
         phase: next_phase(scheduler, state, id),
         priority: state.req.priority,
         arrived_at: nanos_at(state.queued_at),
@@ -911,7 +767,7 @@ pub(crate) fn request(
         // name it.
         migratable: state.req.is_migratable() && !state.terminal_intent.is_terminal(),
         cache_rank: recorded.cache_rank,
-    })
+    }
 }
 
 /// The phase of a resident media request's next ready call, when its graph has
@@ -934,9 +790,9 @@ pub(crate) fn diffusion_request(
     phase: Option<PhaseId>,
     recorded: &Recorded,
 ) -> RequestView {
-    request_view(RequestFacts {
+    RequestView {
         id: ViewRequestId(request.request_id.0),
-        standing,
+        state: standing,
         phase,
         priority: request.priority,
         arrived_at: nanos_at(queued_at),
@@ -957,7 +813,7 @@ pub(crate) fn diffusion_request(
         remaining_tokens: 0,
         migratable: false,
         cache_rank: recorded.cache_rank,
-    })
+    }
 }
 
 /// Every request the scheduler holds, in the order a policy reads them: queued
@@ -1063,7 +919,7 @@ pub(crate) fn pages(scheduler: &Scheduler) -> Vec<PageView> {
             // One page published under several resumes.
             continue;
         }
-        views.push(page_view(PageFacts {
+        views.push(PageView {
             id: device_page(first),
             tokens: u32::try_from(page.tokens.len()).unwrap_or(u32::MAX),
             last_used: Nanos(0),
@@ -1071,7 +927,7 @@ pub(crate) fn pages(scheduler: &Scheduler) -> Vec<PageView> {
             // A page is evictable once no resident request continues from any
             // of its units, not just from the one its id names.
             evictable: !page.units.iter().any(|unit| held.contains(unit)),
-        }));
+        });
     }
     views
 }
@@ -1087,7 +943,7 @@ pub(crate) fn pages(scheduler: &Scheduler) -> Vec<PageView> {
 pub(crate) fn page_of(scheduler: &Scheduler, units: &[u32], tokens: u32) -> Option<PageView> {
     let first = *units.first()?;
     let held = held_units(scheduler);
-    Some(page_view(PageFacts {
+    Some(PageView {
         id: device_page(first),
         tokens,
         last_used: Nanos(0),
@@ -1095,7 +951,7 @@ pub(crate) fn page_of(scheduler: &Scheduler, units: &[u32], tokens: u32) -> Opti
         // A page is evictable once no resident request continues from any of
         // its units, not just from the one its id names.
         evictable: !units.iter().any(|unit| held.contains(unit)),
-    }))
+    })
 }
 
 /// Every page of the device KV cache, keyed by id: the table `Live` checks a
@@ -1272,7 +1128,7 @@ fn candidate_facts<'a>(
         .filter(|(id, _, _)| !decode_stage || !scheduler.dispatch.prefill_groups.contains(*id))
         .enumerate()
         .map(|(index, (worker, bound, main_process_info))| {
-            let view = replica_view(ReplicaFacts {
+            let view = ReplicaView {
                 index,
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(main_process_info),
@@ -1289,7 +1145,7 @@ fn candidate_facts<'a>(
                 ),
                 prefills_only: scheduler.dispatch.prefill_groups.contains(worker),
                 holds_component: holds_component(&scheduler.dispatch, request, worker),
-            });
+            };
             (view, worker.clone(), bound.to_owned())
         })
         .collect()
@@ -1328,7 +1184,7 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
                 .components
                 .first()
                 .map_or(DEFAULT_BLOCK, |component| component.name.as_str());
-            replica_view(ReplicaFacts {
+            ReplicaView {
                 index,
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(info),
@@ -1337,7 +1193,7 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
                 holds_request: false,
                 prefills_only: scheduler.dispatch.prefill_groups.contains(worker),
                 holds_component: false,
-            })
+            }
         })
         .collect()
 }
@@ -1634,33 +1490,6 @@ mod tests {
     use super::*;
     use scheduling::guest::view::PhaseClass;
 
-    fn facts() -> RequestFacts {
-        RequestFacts {
-            id: ViewRequestId(7),
-            standing: Standing::Resident,
-            phase: Some(phase_id(PhaseKind::Decode)),
-            priority: 3,
-            arrived_at: Nanos(10),
-            admitted_at: Some(Nanos(20)),
-            prompt_tokens: 128,
-            prefill_tokens: 128,
-            generated_tokens: 5,
-            cached_prefix_tokens: 64,
-            prefilled_tokens: 96,
-            cached_pages: 4,
-            last_emitted_at: Some(Nanos(30)),
-            class: RequestClass::Token,
-            waiting_transfer: false,
-            next_tokens: 1,
-            reservation_units: 0,
-            prefetch_tokens: 32,
-            refill_tokens: Some(12),
-            remaining_tokens: 100,
-            migratable: true,
-            cache_rank: Some(1),
-        }
-    }
-
     #[test]
     fn a_phase_id_numbers_its_kind() {
         for (index, kind) in PHASES.iter().copied().enumerate() {
@@ -1779,70 +1608,17 @@ mod tests {
     }
 
     #[test]
-    fn a_request_view_carries_its_features() {
-        let view = request_view(facts());
-        assert_eq!(view.id, ViewRequestId(7));
-        assert_eq!(view.state, Standing::Resident);
-        assert_eq!(view.phase, Some(phase_id(PhaseKind::Decode)));
-        assert_eq!(view.cached_prefix_tokens, 64);
-        assert_eq!(view.refill_tokens, Some(12));
-        assert!(view.migratable);
-        assert_eq!(view.cache_rank, Some(1));
-    }
-
-    #[test]
-    fn a_queued_request_has_no_admission_time() {
-        let mut facts = facts();
-        facts.standing = Standing::Queued;
-        facts.admitted_at = None;
-        let view = request_view(facts);
-        assert_eq!(view.state, Standing::Queued);
-        assert_eq!(view.admitted_at, None);
-    }
-
-    #[test]
-    fn a_room_carries_the_steps_walls() {
-        let room = room_view(RoomFacts {
-            step: 4,
-            kv_units: 100,
-            slots: 3,
-            token_budget: 8192,
-            call_budget: 128,
-            graph_tiers: vec![1, 2, 4],
-            page_tokens: 16,
-            prefill_tokens: Some(512),
-            batches: 2,
-            prefill_batches: 1,
-            capacity_units: 1024,
-            warming: vec![WarmingView {
-                request: ViewRequestId(1),
-                pages: vec![device_page(2)],
-            }],
-        });
-        assert_eq!(room.step, 4);
-        assert_eq!(room.kv_units, 100);
-        assert_eq!(room.slots, 3);
-        assert_eq!(room.inflight.batches, 2);
-        assert_eq!(room.inflight.prefill_batches, 1);
-        assert_eq!(room.capacity_units, 1024);
-        assert_eq!(room.warming.len(), 1);
-        assert_eq!(room.graph_tiers, vec![1, 2, 4]);
-    }
-
-    #[test]
     fn replica_indices_number_the_place_list() {
         let replicas: Vec<ReplicaView> = (0..3)
-            .map(|index| {
-                replica_view(ReplicaFacts {
-                    index,
-                    block: ComponentId(1),
-                    kinds: vec![PhaseKind::Denoise],
-                    resident_requests: index as u32,
-                    capacity: 1,
-                    holds_request: index == 1,
-                    prefills_only: false,
-                    holds_component: index == 2,
-                })
+            .map(|index| ReplicaView {
+                index,
+                block: ComponentId(1),
+                kinds: vec![PhaseKind::Denoise],
+                resident_requests: index as u32,
+                capacity: 1,
+                holds_request: index == 1,
+                prefills_only: false,
+                holds_component: index == 2,
             })
             .collect();
         assert_eq!(

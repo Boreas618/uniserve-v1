@@ -24,7 +24,7 @@
 //! 4. [`plan::plan_request`] resolves the canvas, the frame counts, how each
 //!    condition is prepared, the Qwen3-VL vision grids and the encoder units,
 //!    and the rows the conditions take as the denoiser packs them
-//!    ([`plan::RequestPlan::condition_rows`]), which the deployment's
+//!    ([`plan::VideoParams::condition_rows`]), which the deployment's
 //!    condition capacity must hold; [`presentation::present`] tokenizes the
 //!    conditioner's presentation with the checkpoint's tokenizer and tags
 //!    every token for the denoiser's AdaLN modulation.
@@ -194,7 +194,7 @@ struct Presenter {
     vision: ProcessorConfig,
     /// Condition units one latent encoding round covers while a request's
     /// prompt is encoded, which reference images are banded to fill
-    /// (`RequestPlan::image_bands`).
+    /// (`VideoParams::image_bands`).
     latent_encoding_units: u32,
     /// How the denoiser packs a request's conditions, and how many rows they
     /// may take.

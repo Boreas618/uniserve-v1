@@ -1047,9 +1047,9 @@ impl Scheduler {
     /// `views.rs` builds every fact but one: the captured graph tiers, which
     /// the build config states (the deployment's `cuda_graph_config`).
     fn room(&self) -> Room {
-        let mut facts = views::room_facts(self, self.step);
-        facts.graph_tiers = self.config.graph_tiers.clone();
-        views::room_view(facts)
+        let mut room = views::room(self, self.step);
+        room.graph_tiers = self.config.graph_tiers.clone();
+        room
     }
 
     /// The mechanism's state at a batch boundary, owned, for the switch.

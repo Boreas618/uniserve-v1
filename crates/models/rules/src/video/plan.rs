@@ -1205,7 +1205,7 @@ impl ConditionPlan {
 
 /// The resolved size of a request and of every condition.
 #[derive(Debug, Clone, PartialEq, Serialize)]
-pub struct RequestPlan {
+pub struct VideoParams {
     /// The request's task.
     pub task: VideoTask,
     /// The generated canvas.
@@ -1219,7 +1219,7 @@ pub struct RequestPlan {
     pub conditions: Vec<ConditionPlan>,
 }
 
-impl RequestPlan {
+impl VideoParams {
     /// Denoiser rows the request's conditions take in a layout of `packing`.
     /// The request's layout holds them: what exceeds `packing.capacity` the
     /// deployment does not serve, and within it they select the request's
@@ -2076,7 +2076,7 @@ pub fn plan_request(
     media: &[MediaFacts],
     vision: &ProcessorConfig,
     limits: &PlanLimits,
-) -> Result<RequestPlan, VideoInputError> {
+) -> Result<VideoParams, VideoInputError> {
     if media.len() != conditions.len() {
         return Err(VideoInputError::internal(format!(
             "{} conditions were planned with {} probed media",
@@ -2117,7 +2117,7 @@ pub fn plan_request(
         };
         plans.push(plan);
     }
-    Ok(RequestPlan {
+    Ok(VideoParams {
         task,
         canvas: size,
         duration_seconds,
@@ -2138,11 +2138,10 @@ pub(super) mod tests {
     use super::{
         AudioClip, AudioFacts, Canvas, ConditionPlan, ConditionSpec, ConditionType, FrameClips,
         FramePosition, FrameRate, ImageFacts, KeyframeFit, MAX_ASPECT_RATIO, MIN_ASPECT_RATIO,
-        MediaFacts, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig, RequestField,
-        RequestPlan, Role, Target, VideoFacts, VideoInputError, VideoTask, Vision, audio_clip,
-        canvas, check_request, cover_crop, gcd, plan_request, reference_bounds,
-        reference_image_size, requested_frames, rows_per_frame, rule_canvases, video_frame_count,
-        video_reference,
+        MediaFacts, PlanLimits, Prepared, ProcessorConfig, ReferenceConfig, RequestField, Role,
+        Target, VideoFacts, VideoInputError, VideoParams, VideoTask, Vision, audio_clip, canvas,
+        check_request, cover_crop, gcd, plan_request, reference_bounds, reference_image_size,
+        requested_frames, rows_per_frame, rule_canvases, video_frame_count, video_reference,
     };
     use crate::video::{MediaLocator, ReferenceLimits, ServedCanvas};
 
@@ -2341,7 +2340,7 @@ pub(super) mod tests {
         pub(in crate::video) fn plan(
             &self,
             vision: &ProcessorConfig,
-        ) -> Result<RequestPlan, VideoInputError> {
+        ) -> Result<VideoParams, VideoInputError> {
             check_request(self.task, &self.target(), &self.conditions, &limits())?;
             plan_request(
                 self.task,
@@ -2644,7 +2643,7 @@ pub(super) mod tests {
             audio_rows: 80,
             ..image.clone()
         };
-        let plan = |conditions: Vec<ConditionPlan>| RequestPlan {
+        let plan = |conditions: Vec<ConditionPlan>| VideoParams {
             task: VideoTask::Ref2va,
             canvas: Canvas {
                 width: 1344,
