@@ -319,7 +319,7 @@ impl Roster for ProcessRoster {
     fn claim(
         &mut self,
         host: &str,
-        world: u64,
+        epoch: u64,
         scopes: &[process::Scope],
         retire: &[u64],
     ) -> Result<(), String> {
@@ -328,7 +328,7 @@ impl Roster for ProcessRoster {
             deployment: self.deployment.clone(),
             scopes: scopes.to_vec(),
             server_arguments: self.server_arguments.clone(),
-            world,
+            epoch,
             retire: retire.to_vec(),
         }))?;
         if reply.error.is_empty() {
@@ -506,13 +506,13 @@ impl Roster for ProcessRoster {
     fn keep_weights(
         &mut self,
         host: &str,
-        world: u64,
+        epoch: u64,
         to_host: bool,
     ) -> Result<crate::updates::switch::KeptWeights, String> {
         let reply = self.request(process::request::Kind::KeepWeights(process::KeepWeights {
             host: host.to_owned(),
             deployment: self.deployment.clone(),
-            worlds: vec![world],
+            epochs: vec![epoch],
             to_host,
             cache_keys: Vec::new(),
         }))?;
@@ -662,7 +662,7 @@ mod tests {
             devices: vec![0],
             group: "engine".to_owned(),
             rank: 0,
-            world: 1,
+            epoch: 1,
             scheduler_node: true,
             peers: Vec::new(),
             watchdog_timeout_s: None,
@@ -883,7 +883,7 @@ mod tests {
     }
 
     #[test]
-    fn a_claim_names_the_deployment_the_world_and_the_retirement() {
+    fn a_claim_names_the_deployment_the_epoch_and_the_retirement() {
         let epochs = Arc::new(Epochs::new());
         let (_service, link) = service(Arc::clone(&epochs));
         let mut roster = roster(&epochs, link);
@@ -893,6 +893,6 @@ mod tests {
         }];
         roster
             .claim("n0", 12, &scopes, &[11])
-            .expect("the node claims the world");
+            .expect("the node claims the epoch");
     }
 }

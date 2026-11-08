@@ -114,7 +114,7 @@ const SYNTH_VOCAB_SIZE: usize = FAKE_EOS_TOKEN as usize + 1;
 /// The longest sequence the simulated pool serves: the model's context length,
 /// which the attention descriptor bounds every row by.
 ///
-/// A world states it as the pool's own fact, so the mechanism shapes a KV view
+/// An epoch states it as the pool's own fact, so the mechanism shapes a KV view
 /// from a number the pool declares and not from a guess: batches are
 /// refused when it is zero, exactly as a deployment that never states its
 /// model's length is refused.
@@ -1443,7 +1443,7 @@ impl SimEngine {
     }
 
     /// States the longest sequence this pool is launched for, as a launch file
-    /// states a real rank's: a world built for another model length says so
+    /// states a real rank's: an epoch built for another model length says so
     /// here rather than inheriting the simulator's default.
     pub const fn set_max_model_len(&mut self, tokens: u32) {
         self.max_model_len = tokens;
@@ -2132,7 +2132,7 @@ impl SimEngine {
 
     /// Splits the simulated planes into `segments` of `units` each, all
     /// held, the first `inherited` of them after the first mapped from a
-    /// predecessor world, as a successor's planes are.
+    /// predecessor epoch, as a successor's planes are.
     ///
     /// # Panics
     ///
@@ -2149,7 +2149,7 @@ impl SimEngine {
             .expect("sim AR worker has a prefix cache");
         cache.segments = (0..segments)
             .map(|ordinal| ipc::CacheSegment {
-                world: if (1..=inherited).contains(&ordinal) {
+                epoch: if (1..=inherited).contains(&ordinal) {
                     1
                 } else {
                     2
@@ -2821,7 +2821,7 @@ mod tests {
         assert_eq!(
             worker.info().max_model_len,
             0,
-            "a world that states none states none: the mechanism, not the simulator, refuses it"
+            "an epoch that states none states none: the mechanism, not the simulator, refuses it"
         );
 
         let mut longer = SimEngine::new();

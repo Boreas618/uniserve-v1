@@ -1,4 +1,4 @@
-//! §4.4's call discipline, stated as the numbers a world can be asked for.
+//! §4.4's call discipline, stated as the numbers an epoch can be asked for.
 //!
 //! The design fixes how often the mechanism asks a policy: `observe` and
 //! `dispatch` once per step whatever they answer, and the limits once per
@@ -11,7 +11,7 @@
 //! limits, and one `observe` and one `dispatch` per step: `observe == step` and
 //! `dispatch == step + 1`.
 //!
-//! So the world here runs the real `fcfs` program over a pool that answers every
+//! So the epoch here runs the real `fcfs` program over a pool that answers every
 //! batch, serves a request through it, and then reads the counts. A mechanism
 //! that asked a step's halves twice, or asked a decision outside a step, would
 //! report it in the arithmetic; a policy that failed would report itself.
@@ -22,7 +22,7 @@
 //! dispatch and no observe.
 //!
 //! What this test does not state: how many *events* the mechanism records. §4.4
-//! makes those proportional to state changes, and the events a world emits are
+//! makes those proportional to state changes, and the events an epoch emits are
 //! asserted where they come from, request by request.
 
 use std::sync::{Arc, Mutex};
@@ -45,7 +45,7 @@ use worker::completion::Outcome;
 /// module on its own thread.
 const ANSWER: Duration = Duration::from_secs(30);
 
-/// How long a world may take to reach the step the test asks for.
+/// How long an epoch may take to reach the step the test asks for.
 const STEPS: Duration = Duration::from_secs(20);
 
 /// The token this pool samples for the `index`th call of every batch.
@@ -271,7 +271,7 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
     // made them, while the serving instance starts its own life: two
     // instantiations, two `limits`, and one `observe` and `dispatch` per step
     // the serving instance has taken. Stated as a relation between the counts, a
-    // step this world takes on its own does not change it.
+    // step this epoch takes on its own does not change it.
     install(&handle, &serving);
     let installed = reached(&handle, 0);
     let usage = installed.usage.expect("the policy has served");
@@ -296,7 +296,7 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
         "the limits are declared once in each instance's life"
     );
 
-    // Requests make the world step: the real program admits them, the pool
+    // Requests make the epoch step: the real program admits them, the pool
     // answers their batches, and every step is one `observe` and one
     // `dispatch`.
     handle
@@ -317,16 +317,16 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
     }
     assert!(
         tokens > 0,
-        "the request was served, so the world took the steps the counts are read on"
+        "the request was served, so the epoch took the steps the counts are read on"
     );
 
-    // The counters say what the world was asked: one observe and one dispatch
+    // The counters say what the epoch was asked: one observe and one dispatch
     // per step, and one evaluation of the decision set before the first of them.
     let progress = reached(&handle, 2);
     let usage = progress.usage.expect("the policy has served");
     assert!(
         progress.step >= 2,
-        "the world took steps: {}",
+        "the epoch took steps: {}",
         progress.step
     );
     assert_eq!(
@@ -343,7 +343,7 @@ fn a_step_asks_the_policy_to_observe_and_dispatch_once_each() {
         usage.calls,
         usage.decisions.each().map(|(_, calls)| calls).sum::<u64>(),
         "no call is counted twice: the epoch's total is its instances' decisions, summed, and \
-         this world's only trial is the one it serves under"
+         this epoch's only trial is the one it serves under"
     );
     assert!(
         matches!(

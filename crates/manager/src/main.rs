@@ -11,10 +11,10 @@
 //! - `status`: what each node serves.
 //! - `watch`: follows each node's event log until interrupted (attach and
 //!   detach).
-//! - `config`: each node's configuration, worlds and trial.
+//! - `config`: each node's configuration, epochs and trial.
 //! - `apply`: changes each node's configuration (`PUT /admin/config`): an
 //!   idle node (`uniserve serve` without a model) brings the deployment
-//!   up, a serving one changes it in place or in a new world on trial,
+//!   up, a serving one changes it in place or in a new epoch on trial,
 //!   which `--commit-after` commits once it served that long. Each node is
 //!   one service's leader: the manager decides the order of their updates
 //!   from the GPUs and hosts they share and the storage their plans
@@ -65,10 +65,10 @@ enum Command {
         #[arg(long)]
         from_start: bool,
     },
-    /// Each node's configuration, worlds and trial.
+    /// Each node's configuration, epochs and trial.
     Config,
     /// Change each node's configuration: an idle node brings the
-    /// deployment up, a serving one changes it in place or in a new world
+    /// deployment up, a serving one changes it in place or in a new epoch
     /// on trial. Nodes whose services share a GPU update one after another,
     /// each once its plan fits; a failure stops the nodes not started.
     Apply {
@@ -90,17 +90,17 @@ enum Command {
         /// Apply a configuration a rollback marked unavailable.
         #[arg(long)]
         force: bool,
-        /// Commit a node's new world once it served on trial this many
+        /// Commit a node's new epoch once it served on trial this many
         /// seconds, before a node that shares a GPU with it changes; a
         /// trial that rolled back meanwhile stops the nodes not started.
-        /// Without it, each new world stays on trial for the operator, and
+        /// Without it, each new epoch stays on trial for the operator, and
         /// the nodes that share its GPUs wait.
         #[arg(long)]
         commit_after: Option<u64>,
     },
-    /// Commit each node's world on trial.
+    /// Commit each node's epoch on trial.
     Commit,
-    /// Roll each node's world on trial back to the previous world.
+    /// Roll each node's epoch on trial back to the previous epoch.
     Rollback,
     /// Bring each node's deployment down.
     Shutdown {

@@ -220,7 +220,7 @@ pub struct ServerArgs {
     pub host_identity: String,
     /// Host running the engine and ranks whose configuration omits a host.
     /// Unset uses this node's identity. The engine can move to another
-    /// joined node through a world change; the daemon's identity stays local.
+    /// joined node through an epoch change; the daemon's identity stays local.
     #[arg(skip)]
     pub engine_host: Option<String>,
     /// Nodes of the deployment, each running one `uniserve serve`.
@@ -402,8 +402,8 @@ impl Default for AdminConfig {
 
 /// `current` with `target`'s daemon options (those `daemon_options_differ`
 /// compares): the configuration a hot restart of the daemon serves when an
-/// update changes both the daemon and what a world executes, before the
-/// daemon's successor changes the world.
+/// update changes both the daemon and what an epoch executes, before the
+/// daemon's successor changes the epoch.
 pub fn with_daemon_options(current: &ServerArgs, target: &ServerArgs) -> ServerArgs {
     ServerArgs {
         server_config: target.server_config.clone(),
@@ -438,16 +438,16 @@ pub fn daemon_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool 
         || current.program_server != target.program_server
 }
 
-/// How the deployment moves to a new configuration in another world
-/// (`update_config`, `PUT /admin/config`): what of the previous world its
+/// How the deployment moves to a new configuration in another epoch
+/// (`update_config`, `PUT /admin/config`): what of the previous epoch its
 /// trial keeps for a rollback, when the trial rolls back by itself, and how
-/// the transfers and the warming yield to the serving world. A value an
+/// the transfers and the warming yield to the serving epoch. A value an
 /// update states in its own assignments governs that update alone.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpdateConfig {
-    /// What the previous world keeps while the new one is on trial.
-    pub previous_world: PreviousWorld,
+    /// What the previous epoch keeps while the new one is on trial.
+    pub previous_epoch: PreviousEpoch,
     /// When a trial rolls back without the operator: a fatal worker error,
     /// the engine process's exit, a stalled job and non-finite logits always
     /// roll back; these thresholds, which have no default, add the rest.
@@ -477,7 +477,7 @@ pub const TRANSFER_SLOWDOWN: f64 = 0.1;
 impl Default for UpdateConfig {
     fn default() -> Self {
         Self {
-            previous_world: PreviousWorld::Parked,
+            previous_epoch: PreviousEpoch::Parked,
             rollback: RollbackConfig::default(),
             transfer_slowdown: TRANSFER_SLOWDOWN,
             cache_tail_tokens: None,
@@ -486,11 +486,11 @@ impl Default for UpdateConfig {
     }
 }
 
-/// What the previous world keeps during its successor's trial
-/// (`update_config.previous_world`).
+/// What the previous epoch keeps during its successor's trial
+/// (`update_config.previous_epoch`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PreviousWorld {
+pub enum PreviousEpoch {
     /// Its processes, communicators, graph storage, weights and the KV cache
     /// its successor maps: a rollback resumes it at once.
     Parked,
@@ -512,11 +512,11 @@ pub struct RollbackConfig {
     /// The share of the requests that end during the trial, in `(0, 1]`,
     /// past which it rolls back when they failed.
     pub failure_rate: Option<f64>,
-    /// How much longer than the previous world's before its promotion the
-    /// new world's average step may take, as a fraction (`0.2` for 20%).
+    /// How much longer than the previous epoch's before its promotion the
+    /// new epoch's average step may take, as a fraction (`0.2` for 20%).
     pub step_time_regression: Option<f64>,
-    /// How much lower than the previous world's before its promotion the
-    /// new world's token throughput may fall, as a fraction.
+    /// How much lower than the previous epoch's before its promotion the
+    /// new epoch's token throughput may fall, as a fraction.
     pub throughput_regression: Option<f64>,
     /// The span the step time and throughput are averaged over, before the
     /// promotion and during the trial; required with either regression.

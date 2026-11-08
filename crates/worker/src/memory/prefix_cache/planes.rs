@@ -23,13 +23,13 @@
 //!
 //! On a device, each value plane is made of segments along the units, each
 //! column's part of a segment one allocation, mapped back to back so the
-//! plane keeps its layout and addresses ([`PlaneLayout`]). A world's own
-//! units come first, split into at most [`SEGMENTS`] segments; a world that
+//! plane keeps its layout and addresses ([`PlaneLayout`]). An epoch's own
+//! units come first, split into at most [`SEGMENTS`] segments; an epoch that
 //! succeeds another on the same devices maps, after them, the segments its
 //! predecessor's worker of the same scope holds, read-only, so it reads the
 //! predecessor's pages and cannot change them, and takes them once the
 //! predecessor is gone ([`CachePlanes::take_inherited`]). The last segments
-//! are given back to the device when a successor world needs their storage,
+//! are given back to the device when a successor epoch needs their storage,
 //! or all of them while the deployment sleeps
 //! ([`CachePlanes::release_segments`]), and created again at their
 //! addresses after ([`CachePlanes::restore_segments`]); the engine allocates
@@ -120,7 +120,7 @@ fn granule_units(plane_bytes: u64, granularity: u64) -> Option<u32> {
 
 /// How a device pool's value planes are laid out along its units: its
 /// segments in unit order, each of whole allocation granules on every
-/// column, and which of them the predecessor world's worker writes.
+/// column, and which of them the predecessor epoch's worker writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlaneLayout {
     pub(crate) segments: Vec<LaidSegment>,
@@ -130,8 +130,8 @@ pub struct PlaneLayout {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LaidSegment {
     pub(crate) segment: ipc::CacheSegment,
-    /// Whether the predecessor world's worker writes the segment: it is
-    /// mapped read-only until the world's commit.
+    /// Whether the predecessor epoch's worker writes the segment: it is
+    /// mapped read-only until the epoch's commit.
     pub(crate) inherited: bool,
     /// Whether the planes create the segment when its storage does not exist:
     /// a successor's tail segments that its storage does not hold yet are
@@ -140,11 +140,11 @@ pub struct LaidSegment {
 }
 
 impl PlaneLayout {
-    /// A pool of `num_units` units that `world` creates whole: its units
+    /// A pool of `num_units` units that `epoch` creates whole: its units
     /// split into at most [`SEGMENTS`] equal segments ([`segment_layout`]),
     /// numbered from zero. `None` when the pool does not split.
     pub(crate) fn own(
-        world: u64,
+        epoch: u64,
         num_units: u32,
         plane_bytes: u64,
         granularity: u64,
@@ -154,7 +154,7 @@ impl PlaneLayout {
             segments: (0..count)
                 .map(|ordinal| LaidSegment {
                     segment: ipc::CacheSegment {
-                        world,
+                        epoch,
                         ordinal,
                         units,
                     },
@@ -165,10 +165,10 @@ impl PlaneLayout {
         })
     }
 
-    /// The pool of a world that succeeds `predecessor`: a head segment of
+    /// The pool of an epoch that succeeds `predecessor`: a head segment of
     /// its own of `head_units` (the sentinel and the warmup scratch), the
     /// predecessor's segments, read-only, then `tail_units` of its own in
-    /// at most [`SEGMENTS`] equal segments, which the world creates as its
+    /// at most [`SEGMENTS`] equal segments, which the epoch creates as its
     /// storage frees ([`CachePlanes::restore_segments`]) and takes in full
     /// once its predecessor is gone.
     ///
@@ -176,7 +176,7 @@ impl PlaneLayout {
     ///
     /// Fails when the head does not fill whole granules.
     pub(crate) fn successor(
-        world: u64,
+        epoch: u64,
         head_units: u32,
         tail_units: u32,
         plane_bytes: u64,
@@ -191,7 +191,7 @@ impl PlaneLayout {
         }
         let mut segments = vec![LaidSegment {
             segment: ipc::CacheSegment {
-                world,
+                epoch,
                 ordinal: 0,
                 units: head_units,
             },
@@ -211,7 +211,7 @@ impl PlaneLayout {
         if let Some((count, units)) = segment_layout(tail_units, plane_bytes, granularity) {
             segments.extend((0..count).map(|index| LaidSegment {
                 segment: ipc::CacheSegment {
-                    world,
+                    epoch,
                     ordinal: 1 + index,
                     units,
                 },
@@ -223,7 +223,7 @@ impl PlaneLayout {
     }
 
     /// Leaves the tail segments past the first `count` of them to be
-    /// created once the world's storage holds them.
+    /// created once the epoch's storage holds them.
     pub(crate) fn defer_tail(&mut self, count: usize) {
         for laid in self
             .segments
@@ -235,7 +235,7 @@ impl PlaneLayout {
         }
     }
 
-    /// The units and segments of the tail the world creates at once.
+    /// The units and segments of the tail the epoch creates at once.
     pub(crate) fn tail_segment_units(&self) -> Option<u32> {
         self.segments
             .iter()
@@ -250,8 +250,8 @@ impl PlaneLayout {
     }
 
     /// The exact segments a rank's planes were made of: as the serving
-    /// worker of a standby rank group's scope holds them, or as a world's
-    /// rank held them before its relaunch; its own world's, none inherited.
+    /// worker of a standby rank group's scope holds them, or as an epoch's
+    /// rank held them before its relaunch; its own epoch's, none inherited.
     /// The segments past the ones held are left absent.
     pub(crate) fn adopted(table: &ipc::CacheTable) -> Self {
         Self {
@@ -301,7 +301,7 @@ impl PlaneLayout {
 /// The segments of a device pool's value planes and the first one given
 /// back (`segments.len()` while none is).
 struct Segmenting {
-    /// The segments in unit order, each with whether the predecessor world
+    /// The segments in unit order, each with whether the predecessor epoch
     /// still writes it.
     segments: Vec<(ipc::CacheSegment, AtomicBool)>,
     released_from: AtomicU32,
@@ -711,8 +711,8 @@ impl CachePlanes {
         })
     }
 
-    /// The units the planes map read-only from the predecessor world's
-    /// planes; empty once the world took them, or for planes of its own.
+    /// The units the planes map read-only from the predecessor epoch's
+    /// planes; empty once the epoch took them, or for planes of its own.
     pub(crate) fn inherited(&self) -> std::ops::Range<u32> {
         let Some(segmenting) = &self.segmenting else {
             return 0..0;
@@ -735,9 +735,9 @@ impl CachePlanes {
         2 * u64::from(self.plan.columns) * self.plan.plane_bytes
     }
 
-    /// Takes the segments mapped read-only from the predecessor world, whose
+    /// Takes the segments mapped read-only from the predecessor epoch, whose
     /// writer is gone, through `retained`: they become writable at unchanged
-    /// addresses and the world's own. Returns how many it took.
+    /// addresses and the epoch's own. Returns how many it took.
     pub(crate) fn take_inherited(
         &self,
         retained: &crate::memory::retained::Retained,
@@ -753,7 +753,7 @@ impl CachePlanes {
 
     /// Maps the inherited segments that hold exactly the units of
     /// `borrowed` writable through `retained`: the predecessor lent them for
-    /// the world's trial, and the engine allocates their units as its own.
+    /// the epoch's trial, and the engine allocates their units as its own.
     /// Returns how many segments it mapped writable.
     ///
     /// # Errors
@@ -784,7 +784,7 @@ impl CachePlanes {
             }
         }
         // A range that splits a segment would leave part of it read-only to
-        // the world while the engine allocates all of its units.
+        // the epoch while the engine allocates all of its units.
         let requested: u32 = borrowed.iter().map(|range| range.end - range.start).sum();
         if covered != requested {
             return Err(Error::Invalid(format!(
@@ -878,7 +878,7 @@ impl CachePlanes {
             .any(|(_, inherited)| inherited.load(Ordering::Acquire))
         {
             return Err(Error::Invalid(
-                "the predecessor world's segments are not given back by its successor".into(),
+                "the predecessor epoch's segments are not given back by its successor".into(),
             ));
         }
         let peers = Storage::peers(device)?;
@@ -1621,7 +1621,7 @@ impl CachePlanes {
             } else if from == to {
                 Some("the destination is the source")
             } else if inherited.contains(&to.0) {
-                Some("the destination is an inherited read-only unit of the predecessor world")
+                Some("the destination is an inherited read-only unit of the predecessor epoch")
             } else {
                 None
             };
@@ -1933,7 +1933,7 @@ mod layer_view_tests {
         assert!(full > 0);
 
         let segment = |ordinal| ipc::CacheSegment {
-            world: 1,
+            epoch: 1,
             ordinal,
             units: 4,
         };

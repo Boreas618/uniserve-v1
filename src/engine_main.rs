@@ -130,14 +130,14 @@ pub(crate) struct Epoch {
     /// The host identity of the node this process runs on, which the daemon knows and which the
     /// Storage Server's claim states.
     pub host: String,
-    /// The world of the epoch this process succeeds, whose storages it maps until it is promoted.
-    pub predecessor_world: Option<u64>,
+    /// The epoch this process succeeds, whose storages it maps until it is promoted.
+    pub predecessor_epoch: Option<u64>,
     /// The routed experts' distribution this epoch loads (§7.6): what a redistribution committed,
     /// which a relaunch and a standby load again.
     pub experts: BTreeMap<String, Vec<u32>>,
     /// The deployment's always-on profiling (`profiling_config`).
     pub profiling: proto::config::ProfilingConfig,
-    /// The KV cache the world this process succeeds holds, by worker group.
+    /// The KV cache the epoch this process succeeds holds, by worker group.
     pub predecessor_cache: Vec<proto::request::wire::CacheSegments>,
 }
 
@@ -455,7 +455,7 @@ fn load_rank(
                 .segments
                 .iter()
                 .map(|segment| ipc::CacheSegment {
-                    world: segment.world,
+                    epoch: segment.epoch,
                     ordinal: segment.ordinal,
                     units: segment.units,
                 })
@@ -463,20 +463,20 @@ fn load_rank(
             held: cache.held,
         });
     let model_runner = model_runner.sharing_cache_of(
-        epoch.predecessor_world.filter(|_| launch.standby()),
+        epoch.predecessor_epoch.filter(|_| launch.standby()),
         adopted,
     );
     let host = HostGroup::connect(rendezvous, index, count, STARTUP_TIMEOUT)
         .context("joining this process's ranks")?;
     // §8: the rank's Storage Server and its claim are the node's, which the daemon answered for; the
-    // retained weights outlive every world of the epoch, so the store is built once, before the
-    // model loads, and keeps what it maps for the epoch's life.
+    // retained weights outlive the epoch, so the store is built once, before the model loads,
+    // and keeps what it maps for the process's life.
     let client = Retained::connect(
         storage,
         &launch.group,
         model_runner.rank(),
         epoch.generation,
-        epoch.predecessor_world,
+        epoch.predecessor_epoch,
     )
     .context("connecting to the Storage Server")?;
     // A weight's region is one device's address, so the store maps on the device this rank's model
@@ -578,7 +578,7 @@ fn claim(
                 // A server the daemon starts for this claim takes the deployment's connector settings;
                 // the main process has none of its own to state.
                 server_arguments: Vec::new(),
-                world: launch.world,
+                epoch: launch.epoch,
                 retire: Vec::new(),
             },
         )),
@@ -596,7 +596,7 @@ fn claim(
         claim: claim_token(&claimed.claim)?,
         // The host KV cache is the deployment's decision, from the build config: a rank whose
         // deployment keeps a host tier maps a page pool per cache group, and one that does not
-        // maps nothing. Stating `false` for a deployment that asked for it would size the world's
+        // maps nothing. Stating `false` for a deployment that asked for it would size the epoch's
         // host KV cache with no rank holding a page of it.
         host_kv_cache,
         tcp: (!claimed.tcp.is_empty()).then_some(claimed.tcp),
@@ -606,7 +606,7 @@ fn claim(
         // hosts needs them before a cross-host weight transfer can be planned, and until then this
         // rank maps what its own node holds (a named gap for 7.4, not a default).
         peers: Vec::new(),
-        world: launch.world,
+        epoch: launch.epoch,
         // The standby role is the epoch layer's (§2.5, §7.4): a standby maps its scope's storage
         // read-only until it is promoted, and claiming it writable would give the scope two
         // writers. The launch file states the role, so the process never has to infer it.
@@ -940,12 +940,12 @@ impl MainProcess {
         )?;
         // The request interface's handshake: this process says who it is, and the
         // daemon answers with the epoch this node serves (§2.3).
-        // The world this rank belongs to is the daemon's, and both of its facts decide the storage
-        // this process claims and the peers it exchanges products with. A zero world names no
-        // world, and a peer list on a world of one is a second node this epoch does not have: each
+        // The epoch this rank belongs to is the daemon's, and both of its facts decide the storage
+        // this process claims and the peers it exchanges products with. A zero epoch names no
+        // epoch, and a peer list on a world of one is a second node this epoch does not have: each
         // is refused here, by name, rather than at the claim or the first transfer.
-        if launch.world == 0 {
-            bail!("the launch file states world 0, which names no world for this rank to serve");
+        if launch.epoch == 0 {
+            bail!("the launch file states epoch 0, which names no epoch for this rank to serve");
         }
         if launch.world_size == 1 && !launch.peers.is_empty() {
             bail!(
@@ -1000,8 +1000,8 @@ impl MainProcess {
         connected.watch_process(Some(process.connection.descriptor()));
 
         // §8: the rank's Storage Server and its claim are the node's, which the daemon answers for;
-        // the retained weights outlive every world of the epoch, so the store is built once, before
-        // the model loads, and keeps what it maps for the epoch's life.
+        // the retained weights outlive the epoch, so the store is built once, before the model
+        // loads, and keeps what it maps for the process's life.
         // A host tier is the build config's, and it needs prefix caching to have pages to keep.
         let host_kv_cache = build.kv_cache.host_tier && build.kv_cache.prefix_caching;
         // CUPTI accepts one subscriber per process, and what it observes begins at the subscription,
@@ -1328,7 +1328,7 @@ impl MainProcess {
 
     /// §2.5: a standby that has prepared announces itself and executes nothing until promoted.
     ///
-    /// Its schedulers hold no request and have served no world, so parking them would ask for a
+    /// Its schedulers hold no request and have served no epoch, so parking them would ask for a
     /// cache handover that belongs to a drained epoch; what makes this a park is that nothing is
     /// admitted. `Promote` is the command that ends it.
     ///
@@ -3909,7 +3909,7 @@ impl MainProcess {
         let bound = self.watchdog.stall_bound();
         for (scheduler, cache) in self.schedulers.iter().zip(parked) {
             // A resumed epoch recomputes from the tokens the frontend resubmits rather than lending
-            // from a predecessor: it is the same world, and the requests it ended at the drain are
+            // from a predecessor: it is the same epoch, and the requests it ended at the drain are
             // new requests to it.
             scheduler
                 .promote(cache, true, false)
@@ -4333,7 +4333,7 @@ impl MainProcess {
                 }
                 return Ok(None);
             }
-            // The worker era's park, resume and trial commit move a worker world between
+            // The worker era's park, resume and trial commit move a worker epoch between
             // processes. The epoch parks, resumes and commits through the process connection, in
             // front of the frontend rather than behind it (§2.5, §7.4).
             Some(proto::request::wire::engine_command::Kind::Park(park)) => Some(
@@ -4406,10 +4406,10 @@ impl MainProcess {
                         id: describe.id,
                         error,
                         segments,
-                        storage_world: self
+                        storage_epoch: self
                             .storage
                             .first()
-                            .map_or(0, |storage| storage.storage_world()),
+                            .map_or(0, |storage| storage.storage_epoch()),
                     },
                 ))
             }
@@ -4867,7 +4867,7 @@ impl MainProcess {
                         .segments
                         .into_iter()
                         .map(|segment| proto::request::wire::CacheSegment {
-                            world: segment.world,
+                            epoch: segment.epoch,
                             ordinal: segment.ordinal,
                             units: segment.units,
                         })
@@ -8171,7 +8171,7 @@ fn handshake(control: &mut Control, launch: &EngineArgs) -> Result<Epoch> {
     let predecessor = launch.predecessor.as_ref();
     Ok(Epoch {
         generation: 0,
-        predecessor_world: predecessor.map(|predecessor| predecessor.world),
+        predecessor_epoch: predecessor.map(|predecessor| predecessor.epoch),
         predecessor_cache: predecessor
             .map(|predecessor| predecessor.segments.clone())
             .unwrap_or_default(),

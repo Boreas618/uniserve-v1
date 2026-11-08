@@ -71,10 +71,10 @@ pub struct CapacityRequest {
     /// Whether warmup storage is mapped writable and the pool's remaining
     /// virtual addresses are reserved for staged transfer.
     pub stage_cache: bool,
-    /// The predecessor world's cache, whose segments the planes map read-only.
+    /// The predecessor epoch's cache, whose segments the planes map read-only.
     pub predecessor: Option<ipc::PredecessorCache>,
-    /// This rank's world.
-    pub world: u64,
+    /// This rank's epoch.
+    pub epoch: u64,
     /// Ranks of the deployment.
     pub world_size: usize,
     /// Decode graph batch sizes, from the graph plan.
@@ -341,7 +341,7 @@ pub struct RankFacts<'a> {
     pub device: Device,
     /// The rank's host endpoint, as it advertises itself.
     pub host: &'a str,
-    pub world: u64,
+    pub epoch: u64,
     /// The deployment's rank count, which no peer list states.
     pub world_size: usize,
     /// Requests the scheduler may have in flight, which the daemon places.
@@ -360,7 +360,7 @@ pub struct RankFacts<'a> {
     /// The tokens the deployment fixed the cache at (`kv_cache_config.max_tokens`), or `None` to
     /// size it from storage.
     pub max_total_tokens: Option<usize>,
-    /// The planes a standby adopts: the cache of the world it stands by for, which it maps and did
+    /// The planes a standby adopts: the cache of the epoch it stands by for, which it maps and did
     /// not size. `None` for a rank that lays its planes out itself.
     pub segments: Option<ipc::CacheTable>,
     /// Fraction of the device's storage the epoch may hold.
@@ -743,7 +743,7 @@ fn plan(
         segments: facts.segments.clone(),
         stage_cache: false,
         predecessor: None,
-        world: facts.world,
+        epoch: facts.epoch,
         world_size: facts.world_size,
         decode_graph_batch_sizes: Vec::new(),
         prefill_graph_token_sizes: Vec::new(),
@@ -954,7 +954,7 @@ impl TokenLayout {
                 "automatic CUDA KV sizing requires a host storage grant".into(),
             ));
         }
-        // A successor world maps its predecessor's segments beside units of
+        // A successor epoch maps its predecessor's segments beside units of
         // its own, which alone its grant pays for; a standby rank group's
         // worker adopts the segments of the worker it stands by for.
         let inherited: u64 = request.predecessor.as_ref().map_or(0, |predecessor| {
@@ -1037,7 +1037,7 @@ impl TokenLayout {
                         "rounded the KV cache to whole segments"
                     );
                     capacity.num_units = u64::from(rounded);
-                    PlaneLayout::own(request.world, rounded, cache.plane_bytes, granularity)
+                    PlaneLayout::own(request.epoch, rounded, cache.plane_bytes, granularity)
                 }
             };
             if let Some(layout) = &planes {
@@ -1118,7 +1118,7 @@ impl TokenLayout {
             granularity,
         );
         let mut layout = PlaneLayout::successor(
-            request.world,
+            request.epoch,
             head,
             tail,
             cache.plane_bytes,
@@ -1135,11 +1135,11 @@ impl TokenLayout {
             inherited,
             tail,
             created_tail_segments = created,
-            "laid out a successor world's KV cache"
+            "laid out a successor epoch's KV cache"
         );
         if now < head {
             return Err(Error::Resource(
-                "the device holds less than a successor world's head cache segment",
+                "the device holds less than a successor epoch's head cache segment",
             ));
         }
         Ok(layout)
@@ -1296,7 +1296,7 @@ mod tests {
             segments: None,
             stage_cache: false,
             predecessor: None,
-            world: 0,
+            epoch: 0,
             world_size: 1,
             decode_graph_batch_sizes: Vec::new(),
             prefill_graph_token_sizes: Vec::new(),
@@ -1338,7 +1338,7 @@ mod tests {
         RankFacts {
             device: Device::Cuda(DeviceId(0)),
             host: "rank",
-            world: 0,
+            epoch: 0,
             world_size: 1,
             queue_depth: 2,
             block_size: Some(64),

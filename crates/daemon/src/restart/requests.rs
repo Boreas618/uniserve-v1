@@ -34,7 +34,7 @@ pub(super) type Writer = Arc<Mutex<Channel>>;
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct Attachment {
     pub engine: u64,
-    pub world: u64,
+    pub epoch: u64,
     /// A new front uses this interval; an existing front keeps its counter.
     pub first_request: Option<u64>,
     pub kept: Option<Kept>,
@@ -74,7 +74,7 @@ impl Requests {
         replica: usize,
         requests: String,
         known_engine: Option<u64>,
-        previous_world: Option<u64>,
+        previous_epoch: Option<u64>,
     ) -> Result<Attachment, SubmitError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (answer, answered) = oneshot::channel();
@@ -86,7 +86,7 @@ impl Requests {
                 replica,
                 requests,
                 known_engine,
-                previous_world,
+                previous_epoch,
             },
             &[],
         ) {
@@ -129,16 +129,16 @@ impl RemoteHold {
         &self,
         requests: String,
         known_engine: Option<u64>,
-        previous_world: Option<u64>,
+        previous_epoch: Option<u64>,
     ) -> Result<Attachment, SubmitError> {
         self.requests
-            .attach(self.replica, requests, known_engine, previous_world)
+            .attach(self.replica, requests, known_engine, previous_epoch)
             .await
     }
 
     pub(crate) async fn ready(
         &self,
-        previous_world: Option<u64>,
+        previous_epoch: Option<u64>,
     ) -> Result<(Arc<EngineClient>, Option<Kept>), SubmitError> {
         // Concurrent continuations share one front and its request counter.
         let mut client = self.client.lock().await;
@@ -146,16 +146,16 @@ impl RemoteHold {
             .attach(
                 self.control.request_address().to_owned(),
                 client.engine(),
-                previous_world,
+                previous_epoch,
             )
             .await?;
         if let Some(first) = attachment.first_request {
             let control = Arc::clone(&self.control);
-            let world = attachment.world;
+            let epoch = attachment.epoch;
             let engine = attachment.engine;
             let attached = tokio::task::spawn_blocking(move || {
                 let client =
-                    control.adopt(engine, engine + 1, world, None, Box::new(|_, _, _| {}))?;
+                    control.adopt(engine, engine + 1, epoch, None, Box::new(|_, _, _| {}))?;
                 client.number_requests_from(first);
                 Ok::<_, anyhow::Error>(client)
             })

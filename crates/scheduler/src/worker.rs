@@ -884,7 +884,7 @@ pub struct ExecuteError {
 
 impl ExecuteError {
     /// The classification of a batch some of whose calls computed
-    /// non-finite logits (`ErrorCode::NumericalFault`), which fails a world
+    /// non-finite logits (`ErrorCode::NumericalFault`), which fails an epoch
     /// on trial as a whole; `None` for a batch whose failed calls failed
     /// otherwise, whose failure the scheduler reconciles by their requests
     /// alone.
@@ -965,36 +965,36 @@ pub trait Worker: Send {
     fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, WorkerError>;
     /// Closes the worker and its physical workers.
     fn close(&mut self) -> Result<(), WorkerError>;
-    /// Commits the workers' world: each worker takes the predecessor
-    /// world's storage it mapped read-only. Returns what each worker
+    /// Commits the workers' epoch: each worker takes the predecessor
+    /// epoch's storage it mapped read-only. Returns what each worker
     /// reported. The default suits a worker whose workers succeed no
-    /// world.
+    /// epoch.
     fn commit(&mut self) -> Result<Vec<String>, WorkerError> {
         Ok(Vec::new())
     }
-    /// Publishes this world's immutable pages after its commit decision.
+    /// Publishes this epoch's immutable pages after its commit decision.
     /// Workers without shared storage have nothing to publish.
-    fn publish_world(&mut self) -> Result<(), WorkerError> {
+    fn publish_epoch(&mut self) -> Result<(), WorkerError> {
         Ok(())
     }
-    /// Ends the storage of every world of `worlds` on the nodes of the
+    /// Ends the storage of every epoch of `epochs` on the nodes of the
     /// worker's workers. The default suits a worker that retains no
     /// storage.
-    fn retire(&mut self, worlds: &[u64]) -> Result<(), WorkerError> {
-        let _ = worlds;
+    fn retire(&mut self, epochs: &[u64]) -> Result<(), WorkerError> {
+        let _ = epochs;
         Ok(())
     }
-    /// Keeps the weights alone of every world of `worlds` on the nodes of
+    /// Keeps the weights alone of every epoch of `epochs` on the nodes of
     /// the worker's workers, in host storage when `to_host`, and returns
     /// each node's report. The default suits a worker that retains no
     /// storage, which has no node to report.
     fn keep_weights(
         &mut self,
-        worlds: &[u64],
+        epochs: &[u64],
         to_host: bool,
         cache_keys: &[Vec<u8>],
     ) -> Result<Vec<String>, WorkerError> {
-        let _ = (worlds, to_host, cache_keys);
+        let _ = (epochs, to_host, cache_keys);
         Ok(Vec::new())
     }
     /// Halves, or restores when not `halve`, the byte budgets of the links

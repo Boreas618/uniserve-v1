@@ -2,10 +2,10 @@
 //!
 //! The host's Storage Server keeps one ledger per GPU for the deployment
 //! (`storage::GpuLedger`): the quota `⌊total × fraction⌋` of the whole GPU,
-//! and every item the deployment's worlds and the Transfer Server hold on it
+//! and every item the deployment's epochs and the Transfer Server hold on it
 //! (weights, each KV cache segment, the other exclusive storages, graph
 //! pools, process storage, staging, the Transfer Server's context), each once
-//! however many worlds map it. Every worker reports its cache's GPU's ledger
+//! however many epochs map it. Every worker reports its cache's GPU's ledger
 //! with its segments (`uniserve.cache_storage`), and two limits follow from it:
 //!
 //! - **Room** ([`room`]): device storage beside the cache, a profiling
@@ -37,13 +37,13 @@ pub(super) struct CacheStorage {
     /// The worker's host.
     #[serde(default)]
     pub(super) host: String,
-    /// The worker's scope and world, which name its entries in the ledger.
+    /// The worker's scope and epoch, which name its entries in the ledger.
     #[serde(default)]
     pub(super) scope: Option<Scope>,
     #[serde(default)]
-    pub(super) world: Option<u64>,
+    pub(super) epoch: Option<u64>,
     /// The deployment's ledger of the cache's GPU; `None` for a worker that
-    /// keeps its storage itself, which no other world shares.
+    /// keeps its storage itself, which no other epoch shares.
     #[serde(default)]
     pub(super) ledger: Option<GpuLedger>,
 }
@@ -68,7 +68,7 @@ impl CacheStorage {
                     && entry.scope == self.scope
                     && entry.segment
                         == Some(storage::Segment {
-                            world: segment.world,
+                            epoch: segment.epoch,
                             ordinal: segment.ordinal,
                         })
             })
@@ -122,7 +122,7 @@ pub(super) fn room(report: &CacheStorage, bytes: u64, floor: u32) -> Result<Room
     let gpu = storage::protocol::gpu_name(&ledger.gpu);
     let quota = ledger
         .quota
-        .ok_or_else(|| format!("no world states a quota in the storage ledger of GPU {gpu}"))?;
+        .ok_or_else(|| format!("no epoch states a quota in the storage ledger of GPU {gpu}"))?;
     // A process outside the deployment may hold more of the device than the
     // quota leaves it.
     let available = quota.saturating_sub(ledger.used()).min(report.free_bytes);
@@ -180,10 +180,10 @@ pub(super) fn room_refusal(rooms: &[Room]) -> String {
 
 /// How many of the segments of `report` past those it holds fit the
 /// ledger's room now, and the device's free storage; with `released`, also
-/// what the processes of the other world book, which end as they exit (a
-/// previous world kept as its weights).
+/// what the processes of the other epoch book, which end as they exit (a
+/// previous epoch kept as its weights).
 pub(super) fn growable(report: &CacheStorage, released: bool) -> u32 {
-    let (Some(ledger), Some(world)) = (&report.ledger, report.world) else {
+    let (Some(ledger), Some(epoch)) = (&report.ledger, report.epoch) else {
         return 0;
     };
     let Some(quota) = ledger.quota else {
@@ -191,7 +191,7 @@ pub(super) fn growable(report: &CacheStorage, released: bool) -> u32 {
     };
     let ending = if released {
         ledger.bytes(|entry| {
-            entry.item.booked() && !entry.worlds.is_empty() && !entry.worlds.contains(&world)
+            entry.item.booked() && !entry.epochs.is_empty() && !entry.epochs.contains(&epoch)
         })
     } else {
         0

@@ -710,7 +710,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
         &options.socket,
         Role::Head {
             deployment: options.deployment.clone(),
-            world: 0,
+            epoch: 0,
         },
     )?;
     let claim = head.claim(0, vec![scope.clone()], Vec::new())?;
@@ -720,7 +720,7 @@ fn run(options: &Options) -> anyhow::Result<()> {
             scope,
             generation: 1,
             claim,
-            world: 0,
+            epoch: 0,
         },
     )?;
 

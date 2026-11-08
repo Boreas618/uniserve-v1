@@ -12,12 +12,12 @@ use serde::{Deserialize, Serialize};
 use crate::leader::UpdateError;
 use crate::options::ServerArgs;
 
-/// How the requests in flight at a promotion continue when the new world
+/// How the requests in flight at a promotion continue when the new epoch
 /// computes other numerics than the one they ran on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InFlight {
-    /// Each continues with the state it reached, which the new world reads
+    /// Each continues with the state it reached, which the new epoch reads
     /// as its own; the pages it writes afterwards reach no shared tier.
     #[default]
     Keep,

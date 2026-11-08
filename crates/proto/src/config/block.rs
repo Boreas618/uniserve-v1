@@ -10,8 +10,8 @@
 //! deals independent units among them.
 //!
 //! [`BlockConfig::validate`] checks membership and parallel degrees for launch
-//! and worker registration; process-world bounds belong to the owner of that
-//! world. The same value crosses worker IPC in the worker's capability message.
+//! and worker registration; process-epoch bounds belong to the owner of that
+//! epoch. The same value crosses worker IPC in the worker's capability message.
 
 use std::collections::HashSet;
 
@@ -246,7 +246,7 @@ impl BlockConfig {
     }
 
     /// Check a block's membership and its independent parallel degrees.
-    /// Process-world bounds are checked by the caller that owns that world.
+    /// Process-epoch bounds are checked by the caller that owns that epoch.
     pub fn validate(&self) -> Result<(), BlockConfigError> {
         if self.ranks.is_empty()
             || self.ranks.iter().collect::<HashSet<_>>().len() != self.ranks.len()

@@ -1,7 +1,7 @@
 //! Requests' encoder outputs in the host encoder pool, over the simulator
 //! and an in-process Storage Server: an output the pool does not hold is
 //! computed and stored, and a request that reads the same inputs (another,
-//! or the same one resumed, on another world) reads it from the pool
+//! or the same one resumed, on another epoch) reads it from the pool
 //! instead of computing it. A video request's encoder outputs, and an image
 //! request's encodings of its input images and of the images it generated.
 
@@ -31,7 +31,7 @@ use crate::support::video::{video_request, video_worker};
 const PAGE_BYTES: u64 = 4096;
 
 /// A scheduler of a simulated worker whose rank maps a host encoder pool of
-/// a Storage Server, with its loop running: one world of a deployment.
+/// a Storage Server, with its loop running: one epoch of a deployment.
 struct Encoders {
     handle: CommandSender,
     thread: thread::JoinHandle<bool>,
@@ -39,7 +39,7 @@ struct Encoders {
 }
 
 impl Encoders {
-    /// The world of `sim`, whose rank reports the encoder pool `pool` of
+    /// The epoch of `sim`, whose rank reports the encoder pool `pool` of
     /// `server`, which stores the outputs `identities` names.
     fn start(
         mut sim: SimEngine,
@@ -293,23 +293,23 @@ fn image_request(id: u64, image: u8, seed: u64, cache: CachePolicy) -> Generatio
     }
 }
 
-/// Runs `request` to its end on a world of its own, whose encoder cache
+/// Runs `request` to its end on an epoch of its own, whose encoder cache
 /// starts empty, over `server`'s pool `pool`; returns its events and the
-/// batches the world submitted.
+/// batches the epoch submitted.
 fn run_image(
     server: &StorageServer,
     pool: u64,
     request: GenerationRequest,
 ) -> (Vec<Event>, Vec<ExecutionBatch>) {
-    let world = Encoders::start(image_worker(), server, pool, &IMAGE_ENCODERS);
+    let epoch = Encoders::start(image_worker(), server, pool, &IMAGE_ENCODERS);
     let id = request.request_id;
-    let mut events = world.handle.submit(request).unwrap();
+    let mut events = epoch.handle.submit(request).unwrap();
     let read = drain(&mut events);
     assert!(
         matches!(read.last(), Some(Event::Finished { .. })),
         "request {id:?} finished: {read:?}"
     );
-    (read, world.stop())
+    (read, epoch.stop())
 }
 
 /// How request `id`'s input image encodings treated the host encoder pool:
@@ -325,23 +325,23 @@ fn input_encodings(batches: &[ExecutionBatch], id: u64) -> (Option<bool>, Option
     (of(MediaCall::LatentEncoding), of(MediaCall::VisionEncoding))
 }
 
-/// An input image's encodings that no world stored are computed and
-/// written to the pool; another world reads them instead of encoding. The
+/// An input image's encodings that no epoch stored are computed and
+/// written to the pool; another epoch reads them instead of encoding. The
 /// vision features follow the image alone, so a request of another seed
 /// reads them; the latent features sample their posterior at the request's
 /// seed and draw, so a request of another seed computes its own. Another
 /// image computes both, and a request whose cache policy neither reads nor
 /// writes cached outputs encodes without the pool; every request finishes.
 #[test]
-fn an_image_encoding_is_computed_when_missing_and_read_on_another_world() {
+fn an_image_encoding_is_computed_when_missing_and_read_on_another_epoch() {
     let mut server = StorageServer::start(1 << 20);
     let pool = server.encoder_pool("sim", PAGE_BYTES, 64);
     // Whether a request reads and writes cached outputs.
     let shared = (true, true);
     let uncached = (false, false);
-    // Each request runs on a world of its own, once the one before
+    // Each request runs on an epoch of its own, once the one before
     // finished, so the outputs it wrote were committed before the next
-    // looks them up and no world's encoder cache serves another's request.
+    // looks them up and no epoch's encoder cache serves another's request.
     let runs = [
         (1, 5, 5, shared, (Some(false), Some(false))),
         (2, 5, 5, shared, (Some(true), Some(true))),
@@ -385,13 +385,13 @@ fn continuation(mut request: GenerationRequest, events: &[Event]) -> GenerationR
 /// A request's feedback encoding of the image it generated, planned once
 /// the image's values reached the engine (a simulated rank runs one batch
 /// at a time), is computed and written to the pool. The request continued
-/// on another world rebuilds its context from its facts: its input image's
+/// on another epoch rebuilds its context from its facts: its input image's
 /// encodings and the feedback encoding of the image it carries, at the same
-/// draw, are read from the pool instead of encoded. Continued on a world
+/// draw, are read from the pool instead of encoded. Continued on an epoch
 /// whose pool holds none of them, it computes and stores them all, and a
 /// further continuation there reads them; every run finishes.
 #[test]
-fn a_continued_image_request_reads_its_images_encodings_on_another_world() {
+fn a_continued_image_request_reads_its_images_encodings_on_another_epoch() {
     let mut server = StorageServer::start(1 << 20);
     let pool = server.encoder_pool("sim", PAGE_BYTES, 64);
     let request = image_request(1, 5, 5, CachePolicy::default());

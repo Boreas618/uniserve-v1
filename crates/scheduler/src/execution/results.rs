@@ -538,9 +538,9 @@ impl Scheduler {
         }
 
         // A call whose logits held a NaN or an infinity is a fault of the
-        // forward. Outside a trial it fails its request alone; a world on
+        // forward. Outside a trial it fails its request alone; an epoch on
         // trial applies nothing of the batch and fails as a whole, and its
-        // requests continue on the previous world (`hand_back_requests`).
+        // requests continue on the previous epoch (`hand_back_requests`).
         let faulted: Vec<u64> = report
             .calls
             .iter()
@@ -556,7 +556,7 @@ impl Scheduler {
                 tracing::error!(
                     batch_id = result_batch_id,
                     requests = ?faulted,
-                    "the world on trial computed non-finite logits"
+                    "the epoch on trial computed non-finite logits"
                 );
                 self.fail(format!(
                     "batch {result_batch_id} computed non-finite logits for requests {faulted:?}"

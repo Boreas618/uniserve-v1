@@ -3,7 +3,7 @@
 //! A rank answers the engine's `Info` request with a [`MainProcessInfo`]: what only
 //! the loaded rank knows (its endpoint, supported calls, capacities and
 //! component outputs). The engine launched the rank and keeps what it launched
-//! it with (world, devices, transfer mechanisms, queue depth and component
+//! it with (epoch, devices, transfer mechanisms, queue depth and component
 //! layout), so the report does not echo those back. The engine requires
 //! every rank of a group to describe the group alike and a replacement rank to
 //! report an identical description apart from its endpoint; the worker then
@@ -43,7 +43,7 @@ pub struct PrefixCacheInfo {
     /// allocates no unit of the segments after, whose storage was given back.
     #[serde(default)]
     pub held_segments: u32,
-    /// The units the planes map read-only from the predecessor world's
+    /// The units the planes map read-only from the predecessor epoch's
     /// planes, `[inherited_start, inherited_start + inherited_units)`: they
     /// hold the predecessor's pages, which the engine reads once its index
     /// is imported and allocates only once the predecessor is gone and the
@@ -61,7 +61,7 @@ pub struct PrefixCacheInfo {
     /// The bytes one token of the rank's pages takes in the host KV cache,
     /// over every cache group (a group's page bytes over its block size,
     /// rounded up); zero for a rank that copies no page through it. The
-    /// engine sizes the world's host KV cache in tokens from them
+    /// engine sizes the epoch's host KV cache in tokens from them
     /// (`uniserve.host_cache`).
     #[serde(default)]
     pub host_token_bytes: u64,
@@ -112,19 +112,19 @@ impl PrefixCacheInfo {
 }
 
 /// One segment of a rank's KV cache planes: an allocation of whole units on
-/// every plane, which a world created and the Storage Server retains.
+/// every plane, which an epoch created and the Storage Server retains.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CacheSegment {
-    /// The world that created the segment's storage.
-    pub world: u64,
-    /// The segment's ordinal among those its world created.
+    /// The epoch that created the segment's storage.
+    pub epoch: u64,
+    /// The segment's ordinal among those its epoch created.
     pub ordinal: u32,
     /// The units the segment holds.
     pub units: u32,
 }
 
 /// The exact segments a rank's KV cache planes are made of, and how many of
-/// the leading ones exist: a relaunched rank of the same world, or a
+/// the leading ones exist: a relaunched rank of the same epoch, or a
 /// standby rank group's, lays its planes out alike and takes them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CacheTable {
@@ -133,13 +133,13 @@ pub struct CacheTable {
     pub held: u32,
 }
 
-/// What a rank of a world that succeeds another maps of the predecessor's
-/// KV cache: the predecessor's world, and the segments its rank of the same
+/// What a rank of an epoch that succeeds another maps of the predecessor's
+/// KV cache: the predecessor's epoch, and the segments its rank of the same
 /// scope holds, in unit order, which the rank maps read-only after a head
 /// segment of its own.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PredecessorCache {
-    pub world: u64,
+    pub epoch: u64,
     /// The segments the predecessor's planes hold.
     pub segments: Vec<CacheSegment>,
     /// The units of the predecessor's planes, those of the segments it gave
@@ -184,7 +184,7 @@ pub struct LatentPoolInfo {
     /// request's layout, the slot's pages, the rank's coordinate in the
     /// denoiser's mesh and its rows of every layout startup prepares; for
     /// an image denoiser, whose every rank holds whole latents, the page
-    /// encoding alone. A rank of another world with the same share holds
+    /// encoding alone. A rank of another epoch with the same share holds
     /// what this rank held of any trajectory.
     pub region: [u8; 32],
     /// The identity of what the rank's trajectories are computed with: the
@@ -200,7 +200,7 @@ pub struct LatentPoolInfo {
 /// The host encoder pool of a rank that executes encoder calls (a video
 /// model's encoders, an image model's vision and latent encoders): the
 /// Storage Server page pool, shared by the deployment's ranks on its host in
-/// every world of the deployment, that holds encoder outputs keyed by what
+/// every epoch of the deployment, that holds encoder outputs keyed by what
 /// the encoder read and what computes it (`Call::host_output`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EncoderPoolInfo {
@@ -413,7 +413,7 @@ impl PrefixCacheInfo {
             } else {
                 0
             },
-            // The stages of one world inherit the same predecessor units.
+            // The stages of one epoch inherit the same predecessor units.
             inherited_start: self.inherited_start,
             inherited_units: self.inherited_units,
             // Each stage's pages are its own (`page_pools`); the merged view

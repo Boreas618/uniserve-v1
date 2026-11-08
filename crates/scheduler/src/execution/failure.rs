@@ -76,9 +76,9 @@ impl Scheduler {
                     .collect::<Vec<_>>();
                 self.inflight.refused.extend(in_flight);
             }
-            // A world on trial is not repaired: a worker fault, rather than a
+            // An epoch on trial is not repaired: a worker fault, rather than a
             // request its workers rejected, fails it as a whole, and the
-            // daemon rolls back to the previous world.
+            // daemon rolls back to the previous epoch.
             // The failure names the batch it struck and its requests, which
             // the rollback keeps with its reason for diagnosis.
             if self.trial && !refused && code != Some(ipc::ErrorCode::InputError) {
@@ -94,7 +94,7 @@ impl Scheduler {
                         )
                     }
                     _ => format!(
-                        "a worker failed during the world's trial in batches {struck:?} of \
+                        "a worker failed during the epoch's trial in batches {struck:?} of \
                          requests {requests:?}: {error:#}"
                     ),
                 });
@@ -177,11 +177,11 @@ impl Scheduler {
     }
 
     /// Hands every request that resumes from its generated tokens back to
-    /// the daemon after a fatal stop of a world on trial: the calls in
+    /// the daemon after a fatal stop of an epoch on trial: the calls in
     /// flight are dropped (`fail_all_inflight`), and each such request, queued
     /// or running, ends as migratable now (`MigrationCause::Loss`), after
     /// every token it generated, or for the cause a migration it already
-    /// began states. The daemon submits each again to the previous world,
+    /// began states. The daemon submits each again to the previous epoch,
     /// which generates the dropped tokens again. Every video request leaves
     /// the same way, naming the trajectory it named before. The others are
     /// left to `abort_all_requests`.
@@ -193,7 +193,7 @@ impl Scheduler {
             .failure
             .get()
             .cloned()
-            .unwrap_or_else(|| "the world on trial failed".to_owned());
+            .unwrap_or_else(|| "the epoch on trial failed".to_owned());
         self.fail_all_inflight(&failure);
 
         let queued: Vec<RequestId> = self
@@ -212,8 +212,8 @@ impl Scheduler {
                 });
             }
         }
-        // Video requests leave as well, whatever they reached: the world
-        // that held their trajectories failed, and the previous world
+        // Video requests leave as well, whatever they reached: the epoch
+        // that held their trajectories failed, and the previous epoch
         // computes them again from what they name.
         while let Some(pending) = self.waiting_media.pop_front() {
             self.announce_end(

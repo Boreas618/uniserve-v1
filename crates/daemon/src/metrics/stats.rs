@@ -380,7 +380,7 @@ pub(crate) fn record_scheduler_stats(
 }
 
 /// How many requests ended since the daemon started, and how many of them
-/// failed, which a world's trial reads its failure rate from.
+/// failed, which an epoch's trial reads its failure rate from.
 pub(crate) struct Outcomes {
     pub(crate) ended: std::sync::atomic::AtomicU64,
     pub(crate) failed: std::sync::atomic::AtomicU64,

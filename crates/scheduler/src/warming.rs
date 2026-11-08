@@ -78,7 +78,7 @@ impl Scheduler {
         let mut host = false;
         let mut materialized = None;
         let prefixes = match operation {
-            Operation::Snapshot { world, after } => self.snapshot_pages(world, &after)?,
+            Operation::Snapshot { epoch, after } => self.snapshot_pages(epoch, &after)?,
             Operation::Reserve {
                 prefixes,
                 keep,
@@ -116,7 +116,7 @@ impl Scheduler {
             Operation::Retain { requests } => {
                 self.warming
                     .reserved
-                    .retain(|page| requests.contains(&(page.resume.world, page.resume.request_id)));
+                    .retain(|page| requests.contains(&(page.resume.epoch, page.resume.request_id)));
                 Vec::new()
             }
             Operation::Publish { host } => {
@@ -240,7 +240,7 @@ impl Scheduler {
             let host_tokens = if settled { offered } else { held.min(offered) };
             live.insert(id, host_tokens);
             prefixes.push(Prefix {
-                world: 0,
+                epoch: 0,
                 request: id.0,
                 resume: (0, id.0),
                 capacity_tokens: 0,
@@ -271,7 +271,7 @@ impl Scheduler {
             .unwrap_or(1)
     }
 
-    fn snapshot_pages(&mut self, world: u64, after: &[(u64, u32)]) -> Result<Vec<Prefix>, String> {
+    fn snapshot_pages(&mut self, epoch: u64, after: &[(u64, u32)]) -> Result<Vec<Prefix>, String> {
         if !self.warming.leased.is_empty() {
             return Err("the previous cache snapshot still holds page leases".into());
         }
@@ -303,13 +303,13 @@ impl Scheduler {
                 .copied()
                 .collect();
             let mut prefix = Prefix {
-                world,
+                epoch,
                 request: id.0,
                 resume: state
                     .req
                     .cache
                     .resume
-                    .map_or((world, id.0), |resume| (resume.world, resume.request_id)),
+                    .map_or((epoch, id.0), |resume| (resume.epoch, resume.request_id)),
                 capacity_tokens: state.max_reserved_cache_tokens as u32,
                 tokens,
                 computed: state.cache_visible_len,
@@ -341,7 +341,7 @@ impl Scheduler {
                         continue;
                     };
                     prefix.pages.push(Page {
-                        request: (world, id.0),
+                        request: (epoch, id.0),
                         worker_group: worker.to_string(),
                         group: group as u32,
                         start: (index * shape.block_size) as u32,
@@ -382,7 +382,7 @@ impl Scheduler {
         let mut reserved = Vec::new();
         for mut prefix in prefixes {
             let resume = proto::request::CacheResume {
-                world: prefix.resume.0,
+                epoch: prefix.resume.0,
                 request_id: prefix.resume.1,
             };
             let scope = PrefixScope {
@@ -438,7 +438,7 @@ impl Scheduler {
                     }
                     .ok_or("the target cache has no room for the warming pages")?;
                     let page = Page {
-                        request: (prefix.world, prefix.request),
+                        request: (prefix.epoch, prefix.request),
                         worker_group: group_name.to_string(),
                         group: group as u32,
                         start,
@@ -472,7 +472,7 @@ impl Scheduler {
         if let Some(cache) = self.storage.cache() {
             for prefix in &mut prefixes {
                 let resume = proto::request::CacheResume {
-                    world: prefix.resume.0,
+                    epoch: prefix.resume.0,
                     request_id: prefix.resume.1,
                 };
                 let scope = PrefixScope {

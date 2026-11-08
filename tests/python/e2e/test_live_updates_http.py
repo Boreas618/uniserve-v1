@@ -15,7 +15,7 @@ and the server the daemon starts there is stopped at the end).
   generation is paused and are served once it continues; a flush revokes
   the cached prefix pages; scheduling limits within the batch the workers
   were started for change in place while a request streams, and a change
-  of the decode batch sizes is a world change under the same stream,
+  of the decode batch sizes is an epoch change under the same stream,
   which the operator commits; the manager attaches to the node, follows
   its events and detaches while it serves.
 - A sleeping deployment gives back its KV cache and graph storage, holds
@@ -81,7 +81,7 @@ OPTIONS = (
     # policy agree on one number instead of three.
     "max_num_batched_tokens=512",
 )
-# A change of the options that only a new world executes: graphs of other
+# A change of the options that only a new epoch executes: graphs of other
 # decode batch sizes.
 CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 8]"
 # The deployment's host KV cache on the host, in GiB.
@@ -650,7 +650,7 @@ def _apply_settled(base_url: str, *assignments: str) -> None:
     assert answers[-1].status_code == 200, answers[-1].text
 
 
-def _change_world(base_url: str, *assignments: str) -> dict:
+def _change_epoch(base_url: str, *assignments: str) -> dict:
     """Applies `assignments` as an epoch switch and commits the target; returns
     the update's report.
     """  # noqa: D205
@@ -702,7 +702,7 @@ def test_a_serving_deployment_answers_its_admin_api(
         )
 
         # Scheduling limits change in place under a streaming request, and
-        # other decode batch sizes by a world change under the same stream.
+        # other decode batch sizes by an epoch change under the same stream.
         read: list[str] = []
         done = threading.Event()
         streaming = threading.Thread(
@@ -715,7 +715,7 @@ def test_a_serving_deployment_answers_its_admin_api(
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
         before_update = len(read)
-        report = _change_world(base_url, CHANGE)
+        report = _change_epoch(base_url, CHANGE)
         print(f"epoch switch pause: {report['pause_ms']} ms")
         streaming.join(timeout=1800)
         assert done.is_set(), "the count did not end"
@@ -927,7 +927,7 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
     """A successor daemon learns what a target maps from the process that serves.
 
     The epoch that serves took its storage from the one before it, under that
-    world's name. The daemon that switched it is gone, and the next target still
+    epoch's name. The daemon that switched it is gone, and the next target still
     maps that storage.
     """
     name = "qwen3-live-restart-switch"
@@ -942,7 +942,7 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
     try:
         with _serve(runtime, log, name, {"RUST_LOG": "info"}) as base_url:
             answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
-            _change_world(base_url, f"worker_config.executable={executables[0]}")
+            _change_epoch(base_url, f"worker_config.executable={executables[0]}")
             _purged(base_url)
             restarted = _admin(base_url, "restart")
             assert restarted.status_code == 200, (
@@ -950,7 +950,7 @@ def test_a_switch_after_a_hot_restart_finds_the_storage_of_the_epoch_before(
             )
             successors.append(restarted.json()["result"]["pid"])
             _chat(base_url, name, RECOVERY_PROMPT, tokens=8)
-            _change_world(base_url, f"worker_config.executable={executables[1]}")
+            _change_epoch(base_url, f"worker_config.executable={executables[1]}")
             after = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
             assert (
                 after["choices"][0]["message"]["content"]
@@ -1266,9 +1266,9 @@ def _restart_while_streaming(
     server = tomllib.loads(status["config"])["admin_config"]
     assert server["port"] == port, server
 
-    # A change of both the daemon's options and what a world executes
+    # A change of both the daemon's options and what an epoch executes
     # restarts the daemon on its new options first, and its successor then
-    # changes the world in an operation of its own.
+    # changes the epoch in an operation of its own.
     previous = successors[-1]
     port = find_free_port()
     both = _apply(moved_url, f"admin_config.port={port}", CHANGE)
@@ -1284,7 +1284,7 @@ def _restart_while_streaming(
             return last
         return None
 
-    _wait_until(lambda: changed() is not None, 900, "the world did not change")
+    _wait_until(lambda: changed() is not None, 900, "the epoch did not change")
     last = changed()
     assert last["state"] == "succeeded", last
     assert last["result"]["change"] == "epoch", last
@@ -1463,7 +1463,7 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         assert _held(runtime) == before
 
         # The deployment serves throughout: the count goes on, a new
-        # request is answered, and a world change maps the weights the
+        # request is answered, and an epoch change maps the weights the
         # successor holds.
         reply = _chat(base_url, name, prompt)
         assert reply["choices"][0]["message"]["content"]
@@ -1472,7 +1472,7 @@ def test_a_storage_server_restart_keeps_the_deployment_serving(
         numbers = [int(word) for word in re.findall(r"\d+", "".join(read))]
         assert numbers[:200] == list(range(1, 201)), "".join(read)[:400]
         weights = _weight_bytes(base_url)
-        _change_world(base_url, CHANGE)
+        _change_epoch(base_url, CHANGE)
         reply = _chat(base_url, name, "Say hello.")
         assert reply["choices"][0]["message"]["content"]
         # The ledger books a storage once however many epochs map it, so a successor that read the
@@ -1864,9 +1864,9 @@ def test_a_lost_main_process_is_relaunched_without_a_standby(
 def test_a_standby_started_after_a_switch_maps_what_its_epoch_serves_from(
     tmp_path: Path, runtime: Path
 ):
-    """A standby of a target maps storage another world created.
+    """A standby of a target maps storage another epoch created.
 
-    A target serves from the storage of the epoch before it, under that world's
+    A target serves from the storage of the epoch before it, under that epoch's
     name. The standby started beside the target finds it under the same name,
     and takes over when the target's process is lost.
     """
@@ -1902,7 +1902,7 @@ def test_a_standby_started_after_a_switch_maps_what_its_epoch_serves_from(
 def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
     tmp_path: Path, runtime: Path
 ):
-    """A process started again keys the storage it creates by its own world.
+    """A process started again keys the storage it creates by its own epoch.
 
     The epoch that replaces it maps that storage. So it does after a target's
     process is lost, when the first epoch's storage is gone with it, and after a
@@ -1930,7 +1930,7 @@ def test_a_relaunched_epoch_hands_its_own_storage_to_the_next_target(
         result = _apply(
             base_url,
             f"worker_config.executable={executables[1]}",
-            "update_config.previous_world=weights",
+            "update_config.previous_epoch=weights",
         )
         assert result["change"] == "epoch", result
         _on_trial(base_url)
@@ -1990,10 +1990,10 @@ def test_an_epoch_switch_to_a_new_executable_fails_no_request(
         _wait_until(
             lambda: len(_numbers(read)) >= 8, 300, "the count did not stream"
         )
-        report = _change_world(
+        report = _change_epoch(
             base_url, f"worker_config.executable={successor}"
         )
-        assert report, "the epoch switch reported no world"
+        assert report, "the epoch switch reported no epoch"
         for pid in before:
             _wait_until(
                 lambda pid=pid: not _runs(pid),
@@ -2167,13 +2167,13 @@ def _artifact(case: str, evidence: dict) -> None:
     path.write_text(json.dumps(evidence, indent=2, sort_keys=True) + "\n")
 
 
-@pytest.mark.parametrize("previous_world", ["parked", "weights", "host"])
+@pytest.mark.parametrize("previous_epoch", ["parked", "weights", "host"])
 def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
-    tmp_path: Path, runtime: Path, previous_world: str
+    tmp_path: Path, runtime: Path, previous_epoch: str
 ):
     """A revert by hand ends the trial with no request lost.
 
-    The previous epoch is kept as ``update_config.previous_world`` states: its
+    The previous epoch is kept as ``update_config.previous_epoch`` states: its
     drained processes stay alive through the trial, or they exit with its
     weights kept, and the revert starts them again on those.
     """
@@ -2188,11 +2188,11 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
         result = _apply(
             base_url,
             f"worker_config.executable={successor}",
-            f"update_config.previous_world={previous_world}",
+            f"update_config.previous_epoch={previous_epoch}",
         )
         assert result["change"] == "epoch", result
         trial = _on_trial(base_url)
-        if previous_world != "parked":
+        if previous_epoch != "parked":
             for pid in before:
                 _wait_until(
                     lambda pid=pid: not _runs(pid),
@@ -2203,16 +2203,16 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
             assert all(_runs(pid) for pid in before)
         # A node that cannot move the weights keeps them on its GPUs, and says why.
         _wait_until(
-            lambda: previous_world == "parked"
+            lambda: previous_epoch == "parked"
             or _update(base_url)["moved_to_host_bytes"] > 0
-            or _update(base_url)["previous_world_kept"] == previous_world,
+            or _update(base_url)["previous_epoch_kept"] == previous_epoch,
             120,
             "the previous epoch's storage was not kept",
         )
         trial = _update(base_url)
         print("kept:", json.dumps(trial))
         if not trial["host_refused"]:
-            assert trial["previous_world_kept"] == previous_world, trial
+            assert trial["previous_epoch_kept"] == previous_epoch, trial
         rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
         assert rolled.status_code == 200, rolled.text
         count = _assert_whole(streaming, streamed)
@@ -2225,7 +2225,7 @@ def test_an_operator_rollback_returns_to_the_previous_epoch_under_a_request(
         assert update["phase"] == "abandoned", update
         assert update["failure"]["reason"] == "the check", update
         _artifact(
-            f"operator-rollback-{previous_world}",
+            f"operator-rollback-{previous_epoch}",
             {"numbers_across_the_switch": count, "update": update},
         )
 
@@ -2771,7 +2771,7 @@ def test_a_weight_update_leaves_the_pages_of_the_old_weights_in_the_host_cache(
 def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
     tmp_path: Path, runtime: Path
 ):
-    """``previous_world = "host"`` moves bytes, and a revert brings them back.
+    """``previous_epoch = "host"`` moves bytes, and a revert brings them back.
 
     A target of other model files maps none of the serving epoch's weights, so the
     weights that epoch alone retains leave its GPU for host storage while the
@@ -2790,7 +2790,7 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
         answer = _chat(base_url, name, RECOVERY_PROMPT, tokens=32)
         streaming, streamed = _start_count(base_url, name)
         result = _apply(
-            base_url, f"model={other}", "update_config.previous_world=host"
+            base_url, f"model={other}", "update_config.previous_epoch=host"
         )
         assert result["change"] == "epoch", result
         _on_trial(base_url)
@@ -2803,7 +2803,7 @@ def test_a_previous_epoch_in_host_storage_moves_its_weights_and_returns(
         trial = _update(base_url)
         print("kept:", json.dumps(trial))
         assert not trial["host_refused"], trial
-        assert trial["previous_world_kept"] == "host", trial
+        assert trial["previous_epoch_kept"] == "host", trial
         rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
         assert rolled.status_code == 200, rolled.text
         count = _assert_whole(streaming, streamed)

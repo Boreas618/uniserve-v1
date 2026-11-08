@@ -108,27 +108,12 @@ impl Client {
         })))
     }
 
-    /// Connect to the server at `socket` as an operator, in this build's
-    /// protocol or, when the server speaks an earlier one, in the latest
-    /// earlier version it serves, as the restart of a server whose protocol
-    /// predates this build's connects: an operator's requests (`List`,
-    /// `Retire`, `Restart`) read alike in every version.
+    /// Connect to the server at `socket` as an operator.
     pub fn connect_operator(socket: &Path) -> Result<Self> {
-        let mut refusal = None;
-        for version in (crate::protocol::MIN_VERSION..=VERSION).rev() {
-            let connection = Connection::new(UnixStream::connect(socket)?);
-            match Self::open_version(connection, Role::Operator, version) {
-                Ok(client) => return Ok(client),
-                Err(Error::Refused(message)) => refusal = Some(message),
-                Err(error) => return Err(error),
-            }
-        }
-        Err(Error::Refused(refusal.unwrap_or_default()))
-    }
-
-    /// The protocol version the server accepted the connection in.
-    pub fn version(&self) -> u32 {
-        self.version
+        Self::open(
+            Connection::new(UnixStream::connect(socket)?),
+            Role::Operator,
+        )
     }
 
     fn open(connection: Connection, role: Role) -> Result<Self> {
@@ -300,12 +285,12 @@ impl Client {
         }
     }
 
-    /// See [`Request::Claim`]: become the deployment's head, `world`
-    /// placing `scopes` on the host, and end every world of `retire` there.
-    pub fn claim(&mut self, world: u64, scopes: Vec<Scope>, retire: Vec<u64>) -> Result<Claim> {
+    /// See [`Request::Claim`]: become the deployment's head, `epoch`
+    /// placing `scopes` on the host, and end every epoch of `retire` there.
+    pub fn claim(&mut self, epoch: u64, scopes: Vec<Scope>, retire: Vec<u64>) -> Result<Claim> {
         let request = Request::Claim {
             scopes,
-            world,
+            epoch,
             retire,
         };
         match Self::expect(self.call(&request, &[])?)?.reply {
@@ -314,11 +299,11 @@ impl Client {
         }
     }
 
-    /// Make the claimed, committed worlds' tensors and pages shared together.
-    pub fn publish_worlds(&mut self, worlds: Vec<u64>) -> Result<()> {
-        match Self::expect(self.call(&Request::PublishWorlds { worlds }, &[])?)?.reply {
-            Reply::WorldsPublished => Ok(()),
-            other => Err(unexpected("publishing worlds", &other)),
+    /// Make the claimed, committed epochs' tensors and pages shared together.
+    pub fn publish_epochs(&mut self, epochs: Vec<u64>) -> Result<()> {
+        match Self::expect(self.call(&Request::PublishEpochs { epochs }, &[])?)?.reply {
+            Reply::EpochsPublished => Ok(()),
+            other => Err(unexpected("publishing epochs", &other)),
         }
     }
 
@@ -528,11 +513,11 @@ impl Client {
     /// See [`Request::Offload`] (`to_host`) and [`Request::Restore`].
     /// Returns how many storages moved and their bytes, once every copy
     /// ended.
-    pub fn move_weights(&mut self, world: u64, to_host: bool) -> Result<(u64, u64)> {
+    pub fn move_weights(&mut self, epoch: u64, to_host: bool) -> Result<(u64, u64)> {
         let request = if to_host {
-            Request::Offload { world }
+            Request::Offload { epoch }
         } else {
-            Request::Restore { world }
+            Request::Restore { epoch }
         };
         match Self::expect(self.call(&request, &[])?)?.reply {
             Reply::Moved { storages, bytes } => Ok((storages, bytes)),
@@ -541,8 +526,8 @@ impl Client {
     }
 
     /// See [`Request::KeepWeights`]. Returns how many tensors were released.
-    pub fn keep_weights(&mut self, worlds: Vec<u64>, cache_keys: Vec<Key>) -> Result<u64> {
-        match Self::expect(self.call(&Request::KeepWeights { worlds, cache_keys }, &[])?)?.reply {
+    pub fn keep_weights(&mut self, epochs: Vec<u64>, cache_keys: Vec<Key>) -> Result<u64> {
+        match Self::expect(self.call(&Request::KeepWeights { epochs, cache_keys }, &[])?)?.reply {
             Reply::Retained { released } => Ok(released),
             other => Err(unexpected("keep_weights", &other)),
         }

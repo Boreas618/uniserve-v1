@@ -1,6 +1,6 @@
 """Online profiling of a serving deployment through the admin API.
 
-Qwen3 serves on one GPU (``UNISERVE_WORLD_DEVICE``, default 0), with a
+Qwen3 serves on one GPU (``UNISERVE_EPOCH_DEVICE``, default 0), with a
 Storage Server of the test's own in a runtime directory the test creates
 (``tempfile``'s directory, ``TMPDIR`` when set):
 
@@ -18,7 +18,7 @@ Storage Server of the test's own in a runtime directory the test creates
   naming two collectors of the device's performance monitors is refused.
 - A range_metrics session books its range profiler pass's device storage
   with the worker's process item in the GPU's ledger until it ends.
-- A session whose world is replaced ends with the world change, its file
+- A session whose epoch is replaced ends with the epoch change, its file
   written.
 - The quality-of-service guard turns collectors off, costliest first, and
   then ends a session whose step time stays past the slowdown it allows.
@@ -255,7 +255,7 @@ def test_a_range_metrics_session_books_its_pass_while_it_runs(
     assert _process_bytes(served) == before
 
 
-def test_a_world_change_ends_the_session_of_the_world_it_replaces(
+def test_a_epoch_change_ends_the_session_of_the_epoch_it_replaces(
     served: str, tmp_path: Path
 ):
     with _Load(served, streams=1):
@@ -273,7 +273,7 @@ def test_a_world_change_ends_the_session_of_the_world_it_replaces(
         assert changed["change"] == "epoch", changed
         session = _profile(served)
         assert session["state"] == "ended", session
-        assert session["end_reason"] == "world change", session
+        assert session["end_reason"] == "epoch change", session
         assert session["files"][0]["file"]["rows"]["kernel"] > 0, session
         committed = httpx.post(
             f"{served}/admin/config/commit", json={}, timeout=600

@@ -23,7 +23,7 @@
 //!    closes cancel tasks ([`Event::Cancel`]); each still ends with its
 //!    report, since bytes may be in flight until then.
 //!
-//! The server submits tasks of its own too: a world's weights moving
+//! The server submits tasks of its own too: an epoch's weights moving
 //! between its GPUs and host storage ([`crate::moves`]) copy whole storages,
 //! and each task's end goes to its move rather than to a client.
 //!
@@ -108,7 +108,7 @@ pub(super) struct Transfers {
     /// What each deployment's tasks copied since the server started, by
     /// priority (indexed by [`Priority::rank`]): the bytes of the tasks
     /// submitted, and the bytes copied of them as the Transfer Server
-    /// reported its progress. A hot restart hands them over, so a world
+    /// reported its progress. A hot restart hands them over, so an epoch
     /// change's head reads how much its update moved across restarts.
     totals: BTreeMap<String, [Total; 3]>,
 }

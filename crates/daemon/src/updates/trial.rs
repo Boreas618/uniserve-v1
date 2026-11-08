@@ -42,20 +42,20 @@ use crate::options::RollbackConfig;
 /// that serves next, so this is part of the pause a revert costs.
 pub(crate) const POLL: Duration = Duration::from_millis(100);
 
-/// One replica's reports a trial reads: the world the update serves it from,
+/// One replica's reports a trial reads: the epoch the update serves it from,
 /// and what serving reported before the promotion.
 pub(crate) struct Observed {
     pub(crate) observer: Arc<Observer>,
-    pub(crate) world: u64,
+    pub(crate) epoch: u64,
     pub(crate) baseline: Option<Rates>,
 }
 
 impl Observed {
-    /// `world`'s reports through `observer`, with the baseline of `previous`,
-    /// the world that served, over `window` up to `promotion`.
+    /// `epoch`'s reports through `observer`, with the baseline of `previous`,
+    /// the epoch that served, over `window` up to `promotion`.
     pub(crate) fn new(
         observer: Arc<Observer>,
-        world: u64,
+        epoch: u64,
         previous: u64,
         window: Option<Duration>,
         promotion: Instant,
@@ -66,7 +66,7 @@ impl Observed {
         });
         Self {
             observer,
-            world,
+            epoch,
             baseline,
         }
     }
@@ -134,7 +134,7 @@ impl Trial {
         for observed in &self.observed {
             let (Some(baseline), Some(rates)) = (
                 observed.baseline,
-                observed.observer.rates(observed.world, self.began, window),
+                observed.observer.rates(observed.epoch, self.began, window),
             ) else {
                 continue;
             };
@@ -177,9 +177,9 @@ impl Trial {
             .iter()
             .map(|observed| {
                 let rates = window
-                    .and_then(|window| observed.observer.rates(observed.world, self.began, window));
+                    .and_then(|window| observed.observer.rates(observed.epoch, self.began, window));
                 json!({
-                    "world": observed.world,
+                    "epoch": observed.epoch,
                     "baseline": observed.baseline,
                     "rates": rates,
                 })
@@ -232,7 +232,7 @@ mod tests {
         }
     }
 
-    /// A trial of `thresholds` whose world 2 is compared with world 1's steps
+    /// A trial of `thresholds` whose epoch 2 is compared with epoch 1's steps
     /// of 1000 us at 100 tokens a batch, and a whole window of it already past.
     fn trial(thresholds: RollbackConfig, observer: &Arc<Observer>) -> Trial {
         observer.record(1, 0, &stats(1_000, 100, 10_000));

@@ -130,7 +130,7 @@ pub(crate) enum UnitState {
     Cached,
 }
 
-/// One published page as a world hands its prefix cache index to its
+/// One published page as an epoch hands its prefix cache index to its
 /// successor: its group, chained hash, tokens and units.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IndexedPage {
@@ -218,18 +218,18 @@ struct PoolInner {
     /// units from it on is given back (`BlockPool::withdraw`); the unit
     /// count while none is.
     withdrawn: u32,
-    /// The units the workers map read-only from the predecessor world's
+    /// The units the workers map read-only from the predecessor epoch's
     /// planes (`BlockPool::inherit`): never queued or allocated, their
-    /// imported pages acquired and released, until the world takes them
+    /// imported pages acquired and released, until the epoch takes them
     /// (`BlockPool::take_inherited`).
     inherited: std::ops::Range<u32>,
-    /// Of the inherited units, those the predecessor lent this world for
+    /// Of the inherited units, those the predecessor lent this epoch for
     /// its trial (`BlockPool::borrow`): the workers map them writable and
     /// the pool allocates them as its own.
     borrowed: Vec<std::ops::Range<u32>>,
-    /// The units this world lent its successor at its park
+    /// The units this epoch lent its successor at its park
     /// (`BlockPool::lend`), which the successor may write: never queued or
-    /// allocated until the world takes them back (`BlockPool::reclaim`).
+    /// allocated until the epoch takes them back (`BlockPool::reclaim`).
     lent: Vec<std::ops::Range<u32>>,
 }
 
@@ -239,7 +239,7 @@ fn units_below(range: &std::ops::Range<u32>, end: u32) -> u32 {
 }
 
 impl PoolInner {
-    /// Whether the world may not write `unit`: it maps it read-only from
+    /// Whether the epoch may not write `unit`: it maps it read-only from
     /// the predecessor's planes, or lent it to its successor.
     fn foreign(&self, unit: u32) -> bool {
         let borrowed = || self.borrowed.iter().any(|range| range.contains(&unit));
@@ -341,7 +341,7 @@ impl PoolInner {
                 continue;
             }
             // An inherited unit keeps its page for later readers and is
-            // never allocated: the world does not write it, nor a unit it
+            // never allocated: the epoch does not write it, nor a unit it
             // lent until it takes it back.
             if foreign {
                 meta.state = if meta.published.is_some() {
@@ -603,8 +603,8 @@ impl BlockPool {
     }
 
     /// Takes units `range` out of allocation: the workers map them
-    /// read-only from the predecessor world's planes, whose pages the pool
-    /// imports ([`Self::import`]) and which the world never writes until it
+    /// read-only from the predecessor epoch's planes, whose pages the pool
+    /// imports ([`Self::import`]) and which the epoch never writes until it
     /// takes them ([`Self::take_inherited`]).
     pub(crate) fn inherit(&self, range: std::ops::Range<u32>) {
         let mut inner = lock(&self.inner);
@@ -615,14 +615,14 @@ impl BlockPool {
         inner.recount();
     }
 
-    /// The units mapped read-only from the predecessor world.
+    /// The units mapped read-only from the predecessor epoch.
     pub(crate) fn inherited(&self) -> std::ops::Range<u32> {
         lock(&self.inner).inherited.clone()
     }
 
     /// Whether readers other than its holder may read `page`: the prefix
     /// cache publishes one of its units, which any request can acquire, or
-    /// the predecessor world writes them, mapped read-only here. No call may
+    /// the predecessor epoch writes them, mapped read-only here. No call may
     /// write such a page.
     pub(crate) fn shared(&self, page: &PageRef) -> bool {
         let inner = lock(&self.inner);
@@ -631,7 +631,7 @@ impl BlockPool {
             .any(|unit| inner.foreign(unit.0) || inner.meta[unit.0 as usize].published.is_some())
     }
 
-    /// Returns the inherited units to allocation: the predecessor world is
+    /// Returns the inherited units to allocation: the predecessor epoch is
     /// gone and the workers took its storage. Their pages stay published.
     pub(crate) fn take_inherited(&self) {
         let mut inner = lock(&self.inner);
@@ -647,7 +647,7 @@ impl BlockPool {
         inner.recount();
     }
 
-    /// Borrows the inherited units `ranges` for the world's trial: its
+    /// Borrows the inherited units `ranges` for the epoch's trial: its
     /// predecessor lent them at its park ([`Self::lend`]) and the workers
     /// map them writable. The pool queues them behind its own free units and
     /// allocates them as its own; the predecessor's pages they hold stay
@@ -676,7 +676,7 @@ impl BlockPool {
         borrowed
     }
 
-    /// Lends the units `ranges` to the world that succeeds this one, at the
+    /// Lends the units `ranges` to the epoch that succeeds this one, at the
     /// park: the successor may write them, so the pool forgets the pages
     /// they hold and allocates none of them until it takes them back
     /// ([`Self::reclaim`]). Returns how many pages it forgot.
@@ -699,12 +699,12 @@ impl BlockPool {
         heads.len()
     }
 
-    /// The units the world lent its successor and has not taken back.
+    /// The units the epoch lent its successor and has not taken back.
     pub(crate) fn lent(&self) -> Vec<std::ops::Range<u32>> {
         lock(&self.inner).lent.clone()
     }
 
-    /// Takes back the units lent to the successor world ([`Self::lend`]),
+    /// Takes back the units lent to the successor epoch ([`Self::lend`]),
     /// whose processes are gone: they return to allocation holding no page.
     /// Returns how many units it took back.
     pub(crate) fn reclaim(&self) -> u32 {
@@ -724,7 +724,7 @@ impl BlockPool {
     }
 
     /// The published pages whose units the pool holds (none withdrawn), as
-    /// a successor world imports them.
+    /// a successor epoch imports them.
     pub(crate) fn export(&self) -> Vec<IndexedPage> {
         let inner = lock(&self.inner);
         let mut pages: Vec<IndexedPage> = inner
@@ -745,7 +745,7 @@ impl BlockPool {
         pages
     }
 
-    /// Imports the predecessor world's published pages, each unit `offset`
+    /// Imports the predecessor epoch's published pages, each unit `offset`
     /// further into this pool, as unreferenced pages of `source`: requests
     /// read them from the inherited units. A page whose units fall outside
     /// the inherited units, or that holds a unit published already, is
@@ -1032,7 +1032,7 @@ impl BlockPool {
     /// Returns the page's first unit and whether the free queue holds it:
     /// the page is unreferenced and allocatable, and its units count as free
     /// capacity until acquired. An inherited page's units are never queued,
-    /// since the world does not write them. The lookup acquires nothing: the page can be evicted before
+    /// since the epoch does not write them. The lookup acquires nothing: the page can be evicted before
     /// the caller acts on it, so reuse must go through [`BlockPool::acquire`],
     /// which checks the identity again.
     pub(crate) fn lookup(
@@ -1816,7 +1816,7 @@ struct TailPage {
 }
 
 /// The namespace a request's prefix pages are hashed in: its isolation key
-/// (`CachePolicy::isolation_key`), and the seeds of the world whose state it
+/// (`CachePolicy::isolation_key`), and the seeds of the epoch whose state it
 /// continues with (`CachePolicy::state_seeds`) in place of the pool's own.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PrefixScope<'a> {
@@ -2321,7 +2321,7 @@ impl PrefixCacheCoordinator {
     ///
     /// A trailing partial page is not hashed, so only complete pages are ever
     /// published. The chains are rooted at the pool's seed, or at the seed
-    /// of the world whose state the request continues with. An isolation key
+    /// of the epoch whose state the request continues with. An isolation key
     /// is rotated and XORed into the root, so requests with different keys
     /// compute different hash chains and, barring a hash collision, reuse
     /// none of each other's pages. A key of zero leaves the root unchanged
@@ -2515,7 +2515,7 @@ impl PrefixCacheCoordinator {
             private.tails = tails;
             break;
         }
-        // A continuation keeps its origin through mapped worlds as well.
+        // A continuation keeps its origin through mapped epochs as well.
         // Public pages remain eligible under the ordinary read policy;
         // acquisition uses whichever complete prefix is longer.
         if resume.is_some() && public {
@@ -2775,7 +2775,7 @@ impl PrefixCacheCoordinator {
     }
 
     /// Publish immutable partial pages after the request's writes have
-    /// drained. Ordinary preemption and world promotion use the same
+    /// drained. Ordinary preemption and epoch promotion use the same
     /// continuation lookup; consumers copy these pages before appending.
     #[expect(
         clippy::too_many_arguments,
@@ -2986,7 +2986,7 @@ mod tests {
         let source = endpoint();
         let tokens = vec![1, 2, 3, 4, 5];
         let resume = proto::request::CacheResume {
-            world: 3,
+            epoch: 3,
             request_id: 7,
         };
         let scope = PrefixScope {
@@ -3008,7 +3008,7 @@ mod tests {
         );
         let other = PrefixScope {
             resume: Some(proto::request::CacheResume {
-                world: 3,
+                epoch: 3,
                 request_id: 8,
             }),
             ..scope
@@ -3055,7 +3055,7 @@ mod tests {
         let _published = publish(&coordinator, &pool, &tokens, &source);
         let scope = PrefixScope {
             resume: Some(proto::request::CacheResume {
-                world: 3,
+                epoch: 3,
                 request_id: 7,
             }),
             ..Default::default()
@@ -3107,7 +3107,7 @@ mod tests {
         let tokens = vec![1, 2, 3, 4, 5];
         drop(publish(&coordinator, &pool, &tokens, &source));
         let resume = proto::request::CacheResume {
-            world: 3,
+            epoch: 3,
             request_id: 7,
         };
         let scope = PrefixScope {
@@ -3174,7 +3174,7 @@ mod tests {
         let source = endpoint();
         let tokens: Vec<_> = (1..=25).collect();
         let resume = proto::request::CacheResume {
-            world: 3,
+            epoch: 3,
             request_id: 7,
         };
         let scope = PrefixScope {
@@ -3280,7 +3280,7 @@ mod tests {
             let tokens: Vec<u32> = (0..145).collect();
             let scope = PrefixScope {
                 resume: Some(proto::request::CacheResume {
-                    world: 1,
+                    epoch: 1,
                     request_id: 9,
                 }),
                 ..Default::default()
@@ -3347,7 +3347,7 @@ mod tests {
             );
             let foreign = PrefixScope {
                 resume: Some(proto::request::CacheResume {
-                    world: 1,
+                    epoch: 1,
                     request_id: 10,
                 }),
                 ..scope
@@ -3922,7 +3922,7 @@ mod tests {
     }
 
     /// A request resumed from a checkpoint the prefix cache shares (in this
-    /// world, or mapped read-only from the predecessor's) and admitted
+    /// epoch, or mapped read-only from the predecessor's) and admitted
     /// short of the next boundary still holds that page as its latest
     /// checkpoint. A refill of its draft cache evaluates its tokens again
     /// up to that boundary: its tables name fresh units of the request's
@@ -4172,7 +4172,7 @@ mod tests {
     /// but a request continuing the state those workers reached finds them
     /// under their seed.
     #[test]
-    fn a_request_continuing_another_worlds_state_finds_its_pages() {
+    fn a_request_continuing_another_epochs_state_finds_its_pages() {
         let pool = BlockPool::new(64, 0);
         let source = endpoint();
         let prompt = (1..=9).collect::<Vec<u32>>();
@@ -4321,10 +4321,10 @@ mod tests {
         assert_eq!(successor.free_units(), 31);
     }
 
-    /// A world allocates none of the units it lent its successor, whose
+    /// An epoch allocates none of the units it lent its successor, whose
     /// pages it forgets, until it takes them back.
     #[test]
-    fn a_world_allocates_no_unit_it_lent_until_it_takes_them_back() {
+    fn a_epoch_allocates_no_unit_it_lent_until_it_takes_them_back() {
         let coordinator = PrefixCacheCoordinator::new(vec![full(4, 1)]);
         let source = endpoint();
         let prompt = (1..=9).collect::<Vec<u32>>();

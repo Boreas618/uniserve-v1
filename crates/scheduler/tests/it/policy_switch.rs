@@ -135,11 +135,11 @@ fn trapping() -> Vec<u8> {
 }
 
 /// A scheduler thread serving with no request.
-struct World {
+struct Epoch {
     handle: CommandSender,
 }
 
-impl World {
+impl Epoch {
     fn start() -> Self {
         let mut sim = SimEngine::new();
         sim.set_text_len(16);
@@ -201,8 +201,8 @@ fn answer<T>(receiver: Receiver<Result<T, String>>) -> Result<T, String> {
 }
 
 /// The slot's programs as the scheduler reports them.
-fn programs(world: &World) -> scheduler::PolicyPrograms {
-    world
+fn programs(epoch: &Epoch) -> scheduler::PolicyPrograms {
+    epoch
         .handle
         .policy_programs()
         .recv_timeout(ANSWER)
@@ -216,11 +216,11 @@ fn named(program: Option<PolicyProgram>) -> Option<(String, u32)> {
 
 #[test]
 fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
-    let world = World::start();
-    // A scheduler with no policy decides nothing, so a test world serves the
+    let epoch = Epoch::start();
+    // A scheduler with no policy decides nothing, so a test epoch serves the
     // policy its harness installed from the start; nothing waits for the
     // switchover that would prepare another.
-    let serving = programs(&world);
+    let serving = programs(&epoch);
     assert_eq!(
         named(serving.running),
         Some(("fcfs".to_owned(), 1)),
@@ -229,8 +229,8 @@ fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
     assert!(named(serving.prepared).is_none());
 
     // A precopy prepares a candidate without putting it in.
-    world.precopy("fcfs", 2, toy()).expect("the precopy");
-    let prepared = programs(&world);
+    epoch.precopy("fcfs", 2, toy()).expect("the precopy");
+    let prepared = programs(&epoch);
     assert_eq!(
         named(prepared.running),
         Some(("fcfs".to_owned(), 1)),
@@ -243,8 +243,8 @@ fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
     );
 
     // The switchover puts it in: it serves, and nothing waits.
-    world.switch_over().expect("the switchover");
-    let switched = programs(&world);
+    epoch.switch_over().expect("the switchover");
+    let switched = programs(&epoch);
     assert_eq!(
         named(switched.running),
         Some(("fcfs".to_owned(), 2)),
@@ -255,15 +255,15 @@ fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
     // The slot's counters agree with the step the scheduler reports, and the
     // policy that just took over has cost calls — its trial's, carried in with
     // the candidate (§12).
-    let before = world.step();
-    let counters = world
+    let before = epoch.step();
+    let counters = epoch
         .handle
         .counters()
         .recv_timeout(ANSWER)
         .expect("the scheduler answers with its counters");
     // The two commands read the same counter: a step the scheduler took between
     // them is the only difference, so the figures cannot disagree.
-    let after = world.step();
+    let after = epoch.step();
     assert!(
         (before..=after).contains(&counters.steps),
         "the counters' {} steps are the scheduler's ({before} and {after})",
@@ -282,7 +282,7 @@ fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
 
 #[test]
 fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
-    let world = World::start();
+    let epoch = Epoch::start();
 
     // A precopy's policy module belongs to the process holding the Program
     // Server's client, which resolves it once and precopies each scheduler; the
@@ -297,7 +297,7 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
         },
     };
     let refused =
-        answer(world.handle.program_command(precopy)).expect_err("a precopy needs its source");
+        answer(epoch.handle.program_command(precopy)).expect_err("a precopy needs its source");
     assert!(
         refused.contains("Program Server"),
         "the refusal names the owner of the program: {refused}"
@@ -306,10 +306,10 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     // A switchover that names the step its expert group agreed applies at that
     // step: one still ahead waits for it, and its answer is the answer of a
     // stage that applied there.
-    world.precopy("fcfs", 2, toy()).expect("the first precopy");
-    let ahead = world.step() + 2;
+    epoch.precopy("fcfs", 2, toy()).expect("the first precopy");
+    let ahead = epoch.step() + 2;
     answer(
-        world
+        epoch
             .handle
             .program_command(ipc::ProgramCommand::Switchover {
                 generation: 1,
@@ -318,7 +318,7 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     )
     .expect("a switchover at a step ahead applies there");
     assert!(
-        world.step() >= ahead,
+        epoch.step() >= ahead,
         "the boundary it applied at is one the scheduler has reached"
     );
 
@@ -327,11 +327,11 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     // prepared first, because the switchover above used the one it applied: with
     // nothing prepared the answer would be that, and the boundary's own refusal
     // would never be reached.
-    world
+    epoch
         .precopy("fcfs", 3, toy())
         .expect("a candidate the boundary check can leave prepared");
     let refused_step = answer(
-        world
+        epoch
             .handle
             .program_command(ipc::ProgramCommand::Switchover {
                 generation: 1,
@@ -345,14 +345,14 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
     );
 
     // One that names a step far ahead waits for it instead of applying early.
-    world
+    epoch
         .precopy("priority", 4, toy())
         .expect("the second precopy");
-    let waiting = world
+    let waiting = epoch
         .handle
         .program_command(ipc::ProgramCommand::Switchover {
             generation: 2,
-            step: Some(world.step() + 1000),
+            step: Some(epoch.step() + 1000),
         });
     assert!(
         waiting.recv_timeout(Duration::from_millis(200)).is_err(),
@@ -361,7 +361,7 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
 
     // The boundary belongs to the stage that took it: a second one is refused
     // with the waiting stage's name, so the first caller's answer is not lost.
-    let refused = answer(world.handle.commit_policy())
+    let refused = answer(epoch.handle.commit_policy())
         .expect_err("a stage waits for the boundary already claimed");
     assert!(
         refused.contains("switchover"),
@@ -371,12 +371,12 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
 
 #[test]
 fn a_scheduler_over_a_supplied_worker_refuses_a_shadow_pass_and_names_why() {
-    let world = World::start();
+    let epoch = Epoch::start();
 
     // §7.3 step 2's paired pass is the in-process arm's: a supplied worker
     // runs none, so the ask is answered with that rather than left waiting for
     // a step that cannot run it.
-    let refused = answer(world.handle.shadow(7))
+    let refused = answer(epoch.handle.shadow(7))
         .expect_err("a scheduler over a supplied worker runs no shadow pass");
     assert!(
         refused.contains("supplied worker"),
@@ -386,14 +386,14 @@ fn a_scheduler_over_a_supplied_worker_refuses_a_shadow_pass_and_names_why() {
 
 #[test]
 fn a_consumers_position_is_the_connections_and_a_scheduler_refuses_it() {
-    let world = World::start();
+    let epoch = Epoch::start();
     let command = proto::request::wire::Command {
         request: 7,
         kind: Some(proto::request::wire::command::Kind::Consumed(
             proto::request::wire::Consumed { events: 3 },
         )),
     };
-    let refused = world
+    let refused = epoch
         .handle
         .request_command(command)
         .expect_err("a consumer's position is not a scheduler's to record");
@@ -405,35 +405,35 @@ fn a_consumers_position_is_the_connections_and_a_scheduler_refuses_it() {
 
 #[test]
 fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_back() {
-    let world = World::start();
+    let epoch = Epoch::start();
 
     // A program precopied while the installed one serves: its precopy prepares
     // the next instance, and the switchover puts it in.
-    world
+    epoch
         .precopy("fcfs", 3, toy())
         .expect("the first program's precopy");
-    let first = world.switch_over().expect("the first switchover");
+    let first = epoch.switch_over().expect("the first switchover");
     // A stage names the boundary it applied at: a step the scheduler had
     // reached. The scheduler runs on past that boundary as soon as a policy
     // serves, so the answer is a step it has reached, not the one it is at when
     // asked — and the slot names the program the stage put in.
     assert!(
-        first.step <= world.step(),
+        first.step <= epoch.step(),
         "the boundary {} is one the scheduler reached",
         first.step
     );
     assert_eq!(
-        named(programs(&world).running),
+        named(programs(&epoch).running),
         Some(("fcfs".to_owned(), 3)),
         "the switchover's program serves"
     );
 
     // The next program is precopied while the first serves, then switched in;
     // the first is kept for a revert.
-    world
+    epoch
         .precopy("priority", 2, toy())
         .expect("the second program's precopy");
-    let second = world.switch_over().expect("the second switchover");
+    let second = epoch.switch_over().expect("the second switchover");
     assert!(
         second.step >= first.step,
         "a later switchover names a boundary no earlier than the first's: {} then {}",
@@ -441,53 +441,53 @@ fn the_switch_passes_through_its_stages_and_a_revert_brings_the_previous_policy_
         second.step
     );
     assert_eq!(
-        named(programs(&world).running),
+        named(programs(&epoch).running),
         Some(("priority".to_owned(), 2)),
         "the second switchover's program serves"
     );
 
     // A commit keeps the replaced policy until the next precopy (§7.3 step 5),
     // so a revert still finds it and brings it back.
-    answer(world.handle.commit_policy()).expect("the commit applies at a boundary");
-    world.revert().expect("the commit kept the previous policy");
+    answer(epoch.handle.commit_policy()).expect("the commit applies at a boundary");
+    epoch.revert().expect("the commit kept the previous policy");
     assert_eq!(
-        named(programs(&world).running),
+        named(programs(&epoch).running),
         Some(("fcfs".to_owned(), 3)),
         "the revert brought the replaced program back"
     );
 
     // The revert consumed it: there is nothing older to revert to.
     assert!(
-        world.revert().is_err(),
+        epoch.revert().is_err(),
         "a second revert has no previous policy"
     );
 }
 
 #[test]
 fn a_purge_drops_the_policy_a_revert_would_return_to() {
-    let world = World::start();
-    world
+    let epoch = Epoch::start();
+    epoch
         .precopy("fcfs", 1, toy())
         .expect("the first program's precopy");
-    world.switch_over().expect("the first switchover");
-    world
+    epoch.switch_over().expect("the first switchover");
+    epoch
         .precopy("priority", 2, toy())
         .expect("the second program's precopy");
-    world.switch_over().expect("the second switchover");
+    epoch.switch_over().expect("the second switchover");
 
     // §7.3 step 6: the generation before the serving one is released once no
     // batch uses it, so the policy a revert would return to is gone.
-    answer(world.handle.purge_policy()).expect("the purge applies at a boundary");
+    answer(epoch.handle.purge_policy()).expect("the purge applies at a boundary");
     assert!(
-        world.revert().is_err(),
+        epoch.revert().is_err(),
         "a purged generation cannot be reverted to"
     );
 }
 
 #[test]
 fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
-    let world = World::start();
-    world.precopy("fcfs", 1, toy()).expect("the precopy");
+    let epoch = Epoch::start();
+    epoch.precopy("fcfs", 1, toy()).expect("the precopy");
 
     // A stage of §7.3 is a scheduler's: it applies at the next boundary.
     let switchover = proto::process::Command {
@@ -495,7 +495,7 @@ fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
             proto::process::Switchover { generation: 1 },
         )),
     };
-    answer(world.handle.engine_command(switchover))
+    answer(epoch.handle.engine_command(switchover))
         .expect("a switchover applies at the scheduler's next boundary");
 
     // A precopy's module comes from the Program Server, whose client the
@@ -508,7 +508,7 @@ fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
             },
         )),
     };
-    let refused = answer(world.handle.engine_command(precopy))
+    let refused = answer(epoch.handle.engine_command(precopy))
         .expect_err("a precopy is not one scheduler's to prepare");
     assert!(
         refused.contains("Program Server"),
@@ -518,26 +518,26 @@ fn the_engines_commands_reach_a_scheduler_and_name_what_is_not_its_own() {
 
 #[test]
 fn a_precopy_whose_decisions_trap_fails_and_the_serving_policy_stays() {
-    let world = World::start();
-    world
+    let epoch = Epoch::start();
+    epoch
         .precopy("fcfs", 1, toy())
         .expect("the first program's precopy");
-    world.switch_over().expect("the first switchover");
+    epoch.switch_over().expect("the first switchover");
 
-    let failed = world.precopy("priority", 2, trapping());
+    let failed = epoch.precopy("priority", 2, trapping());
     assert!(
         failed.is_err(),
         "a policy that traps in a decision fails its precopy"
     );
     assert!(
-        world.switch_over().is_err(),
+        epoch.switch_over().is_err(),
         "a switchover without a prepared instance is refused, so the serving policy stays"
     );
 
     // The serving policy still answers: a later program's precopy and
     // switchover go through.
-    world
+    epoch
         .precopy("priority", 3, toy())
         .expect("a later program's precopy");
-    world.switch_over().expect("the later switchover");
+    epoch.switch_over().expect("the later switchover");
 }

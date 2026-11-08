@@ -4,29 +4,29 @@
 //! A ledger is derived on demand from three sources:
 //!
 //! - The device storages the server retains, each booked once in the ledger
-//!   of every deployment that retains it, however many scopes and worlds map
+//!   of every deployment that retains it, however many scopes and epochs map
 //!   it: a read-only storage as [`Item::Weights`], one a client marked with
 //!   its KV cache segment as [`Item::CacheSegment`], any other exclusive one
-//!   as [`Item::Exclusive`]. An entry names the worlds that hold it, so a
-//!   segment a successor world maps read-only appears once, held by both
-//!   worlds, and becomes the successor's alone when the predecessor is
+//!   as [`Item::Exclusive`]. An entry names the epochs that hold it, so a
+//!   segment a successor epoch maps read-only appears once, held by both
+//!   epochs, and becomes the successor's alone when the predecessor is
 //!   retired: the commit's handover of the segments is a transfer on the
 //!   ledger, never a release and an allocation.
 //! - What the processes book themselves ([`Request::Book`]), which the server
 //!   cannot see: a worker's graph pool, process storage and staging under its
-//!   scope and world; the Transfer Server's staging, and its CUDA context
+//!   scope and epoch; the Transfer Server's staging, and its CUDA context
 //!   while it holds the context on the GPU, in every ledger of the GPU. The
-//!   processes of one scope and world serve in turn (a rank and the
+//!   processes of one scope and epoch serve in turn (a rank and the
 //!   relaunch or standby that replaces it), so the largest of their bookings
 //!   of an item counts. A worker that ends in order withdraws its bookings
 //!   first; a worker's process that is lost leaves them reserved for the
 //!   process that replaces it, which takes each item over as it books it,
-//!   so a successor world cannot take a lost rank's storage before its
-//!   relaunch does. The reservation ends with its world's retirement or the
+//!   so a successor epoch cannot take a lost rank's storage before its
+//!   relaunch does. The reservation ends with its epoch's retirement or the
 //!   deployment. The Transfer Server's bookings end with its connection.
 //!
 //! The quota of a deployment's ledger is `⌊total × fraction⌋` of the whole
-//! GPU, which its workers state with their bookings; while two worlds that
+//! GPU, which its workers state with their bookings; while two epochs that
 //! state different fractions hold storage on the GPU, the smaller quota
 //! holds. Every change that adds to a ledger, a booking or a new device
 //! storage, is refused when it would take the ledger past its quota, so a
@@ -45,11 +45,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::ClientId;
 
-/// What books an item: a worker of a scope and world, or the Transfer
+/// What books an item: a worker of a scope and epoch, or the Transfer
 /// Server.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum Booker {
-    Worker { scope: Scope, world: u64 },
+    Worker { scope: Scope, epoch: u64 },
     Transfer,
 }
 
@@ -64,7 +64,7 @@ pub(crate) struct Booking {
 }
 
 /// One retained device storage as the ledgers see it: its record, whether
-/// its tensors are read-only, and the scopes of the worlds that retain any
+/// its tensors are read-only, and the scopes of the epochs that retain any
 /// of them.
 pub(crate) struct Held<'a> {
     pub(crate) record: &'a StorageRecord,
@@ -72,7 +72,7 @@ pub(crate) struct Held<'a> {
     pub(crate) retainers: BTreeSet<&'a Retainer>,
 }
 
-/// The ledgers' own state: every GPU's total storage, the quotas the worlds
+/// The ledgers' own state: every GPU's total storage, the quotas the epochs
 /// state and the processes' bookings. The storages they derive the rest
 /// from are the server's.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -80,14 +80,14 @@ pub(crate) struct Ledgers {
     /// Each GPU's total storage, as the last process that booked on it
     /// stated it.
     totals: BTreeMap<[u8; 16], u64>,
-    /// The quota each world of a deployment states for a GPU, by
-    /// `(deployment, GPU, world)`.
+    /// The quota each epoch of a deployment states for a GPU, by
+    /// `(deployment, GPU, epoch)`.
     quotas: BTreeMap<(String, [u8; 16], u64), u64>,
     /// The bookings of each connected process.
     bookings: BTreeMap<ClientId, Booking>,
-    /// The bookings of each scope and world whose worker's process was lost,
-    /// per GPU and item, until a process of the scope and world books the
-    /// item again or the world retires.
+    /// The bookings of each scope and epoch whose worker's process was lost,
+    /// per GPU and item, until a process of the scope and epoch books the
+    /// item again or the epoch retires.
     #[serde(default)]
     reserved: BTreeMap<(Scope, u64), ItemBytes>,
 }
@@ -111,20 +111,20 @@ impl Ledgers {
         if total > 0 {
             self.totals.insert(gpu, total);
         }
-        if let (Booker::Worker { scope, world }, Some(quota)) = (&booker, quota) {
+        if let (Booker::Worker { scope, epoch }, Some(quota)) = (&booker, quota) {
             self.quotas
-                .insert((scope.deployment.clone(), gpu, *world), quota);
+                .insert((scope.deployment.clone(), gpu, *epoch), quota);
         }
-        // A process of a scope and world takes each item it books over from
+        // A process of a scope and epoch takes each item it books over from
         // the reservation its lost predecessor left.
-        if let Booker::Worker { scope, world } = &booker
-            && let Some(reserved) = self.reserved.get_mut(&(scope.clone(), *world))
+        if let Booker::Worker { scope, epoch } = &booker
+            && let Some(reserved) = self.reserved.get_mut(&(scope.clone(), *epoch))
         {
             for &(item, _) in items {
                 reserved.remove(&(gpu, item));
             }
             if reserved.is_empty() {
-                self.reserved.remove(&(scope.clone(), *world));
+                self.reserved.remove(&(scope.clone(), *epoch));
             }
         }
         let booking = self.bookings.entry(client).or_insert_with(|| Booking {
@@ -142,12 +142,12 @@ impl Ledgers {
     }
 
     /// The connection of `client` ends: its process is gone. A worker's
-    /// remaining bookings that no other process of its scope and world
+    /// remaining bookings that no other process of its scope and epoch
     /// books (one that ended in order withdrew them first) stay reserved
     /// for the process that replaces it; the Transfer Server's end.
     pub(crate) fn disconnect(&mut self, client: ClientId) {
         let Some(Booking {
-            booker: Booker::Worker { scope, world },
+            booker: Booker::Worker { scope, epoch },
             items,
         }) = self.bookings.remove(&client)
         else {
@@ -159,8 +159,8 @@ impl Ledgers {
             .filter(|booking| match &booking.booker {
                 Booker::Worker {
                     scope: of,
-                    world: at,
-                } => *of == scope && *at == world,
+                    epoch: at,
+                } => *of == scope && *at == epoch,
                 Booker::Transfer => false,
             })
             .flat_map(|booking| booking.items.keys().copied())
@@ -172,20 +172,20 @@ impl Ledgers {
         if lost.is_empty() {
             return;
         }
-        let reserved = self.reserved.entry((scope, world)).or_default();
+        let reserved = self.reserved.entry((scope, epoch)).or_default();
         for (key, bytes) in lost {
             let counted = reserved.entry(key).or_default();
             *counted = (*counted).max(bytes);
         }
     }
 
-    /// The quotas the worlds of `retired` stated, and the bookings reserved
+    /// The quotas the epochs of `retired` stated, and the bookings reserved
     /// for their lost processes, end with their storage.
     pub(crate) fn retire(&mut self, deployment: &str, retired: &BTreeSet<u64>) {
         self.quotas
-            .retain(|(of, _, world), _| of != deployment || !retired.contains(world));
+            .retain(|(of, _, epoch), _| of != deployment || !retired.contains(epoch));
         self.reserved
-            .retain(|(scope, world), _| scope.deployment != deployment || !retired.contains(world));
+            .retain(|(scope, epoch), _| scope.deployment != deployment || !retired.contains(epoch));
     }
 
     /// Every quota and reservation of `deployment` ends: it is no longer
@@ -241,9 +241,9 @@ impl Ledgers {
                     [scope] => Some((*scope).clone()),
                     _ => None,
                 };
-                let worlds: Vec<u64> = retainers
+                let epochs: Vec<u64> = retainers
                     .iter()
-                    .map(|retainer| retainer.world)
+                    .map(|retainer| retainer.epoch)
                     .collect::<BTreeSet<_>>()
                     .into_iter()
                     .collect();
@@ -254,17 +254,17 @@ impl Ledgers {
                 *books
                     .entry((name.to_owned(), gpu))
                     .or_default()
-                    .entry((item, scope, worlds, segment))
+                    .entry((item, scope, epochs, segment))
                     .or_default() += storage.record.bytes;
             }
         }
 
-        // Each worker's booking, the largest of its scope and world's
+        // Each worker's booking, the largest of its scope and epoch's
         // processes and of what a lost process of theirs reserved; the
         // Transfer Server's, the largest of its processes.
         let mut workers: BTreeMap<(String, [u8; 16], EntryKey), u64> = BTreeMap::new();
         let mut transfer: BTreeMap<([u8; 16], Item), u64> = BTreeMap::new();
-        for ((scope, world), items) in &self.reserved {
+        for ((scope, epoch), items) in &self.reserved {
             if !deployment(&scope.deployment) {
                 continue;
             }
@@ -272,7 +272,7 @@ impl Ledgers {
                 if !gpus(&gpu) {
                     continue;
                 }
-                let key = (item, Some(scope.clone()), vec![*world], None);
+                let key = (item, Some(scope.clone()), vec![*epoch], None);
                 let counted = workers
                     .entry((scope.deployment.clone(), gpu, key))
                     .or_default();
@@ -285,11 +285,11 @@ impl Ledgers {
                     continue;
                 }
                 match &booking.booker {
-                    Booker::Worker { scope, world } => {
+                    Booker::Worker { scope, epoch } => {
                         if !deployment(&scope.deployment) {
                             continue;
                         }
-                        let key = (item, Some(scope.clone()), vec![*world], None);
+                        let key = (item, Some(scope.clone()), vec![*epoch], None);
                         let counted = workers
                             .entry((scope.deployment.clone(), gpu, key))
                             .or_default();
@@ -360,10 +360,10 @@ impl Ledgers {
                 host_link_bytes_per_second: None,
                 entries: entries
                     .into_iter()
-                    .map(|((item, scope, worlds, segment), bytes)| LedgerEntry {
+                    .map(|((item, scope, epochs, segment), bytes)| LedgerEntry {
                         item,
                         scope,
-                        worlds,
+                        epochs,
                         segment,
                         bytes,
                     })
@@ -375,7 +375,7 @@ impl Ledgers {
 
 /// The first ledger of `after` that a change takes past its quota, beyond
 /// what it booked in `before`: a ledger already past its quota (as one whose
-/// worlds stated a smaller fraction since) may still shrink, but not grow.
+/// epochs stated a smaller fraction since) may still shrink, but not grow.
 /// Returns the refusal's message, which names every entry of the ledger.
 pub(crate) fn overrun(before: &[GpuLedger], after: &[GpuLedger]) -> Option<String> {
     after.iter().find_map(|ledger| {

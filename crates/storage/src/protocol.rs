@@ -7,37 +7,33 @@
 //! with one [`Reply`] that repeats the identity, and sends asynchronous
 //! completions as [`Event`]s on the same connection.
 //!
-//! The protocol is versioned independently of the build ([`VERSION`]),
-//! because a Storage Server outlives builds of the head and the workers. The
-//! encoding is MessagePack with named fields, so a field added in a later
-//! version of a message is ignored by an older peer, and a field a client of
-//! an earlier version leaves out takes its default. A server serves clients
-//! of its version and of every earlier one from [`MIN_VERSION`] on, and
-//! refuses a client of a later version at `Hello`: a component that needs a
-//! later protocol than the running server speaks restarts the server with
-//! its own build first, which goes on with every connection.
+//! The protocol is versioned ([`VERSION`]) and a Storage Server serves
+//! clients of its own version only: it refuses a client of any other version
+//! at `Hello`, and a server of another version has to be stopped before a
+//! component of this build starts its own. The encoding is MessagePack with
+//! named fields.
 //!
-//! Storage belongs to worlds: a world is the set of processes that executes
+//! Storage belongs to epochs: an epoch is the set of processes that executes
 //! one configuration of a deployment (an engine and its workers, relaunched
 //! or not), and a deployment runs at most two at once while it updates. Each
-//! tensor is retained by the `(scope, world)` pairs that use it: a worker's
-//! requests retain and release under its own world alone, so a world that
+//! tensor is retained by the `(scope, epoch)` pairs that use it: a worker's
+//! requests retain and release under its own epoch alone, so an epoch that
 //! starts beside another neither takes nor releases the other's storage,
-//! and a world's storage outlives its processes until the head retires the
-//! world.
+//! and an epoch's storage outlives its processes until the head retires the
+//! epoch.
 //!
 //! The server stores bytes with DLPack metadata and never interprets them:
 //! clients compute every [`Key`] and define what the bytes mean.
 //!
 //! The server keeps one storage ledger per GPU for each deployment that uses
-//! it ([`GpuLedger`]), so that the two worlds of a deployment and the host's
+//! it ([`GpuLedger`]), so that the two epochs of a deployment and the host's
 //! Transfer Server stay within one quota on a GPU they share, rather than
 //! each sizing itself against what its own process holds. The quota is
 //! `⌊total × fraction⌋` of the whole GPU for the fraction the deployment's
 //! workers configure (`mem_fraction_static`). The ledger books what the
 //! server derives from the storages it retains (the weights, each KV cache
 //! segment, the other exclusive storages), each storage once whatever
-//! number of worlds map it, and what the processes book themselves
+//! number of epochs map it, and what the processes book themselves
 //! ([`Request::Book`]): a worker's graph pool, process storage and staging,
 //! and the Transfer Server's staging and its CUDA context while it holds
 //! one on the GPU. The server refuses a booking or a new device storage
@@ -81,26 +77,17 @@ use serde::{Deserialize, Serialize};
 
 /// Wire contract negotiated when a Storage Server client connects. Committed
 /// pages stay reusable by content key until ordinary eviction; only a
-/// world's uncommitted publications are discarded when it retires. A
+/// epoch's uncommitted publications are discarded when it retires. A
 /// [`Reply::Ledger`] answering a [`Request::Ledger`] carries what the
-/// deployment's transfer tasks copied ([`TransferTotal`]).
-pub const VERSION: u32 = 18;
+/// deployment's transfer tasks copied ([`TransferTotal`]). Version 19 names
+/// the epoch where earlier versions named the world.
+pub const VERSION: u32 = 19;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
 /// largest models the library serves fits many times over, and a reply of
 /// this size holds the server's loop for a few milliseconds on a host's
 /// network.
 pub const READ_BYTES: u64 = 64 << 20;
-
-/// The earliest client version the server serves: a client of version 4
-/// knows no worlds, and its requests act on world 0; a client of version 4
-/// or 5 states no world as a head, which reads and publishes world 0's
-/// pages; a client before version 7 makes no transfer request and reads no
-/// transfer event; a client before version 8 names no storage of another
-/// host; a client before version 9 books nothing in the ledgers and marks
-/// no storage as a KV cache segment; a client before version 10 names no
-/// location of a key's copy, and its requests take every copy.
-pub const MIN_VERSION: u32 = 4;
 
 /// A content address: the 32-byte digest of everything that determines a
 /// tensor's bytes, computed by the client.
@@ -144,7 +131,7 @@ impl std::fmt::Display for Scope {
 
 /// The token a deployment's claim carries: the server issues one when a head
 /// first claims the deployment and keeps it for every later claim of that
-/// head, of whatever world, and the head hands it to its workers, which
+/// head, of whatever epoch, and the head hands it to its workers, which
 /// state it in their [`Role`]. A worker that states another token belongs to
 /// a previous head of the deployment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -158,25 +145,25 @@ pub enum Role {
     /// host's daemon), or an engine of the deployment, which sends the page
     /// requests.
     ///
-    /// An engine states its `world`: the pages it commits are that world's,
-    /// and it reads its own world's pages and those every world shares.
-    /// Uncommitted worlds keep pages and tensors private until publication;
-    /// retiring such a world discards its pages.
+    /// An engine states its `epoch`: the pages it commits are that epoch's,
+    /// and it reads its own epoch's pages and those every epoch shares.
+    /// Uncommitted epochs keep pages and tensors private until publication;
+    /// retiring such an epoch discards its pages.
     Head {
         deployment: String,
         #[serde(default)]
-        world: u64,
+        epoch: u64,
     },
-    /// A worker of `scope` in `world`, started by the launch `generation` of
+    /// A worker of `scope` in `epoch`, started by the launch `generation` of
     /// its group, for the head that holds `claim`.
     Worker {
         scope: Scope,
         generation: u64,
         claim: Claim,
-        /// The world the worker belongs to: the head's identity of the
+        /// The epoch the worker belongs to: the head's identity of the
         /// processes that execute one configuration of the deployment.
         #[serde(default)]
-        world: u64,
+        epoch: u64,
     },
     /// The Mooncake connector the server runs.
     Connector,
@@ -281,12 +268,12 @@ impl<'de> Deserialize<'de> for FabricHandle {
     }
 }
 
-/// One segment of a KV cache's value planes: the world that created its
+/// One segment of a KV cache's value planes: the epoch that created its
 /// storage and its ordinal there. A segment is one storage per layer and
 /// plane, which a ledger books together.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Segment {
-    pub world: u64,
+    pub epoch: u64,
     pub ordinal: u32,
 }
 
@@ -294,7 +281,7 @@ pub struct Segment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Item {
-    /// Read-only device storages the server retains: a world's weights.
+    /// Read-only device storages the server retains: an epoch's weights.
     Weights,
     /// The device storages of one KV cache segment.
     CacheSegment,
@@ -348,7 +335,7 @@ impl Item {
 }
 
 /// One deployment's storage ledger of one GPU: everything the deployment's
-/// worlds hold on it, and the Transfer Server's items there, beside which
+/// epochs hold on it, and the Transfer Server's items there, beside which
 /// every deployment that uses the GPU holds its storage.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GpuLedger {
@@ -359,7 +346,7 @@ pub struct GpuLedger {
     /// The GPU's total storage, as the processes that use it state it; 0
     /// until one does.
     pub total: u64,
-    /// `⌊total × fraction⌋` for the smallest fraction a world of the
+    /// `⌊total × fraction⌋` for the smallest fraction an epoch of the
     /// deployment states for the GPU; `None` until one states one.
     pub quota: Option<u64>,
     pub entries: Vec<LedgerEntry>,
@@ -386,10 +373,10 @@ pub struct LedgerEntry {
     /// The worker scope that holds it; `None` for the Transfer Server's
     /// items and for storages several scopes hold.
     pub scope: Option<Scope>,
-    /// The worlds that hold it: one for a world's own, two for the storages
-    /// a successor world maps of its predecessor, which are booked once;
+    /// The epochs that hold it: one for an epoch's own, two for the storages
+    /// a successor epoch maps of its predecessor, which are booked once;
     /// none for the Transfer Server's items.
-    pub worlds: Vec<u64>,
+    pub epochs: Vec<u64>,
     /// The segment of an [`Item::CacheSegment`].
     pub segment: Option<Segment>,
     pub bytes: u64,
@@ -436,15 +423,15 @@ impl GpuLedger {
 impl LedgerEntry {
     /// The entry on one line: its item, holder and bytes.
     pub fn describe(&self) -> String {
-        let worlds: Vec<String> = self.worlds.iter().map(u64::to_string).collect();
-        let holder = match (&self.scope, worlds.is_empty()) {
+        let epochs: Vec<String> = self.epochs.iter().map(u64::to_string).collect();
+        let holder = match (&self.scope, epochs.is_empty()) {
             (None, true) => "the Transfer Server".to_owned(),
-            (Some(scope), _) => format!("{scope} of world {}", worlds.join(" and ")),
-            (None, false) => format!("world {}", worlds.join(" and ")),
+            (Some(scope), _) => format!("{scope} of epoch {}", epochs.join(" and ")),
+            (None, false) => format!("epoch {}", epochs.join(" and ")),
         };
         let segment = self
             .segment
-            .map(|segment| format!(" {}/{}", segment.world, segment.ordinal))
+            .map(|segment| format!(" {}/{}", segment.epoch, segment.ordinal))
             .unwrap_or_default();
         format!(
             "{}{segment} of {holder}: {} bytes",
@@ -683,10 +670,10 @@ impl Span {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
-    /// What a world's promotion waits for: the data the in-flight requests
-    /// wrote after the next world's store was warmed.
+    /// What an epoch's promotion waits for: the data the in-flight requests
+    /// wrote after the next epoch's store was warmed.
     Promotion,
-    /// Warming the next world's store while the executing world runs: the
+    /// Warming the next epoch's store while the executing epoch runs: the
     /// pages the in-flight requests filled, copied ahead of the promotion.
     Warming,
     /// Weight moves and every other copy no promotion waits for.
@@ -737,7 +724,7 @@ pub struct Link {
     pub destination: LinkEnd,
 }
 
-/// A change of links' byte budgets, which the head of the executing world
+/// A change of links' byte budgets, which the head of the executing epoch
 /// makes when its scheduler steps slow down while transfers run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -863,9 +850,9 @@ pub struct ContextBytes {
 #[serde(rename_all = "snake_case")]
 pub enum Request {
     /// Make the caller the head of its deployment, keeping the claim it holds
-    /// already, and state the scopes `world` places on the host: the world's
-    /// retention of every other scope ends. Every world of `retire` ends on
-    /// the host: its retention of every tensor ends, and a tensor no world
+    /// already, and state the scopes `epoch` places on the host: the epoch's
+    /// retention of every other scope ends. Every epoch of `retire` ends on
+    /// the host: its retention of every tensor ends, and a tensor no epoch
     /// retains is released. Refused while a previous head of the deployment
     /// is connected. Every process of the deployment that belongs to no
     /// current worker is shot down. Every other deployment whose head is not
@@ -874,15 +861,15 @@ pub enum Request {
     Claim {
         scopes: Vec<Scope>,
         #[serde(default)]
-        world: u64,
+        epoch: u64,
         #[serde(default)]
         retire: Vec<u64>,
     },
-    /// Publish all listed committed worlds together. Claimed worlds remain
+    /// Publish all listed committed epochs together. Claimed epochs remain
     /// private until this request, including during preparation and trial.
-    /// Every listed world must be claimed by the head's deployment.
-    PublishWorlds { worlds: Vec<u64> },
-    /// Release every tensor the caller's scope retains in the caller's world
+    /// Every listed epoch must be claimed by the head's deployment.
+    PublishEpochs { epochs: Vec<u64> },
+    /// Release every tensor the caller's scope retains in the caller's epoch
     /// that `keys` does not list; the copies of listed keys at the locations
     /// `at` lists are retained (every copy when `at` is empty).
     Retain {
@@ -890,35 +877,35 @@ pub enum Request {
         #[serde(default)]
         at: Vec<Location>,
     },
-    /// Worlds in the head's deployment retain their weights and the exact
+    /// Epochs in the head's deployment retain their weights and the exact
     /// `cache_keys` holding completed rollback copies. Their retention of
-    /// every other exclusive tensor ends. A tensor no other world retains
+    /// every other exclusive tensor ends. A tensor no other epoch retains
     /// is released, while segments mapped by the successor remain retained
     /// by that successor. Call after the predecessor's processes exit.
     /// Answered with `Retained`.
     KeepWeights {
-        worlds: Vec<u64>,
+        epochs: Vec<u64>,
         cache_keys: Vec<Key>,
     },
-    /// From a head: world `world` of its deployment keeps its weights in
-    /// host storage (`update_config.previous_world = "host"`, its processes
-    /// exited). Every device copy of read-only tensors that this world
+    /// From a head: epoch `epoch` of its deployment keeps its weights in
+    /// host storage (`update_config.previous_epoch = "host"`, its processes
+    /// exited). Every device copy of read-only tensors that this epoch
     /// alone retains moves to host storage: the server creates host storage of
     /// each storage's size, admitted under the host rule as one (refused,
     /// moving nothing, when the host cannot hold it all), has its Transfer
     /// Server copy each storage there, and then the tensors' copies lie in
     /// host storage and the device storages are released: each GPU's ledger
-    /// leaves their storage to the other world. Answered with `Moved` once
+    /// leaves their storage to the other epoch. Answered with `Moved` once
     /// every copy ended; refused while no Transfer Server runs.
-    Offload { world: u64 },
-    /// From a head: world `world`'s weights that `Offload` moved to host
+    Offload { epoch: u64 },
+    /// From a head: epoch `epoch`'s weights that `Offload` moved to host
     /// storage return to the GPUs they came from, before its processes start
     /// again: its Transfer Server creates device storage of each storage's
     /// size on its GPU, admitted against the GPU's ledger (refused, moving
     /// nothing, past the quota), and copies each storage there; then the
     /// tensors' copies lie on those GPUs again and the host copies are
     /// released. Answered with `Moved` once every copy ended.
-    Restore { world: u64 },
+    Restore { epoch: u64 },
     /// The copies of `keys` that exist at the locations `at` lists (at
     /// every location when `at` is empty), with their storages'
     /// descriptors, and the keys with no such copy.
@@ -930,7 +917,7 @@ pub enum Request {
     },
     /// Allocate an exclusive byte tensor in host storage after host
     /// admission. Returns its retained storage through `Got`, with write
-    /// ownership belonging to this worker and lifetime to its world.
+    /// ownership belonging to this worker and lifetime to its epoch.
     AllocateHost { key: Key, name: String, bytes: u64 },
     /// Publish tensors whose bytes are written, over the storages this
     /// message carries. Read-only tensors become readable; exclusive ones
@@ -1032,14 +1019,14 @@ pub enum Request {
     /// [`Event::Prefetched`] with the same `tag` follows when the reads
     /// end.
     Prefetch { pool: u64, keys: Vec<Key>, tag: u64 },
-    /// The token count each rank of a world holds in the host KV cache of
-    /// this host, beside the world's other ranks here: the least of
-    /// `tokens`, the count the world asks for, and the host's budget over
+    /// The token count each rank of an epoch holds in the host KV cache of
+    /// this host, beside the epoch's other ranks here: the least of
+    /// `tokens`, the count the epoch asks for, and the host's budget over
     /// the bytes one token takes on all of those ranks (`token_bytes`, one
     /// entry per rank). The budget is `host_bytes`, the deployment's host KV
     /// cache on each host, when stated; otherwise four fifths of the host's
     /// available storage (bounded by the server's storage cgroup limit, and
-    /// counting the deployment's page pools no world maps, which the server
+    /// counting the deployment's page pools no epoch maps, which the server
     /// releases for a new pool) less what the page pools have yet to
     /// allocate and the server's reserve. Answered with [`Reply::HostCache`].
     HostCache {
@@ -1055,8 +1042,8 @@ pub enum Request {
     /// each item of `items` takes its bytes, 0 ending it; an item left out
     /// keeps its booking. A worker books [`Item::GraphPool`],
     /// [`Item::Process`] and [`Item::Staging`] in its deployment's ledger
-    /// under its scope and world, and states `quota`, `⌊total × fraction⌋`
-    /// for its configured fraction. The processes of one scope and world (a
+    /// under its scope and epoch, and states `quota`, `⌊total × fraction⌋`
+    /// for its configured fraction. The processes of one scope and epoch (a
     /// rank, and the relaunch or standby that replaces it) serve in turn, so
     /// the larger of their bookings of an item counts. The Transfer Server
     /// books [`Item::Staging`] and [`Item::TransferContext`] in every ledger
@@ -1088,7 +1075,7 @@ pub enum Request {
     Transfer {
         spans: Vec<Span>,
         priority: Priority,
-        /// The update (world change) the task serves, a number its
+        /// The update (epoch change) the task serves, a number its
         /// deployment's head chooses; the tasks of an update that aborts
         /// are cancelled together.
         update: u64,
@@ -1110,7 +1097,7 @@ pub enum Request {
     },
     /// From a head: halve or restore the byte budget of each of `links`.
     /// With no links, a halving takes every link a task of the head's
-    /// deployment copies over now (a deployment changes one world at a
+    /// deployment copies over now (a deployment changes one epoch at a
     /// time, so they are its update's links), and a restoration every link
     /// whose budget a halving reduced.
     Throttle {
@@ -1204,7 +1191,7 @@ pub enum ErrorKind {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Reply {
-    WorldsPublished,
+    EpochsPublished,
     Claimed {
         claim: Claim,
     },
@@ -1407,7 +1394,7 @@ pub struct ListedTensor {
     pub key: Key,
     pub name: String,
     pub scopes: Vec<Scope>,
-    /// The `(scope, world)` pairs that retain the tensor.
+    /// The `(scope, epoch)` pairs that retain the tensor.
     #[serde(default)]
     pub retainers: Vec<Retainer>,
     pub location: Location,
@@ -1421,23 +1408,23 @@ pub struct ListedTensor {
     pub writer: Option<i32>,
 }
 
-/// Storage bytes one scope of one world holds on one location.
+/// Storage bytes one scope of one epoch holds on one location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScopeBytes {
     /// The GPU's UUID for device bytes; `None` for host bytes.
     pub gpu: Option<[u8; 16]>,
     pub scope: Scope,
-    /// The world whose scope holds the bytes.
+    /// The epoch whose scope holds the bytes.
     #[serde(default)]
-    pub world: u64,
+    pub epoch: u64,
     pub bytes: u64,
 }
 
-/// One use that keeps a tensor: a scope of one world.
+/// One use that keeps a tensor: a scope of one epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Retainer {
     pub scope: Scope,
-    pub world: u64,
+    pub epoch: u64,
 }
 
 /// One claimed deployment in a [`Listing`].
@@ -1510,7 +1497,7 @@ pub enum Event {
     /// GPU `gpu`, retainable through a POSIX descriptor and addressed by
     /// every GPU that can, send its descriptor with
     /// [`Request::Allocated`], and keep no handle of it: the server holds
-    /// the storage from then on, which a world's restored weights take.
+    /// the storage from then on, which an epoch's restored weights take.
     Allocate {
         request: u64,
         gpu: [u8; 16],

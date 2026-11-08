@@ -1,5 +1,5 @@
-//! The instrumentation a world change reads: the schedulers' statistics kept
-//! over the longest span a trial measures, the rates a world computes at, and
+//! The instrumentation an epoch change reads: the schedulers' statistics kept
+//! over the longest span a trial measures, the rates an epoch computes at, and
 //! the samples they are read from. It is not part of the change mechanism; the
 //! mechanism reads it, and profiling reports through it.
 
@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::leader::locked;
 
-/// Average step time and throughput of one world over a span.
+/// Average step time and throughput of one epoch over a span.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Rates {
     /// Microseconds per batch.
@@ -20,11 +20,11 @@ pub struct Rates {
     pub tokens_per_second: f64,
 }
 
-/// One statistics report of one scheduler of one world: the interval's
+/// One statistics report of one scheduler of one epoch: the interval's
 /// host-observed batch time, batches, query tokens and numerical faults.
 pub(crate) struct Sample {
     pub(crate) at: Instant,
-    pub(crate) world: u64,
+    pub(crate) epoch: u64,
     pub(crate) scheduler: u32,
     pub(crate) batch_us: u64,
     pub(crate) batches: u64,
@@ -32,8 +32,8 @@ pub(crate) struct Sample {
     numerical_faults: u64,
 }
 
-/// The schedulers' statistics of every world, kept over the longest span a
-/// trial measures, from which a trial reads the previous world's baseline
+/// The schedulers' statistics of every epoch, kept over the longest span a
+/// trial measures, from which a trial reads the previous epoch's baseline
 /// and its own rates and faults.
 #[derive(Default)]
 pub(crate) struct Observer {
@@ -47,8 +47,8 @@ pub(crate) struct Observer {
 const OBSERVED: Duration = Duration::from_secs(600);
 
 impl Observer {
-    /// Records the report of scheduler `scheduler` of `world`.
-    pub(crate) fn record(&self, world: u64, scheduler: u32, stats: &SchedulerStats) {
+    /// Records the report of scheduler `scheduler` of `epoch`.
+    pub(crate) fn record(&self, epoch: u64, scheduler: u32, stats: &SchedulerStats) {
         if let Some(forward) = &stats.worker_forward_stats {
             let mut profile = locked(&self.profile);
             for (key, value) in &forward.profile {
@@ -59,7 +59,7 @@ impl Observer {
         let mut samples = locked(&self.samples);
         samples.push_back(Sample {
             at: now,
-            world,
+            epoch,
             scheduler,
             batch_us: stats.batch_roundtrip_us,
             batches: stats.batch_count,
@@ -74,23 +74,23 @@ impl Observer {
         }
     }
 
-    /// `world`'s rates over the `window` before now, from `since` on; `None`
+    /// `epoch`'s rates over the `window` before now, from `since` on; `None`
     /// without a batch in it.
-    pub(crate) fn rates(&self, world: u64, since: Instant, window: Duration) -> Option<Rates> {
+    pub(crate) fn rates(&self, epoch: u64, since: Instant, window: Duration) -> Option<Rates> {
         let now = Instant::now();
         let from = since.max(now.checked_sub(window).unwrap_or(since));
-        self.rates_between(world, from, now)
+        self.rates_between(epoch, from, now)
     }
 
-    /// `world`'s rates over the reports it made in `[from, until)`; `None`
+    /// `epoch`'s rates over the reports it made in `[from, until)`; `None`
     /// without a batch among them.
-    pub(crate) fn rates_between(&self, world: u64, from: Instant, until: Instant) -> Option<Rates> {
+    pub(crate) fn rates_between(&self, epoch: u64, from: Instant, until: Instant) -> Option<Rates> {
         let samples = locked(&self.samples);
         let (mut batch_us, mut batches, mut tokens) = (0_u64, 0_u64, 0_u64);
         let mut first: Option<Instant> = None;
         for sample in samples
             .iter()
-            .filter(|sample| sample.world == world && sample.at >= from && sample.at < until)
+            .filter(|sample| sample.epoch == epoch && sample.at >= from && sample.at < until)
         {
             batch_us += sample.batch_us;
             batches += sample.batches;
@@ -109,18 +109,18 @@ impl Observer {
         })
     }
 
-    /// Calls `visit` with every report of `world` made in `[from, until)`,
+    /// Calls `visit` with every report of `epoch` made in `[from, until)`,
     /// in the order they arrived.
     pub(crate) fn samples(
         &self,
-        world: u64,
+        epoch: u64,
         from: Instant,
         until: Instant,
         mut visit: impl FnMut(&Sample),
     ) {
         for sample in locked(&self.samples)
             .iter()
-            .filter(|sample| sample.world == world && sample.at >= from && sample.at < until)
+            .filter(|sample| sample.epoch == epoch && sample.at >= from && sample.at < until)
         {
             visit(sample);
         }
@@ -140,11 +140,11 @@ impl Observer {
         (counter("steps"), counter("bytes"), counter("ended"))
     }
 
-    /// The calls of `world` that produced non-finite logits since `since`.
-    pub(crate) fn numerical_faults(&self, world: u64, since: Instant) -> u64 {
+    /// The calls of `epoch` that produced non-finite logits since `since`.
+    pub(crate) fn numerical_faults(&self, epoch: u64, since: Instant) -> u64 {
         locked(&self.samples)
             .iter()
-            .filter(|sample| sample.world == world && sample.at >= since)
+            .filter(|sample| sample.epoch == epoch && sample.at >= since)
             .map(|sample| sample.numerical_faults)
             .sum()
     }
@@ -165,10 +165,10 @@ mod tests {
         }
     }
 
-    /// A world's rates average its own batches over the window, apart from
-    /// another world's.
+    /// An epoch's rates average its own batches over the window, apart from
+    /// another epoch's.
     #[test]
-    fn rates_average_one_worlds_batches() {
+    fn rates_average_one_epochs_batches() {
         let observer = Observer::default();
         let since = Instant::now();
         observer.record(1, 0, &stats(1_000, 10, 500, 0));
@@ -176,7 +176,7 @@ mod tests {
         observer.record(2, 0, &stats(90_000, 1, 1, 2));
         let rates = observer
             .rates(1, since, Duration::from_secs(60))
-            .expect("world 1 ran batches");
+            .expect("epoch 1 ran batches");
         assert!((rates.step_us - 200.0).abs() < 1e-9, "{rates:?}");
         assert!(rates.tokens_per_second > 0.0);
         assert_eq!(observer.numerical_faults(1, since), 0);

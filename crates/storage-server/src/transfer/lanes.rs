@@ -9,7 +9,7 @@
 //!
 //! - **Chunks.** A chunk lasts the configured chunk time at the link's
 //!   bandwidth, so that a copy engine is never held by one copy much longer
-//!   than that, far below a scheduler step of the world executing beside
+//!   than that, far below a scheduler step of the epoch executing beside
 //!   the transfers; a task of a higher priority starts on the next chunk.
 //! - **Budgets.** A link may move its budget's share of its bandwidth: a
 //!   token bucket refilled at that rate, holding at most [`DEPTH`] chunks,

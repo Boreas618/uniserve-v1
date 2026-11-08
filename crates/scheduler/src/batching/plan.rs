@@ -176,7 +176,7 @@ impl Scheduler {
                 if !self.ensure_decode_capacity(id, cache_visible_len as usize, capacity_target) {
                     // The request stays where it is for this step, and the pass
                     // stays non-token behind it. A plan the mechanism cannot
-                    // build is a stall the rest of the world cannot see, so it
+                    // build is a stall the rest of the epoch cannot see, so it
                     // is named at `warn`: a policy that keeps asking for a
                     // verification the cache has no room for would otherwise
                     // park the request in silence.
@@ -243,7 +243,7 @@ impl Scheduler {
                     // The request stays in `CloseCache` for this step: the
                     // cache does not yet cover the position the write lands on.
                     // Named here because the silent return is a stall the rest
-                    // of the world cannot see (the pass stays non-token and the
+                    // of the epoch cannot see (the pass stays non-token and the
                     // decoders wait behind it).
                     tracing::debug!(
                         request = id.0,

@@ -1,4 +1,4 @@
-//! Design 8's exchange transport and the world switch: a pool's storage is unmapped while its
+//! Design 8's exchange transport and the epoch switch: a pool's storage is unmapped while its
 //! virtual range stays reserved, so a captured graph over it stays valid, and a restore maps
 //! storage at the same addresses again - refusing a layout the captured graphs do not address.
 //!
@@ -166,7 +166,7 @@ fn a_restore_whose_layout_the_graphs_do_not_address_is_refused() {
     let before = pools.layout();
 
     pools.suspend().expect("unmap the pool's storage");
-    // A second stream's range appears between the two calls - what a world switch that opened a
+    // A second stream's range appears between the two calls - what an epoch switch that opened a
     // new generation's stream inside the window would do.
     pools.base(StreamId(1)).expect("a second stream's range");
     let error = pools

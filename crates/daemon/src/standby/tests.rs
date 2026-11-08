@@ -12,14 +12,14 @@ const SERVING: u64 = 7;
 
 /// A process whose next child's generation the epoch layer took one after
 /// the serving one, as the counter gives it.
-fn process(host: &str, world: Option<u64>) -> MainProcess {
+fn process(host: &str, epoch: Option<u64>) -> MainProcess {
     MainProcess {
         host: host.to_owned(),
         group: format!("main-{host}"),
         rank: 0,
         generation: SERVING,
         standby_generation: SERVING + 1,
-        world,
+        epoch,
     }
 }
 
@@ -109,7 +109,7 @@ fn migrate(host: &str) -> Action {
     }
 }
 
-/// Two domains: `a` alone, and `b` and `c` sharing cross-node world 3.
+/// Two domains: `a` alone, and `b` and `c` sharing cross-node epoch 3.
 fn roster() -> Roster {
     Roster::new(vec![
         process("a", None),
@@ -165,7 +165,7 @@ fn domains(roster: &Roster) -> Vec<Vec<String>> {
 }
 
 #[test]
-fn the_domains_follow_the_cross_node_worlds() {
+fn the_domains_follow_the_cross_node_epochs() {
     let roster = Roster::new(vec![
         process("a", None),
         process("b", Some(3)),
@@ -398,7 +398,7 @@ fn a_parked_standby_that_dies_leaves_the_domain_to_a_relaunch() {
     let mut roster = roster();
     start(&mut roster);
     parked(&mut roster);
-    // A standby dies (its device faulted): the domain's standby world is
+    // A standby dies (its device faulted): the domain's standby epoch is
     // one, so the other members' standbys are dropped with it.
     assert_eq!(roster.standby_lost("c"), vec![terminate("b", SERVING + 1)]);
     allocated(&mut roster, &["b", "c"], SERVING + 2);
@@ -468,7 +468,7 @@ fn every_member_is_asked_to_promote_before_any_answer_is_awaited() {
     start(&mut roster);
     parked(&mut roster);
     // The whole round's promotions are returned in one call, so the caller
-    // issues them all before it awaits any answer (a suspended world
+    // issues them all before it awaits any answer (a suspended epoch
     // restores its communication together).
     let actions = roster.failed("c", &failure("launch_failed"));
     assert_eq!(

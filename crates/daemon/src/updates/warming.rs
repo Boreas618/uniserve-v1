@@ -124,7 +124,7 @@ mod tests {
 
     fn prefix(computed: u32, cached: u32) -> Prefix {
         Prefix {
-            world: 0,
+            epoch: 0,
             request: 1,
             resume: (0, 1),
             capacity_tokens: 0,

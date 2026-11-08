@@ -217,11 +217,11 @@ pub(crate) fn block_id(blocks: &[String], name: &str) -> Option<ComponentId> {
         .map(|index| ComponentId(u32::try_from(index).unwrap_or(u32::MAX)))
 }
 
-/// The blocks of every worker of the world: the table `ComponentId`s number, so
+/// The blocks of every worker of the epoch: the table `ComponentId`s number, so
 /// a phase's block and a replica's block name the same component.
-pub(crate) fn world_blocks(world: &dyn super::submission::World) -> Vec<String> {
+pub(crate) fn epoch_blocks(epoch: &dyn super::submission::Epoch) -> Vec<String> {
     let mut names = Vec::new();
-    for (_, info) in &world.info().workers {
+    for (_, info) in &epoch.info().workers {
         names.extend(blocks(info));
     }
     names.sort();
@@ -250,7 +250,7 @@ pub(crate) fn phases(info: &MainProcessInfo) -> Vec<PhaseView> {
     phases_in(info, &blocks(info))
 }
 
-/// Every phase this worker group can run, numbered in the world's block table.
+/// Every phase this worker group can run, numbered in the epoch's block table.
 pub(crate) fn phases_in(info: &MainProcessInfo, table: &[String]) -> Vec<PhaseView> {
     PHASES
         .iter()
@@ -1261,8 +1261,8 @@ fn candidate_facts<'a>(
     kind: CallKind,
     candidates: impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)>,
 ) -> Vec<(ReplicaView, crate::WorkerGroupId, String)> {
-    let world = &scheduler.worker;
-    let table = world_blocks(world);
+    let epoch = &scheduler.worker;
+    let table = epoch_blocks(epoch);
     let decode_stage = matches!(
         kind,
         CallKind::Forward(ForwardMode::Decode | ForwardMode::Verify)
@@ -1279,7 +1279,7 @@ fn candidate_facts<'a>(
                 resident_requests: resident_requests(&scheduler.dispatch, worker),
                 // The worker reports whether a worker's queue has room, not
                 // how many rows that is; a plan may submit one call's worth.
-                capacity: u32::from(world.has_capacity(worker)),
+                capacity: u32::from(epoch.has_capacity(worker)),
                 holds_request: holds_request(
                     &scheduler.dispatch,
                     request,
@@ -1306,7 +1306,7 @@ pub(crate) fn call(
     (!candidates.is_empty()).then(|| (call_view(request, kind), candidates))
 }
 
-/// One entry per pool the world reports, in the order it states them — the
+/// One entry per pool the epoch reports, in the order it states them — the
 /// same length and order as the control thread's
 /// `routing.slots`, so an index into this list and an index into that one name
 /// the same rank. The two are built on different threads and carry different
@@ -1314,11 +1314,11 @@ pub(crate) fn call(
 /// thread), so this contract is stated here rather than enforced by a type.
 
 /// Every replica a `place` decision may choose, for `Snapshot::replicas`: one
-/// per worker of the world, in the worker's order.
+/// per worker of the epoch, in the worker's order.
 pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
-    let world = &scheduler.worker;
-    let table = world_blocks(world);
-    world
+    let epoch = &scheduler.worker;
+    let table = epoch_blocks(epoch);
+    epoch
         .info()
         .workers
         .iter()
@@ -1333,7 +1333,7 @@ pub(crate) fn replica_catalog(scheduler: &Scheduler) -> Vec<ReplicaView> {
                 block: block_id(&table, bound).unwrap_or(ComponentId(0)),
                 kinds: worker_phases(info),
                 resident_requests: resident_requests(&scheduler.dispatch, worker),
-                capacity: u32::from(world.has_capacity(worker)),
+                capacity: u32::from(epoch.has_capacity(worker)),
                 holds_request: false,
                 prefills_only: scheduler.dispatch.prefill_groups.contains(worker),
                 holds_component: false,
@@ -1369,7 +1369,7 @@ pub(crate) fn snapshot(scheduler: &Scheduler, step: u64, recorded: &RecordedTabl
         pages: pages(scheduler),
         encodings: encodings(scheduler),
         replicas: replica_catalog(scheduler),
-        phases: phases_in(&scheduler.info, &world_blocks(&scheduler.worker)),
+        phases: phases_in(&scheduler.info, &epoch_blocks(&scheduler.worker)),
         ranks: Vec::new(),
     }
 }

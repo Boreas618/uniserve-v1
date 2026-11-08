@@ -2,7 +2,7 @@
 //! which it keeps derived state in their host page pools (trajectories,
 //! encoder outputs).
 //!
-//! The scheduler connects as a head of its engine's world, so what a world
+//! The scheduler connects as a head of its engine's epoch, so what an epoch
 //! on trial commits stays its own until its commit. Requests to the servers
 //! never block the scheduler: [`Servers::submit`] sends one with what it was
 //! asked for (its purpose), and [`Servers::answers`] takes the answers that
@@ -17,7 +17,7 @@ use storage::{Client, Role};
 /// purpose of every request they have not answered.
 pub(crate) struct Servers<P> {
     deployment: String,
-    world: u64,
+    epoch: u64,
     /// What the store keeps, for its logs.
     what: &'static str,
     /// The engine's host's server first, then other hosts' by the TCP
@@ -30,23 +30,23 @@ pub(crate) struct Servers<P> {
 
 impl<P> Servers<P> {
     /// Connect to this host's Storage Server, at `socket`, as a head of
-    /// `deployment` in `world`, for a store keeping `what`.
+    /// `deployment` in `epoch`, for a store keeping `what`.
     pub(crate) fn connect(
         socket: &std::path::Path,
         deployment: &str,
-        world: u64,
+        epoch: u64,
         what: &'static str,
     ) -> anyhow::Result<Self> {
         let client = Client::connect(
             socket,
             Role::Head {
                 deployment: deployment.to_owned(),
-                world,
+                epoch,
             },
         )?;
         Ok(Self {
             deployment: deployment.to_owned(),
-            world,
+            epoch,
             what,
             clients: vec![client],
             remote: HashMap::new(),
@@ -73,7 +73,7 @@ impl<P> Servers<P> {
         }
         let role = Role::Head {
             deployment: self.deployment.clone(),
-            world: self.world,
+            epoch: self.epoch,
         };
         match Client::connect_tcp(address, role) {
             Ok(client) => {

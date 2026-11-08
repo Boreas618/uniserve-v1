@@ -863,7 +863,7 @@ pub enum GenerationResourceError {
 /// Scheduler-relevant prefix-cache behavior resolved during compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct CacheResume {
-    pub world: u64,
+    pub epoch: u64,
     pub request_id: u64,
 }
 
@@ -876,12 +876,12 @@ pub struct CachePolicy {
     pub write: bool,
     /// Optional tenant or request-group cache namespace.
     pub isolation_key: Option<u64>,
-    /// The prefix seed of the world whose state the request continues with:
-    /// a request a world change migrates with `in_flight = keep`, when the
-    /// new world computes other numerics. Its prefix lookups match the
-    /// pages that world computed, it reads no host KV cache, whose pages are
-    /// keyed by the world that serves, and a request continuing so writes
-    /// no public page (`write`), since its pages are neither world's. Its
+    /// The prefix seed of the epoch whose state the request continues with:
+    /// a request an epoch change migrates with `in_flight = keep`, when the
+    /// new epoch computes other numerics. Its prefix lookups match the
+    /// pages that epoch computed, it reads no host KV cache, whose pages are
+    /// keyed by the epoch that serves, and a request continuing so writes
+    /// no public page (`write`), since its pages are neither epoch's. Its
     /// private continuation retains them for subsequent migrations.
     #[serde(default)]
     pub state_seeds: Vec<u64>,

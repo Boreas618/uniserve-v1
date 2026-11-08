@@ -36,23 +36,23 @@ pub struct RequestHold {
     serving: watch::Sender<Serving>,
     /// Whether submissions wait although an engine serves.
     paused: watch::Sender<bool>,
-    /// The state the requests migrating out of a world continue with
+    /// The state the requests migrating out of an epoch continue with
     /// (`Self::kept`).
     kept: std::sync::Mutex<Option<Kept>>,
 }
 
-/// The state the requests migrating out of world `world` continue with,
-/// although the world that serves next computes other numerics: a world
+/// The state the requests migrating out of epoch `epoch` continue with,
+/// although the epoch that serves next computes other numerics: an epoch
 /// change's `in_flight = keep`.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Kept {
-    pub world: u64,
+    pub epoch: u64,
     /// The prefix seeds of the pages a token request continues with
-    /// (`CachePolicy::state_seeds`), when the worlds' pages differ.
+    /// (`CachePolicy::state_seeds`), when the epochs' pages differ.
     pub prefix_seeds: Option<Vec<u64>>,
     /// The latent seed of the trajectories a request continues with
     /// (`Trajectory::state_seed`: a video request's, or the image a token
-    /// request had begun), when the worlds' trajectories differ.
+    /// request had begun), when the epochs' trajectories differ.
     pub latent_seed: Option<u64>,
 }
 
@@ -88,9 +88,9 @@ impl RequestHold {
         }
     }
 
-    /// Has the requests that migrate out of `kept.world` continue with the
-    /// state they reached there: a world change's `in_flight = keep` when
-    /// the world that serves next computes other numerics. `None` ends it.
+    /// Has the requests that migrate out of `kept.epoch` continue with the
+    /// state they reached there: an epoch change's `in_flight = keep` when
+    /// the epoch that serves next computes other numerics. `None` ends it.
     pub fn keep(&self, kept: Option<Kept>) {
         *self
             .kept
@@ -98,14 +98,14 @@ impl RequestHold {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = kept;
     }
 
-    /// The state a request migrating out of world `world` continues with,
+    /// The state a request migrating out of epoch `epoch` continues with,
     /// if it keeps it.
-    pub fn kept(&self, world: u64) -> Option<Kept> {
+    pub fn kept(&self, epoch: u64) -> Option<Kept> {
         self.kept
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
-            .filter(|kept| kept.world == world)
+            .filter(|kept| kept.epoch == epoch)
     }
 
     /// Holds later submissions until [`Self::resume`], whatever engine
@@ -141,7 +141,7 @@ impl RequestHold {
     }
 
     /// Transfers continuations to a successor replica. Existing HTTP
-    /// streams retain this hold, while each successor owns its later world
+    /// streams retain this hold, while each successor owns its later epoch
     /// changes. The caller must avoid cycles and restore predecessor holds
     /// before redirecting successors during rollback.
     pub(crate) fn redirect(&self, successor: Arc<RequestHold>) {
@@ -213,13 +213,13 @@ impl RequestHold {
     /// waits on all replicas when none is ready, without polling.
     pub(crate) async fn ready(
         &self,
-        previous_world: Option<u64>,
+        previous_epoch: Option<u64>,
     ) -> Result<(Arc<EngineClient>, Option<Kept>), SubmitError> {
-        let (destination, kept) = self.destination(previous_world).await?;
+        let (destination, kept) = self.destination(previous_epoch).await?;
         match destination {
             Destination::Engine(client) => Ok((client, kept)),
             Destination::Remote(remote) => {
-                let (client, remote_kept) = remote.ready(previous_world).await?;
+                let (client, remote_kept) = remote.ready(previous_epoch).await?;
                 Ok((client, kept.or(remote_kept)))
             }
         }
@@ -231,9 +231,9 @@ impl RequestHold {
         &self,
         requests: String,
         known_engine: Option<u64>,
-        previous_world: Option<u64>,
+        previous_epoch: Option<u64>,
     ) -> Result<crate::restart::requests::Attachment, SubmitError> {
-        let (destination, kept) = self.destination(previous_world).await?;
+        let (destination, kept) = self.destination(previous_epoch).await?;
         match destination {
             Destination::Engine(client) => {
                 let engine = client.engine().ok_or_else(|| {
@@ -248,14 +248,14 @@ impl RequestHold {
                 };
                 Ok(crate::restart::requests::Attachment {
                     engine,
-                    world: client.world(),
+                    epoch: client.epoch(),
                     first_request,
                     kept,
                 })
             }
             Destination::Remote(remote) => {
                 let mut attachment = remote
-                    .attach(requests, known_engine, previous_world)
+                    .attach(requests, known_engine, previous_epoch)
                     .await?;
                 attachment.kept = kept.or(attachment.kept);
                 Ok(attachment)
@@ -265,7 +265,7 @@ impl RequestHold {
 
     async fn destination(
         &self,
-        previous_world: Option<u64>,
+        previous_epoch: Option<u64>,
     ) -> Result<(Destination, Option<Kept>), SubmitError> {
         let mut serving = self.serving.subscribe();
         let mut paused = self.paused.subscribe();
@@ -276,13 +276,13 @@ impl RequestHold {
                 Serving::Engine(client) if !held && client.state() == EngineState::Ready => {
                     return Ok((
                         Destination::Engine(client),
-                        previous_world.and_then(|world| self.kept(world)),
+                        previous_epoch.and_then(|epoch| self.kept(epoch)),
                     ));
                 }
                 Serving::Remote(remote) if !held => {
                     return Ok((
                         Destination::Remote(remote),
-                        previous_world.and_then(|world| self.kept(world)),
+                        previous_epoch.and_then(|epoch| self.kept(epoch)),
                     ));
                 }
                 Serving::Closed(reason) => return Err(SubmitError::Unavailable(reason)),
@@ -291,9 +291,9 @@ impl RequestHold {
                         changed = serving.changed() => {
                             changed.map_err(|_| SubmitError::Unavailable("the daemon stopped serving requests".into()))?;
                         }
-                        ready = Box::pin(successor.destination(previous_world)) => {
+                        ready = Box::pin(successor.destination(previous_epoch)) => {
                             let (destination, kept) = ready?;
-                            return Ok((destination, previous_world.and_then(|world| self.kept(world)).or(kept)));
+                            return Ok((destination, previous_epoch.and_then(|epoch| self.kept(epoch)).or(kept)));
                         }
                     }
                     continue;

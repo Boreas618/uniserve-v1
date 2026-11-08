@@ -1,4 +1,4 @@
-//! Manifests applied to byte images of both worlds: the target's bytes
+//! Manifests applied to byte images of both epochs: the target's bytes
 //! after the mappings, conversions, copies and fills equal what the
 //! target holds when it loads its regions directly.
 
@@ -8,12 +8,12 @@ use crate::protocol::{Link, LinkEnd, Location};
 
 use super::*;
 
-/// The allocation granularity of these worlds: small, so that shards of a
+/// The allocation granularity of these epochs: small, so that shards of a
 /// few kilobytes lie on chunk bounds as gigabyte shards do on devices.
 const GRANULE: u64 = 256;
 
 /// The element of logical tensor `tensor` at `index`, as the bytes every
-/// world holding it stores.
+/// epoch holding it stores.
 fn element(tensor: &str, index: &[u64]) -> [u8; 4] {
     let mut value: u32 = tensor
         .bytes()
@@ -284,9 +284,9 @@ fn field_image(field: &Field, canonical: bool) -> Vec<u8> {
     bytes
 }
 
-/// A world's storages as loading writes them.
-fn image(world: &World) -> Vec<Vec<Vec<u8>>> {
-    world
+/// An epoch's storages as loading writes them.
+fn image(epoch: &Epoch) -> Vec<Vec<Vec<u8>>> {
+    epoch
         .ranks
         .iter()
         .map(|rank| {
@@ -306,8 +306,8 @@ fn image(world: &World) -> Vec<Vec<Vec<u8>>> {
         .collect()
 }
 
-/// The target world's storages after executing `manifest` on the source
-/// world's bytes, starting from garbage.
+/// The target epoch's storages after executing `manifest` on the source
+/// epoch's bytes, starting from garbage.
 fn apply(request: &Request, manifest: &Manifest) -> Vec<Vec<Vec<u8>>> {
     let source = image(&request.source);
     let mut target: Vec<Vec<Vec<u8>>> = request
@@ -340,12 +340,12 @@ fn apply(request: &Request, manifest: &Manifest) -> Vec<Vec<Vec<u8>>> {
             [into.offset as usize..(into.offset + into.length) as usize]
             .copy_from_slice(&bytes);
     }
-    let fields_of = |world: &World, rank: u32, conversion: &Conversion| -> Vec<(u32, Field)> {
+    let fields_of = |epoch: &Epoch, rank: u32, conversion: &Conversion| -> Vec<(u32, Field)> {
         conversion
             .fields
             .iter()
             .map(|(storage, tensor)| {
-                let field = world.ranks[rank as usize].storages[*storage as usize]
+                let field = epoch.ranks[rank as usize].storages[*storage as usize]
                     .layout
                     .fields
                     .iter()
@@ -456,8 +456,8 @@ fn assert_fields_equal(request: &Request, applied: &[Vec<Vec<u8>>]) {
     }
 }
 
-fn world(ranks: Vec<(Option<Gpu>, Vec<Storage>)>) -> World {
-    World {
+fn epoch(ranks: Vec<(Option<Gpu>, Vec<Storage>)>) -> Epoch {
+    Epoch {
         ranks: ranks
             .into_iter()
             .map(|(gpu, storages)| Rank { gpu, storages })
@@ -469,12 +469,12 @@ fn world(ranks: Vec<(Option<Gpu>, Vec<Storage>)>) -> World {
 fn tensor_parallel_replicas_become_expert_parallel_ranks() {
     // Two replicas of tensor parallelism 2 on GPUs 0..4, then each GPU a
     // data-parallel rank of the four-way expert partition.
-    let source = world(
+    let source = epoch(
         (0..4)
             .map(|index| (Some(gpu(index)), moe_rank(2, index as u64 % 2, 1, 0)))
             .collect(),
     );
-    let target = world((0..4).map(|rank| (None, moe_rank(1, 0, 4, rank))).collect());
+    let target = epoch((0..4).map(|rank| (None, moe_rank(1, 0, 4, rank))).collect());
     let request = Request {
         source,
         target,
@@ -516,7 +516,7 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
         spans.len()
     );
     // A chunk's GPU, key and offset in its storage, by its key at a GPU.
-    let chunk = |region: &crate::protocol::Region, world: &World, gpus: &[Gpu]| {
+    let chunk = |region: &crate::protocol::Region, epoch: &Epoch, gpus: &[Gpu]| {
         let crate::protocol::Region::Tensor {
             key,
             at: Some(Location::Device { gpu }),
@@ -524,7 +524,7 @@ fn tensor_parallel_replicas_become_expert_parallel_ranks() {
         else {
             panic!("a span names a chunk at its GPU");
         };
-        world
+        epoch
             .ranks
             .iter()
             .zip(gpus)
@@ -586,11 +586,11 @@ fn ranks_take_the_gpus_that_hold_their_experts() {
     // Two expert-parallel ranks on GPUs 0 and 1, then four ranks with
     // tensor-parallel attention and four-way experts on GPUs 0..4: the
     // ranks whose experts GPUs 0 and 1 hold take them.
-    let source = world(vec![
+    let source = epoch(vec![
         (Some(gpu(0)), moe_rank(1, 0, 2, 0)),
         (Some(gpu(1)), moe_rank(1, 0, 2, 1)),
     ]);
-    let target = world(
+    let target = epoch(
         (0..4)
             .map(|rank| (None, moe_rank(4, rank, 4, rank)))
             .collect(),
@@ -625,11 +625,11 @@ fn ranks_take_the_gpus_that_hold_their_experts() {
 fn running_target_ranks_keep_their_gpus() {
     // The same change with target ranks already running on GPUs 0..4 in
     // order: rank 1, whose experts GPU 0 holds, copies them to GPU 1.
-    let source = world(vec![
+    let source = epoch(vec![
         (Some(gpu(0)), moe_rank(1, 0, 2, 0)),
         (Some(gpu(1)), moe_rank(1, 0, 2, 1)),
     ]);
-    let target = world(
+    let target = epoch(
         (0..4)
             .map(|rank| (Some(gpu(rank as usize)), moe_rank(4, rank, 4, rank)))
             .collect(),
@@ -663,11 +663,11 @@ fn ranks_on_another_host_receive_over_the_links_from_its_gpus() {
     // ranks on GPUs 0..4, GPUs 2 and 3 on another host: that host's
     // Transfer Server measured GPUs 0 and 1 by READ, and GPU 1 over the
     // NVLink fabric too.
-    let source = world(vec![
+    let source = epoch(vec![
         (Some(gpu(0)), moe_rank(1, 0, 2, 0)),
         (Some(gpu(1)), moe_rank(1, 0, 2, 1)),
     ]);
-    let target = world(
+    let target = epoch(
         (0..4)
             .map(|rank| (None, moe_rank(4, rank, 4, rank)))
             .collect(),
@@ -812,11 +812,11 @@ fn position_mod_n_and_strided_indices_redistribute() {
         target_ranks.push((None, storages));
     }
     let request = Request {
-        source: world(vec![
+        source: epoch(vec![
             (Some(gpu(0)), contiguous(0)),
             (Some(gpu(1)), contiguous(1)),
         ]),
-        target: world(target_ranks),
+        target: epoch(target_ranks),
         gpus: (0..2).map(gpu).collect(),
         links: links(2),
     };
@@ -850,7 +850,7 @@ fn column_views_with_gaps_between_rows_redistribute() {
     // Quarters of a matrix's columns, each a view into a storage of the
     // whole matrix, become halves; the gaps are no field's bytes.
     let request = Request {
-        source: world(
+        source: epoch(
             (0..4)
                 .map(|rank| {
                     (
@@ -860,7 +860,7 @@ fn column_views_with_gaps_between_rows_redistribute() {
                 })
                 .collect(),
         ),
-        target: world(
+        target: epoch(
             (0..2)
                 .map(|rank| (None, vec![column_view(64, 32, 16 * rank, 16)]))
                 .collect(),
@@ -881,8 +881,8 @@ fn borrowed_regions_copy_between_offsets_of_the_same_allocation() {
     let mut target = source.clone();
     target.chunks[0].storage_offset = 512;
     let request = Request {
-        source: world(vec![(Some(gpu(0)), vec![source])]),
-        target: world(vec![(Some(gpu(0)), vec![target])]),
+        source: epoch(vec![(Some(gpu(0)), vec![source])]),
+        target: epoch(vec![(Some(gpu(0)), vec![target])]),
         gpus: vec![gpu(0)],
         links: links(1),
     };
@@ -911,8 +911,8 @@ fn mixed_host_and_device_chunks_use_their_physical_links() {
         at: Location::Host { numa_node: Some(0) },
     };
     let request = Request {
-        source: world(vec![(Some(gpu(0)), vec![source])]),
-        target: world(vec![(Some(gpu(1)), vec![target])]),
+        source: epoch(vec![(Some(gpu(0)), vec![source])]),
+        target: epoch(vec![(Some(gpu(1)), vec![target])]),
         gpus: vec![gpu(1)],
         links: vec![
             LinkBandwidth {
@@ -983,8 +983,8 @@ fn host_staging_round_trip_preserves_borrowed_region_offsets() {
         (host, device, LinkEnd::Host, LinkEnd::Device { gpu: gpu(0) }),
     ] {
         let request = Request {
-            source: world(vec![(Some(gpu(0)), vec![source])]),
-            target: world(vec![(Some(gpu(0)), vec![target])]),
+            source: epoch(vec![(Some(gpu(0)), vec![source])]),
+            target: epoch(vec![(Some(gpu(0)), vec![target])]),
             gpus: vec![gpu(0)],
             links: vec![LinkBandwidth {
                 link: Link {
@@ -1065,8 +1065,8 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
         });
     }
     let request = Request {
-        source: world(sources),
-        target: world(vec![(Some(gpu(0)), vec![page])]),
+        source: epoch(sources),
+        target: epoch(vec![(Some(gpu(0)), vec![page])]),
         gpus: vec![gpu(0)],
         links: measured,
     };
@@ -1101,7 +1101,7 @@ fn remote_host_sources_use_the_measured_endpoint_bandwidth() {
 
 /// Ranks on two hosts read the sources at other times and bind them from
 /// their own hosts: they plan from the storages both read, in the first
-/// reader's order and bindings, and each binds that world from its host.
+/// reader's order and bindings, and each binds that epoch from its host.
 #[test]
 fn ranks_on_two_hosts_plan_from_the_sources_both_read() {
     let page = |name: &str| storage(vec![field(name, 0, &[64], vec![whole(64)], vec![0])]);
@@ -1117,8 +1117,8 @@ fn ranks_on_two_hosts_plan_from_the_sources_both_read() {
     // Host A holds GPU 0's storages: its reader binds them locally and
     // read before the second was published; host B's reader reads both
     // from host A's server.
-    let first = world(vec![(Some(gpu(0)), vec![page("a")])]);
-    let second = world(vec![(
+    let first = epoch(vec![(Some(gpu(0)), vec![page("a")])]);
+    let second = epoch(vec![(
         Some(gpu(0)),
         vec![remote(page("b"), gpu(0)), remote(page("a"), gpu(0))],
     )]);
@@ -1143,8 +1143,8 @@ fn ranks_on_two_hosts_plan_from_the_sources_both_read() {
 fn one_gpu_copy_plan_binds_to_each_submitting_host() {
     let page = storage(vec![field("page", 0, &[64], vec![whole(64)], vec![0])]);
     let request = Request {
-        source: world(vec![(Some(gpu(0)), vec![page.clone()])]),
-        target: world(vec![(Some(gpu(1)), vec![page])]),
+        source: epoch(vec![(Some(gpu(0)), vec![page.clone()])]),
+        target: epoch(vec![(Some(gpu(1)), vec![page])]),
         gpus: vec![gpu(1)],
         links: links(2),
     };
@@ -1241,11 +1241,11 @@ fn encoded_fields_move_in_canonical_form() {
         )
     };
     let request = Request {
-        source: world(vec![
+        source: epoch(vec![
             (Some(gpu(0)), vec![storage(vec![rows(0, 32)])]),
             (Some(gpu(1)), vec![storage(vec![rows(32, 32)])]),
         ]),
-        target: world(vec![(None, vec![storage(vec![rows(0, 64)])])]),
+        target: epoch(vec![(None, vec![storage(vec![rows(0, 64)])])]),
         gpus: vec![gpu(0)],
         links: links(2),
     };
@@ -1266,8 +1266,8 @@ fn encoded_fields_move_in_canonical_form() {
 
     // The same encoded region on another GPU moves as it is stored.
     let request = Request {
-        source: world(vec![(Some(gpu(1)), vec![storage(vec![rows(0, 64)])])]),
-        target: world(vec![(None, vec![storage(vec![rows(0, 64)])])]),
+        source: epoch(vec![(Some(gpu(1)), vec![storage(vec![rows(0, 64)])])]),
+        target: epoch(vec![(None, vec![storage(vec![rows(0, 64)])])]),
         gpus: vec![gpu(0)],
         links: links(2),
     };
@@ -1276,9 +1276,9 @@ fn encoded_fields_move_in_canonical_form() {
     assert_fields_equal(&request, &apply(&request, &manifest));
 }
 
-/// A tensor a listing lists: `key` at `location`, retained by `world` of
+/// A tensor a listing lists: `key` at `location`, retained by `epoch` of
 /// deployment `model`.
-fn listed(key: Key, name: &str, location: Location, world: u64) -> crate::protocol::ListedTensor {
+fn listed(key: Key, name: &str, location: Location, epoch: u64) -> crate::protocol::ListedTensor {
     let scope = crate::Scope {
         deployment: "model".into(),
         group: "model".into(),
@@ -1288,7 +1288,7 @@ fn listed(key: Key, name: &str, location: Location, world: u64) -> crate::protoc
         key,
         name: name.into(),
         scopes: vec![scope.clone()],
-        retainers: vec![crate::protocol::Retainer { scope, world }],
+        retainers: vec![crate::protocol::Retainer { scope, epoch }],
         location: location,
         storage_bytes: 0,
         dtype: "uint8".into(),
@@ -1322,14 +1322,14 @@ fn weight_manifest(fingerprints: &[(&str, &str)], storages: &[&Storage]) -> Stri
 }
 
 #[test]
-fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() {
+fn a_epochs_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() {
     let held = storage(vec![field("w/data", 0, &[256], vec![whole(256)], vec![1])]);
     let partial = storage(vec![field("v/data", 0, &[256], vec![whole(256)], vec![1])]);
     let other = storage(vec![field("u/data", 0, &[256], vec![whole(256)], vec![1])]);
     assert!(held.chunks.len() > 1);
     let ours = [("w", "weights-w"), ("v", "weights-v"), ("u", "weights-u")];
     let manifests: BTreeMap<Key, String> = [
-        // Two of world 1's ranks name the same storage.
+        // Two of epoch 1's ranks name the same storage.
         (Key([1; 32]), weight_manifest(&ours, &[&held, &partial])),
         (Key([2; 32]), weight_manifest(&ours, &[&held])),
         // A storage of another checkpoint holds no bytes this rank needs.
@@ -1337,7 +1337,7 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
             Key([3; 32]),
             weight_manifest(&[("u", "another")], &[&other]),
         ),
-        // World 2's manifest is not world 1's.
+        // Epoch 2's manifest is not epoch 1's.
         (Key([4; 32]), weight_manifest(&ours, &[&other])),
     ]
     .into_iter()
@@ -1352,7 +1352,7 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
     ];
     // GPU 0 holds every chunk of both storages, GPU 1 all of `held` but
     // not the last chunk of `partial`; the storage of the other checkpoint
-    // and world 2's lie on GPU 0 too.
+    // and epoch 2's lie on GPU 0 too.
     for chunk in &held.chunks {
         tensors.push(listed(chunk.key, "weights", device(0), 1));
         tensors.push(listed(chunk.key, "weights", device(1), 1));
@@ -1388,8 +1388,8 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
     let mut on_first = vec![held.clone(), partial.clone()];
     on_first.sort_by_key(|storage| serde_json::to_vec(storage).unwrap());
     assert_eq!(
-        sources.world,
-        World {
+        sources.epoch,
+        Epoch {
             ranks: vec![
                 Rank {
                     gpu: Some(gpu(0)),
@@ -1404,15 +1404,15 @@ fn a_worlds_weight_manifests_are_sources_on_the_gpus_holding_all_their_chunks() 
     );
     assert_eq!(sources.links, links(2));
 
-    // A coupled reshape can read multiple predecessor worlds. Storage
-    // described by the second world then becomes an eligible source too.
+    // A coupled reshape can read multiple predecessor epochs. Storage
+    // described by the second epoch then becomes an eligible source too.
     let combined = weights::sources(&listing, "model", Some(&[1, 2]), &fingerprints, read)
         .unwrap()
         .unwrap();
     let mut expected = vec![held.clone(), partial, other];
     expected.sort_by_key(|storage| serde_json::to_vec(storage).unwrap());
-    assert_eq!(combined.world.ranks[0].storages, expected);
-    assert_eq!(combined.world.ranks[1].storages, vec![held]);
+    assert_eq!(combined.epoch.ranks[0].storages, expected);
+    assert_eq!(combined.epoch.ranks[1].storages, vec![held]);
 
     // Another deployment retains none of them, and without a Transfer
     // Server nothing is copied.
@@ -1468,10 +1468,10 @@ fn unchanged_fields_of_a_packed_weight_storage_remain_transfer_sources() {
     })
     .unwrap()
     .unwrap()
-    .world;
+    .epoch;
     let request = Request {
         source,
-        target: world(vec![(
+        target: epoch(vec![(
             None,
             vec![storage(vec![field(
                 "w/data",

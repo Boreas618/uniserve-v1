@@ -5,9 +5,7 @@
 //! `POST /admin/restart` starts the successor (`uniserve serve --predecessor
 //! FD`) with one end of a socket pair at that descriptor. They talk over it:
 //!
-//! 1. The daemon sends its options (`Prepare`). The successor restarts
-//!    this node's Storage Server in place when it speaks an earlier protocol
-//!    than the successor's build (`supervision::restart_earlier`), loads the
+//! 1. The daemon sends its options (`Prepare`). The successor loads the
 //!    model's files and binds a request socket of its own, which it answers
 //!    with (`Prepared`).
 //! 2. The daemon stops its service thread between two rounds and sends what
@@ -92,7 +90,7 @@ enum Message {
         replica: usize,
         requests: String,
         known_engine: Option<u64>,
-        previous_world: Option<u64>,
+        previous_epoch: Option<u64>,
     },
     Resumed {
         id: u64,
@@ -161,7 +159,7 @@ struct HandedPrograms {
     policy: program_server::program::Program,
 }
 
-/// One replica's control connection and executing world. Descriptors follow
+/// One replica's control connection and executing epoch. Descriptors follow
 /// replica order after the HTTP listener and before the service descriptors.
 #[derive(Debug, Serialize, Deserialize)]
 struct ReplicaHandoff {
@@ -315,7 +313,7 @@ impl Restarter {
             Some(executable) => std::path::PathBuf::from(executable),
             None => std::env::current_exe().context("finding this daemon's executable")?,
         };
-        // No world change, rollback or relaunch replaces the engine meanwhile.
+        // No epoch change, rollback or relaunch replaces the engine meanwhile.
         let _quiet = leader.quiesce().await;
         // The parked standbys are this daemon's processes (§2.5): the successor
         // numbers and starts its own once it has adopted the engines, so ending
@@ -706,18 +704,6 @@ async fn prepared_successor(
     prepare: Prepare,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
-    // This node's Storage Server goes first: a successor of a later build
-    // replaces a server of an earlier protocol before it takes the
-    // deployment over, and a failure leaves the daemon serving as it was.
-    let socket = storage::socket::default_socket();
-    if socket.exists() {
-        let executable = std::env::current_exe().context("locating this daemon's executable")?;
-        tokio::task::spawn_blocking(move || {
-            crate::supervision::restart_earlier(&executable, &socket)
-        })
-        .await
-        .context("the storage server's protocol check did not complete")??;
-    }
     let (mut config, _) = crate::options::resolve_text(&prepare.config, &[])?;
     config.server_config.api_key = prepare.api_key;
     let stated = Stated::from_paths(prepare.stated);
@@ -855,7 +841,7 @@ async fn prepared_successor(
                 let client = adopting.adopt(
                     replica.engine,
                     replica.next_engine,
-                    served.world,
+                    served.epoch,
                     connection,
                     sink,
                 )?;
@@ -869,7 +855,7 @@ async fn prepared_successor(
     let mut adopted = adopted.into_iter();
     let (handed, options, served, observer, client) =
         adopted.next().context("the takeover names no replicas")?;
-    let adopted_world = served.world;
+    let served_epoch = served.epoch;
     let leader = Arc::new(
         Leader::finish(
             &config,
@@ -884,8 +870,8 @@ async fn prepared_successor(
     );
     // The successor adopts the epoch that serves (§2.5, §7.4, §7.5).
     {
-        let (record, process) = adopted_epoch(adopted_world, handed.engine, &options, programs)?;
-        epoch_records.record(adopted_world, record);
+        let (record, process) = adopted_epoch(served_epoch, handed.engine, &options, programs)?;
+        epoch_records.record(served_epoch, record);
         let mut processes = epoch_records.processes();
         processes.push(process);
         epoch_records.set_processes(processes);
@@ -1018,7 +1004,7 @@ async fn prepared_successor(
                         replica,
                         requests,
                         known_engine,
-                        previous_world,
+                        previous_epoch,
                     },
                     _,
                 )) => {
@@ -1027,7 +1013,7 @@ async fn prepared_successor(
                     tokio::spawn(async move {
                         let attachment = match hold {
                             Some(hold) => hold
-                                .attach(requests, known_engine, previous_world)
+                                .attach(requests, known_engine, previous_epoch)
                                 .await
                                 .map_err(|error| error.to_string()),
                             None => Err(format!("the handoff has no replica {replica}")),
@@ -1085,7 +1071,7 @@ async fn prepared_successor(
 /// next switch; without the row the next launch would be numbered 1 again,
 /// under a live child's generation (§2.5).
 fn adopted_epoch(
-    world: u64,
+    epoch: u64,
     engine: u64,
     options: &crate::options::ServerArgs,
     programs: Option<HandedPrograms>,
@@ -1112,7 +1098,7 @@ fn adopted_epoch(
         group: crate::engine::control::ENGINE_GROUP.to_owned(),
         rank: 0,
         pid: None,
-        epoch: Some(world),
+        epoch: Some(epoch),
         build: deployment.engine.executable.clone(),
         generation: engine,
         state: crate::epoch::ProcessState::Serving,

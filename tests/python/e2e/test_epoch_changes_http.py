@@ -1,20 +1,20 @@
-"""A world change continues the requests in flight on a successor world.
+"""An epoch change continues the requests in flight on a successor epoch.
 
 The successor serves on trial until the operator commits it or a fault
 rolls it back.
 
 Qwen3-MoE (``UNISERVE_QWEN3_MODEL``) streams a long greedy count. While it
 streams, ``PUT /admin/config`` changes the decode batch sizes the CUDA graphs
-capture, which only a new world executes: a successor world starts beside
+capture, which only a new epoch executes: a successor epoch starts beside
 the serving one on the same GPUs and maps its weights and KV cache segments
-read-only; at a step boundary the serving world parks, its streaming
+read-only; at a step boundary the serving epoch parks, its streaming
 request leaving it as migratable after every token it generated; the
 successor imports its prefix cache index and serves on trial, and the
 daemon submits the request again with those tokens. The client reads one
-uninterrupted stream, equal to the count the committed world decodes for
+uninterrupted stream, equal to the count the committed epoch decodes for
 the same request alone, with the same usage.
 
-- A commit releases the previous world: its engine's process exits and the
+- A commit releases the previous epoch: its engine's process exits and the
   slot it held empties. The trial refuses another change meanwhile. The
   deployment runs on one GPU, as two schedulers sharing their experts
   (``--data-parallel-size 2`` with expert parallelism), or as attention and
@@ -24,8 +24,8 @@ the same request alone, with the same usage.
   retained weight, a cached prompt finds as many tokens cached as before
   the change, on the device and, once fill prompts pushed its pages out of
   it, in the host KV cache, and the Storage Server shoots down no writer.
-- An operator's rollback resumes the previous world, parked or started
-  again on the weights it kept (``update_config.previous_world``); the
+- An operator's rollback resumes the previous epoch, parked or started
+  again on the weights it kept (``update_config.previous_epoch``); the
   stream continues on it, and the configuration is marked unavailable:
   applying it again is refused unless forced.
 
@@ -73,13 +73,13 @@ PROMPT = (
     "Count from 1 to 5000, separated by commas and spaces. "
     "Write only the numbers."
 )
-# A prompt of several pages, whose pages the serving world publishes.
+# A prompt of several pages, whose pages the serving epoch publishes.
 CACHED_PROMPT = "Describe the sea in one sentence. " * 40
-# A prompt of several pages only a world on trial computes, which shares no
+# A prompt of several pages only an epoch on trial computes, which shares no
 # page with the other prompts.
 TRIAL_PROMPT = "List the colours of the rainbow and what each means. " * 40
 # Options every deployment of the tests serves with: few captured graphs,
-# so that worlds start while the count streams, and a small KV cache.
+# so that epochs start while the count streams, and a small KV cache.
 OPTIONS = (
     "dtype=bfloat16",
     "kv_cache_config.max_tokens=32768",
@@ -88,7 +88,7 @@ OPTIONS = (
     "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8]",
 )
 # The change every test applies: graphs of other decode batch sizes, which
-# a new world captures.
+# a new epoch captures.
 CHANGE = "cuda_graph_config.decode_batch_sizes=[1, 2, 4, 8, 16]"
 
 
@@ -400,13 +400,13 @@ def _admin(
     )
 
 
-def _world_change(base_url: str, *assignments: str) -> dict:
-    """Applies `assignments` as a world change; returns its report."""
+def _epoch_change(base_url: str, *assignments: str) -> dict:
+    """Applies `assignments` as an epoch change; returns its report."""
     response = _apply(base_url, *assignments)
     assert response.status_code == 200, response.text
     result = response.json()["result"]
-    assert result["change"] == "world", result
-    return result["world"]
+    assert result["change"] == "epoch", result
+    return result["epoch"]
 
 
 def _change_under_traffic(
@@ -420,7 +420,7 @@ def _change_under_traffic(
     """
     streams = [streaming]
     with ThreadPoolExecutor(max_workers=1) as executor:
-        change = executor.submit(_world_change, base_url, *assignments)
+        change = executor.submit(_epoch_change, base_url, *assignments)
         while not change.done():
             if streams[-1].finished:
                 streams[-1].join()
@@ -433,7 +433,7 @@ def _change_under_traffic(
 
 def _planned_storage(base_url: str, *assignments: str) -> dict:
     """The storage plan of a dry run of `assignments`, which changes nothing:
-    for every GPU, the serving world's KV cache limit beside a successor
+    for every GPU, the serving epoch's KV cache limit beside a successor
     from the GPU's ledger, and every host's admission of host storage.
     """  # noqa: D205
     response = httpx.put(
@@ -461,10 +461,10 @@ def _ledgers(status: dict) -> list[dict]:
     return ledgers
 
 
-def _worlds_of(ledgers: list[dict], item: str) -> set[tuple[int, ...]]:
-    """The sets of worlds holding the ledgers' entries of `item`."""
+def _epochs_of(ledgers: list[dict], item: str) -> set[tuple[int, ...]]:
+    """The sets of epochs holding the ledgers' entries of `item`."""
     return {
-        tuple(entry["worlds"])
+        tuple(entry["epochs"])
         for ledger in ledgers
         for entry in ledger["entries"]
         if entry["item"] == item
@@ -482,32 +482,32 @@ def test_independent_replicas_roll_on_disjoint_devices(tmp_path: Path):
     ):
         before = _config(base_url)["replicas"]
         assert len(before) == 2
-        worlds = [replica["slots"][0]["world"] for replica in before]
-        assert len(set(worlds)) == 2
+        epochs = [replica["slots"][0]["epoch"] for replica in before]
+        assert len(set(epochs)) == 2
         expected = _chat(base_url, name, CACHED_PROMPT)
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
         report, streams = _change_under_traffic(
             base_url, name, streaming, (CHANGE,)
         )
-        assert report["previous_world"] == worlds[0]
+        assert report["previous_epoch"] == epochs[0]
         status = _config(base_url)
         assert status["pending_replicas"] == [1]
-        assert status["replicas"][1]["slots"][0]["world"] == worlds[1]
+        assert status["replicas"][1]["slots"][0]["epoch"] == epochs[1]
         for ledger in _ledgers(status):
             resident = {
-                world
+                epoch
                 for entry in ledger["entries"]
                 if entry["item"] == "process"
-                for world in entry["worlds"]
+                for epoch in entry["epochs"]
             }
-            assert not {worlds[0], report["world"]} <= resident
+            assert not {epochs[0], report["epoch"]} <= resident
         assert _chat(base_url, name, CACHED_PROMPT) == expected
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
         status = _config(base_url)
         assert status["replicas"][0]["trial"] is None
-        assert status["replicas"][1]["trial"]["previous_world"] == worlds[1]
+        assert status["replicas"][1]["trial"]["previous_epoch"] == epochs[1]
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
         status = _config(base_url)
@@ -530,7 +530,7 @@ def test_replica_rollback_and_daemon_restart_preserve_serving(tmp_path: Path):
         successor = None
         try:
             before = _config(base_url)["replicas"]
-            worlds = [replica["slots"][0]["world"] for replica in before]
+            epochs = [replica["slots"][0]["epoch"] for replica in before]
             expected = _chat(base_url, name, CACHED_PROMPT)
             applied = httpx.put(
                 f"{base_url}/admin/config",
@@ -539,8 +539,8 @@ def test_replica_rollback_and_daemon_restart_preserve_serving(tmp_path: Path):
             )
             assert applied.status_code == 200, applied.text
             status = _config(base_url)
-            assert status["replicas"][0]["slots"][0]["world"] == worlds[0]
-            assert status["replicas"][1]["trial"]["previous_world"] == worlds[1]
+            assert status["replicas"][0]["slots"][0]["epoch"] == epochs[0]
+            assert status["replicas"][1]["trial"]["previous_epoch"] == epochs[1]
             streaming = Streaming(base_url, name)
             streaming.wait_for(EARLY_TOKENS)
             rolled = _admin(
@@ -549,8 +549,8 @@ def test_replica_rollback_and_daemon_restart_preserve_serving(tmp_path: Path):
             assert rolled.status_code == 200, rolled.text
             restored = _config(base_url)
             assert [
-                replica["slots"][0]["world"] for replica in restored["replicas"]
-            ] == worlds
+                replica["slots"][0]["epoch"] for replica in restored["replicas"]
+            ] == epochs
             assert restored["pending_replicas"] == []
             assert _chat(base_url, name, CACHED_PROMPT) == expected
             engines = _pids(log, "Engine")
@@ -559,8 +559,8 @@ def test_replica_rollback_and_daemon_restart_preserve_serving(tmp_path: Path):
             successor = restarted.json()["result"]["pid"]
             adopted = _config(base_url)
             assert [
-                replica["slots"][0]["world"] for replica in adopted["replicas"]
-            ] == worlds
+                replica["slots"][0]["epoch"] for replica in adopted["replicas"]
+            ] == epochs
             assert _pids(log, "Engine") == engines
             assert _chat(base_url, name, CACHED_PROMPT) == expected
             streaming.join()
@@ -588,17 +588,17 @@ def test_splitting_an_expert_group_rolls_back_as_one_transaction(
     )
     with _serve(tmp_path, name, devices, options) as (base_url, _log):
         before = _config(base_url)
-        previous = before["replicas"][0]["slots"][0]["world"]
+        previous = before["replicas"][0]["slots"][0]["epoch"]
         expected = _chat(base_url, name, CACHED_PROMPT)
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
         report, streams = _change_under_traffic(
             base_url, name, streaming, ("moe_config.expert_parallel=false",)
         )
-        assert report["previous_worlds"] == [previous]
-        assert len(report["worlds"]) == 2
+        assert report["previous_epochs"] == [previous]
+        assert len(report["epochs"]) == 2
         status = _config(base_url)
-        assert status["trial"]["worlds"] == report["worlds"]
+        assert status["trial"]["epochs"] == report["epochs"]
         assert len(status["replicas"]) == 2
         # Each Replica computes every expert of its own tokens, where the
         # group dispatched them among its ranks, beside the counts still
@@ -610,22 +610,22 @@ def test_splitting_an_expert_group_rolls_back_as_one_transaction(
             base_url, "config/rollback", {"reason": "operator rollback"}
         )
         assert rolled.status_code == 200, rolled.text
-        assert rolled.json()["result"]["rolled_back"] == report["worlds"]
+        assert rolled.json()["result"]["rolled_back"] == report["epochs"]
         restored = _config(base_url)
         assert restored["trial"] is None
         assert len(restored["replicas"]) == 1
-        assert restored["replicas"][0]["slots"][0]["world"] == previous
+        assert restored["replicas"][0]["slots"][0]["epoch"] == previous
         for stream in streams:
             stream.join()
         assert _chat(base_url, name, CACHED_PROMPT) == expected
 
 
 @pytest.mark.parametrize("topology", ["single", "experts", "dedicated"])
-def test_a_world_change_continues_a_streaming_request_and_commits(
+def test_a_epoch_change_continues_a_streaming_request_and_commits(
     tmp_path: Path, topology: str
 ):
     devices, options = _topology(topology, tmp_path)
-    name = "qwen3-world-change"
+    name = "qwen3-epoch-change"
     with _serve(tmp_path, name, devices, options) as (base_url, log):
         before = _config(base_url)
         (serving,) = [
@@ -633,16 +633,16 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         ]
         assert serving["state"] == "executing", before
         engines_before = _pids(log, "Engine")
-        # Every GPU's ledger books the serving world alone, within its
+        # Every GPU's ledger books the serving epoch alone, within its
         # quota: its weights, KV cache segments, graph pool and process.
         ledgers = _ledgers(before)
         for item in ("weights", "cache_segment", "graph_pool", "process"):
-            assert _worlds_of(ledgers, item) == {(serving["world"],)}, ledgers
+            assert _epochs_of(ledgers, item) == {(serving["epoch"],)}, ledgers
 
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
         # A dry run plans the change on every GPU's ledger and changes
-        # nothing: the successor fits beside the serving world.
+        # nothing: the successor fits beside the serving epoch.
         _wait_until(
             lambda: _prefix_counter(base_url, "queries") > 0,
             30,
@@ -667,10 +667,10 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
                 f"{gpu['kv_limit']}, {gpu['segments_kept']} of "
                 f"{gpu['segments_held']} segments kept"
             )
-        report = _world_change(base_url, CHANGE)
+        report = _epoch_change(base_url, CHANGE)
         streaming.mark()
-        world = report["world"]
-        assert report["previous_world"] == serving["world"], report
+        epoch = report["epoch"]
+        assert report["previous_epoch"] == serving["epoch"], report
         assert report["storage"]["feasible"] is True, report
         print(
             f"promotion pause: {report['pause_seconds']:.3f} s "
@@ -678,21 +678,21 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
             f"preparation {report['prepare_seconds']:.1f} s)"
         )
 
-        # The successor serves on trial beside the parked previous world, and
-        # the trial refuses another change. Both worlds share each GPU's
+        # The successor serves on trial beside the parked previous epoch, and
+        # the trial refuses another change. Both epochs share each GPU's
         # quota: the weights and the segments the successor maps are booked
-        # once, held by both, beside each world's graph pool and process.
+        # once, held by both, beside each epoch's graph pool and process.
         status = _config(base_url)
-        assert status["trial"]["world"] == world, status
+        assert status["trial"]["epoch"] == epoch, status
         assert status["slots"] == [
-            {"world": world, "state": "executing"},
-            {"world": serving["world"], "state": "parked"},
+            {"epoch": epoch, "state": "executing"},
+            {"epoch": serving["epoch"], "state": "parked"},
         ], status
         ledgers = _ledgers(status)
-        both = (serving["world"], world)
-        assert _worlds_of(ledgers, "weights") == {both}, ledgers
-        assert both in _worlds_of(ledgers, "cache_segment"), ledgers
-        assert _worlds_of(ledgers, "process") == {(serving["world"],), (world,)}
+        both = (serving["epoch"], epoch)
+        assert _epochs_of(ledgers, "weights") == {both}, ledgers
+        assert both in _epochs_of(ledgers, "cache_segment"), ledgers
+        assert _epochs_of(ledgers, "process") == {(serving["epoch"],), (epoch,)}
         refused = _apply(base_url, "max_running_requests=4")
         assert refused.status_code == 409, refused.text
 
@@ -711,27 +711,27 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
         assert reused == queried > 0, (reused, queried)
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
-        assert committed.json()["result"]["world"] == world
+        assert committed.json()["result"]["epoch"] == epoch
         status = _config(base_url)
         assert status["trial"] is None, status
         assert status["slots"] == [
-            {"world": world, "state": "executing"},
-            {"world": None, "state": "empty"},
+            {"epoch": epoch, "state": "executing"},
+            {"epoch": None, "state": "empty"},
         ], status
         graphs = tomllib.loads(status["config"])["cuda_graph_config"]
         assert graphs["decode_batch_sizes"] == [1, 2, 4, 8, 16], graphs
-        # The commit released everything only the previous world held: the
+        # The commit released everything only the previous epoch held: the
         # segments the successor mapped are its own on the ledger now. The
-        # previous world's workers end their bookings as their processes
+        # previous epoch's workers end their bookings as their processes
         # exit, a moment after its engine's.
         items = ("weights", "cache_segment", "graph_pool", "process")
         _wait_until(
             lambda: all(
-                _worlds_of(_ledgers(_config(base_url)), item) == {(world,)}
+                _epochs_of(_ledgers(_config(base_url)), item) == {(epoch,)}
                 for item in items
             ),
             30,
-            "the ledgers did not book the committed world alone",
+            "the ledgers did not book the committed epoch alone",
         )
         streaming.join()
         reference, reference_usage = _ask(base_url, name)
@@ -748,11 +748,11 @@ def test_a_world_change_continues_a_streaming_request_and_commits(
             r"imported the predecessor's prefix cache index.*pages=[1-9]", line
         )
         for line in lines
-    ), "the successor imported no page of the previous world's index"
+    ), "the successor imported no page of the previous epoch's index"
     assert len(streaming.tokens) > streaming.marked, (
         "the stream ended before the successor served"
     )
-    # The previous world's engine exited at the commit.
+    # The previous epoch's engine exited at the commit.
     (previous_engine,) = engines_before
     assert not _runs(previous_engine)
     assert streaming.tokens == reference
@@ -782,7 +782,7 @@ def _host_hits_of(
 def test_a_resource_change_continues_requests_with_a_smaller_cache(
     tmp_path: Path,
 ):
-    """Quotas, queue depth and cache capacity change through a world."""
+    """Quotas, queue depth and cache capacity change through an epoch."""
     name = "qwen3-resource-change"
     assignments = (
         "mem_fraction_static=0.8",
@@ -803,7 +803,7 @@ def test_a_resource_change_continues_requests_with_a_smaller_cache(
         report, streams = _change_under_traffic(
             base_url, name, streaming, assignments
         )
-        assert report["previous_world"] == before["slots"][0]["world"]
+        assert report["previous_epoch"] == before["slots"][0]["epoch"]
         assert report["storage"]["feasible"] is True, report
         assert report["numerics"] == "unchanged", report
         kv_pages = report["derived_state"]["kv_pages"]
@@ -835,13 +835,13 @@ def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
         assert host_before[1] > 0, host_before
 
         # Graph capture changes none of these page keys.
-        report = _world_change(base_url, CHANGE)
+        report = _epoch_change(base_url, CHANGE)
         weights = report["derived_state"]["weights"]["treatment"]
         assert (report["numerics"], weights) == ("unchanged", "mapped"), report
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
 
-        # The committed world finds as many of the prompt's tokens cached,
+        # The committed epoch finds as many of the prompt's tokens cached,
         # on the device and in the host KV cache, and answers it as before.
         assert _hits_of(base_url, name, CACHED_PROMPT) == (answer, hits)
         host_after = _host_hits_of(
@@ -854,11 +854,11 @@ def test_a_change_of_the_executable_alone_invalidates_nothing(tmp_path: Path):
     assert "shooting down a previous writer" not in storage_log
 
 
-@pytest.mark.parametrize("previous_world", ["parked", "weights"])
-def test_an_operator_rollback_resumes_the_previous_world(
-    tmp_path: Path, previous_world: str
+@pytest.mark.parametrize("previous_epoch", ["parked", "weights"])
+def test_an_operator_rollback_resumes_the_previous_epoch(
+    tmp_path: Path, previous_epoch: str
 ):
-    name = "qwen3-world-rollback"
+    name = "qwen3-epoch-rollback"
     with _serve(tmp_path, name) as (base_url, log):
         cached = _chat(base_url, name, CACHED_PROMPT)
         (serving,) = [
@@ -870,26 +870,26 @@ def test_an_operator_rollback_resumes_the_previous_world(
 
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
-        report = _world_change(
-            base_url, CHANGE, f"update_config.previous_world={previous_world}"
+        report = _epoch_change(
+            base_url, CHANGE, f"update_config.previous_epoch={previous_epoch}"
         )
-        world = report["world"]
+        epoch = report["epoch"]
         status = _config(base_url)
         assert status["slots"][1] == {
-            "world": serving["world"],
-            "state": previous_world,
+            "epoch": serving["epoch"],
+            "state": previous_epoch,
         }, status
-        # The world on trial publishes the pages of a prompt only it
+        # The epoch on trial publishes the pages of a prompt only it
         # computes.
         trial_answer = _chat(base_url, name, TRIAL_PROMPT)
-        if previous_world == "weights":
+        if previous_epoch == "weights":
             _wait_until(
                 lambda: not _runs(engine_before),
                 120,
-                "the previous world's engine did not exit",
+                "the previous epoch's engine did not exit",
             )
 
-            # The previous world keeps its weights alone: each GPU's ledger
+            # The previous epoch keeps its weights alone: each GPU's ledger
             # books nothing else of it once its workers exited, the
             # segments the successor maps being the successor's.
             def kept() -> set[str]:
@@ -897,13 +897,13 @@ def test_an_operator_rollback_resumes_the_previous_world(
                     entry["item"]
                     for ledger in _ledgers(_config(base_url))
                     for entry in ledger["entries"]
-                    if serving["world"] in entry["worlds"]
+                    if serving["epoch"] in entry["epochs"]
                 }
 
             _wait_until(
                 lambda: kept() == {"weights"},
                 60,
-                "the previous world kept more than its weights",
+                "the previous epoch kept more than its weights",
             )
 
         rolled = _admin(
@@ -911,11 +911,11 @@ def test_an_operator_rollback_resumes_the_previous_world(
         )
         assert rolled.status_code == 200, rolled.text
         result = rolled.json()["result"]
-        assert result["rolled_back"] == world, result
-        assert result["world"] == serving["world"], result
+        assert result["rolled_back"] == epoch, result
+        assert result["epoch"] == serving["epoch"], result
         streaming.mark()
         print(
-            f"{previous_world}: promotion pause "
+            f"{previous_epoch}: promotion pause "
             f"{report['pause_seconds']:.3f} s, "
             f"rollback pause {result['pause_seconds']:.3f} s"
         )
@@ -923,16 +923,16 @@ def test_an_operator_rollback_resumes_the_previous_world(
 
         status = _config(base_url)
         assert status["trial"] is None, status
-        assert status["slots"][0]["world"] == serving["world"], status
+        assert status["slots"][0]["epoch"] == serving["epoch"], status
         (unavailable,) = status["unavailable"]
-        assert unavailable["world"] == world, unavailable
+        assert unavailable["epoch"] == epoch, unavailable
         assert unavailable["reason"] == "the operator's check", unavailable
         reference, reference_usage = _ask(base_url, name)
         assert streaming.tokens == reference
         assert streaming.usage == reference_usage
-        # The previous world reads the pages it published before the change,
+        # The previous epoch reads the pages it published before the change,
         # from its device cache or the host KV cache, and none the discarded
-        # world published.
+        # epoch published.
         answer, hits = _hits_of(base_url, name, CACHED_PROMPT)
         assert answer == cached
         assert hits > 0
@@ -942,42 +942,42 @@ def test_an_operator_rollback_resumes_the_previous_world(
 
         # The configuration is unavailable until forced.
         again = _apply(
-            base_url, CHANGE, f"update_config.previous_world={previous_world}"
+            base_url, CHANGE, f"update_config.previous_epoch={previous_epoch}"
         )
         assert again.status_code == 400, again.text
         assert "rolled back" in again.text, again.text
         forced = _apply(
             base_url,
             CHANGE,
-            f"update_config.previous_world={previous_world}",
+            f"update_config.previous_epoch={previous_epoch}",
             force=True,
         )
         assert forced.status_code == 200, forced.text
-        assert forced.json()["result"]["change"] == "world"
+        assert forced.json()["result"]["change"] == "epoch"
         assert _admin(base_url, "config/commit").status_code == 200
         assert _chat(base_url, name, CACHED_PROMPT) == cached
 
     lines = _log_lines(log)
-    if previous_world == "parked":
+    if previous_epoch == "parked":
         # The parked engine resumed: the same process served before and after.
         assert any("the parked scheduler resumes" in line for line in lines)
     else:
-        # The previous world started again on the weights it kept.
+        # The previous epoch started again on the weights it kept.
         assert any(
             re.search(r"mapped the retained weights .*missing=0", line)
             for line in lines
-        ), "the restarted previous world did not map its weights"
+        ), "the restarted previous epoch did not map its weights"
     assert (
         sum(
             "uniserve.loading.rank: loaded numerical model" in line
             for line in lines
         )
         == 1
-    ), "a world read the checkpoint again rather than the retained weights"
+    ), "an epoch read the checkpoint again rather than the retained weights"
 
 
 def _forwards(base_url: str, mode: str) -> float:
-    """The forwards every world ran in ``mode`` so far (``eager`` or
+    """The forwards every epoch ran in ``mode`` so far (``eager`` or
     ``graph_replay``; ``uniserve:worker_forward_mode_counts``), once the
     reports of what came before arrived.
     """  # noqa: D205
@@ -992,20 +992,20 @@ def _forwards(base_url: str, mode: str) -> float:
 
 
 @pytest.mark.parametrize("topology", ["single", "experts", "dedicated"])
-def test_a_serving_world_gives_its_graph_storage_to_a_preparing_successor(
+def test_a_serving_epoch_gives_its_graph_storage_to_a_preparing_successor(
     tmp_path: Path, topology: str
 ):
     devices, options = _topology(topology, tmp_path)
-    name = "qwen3-world-eager"
+    name = "qwen3-epoch-eager"
     with _serve(tmp_path, name, devices, options) as (base_url, _log):
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
         eager = _forwards(base_url, "eager")
 
-        # The serving world decodes the count eagerly while the successor
+        # The serving epoch decodes the count eagerly while the successor
         # prepares in its graph storage, once its eager steps made the
         # baseline its successor's transfers yield to.
-        report = _world_change(
+        report = _epoch_change(
             base_url, CHANGE, "update_config.eager_prepare=true"
         )
         assert _forwards(base_url, "eager") > eager
@@ -1018,7 +1018,7 @@ def test_a_serving_world_gives_its_graph_storage_to_a_preparing_successor(
             f"restorations {report['transfer_restorations']}"
         )
 
-        # Resumed, the previous world replays its graphs again.
+        # Resumed, the previous epoch replays its graphs again.
         rolled = _admin(
             base_url, "config/rollback", {"reason": "the operator's check"}
         )
@@ -1037,7 +1037,7 @@ REPORT_SETTLE = 2.0
 
 
 def _prefix_counter(base_url: str, name: str) -> float:
-    """A prefix cache counter every world counted so far, in tokens
+    """A prefix cache counter every epoch counted so far, in tokens
     (``uniserve:prefix_cache_<name>``).
     """  # noqa: D205
     text = httpx.get(f"{base_url}/metrics", timeout=10).text
@@ -1049,7 +1049,7 @@ def _prefix_counter(base_url: str, name: str) -> float:
 
 
 def _prefix_hits(base_url: str) -> float:
-    """The prefix cache hits every world counted so far."""
+    """The prefix cache hits every epoch counted so far."""
     return _prefix_counter(base_url, "hits")
 
 
@@ -1086,18 +1086,18 @@ def _updated_checkpoint() -> str:
 
 
 # The share of the GPU a deployment whose successor loads every weight
-# again serves with: both worlds' weights, the successor's graph share and
+# again serves with: both epochs' weights, the successor's graph share and
 # both KV caches fit in it.
 WEIGHTS_SHARE = ("--set", "mem_fraction_static=0.9")
 
 
 def _weights_of(base_url: str) -> set[tuple[int, ...]]:
-    """The sets of worlds holding weights on the deployment's GPUs."""
-    return _worlds_of(_ledgers(_config(base_url)), "weights")
+    """The sets of epochs holding weights on the deployment's GPUs."""
+    return _epochs_of(_ledgers(_config(base_url)), "weights")
 
 
 @pytest.mark.parametrize(
-    ("previous_world", "end"),
+    ("previous_epoch", "end"),
     [
         # The successor serves without the predecessor's weights of the
         # changed files: they are loaded, not mapped.
@@ -1108,22 +1108,22 @@ def _weights_of(base_url: str) -> set[tuple[int, ...]]:
     ],
 )
 def test_a_change_of_model_files_loads_the_successors_weights(
-    tmp_path: Path, previous_world: str, end: str
+    tmp_path: Path, previous_epoch: str, end: str
 ):
-    """A world change to other model files of the same model loads the
-    successor's changed weights from them beside the serving world's and
+    """An epoch change to other model files of the same model loads the
+    successor's changed weights from them beside the serving epoch's and
     maps the tensors both checkpoints hold alike; the count streaming
     meanwhile continues on the state it reached. The successor answers with
     its weights. A commit leaves its weights alone on the GPU; a rollback
-    answers as before on the previous world: parked, started again on the
+    answers as before on the previous epoch: parked, started again on the
     weights it kept on the GPU, or on the weights it kept in host storage,
     which return to the GPU first.
     """  # noqa: D205
-    name = "qwen3-world-weights"
+    name = "qwen3-epoch-weights"
     updated = _updated_checkpoint()
     change = (
         f"model={updated}",
-        f"update_config.previous_world={previous_world}",
+        f"update_config.previous_epoch={previous_epoch}",
     )
     with _serve(tmp_path, name, options=WEIGHTS_SHARE) as (base_url, _log):
         original = _chat(base_url, name, CACHED_PROMPT)
@@ -1132,27 +1132,27 @@ def test_a_change_of_model_files_loads_the_successors_weights(
             for slot in _config(base_url)["slots"]
             if slot["state"] != "empty"
         ]
-        previous = serving["world"]
+        previous = serving["epoch"]
         assert _weights_of(base_url) == {(previous,)}
         streaming = Streaming(base_url, name)
         streaming.wait_for(EARLY_TOKENS)
 
         # The plan counts the successor's weights beside the serving
-        # world's, and fits.
+        # epoch's, and fits.
         storage = _planned_storage(base_url, *change)
         assert storage["feasible"] is True, storage
         for gpu in storage["gpus"]:
             assert gpu["successor"]["weights"] == gpu["serving"]["weights"], gpu
-        if previous_world == "host":
-            # The host admits the previous world's weights in host storage.
+        if previous_epoch == "host":
+            # The host admits the previous epoch's weights in host storage.
             for host in storage["hosts"]:
-                assert host["previous_world_weights"] > 0, host
+                assert host["previous_epoch_weights"] > 0, host
                 assert host["feasible"] is True, host
-        report = _world_change(base_url, *change)
+        report = _epoch_change(base_url, *change)
         streaming.mark()
-        world = report["world"]
+        epoch = report["epoch"]
         # The successor reads its weights from the other files, and the
-        # requests in flight continue on the pages of the serving world's
+        # requests in flight continue on the pages of the serving epoch's
         # numerics, which it maps.
         state = report["derived_state"]
         treatments = (
@@ -1161,43 +1161,43 @@ def test_a_change_of_model_files_loads_the_successors_weights(
         )
         assert treatments == ("recomputed", "continued"), report
         assert report["numerics"] == "changed", report
-        assert report["previous_world_kept"] == previous_world, report
+        assert report["previous_epoch_kept"] == previous_epoch, report
         print(
-            f"{previous_world}: promotion pause "
+            f"{previous_epoch}: promotion pause "
             f"{report['pause_seconds']:.3f} s, "
             f"preparation {report['prepare_seconds']:.1f} s"
         )
 
-        # The successor answers with its own weights. Both worlds hold the
-        # tensors the checkpoints share; the previous world keeps its other
+        # The successor answers with its own weights. Both epochs hold the
+        # tensors the checkpoints share; the previous epoch keeps its other
         # weights on the GPU, or in host storage, which leaves no weights of
-        # the previous world alone in the GPU's ledger.
+        # the previous epoch alone in the GPU's ledger.
         changed = _chat(base_url, name, CACHED_PROMPT)
         assert changed != original, "the checkpoints answer alike"
-        shared = {(previous, world)}
-        if previous_world == "host":
+        shared = {(previous, epoch)}
+        if previous_epoch == "host":
             assert report["moved_to_host_bytes"] > 0, report
-            assert _weights_of(base_url) - shared == {(world,)}
+            assert _weights_of(base_url) - shared == {(epoch,)}
             (kept,) = [
                 slot
                 for slot in _config(base_url)["slots"]
-                if slot["world"] == previous
+                if slot["epoch"] == previous
             ]
             assert kept["state"] == "host", kept
         else:
-            assert _weights_of(base_url) - shared == {(previous,), (world,)}
+            assert _weights_of(base_url) - shared == {(previous,), (epoch,)}
         streaming.wait_for(streaming.marked + 32)
 
         if end == "commit":
             committed = _admin(base_url, "config/commit")
             assert committed.status_code == 200, committed.text
             _wait_until(
-                lambda: _weights_of(base_url) == {(world,)},
+                lambda: _weights_of(base_url) == {(epoch,)},
                 60,
-                "the previous world's weights outlived the commit",
+                "the previous epoch's weights outlived the commit",
             )
             streaming.join()
-            # The committed world answers with the successor's weights. Its
+            # The committed epoch answers with the successor's weights. Its
             # answer during the trial shared its batch with the count, whose
             # greedy decoding may part from an answer computed alone.
             assert _chat(base_url, name, CACHED_PROMPT) != original
@@ -1205,9 +1205,9 @@ def test_a_change_of_model_files_loads_the_successors_weights(
         rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
         assert rolled.status_code == 200, rolled.text
         result = rolled.json()["result"]
-        assert result["world"] == previous, result
+        assert result["epoch"] == previous, result
         print(
-            f"{previous_world}: rollback pause {result['pause_seconds']:.3f} s"
+            f"{previous_epoch}: rollback pause {result['pause_seconds']:.3f} s"
         )
         streaming.join()
         assert _chat(base_url, name, CACHED_PROMPT) == original
@@ -1273,13 +1273,13 @@ WITHOUT_MOONCAKE = pytest.mark.skipif(
 )
 
 
-def _segments_of(base_url: str, world: int) -> int:
-    """The KV cache segments `world` holds on the deployment's GPUs."""
+def _segments_of(base_url: str, epoch: int) -> int:
+    """The KV cache segments `epoch` holds on the deployment's GPUs."""
     return sum(
         1
         for ledger in _ledgers(_config(base_url))
         for entry in ledger["entries"]
-        if entry["item"] == "cache_segment" and world in entry["worlds"]
+        if entry["item"] == "cache_segment" and epoch in entry["epochs"]
     )
 
 
@@ -1291,12 +1291,12 @@ def _segments_of(base_url: str, world: int) -> int:
         pytest.param("no_host_pool", marks=WITHOUT_MOONCAKE),
     ],
 )
-def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
+def test_a_parked_epoch_evicts_the_cache_its_successor_does_not_map(
     tmp_path: Path, host_cache: str
 ):
     """A change to other model files whose requests in flight compute their
-    state again maps none of the serving world's KV cache. The previous
-    world, parked, evicts every segment past its first once the idle pages
+    state again maps none of the serving epoch's KV cache. The previous
+    epoch, parked, evicts every segment past its first once the idle pages
     there reached the host KV cache, and the successor's cache grows into
     their storage; the dry run states what that frees. A rollback creates
     the segments again and reads the evicted pages back from the host KV
@@ -1310,10 +1310,10 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
     no page pool at all, and the pages pass through a staging pool into the
     KV storage.
     """  # noqa: D205
-    name = "qwen3-world-evict"
+    name = "qwen3-epoch-evict"
     change = [
         f"model={_updated_checkpoint()}",
-        "update_config.previous_world=parked",
+        "update_config.previous_epoch=parked",
     ]
     options, storage, cached = WEIGHTS_SHARE, None, CACHED_PROMPT
     if host_cache == "kv_storage":
@@ -1336,7 +1336,7 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
             for slot in _config(base_url)["slots"]
             if slot["state"] != "empty"
         ]
-        previous = serving["world"]
+        previous = serving["epoch"]
         held = _segments_of(base_url, previous)
         assert held > 1
 
@@ -1365,7 +1365,7 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
             timeout=1800,
         )
         assert response.status_code == 200, response.text
-        report = response.json()["result"]["world"]
+        report = response.json()["result"]["epoch"]
         kv_pages = report["derived_state"]["kv_pages"]
         assert kv_pages["treatment"] == "recomputed", report
         # The preparation gave back the tail past what the successor's
@@ -1374,16 +1374,16 @@ def test_a_parked_world_evicts_the_cache_its_successor_does_not_map(
         evicted = report["evicted"]
         assert evicted["evicted_segments"] == kept - 1, report
         assert evicted["evicted_bytes"] > 0, report
-        world = report["world"]
-        # The previous world keeps its first segment; the successor's cache
+        epoch = report["epoch"]
+        # The previous epoch keeps its first segment; the successor's cache
         # grew past its head segment into the storage freed.
         assert _segments_of(base_url, previous) == 1
-        assert _segments_of(base_url, world) > 1
+        assert _segments_of(base_url, epoch) > 1
         assert _chat(base_url, name, cached) != original
 
         rolled = _admin(base_url, "config/rollback", {"reason": "the check"})
         assert rolled.status_code == 200, rolled.text
-        assert rolled.json()["result"]["world"] == previous
+        assert rolled.json()["result"]["epoch"] == previous
         assert _segments_of(base_url, previous) == held
         answer, hits = _hits_of(base_url, name, cached)
         assert answer == original

@@ -218,7 +218,7 @@ pub(crate) struct ModelRunner {
     /// The output and the media lane the ranks of this process share, once the first rank made them.
     codec: Arc<std::sync::Mutex<Option<SharedCodec>>>,
     /// The process's arguments, which every rank of it shares: the epoch's engine configuration
-    /// (§7.2), the checkpoint, the world and the node's interfaces. A model runner that loads another
+    /// (§7.2), the checkpoint, the epoch and the node's interfaces. A model runner that loads another
     /// checkpoint holds its own copy, whose configuration names that checkpoint.
     launch: Arc<EngineArgs>,
     /// This rank's devices, as the worker's names for them.
@@ -230,10 +230,10 @@ pub(crate) struct ModelRunner {
     /// This rank's ordinal inside its group, which the storage claims and the cache plan's
     /// agreement with its group are keyed by.
     rank: u32,
-    /// The world whose cache planes this rank maps, on a standby: it serves from the planes its
-    /// predecessor serves from, whose segments that world created.
-    cache_world: Option<u64>,
-    /// The planes of the world `cache_world` names, as that world laid them out: what a standby
+    /// The epoch whose cache planes this rank maps, on a standby: it serves from the planes its
+    /// predecessor serves from, whose segments that epoch created.
+    cache_epoch: Option<u64>,
+    /// The planes of the epoch `cache_epoch` names, as that epoch laid them out: what a standby
     /// maps is the serving rank's cache, which only that rank sized.
     adopted_cache: Option<ipc::CacheTable>,
     /// Ranks in the deployment, whose minimum the cache plan's block size and slot count are
@@ -393,7 +393,7 @@ impl ModelRunner {
             targets,
             buckets,
             rank: launch.rank,
-            cache_world: None,
+            cache_epoch: None,
             adopted_cache: None,
             world_size: launch.world_size as usize,
             codec: Arc::default(),
@@ -592,13 +592,13 @@ impl ModelRunner {
             .map(|union| (union, self.mapping.union_rank as usize))
     }
 
-    /// This model runner on the cache planes of `world`, when this rank stands by for that world's process.
+    /// This model runner on the cache planes of `epoch`, when this rank stands by for that epoch's process.
     pub(crate) fn sharing_cache_of(
         mut self,
-        world: Option<u64>,
+        epoch: Option<u64>,
         table: Option<ipc::CacheTable>,
     ) -> Self {
-        self.cache_world = world;
+        self.cache_epoch = epoch;
         self.adopted_cache = table;
         self
     }
@@ -1623,7 +1623,7 @@ impl ModelRunner {
                 let facts = worker::capacity::RankFacts {
                     device: worker::config::Device::Cuda(device),
                     host: &host,
-                    world: self.cache_world.unwrap_or(self.launch.world),
+                    epoch: self.cache_epoch.unwrap_or(self.launch.epoch),
                     world_size: self.world_size,
                     queue_depth: self.queue_depth(),
                     // The model's page is the preset: the plan returns it or fails, and a plan that
@@ -1652,7 +1652,7 @@ impl ModelRunner {
                 let facts = worker::capacity::RankFacts {
                     device: worker::config::Device::Cuda(device),
                     host: &host,
-                    world: self.launch.world,
+                    epoch: self.launch.epoch,
                     world_size: self.world_size,
                     queue_depth: self.queue_depth(),
                     // No page and no cache: the media class addresses no paged request, so the
@@ -3048,7 +3048,7 @@ fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
     kinds.dedup();
     kinds
         .into_iter()
-        // The scheduler numbers a phase with the world's `u32` and the worker names one with the
+        // The scheduler numbers a phase with the epoch's `u32` and the worker names one with the
         // wire's `u16`: the plan is where the two meet, and a kind that did not fit would be a table
         // this process cannot state rather than a phase to serve quietly.
         .map(|kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits")))

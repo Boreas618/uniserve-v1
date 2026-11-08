@@ -92,19 +92,19 @@ fn claim_pool(socket: &Path, shape: PageShape) -> (Client, Client, u64, Mapping)
         socket,
         Role::Head {
             deployment: "model".into(),
-            world: 0,
+            epoch: 0,
         },
     )
     .unwrap();
     let claim = head.claim(0, vec![scope()], Vec::new()).unwrap();
-    head.publish_worlds(vec![0]).unwrap();
+    head.publish_epochs(vec![0]).unwrap();
     let mut worker = Client::connect(
         socket,
         Role::Worker {
             scope: scope(),
             generation: 1,
             claim,
-            world: 0,
+            epoch: 0,
         },
     )
     .unwrap();

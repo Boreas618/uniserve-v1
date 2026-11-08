@@ -41,7 +41,7 @@
 //!   recycled until the copy commits. The next text batch the worker group
 //!   runs copies the pages (`Batch::page_offloads`), and the batch's output
 //!   commits them, or aborts them when the batch failed.
-//! - **Evictions.** A world change evicts idle cached pages from the device
+//! - **Evictions.** An epoch change evicts idle cached pages from the device
 //!   once their copies commit (`specs/online-operations.md` §6.5, steps 1
 //!   and 5; [`OffloadKind::Evicted`]). A pool answers `Full` for a page it
 //!   has no slot for: every slot is reserved, pinned or uploading, as when
@@ -53,7 +53,7 @@
 //!   until its copy commits: the evicted pages pass through the pool into
 //!   the KV storage, from which a later admission prefetches them. A page
 //!   gives up only when its pool grants the eviction no slot for
-//!   [`EVICTION_STALL`]. A host whose storage holds no pool of the world's
+//!   [`EVICTION_STALL`]. A host whose storage holds no pool of the epoch's
 //!   still gives a server with a KV storage small staging pools
 //!   (`storage_server::STAGING_POOL_BYTES` on each rank), through which
 //!   the pages pass the same way.
@@ -66,14 +66,14 @@
 //! does. The keys of every group form one key space: for each key, the
 //! lookups say where its page is.
 //!
-//! A world's host KV cache holds one token count on every rank
-//! ([`HostCacheDemand`]): the world asks for its device KV cache's tokens
+//! An epoch's host KV cache holds one token count on every rank
+//! ([`HostCacheDemand`]): the epoch asks for its device KV cache's tokens
 //! times `kv_cache_config.host_ratio`, and each host's Storage Server lowers
-//! that for the whole world to what its budget holds over the bytes a token
-//! takes on all of the world's ranks there (`Request::HostCache`). Every
+//! that for the whole epoch to what its budget holds over the bytes a token
+//! takes on all of the epoch's ranks there (`Request::HostCache`). Every
 //! rank then maps a pool per cache group holding that many tokens
 //! (`uniserve.host_cache`); a pool the deployment already has for the same
-//! pages, which a previous world created, is shared at its size.
+//! pages, which a previous epoch created, is shared at its size.
 //!
 //! A rank's pool is reached through its host's Storage Server: on the
 //! engine's host through the server's socket, on another host over the TCP
@@ -113,7 +113,7 @@ pub(crate) const DEFAULT_BOUNDARY_INTERVAL: usize = 64;
 /// that keeps pages (`--hicache-ratio`).
 const DEFAULT_HOST_RATIO: f64 = 2.0;
 
-/// How large a world's host KV cache is (`kv_cache_config.host_ratio` and
+/// How large an epoch's host KV cache is (`kv_cache_config.host_ratio` and
 /// `host_gib`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HostCacheSize {
@@ -149,15 +149,15 @@ impl HostCacheSize {
     }
 }
 
-/// What a world's host KV cache asks of each host: the token count of every
+/// What an epoch's host KV cache asks of each host: the token count of every
 /// rank, and the ranks of each host.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HostCacheDemand {
     /// The device KV cache's tokens times the ratio, the least over the
-    /// world's ranks.
+    /// epoch's ranks.
     pub tokens: u64,
     /// By host: where an engine on another host reaches its Storage Server,
-    /// and the bytes a token takes on each of the world's ranks there.
+    /// and the bytes a token takes on each of the epoch's ranks there.
     pub hosts: BTreeMap<String, (Option<String>, Vec<u64>)>,
 }
 
@@ -451,8 +451,8 @@ pub(crate) struct RankCache<'a> {
 /// The scheduler's side of the host KV cache and the KV storage.
 pub(crate) struct KvOffloadManager {
     deployment: String,
-    /// The engine's world, which publishes the pages it commits.
-    world: u64,
+    /// The engine's epoch, which publishes the pages it commits.
+    epoch: u64,
     /// The pages of the largest block size between aligned sliding-window
     /// boundaries.
     boundary_interval: usize,
@@ -486,13 +486,13 @@ pub(crate) struct KvOffloadManager {
 
 impl KvOffloadManager {
     /// Connect to this host's Storage Server, at `socket`, as a head of
-    /// `world` of `deployment`, offloading sliding windows every
+    /// `epoch` of `deployment`, offloading sliding windows every
     /// `boundary_interval` pages of a long prompt. `kv_storage` states
     /// whether a KV storage keeps every page the pools commit.
     pub(crate) fn connect(
         socket: &std::path::Path,
         deployment: &str,
-        world: u64,
+        epoch: u64,
         boundary_interval: usize,
         kv_storage: bool,
     ) -> anyhow::Result<Self> {
@@ -500,12 +500,12 @@ impl KvOffloadManager {
             socket,
             Role::Head {
                 deployment: deployment.to_owned(),
-                world,
+                epoch,
             },
         )?;
         Ok(Self {
             deployment: deployment.to_owned(),
-            world,
+            epoch,
             boundary_interval: boundary_interval.max(1),
             clients: vec![client],
             remote: HashMap::new(),
@@ -532,7 +532,7 @@ impl KvOffloadManager {
         }
         let role = Role::Head {
             deployment: self.deployment.clone(),
-            world: self.world,
+            epoch: self.epoch,
         };
         match Client::connect_tcp(address, role) {
             Ok(client) => {
@@ -548,8 +548,8 @@ impl KvOffloadManager {
         }
     }
 
-    /// The token count every rank of the world holds in the host KV cache
-    /// of `host`'s Storage Server, for the world's ranks there that take
+    /// The token count every rank of the epoch holds in the host KV cache
+    /// of `host`'s Storage Server, for the epoch's ranks there that take
     /// `token_bytes` bytes a token (`Request::HostCache`): at most `tokens`.
     /// `local` names the engine's host; another host's server is reached at
     /// `endpoint`.
@@ -1955,7 +1955,7 @@ mod tests {
                 scope,
                 generation: 1,
                 claim: Claim([0; 16]),
-                world: 0,
+                epoch: 0,
             },
         )
         .unwrap();
@@ -2028,11 +2028,11 @@ mod tests {
         }
     }
 
-    /// A world asks for its device KV cache's tokens times the ratio, the
+    /// An epoch asks for its device KV cache's tokens times the ratio, the
     /// least over its ranks, and states the bytes a token takes on each rank
     /// by host; ranks that copy no page ask nothing.
     #[test]
-    fn a_world_asks_its_hosts_for_one_token_count() {
+    fn a_epoch_asks_its_hosts_for_one_token_count() {
         let rank = |host: &str, units: u32, scratch: u32, bytes: u64| {
             let mut cache = report(vec![cache_group(None)], &[], &[]);
             cache.num_units = units;

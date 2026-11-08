@@ -3,9 +3,9 @@
 //!
 //! A request's trajectory is derived state: the samples of its committed
 //! step, which the request's facts and the step count determine. Whatever
-//! preempts a request (a world's park, a sleep, an in-place weight update,
+//! preempts a request (an epoch's park, a sleep, an in-place weight update,
 //! a shrink of the KV cache, the loss of its workers) preempts it the same
-//! way, and a resumed request is the same whether it resumes on this world
+//! way, and a resumed request is the same whether it resumes on this epoch
 //! or on another:
 //!
 //! 1. **Preempt.** The request offers no further call

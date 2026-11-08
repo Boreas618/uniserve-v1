@@ -55,7 +55,7 @@ impl Copies {
             .flat_map(|copy| copy.spans)
             .collect();
         if !spans.is_empty() {
-            self.task = Some(retained.transfer(spans, transfer.priority, retained.world())?);
+            self.task = Some(retained.transfer(spans, transfer.priority, retained.epoch())?);
         }
         Ok(())
     }

@@ -812,7 +812,7 @@ impl DataPlane {
                     "free_bytes": memory.free,
                     "host": rank.host,
                     "scope": rank.storage.scope(),
-                    "world": rank.storage.world(),
+                    "epoch": rank.storage.epoch(),
                     "ledger": ledger,
                 })
                 .to_string())

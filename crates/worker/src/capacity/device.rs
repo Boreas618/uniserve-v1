@@ -1,16 +1,16 @@
 //! Device storage accounting against the GPU's storage ledger.
 //!
 //! A deployment may use `⌊total × fraction⌋` of a GPU (its quota), and every
-//! world of the deployment that uses the GPU, with the host's Transfer
+//! epoch of the deployment that uses the GPU, with the host's Transfer
 //! Server, holds its storage within that one quota: the host's Storage Server
 //! keeps the GPU's ledger (`::storage::GpuLedger`). A rank's grant is the
 //! quota less everything the ledger books beside the rank's own process
-//! (another world's weights, KV cache segments, graph pool and process, the
+//! (another epoch's weights, KV cache segments, graph pool and process, the
 //! Transfer Server's context, the storages this rank's scope retains) and
 //! less what the process holds now, never more than the device has free.
-//! In a deployment of one world this is the fraction of the device less
+//! In a deployment of one epoch this is the fraction of the device less
 //! what the process and its retained storages hold; beside a predecessor
-//! world it is also less everything the predecessor holds, so two worlds
+//! epoch it is also less everything the predecessor holds, so two epochs
 //! never each size themselves to the whole quota.
 //!
 //! The process figure is NVML's per-process usage, which counts every
@@ -24,7 +24,7 @@
 //! segments. So does the part of the plugins' communication buffers NVML
 //! attributes to no process, which counts as the process's own.
 //!
-//! Exclusive storages a predecessor of the rank's scope and world left that
+//! Exclusive storages a predecessor of the rank's scope and epoch left that
 //! the rank has not taken yet are about to be reused or released by its
 //! owners, so they count as free.
 //!
@@ -66,9 +66,9 @@ pub(crate) struct DeviceBudget {
 pub(crate) struct Budget {
     /// Bytes the rank may still allocate on the device.
     pub available: u64,
-    /// Bytes the rank may hold beside its process once every other world
+    /// Bytes the rank may hold beside its process once every other epoch
     /// of its deployment has left the device: the quota less the process
-    /// and what the ledger books for the rank's own world and the Transfer
+    /// and what the ledger books for the rank's own epoch and the Transfer
     /// Server.
     pub full: u64,
     /// Bytes the device reports free, with the scope's reclaimable
@@ -130,7 +130,7 @@ impl DeviceBudget {
     }
 
     /// The storage grant on `device` for a rank allowed `fraction` of it,
-    /// stating the rank's world's quota in the GPU's ledger.
+    /// stating the rank's epoch's quota in the GPU's ledger.
     pub(crate) fn budget(&self, device: DeviceId, fraction: f64) -> Result<Budget> {
         let own = self.own_bytes(device)?;
         let scope = self.retained.scope_bytes(device)?;
@@ -145,17 +145,17 @@ impl DeviceBudget {
         )?;
         let quota = ledger.quota.unwrap_or(quota(storage.total, fraction));
         // The measurement of the process stands for what it, or another
-        // process of its scope and world it replaces, booked; the
+        // process of its scope and epoch it replaces, booked; the
         // reclaimable storages count as free.
         let others = ledger
             .used()
             .saturating_sub(ledger.bytes(|entry| self.retained.books(entry)))
             .saturating_sub(scope.reclaimable);
-        let world = self.retained.world();
+        let epoch = self.retained.epoch();
         let stays = ledger
             .bytes(|entry| {
                 !self.retained.books(entry)
-                    && (entry.worlds.contains(&world) || entry.worlds.is_empty())
+                    && (entry.epochs.contains(&epoch) || entry.epochs.is_empty())
             })
             .saturating_sub(scope.reclaimable);
         let free = storage.free + scope.reclaimable;

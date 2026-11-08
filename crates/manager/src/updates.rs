@@ -6,15 +6,15 @@
 //!
 //! Each `--node` is the leader daemon of one service (one served model
 //! name). Before it starts a service's update, the manager reads the GPUs
-//! the service's worlds hold (`GET /admin/config`, `gpus`) and asks for the
+//! the service's epochs hold (`GET /admin/config`, `gpus`) and asks for the
 //! update's plan (`PUT /admin/config` with `dry_run`): whether it starts a
-//! new world, the GPUs its successor prepares on, each host's host storage
+//! new epoch, the GPUs its successor prepares on, each host's host storage
 //! it requires and admits, and whether every GPU and host it uses has the
 //! storage it requires (the plan's `storage` and `redistribution`). The
 //! decision:
 //!
 //! - Services are taken in the order given. One whose update starts a new
-//!   world starts only when no update in progress (preparing, or on trial
+//!   epoch starts only when no update in progress (preparing, or on trial
 //!   until the manager commits it) holds one of its GPUs, so two services
 //!   that share a GPU are never prepared at once; when its plan, made just
 //!   then, finds the storage it requires on every GPU and host; and when
@@ -23,9 +23,9 @@
 //!   that share no GPU, and whose host storage fits together, update at
 //!   once.
 //! - A service that cannot start waits, and is planned again whenever an
-//!   update in progress ends: a commit releases the previous world's
+//!   update in progress ends: a commit releases the previous epoch's
 //!   storage, which may make its plan fit.
-//! - Each update runs to its end: applied in place, or a new world on
+//! - Each update runs to its end: applied in place, or a new epoch on
 //!   trial, which the manager commits once it served `--commit-after`
 //!   seconds (completing the service's remaining replica trials), or which
 //!   rolled back by itself meanwhile (`update_config.rollback`). Without
@@ -49,10 +49,10 @@ type Gpu = (String, String);
 pub(crate) struct Needs {
     /// Whether the update changes anything.
     pub(crate) changes: bool,
-    /// Whether it starts a new world, which prepares beside the serving
+    /// Whether it starts a new epoch, which prepares beside the serving
     /// one and serves on trial.
-    pub(crate) world: bool,
-    /// The GPUs the service's worlds hold and those its successor prepares
+    pub(crate) epoch: bool,
+    /// The GPUs the service's epochs hold and those its successor prepares
     /// on.
     pub(crate) gpus: BTreeSet<Gpu>,
     /// Each host's host storage the update requires and what the host
@@ -66,7 +66,7 @@ impl Needs {
     /// What the update of a service needs, from its status (`GET
     /// /admin/config`) and its dry run's result (`PUT /admin/config` with
     /// `dry_run`): one replica's plan, the plans of every independent
-    /// replica (`replicas`), a group change's plan (`previous_worlds`), or
+    /// replica (`replicas`), a group change's plan (`previous_epochs`), or
     /// an idle node's deployment (`deployment`).
     pub(crate) fn of(status: &Value, planned: &Value) -> Self {
         let mut needs = Self::default();
@@ -82,14 +82,14 @@ impl Needs {
         };
         let mut refusals = Vec::new();
         for plan in plans {
-            let world = !plan["steps"].is_null()
+            let epoch = !plan["steps"].is_null()
                 || plan["deployment"].is_string()
-                || plan["previous_worlds"].is_array();
-            needs.world |= world;
-            needs.changes |= world || plan["world"] == true || plan["daemon"] == true;
+                || plan["previous_epochs"].is_array();
+            needs.epoch |= epoch;
+            needs.changes |= epoch || plan["epoch"] == true || plan["daemon"] == true;
 
             // The storage plan names the GPUs the successor prepares on
-            // beside the serving world, and each host's admission.
+            // beside the serving epoch, and each host's admission.
             let storage = &plan["storage"];
             let planned_gpus = storage["gpus"].as_array().into_iter().flatten();
             needs.gpus.extend(planned_gpus.filter_map(gpu));
@@ -152,7 +152,7 @@ fn gpu(entry: &Value) -> Option<Gpu> {
     ))
 }
 
-/// Why an update that starts a new world waits.
+/// Why an update that starts a new epoch waits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Wait {
     /// It shares GPU `gpu` with the update in progress of service `with`.
@@ -232,7 +232,7 @@ pub(crate) fn conflict(candidate: &Needs, beside: &BTreeMap<usize, Needs>) -> Op
 pub(crate) struct Options {
     /// The body of `PUT /admin/config`, without `dry_run`.
     pub(crate) body: Value,
-    /// How long a new world serves on trial before the manager commits it;
+    /// How long a new epoch serves on trial before the manager commits it;
     /// `None` leaves it on trial for the operator.
     pub(crate) commit_after: Option<Duration>,
     /// How often the manager reads a node's status while it waits for an
@@ -243,9 +243,9 @@ pub(crate) struct Options {
 /// How one service's update ended.
 #[derive(Debug)]
 enum Ended {
-    /// Applied without a new world, or committed.
+    /// Applied without a new epoch, or committed.
     Done,
-    /// A new world serves on trial, for the operator to end.
+    /// A new epoch serves on trial, for the operator to end.
     OnTrial,
 }
 
@@ -290,7 +290,7 @@ pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
                 println!("{}: unchanged", node.base);
                 continue;
             }
-            if needs.world
+            if needs.epoch
                 && let Some(wait) = conflict(&needs, &holding)
             {
                 println!("{}: waits: {}", node.base, wait.describe(nodes));
@@ -317,7 +317,7 @@ pub(crate) async fn apply(nodes: &[Node], options: &Options) -> Result<()> {
             Ok(Ended::Done) => {
                 holding.remove(&index);
             }
-            // A trial holds both worlds' storage until the operator ends it.
+            // A trial holds both epochs' storage until the operator ends it.
             Ok(Ended::OnTrial) => on_trial.push(index),
             Err(error) => {
                 holding.remove(&index);
@@ -395,20 +395,20 @@ pub(crate) async fn plan(nodes: &[Node], options: &Options) -> Result<()> {
             println!("{base}: unchanged");
             continue;
         }
-        if !needs.world {
-            println!("{base}: changes without a new world, at once");
+        if !needs.epoch {
+            println!("{base}: changes without a new epoch, at once");
             continue;
         }
         let after: Vec<&str> = planned[..index]
             .iter()
             .enumerate()
-            .filter(|(_, other)| other.world && !other.gpus.is_disjoint(&needs.gpus))
+            .filter(|(_, other)| other.epoch && !other.gpus.is_disjoint(&needs.gpus))
             .map(|(other, _)| nodes[other].base.as_str())
             .collect();
         if after.is_empty() {
-            println!("{base}: a new world, first");
+            println!("{base}: a new epoch, first");
         } else {
-            println!("{base}: a new world, after {}", after.join(", "));
+            println!("{base}: a new epoch, after {}", after.join(", "));
         }
         if let Some(refusal) = &needs.refusal {
             println!("{base}: does not fit now: {refusal}");
@@ -427,29 +427,29 @@ async fn update(node: &Node, options: &Options) -> Result<Ended> {
         .with_context(|| format!("{} did not change", node.base))?;
     let mut result = answer["result"].clone();
     println!("{}: {result}", node.base);
-    if result["change"] == "daemon" && result["then"] == "world" {
-        // The hot restart's successor changes the world in an operation of
+    if result["change"] == "daemon" && result["then"] == "epoch" {
+        // The hot restart's successor changes the epoch in an operation of
         // its own, after the one that answered.
         let after = answer["id"].as_u64().unwrap_or(0);
         result = operation_after(node, after, options.poll).await?;
         println!("{}: {result}", node.base);
     }
-    if result["change"] != "world" {
+    if result["change"] != "epoch" {
         return Ok(Ended::Done);
     }
     let Some(trial_window) = options.commit_after else {
         return Ok(Ended::OnTrial);
     };
-    let mut trial = result["world"].clone();
+    let mut trial = result["epoch"].clone();
     loop {
         tokio::time::sleep(trial_window).await;
         let status = node.get("/admin/config").await?.unwrap_or(Value::Null);
-        let worlds = if trial["worlds"].is_array() {
-            "worlds"
+        let epochs = if trial["epochs"].is_array() {
+            "epochs"
         } else {
-            "world"
+            "epoch"
         };
-        if status["trial"].is_null() || status["trial"][worlds] != trial[worlds] {
+        if status["trial"].is_null() || status["trial"][epochs] != trial[epochs] {
             bail!(
                 "{}: the trial rolled back before its commit ({})",
                 node.base,
@@ -542,7 +542,7 @@ mod tests {
     /// its admin API.
     struct Daemon {
         name: &'static str,
-        /// The GPUs its worlds hold, as `GET /admin/config` names them.
+        /// The GPUs its epochs hold, as `GET /admin/config` names them.
         gpus: Vec<(&'static str, &'static str)>,
         plan: Planner,
         /// Whether its trials roll back by themselves.
@@ -560,9 +560,9 @@ mod tests {
             .collect();
         Json(json!({
             "gpus": gpus,
-            "trial": trial.map(|world| json!({ "world": world })),
+            "trial": trial.map(|epoch| json!({ "epoch": epoch })),
             "last": if daemon.rolls_back {
-                json!({ "rolled_back": 2, "reason": "world 2 failed" })
+                json!({ "rolled_back": 2, "reason": "epoch 2 failed" })
             } else {
                 Value::Null
             },
@@ -582,7 +582,7 @@ mod tests {
         *daemon.trial.lock().unwrap() = Some(2);
         Json(json!({
             "id": 2, "kind": "config", "state": "succeeded",
-            "result": { "change": "world", "world": { "world": 2, "previous_world": 1 } },
+            "result": { "change": "epoch", "epoch": { "epoch": 2, "previous_epoch": 1 } },
         }))
     }
 
@@ -597,7 +597,7 @@ mod tests {
             .insert(daemon.name.to_owned());
         Json(json!({
             "id": 3, "kind": "commit", "state": "succeeded",
-            "result": { "world": 2, "previous_world": 1 },
+            "result": { "epoch": 2, "previous_epoch": 1 },
         }))
     }
 
@@ -614,16 +614,16 @@ mod tests {
         Node::new(&format!("http://{address}"), &reqwest::Client::new(), None)
     }
 
-    /// The plan of a new world beside the serving one on `gpus`, requiring
+    /// The plan of a new epoch beside the serving one on `gpus`, requiring
     /// `required` bytes of host storage of host `rank-0`, which admits
     /// 1000, and refused for `refusal`, as a daemon's dry run states it.
-    fn world(gpus: &[(&str, &str)], required: u64, refusal: Option<&str>) -> Value {
+    fn epoch(gpus: &[(&str, &str)], required: u64, refusal: Option<&str>) -> Value {
         let gpus: Vec<Value> = gpus
             .iter()
             .map(|(host, gpu)| json!({ "host": host, "gpu": gpu, "feasible": refusal.is_none() }))
             .collect();
         json!({
-            "world": true,
+            "epoch": true,
             "daemon": false,
             "steps": [{ "step": "shrink" }, { "step": "prepare" }, { "step": "promote" }],
             "storage": {
@@ -677,9 +677,9 @@ mod tests {
         let shared = [("rank-0", "GPU-0")];
         let other = [("rank-1", "GPU-1")];
         let nodes = vec![
-            serve(daemon("a", &shared, always(world(&shared, 0, None)), &log)).await,
-            serve(daemon("b", &shared, always(world(&shared, 0, None)), &log)).await,
-            serve(daemon("c", &other, always(world(&other, 0, None)), &log)).await,
+            serve(daemon("a", &shared, always(epoch(&shared, 0, None)), &log)).await,
+            serve(daemon("b", &shared, always(epoch(&shared, 0, None)), &log)).await,
+            serve(daemon("c", &other, always(epoch(&other, 0, None)), &log)).await,
         ];
         apply(&nodes, &options(Some(TRIAL))).await.unwrap();
         assert!(log.at("c:apply") < log.at("a:commit"), "{:?}", log.calls());
@@ -696,11 +696,11 @@ mod tests {
         let second = [("rank-0", "GPU-1")];
         let fits_after_first: Planner = Box::new(move |log: &Log| {
             let refusal = (!log.committed("a"))
-                .then_some("GPU-1 of rank-0 leaves the serving world's KV cache 0 bytes");
-            world(&second, 0, refusal)
+                .then_some("GPU-1 of rank-0 leaves the serving epoch's KV cache 0 bytes");
+            epoch(&second, 0, refusal)
         });
         let nodes = vec![
-            serve(daemon("a", &first, always(world(&first, 0, None)), &log)).await,
+            serve(daemon("a", &first, always(epoch(&first, 0, None)), &log)).await,
             serve(daemon("b", &second, fits_after_first, &log)).await,
         ];
         apply(&nodes, &options(Some(TRIAL))).await.unwrap();
@@ -723,21 +723,21 @@ mod tests {
             serve(daemon(
                 "a",
                 &gpus[0],
-                always(world(&gpus[0], 600, None)),
+                always(epoch(&gpus[0], 600, None)),
                 &log,
             ))
             .await,
             serve(daemon(
                 "b",
                 &gpus[1],
-                always(world(&gpus[1], 600, None)),
+                always(epoch(&gpus[1], 600, None)),
                 &log,
             ))
             .await,
             serve(daemon(
                 "c",
                 &gpus[2],
-                always(world(&gpus[2], 300, None)),
+                always(epoch(&gpus[2], 300, None)),
                 &log,
             ))
             .await,
@@ -756,9 +756,9 @@ mod tests {
         let shared = [("rank-0", "GPU-0")];
         let rolling_back = Daemon {
             rolls_back: true,
-            ..daemon("a", &shared, always(world(&shared, 0, None)), &log)
+            ..daemon("a", &shared, always(epoch(&shared, 0, None)), &log)
         };
-        let waiting = serve(daemon("b", &shared, always(world(&shared, 0, None)), &log)).await;
+        let waiting = serve(daemon("b", &shared, always(epoch(&shared, 0, None)), &log)).await;
         let nodes = vec![serve(rolling_back).await, waiting];
         let error = apply(&nodes, &options(Some(TRIAL)))
             .await
@@ -774,7 +774,7 @@ mod tests {
         assert!(!log.committed("a"));
     }
 
-    /// Without a commit, a new world stays on trial for the operator and
+    /// Without a commit, a new epoch stays on trial for the operator and
     /// holds its GPUs: a service that shares one waits for the next apply,
     /// and one on other GPUs updates.
     #[tokio::test(flavor = "multi_thread")]
@@ -783,9 +783,9 @@ mod tests {
         let shared = [("rank-0", "GPU-0")];
         let other = [("rank-1", "GPU-1")];
         let nodes = vec![
-            serve(daemon("a", &shared, always(world(&shared, 0, None)), &log)).await,
-            serve(daemon("b", &shared, always(world(&shared, 0, None)), &log)).await,
-            serve(daemon("c", &other, always(world(&other, 0, None)), &log)).await,
+            serve(daemon("a", &shared, always(epoch(&shared, 0, None)), &log)).await,
+            serve(daemon("b", &shared, always(epoch(&shared, 0, None)), &log)).await,
+            serve(daemon("c", &other, always(epoch(&other, 0, None)), &log)).await,
         ];
         apply(&nodes, &options(None)).await.unwrap();
         let calls = log.calls();
@@ -804,8 +804,8 @@ mod tests {
     async fn a_plan_that_never_fits_is_refused() {
         let log = Arc::new(Log::default());
         let gpus = [("rank-0", "GPU-0")];
-        let refusal = "GPU-0 of rank-0 leaves the serving world's KV cache 0 bytes";
-        let plan = always(world(&gpus, 0, Some(refusal)));
+        let refusal = "GPU-0 of rank-0 leaves the serving epoch's KV cache 0 bytes";
+        let plan = always(epoch(&gpus, 0, Some(refusal)));
         let nodes = vec![serve(daemon("a", &gpus, plan, &log)).await];
         let error = apply(&nodes, &options(Some(TRIAL)))
             .await
@@ -814,7 +814,7 @@ mod tests {
         assert_eq!(log.calls(), ["a:plan"]);
     }
 
-    /// The GPUs an update uses are those its service's worlds hold, those
+    /// The GPUs an update uses are those its service's epochs hold, those
     /// its storage plan prepares on, and its successor's target ranks;
     /// every refusal of its plans is kept, and the largest host storage a
     /// replica requires on a host is the update's.
@@ -823,7 +823,7 @@ mod tests {
         let status = json!({ "gpus": [{ "host": "rank-0", "gpu": "GPU-0" }] });
         let replica = |gpu: &str, target: &str, required: u64, feasible: bool| {
             json!({
-                "world": true,
+                "epoch": true,
                 "steps": [{ "step": "prepare" }],
                 "storage": {
                     "feasible": true,
@@ -845,7 +845,7 @@ mod tests {
             ] },
         });
         let needs = Needs::of(&status, &planned);
-        assert!(needs.changes && needs.world);
+        assert!(needs.changes && needs.epoch);
         let gpus: Vec<(&str, &str)> = needs
             .gpus
             .iter()
@@ -869,14 +869,14 @@ mod tests {
             Some("GPU-9 has 0 bytes available")
         );
 
-        // A change in place starts no world, and one that changes nothing
+        // A change in place starts no epoch, and one that changes nothing
         // needs nothing.
         let in_place = json!({
             "change": "planned",
-            "plan": { "world": true, "daemon": false, "steps": null },
+            "plan": { "epoch": true, "daemon": false, "steps": null },
         });
         let needs = Needs::of(&status, &in_place);
-        assert!(needs.changes && !needs.world);
+        assert!(needs.changes && !needs.epoch);
         let unchanged = Needs::of(&status, &json!({ "change": "none" }));
         assert!(!unchanged.changes);
     }

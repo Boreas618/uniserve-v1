@@ -42,7 +42,7 @@ use tracing::{info, warn};
 
 use crate::observe::{Observer, Sample};
 
-/// The span before a world change whose steps make the schedulers'
+/// The span before an epoch change whose steps make the schedulers'
 /// baselines: sixty of their once-a-second reports.
 pub(crate) const BASELINE: Duration = Duration::from_secs(60);
 
@@ -79,10 +79,10 @@ pub(crate) struct Baseline {
 }
 
 impl Baseline {
-    /// `world`'s baseline from its reports in `[from, until)`.
-    pub(crate) fn of(observer: &Observer, world: u64, from: Instant, until: Instant) -> Self {
+    /// `epoch`'s baseline from its reports in `[from, until)`.
+    pub(crate) fn of(observer: &Observer, epoch: u64, from: Instant, until: Instant) -> Self {
         let mut baseline = Self::default();
-        observer.samples(world, from, until, |sample| {
+        observer.samples(epoch, from, until, |sample| {
             if let Some((_, range)) = step(sample) {
                 let entry = baseline.steps.entry((sample.scheduler, range)).or_default();
                 entry.0 += sample.batch_us;
@@ -107,10 +107,10 @@ pub(crate) enum Decision {
     Restore,
 }
 
-/// The control of one world change's preparation: the serving world's
+/// The control of one epoch change's preparation: the serving epoch's
 /// baseline and whether the budgets stand halved.
 pub(crate) struct Throttling {
-    world: u64,
+    epoch: u64,
     /// The slowdown tolerated: a step may take `1 + slowdown` times its
     /// baseline.
     slowdown: f64,
@@ -124,15 +124,15 @@ pub(crate) struct Throttling {
 }
 
 impl Throttling {
-    /// The control of `world`, the serving epoch's, whose target began
+    /// The control of `epoch`, the serving epoch's, whose target began
     /// preparing at `preparing`, tolerating steps `1 + slowdown` times their
     /// baseline.
-    pub(crate) fn new(observer: &Observer, world: u64, slowdown: f64, preparing: Instant) -> Self {
+    pub(crate) fn new(observer: &Observer, epoch: u64, slowdown: f64, preparing: Instant) -> Self {
         let from = preparing.checked_sub(BASELINE).unwrap_or(preparing);
         Self {
-            world,
+            epoch,
             slowdown,
-            baseline: Baseline::of(observer, world, from, preparing),
+            baseline: Baseline::of(observer, epoch, from, preparing),
             read: preparing,
             halved: false,
             ratio: None,
@@ -147,7 +147,7 @@ impl Throttling {
     pub(crate) fn decide(&mut self, observer: &Observer) -> Option<(Decision, f64)> {
         let now = Instant::now();
         let mut slowest: Option<f64> = None;
-        observer.samples(self.world, self.read, now, |sample| {
+        observer.samples(self.epoch, self.read, now, |sample| {
             let Some((step_us, range)) = step(sample) else {
                 return;
             };
@@ -187,7 +187,7 @@ pub(crate) struct Throttled {
     pub(crate) restorations: u32,
 }
 
-/// The serving world's steps against their baseline while a successor
+/// The serving epoch's steps against their baseline while a successor
 /// prepares, as the control last read them, which `GET /admin/config`
 /// reports of the change in progress.
 #[derive(Debug, Default, Clone, Copy, PartialEq, serde::Serialize)]
@@ -283,7 +283,7 @@ pub(crate) async fn control(
                         ?decision,
                         ratio,
                         ?hosts,
-                        "the serving world's steps against their baseline changed the \
+                        "the serving epoch's steps against their baseline changed the \
                          transfers' budgets"
                     );
                 }
@@ -382,7 +382,7 @@ mod tests {
         (Arc::new(Recorded(std::sync::Mutex::new(decisions))), told)
     }
 
-    /// The serving world's slowed scheduler makes the leader halve the
+    /// The serving epoch's slowed scheduler makes the leader halve the
     /// budgets of the deployment's transfers through the engine, once each
     /// interval while it lasts; its recovery makes it restore them once.
     #[tokio::test(flavor = "multi_thread")]

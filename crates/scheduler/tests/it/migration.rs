@@ -536,7 +536,7 @@ fn fail_while_generating(trial: bool, fault: Fault, request: GenerationRequest) 
     }
 }
 
-/// A world on trial is not repaired: a lost worker stops its scheduler,
+/// An epoch on trial is not repaired: a lost worker stops its scheduler,
 /// which hands every request that resumes from its generated tokens back
 /// as migratable for a loss, after every token it delivered, and reports
 /// the loss as its first error.
@@ -570,9 +570,9 @@ fn a_scheduler_on_trial_hands_its_requests_back_when_its_workers_are_lost() {
 }
 
 /// An image-generating request leaves as migratable for a loss when the
-/// workers of a world on trial are lost, whatever it was computing, as a
+/// workers of an epoch on trial are lost, whatever it was computing, as a
 /// text request does: the daemon submits it again, with its tokens and
-/// images, to the previous world.
+/// images, to the previous epoch.
 #[test]
 fn a_scheduler_on_trial_hands_its_image_requests_back_when_its_workers_are_lost() {
     let mut image_request = request(1, Vec::new(), SamplingParams::default(), 100_000);
@@ -621,7 +621,7 @@ fn a_scheduler_on_trial_hands_its_image_requests_back_when_its_workers_are_lost(
     );
 }
 
-/// A worker fault fails a world on trial as a whole, and its first error
+/// A worker fault fails an epoch on trial as a whole, and its first error
 /// names the batch the fault struck and that batch's requests, which the
 /// rollback keeps for diagnosis.
 #[test]
@@ -640,12 +640,12 @@ fn a_worker_fault_on_trial_names_its_batch_and_requests() {
     assert!(failure.contains("of requests [1]"), "{failure}");
 }
 
-/// Non-finite logits fail a world on trial as a whole: the scheduler stops
+/// Non-finite logits fail an epoch on trial as a whole: the scheduler stops
 /// and hands the request back as migratable, naming the batch and its
 /// requests as its first error. Outside a trial they fail the request
 /// alone, as any failed call does, and the scheduler serves on.
 #[test]
-fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
+fn non_finite_logits_fail_a_epoch_on_trial_and_a_request_otherwise() {
     let Faulted {
         tokens,
         terminal,
@@ -696,7 +696,7 @@ fn non_finite_logits_fail_a_world_on_trial_and_a_request_otherwise() {
 /// A request a worker refuses as invalid input fails alone, on trial too:
 /// the calls of it already in flight then fail for want of the refused
 /// calls' products, and that failure is the refusal's, not a worker
-/// fault, so the world on trial serves on.
+/// fault, so the epoch on trial serves on.
 #[test]
 fn a_refused_request_fails_alone_on_trial_with_its_calls_in_flight() {
     let Faulted {

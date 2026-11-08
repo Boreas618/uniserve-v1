@@ -93,7 +93,7 @@ impl StorageServer {
                 },
                 generation: 1,
                 claim: Claim([0; 16]),
-                world: 0,
+                epoch: 0,
             },
         )
         .unwrap();

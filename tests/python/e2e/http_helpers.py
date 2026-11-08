@@ -23,7 +23,7 @@ from PIL import Image
 
 from uniserve_eval.transport.sse import iter_sse_events
 
-# The host KV cache a test's world holds unless the test sizes it itself.
+# The host KV cache a test's epoch holds unless the test sizes it itself.
 # Every test runs its own Storage Server, which budgets the host's available
 # storage as if it were the host's only one, so concurrent tests sized by
 # `kv_cache_config.host_ratio` alone would together commit more host storage
@@ -46,7 +46,7 @@ def scaled(seconds: float) -> float:
 
 
 # Attention on the first GPU and the routed experts on the second, exchanging
-# tokens through an expert transport: two worker groups of one expert world.
+# tokens through an expert transport: two worker groups of one expert epoch.
 DEDICATED_EXPERTS = """
 [[worker_groups]]
 id = "attention"

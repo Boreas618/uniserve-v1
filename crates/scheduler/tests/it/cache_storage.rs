@@ -1,6 +1,6 @@
 //! Giving back and restoring the KV cache's device storage against the GPU's
 //! storage ledger: a shrink keeps the segments the quota leaves the serving
-//! world beside everything else the ledger books and what a successor adds,
+//! epoch beside everything else the ledger books and what a successor adds,
 //! lets the requests that hold the tail it withdraws run to their end (or
 //! recomputes them past its bound, or once they cannot get a unit to
 //! continue) before the workers give the tail back,
@@ -37,8 +37,8 @@ const BLOCK: u32 = 16;
 const UNIT_BYTES: u64 = 250;
 const SEGMENT_BYTES: u64 = SEGMENT_UNITS as u64 * UNIT_BYTES;
 
-/// The serving world of the simulated workers.
-const WORLD: u64 = 1;
+/// The serving epoch of the simulated workers.
+const EPOCH: u64 = 1;
 
 /// What the simulated workers report and the hooks they ran.
 #[derive(Default)]
@@ -47,16 +47,16 @@ struct SimWorkers {
     quota: u64,
     /// What the worker's process books beside its weights and its cache.
     process_bytes: u64,
-    /// The serving world's captured graph allocations.
+    /// The serving epoch's captured graph allocations.
     graph_bytes: u64,
     /// What the Transfer Server books on the GPU.
     transfer_bytes: u64,
     /// What the Transfer Server's context takes on the GPU while held,
     /// which the ledger reports booked or not.
     transfer_context: u64,
-    /// What another world's process books on the GPU.
-    other_world_bytes: u64,
-    /// The serving world's weights on the GPU.
+    /// What another epoch's process books on the GPU.
+    other_epoch_bytes: u64,
+    /// The serving epoch's weights on the GPU.
     weights_bytes: u64,
     /// Free device bytes.
     free_bytes: u64,
@@ -99,7 +99,7 @@ impl SimWorkers {
     }
 
     /// The deployment's ledger of the worker's GPU: each held segment of the
-    /// serving world, its process, and the other world's and the Transfer
+    /// serving epoch, its process, and the other epoch's and the Transfer
     /// Server's bookings.
     fn ledger(&self) -> GpuLedger {
         let scope = Scope {
@@ -107,10 +107,10 @@ impl SimWorkers {
             group: "model".into(),
             rank: 0,
         };
-        let entry = |item, scope: Option<&Scope>, worlds: Vec<u64>, segment, bytes| LedgerEntry {
+        let entry = |item, scope: Option<&Scope>, epochs: Vec<u64>, segment, bytes| LedgerEntry {
             item,
             scope: scope.cloned(),
-            worlds,
+            epochs,
             segment,
             bytes,
         };
@@ -119,9 +119,9 @@ impl SimWorkers {
                 entry(
                     Item::CacheSegment,
                     Some(&scope),
-                    vec![WORLD],
+                    vec![EPOCH],
                     Some(Segment {
-                        world: WORLD,
+                        epoch: EPOCH,
                         ordinal,
                     }),
                     SEGMENT_BYTES,
@@ -131,14 +131,14 @@ impl SimWorkers {
         entries.push(entry(
             Item::Process,
             Some(&scope),
-            vec![WORLD],
+            vec![EPOCH],
             None,
             self.process_bytes,
         ));
         entries.push(entry(
             Item::GraphPool,
             Some(&scope),
-            vec![WORLD],
+            vec![EPOCH],
             None,
             self.graph_bytes,
         ));
@@ -152,14 +152,14 @@ impl SimWorkers {
         entries.push(entry(
             Item::Process,
             Some(&scope),
-            vec![WORLD + 1],
+            vec![EPOCH + 1],
             None,
-            self.other_world_bytes,
+            self.other_epoch_bytes,
         ));
         entries.push(entry(
             Item::Weights,
             Some(&scope),
-            vec![WORLD],
+            vec![EPOCH],
             None,
             self.weights_bytes,
         ));
@@ -225,7 +225,7 @@ impl Worker for Segmented {
             "uniserve.cache_storage" => serde_json::json!({
                 "segments": (0..SEGMENTS)
                     .map(|ordinal| ipc::CacheSegment {
-                        world: WORLD,
+                        epoch: EPOCH,
                         ordinal,
                         units: SEGMENT_UNITS,
                     })
@@ -240,7 +240,7 @@ impl Worker for Segmented {
                 "capturable": workers.capturable,
                 "host": "node0",
                 "scope": {"deployment": "model", "group": "model", "rank": 0},
-                "world": WORLD,
+                "epoch": EPOCH,
                 "ledger": workers.ledger(),
                 "host_storage": {"available": 1u64 << 40, "reserve": 10u64 << 30, "unallocated": 0},
             }),
@@ -288,7 +288,7 @@ impl Worker for Segmented {
                         group: "experts".into(),
                         rank: 0,
                     }),
-                    worlds: vec![WORLD],
+                    epochs: vec![EPOCH],
                     segment: None,
                     bytes: process,
                 }],
@@ -301,7 +301,7 @@ impl Worker for Segmented {
                     "free_bytes": free,
                     "host": "node1",
                     "scope": {"deployment": "model", "group": "experts", "rank": 0},
-                    "world": WORLD,
+                    "epoch": EPOCH,
                     "ledger": ledger,
                 })
                 .to_string(),
@@ -482,10 +482,10 @@ fn a_growth_creates_the_segments_the_ledgers_room_holds() {
     );
     assert_eq!(workers.lock().unwrap().held, 4);
 
-    // Another world's process of 1.5 segments' bytes leaves two and a half
+    // Another epoch's process of 1.5 segments' bytes leaves two and a half
     // segments' bytes of the quota: two segments grow back, although the
     // device has more free.
-    workers.lock().unwrap().other_world_bytes = 1_500;
+    workers.lock().unwrap().other_epoch_bytes = 1_500;
     assert!(resize(&handle, CacheChange::Grow).is_ok());
     assert!(
         workers
@@ -695,12 +695,12 @@ fn a_request_longer_than_the_cache_ends_at_the_length_the_cache_holds() {
     thread.join().unwrap();
 }
 
-/// A world parked for a successor that maps its cache lends it the
+/// An epoch parked for a successor that maps its cache lends it the
 /// segments past its first that hold no page a request in flight continues
 /// from, and allocates none of their units until a resume takes them back:
 /// a request that needs more than the units it kept waits for that resume.
 #[test]
-fn a_parked_world_lends_the_segments_no_request_in_flight_continues_from() {
+fn a_parked_epoch_lends_the_segments_no_request_in_flight_continues_from() {
     let (handle, _workers, thread) = start_split(SimWorkers::filling(0), Some(0));
     let mut running = handle.submit(request(1, 2, 10_000)).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -739,11 +739,11 @@ fn a_parked_world_lends_the_segments_no_request_in_flight_continues_from() {
     assert_eq!(parked.lent, lent);
 
     // The units kept: those past the sentinel less the lent ones. The waiting
-    // request asks for one page more than the world keeps, and its prompt
+    // request asks for one page more than the epoch keeps, and its prompt
     // shares no prefix with the request in flight: a request draws its token
     // before it needs a page for it, and a shared prefix is served from the
     // pages the request in flight publishes, so either would let it fit in
-    // the units the world kept and the case would test nothing.
+    // the units the epoch kept and the case would test nothing.
     let kept = SEGMENTS * SEGMENT_UNITS - 1 - lent.len() as u32 * SEGMENT_UNITS;
     let resumed = handle
         .resume(false)
@@ -756,7 +756,7 @@ fn a_parked_world_lends_the_segments_no_request_in_flight_continues_from() {
     thread::sleep(Duration::from_millis(500));
     assert!(
         std::iter::from_fn(|| waiting.try_recv().ok()).all(|event| !event.is_terminal()),
-        "the request ended within the units the world kept"
+        "the request ended within the units the epoch kept"
     );
     let reclaimed = handle
         .resume(true)

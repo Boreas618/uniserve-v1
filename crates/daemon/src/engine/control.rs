@@ -177,7 +177,7 @@ impl EngineControl {
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         let launch = self.launch(args, engine)?;
-        let world = launch.world;
+        let epoch = launch.epoch;
         let standby = launch.standby();
         let executable = launch
             .engine_config
@@ -241,7 +241,7 @@ impl EngineControl {
                             // connection.
                             Some(control),
                         )
-                        .map(|client| client.numbered(engine).in_world(world));
+                        .map(|client| client.numbered(engine).in_epoch(epoch));
                     }
                     Ok(wire::EngineState::Failed) => {
                         // The failed engine closes its workers and exits;
@@ -281,7 +281,7 @@ impl EngineControl {
         self.next_engine.load(Ordering::Relaxed)
     }
 
-    /// Joins an epoch switch's target, which executes `world`: the child the switch started dials
+    /// Joins an epoch switch's target, which executes `epoch`: the child the switch started dials
     /// this daemon's request socket, is welcomed, and states what it is. The switch commands it on
     /// the process link, so this connection carries only its requests from `Serve` on.
     ///
@@ -292,7 +292,7 @@ impl EngineControl {
     pub fn join_target(
         &self,
         engine: u64,
-        world: u64,
+        epoch: u64,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
         let (mut reader, mut writer, hello) = self.accept(engine, None)?;
@@ -336,12 +336,12 @@ impl EngineControl {
             let info = state.info.context("the engine reported no info")?;
             tracing::info!(engine, build = %hello.build, "the switch's target joined this daemon");
             return EngineClient::new(reader, writer, info.into(), known, stats, None)
-                .map(|client| client.numbered(engine).in_world(world));
+                .map(|client| client.numbered(engine).in_epoch(epoch));
         }
     }
 
     /// Takes over the engine `engine` a daemon this one replaced started,
-    /// which executes `world` and lives under `control`: the engine connects
+    /// which executes `epoch` and lives under `control`: the engine connects
     /// to this daemon's request socket, as the replaced daemon commanded it
     /// (`EngineClient::attach`), is welcomed, and reports itself ready.
     /// Later engines this control starts take the identities from
@@ -357,7 +357,7 @@ impl EngineControl {
         &self,
         engine: u64,
         next_engine: u64,
-        world: u64,
+        epoch: u64,
         mut control: Option<Connection>,
         stats: StatsSink,
     ) -> anyhow::Result<EngineClient> {
@@ -407,7 +407,7 @@ impl EngineControl {
                     stats,
                     control,
                 )
-                .map(|client| client.numbered(engine).in_world(world));
+                .map(|client| client.numbered(engine).in_epoch(epoch));
             }
         }
     }
@@ -445,7 +445,7 @@ impl EngineControl {
 
     /// Queries each daemon for its CUDA-visible devices with no compute or
     /// graphics owner. These ordinals can be assigned to a successor without
-    /// displacing another serving world.
+    /// displacing another serving epoch.
     pub fn available_devices(&self) -> anyhow::Result<BTreeMap<String, Vec<u32>>> {
         let (mut connection, nodes) = self.connect()?;
         let mut devices = BTreeMap::new();
@@ -563,9 +563,9 @@ impl EngineControl {
     /// Publishes one commit decision at every deployment node. Publication
     /// is atomic within each Storage Server and idempotent across retries;
     /// the daemon retains its commit decision until every node has answered.
-    pub fn publish_worlds(
+    pub fn publish_epochs(
         &self,
-        worlds: &[u64],
+        epochs: &[u64],
         pending: &mut Option<Vec<String>>,
     ) -> anyhow::Result<()> {
         let (mut connection, nodes) = self.connect()?;
@@ -575,26 +575,26 @@ impl EngineControl {
             connection.send(&process::Upstream {
                 kind: Some(upstream::Kind::Request(process::Request {
                     id: 1,
-                    kind: Some(request::Kind::PublishWorlds(process::PublishWorlds {
+                    kind: Some(request::Kind::PublishEpochs(process::PublishEpochs {
                         host: host.clone(),
                         deployment: self.deployment.clone(),
-                        worlds: worlds.to_vec(),
+                        epochs: epochs.to_vec(),
                     })),
                 })),
             })?;
             let answer: process::Downstream = connection
                 .recv(DAEMON_TIMEOUT)?
-                .context("the daemon did not report world publication")?;
+                .context("the daemon did not report epoch publication")?;
             let Some(downstream::Kind::Reply(answer)) = answer.kind else {
-                anyhow::bail!("the daemon did not answer world publication");
+                anyhow::bail!("the daemon did not answer epoch publication");
             };
             anyhow::ensure!(
                 answer.error.is_empty(),
-                "publishing worlds at {host}: {}",
+                "publishing epochs at {host}: {}",
                 answer.error
             );
             anyhow::ensure!(
-                matches!(answer.kind, Some(reply::Kind::WorldsPublished(_))),
+                matches!(answer.kind, Some(reply::Kind::EpochsPublished(_))),
                 "the daemon returned no publication result"
             );
             pending.remove(0);
@@ -698,15 +698,15 @@ impl EngineControl {
             "this node has no Program Server socket, so a main process could resolve no policy \
              module: it is not started without one",
         )?;
-        // A new world takes the identity of its first engine; an engine that
-        // replaces a lost one goes on with its world.
-        if args.world == 0 {
-            args.world = engine;
+        // A new epoch takes the identity of its first engine; an engine that
+        // replaces a lost one goes on with its epoch.
+        if args.epoch == 0 {
+            args.epoch = engine;
         }
         // One main process per node today, so it has no peer to accept: the
         // world is this rank alone. A deployment that starts more states their
         // addresses here, and the world grows with them (exec's rule: the
-        // world is its peers and itself).
+        // epoch is its peers and itself).
         let peers: Vec<String> = Vec::new();
         args.world_size = u32::try_from(peers.len() + 1).unwrap_or(u32::MAX);
         args.host = self.host.clone();
@@ -1782,14 +1782,14 @@ mod tests {
         options.worker_config.executable = own;
         let mut args =
             EngineArgs::new(options.engine_config().expect("the configuration resolves"));
-        args.world = 3;
+        args.epoch = 3;
 
         let start = control.epoch_start(&args, 9).unwrap();
         assert_eq!(start.build, Some(proto::BUILD.to_owned()));
         // The file is the adapter's to write for the process it starts; the
         // start carries its contents, with this process's generation.
         assert_eq!(start.launch.engine, 9);
-        assert_eq!(start.launch.world, 3);
+        assert_eq!(start.launch.epoch, 3);
         assert_eq!(start.launch.processes, "unix:/run/processes.sock");
         assert_eq!(start.launch.requests, control.request_address());
         assert_eq!(start.launch.queue_depth, 4);
@@ -1800,12 +1800,12 @@ mod tests {
         // not read the file as one.
         assert!(!start.launch.standby());
         args.predecessor = Some(wire::Predecessor {
-            world: 3,
+            epoch: 3,
             segments: Vec::new(),
         });
         let standby = control.epoch_start(&args, 10).unwrap();
         assert!(standby.launch.standby());
-        assert_eq!(standby.launch.world, 3);
+        assert_eq!(standby.launch.epoch, 3);
         args.predecessor = None;
 
         args.engine_config.worker.executable = std::path::PathBuf::from("/opt/uniserve-b");

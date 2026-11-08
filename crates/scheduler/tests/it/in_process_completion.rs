@@ -181,7 +181,7 @@ fn a_request_is_served_through_the_workers_own_batch_path() {
         batches.len()
     );
     // Every batch names the generation the step read, so the kernels it ran on
-    // are stated rather than assumed, and one step never mixes two worlds.
+    // are stated rather than assumed, and one step never mixes two epochs.
     assert!(
         batches.iter().all(|batch| batch.generation == GENERATION),
         "every batch of a step carries the generation that step read: {:?}",
@@ -201,7 +201,7 @@ fn a_request_is_served_through_the_workers_own_batch_path() {
 /// `admit` the other rule in the same row: the mechanism admits in the plan's
 /// order, and the first request it cannot place, and those after it, stay
 /// queued. `fcfs` names every queued request, so a refusal here would stop every
-/// world that queues more than it can run at once; a stop serves them in turn.
+/// epoch that queues more than it can run at once; a stop serves them in turn.
 #[test]
 fn a_request_that_does_not_fit_a_slot_waits_for_one() {
     let serving = Arc::new(crate::support::Serving::new(vec![crate::support::pool(
@@ -317,7 +317,7 @@ fn an_admitted_request_is_prefilled_on_the_next_step() {
     )
     .expect("the pool serves");
     install(&handle, &serving);
-    // The consumer is kept open for the case's length: a world whose client
+    // The consumer is kept open for the case's length: an epoch whose client
     // went away ends its requests, which is not what is under test.
     let _events = handle
         .submit(text_request(1, 8, 4))

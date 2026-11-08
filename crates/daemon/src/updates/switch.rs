@@ -5,7 +5,7 @@
 //! operator's commit or rollback; every phase ends on an acknowledgement a
 //! main process makes, never on an assumption about its progress. The
 //! participants and their wire are `proto::process`: a node's daemon starts
-//! and stops children (`Spawn`, `Stop`), claims a world's storage (`Claim`),
+//! and stops children (`Spawn`, `Stop`), claims an epoch's storage (`Claim`),
 //! commands a main process of one generation (`Command`), and the frontend is
 //! commanded down its own connection (`Serve`). The roster behind those verbs
 //! is the caller's; this module owns the order.
@@ -14,7 +14,7 @@
 //!
 //! 1. **Preparing.** Every node starts the target executable at the next
 //!    generation of the serving group and rank, then claims the target
-//!    world's storage for the node's scopes. The child parks on its storage
+//!    epoch's storage for the node's scopes. The child parks on its storage
 //!    and reports `Parked { generation }`; the daemon numbers nothing — the
 //!    child's number is authoritative and is the generation the switch
 //!    commands from then on. The child's own `Hello` states the build it
@@ -30,12 +30,12 @@
 //!    not a drop: the previous epoch must serve again, and it was parked at
 //!    the switchover rather than ended (§7.4).
 //! 4. **Probation**, recorded once the drain completed. The previous epoch is
-//!    kept as `update_config.previous_world` states: drained and alive, or its
+//!    kept as `update_config.previous_epoch` states: drained and alive, or its
 //!    processes stopped and its weights kept ([`Roster::keep_weights`]). A
 //!    failure the target reports, a target process that exits, or a threshold of
 //!    `update_config.rollback` ([`crate::updates::trial`]) reverts.
 //! 5. **Commit** records the target as serving once it acknowledges, stops
-//!    the old generation and purges and retires the previous world; **revert**
+//!    the old generation and purges and retires the previous epoch; **revert**
 //!    drains the target (a target that failed is stopped instead), returns the
 //!    previous epoch to serving once every target ended its requests, serves
 //!    the frontend only once every host serves, stops the target generation,
@@ -45,7 +45,7 @@
 //!    switch names it ([`Switch::relaunch_due`]) and is told it serves
 //!    ([`Switch::serving`]).
 //!
-//! A world dropped before the switchover is kept in [`Switch::discarded`] and
+//! An epoch dropped before the switchover is kept in [`Switch::discarded`] and
 //! passed in the next claim's `retire`: storage ends only through a claim,
 //! and nothing else would ever retire a target that never served.
 
@@ -56,7 +56,7 @@ use std::time::{Duration, Instant};
 use proto::process::{self, Report, Spawn};
 
 use crate::epoch::{EpochRecord, Epochs, Failure, FilledPrograms, Status, Update};
-use crate::options::PreviousWorld;
+use crate::options::PreviousEpoch;
 
 /// A node of the deployment the switch starts main processes on.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -133,19 +133,19 @@ pub(crate) struct KeptWeights {
     pub(crate) refused: Option<String>,
 }
 
-/// What the switch asks of the nodes: claim a world's storage, start and
+/// What the switch asks of the nodes: claim an epoch's storage, start and
 /// stop main processes, command one generation's main process, command the
 /// frontend, and take the events that arrive. The daemon's supervision is
 /// its only real implementation; the crate's tests drive a scripted one.
 pub(crate) trait Roster {
-    /// Claims `world`'s storage on `host` for `scopes`, retiring `retire`'s
-    /// worlds, and holds the claim when it returns `Ok`: §7.4 requires it
+    /// Claims `epoch`'s storage on `host` for `scopes`, retiring `retire`'s
+    /// epochs, and holds the claim when it returns `Ok`: §7.4 requires it
     /// held before the target maps storage, so it is synchronous and has no
     /// matching report. `Err` says the node refused and holds nothing.
     fn claim(
         &mut self,
         host: &str,
-        world: u64,
+        epoch: u64,
         scopes: &[process::Scope],
         retire: &[u64],
     ) -> Result<(), String>;
@@ -177,16 +177,16 @@ pub(crate) trait Roster {
     /// generation travels inside the command, not in `generation`. The switch
     /// learns the host serves through `serving`.
     fn resume(&mut self, host: &str, generation: u64, reason: &str);
-    /// Retains `world`'s weights on `host` once its processes exited, and
+    /// Retains `epoch`'s weights on `host` once its processes exited, and
     /// releases the rest of its exclusive storage; with `to_host` the weights
     /// it alone retains move to host storage. Answers what the node did.
     fn keep_weights(
         &mut self,
         host: &str,
-        world: u64,
+        epoch: u64,
         to_host: bool,
     ) -> Result<KeptWeights, String> {
-        let _ = (host, world, to_host);
+        let _ = (host, epoch, to_host);
         Ok(KeptWeights::default())
     }
     /// Takes the events that arrived since the last call.
@@ -199,11 +199,11 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
     fn claim(
         &mut self,
         host: &str,
-        world: u64,
+        epoch: u64,
         scopes: &[process::Scope],
         retire: &[u64],
     ) -> Result<(), String> {
-        (**self).claim(host, world, scopes, retire)
+        (**self).claim(host, epoch, scopes, retire)
     }
 
     fn spawn(
@@ -237,10 +237,10 @@ impl<T: Roster + ?Sized> Roster for Box<T> {
     fn keep_weights(
         &mut self,
         host: &str,
-        world: u64,
+        epoch: u64,
         to_host: bool,
     ) -> Result<KeptWeights, String> {
-        (**self).keep_weights(host, world, to_host)
+        (**self).keep_weights(host, epoch, to_host)
     }
 
     fn events(&mut self) -> Vec<Event> {
@@ -297,10 +297,10 @@ pub(crate) struct Switch {
     awaiting_programs: BTreeSet<String>,
     /// The previous epoch's number, which `Serve` and `Drain` name.
     previous: u64,
-    /// The world the previous epoch executes, whose storage a claim retires
-    /// or keeps: the epoch a deployment starts with is number 0, its world the
+    /// The epoch the previous epoch executes, whose storage a claim retires
+    /// or keeps: the epoch a deployment starts with is number 0, its epoch the
     /// first engine's.
-    previous_world: u64,
+    previous_epoch: u64,
     /// The launch generation the target's children are started at.
     ///
     /// The epoch layer chooses it and owes the switch one property: it is
@@ -329,7 +329,7 @@ pub(crate) struct Switch {
     /// The request socket the frontend submits to after the switchover.
     requests: String,
     phase: Phase,
-    /// Worlds whose storage must be retired by the next claim.
+    /// Epochs whose storage must be retired by the next claim.
     retire: Vec<u64>,
     /// The hosts whose target main process was told to park: a command can
     /// only be addressed to a generation that has connected, so each park is
@@ -364,11 +364,11 @@ pub(crate) struct Switch {
     revert_asked: Option<Failure>,
     pause: Option<Duration>,
     /// What the previous epoch keeps through the trial
-    /// (`update_config.previous_world`).
-    keeps: PreviousWorld,
+    /// (`update_config.previous_epoch`).
+    keeps: PreviousEpoch,
     /// What it keeps as the trial goes: `keeps`, or `weights` once a node
     /// refused to move the weights to host storage.
-    kept: PreviousWorld,
+    kept: PreviousEpoch,
     /// Each node's reason for keeping the weights on its GPUs.
     host_refused: Vec<String>,
     /// The bytes of weights the nodes moved to host storage.
@@ -387,18 +387,18 @@ pub(crate) struct Switch {
 }
 
 impl Switch {
-    /// A switch of epoch `previous` of world `previous_world` (launch generation
+    /// A switch of epoch `previous` of epoch `previous_epoch` (launch generation
     /// `previous_generation`) to epoch `target`, whose record is `record`, with the target's
     /// children started at `spawn_generation` — above every live generation
     /// of the group and rank, the serving epoch's standby included —
-    /// retiring `discarded`, the worlds an earlier switch dropped.
+    /// retiring `discarded`, the epochs an earlier switch dropped.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         epochs: Arc<Epochs>,
         update: Update,
         target: u64,
         record: EpochRecord,
-        (previous, previous_world): (u64, u64),
+        (previous, previous_epoch): (u64, u64),
         previous_generation: u64,
         spawn_generation: u64,
         group: String,
@@ -406,7 +406,7 @@ impl Switch {
         start: Start,
         requests: String,
         discarded: Vec<u64>,
-        keeps: PreviousWorld,
+        keeps: PreviousEpoch,
     ) -> Self {
         let mut record = record;
         record.status = Status::Precopy;
@@ -416,7 +416,7 @@ impl Switch {
             update,
             target,
             previous,
-            previous_world,
+            previous_epoch,
             spawn_generation,
             spawned: Vec::new(),
             previous_generation,
@@ -490,7 +490,7 @@ impl Switch {
         self.epochs.record(self.target, self.record.clone());
     }
 
-    /// Worlds this switch dropped whose storage a later claim must retire:
+    /// Epochs this switch dropped whose storage a later claim must retire:
     /// the update layer keeps them for the next switch's `start`.
     pub(crate) fn discarded(&self) -> &[u64] {
         &self.retire
@@ -513,7 +513,7 @@ impl Switch {
 
     /// What the previous epoch is kept as through the trial: what the update
     /// asked for, or `weights` where a node could not move them to host storage.
-    pub(crate) fn previous_kept(&self) -> PreviousWorld {
+    pub(crate) fn previous_kept(&self) -> PreviousEpoch {
         self.kept
     }
 
@@ -561,7 +561,7 @@ impl Switch {
     }
 
     /// Starts the precopy: every node starts the target's main process, then
-    /// claims the target world's storage before the child maps it.
+    /// claims the target epoch's storage before the child maps it.
     pub(crate) fn start(&mut self, roster: &mut impl Roster) {
         for node in &self.nodes {
             roster.adopt(&node.host, &self.group, node.rank, self.previous_generation);
@@ -598,7 +598,7 @@ impl Switch {
         let retire = std::mem::take(&mut self.retire);
         for node in &self.nodes {
             // A claim retires storage on the node it is made on, so every
-            // node is told the same worlds.
+            // node is told the same epochs.
             if let Err(reason) = roster.claim(&node.host, self.target, &self.scopes(node), &retire)
             {
                 self.retire = retire;
@@ -787,7 +787,7 @@ impl Switch {
     }
 
     /// Drops the target before the frontend ever served it: its processes
-    /// stop, its world is retired by the next claim, and the previous epoch
+    /// stop, its epoch is retired by the next claim, and the previous epoch
     /// went on serving untouched.
     fn failed(&mut self, roster: &mut impl Roster, failure: Failure) {
         self.failure = Some(failure);
@@ -891,7 +891,7 @@ impl Switch {
         let generation = self.target_generation();
         for node in &self.nodes {
             roster.stop(&node.host, &self.group, Some(generation));
-            let _ = roster.claim(&node.host, self.previous_world, &self.scopes(node), &retire);
+            let _ = roster.claim(&node.host, self.previous_epoch, &self.scopes(node), &retire);
         }
         self.record.status = Status::Purged;
         self.epochs.record(self.target, self.record.clone());
@@ -1033,7 +1033,7 @@ impl Switch {
                     self.drained.insert(host);
                     self.progress(roster);
                 }
-                // The trial stopped it: `update_config.previous_world` keeps its
+                // The trial stopped it: `update_config.previous_epoch` keeps its
                 // weights alone, and its exit is what lets the node release the
                 // rest of its storage. A commit retires that storage anyway, and
                 // a revert under way starts the epoch on it.
@@ -1089,18 +1089,18 @@ impl Switch {
         {
             return;
         }
-        let to_host = self.keeps == PreviousWorld::Host;
-        match roster.keep_weights(host, self.previous_world, to_host) {
+        let to_host = self.keeps == PreviousEpoch::Host;
+        match roster.keep_weights(host, self.previous_epoch, to_host) {
             Ok(kept) => {
                 self.moved_bytes += kept.moved_bytes;
                 if let Some(refused) = kept.refused {
-                    self.kept = PreviousWorld::Weights;
+                    self.kept = PreviousEpoch::Weights;
                     self.host_refused.push(format!("{host}: {refused}"));
                 }
             }
             Err(reason) => {
                 if to_host {
-                    self.kept = PreviousWorld::Weights;
+                    self.kept = PreviousEpoch::Weights;
                 }
                 self.host_refused.push(format!("{host}: {reason}"));
             }
@@ -1292,8 +1292,8 @@ impl Switch {
                 }
                 // What the trial keeps of the previous epoch: a process that
                 // serves nothing holds the storage the target could use, and
-                // `previous_world` says whether a revert is worth that storage.
-                if self.keeps != PreviousWorld::Parked {
+                // `previous_epoch` says whether a revert is worth that storage.
+                if self.keeps != PreviousEpoch::Parked {
                     self.previous_stopped = true;
                     for node in &self.nodes {
                         roster.stop(&node.host, &self.group, Some(self.previous_generation));
@@ -1306,7 +1306,7 @@ impl Switch {
             Phase::Committing if hosts.is_subset(&self.committed) => {
                 self.record.status = Status::Serving;
                 self.epochs.record(self.target, self.record.clone());
-                let retire = vec![self.previous_world];
+                let retire = vec![self.previous_epoch];
                 for node in &self.nodes {
                     // Addressed per node for the same reason `Promote` is.
                     let generation = self
@@ -1320,7 +1320,7 @@ impl Switch {
                             generation: self.previous_generation,
                         })),
                     );
-                    // The previous world's storage ends on the node that
+                    // The previous epoch's storage ends on the node that
                     // served it while the target keeps its own.
                     let _ = roster.claim(&node.host, self.target, &self.scopes(node), &retire);
                 }
@@ -1363,7 +1363,7 @@ mod tests {
         scripted: Vec<Event>,
         fail_spawn: Option<String>,
         fail_claim: Option<String>,
-        /// The retentions the switch asked for: host, world and `to_host`.
+        /// The retentions the switch asked for: host, epoch and `to_host`.
         kept: Vec<(String, u64, bool)>,
         /// Why every node refuses to move weights to host storage.
         refuse_host: Option<String>,
@@ -1397,7 +1397,7 @@ mod tests {
         fn claim(
             &mut self,
             host: &str,
-            world: u64,
+            epoch: u64,
             scopes: &[process::Scope],
             retire: &[u64],
         ) -> Result<(), String> {
@@ -1405,7 +1405,7 @@ mod tests {
                 return Err(reason.clone());
             }
             self.claims
-                .push((host.to_owned(), world, scopes.to_vec(), retire.to_vec()));
+                .push((host.to_owned(), epoch, scopes.to_vec(), retire.to_vec()));
             Ok(())
         }
 
@@ -1450,10 +1450,10 @@ mod tests {
         fn keep_weights(
             &mut self,
             host: &str,
-            world: u64,
+            epoch: u64,
             to_host: bool,
         ) -> Result<KeptWeights, String> {
-            self.kept.push((host.to_owned(), world, to_host));
+            self.kept.push((host.to_owned(), epoch, to_host));
             Ok(KeptWeights {
                 refused: self.refuse_host.clone(),
                 ..KeptWeights::default()
@@ -1481,7 +1481,7 @@ mod tests {
             status: Status::Serving,
             generation: None,
             // The record is kept under epsilon 12 in this test's switch, and
-            // `apply` fills the world allocation with the epoch number.
+            // `apply` fills the epoch allocation with the epoch number.
         }
     }
 
@@ -1516,7 +1516,7 @@ mod tests {
                 devices: vec![0],
                 group: "engine".to_owned(),
                 rank: 0,
-                world: 11,
+                epoch: 11,
                 scheduler_node: true,
                 peers: Vec::new(),
                 watchdog_timeout_s: None,
@@ -1552,7 +1552,7 @@ mod tests {
             start,
             "unix:/run/requests.sock".to_owned(),
             Vec::new(),
-            PreviousWorld::Parked,
+            PreviousEpoch::Parked,
         );
         (epochs, switch)
     }
@@ -1704,8 +1704,8 @@ mod tests {
             );
         }
         assert_eq!(roster.claims.len(), 2);
-        for (index, (_, world, scopes, retire)) in roster.claims.iter().enumerate() {
-            assert_eq!(*world, 12);
+        for (index, (_, epoch, scopes, retire)) in roster.claims.iter().enumerate() {
+            assert_eq!(*epoch, 12);
             assert!(retire.is_empty());
             assert_eq!(
                 scopes,
@@ -1976,11 +1976,11 @@ mod tests {
         );
     }
 
-    /// A world an earlier switch dropped is retired by the next switch's
+    /// An epoch an earlier switch dropped is retired by the next switch's
     /// claim on every node: a claim retires storage on the node it is made
     /// on, so passing it to one node would leave the others holding it.
     #[test]
-    fn a_discarded_world_is_retired_on_every_node() {
+    fn a_discarded_epoch_is_retired_on_every_node() {
         let (epochs, mut switch) = setup();
         let mut roster = Fake::default();
         switch.start(&mut roster);
@@ -2013,7 +2013,7 @@ mod tests {
             start(),
             "unix:/run/requests.sock".to_owned(),
             discarded,
-            PreviousWorld::Parked,
+            PreviousEpoch::Parked,
         );
         let mut roster = Fake::default();
         next.start(&mut roster);
@@ -2022,11 +2022,11 @@ mod tests {
             roster
                 .claims
                 .iter()
-                .all(|(_, world, _, retire)| *world == 13 && retire == &[12])
+                .all(|(_, epoch, _, retire)| *epoch == 13 && retire == &[12])
         );
     }
 
-    /// A failed precopy drops the target, retires its world through the next
+    /// A failed precopy drops the target, retires its epoch through the next
     /// claim, and leaves the serving epoch alone: the update reverts with no
     /// failure, so applying it again needs no `force`.
     #[test]
@@ -2187,7 +2187,7 @@ mod tests {
             start(),
             "unix:/run/requests.sock".to_owned(),
             Vec::new(),
-            PreviousWorld::Parked,
+            PreviousEpoch::Parked,
         );
         let mut roster = Fake::default();
         switch.start(&mut roster);
@@ -2433,7 +2433,7 @@ mod tests {
             roster
                 .claims
                 .iter()
-                .all(|(_, world, _, retire)| *world == 11 && retire == &[12])
+                .all(|(_, epoch, _, retire)| *epoch == 11 && retire == &[12])
         );
         assert_eq!(
             switch
@@ -2489,7 +2489,7 @@ mod tests {
         serve_target(&mut roster, &mut switch);
         roster.commands.clear();
         roster.serves.clear();
-        // The precopy spawned the target and claimed its world on each node;
+        // The precopy spawned the target and claimed its epoch on each node;
         // only what the revert does is asserted below.
         roster.spawns.clear();
         roster.claims.clear();
@@ -2572,8 +2572,8 @@ mod tests {
             roster
                 .claims
                 .iter()
-                .any(|(_, world, _, retire)| *world == 11 && retire == &[12]),
-            "the previous world is claimed back, retiring the target's"
+                .any(|(_, epoch, _, retire)| *epoch == 11 && retire == &[12]),
+            "the previous epoch is claimed back, retiring the target's"
         );
         assert!(
             roster
@@ -2590,7 +2590,7 @@ mod tests {
             roster
                 .claims
                 .iter()
-                .all(|(_, world, _, retire)| *world == 11 && retire == &[12])
+                .all(|(_, epoch, _, retire)| *epoch == 11 && retire == &[12])
         );
     }
 
@@ -2683,7 +2683,7 @@ mod tests {
     }
 
     /// A switch of `keeps`, its target serving on trial.
-    fn on_trial(keeps: PreviousWorld) -> (Switch, Fake) {
+    fn on_trial(keeps: PreviousEpoch) -> (Switch, Fake) {
         let epochs = Arc::new(Epochs::new());
         let mut switch = Switch::new(
             Arc::clone(&epochs),
@@ -2711,8 +2711,8 @@ mod tests {
     /// `parked` keeps the drained processes through the trial; `weights` stops
     /// them, and once each exited its node keeps the weights alone.
     #[test]
-    fn previous_world_says_what_the_trial_keeps() {
-        let (switch, roster) = on_trial(PreviousWorld::Parked);
+    fn previous_epoch_says_what_the_trial_keeps() {
+        let (switch, roster) = on_trial(PreviousEpoch::Parked);
         assert_eq!(switch.phase(), Phase::Probation);
         assert!(
             !roster.stops.iter().any(|stop| stop.2 == Some(5)),
@@ -2720,7 +2720,7 @@ mod tests {
         );
         assert!(roster.kept.is_empty());
 
-        let (mut switch, mut roster) = on_trial(PreviousWorld::Weights);
+        let (mut switch, mut roster) = on_trial(PreviousEpoch::Weights);
         assert_eq!(
             roster.stops.iter().filter(|stop| stop.2 == Some(5)).count(),
             2,
@@ -2734,19 +2734,19 @@ mod tests {
             vec![("n0".to_owned(), 11, false), ("n1".to_owned(), 11, false)]
         );
         assert!(!switch.promotion_due(), "the exit is the trial's own");
-        assert_eq!(switch.previous_kept(), PreviousWorld::Weights);
+        assert_eq!(switch.previous_kept(), PreviousEpoch::Weights);
     }
 
     /// `host` asks for host storage, and a node that refuses keeps the weights
     /// on its GPUs: the status reports `weights`, with its reason.
     #[test]
     fn a_node_that_refuses_host_storage_keeps_the_weights() {
-        let (mut switch, mut roster) = on_trial(PreviousWorld::Host);
+        let (mut switch, mut roster) = on_trial(PreviousEpoch::Host);
         roster.refuse_host = Some("no Transfer Server".to_owned());
         roster.scripted = vec![exit_event("n0", 5), exit_event("n1", 5)];
         switch.advance(&mut roster);
         assert_eq!(roster.kept[0], ("n0".to_owned(), 11, true));
-        assert_eq!(switch.previous_kept(), PreviousWorld::Weights);
+        assert_eq!(switch.previous_kept(), PreviousEpoch::Weights);
         assert_eq!(
             switch.host_refused(),
             ["n0: no Transfer Server", "n1: no Transfer Server"]
@@ -2758,7 +2758,7 @@ mod tests {
     /// epoch serves, at the generation it started.
     #[test]
     fn a_revert_starts_an_epoch_whose_processes_exited_again() {
-        let (mut switch, mut roster) = on_trial(PreviousWorld::Weights);
+        let (mut switch, mut roster) = on_trial(PreviousEpoch::Weights);
         roster.scripted = vec![exit_event("n0", 5), exit_event("n1", 5)];
         switch.advance(&mut roster);
         roster.stops.clear();
@@ -2895,12 +2895,12 @@ mod tests {
             roster.commands_of(6, |kind| matches!(kind, process::command::Kind::Purge(_))),
             2
         );
-        assert_eq!(roster.claims.len(), 2, "each node retires the old world");
+        assert_eq!(roster.claims.len(), 2, "each node retires the old epoch");
         assert!(
             roster
                 .claims
                 .iter()
-                .all(|(_, world, _, retire)| *world == 12 && retire == &[11])
+                .all(|(_, epoch, _, retire)| *epoch == 12 && retire == &[11])
         );
     }
 
@@ -2951,7 +2951,7 @@ mod tests {
             start(),
             "unix:/run/requests.sock".to_owned(),
             Vec::new(),
-            PreviousWorld::Parked,
+            PreviousEpoch::Parked,
         );
         let mut roster = Fake::default();
         switch.start(&mut roster);
@@ -2982,7 +2982,7 @@ mod tests {
             roster.serves.is_empty(),
             "the promotion path serves, not the switch"
         );
-        assert_eq!(switch.discarded(), &[12], "the target world still retires");
+        assert_eq!(switch.discarded(), &[12], "the target epoch still retires");
     }
 
     /// A claim the daemon refuses, or a spawn it cannot start, drops the
@@ -2991,7 +2991,7 @@ mod tests {
     fn a_refused_claim_or_spawn_drops_the_target() {
         let (_epochs, mut switch) = setup();
         let mut roster = Fake {
-            fail_claim: Some("the world is not feasible".to_owned()),
+            fail_claim: Some("the epoch is not feasible".to_owned()),
             ..Fake::default()
         };
         switch.start(&mut roster);

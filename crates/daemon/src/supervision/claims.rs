@@ -2,26 +2,21 @@
 //!
 //! An engine asks every node's daemon to claim the deployment before a worker
 //! starts there (`Claim`): the daemon starts the node's Storage Server when
-//! it has none, claims the scopes the engine's world places on the node, and
+//! it has none, claims the scopes the engine's epoch places on the node, and
 //! holds the claiming connection for as long as it runs. The claim therefore
-//! outlives every engine and every world: an engine that succeeds another
-//! claims the scopes of its own world under the same claim, and its workers
-//! hold the same token as the running world's, so neither world's storage is
-//! touched by the other's claim. A claim names the worlds whose storage on
-//! the node ends (`retire`): the world a commit superseded, or the world a
+//! outlives every engine and every epoch: an engine that succeeds another
+//! claims the scopes of its own epoch under the same claim, and its workers
+//! hold the same token as the running epoch's, so neither epoch's storage is
+//! touched by the other's claim. A claim names the epochs whose storage on
+//! the node ends (`retire`): the epoch a commit superseded, or the epoch a
 //! rollback discarded.
 //!
-//! A previous world kept in host storage on trial (`KeepWeights` with
+//! A previous epoch kept in host storage on trial (`KeepWeights` with
 //! `to_host`) has its weights moved there by the server's Transfer Server
-//! (`Request::Offload`). Every claim of a world returns that world's weights
+//! (`Request::Offload`). Every claim of an epoch returns that epoch's weights
 //! to the GPUs they left before it is answered (`Request::Restore`), after
-//! the worlds it retires released their storage: a world started again at a
+//! the epochs it retires released their storage: an epoch started again at a
 //! rollback claims, and its workers then map its weights where they were.
-//!
-//! A server of an earlier protocol than this build's is restarted with this
-//! daemon's executable before the deployment is claimed, or taken over by a
-//! hot restart ([`restart_earlier`]): the successor goes on with every
-//! connection and every allocation it holds.
 
 use std::collections::{BTreeMap, HashMap};
 use std::os::fd::OwnedFd;
@@ -42,8 +37,8 @@ const RESTART_POLL: Duration = Duration::from_millis(50);
 struct Held {
     /// The connection that holds the claim; the claim ends with it.
     client: storage::Client,
-    /// The scopes each world claimed, sorted.
-    worlds: BTreeMap<u64, Vec<(String, u32)>>,
+    /// The scopes each epoch claimed, sorted.
+    epochs: BTreeMap<u64, Vec<(String, u32)>>,
     claimed: Claimed,
 }
 
@@ -74,10 +69,10 @@ impl ClaimHolder {
         }
     }
 
-    /// Claims `claim`'s deployment for its world at this node's Storage
+    /// Claims `claim`'s deployment for its epoch at this node's Storage
     /// Server, starting the server when the node has none and restarting it
     /// when it speaks an earlier protocol, or answers the claim held when the
-    /// world claimed the same scopes and retires nothing.
+    /// epoch claimed the same scopes and retires nothing.
     ///
     /// # Errors
     ///
@@ -103,27 +98,27 @@ impl ClaimHolder {
                 .collect::<Vec<_>>()
         };
         if let Some(held) = self.held.get_mut(&claim.deployment) {
-            if claim.retire.is_empty() && held.worlds.get(&claim.world) == Some(&scopes) {
-                restore(&mut held.client, &claim.deployment, claim.world)?;
+            if claim.retire.is_empty() && held.epochs.get(&claim.epoch) == Some(&scopes) {
+                restore(&mut held.client, &claim.deployment, claim.epoch)?;
                 return Ok(held.claimed.clone());
             }
             held.client
                 .claim(
-                    claim.world,
+                    claim.epoch,
                     as_scopes(&claim.deployment),
                     claim.retire.clone(),
                 )
                 .with_context(|| format!("claiming deployment {}", claim.deployment))?;
-            for world in &claim.retire {
-                held.worlds.remove(world);
+            for epoch in &claim.retire {
+                held.epochs.remove(epoch);
             }
-            restore(&mut held.client, &claim.deployment, claim.world)?;
-            held.worlds.insert(claim.world, scopes);
+            restore(&mut held.client, &claim.deployment, claim.epoch)?;
+            held.epochs.insert(claim.epoch, scopes);
             tracing::info!(
                 deployment = %claim.deployment,
-                world = claim.world,
+                epoch = claim.epoch,
                 retired = ?claim.retire,
-                "claimed the deployment's storage for a world"
+                "claimed the deployment's storage for an epoch"
             );
             return Ok(held.claimed.clone());
         }
@@ -135,25 +130,24 @@ impl ClaimHolder {
         }
         storage::socket::ensure(&self.executable, &socket, START_TIMEOUT, &arguments)
             .context("starting this node's storage server")?;
-        restart_earlier(&self.executable, &socket)?;
         let mut client = storage::Client::connect(
             &socket,
             storage::Role::Head {
                 deployment: claim.deployment.clone(),
-                // The claim holds every world; it reads and publishes no
+                // The claim holds every epoch; it reads and publishes no
                 // page.
-                world: 0,
+                epoch: 0,
             },
         )
         .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
         let token = client
             .claim(
-                claim.world,
+                claim.epoch,
                 as_scopes(&claim.deployment),
                 claim.retire.clone(),
             )
             .with_context(|| format!("claiming deployment {}", claim.deployment))?;
-        restore(&mut client, &claim.deployment, claim.world)?;
+        restore(&mut client, &claim.deployment, claim.epoch)?;
         // A server another process started may accept no other node.
         let tcp = match client
             .call(&storage::protocol::Request::Endpoint, &[])?
@@ -172,23 +166,23 @@ impl ClaimHolder {
             claim: token.0.to_vec(),
             tcp,
         };
-        tracing::info!(deployment = %claim.deployment, world = claim.world, scopes = scopes.len(), "claimed the deployment's storage");
+        tracing::info!(deployment = %claim.deployment, epoch = claim.epoch, scopes = scopes.len(), "claimed the deployment's storage");
         self.held.insert(
             claim.deployment.clone(),
             Held {
                 client,
-                worlds: BTreeMap::from([(claim.world, scopes)]),
+                epochs: BTreeMap::from([(claim.epoch, scopes)]),
                 claimed: claimed.clone(),
             },
         );
         Ok(claimed)
     }
 
-    /// Publishes committed worlds through this node's deployment claim.
-    pub(crate) fn publish_worlds(
+    /// Publishes committed epochs through this node's deployment claim.
+    pub(crate) fn publish_epochs(
         &mut self,
         deployment: &str,
-        worlds: &[u64],
+        epochs: &[u64],
     ) -> anyhow::Result<()> {
         use anyhow::Context as _;
 
@@ -196,17 +190,17 @@ impl ClaimHolder {
             .get_mut(deployment)
             .with_context(|| format!("this node holds no claim of deployment {deployment}"))?
             .client
-            .publish_worlds(worlds.to_vec())?;
+            .publish_epochs(epochs.to_vec())?;
         Ok(())
     }
 
-    /// Has this node's Storage Server keep the weights alone of `worlds` of
+    /// Has this node's Storage Server keep the weights alone of `epochs` of
     /// `deployment` (`Request::KeepWeights`), over the claim this daemon
     /// holds, and with `to_host` move them to host storage
     /// (`Request::Offload`). Returns how many storages it released, the
     /// bytes it moved, and why it kept the weights on the GPUs when the
     /// server refused or failed the move: the weights then stay where they
-    /// are, as a previous world kept as its weights keeps them.
+    /// are, as a previous epoch kept as its weights keeps them.
     ///
     /// # Errors
     ///
@@ -215,7 +209,7 @@ impl ClaimHolder {
     pub(crate) fn keep_weights(
         &mut self,
         deployment: &str,
-        worlds: &[u64],
+        epochs: &[u64],
         to_host: bool,
         cache_keys: &[Vec<u8>],
     ) -> anyhow::Result<WeightsKept> {
@@ -228,7 +222,7 @@ impl ClaimHolder {
         let released = held
             .client
             .keep_weights(
-                worlds.to_vec(),
+                epochs.to_vec(),
                 cache_keys
                     .iter()
                     .map(|key| {
@@ -240,13 +234,13 @@ impl ClaimHolder {
                     .collect::<anyhow::Result<_>>()?,
             )
             .with_context(|| {
-                format!("retaining weights and rollback cache of worlds {worlds:?}")
+                format!("retaining weights and rollback cache of epochs {epochs:?}")
             })?;
         tracing::info!(
             deployment,
-            ?worlds,
+            ?epochs,
             released,
-            "worlds keep their weights alone"
+            "epochs keep their weights alone"
         );
         let mut kept = WeightsKept {
             released,
@@ -255,22 +249,22 @@ impl ClaimHolder {
         if !to_host {
             return Ok(kept);
         }
-        for &world in worlds {
-            match held.client.move_weights(world, true) {
+        for &epoch in epochs {
+            match held.client.move_weights(epoch, true) {
                 Ok((storages, bytes)) => {
                     kept.moved_bytes += bytes;
                     tracing::info!(
                         deployment,
-                        world,
+                        epoch,
                         storages,
                         bytes,
-                        "a world's weights moved to host storage"
+                        "an epoch's weights moved to host storage"
                     );
                 }
-                // A world that cannot is kept as its weights on the GPUs.
+                // An epoch that cannot is kept as its weights on the GPUs.
                 Err(error) => {
-                    tracing::warn!(deployment, world, %error, "a world's weights stay on the GPUs");
-                    kept.refused = format!("world {world}: {error}");
+                    tracing::warn!(deployment, epoch, %error, "an epoch's weights stay on the GPUs");
+                    kept.refused = format!("epoch {epoch}: {error}");
                     break;
                 }
             }
@@ -292,7 +286,7 @@ impl ClaimHolder {
         use anyhow::Context as _;
 
         // A node that holds no claim of the deployment runs none of its
-        // transfers: no world of it has claimed the node yet.
+        // transfers: no epoch of it has claimed the node yet.
         let Some(held) = self.held.get_mut(deployment) else {
             tracing::debug!(
                 deployment,
@@ -347,69 +341,22 @@ impl ClaimHolder {
     }
 }
 
-/// Restarts the server at `socket` with `executable` (this build's) when it
-/// speaks an earlier protocol than this build, which needs this build's,
-/// and waits until the successor serves: it goes on with every connection
-/// and allocation, so no deployment of the host notices. A daemon of this
-/// build calls it before it claims a deployment, and before it takes a
-/// deployment over from a daemon of an earlier build, so that every update
-/// replaces the Storage Server before the daemon and the daemon before the
-/// world (`specs/online-operations.md` §4.4).
-pub(crate) fn restart_earlier(
-    executable: &std::path::Path,
-    socket: &std::path::Path,
-) -> anyhow::Result<()> {
-    use anyhow::Context as _;
-
-    let mut operator = storage::Client::connect_operator(socket)
-        .with_context(|| format!("connecting to the storage server at {}", socket.display()))?;
-    if operator.version() >= storage::protocol::VERSION {
-        return Ok(());
-    }
-    let earlier = operator.version();
-    let pid = operator
-        .restart(Some(executable.to_string_lossy().into_owned()))
-        .context("restarting a storage server of an earlier protocol")?;
-    tracing::info!(
-        earlier,
-        version = storage::protocol::VERSION,
-        pid,
-        "restarting the storage server, which speaks an earlier protocol"
-    );
-    drop(operator);
-    let deadline = std::time::Instant::now() + RESTART_TIMEOUT;
-    loop {
-        if let Ok(client) = storage::Client::connect_operator(socket)
-            && client.version() >= storage::protocol::VERSION
-        {
-            return Ok(());
-        }
-        anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "the storage server did not serve protocol {} within {RESTART_TIMEOUT:?} of its \
-                 restart",
-            storage::protocol::VERSION
-        );
-        std::thread::sleep(RESTART_POLL);
-    }
-}
-
-/// Returns `world`'s weights that an offload left in host storage to the
+/// Returns `epoch`'s weights that an offload left in host storage to the
 /// GPUs they left (`Request::Restore`), which answers at once when there
 /// are none.
-fn restore(client: &mut storage::Client, deployment: &str, world: u64) -> anyhow::Result<()> {
+fn restore(client: &mut storage::Client, deployment: &str, epoch: u64) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     let (storages, bytes) = client
-        .move_weights(world, false)
-        .with_context(|| format!("returning the weights of world {world} to its GPUs"))?;
+        .move_weights(epoch, false)
+        .with_context(|| format!("returning the weights of epoch {epoch} to its GPUs"))?;
     if storages > 0 {
         tracing::info!(
             deployment,
-            world,
+            epoch,
             storages,
             bytes,
-            "a world's weights returned from host storage"
+            "an epoch's weights returned from host storage"
         );
     }
     Ok(())
@@ -429,11 +376,11 @@ pub(crate) struct HandedClaims {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct HandedClaim {
     deployment: String,
-    /// The scopes of a predecessor that knew no worlds, which world 0 holds.
+    /// The scopes of a predecessor that knew no epochs, which epoch 0 holds.
     #[serde(default)]
     scopes: Vec<(String, u32)>,
     #[serde(default)]
-    worlds: BTreeMap<u64, Vec<(String, u32)>>,
+    epochs: BTreeMap<u64, Vec<(String, u32)>>,
     socket: String,
     claim: Vec<u8>,
     tcp: String,
@@ -459,7 +406,7 @@ impl ClaimHolder {
             claims.push(HandedClaim {
                 deployment,
                 scopes: Vec::new(),
-                worlds: held.worlds,
+                epochs: held.epochs,
                 socket: held.claimed.socket,
                 claim: held.claimed.claim,
                 tcp: held.claimed.tcp,
@@ -489,8 +436,8 @@ impl ClaimHolder {
                 claim.deployment,
                 Held {
                     client: storage::Client::resume(descriptor, claim.next),
-                    worlds: if claim.scopes.is_empty() {
-                        claim.worlds
+                    epochs: if claim.scopes.is_empty() {
+                        claim.epochs
                     } else {
                         BTreeMap::from([(0, claim.scopes)])
                     },

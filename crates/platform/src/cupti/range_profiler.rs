@@ -143,7 +143,7 @@ fn pop_range(object: *mut c_void) -> Result<()> {
 /// thread makes inside another launch call. A push or pop CUPTI refuses is
 /// kept for the profiler's next stop, which reports it.
 ///
-/// The worker captures its CUDA graphs at warmup, before its world serves,
+/// The worker captures its CUDA graphs at warmup, before its epoch serves,
 /// and a session starts the profiler only around served steps, so no ranged
 /// launch is one a capture records.
 ///

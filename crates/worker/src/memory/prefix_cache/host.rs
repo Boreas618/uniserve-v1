@@ -189,8 +189,8 @@ impl HostKvCache {
     /// published page. `fingerprint` is the pages' key digest
     /// (`Fingerprints::pages`).
     /// Each group's pool holds the pages of `tokens` tokens, the count the
-    /// engine sizes every rank of the world's host KV cache at; a pool the
-    /// deployment already has for the same pages, which a previous world
+    /// engine sizes every rank of the epoch's host KV cache at; a pool the
+    /// deployment already has for the same pages, which a previous epoch
     /// created, is shared at its size.
     /// Returns the host KV cache and what the rank reports of each pool.
     pub(crate) fn start(

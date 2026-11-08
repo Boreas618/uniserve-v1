@@ -516,13 +516,13 @@ struct ConfigBody {
 }
 
 /// `GET /admin/config`: the configuration, its digest, the two slots'
-/// worlds, the change in progress, the trial, the configurations a
+/// epochs, the change in progress, the trial, the configurations a
 /// rollback marked unavailable and every item of the GPUs' storage ledgers
 /// (`Leader::config_status`).
 async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
     let mut body = state.leader.config_status().await;
     // The epochs and the processes this daemon manages sit beside the
-    // configuration and its worlds: `EpochRecord`s are the daemon's record
+    // configuration and its epochs: `EpochRecord`s are the daemon's record
     // of what it executes, not the engine's (`crate::epoch`).
     if let Some(object) = body.as_object_mut() {
         let report = state.admin.epochs().report();
@@ -534,7 +534,7 @@ async fn config(State(state): State<AdminState>) -> Json<serde_json::Value> {
 
 /// `PUT /admin/config`: changes the deployment to a configuration
 /// (`Leader::apply`), in place, by a hot restart of the daemon, or in a new
-/// world on trial.
+/// epoch on trial.
 async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let body = if body.is_empty() {
         ConfigBody {
@@ -562,7 +562,7 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
         };
         // The program layer is tried first, and only on a target resolved
         // against the serving configuration: a change that fills other
-        // programs moves the main processes in place, and the world path would
+        // programs moves the main processes in place, and the epoch path would
         // answer `none` for it because its build config is unchanged (§7.2,
         // §7.3).
         if let Some(program) = program_update(&admin, &leader, &request, body.dry_run).await? {
@@ -583,14 +583,14 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
                             .to_owned(),
                     ));
                 };
-                let world = then.is_some();
+                let epoch = then.is_some();
                 restarter
                     .restart(executable, Some(*config), then, &leader, &admin, &jobs)
                     .await
                     .map(|pid| {
                         // The successor changes the epoch in an operation of
                         // its own (`GET /admin/status`).
-                        json!({ "change": "daemon", "pid": pid, "then": world.then_some("epoch") })
+                        json!({ "change": "daemon", "pid": pid, "then": epoch.then_some("epoch") })
                     })
                     .map_err(|error| (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")))
             }
@@ -652,7 +652,7 @@ pub(crate) fn apply_after_restart(
     });
 }
 
-/// `POST /admin/config/commit`: ends the trial of the world that executes
+/// `POST /admin/config/commit`: ends the trial of the epoch that executes
 /// (`Leader::commit`).
 async fn commit(State(state): State<AdminState>) -> Response {
     let leader = Arc::clone(&state.leader);
@@ -710,7 +710,7 @@ async fn commit(State(state): State<AdminState>) -> Response {
 }
 
 /// Applies a change at the program layer, answering what it did, or `None`
-/// when the change moves nothing there and the world path decides it (§7.2).
+/// when the change moves nothing there and the epoch path decides it (§7.2).
 ///
 /// The layer is decided on the target resolved against the serving
 /// configuration, and nothing is compared before the target's programs are
@@ -723,11 +723,11 @@ async fn program_update(
     dry_run: bool,
 ) -> Result<Option<serde_json::Value>, (StatusCode, String)> {
     let Ok(current) = leader.serving_config() else {
-        // No replica serves: the world path answers that account itself.
+        // No replica serves: the epoch path answers that account itself.
         return Ok(None);
     };
     let Ok((target, _, options)) = crate::updates::change::resolve(&current, request) else {
-        // The change itself is refused; the world path answers it the same way.
+        // The change itself is refused; the epoch path answers it the same way.
         return Ok(None);
     };
     // A change the epoch or host layer outranks is not the program layer's,
@@ -738,7 +738,7 @@ async fn program_update(
         crate::epoch::Deployment::of(current.clone()),
         crate::epoch::Deployment::of(target.clone()),
     ) else {
-        // The configuration does not resolve; the world path refuses it with the reason.
+        // The configuration does not resolve; the epoch path refuses it with the reason.
         return Ok(None);
     };
     if matches!(
@@ -874,8 +874,8 @@ struct RollbackBody {
     reason: Option<String>,
 }
 
-/// `POST /admin/config/rollback`: rolls the world on trial back to the
-/// previous world (`Leader::rollback`).
+/// `POST /admin/config/rollback`: rolls the epoch on trial back to the
+/// previous epoch (`Leader::rollback`).
 async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let body = if body.is_empty() {
         RollbackBody::default()
@@ -1026,7 +1026,7 @@ async fn update_weights(State(state): State<AdminState>, body: axum::body::Bytes
     .await
 }
 
-/// Redistribute experts within each selected replica's current world.
+/// Redistribute experts within each selected replica's current epoch.
 async fn rebalance_experts(State(state): State<AdminState>, body: axum::body::Bytes) -> Response {
     let request: crate::experts::Rebalance = match serde_json::from_slice(&body) {
         Ok(request) => request,
@@ -1151,7 +1151,7 @@ async fn unload_lora_adapter(State(state): State<AdminState>, body: axum::body::
 }
 
 /// `POST /admin/profile`: starts a profiling session
-/// (`proto::profile::SessionRequest`) on every worker of the executing world
+/// (`proto::profile::SessionRequest`) on every worker of the executing epoch
 /// at the engine's next step boundary (`crate::profiling`), and answers with
 /// it: its identity, each worker's file and collectors. One runs at a time:
 /// another is refused (`400`) until it ends.

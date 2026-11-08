@@ -72,20 +72,20 @@ struct HandedServer {
     clients: Vec<HandedClient>,
     next_client: ClientId,
     storages: Vec<(u64, StorageRecord, usize)>,
-    /// The host copies of worlds' weights, with the GPU each left
+    /// The host copies of epochs' weights, with the GPU each left
     /// ([`crate::moves`]); a predecessor that moved no weights hands none.
     #[serde(default)]
     moved: Vec<(u64, [u8; 16])>,
     next_storage: u64,
     tensors: Vec<(Key, HandedTensor)>,
     deployments: Vec<(String, Claim, Option<ClientId>)>,
-    /// The worlds each deployment claims, and those it discarded; a
-    /// predecessor that knew no visibility of worlds hands none over, and
+    /// The epochs each deployment claims, and those it discarded; a
+    /// predecessor that knew no visibility of epochs hands none over, and
     /// its deployments claim none.
     #[serde(default)]
-    worlds: Vec<(String, BTreeSet<u64>, BTreeSet<u64>)>,
-    /// Explicit committed worlds. Protocol 12 handoffs describe one
-    /// committed world implicitly as the first claimed world.
+    epochs: Vec<(String, BTreeSet<u64>, BTreeSet<u64>)>,
+    /// Explicit committed epochs. Protocol 12 handoffs describe one
+    /// committed epoch implicitly as the first claimed epoch.
     #[serde(default)]
     published: Option<Vec<(String, BTreeSet<u64>)>>,
     /// The pidfds of the processes shot down that left every GPU, and of
@@ -95,7 +95,7 @@ struct HandedServer {
     pages: HandedPools,
     host_reserve: u64,
     relaunch: Vec<String>,
-    /// The GPUs' totals, the worlds' quotas and the bookings of the
+    /// The GPUs' totals, the epochs' quotas and the bookings of the
     /// clients the handoff carries; empty from a predecessor that kept no
     /// ledgers, whose clients book again when they next book.
     #[serde(default)]
@@ -126,15 +126,15 @@ struct HandedTensor {
     shape: Vec<u64>,
     strides: Vec<u64>,
     access: Access,
-    /// The scopes a predecessor that knew no worlds handed over, which
-    /// retain the tensor in world 0.
+    /// The scopes a predecessor that knew no epochs handed over, which
+    /// retain the tensor in epoch 0.
     #[serde(default)]
     scopes: BTreeSet<Scope>,
     #[serde(default)]
     retainers: BTreeSet<Retainer>,
-    /// The deployment and world that published the tensor; a predecessor
-    /// that knew no visibility of worlds hands over tensors every world
-    /// reads (world 0).
+    /// The deployment and epoch that published the tensor; a predecessor
+    /// that knew no visibility of epochs hands over tensors every epoch
+    /// reads (epoch 0).
     #[serde(default)]
     publisher: (String, u64),
     writer: Option<HandedHolder>,
@@ -150,7 +150,7 @@ struct HandedHolder {
     generation: u64,
     claim: Claim,
     #[serde(default)]
-    world: u64,
+    epoch: u64,
 }
 
 /// The pidfds a handoff names, each once.
@@ -180,7 +180,7 @@ impl Pidfds {
             scope: holder.scope.clone(),
             generation: holder.generation,
             claim: holder.claim,
-            world: holder.world,
+            epoch: holder.epoch,
         }
     }
 }
@@ -348,13 +348,13 @@ impl Server {
             moved,
             next_storage: self.next_storage,
             tensors,
-            worlds: self
+            epochs: self
                 .deployments
                 .iter()
                 .map(|(name, deployment)| {
                     (
                         name.clone(),
-                        deployment.worlds.clone(),
+                        deployment.epochs.clone(),
                         deployment.discarded.clone(),
                     )
                 })
@@ -540,7 +540,7 @@ impl Server {
                 scope: holder.scope,
                 generation: holder.generation,
                 claim: holder.claim,
-                world: holder.world,
+                epoch: holder.epoch,
             })
         };
         // A tensor lies where its storage lies.
@@ -576,7 +576,7 @@ impl Server {
                             tensor
                                 .scopes
                                 .into_iter()
-                                .map(|scope| Retainer { scope, world: 0 }),
+                                .map(|scope| Retainer { scope, epoch: 0 }),
                         )
                         .collect(),
                     publisher: tensor.publisher,
@@ -625,26 +625,26 @@ impl Server {
                 let mut published = handed
                     .published
                     .map(|entries| entries.into_iter().collect::<HashMap<_, _>>());
-                let mut worlds: HashMap<String, (BTreeSet<u64>, BTreeSet<u64>)> = handed
-                    .worlds
+                let mut epochs: HashMap<String, (BTreeSet<u64>, BTreeSet<u64>)> = handed
+                    .epochs
                     .into_iter()
-                    .map(|(name, worlds, discarded)| (name, (worlds, discarded)))
+                    .map(|(name, epochs, discarded)| (name, (epochs, discarded)))
                     .collect();
                 handed
                     .deployments
                     .into_iter()
                     .map(|(name, claim, head)| {
-                        let (worlds, discarded) = worlds.remove(&name).unwrap_or_default();
+                        let (epochs, discarded) = epochs.remove(&name).unwrap_or_default();
                         let published = match &mut published {
                             Some(entries) => entries.remove(&name).unwrap_or_default(),
-                            None => worlds.first().copied().into_iter().collect(),
+                            None => epochs.first().copied().into_iter().collect(),
                         };
                         (
                             name,
                             Deployment {
                                 claim,
                                 head,
-                                worlds,
+                                epochs,
                                 published,
                                 discarded,
                             },
@@ -748,19 +748,19 @@ mod tests {
             &path,
             Role::Head {
                 deployment: "model".into(),
-                world: 0,
+                epoch: 0,
             },
         )
         .unwrap();
         let claim = head.claim(0, vec![scope.clone()], Vec::new()).unwrap();
-        head.publish_worlds(vec![0]).unwrap();
+        head.publish_epochs(vec![0]).unwrap();
         let mut worker = Client::connect(
             &path,
             Role::Worker {
                 scope: scope.clone(),
                 generation: 1,
                 claim,
-                world: 0,
+                epoch: 0,
             },
         )
         .unwrap();
@@ -797,22 +797,22 @@ mod tests {
 
         // Committed replicas share their outputs; a candidate's output is
         // still private when both kinds cross the restart.
-        for world in [2, 3] {
-            head.claim(world, vec![scope.clone()], Vec::new()).unwrap();
+        for epoch in [2, 3] {
+            head.claim(epoch, vec![scope.clone()], Vec::new()).unwrap();
             let mut replica = Client::connect(
                 &path,
                 Role::Worker {
                     scope: scope.clone(),
                     generation: 1,
                     claim,
-                    world,
+                    epoch,
                 },
             )
             .unwrap();
             replica
                 .put(
                     vec![TensorRecord {
-                        key: Key([world as u8; 32]),
+                        key: Key([epoch as u8; 32]),
                         name: "replica_weight".into(),
                         storage: 0,
                         offset: 0,
@@ -833,7 +833,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        head.publish_worlds(vec![2]).unwrap();
+        head.publish_epochs(vec![2]).unwrap();
 
         // Stop the server between two rounds and hand it to a successor on
         // another thread; a sleeping process stands for the successor's.
@@ -875,7 +875,7 @@ mod tests {
             .get(vec![Key([2; 32]), Key([3; 32])], Mode::Read, Vec::new())
             .unwrap();
         assert_eq!(got.missing, vec![Key([3; 32])]);
-        head.publish_worlds(vec![3]).unwrap();
+        head.publish_epochs(vec![3]).unwrap();
         assert!(
             worker
                 .get(vec![Key([3; 32])], Mode::Read, Vec::new())

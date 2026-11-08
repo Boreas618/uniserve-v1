@@ -140,6 +140,7 @@ pub use config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,
     DEFAULT_MAX_RUNNING_REQUESTS, SchedulerConfig,
 };
+pub use epoch::{GroupCache, ParkedCache};
 use ipc::{ForwardMode, TransferMode};
 #[cfg(feature = "testing")]
 pub(crate) use policy::process_engine;
@@ -159,7 +160,6 @@ pub use stats::{
 };
 pub use stats_report::SchedulerStatsReporter;
 pub use views::phase_id;
-pub use world::{GroupCache, ParkedCache};
 
 mod admission;
 mod batching;
@@ -200,9 +200,9 @@ pub(crate) fn submissions_over(
 ) -> anyhow::Result<submission::Submissions> {
     submission::Submissions::over_batches(batches)
 }
+mod epoch;
 pub(crate) mod views;
 mod warming;
-mod world;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -576,7 +576,7 @@ pub struct Scheduler {
     waiting_media: VecDeque<PendingMedia>,
     running: HashMap<RequestId, RequestState>,
     running_media: HashMap<RequestId, MediaFlowState>,
-    /// What the world measures of speculation, which the refill policy
+    /// What the epoch measures of speculation, which the refill policy
     /// weighs.
     speculation_meter: speculation::SpeculationMeter,
     /// Finished requests whose storage stays allocated until their workers
@@ -597,7 +597,7 @@ pub struct Scheduler {
     /// worker publishes it, so the periodic call asks nothing it cannot state.
     expert_load: Option<scheduling::guest::ExpertLoad>,
     /// The expert layout the policy last answered, validated and waiting for
-    /// the worker's world setup, which applies it (§7.6).
+    /// the worker's epoch setup, which applies it (§7.6).
     expert_order: Option<scheduling::guest::ExpertOrder>,
     /// The step the policy last answered an expert layout on, so the
     /// mechanism's interval is measured from the decision, not from step zero.
@@ -606,7 +606,7 @@ pub struct Scheduler {
     /// worth asking about at once, rather than after a full interval.
     expert_load_new: bool,
     /// §7.3 step 2's paired pass: an update asked that the following step's
-    /// batches also run in shadow for a world generation, and the answer waits
+    /// batches also run in shadow for an epoch generation, and the answer waits
     /// for the step that shadows them.
     shadow_pass: Option<control::ShadowPass>,
     /// The candidate a precopy is preparing on a blocking thread, while it runs
@@ -670,7 +670,7 @@ pub struct Scheduler {
     latent_dtype: Option<DType>,
     /// `engine_id` of every `RequestKey` this scheduler issues.
     engine_id: u64,
-    world: u64,
+    epoch: u64,
     /// Engine-wide counter for product generations, drawn by
     /// `generation::register_call` and `Scheduler::media_completion_product`;
     /// both fail once a generation would exceed `u32::MAX`.
@@ -722,16 +722,16 @@ pub struct Scheduler {
     asleep: bool,
     /// A park waiting for the scheduler's requests to end
     /// (`Scheduler::park`).
-    parking: Option<world::Parking>,
+    parking: Option<epoch::Parking>,
     warming: warming::Warming,
     /// The scheduler parked: it admits and executes nothing until it
     /// resumes, and keeps its storage and prefix cache index.
     parked: bool,
-    /// The scheduler's world is on trial until its commit
+    /// The scheduler's epoch is on trial until its commit
     /// (`Scheduler::commit`): any fault, non-finite logits included, fails
-    /// the world as a whole, which the daemon rolls back rather than
+    /// the epoch as a whole, which the daemon rolls back rather than
     /// repairs, and the requests that resume from their generated tokens
-    /// leave as migratable for the previous world.
+    /// leave as migratable for the previous epoch.
     trial: bool,
     /// The first error of a fatal stop, which the scheduler's handle reports
     /// (`SchedulerHandle::failure`); set once.

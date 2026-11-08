@@ -1,12 +1,12 @@
-//! The policy source a test world installs, and the WebAssembly-text encoder
+//! The policy source a test epoch installs, and the WebAssembly-text encoder
 //! the switch's own tests state their modules with.
 //!
 //! A deployed epoch takes its policy from the Program Server (§5.1, §7.3); a
-//! test world has none, and a scheduler with no policy decides nothing — no
-//! plan, no admission, no batch — so a world that submits a request must be
+//! test epoch has none, and a scheduler with no policy decides nothing — no
+//! plan, no admission, no batch — so an epoch that submits a request must be
 //! given a module. [`packaged_policy`] is that source: the real `fcfs` program
 //! this tree builds, read from `SCHED_POLICY_WASM`, with the arguments that make
-//! its declared limits fit the capacity the caller's world was built for. It
+//! its declared limits fit the capacity the caller's epoch was built for. It
 //! installs through the same precopy and switchover a deployment uses, so a
 //! caller's fixtures exercise the mechanism rather than a stand-in for it, and
 //! there is no second policy in the tree to keep honest.
@@ -204,7 +204,7 @@ fn parameters_of(limits: Limits) -> Parameters {
 ///
 /// The program is `fcfs` revision one with the arguments that state
 /// [`ceilings_of`]`(capacity)` — the same derivation the mechanism's own
-/// integration worlds use to install their policy — so the limits it declares
+/// integration epochs use to install their policy — so the limits it declares
 /// fit any fixture's build config and the mechanism's check of a policy's
 /// limits against the ceilings cannot refuse it.
 ///
@@ -221,7 +221,7 @@ pub fn packaged_policy(capacity: BatchCapacity) -> (PolicyProgram, Vec<u8>) {
     (packaged_program(capacity), packaged_module())
 }
 
-/// The program `fcfs` revision one runs under for a world of `capacity`.
+/// The program `fcfs` revision one runs under for an epoch of `capacity`.
 fn packaged_program(capacity: BatchCapacity) -> PolicyProgram {
     PolicyProgram {
         backend: "fcfs".to_owned(),
@@ -315,7 +315,7 @@ mod tests {
 
         // The arguments state the ceilings themselves, so the limits the module
         // declares are the ones the mechanism checks a policy against and
-        // cannot be refused for a world of this capacity.
+        // cannot be refused for an epoch of this capacity.
         let limits = Limits::from_parameters(&program.arguments);
         let ceilings = ceilings_of(capacity());
         assert_eq!(limits.max_batch, ceilings.max_batch);
@@ -329,8 +329,8 @@ mod tests {
     }
 
     #[test]
-    fn a_world_built_for_fewer_calls_states_fewer() {
-        // `fcfs`'s own default declares 128 calls, which a test world built for
+    fn a_epoch_built_for_fewer_calls_states_fewer() {
+        // `fcfs`'s own default declares 128 calls, which a test epoch built for
         // two would be refused for: the program's arguments are what make the
         // declaration fit.
         let small = packaged_program(BatchCapacity {

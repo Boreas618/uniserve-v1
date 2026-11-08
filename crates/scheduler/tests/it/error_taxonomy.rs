@@ -220,21 +220,21 @@ fn escape(text: &str) -> String {
 ///
 /// A submission is a command, and the scheduler handles commands before it
 /// steps: once a step past the submission has run, the request is in the state
-/// the next decision is judged against. `from` is read with [`World::step`].
-fn stepped_past(world: &World, from: u64) {
+/// the next decision is judged against. `from` is read with [`Epoch::step`].
+fn stepped_past(epoch: &Epoch, from: u64) {
     eventually(|| {
-        let progress = world.handle.progress().recv().ok()?;
+        let progress = epoch.handle.progress().recv().ok()?;
         (progress.step > from).then_some(())
     });
 }
 
 /// A scheduler thread serving one program, with the one it replaced kept for a
 /// revert.
-struct World {
+struct Epoch {
     handle: CommandSender,
 }
 
-impl World {
+impl Epoch {
     /// A scheduler serving `good`, committed: the program that serves on when
     /// a candidate is refused or a live failure reverts one.
     fn serving(good: Toy) -> Self {
@@ -252,24 +252,24 @@ impl World {
         thread::spawn(move || {
             let _ = scheduler.run(rx);
         });
-        let world = Self {
+        let epoch = Self {
             handle: CommandSender::new(tx),
         };
-        world
+        epoch
             .install("fcfs", 1, good)
             .expect("the good program serves");
-        world.handle.commit_policy();
-        world
+        epoch.handle.commit_policy();
+        epoch
     }
 
     /// Starts a scheduler serving `good`, committed, and then puts `failing` in
     /// so that a live failure has a program to serve on under.
     fn with_previous(good: Toy, failing: Toy) -> Self {
-        let world = Self::serving(good);
-        world
+        let epoch = Self::serving(good);
+        epoch
             .install("fcfs", 2, failing)
             .expect("the failing program is instantiated before it serves");
-        world
+        epoch
     }
 
     /// Offers `failing` as the epoch's next program and answers the trial's
@@ -380,18 +380,18 @@ fn a_trap_in_observe_fails_the_policy() {
     // are no events to observe, so a program that traps in it passes its trial
     // and fails the first real step that hands it one. That is the live
     // failure, and the program before it serves on.
-    let world = World::with_previous(
+    let epoch = Epoch::with_previous(
         Toy::idle(),
         Toy {
             observe: Observe::Traps,
             ..Toy::idle()
         },
     );
-    let mut events = world
+    let mut events = epoch
         .handle
         .submit(text_request(1, 8, 4))
         .expect("the request is submitted");
-    let report = world.failed();
+    let report = epoch.failed();
     let reason = report.reason.to_lowercase();
     assert!(
         reason.contains("trap") && reason.contains("observ"),
@@ -399,9 +399,9 @@ fn a_trap_in_observe_fails_the_policy() {
     );
     // The program before the trapping one answers the next decision: its
     // layout is the one handed over, and the failed program's is not.
-    assert_eq!(world.serving_order().layout, vec![1, 0]);
+    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
     assert!(
-        world
+        epoch
             .handle
             .take_policy_report()
             .recv()
@@ -420,8 +420,8 @@ fn a_trap_in_observe_fails_the_policy() {
 
 #[test]
 fn exhausted_fuel_in_dispatch_fails_the_policy() {
-    let world = World::serving(Toy::idle());
-    let reason = world
+    let epoch = Epoch::serving(Toy::idle());
+    let reason = epoch
         .refuse(Toy {
             dispatch: Dispatch::Burns,
             ..Toy::idle()
@@ -431,14 +431,14 @@ fn exhausted_fuel_in_dispatch_fails_the_policy() {
         reason.contains("fuel") && reason.contains("dispatch"),
         "the reason names the spent budget and the call it was spent in: {reason}"
     );
-    assert_eq!(world.serving_order().layout, vec![1, 0]);
-    world.no_failure();
+    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
+    epoch.no_failure();
 }
 
 #[test]
 fn limits_over_the_build_ceiling_fail_the_policy() {
-    let world = World::serving(Toy::idle());
-    let reason = world
+    let epoch = Epoch::serving(Toy::idle());
+    let reason = epoch
         .refuse(Toy {
             limits: Limits {
                 // The simulated deployment was built for eight rows at most.
@@ -452,8 +452,8 @@ fn limits_over_the_build_ceiling_fail_the_policy() {
         reason.contains("limit") || reason.contains("ceiling"),
         "the reason names the limits: {reason}"
     );
-    assert_eq!(world.serving_order().layout, vec![1, 0]);
-    world.no_failure();
+    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
+    epoch.no_failure();
 }
 
 #[test]
@@ -471,27 +471,27 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     // this case states.
     admitting.dispatch = Dispatch::PlanOnce;
     // A program may admit only a queued request (§4.4), and the trial of the
-    // first program runs before this request exists. So the world serves an
+    // first program runs before this request exists. So the epoch serves an
     // idle program first, the request arrives, and the admitting program is
-    // installed over it: the world this case is about is one whose serving
+    // installed over it: the epoch this case is about is one whose serving
     // program has admitted the request and given it no work.
-    let world = World::serving(Toy::idle());
+    let epoch = Epoch::serving(Toy::idle());
     // The submission's receiver is kept: a request whose events nobody reads
     // is withdrawn, and the trial would be asked to admit a request the
     // mechanism no longer holds.
-    let _events = world
+    let _events = epoch
         .handle
         .submit(text_request(1, 8, 4))
         .expect("the request is submitted");
     // A trial runs on the mechanism's state at the boundary it is prepared at,
     // so the arrival must have been applied before the trial that admits it:
     // one step of the idle program leaves the request queued.
-    stepped_past(&world, world.step());
-    world
+    stepped_past(&epoch, epoch.step());
+    epoch
         .install("fcfs", 2, admitting)
         .expect("the good program serves");
-    stepped_past(&world, world.step());
-    let reason = world
+    stepped_past(&epoch, epoch.step());
+    let reason = epoch
         .refuse(Toy {
             plan: unknown_phase(),
             ..Toy::idle()
@@ -503,19 +503,19 @@ fn an_invalid_decision_fails_the_policy_and_applies_nothing() {
     );
     // Nothing of the refused plan ran, and nothing of it serves: the program
     // that answers the next decision is the one that was already serving.
-    assert_eq!(world.serving_order().layout, vec![1, 0]);
-    world.no_failure();
+    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
+    epoch.no_failure();
 }
 
 #[test]
 fn an_invalid_expert_order_fails_the_policy() {
-    let world = World::serving(Toy::idle());
-    world.handle.publish_expert_load(Some(ExpertLoad {
+    let epoch = Epoch::serving(Toy::idle());
+    epoch.handle.publish_expert_load(Some(ExpertLoad {
         ranks: 2,
         experts: 2,
         tokens: vec![1, 1],
     }));
-    let reason = world
+    let reason = epoch
         .refuse(Toy {
             experts: ExpertOrder { layout: vec![0, 0] },
             ..Toy::idle()
@@ -525,8 +525,8 @@ fn an_invalid_expert_order_fails_the_policy() {
         reason.contains("expert"),
         "the reason names the order: {reason}"
     );
-    assert_eq!(world.serving_order().layout, vec![1, 0]);
-    world.no_failure();
+    assert_eq!(epoch.serving_order().layout, vec![1, 0]);
+    epoch.no_failure();
 }
 
 /// A policy that admits `admit` and gives it no work, with `timeout` as its
@@ -586,13 +586,13 @@ fn a_starved_request_with_nothing_else_resident_ends_the_epoch() {
     // and the request ends with the epoch. It is not a policy failure: the program that answers every
     // decision correctly did nothing wrong, so no report is recorded and the previous program is not
     // put back in.
-    let world = World::serving(Toy::idle());
-    let mut events = world
+    let epoch = Epoch::serving(Toy::idle());
+    let mut events = epoch
         .handle
         .submit(text_request(1, 8, 4))
         .expect("the request is submitted");
-    stepped_past(&world, world.step());
-    world
+    stepped_past(&epoch, epoch.step());
+    epoch
         .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))
         .expect("the starving program is instantiated before it serves");
     let terminal = eventually(|| events.try_recv().ok().filter(|event| event.is_terminal()));
@@ -600,7 +600,7 @@ fn a_starved_request_with_nothing_else_resident_ends_the_epoch() {
         terminal.is_terminal(),
         "the request did not end with the epoch it was the whole of"
     );
-    world.no_failure();
+    epoch.no_failure();
 }
 
 #[test]
@@ -610,25 +610,25 @@ fn a_starved_request_fails_alone_while_the_epoch_serves() {
     // request's thirty seconds is not evidence that every request must be lost. (That the queued
     // one is then served is the policy's decision, which this program does not make; what is
     // asserted here is that the epoch is still there to make it.)
-    let world = World::serving(Toy::idle());
-    let mut starved = world
+    let epoch = Epoch::serving(Toy::idle());
+    let mut starved = epoch
         .handle
         .submit(text_request(1, 8, 4))
         .expect("the request is submitted");
-    let mut queued = world
+    let mut queued = epoch
         .handle
         .submit(text_request(2, 8, 4))
         .expect("the second request is submitted");
-    stepped_past(&world, world.step());
+    stepped_past(&epoch, epoch.step());
     // `PlanOnce` admits request 1 alone and gives it no work, so request 2 stays queued: the
     // mechanism's starvation rule watches residents, so request 1 is the one that starves.
-    world
+    epoch
         .install("fcfs", 2, starving(vec![RequestId(1)], Nanos(1_000_000)))
         .expect("the starving program is instantiated before it serves");
     let terminal = eventually(|| starved.try_recv().ok().filter(|event| event.is_terminal()));
     assert!(terminal.is_terminal(), "the starved request was not ended");
     // The epoch did not blame the program, and the other request is still the epoch's.
-    world.no_failure();
+    epoch.no_failure();
     assert!(
         !queued.try_recv().is_ok_and(|event| event.is_terminal()),
         "the epoch ended a request that never starved"

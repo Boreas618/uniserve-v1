@@ -1,5 +1,5 @@
 //! The vocabulary of profiling sessions (`POST /admin/profile`) between the
-//! leader daemon and the workers of the world that executes.
+//! leader daemon and the workers of the epoch that executes.
 //!
 //! The daemon validates a session's request, gives it an identity and hands
 //! it to every worker as the payload of the worker hook
@@ -389,8 +389,8 @@ impl SessionRequest {
 pub struct SessionStart {
     /// The session's identity.
     pub session: u64,
-    /// The world the session belongs to.
-    pub world: u64,
+    /// The epoch the session belongs to.
+    pub epoch: u64,
     pub request: SessionRequest,
 }
 

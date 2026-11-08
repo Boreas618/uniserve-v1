@@ -1,6 +1,6 @@
 //! Request migration: how a token or video request moves between engines.
 //!
-//! An engine that parks for a world change or a rollback, sleeps, rewrites
+//! An engine that parks for an epoch change or a rollback, sleeps, rewrites
 //! its weights in place, shrinks its KV cache, or loses the workers that
 //! hold a request, ends the request as migratable (`Event::Migratable`): a
 //! token request after every token and image it generated there, a video
@@ -33,7 +33,7 @@
 //! and the daemon's detokenizer, stop-string matcher and response assembly
 //! keep their state. An image the request had begun and not finished
 //! continues from its stored step when the engine that serves next computes
-//! the same (or when a world change keeps the state of the requests in
+//! the same (or when an epoch change keeps the state of the requests in
 //! flight, `in_flight = keep`) and its host latent pools hold the
 //! trajectory, and starts again from noise otherwise, which follows from
 //! its facts; the consumer does not read its start or the steps it read
@@ -177,9 +177,9 @@ impl Resumable {
     /// tokens it generated, each naming the trajectory steps its engine
     /// stored (of a video request, or of the image a token request had
     /// begun) and its record of where they lie (`Migration::denoised_steps`,
-    /// zero for none). `kept` is the state a world change keeps of the
+    /// zero for none). `kept` is the state an epoch change keeps of the
     /// requests in flight (`in_flight = keep`), which the request continues
-    /// with when the world that serves next computes other numerics.
+    /// with when the epoch that serves next computes other numerics.
     fn continuation(&self, migration: &Migration, kept: Option<Kept>) -> Request {
         let Migration {
             cause,
@@ -194,7 +194,7 @@ impl Resumable {
                 continuation.sampling.return_prompt_logprobs = false;
                 continuation.sampling.n_prompt_logprobs = 0;
                 // It reads the state it reached and publishes later pages
-                // only to its private continuation: they are neither world's.
+                // only to its private continuation: they are neither epoch's.
                 if let Some(seeds) = kept.as_ref().and_then(|kept| kept.prefix_seeds.as_ref()) {
                     continuation.cache.state_seeds = seeds.clone();
                     continuation.cache.write = false;
@@ -238,7 +238,7 @@ impl Resumable {
 /// Names in `trajectory` the `denoised_steps` of it an engine stored at a
 /// step boundary, keyed by what that engine computes, and its record of
 /// where they lie (`stored_layout`): the next engine reads them when it
-/// computes the same, or when a world change keeps the state the request
+/// computes the same, or when an epoch change keeps the state the request
 /// reached (`kept`), whatever its parallel configuration, from where the
 /// record says the pages lie. A request the engine stored nothing of names
 /// the trajectory it named before, which is the same at that step whenever
@@ -670,10 +670,10 @@ impl RequestEvents {
             self.losses += 1;
         }
         let hold = Arc::clone(hold);
-        // A request a world change moves to a world computing other
+        // A request an epoch change moves to an epoch computing other
         // numerics continues with the state it reached (`in_flight = keep`).
-        let previous_world = (cause == MigrationCause::Drain)
-            .then(|| self.stream.world())
+        let previous_epoch = (cause == MigrationCause::Drain)
+            .then(|| self.stream.epoch())
             .flatten();
         // Admission resolves the current owner first. After a daemon handoff
         // that owner supplies both the engine and the continuation's state.
@@ -681,7 +681,7 @@ impl RequestEvents {
         // other bound (a deployment between engines is the ordinary case a
         // successor daemon covers), so a request that finds none is answered
         // with its own deadline rather than left open on the engine that went.
-        let (client, kept) = tokio::time::timeout(MIGRATION_TIMEOUT, hold.ready(previous_world))
+        let (client, kept) = tokio::time::timeout(MIGRATION_TIMEOUT, hold.ready(previous_epoch))
             .await
             .map_err(|_| {
                 failed(format!(
@@ -936,8 +936,8 @@ mod tests {
     /// A video request leaves its engine naming the trajectory steps the
     /// engine stored and where they lie: it is submitted again with them
     /// and its trajectory's identity, reading the stored trajectory under
-    /// the next world's own latent seed, or under the parked world's when a
-    /// world change keeps the state of the requests in flight. A migration
+    /// the next epoch's own latent seed, or under the parked epoch's when a
+    /// epoch change keeps the state of the requests in flight. A migration
     /// that stored nothing submits the request naming what it named before.
     #[test]
     fn a_video_request_migrates_with_the_steps_its_engine_stored() {
@@ -984,7 +984,7 @@ mod tests {
             }
         );
         let kept = Kept {
-            world: 1,
+            epoch: 1,
             prefix_seeds: None,
             latent_seed: Some(11),
         };
@@ -1236,7 +1236,7 @@ mod tests {
     /// How an image test's engine preempts its request.
     #[derive(Debug, Clone, Copy)]
     enum Preemption {
-        /// A park for a world change: the request resumes on another engine.
+        /// A park for an epoch change: the request resumes on another engine.
         Park,
         /// A sleep: the request resumes on the same engine once it wakes.
         Sleep,

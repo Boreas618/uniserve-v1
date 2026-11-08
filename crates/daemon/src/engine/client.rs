@@ -40,7 +40,7 @@ pub struct EngineInfo {
     /// The engine's schedulers, one per DP rank.
     pub schedulers: u32,
     /// Each worker group's KV cache segments as the engine started with
-    /// them; a world succeeding this one maps those its engine describes
+    /// them; an epoch succeeding this one maps those its engine describes
     /// then ([`EngineClient::describe_cache`]).
     pub segments: Vec<wire::CacheSegments>,
     /// The batch the workers were started for, within which the schedulers
@@ -48,10 +48,10 @@ pub struct EngineInfo {
     /// state it.
     pub capacity: Option<wire::BatchCapacity>,
     /// The root of the prefix hash chains of the pages the engine's workers
-    /// compute: equal between worlds whose models and numerics agree.
+    /// compute: equal between epochs whose models and numerics agree.
     pub prefix_seeds: Vec<u64>,
     /// The seed of the keys of the trajectories the engine stores at
-    /// preemption (a video request's, or an image's): equal between worlds
+    /// preemption (a video request's, or an image's): equal between epochs
     /// whose denoising computes the same; zero without a denoiser or host
     /// latent pools.
     pub latent_seed: u64,
@@ -138,9 +138,9 @@ struct Shared {
     /// identity: a hook's answer is each worker's result, a configure's
     /// none.
     answers: Mutex<HashMap<u64, Answer>>,
-    /// The world the engine executes, which its statistics are recorded
+    /// The epoch the engine executes, which its statistics are recorded
     /// under; 0 for an engine this daemon did not start.
-    world: AtomicU64,
+    epoch: AtomicU64,
 }
 
 /// Where an engine command's answer goes: each worker's result, or why the
@@ -241,7 +241,7 @@ impl EngineClient {
             state,
             next_id: AtomicU64::new(1),
             answers: Mutex::default(),
-            world: AtomicU64::new(0),
+            epoch: AtomicU64::new(0),
         });
         let thread = {
             let shared = Arc::clone(&shared);
@@ -267,10 +267,10 @@ impl EngineClient {
         self
     }
 
-    /// The client of an engine that executes world `world`.
+    /// The client of an engine that executes epoch `epoch`.
     #[must_use]
-    pub fn in_world(self, world: u64) -> Self {
-        self.shared.world.store(world, Ordering::Relaxed);
+    pub fn in_epoch(self, epoch: u64) -> Self {
+        self.shared.epoch.store(epoch, Ordering::Relaxed);
         self
     }
 
@@ -280,10 +280,10 @@ impl EngineClient {
         self.engine
     }
 
-    /// The world the engine executes; 0 for an engine this daemon did not
+    /// The epoch the engine executes; 0 for an engine this daemon did not
     /// start.
-    pub fn world(&self) -> u64 {
-        self.shared.world.load(Ordering::Relaxed)
+    pub fn epoch(&self) -> u64 {
+        self.shared.epoch.load(Ordering::Relaxed)
     }
 
     /// What the engine reported it serves.
@@ -541,10 +541,10 @@ impl EngineClient {
     /// Parks the engine: at its next step boundary it ends every token
     /// request that resumes from its generated tokens as migratable, lets
     /// the others finish, and executes nothing more, keeping its storage and
-    /// prefix cache index. When it `lend`s, the world that succeeds it maps
-    /// its KV cache: it lends that world the segments no request in flight
+    /// prefix cache index. When it `lend`s, the epoch that succeeds it maps
+    /// its KV cache: it lends that epoch the segments no request in flight
     /// continues from, forgetting their pages, and allocates none of their
-    /// units until a resume retires that world. Returns its index once it
+    /// units until a resume retires that epoch. Returns its index once it
     /// parked.
     ///
     /// # Errors
@@ -561,7 +561,7 @@ impl EngineClient {
         }
     }
 
-    /// Resumes a parked engine, ending the storage of the worlds `retire`
+    /// Resumes a parked engine, ending the storage of the epochs `retire`
     /// names on its nodes first: the successor a rollback discards.
     ///
     /// # Errors
@@ -574,7 +574,7 @@ impl EngineClient {
             .map(drop)
     }
 
-    /// Commits the engine's world: ends the storage of the worlds `retire`
+    /// Commits the engine's epoch: ends the storage of the epochs `retire`
     /// names (its predecessor, whose processes are gone) on its nodes, and
     /// its workers take the predecessor's storage they mapped read-only.
     /// Returns what each worker reported.
@@ -594,7 +594,7 @@ impl EngineClient {
     }
 
     /// Each worker group's KV cache segments as the engine holds them now,
-    /// which a world succeeding it maps.
+    /// which an epoch succeeding it maps.
     ///
     /// # Errors
     ///
@@ -1037,7 +1037,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             Some(from_engine::Kind::Stats(report)) => {
                 match SchedulerStats::decode(&report.snapshot) {
                     Ok(snapshot) => stats(
-                        shared.world.load(Ordering::Relaxed),
+                        shared.epoch.load(Ordering::Relaxed),
                         report.scheduler,
                         snapshot,
                     ),
@@ -1104,7 +1104,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
                 if let Some(answer) = lock(&shared.answers).remove(&described.id) {
                     let _ = answer.send(if described.error.is_empty() {
                         Ok(Answered::Cache(wire::Predecessor {
-                            world: described.storage_world,
+                            epoch: described.storage_epoch,
                             segments: described.segments,
                         }))
                     } else {
@@ -1198,17 +1198,17 @@ pub struct EventStream {
 impl EventStream {
     /// Provenance of private cache pages when this request resumes elsewhere.
     pub fn cache_resume(&self) -> Option<proto::request::CacheResume> {
-        self.world().map(|world| proto::request::CacheResume {
-            world,
+        self.epoch().map(|epoch| proto::request::CacheResume {
+            epoch,
             request_id: self.id.0,
         })
     }
-    /// The world of the engine that feeds the stream; `None` for a stream no
+    /// The epoch of the engine that feeds the stream; `None` for a stream no
     /// engine feeds.
-    pub fn world(&self) -> Option<u64> {
+    pub fn epoch(&self) -> Option<u64> {
         self.shared
             .as_ref()
-            .map(|shared| shared.world.load(Ordering::Relaxed))
+            .map(|shared| shared.epoch.load(Ordering::Relaxed))
     }
 
     /// A stream of the events `events` delivers, which no engine feeds.

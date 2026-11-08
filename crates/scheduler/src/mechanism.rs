@@ -52,7 +52,7 @@
 //!   `Command::TakeExpertOrder` — `SchedulerHandle::take_expert_order` is that
 //!   hand-off. **The application is the worker's**, and it is deferred on
 //!   that side with a named owner (§7.6): applying a layout moves weights
-//!   across ranks and pools, which is device and world state, and the mechanism
+//!   across ranks and pools, which is device and epoch state, and the mechanism
 //!   owns none of it; `Worker::commit_experts` is the method that retains an
 //!   order. Nothing in this tree takes the order yet, so until the worker
 //!   applies it the order changes nothing — stated here so the row is not a
@@ -307,7 +307,7 @@ pub(crate) fn validate_admission(plan: &Plan, live: &Live<'_>) -> Result<(), Pol
     // request that cannot be placed, and it and those after it stay queued. A
     // plan that names more requests than there are slots free is exactly what
     // `fcfs` states - it names every queued request - so refusing it here would
-    // stop every loaded world.
+    // stop every loaded epoch.
     let mut admitted = BTreeSet::new();
     for id in &plan.admit {
         if !live.queued(*id) {
