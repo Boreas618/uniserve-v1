@@ -36,15 +36,6 @@ pub(crate) struct Stored {
     pub(crate) page_bytes: u64,
 }
 
-impl Stored {
-    /// The pages that hold the samples: the slot's pages up to the last
-    /// one a value lies in. The slot's later pages hold nothing of the
-    /// request, so no trajectory stores or restores them.
-    pub(crate) fn pages(&self) -> u64 {
-        self.layout.bytes.div_ceil(self.page_bytes.max(1))
-    }
-}
-
 /// `bytes` bytes from byte `offset` of page `page` of stored rank `source`
 /// to byte `target` of the restoring rank's slot pages, which lie back to
 /// back.
@@ -160,6 +151,13 @@ mod tests {
     use ::storage::manifest::{Encoding, Field, Logical, Segment, Span};
 
     use super::*;
+
+    impl Stored {
+        /// The pages that hold the samples: the pages up to the last one a value lies in.
+        fn pages(&self) -> u64 {
+            self.layout.bytes.div_ceil(self.page_bytes.max(1))
+        }
+    }
 
     /// Values of one page: 64 float32.
     const PAGE_BYTES: u64 = 256;

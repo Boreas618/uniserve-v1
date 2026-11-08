@@ -22,7 +22,6 @@ pub use request_slots::SlotField;
 pub mod retained;
 pub mod weights;
 
-pub use latent::LatentPlan;
 pub use prefix_cache::block_tables::{
     BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
 };
