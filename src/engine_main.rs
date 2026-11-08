@@ -186,7 +186,6 @@ impl ProcessInterface {
         })?;
         connection.send(&proto::process::Hello {
             major: proto::PROTOCOL_MAJOR,
-            minor: proto::PROTOCOL_MINOR,
             build: proto::BUILD.to_owned(),
             peer: Some(proto::process::hello::Peer::Engine(
                 proto::process::Engine {
@@ -8143,7 +8142,6 @@ fn handshake(control: &mut Control, launch: &EngineArgs) -> Result<Epoch> {
         engine: launch.engine,
         build: proto::BUILD.to_owned(),
         major: proto::PROTOCOL_MAJOR,
-        minor: proto::PROTOCOL_MINOR,
         // The request link: requests, their events and the epoch's metrics. The process link
         // states `PROCESS` on its own socket, and both name the same engine number.
         interface: proto::process::Interface::Requests as i32,

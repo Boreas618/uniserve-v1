@@ -22,8 +22,6 @@ message Hello {
   // `PROTOCOL_MAJOR` of the sender's build; the peers refuse each other on a
   // difference.
   uint32 major = 1;
-  // `PROTOCOL_MINOR` of the sender's build: which additions it knows.
-  uint32 minor = 2;
   // The sender's build: package version and source digest.
   string build = 3;
   oneof peer {
@@ -32,7 +30,7 @@ message Hello {
     // An engine process asking the leader to supervise its processes.
     Engine engine = 5;
     // A frontend process of the deployment, which the daemon commands down
-    // this connection (minor 4).
+    // this connection.
     Frontend frontend = 6;
   }
 }
@@ -87,7 +85,6 @@ enum Interface {
 // The answer to a `Hello`.
 message Welcome {
   uint32 major = 1;
-  uint32 minor = 2;
   string build = 3;
   // Why the peer is refused; empty when it is accepted.
   string refusal = 4;
@@ -144,7 +141,7 @@ message Reply {
 }
 
 // The deployment's nodes as the leader knows them now, a node that joined
-// the running deployment included (minor 1). The leader answers it itself.
+// the running deployment included. The leader answers it itself.
 message NodesQuery {}
 
 message NodesKnown {
@@ -253,7 +250,6 @@ message Claim {
   // Epochs of the deployment whose storage on the node ends: an epoch the
   // claiming one superseded at a commit, or one a rollback discarded.
   repeated uint64 retire = 6;
-  reserved 7;
 }
 
 message Scope {
@@ -329,7 +325,7 @@ message LedgerReport {
 message Event {
   oneof kind {
     Exit exit = 1;
-    // A command for the main process of one epoch (minor 4).
+    // A command for the main process of one epoch.
     Command command = 2;
   }
 }
@@ -424,11 +420,6 @@ message Command {
 message Precopy {
   repeated KernelProgram kernels = 1;
   Program policy = 2;
-  // The main process numbers its program generations and reports the number
-  // it prepared in `Report::Precopied`; the daemon sends that number back in
-  // `Switchover` and `Purge`. It never assigns a generation itself, so this
-  // message carries none.
-  reserved 3;
 }
 
 message Park {}
@@ -635,7 +626,7 @@ message Exit {
 message Upstream {
   oneof kind {
     Request request = 1;
-    // The main process's report of its own state, unasked (minor 4).
+    // The main process's report of its own state, unasked.
     Report report = 2;
   }
 }

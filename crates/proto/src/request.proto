@@ -24,7 +24,6 @@ package uniserve.request;
 // The first message on a connection, from the engine process.
 message Hello {
   uint32 major = 1;
-  uint32 minor = 2;
   string build = 3;
   // The identity the daemon started the engine process under.
   uint64 engine = 4;
@@ -36,13 +35,9 @@ message Hello {
 // The answer to a `Hello`.
 message Welcome {
   uint32 major = 1;
-  uint32 minor = 2;
   string build = 3;
   // Why the engine is refused; empty when it is accepted.
   string refusal = 4;
-  // Field 5 carried the engine spec, which the launch file carries now.
-  reserved 5;
-  reserved "spec";
 }
 
 // What travels from the engine process after the welcome.
@@ -59,7 +54,7 @@ message FromEngine {
     RequestsDescribed requests_described = 9;
     // TCP artifact bytes, sent contiguously before their Artifact event.
     ArtifactPart artifact_part = 10;
-    // The main process's counters for the frontend's `/metrics` (minor 4).
+    // The main process's counters for the frontend's `/metrics`.
     Metrics metrics = 11;
   }
 }
@@ -138,8 +133,6 @@ enum EngineState {
   ENGINE_STATE_READY = 2;
   // Its start failed or its workers are lost; it serves nothing more.
   ENGINE_STATE_FAILED = 3;
-  reserved 4;
-  reserved "ENGINE_STATE_DRAINING";
   // Prepared: an engine that succeeds a serving one loaded its workers,
   // mapped what it shares with its predecessor read-only, warmed up and
   // captured its graphs; it executes nothing until promoted.
@@ -164,16 +157,12 @@ message EngineInfo {
   uint32 latent_encoding_units = 3;
   // The engine's schedulers, one per DP rank.
   uint32 schedulers = 4;
-  reserved 5;
-  reserved "cache_units";
   // The largest scheduling limits the workers were started for: the
   // schedulers take any limits within them in place (`Configure`).
   BatchCapacity capacity = 6;
   // The KV cache segments of each worker group, which an engine that
   // succeeds this one on the same devices maps.
   repeated CacheSegments segments = 7;
-  reserved 8;
-  reserved "prefix_seed";
   // The roots of the prefix hash chains of the pages the engine's workers
   // compute: equal between epochs whose models and numerics agree, whose
   // pages a successor reuses.
@@ -293,8 +282,6 @@ message Takeover {
 
 // A command for the whole engine.
 message EngineCommand {
-  reserved 2;
-  reserved "drain";
   oneof kind {
     // Finish every request as aborted, close the workers and exit.
     Shutdown shutdown = 1;
@@ -430,11 +417,6 @@ message Scheduling {
   optional uint64 max_queued_requests = 5;
   // Absent for the engine's default.
   optional uint32 chunked_prefill_size = 6;
-  // Field 1 named the scheduling policy's backend, fields 7 and 8 its
-  // draft-cache refill parameters: all three are the policy program's
-  // (§7.7).
-  reserved 1, 7, 8;
-  reserved "policy", "expected_speedup", "refill_token_cost";
 }
 
 // The answer to a `Configure`.
@@ -469,7 +451,6 @@ message ResizeCache {
   // Matches the `Hooked` answer.
   uint64 id = 1;
   CacheChange change = 2;
-  reserved 3, 5, 6, 8, 10, 12, 14;
   // Before the change: epochs of the deployment that keep their weights
   // alone on every node (a previous epoch kept as its weights, whose
   // processes exited), so that a growth takes the rest of their storage.
@@ -499,7 +480,6 @@ message DeviceBytes {
 enum CacheChange {
   // No change: a command that states none is refused.
   CACHE_CHANGE_UNSPECIFIED = 0;
-  reserved 1, 5, 6;
   // Give back the whole KV cache and the CUDA graph storage, keeping the
   // weights, once no request runs.
   CACHE_CHANGE_SLEEP = 2;
@@ -580,7 +560,6 @@ message Commit {
   // Epochs whose storage ends on every node of the engine: the predecessor,
   // whose processes are gone.
   repeated uint64 retire = 2;
-  reserved 3;
 }
 
 // A request for the engine's KV cache segments.
@@ -749,7 +728,6 @@ message ImageInput {
   uint32 position = 3;
   uint32 num_positions = 4;
   repeated ImageEncoderInput encoders = 5;
-  reserved 1;
 }
 
 enum ImageEncoder {
@@ -823,8 +801,6 @@ message CachePolicy {
   bool read = 1;
   bool write = 2;
   optional uint64 isolation_key = 3;
-  reserved 4;
-  reserved "state_seed";
   // The prefix seeds of the epoch whose state a migrated request continues
   // with (an epoch change's `in_flight = keep`).
   repeated uint64 state_seeds = 6;

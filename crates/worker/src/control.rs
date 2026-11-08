@@ -350,7 +350,6 @@ impl Control {
         reader
             .send(&proto::request::wire::Hello {
                 major: proto::PROTOCOL_MAJOR,
-                minor: proto::PROTOCOL_MINOR,
                 build: proto::BUILD.to_owned(),
                 engine: self.engine,
                 // A request link of a process of the deployment: the successor
@@ -579,7 +578,6 @@ mod tests {
             connection
                 .send(&proto::request::wire::Welcome {
                     major: proto::PROTOCOL_MAJOR,
-                    minor: proto::PROTOCOL_MINOR,
                     build: proto::BUILD.to_owned(),
                     refusal,
                 })

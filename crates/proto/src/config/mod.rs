@@ -50,7 +50,7 @@ pub const fn positive(count: usize) -> NonZeroUsize {
 
 /// The HTTP server (`server_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// TCP address the server listens on.
     pub host: String,
@@ -95,7 +95,7 @@ impl Default for ServerConfig {
 
 /// Checkpoint loading (`load_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoadConfig {
     /// Checkpoint reader: `auto`, `safetensors`, `pt`, `layered` (one layer
     /// at a time) or `dummy` (no weights read).
@@ -128,7 +128,7 @@ impl Default for LoadConfig {
 
 /// The KV cache (`kv_cache_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct KvCacheConfig {
     /// Capacity in tokens; sized from storage when unset.
     pub max_tokens: Option<NonZeroU64>,
@@ -190,6 +190,7 @@ impl Default for KvCacheConfig {
 /// Mooncake, the KV storage (`kv_cache_config.mooncake`): the
 /// settings of each Storage Server's Mooncake client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MooncakeConfig {
     /// Mooncake's master, `host:port`.
     pub master: String,
@@ -225,7 +226,7 @@ impl MooncakeConfig {
 
 /// Admission and batching (`scheduler_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SchedulerConfig {
     /// Waiting-queue order: `fcfs` or `priority`.
     pub policy: SchedulingPolicy,
@@ -260,7 +261,7 @@ impl Default for SchedulerConfig {
 /// idle prefill budget of the steps, when the refill policy finds it worth
 /// its cost.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SpeculativeConfig {
     /// The most draft tokens one verification carries per request; zero
     /// does not speculate. The draft cache and the drafter's work belong
@@ -279,7 +280,7 @@ pub struct SpeculativeConfig {
 /// Rank layout without a deployment file, and product transport
 /// (`device_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct DeviceConfig {
     /// Device of every rank; `cuda` numbers each host's GPUs from zero.
     pub device: String,
@@ -313,7 +314,7 @@ impl Default for DeviceConfig {
 
 /// Mixture-of-experts parallelism (`moe_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MoeConfig {
     /// Shard routed experts across the schedulers, the tensor-parallel
     /// ranks of a single scheduler's one worker group, or the deployment's
@@ -338,7 +339,7 @@ impl Default for MoeConfig {
 
 /// CUDA graph capture (`cuda_graph_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct CudaGraphConfig {
     /// `auto` captures graphs unless serving does not capture the attention
     /// provider's calls, `full` requires them, `off` serves eagerly.
@@ -393,7 +394,7 @@ impl Default for CudaGraphConfig {
 
 /// The FlashInfer attention provider (`flashinfer_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct FlashInferConfig {
     /// Workspace per rank.
     #[serde(with = "values::bytes")]
@@ -429,7 +430,7 @@ impl Default for FlashInferConfig {
 
 /// The worker processes (`worker_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct WorkerConfig {
     /// The `uniserve` executable the deployment's main processes run as.
     pub executable: PathBuf,
@@ -507,7 +508,7 @@ pub fn default_executable() -> PathBuf {
 /// What the server logs about its serving (`logging_config`). A process's
 /// log levels are options of the binary that runs it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct LoggingConfig {
     /// Log a summary line for each completed request.
     pub log_requests: bool,
@@ -538,7 +539,7 @@ pub enum ReasoningParser {
 
 /// Chat models: `Qwen3` (`chat_config`).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ChatConfig {
     /// Chat template, as a file path or the template itself.
     pub template: Option<String>,
@@ -554,7 +555,7 @@ pub struct ChatConfig {
 
 /// Fetching input images of chat requests (`image_fetch_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ImageFetchConfig {
     /// Time to fetch one `http(s)` image URL, redirects and body included.
     #[serde(with = "values::duration")]
@@ -580,7 +581,7 @@ impl Default for ImageFetchConfig {
 
 /// MiniMax-H3 video generation (`video_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
     /// Longest admitted clip, 4 to 15 seconds.
     pub max_seconds: f64,
@@ -615,7 +616,7 @@ impl Default for VideoConfig {
 
 /// Condition media of video requests (`media_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MediaConfig {
     /// Directory `file://` condition media resolves under; `file://` is
     /// refused when unset.
@@ -648,7 +649,7 @@ impl Default for MediaConfig {
 /// probes at the entry and exit of the model's components, which export
 /// per-step component durations (`docs/profiling.md`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ProfilingConfig {
     /// Whether the probes record: the device switch every probe reads,
     /// changed in place, at the engine's next step boundary.
@@ -764,7 +765,7 @@ mod content_format {
 
 /// Moving token requests between engines (`migration_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct MigrationConfig {
     /// Migrations caused by lost workers, a lost engine process or a failed
     /// epoch on trial that a request survives; it fails on the next.
@@ -780,7 +781,7 @@ impl Default for MigrationConfig {
 
 /// Asynchronous video jobs (`video_job_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VideoJobConfig {
     /// Time a finished job stays retrievable.
     #[serde(with = "values::duration")]
@@ -802,6 +803,7 @@ impl Default for VideoJobConfig {
 
 /// The model an epoch serves, and how its parameters are represented.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelConfig {
     /// Local model directory or Hugging Face repository.
     pub model: String,
@@ -818,6 +820,7 @@ pub struct ModelConfig {
 
 /// What the leader reads from a model's checkpoint and the engine would otherwise have to guess.
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelFacts {
     /// The model's generation requirements, which the engine intersects with its workers'
     /// capacities.
@@ -836,6 +839,7 @@ pub struct ModelFacts {
 
 /// How an epoch's ranks divide the model and the requests.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ParallelConfig {
     /// Tensor-parallel workers of each scheduler's group when no deployment file is given.
     pub tensor_parallel_size: NonZeroUsize,
@@ -855,6 +859,7 @@ pub struct ParallelConfig {
 /// selects a program's backend or is a program's parameter, which the program layer applies in
 /// place; [`EngineConfig::build_hash`] tells the two apart.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EngineConfig {
     /// The build of the engine executable the epoch runs: a replaced executable is a new epoch
     /// even at the same configuration.
@@ -933,6 +938,7 @@ impl EngineConfig {
 /// Storage Server's socket are runtime facts of the node, which the daemon answers when the
 /// process asks, so they are not here.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EngineArgs {
     /// The epoch's engine configuration, the same for every engine process of the epoch.
     pub engine_config: EngineConfig,
@@ -945,11 +951,9 @@ pub struct EngineArgs {
     /// read-only, parks once it is prepared, and is promoted in place when the serving process of
     /// its failure domain fails. A standby that claimed writable storage would give the scope two
     /// writers, so the role is stated here, before the process claims anything.
-    #[serde(default)]
     pub predecessor: Option<Predecessor>,
     /// The expert order each MoE module loads, keyed by module, once the daemon has rebalanced the
     /// experts; empty for the checkpoint's own order.
-    #[serde(default)]
     pub expert_order: BTreeMap<String, ExpertOrder>,
     /// This node's host identity, which keys this rank's storage claim.
     pub host: String,
@@ -974,18 +978,14 @@ pub struct EngineArgs {
     /// This rank's ordinal inside its group.
     pub rank: u32,
     /// Whether this node holds the epoch's schedulers.
-    #[serde(default)]
     pub scheduler_node: bool,
     /// The addresses on which this node accepts its peer main processes'
     /// connections; empty for a world of one.
-    #[serde(default)]
     pub peers: Vec<String>,
     /// How long a job may run without progress before it is reported
     /// `Stalled`, when the daemon states it apart from the engine configuration.
-    #[serde(default)]
     pub watchdog_timeout_s: Option<u64>,
     /// The probation an update must survive before the daemon commits it.
-    #[serde(default)]
     pub rollback_s: Option<u64>,
     /// The rank layout's queue depth for this rank's worker groups.
     pub queue_depth: u32,

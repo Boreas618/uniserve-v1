@@ -156,7 +156,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ] {
         config.type_attribute(
             format!(".uniserve.request.{message}"),
-            "#[derive(serde::Serialize, serde::Deserialize)] #[serde(default)]",
+            "#[derive(serde::Serialize, serde::Deserialize)]",
         );
     }
     config.compile_fds(descriptors)?;

@@ -165,7 +165,6 @@ impl Control {
         connection
             .send(&process::Hello {
                 major: proto::PROTOCOL_MAJOR,
-                minor: proto::PROTOCOL_MINOR,
                 build: proto::BUILD.to_owned(),
                 peer: Some(hello::Peer::Frontend(process::Frontend {
                     deployment: deployment.to_owned(),
@@ -386,7 +385,6 @@ mod tests {
             connection
                 .send(&process::Welcome {
                     major: proto::PROTOCOL_MAJOR,
-                    minor: proto::PROTOCOL_MINOR,
                     build: proto::BUILD.to_owned(),
                     refusal: String::new(),
                     nodes: Vec::new(),

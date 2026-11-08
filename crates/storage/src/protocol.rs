@@ -75,12 +75,12 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Wire contract negotiated when a Storage Server client connects. Committed
-/// pages stay reusable by content key until ordinary eviction; only a
-/// epoch's uncommitted publications are discarded when it retires. A
-/// [`Reply::Ledger`] answering a [`Request::Ledger`] carries what the
-/// deployment's transfer tasks copied ([`TransferTotal`]). Version 19 names
-/// the epoch where earlier versions named the world.
+/// The protocol version a Storage Server and its clients speak; a server
+/// refuses a client of any other. Committed pages stay reusable by content key
+/// until ordinary eviction; only an epoch's uncommitted publications are
+/// discarded when it retires. A [`Reply::Ledger`] answering a
+/// [`Request::Ledger`] carries what the deployment's transfer tasks copied
+/// ([`TransferTotal`]).
 pub const VERSION: u32 = 19;
 
 /// The most bytes a [`Request::Read`] answers with: a weight manifest of the
@@ -149,11 +149,7 @@ pub enum Role {
     /// and it reads its own epoch's pages and those every epoch shares.
     /// Uncommitted epochs keep pages and tensors private until publication;
     /// retiring such an epoch discards its pages.
-    Head {
-        deployment: String,
-        #[serde(default)]
-        epoch: u64,
-    },
+    Head { deployment: String, epoch: u64 },
     /// A worker of `scope` in `epoch`, started by the launch `generation` of
     /// its group, for the head that holds `claim`.
     Worker {
@@ -162,7 +158,6 @@ pub enum Role {
         claim: Claim,
         /// The epoch the worker belongs to: the head's identity of the
         /// processes that execute one configuration of the deployment.
-        #[serde(default)]
         epoch: u64,
     },
     /// The Mooncake connector the server runs.
@@ -223,8 +218,7 @@ pub struct StorageRecord {
     pub bytes: u64,
     /// The KV cache segment the storage is part of, which its GPU's ledger
     /// books as that segment ([`Item::CacheSegment`]); `None` for any other
-    /// storage, and for every storage of a client of protocol 5.
-    #[serde(default)]
+    /// storage.
     pub segment: Option<Segment>,
     /// The fabric handle the device allocation's creator exported, when it
     /// holds the allocation and its GPU belongs to an NVLink fabric
@@ -232,7 +226,6 @@ pub struct StorageRecord {
     /// to copy the storage over NVLink while the creator holds it. `None`
     /// for host storage, for an allocation without one, and for every
     /// storage of a client that states none.
-    #[serde(default)]
     pub fabric: Option<FabricHandle>,
 }
 
@@ -354,7 +347,6 @@ pub struct GpuLedger {
     /// second, as the host's Transfer Server measured it when it started;
     /// `None` while none did. What returns from host storage to the GPU
     /// takes its bytes over this time.
-    #[serde(default)]
     pub host_link_bytes_per_second: Option<u64>,
     /// The device storage the Transfer Server's CUDA context takes on the
     /// GPU while it holds one, as it measured it when it started; 0 when no
@@ -362,7 +354,6 @@ pub struct GpuLedger {
     /// ([`Item::TransferContext`]) only while the Transfer Server holds the
     /// context, from its first work on the GPU to its last, so a plan that
     /// leaves room for transfers counts it whether or not it is booked.
-    #[serde(default)]
     pub transfer_context: u64,
 }
 
@@ -597,11 +588,7 @@ pub enum Region {
     /// written: a read-only tensor is immutable. A key with copies at
     /// several locations names the copy at `at`; `None` names the key's
     /// only copy.
-    Tensor {
-        key: Key,
-        #[serde(default)]
-        at: Option<Location>,
-    },
+    Tensor { key: Key, at: Option<Location> },
     /// A live page pool of the caller's deployment; offsets count from slot
     /// 0, at `slot × page_bytes`.
     Pool { pool: u64 },
@@ -820,7 +807,6 @@ pub struct Registered {
     /// its creator recorded one ([`StorageRecord::fabric`]): a reader whose
     /// GPU imports it copies the range over the NVLink fabric rather than
     /// READ it.
-    #[serde(default)]
     pub fabric: Option<FabricExport>,
 }
 
@@ -860,9 +846,7 @@ pub enum Request {
     /// on it.
     Claim {
         scopes: Vec<Scope>,
-        #[serde(default)]
         epoch: u64,
-        #[serde(default)]
         retire: Vec<u64>,
     },
     /// Publish all listed committed epochs together. Claimed epochs remain
@@ -872,11 +856,7 @@ pub enum Request {
     /// Release every tensor the caller's scope retains in the caller's epoch
     /// that `keys` does not list; the copies of listed keys at the locations
     /// `at` lists are retained (every copy when `at` is empty).
-    Retain {
-        keys: Vec<Key>,
-        #[serde(default)]
-        at: Vec<Location>,
-    },
+    Retain { keys: Vec<Key>, at: Vec<Location> },
     /// Epochs in the head's deployment retain their weights and the exact
     /// `cache_keys` holding completed rollback copies. Their retention of
     /// every other exclusive tensor ends. A tensor no other epoch retains
@@ -912,7 +892,6 @@ pub enum Request {
     Get {
         keys: Vec<Key>,
         mode: Mode,
-        #[serde(default)]
         at: Vec<Location>,
     },
     /// Allocate an exclusive byte tensor in host storage after host
@@ -945,7 +924,6 @@ pub enum Request {
     /// its location.
     Rekey {
         moves: Vec<(Key, Key)>,
-        #[serde(default)]
         at: Vec<Location>,
     },
     /// Every tensor, storage and claim the server holds.
@@ -978,7 +956,6 @@ pub enum Request {
     PagePool {
         shape: PageShape,
         numa_node: Option<u32>,
-        #[serde(default)]
         bytes: Option<u64>,
     },
     /// Where each page of `keys` is: committed in the pool (L2), in the KV
@@ -1259,7 +1236,6 @@ pub enum Reply {
     Ledger {
         ledgers: Vec<GpuLedger>,
         host: HostStorage,
-        #[serde(default)]
         transfers: Vec<TransferTotal>,
     },
     /// The task a [`Request::Transfer`] submitted.
@@ -1315,13 +1291,10 @@ pub struct Listing {
     /// The page pools.
     pub page_pools: Vec<ListedPool>,
     /// Whether the Mooncake connector is connected.
-    #[serde(default)]
     pub connector: bool,
     /// The Transfer Server, while it is connected.
-    #[serde(default)]
     pub transfer: Option<ListedTransfer>,
     /// Every deployment's ledger of every GPU the server books.
-    #[serde(default)]
     pub ledgers: Vec<GpuLedger>,
 }
 
@@ -1373,7 +1346,6 @@ pub struct TransferTotal {
 pub struct ListedPool {
     pub pool: u64,
     /// The deployment the pool belongs to.
-    #[serde(default)]
     pub deployment: String,
     pub shape: PageShape,
     pub numa_node: Option<u32>,
@@ -1395,7 +1367,6 @@ pub struct ListedTensor {
     pub name: String,
     pub scopes: Vec<Scope>,
     /// The `(scope, epoch)` pairs that retain the tensor.
-    #[serde(default)]
     pub retainers: Vec<Retainer>,
     pub location: Location,
     /// Bytes of the tensor's storage.
@@ -1415,7 +1386,6 @@ pub struct ScopeBytes {
     pub gpu: Option<[u8; 16]>,
     pub scope: Scope,
     /// The epoch whose scope holds the bytes.
-    #[serde(default)]
     pub epoch: u64,
     pub bytes: u64,
 }
@@ -1483,7 +1453,6 @@ pub enum Event {
     Throttle {
         links: Vec<Link>,
         throttle: Throttle,
-        #[serde(default)]
         tasks: Vec<u64>,
     },
     /// To the Transfer Server: register `allocations`, each given before,

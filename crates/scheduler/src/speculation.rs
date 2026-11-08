@@ -15,7 +15,7 @@
 //! (zero to the deployment's limit and the request's remaining tokens);
 //! otherwise it verifies none, a verification row of one token, and decodes
 //! correctly. A draft cache goes missing when the request reuses a prefix
-//! whose draft pages the pool lacks, when an epoch change moves it from a
+//! whose draft pages the pool lacks, when an epoch change moves it from an
 //! epoch that did not speculate, or when its draft pages were released to
 //! make room for another request's required pages. Its forwards keep
 //! writing the entries of their own positions ([`DraftCache::tail`]); a
