@@ -932,29 +932,18 @@ pub struct HostCacheKeys {
     pub endpoint: Option<String>,
 }
 
-/// One pool of the deployment a worker serves (4.2, 7.3).
-#[derive(Clone, Debug, Default)]
+/// One pool of the deployment a worker serves (4.2, 7.3): a worker group of the deployment, and
+/// what each of its ranks reported.
+#[derive(Clone, Debug)]
 pub struct Inventory {
-    /// The deployment's name for the pool, the identity the mechanism's `WorkerGroupId` carries.
-    pub group: String,
-    /// The pool's ranks in launch order, each with what it reported at handshake.
+    /// The worker group as the deployment states it: its identity, ranks, queue depth and blocks.
+    /// The ranks' reports do not carry these back, so the scheduler reads them here.
+    pub group: proto::config::WorkerGroupConfig,
+    /// The group's ranks in rank order, each with what it reported at handshake.
     pub ranks: Vec<MainProcessInfo>,
-    /// What the deployment launched the pool with; the ranks' reports do not carry it back.
-    pub layout: PoolLayout,
     /// The longest sequence the pool's model was built for: the attention descriptor's static bound
     /// on the keys one row reads.
     pub max_model_len: u32,
-}
-
-/// What a deployment launched one pool with (4.2).
-#[derive(Clone, Debug, Default)]
-pub struct PoolLayout {
-    /// Unresolved physical batches the pool admits at once, counted as at least one.
-    pub queue_depth: usize,
-    /// Ranks the pool was launched with, counted as at least one.
-    pub ranks: usize,
-    /// The pool's components by name, each with its member ranks, parallel degrees and distribution.
-    pub components: std::collections::BTreeMap<String, BlockConfig>,
 }
 
 /// The mechanism's `Batches` over a node's devices (2.4, 4.4): a batch goes to every device whose
@@ -1168,7 +1157,7 @@ impl Batches for Workers {
         Ok(self
             .inventory
             .iter()
-            .map(|pool| (pool.group.clone(), ranks.clone()))
+            .map(|pool| (pool.group.id.0.clone(), ranks.clone()))
             .collect())
     }
 

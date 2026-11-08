@@ -80,8 +80,8 @@ pub use crate::handle::{
 pub use crate::worker::{BatchResult, CallResult, Worker};
 pub use crate::worker::{
     BlockConfig, BlockDistribution, CommandOutcome, CommandResult, ConnectorConfig,
-    ConnectorConfigError, ConnectorEdge, ExecuteError, ExecutionBatch, PageOffloads, PoolLayout,
-    RankBuffer, RankEncoderPools, RequestDispatch, SequenceParallel, TransferBackend, WorkerError,
+    ConnectorConfigError, ConnectorEdge, ExecuteError, ExecutionBatch, PageOffloads, RankBuffer,
+    RankEncoderPools, RequestDispatch, SequenceParallel, TransferBackend, WorkerError,
     WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
 };
 // The engine schedules requests in the request vocabulary its daemon
