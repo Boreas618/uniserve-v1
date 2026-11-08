@@ -405,7 +405,7 @@ impl ModelRunner {
     }
 
     /// The epoch's engine configuration (§7.2).
-    fn engine_config(&self) -> &proto::config::EngineConfig {
+    pub(crate) fn engine_config(&self) -> &proto::config::EngineConfig {
         &self.launch.engine_config
     }
 
@@ -1289,13 +1289,9 @@ impl ModelRunner {
                     // A request may ask for any top-k it likes, so the candidate width is the
                     // vocabulary: a narrower buffer would silently sample a different set.
                     width: narrow(model.config().vocab_size, "vocab_size")?,
-                    // The page size the resident cache was planned with, not the one the model
-                    // asked for: the capacity plan may have had to take a smaller page, and a
-                    // runner that read a different one would address another request's pages.
-                    // A plan that disagrees with the model's stated page size is refused here,
-                    // naming both figures, rather than served.
-                    page_size: cache_page_size(memory, &model)?,
-                    max_kv_len: self.max_kv_len(served)?,
+                    // The model's page, which the resident cache was planned with.
+                    page_size: model.page_tokens(),
+                    max_kv_len: self.engine_config().model.max_model_len,
                 };
                 let stream = platform::Stream::new(device)
                     .with_context(|| format!("creating device {}'s stream", device.0))?;
@@ -1570,82 +1566,51 @@ impl ModelRunner {
                 )
             }
         };
-        // Everything the engine states about the rank, and what the rank reports of itself. The two
-        // differ in one field between the classes: a rank that keeps a paged cache states its
-        // geometry and a rank that keeps none states its absence, and each planner refuses the
-        // other's value by name.
-        let (facts, report) = match served {
+        // What the rank states to the memory planner, and what it reports of itself. The two classes
+        // differ in the cache: a rank that keeps a paged cache states the one its model reads, and a
+        // rank that keeps none states its absence.
+        let (request, report) = match served {
             Served::Text(model) => {
-                // The KV geometry is the model's own: its layer count, the heads each layer stores
-                // and the width of a head. Every figure comes from `config()`, so a checkpoint whose
-                // shape this build cannot state is refused by name rather than planned with a
-                // literal.
+                // The KV layout is the model's own: its page, its layer count, the heads each layer
+                // stores and the width of a head. Every figure comes from the model and its
+                // `config()`, so a checkpoint whose shape this build cannot state is refused by name
+                // rather than planned with a literal.
                 let config = model.config();
-                let cache = worker::capacity::CacheGeometry {
-                    layers: narrow(config.num_hidden_layers, "num_hidden_layers")?,
-                    // A tensor rank stores the heads its attention holds.
-                    kv_heads: narrow(
-                        model.partition().local_key_value_heads(config),
-                        "num_key_value_heads",
-                    )?,
-                    head_dim: narrow(config.head_dim, "head_dim")?,
-                };
-                let facts = worker::capacity::RankFacts {
+                let cache =
+                    worker::memory::CachePlan::new(worker::memory::CacheDescription::dense(
+                        model.page_tokens(),
+                        narrow(config.num_hidden_layers, "num_hidden_layers")?,
+                        // A tensor rank stores the heads its attention holds.
+                        narrow(
+                            model.partition().local_key_value_heads(config),
+                            "num_key_value_heads",
+                        )?,
+                        narrow(config.head_dim, "head_dim")?,
+                        cache_dtype(model, self.engine_config().kv_cache.dtype)?,
+                    ))
+                    .context("describing the model's KV cache")?;
+                let request = worker::capacity::MemoryRequest {
                     device: worker::config::Device::Cuda(device),
-                    host: &host,
                     epoch: self.cache_epoch.unwrap_or(self.launch.epoch),
-                    world_size: self.world_size,
                     queue_depth: self.queue_depth(),
-                    // The model's page is the preset: the plan returns it or fails, and a plan that
-                    // lowered it would leave every runner addressing pages the pool does not hold.
-                    block_size: Some(model.page_tokens()),
                     max_batch_calls: rows as usize,
                     max_batch_tokens: tokens as usize,
-                    max_request_pool_size: self.engine_config().max_running_requests.get(),
-                    max_model_len: self.max_kv_len(served)? as usize,
-                    max_total_tokens: self
-                        .engine_config()
-                        .kv_cache
-                        .max_tokens
-                        .map(|tokens| usize::try_from(tokens.get()))
-                        .transpose()
-                        .context("kv_cache_config.max_tokens")?,
+                    cache: Some(Arc::new(cache)),
                     segments: self.adopted_cache.clone(),
-                    mem_fraction_static: self.engine_config().mem_fraction_static,
-                    cache: Some(cache),
-                    kv_dtype: cache_dtype(model, self.engine_config().kv_cache.dtype)?,
                     transport_bytes: self.transport_bytes(device, model)?,
                 };
-                (facts, rank_report(device, host)?)
+                (request, rank_report(device, host)?)
             }
             Served::Media(_) => {
-                let facts = worker::capacity::RankFacts {
+                // No cache: the media class addresses no paged request.
+                let request = worker::capacity::MemoryRequest {
                     device: worker::config::Device::Cuda(device),
-                    host: &host,
                     epoch: self.launch.epoch,
-                    world_size: self.world_size,
                     queue_depth: self.queue_depth(),
-                    // No page and no cache: the media class addresses no paged request, so the
-                    // three figures a cache is described by are absent. `kv_dtype` is the
-                    // deployment's own setting, kept here because the struct states one and the
-                    // media plan fits no cache to apply it to.
-                    block_size: None,
                     max_batch_calls: rows as usize,
                     max_batch_tokens: tokens as usize,
-                    max_request_pool_size: self.engine_config().max_running_requests.get(),
-                    max_model_len: self.max_kv_len(served)? as usize,
-                    max_total_tokens: None,
-                    segments: None,
-                    mem_fraction_static: self.engine_config().mem_fraction_static,
                     cache: None,
-                    // The media plan fits no cache, so this figure is never read: it states the
-                    // element type the rank's states are held in, which is the deployment's own
-                    // model type rather than a cache setting the deployment did not make.
-                    kv_dtype: match self.engine_config().model.dtype {
-                        proto::request::ModelDtype::Float16 => ipc::PrefixCacheDtype::Float16,
-                        proto::request::ModelDtype::BFloat16 => ipc::PrefixCacheDtype::BFloat16,
-                        proto::request::ModelDtype::Float32 => ipc::PrefixCacheDtype::Float32,
-                    },
+                    segments: None,
                     transport_bytes: 0,
                 };
                 let clips = frame_clips()?;
@@ -1662,7 +1627,7 @@ impl ModelRunner {
                     .filter(|denoiser| denoiser.places_encoders())
                     .map_or(0, |denoiser| denoiser.rules().arrangement().condition_rows);
                 let bounds = MediaBounds {
-                    prompt_tokens: self.max_kv_len(served)?,
+                    prompt_tokens: self.engine_config().model.max_model_len,
                     video_units: clips.units(clips.align_up(frames as u32)),
                     condition_rows,
                 };
@@ -1671,15 +1636,12 @@ impl ModelRunner {
                 } else {
                     "transformer"
                 };
-                (facts, media_rank_report(device, host, bounds, denoiser)?)
+                (request, media_rank_report(device, host, bounds, denoiser)?)
             }
         };
         // The ranks of this process agree over the group the main process formed at start, and a
         // world of one rank is a group of one member.
-        let planned = match served {
-            Served::Text(_) => worker::capacity::plan_rank(&facts, report, group)?,
-            Served::Media(_) => worker::capacity::plan_media(&facts, report, group)?,
-        };
+        let planned = worker::capacity::plan_rank(self.engine_config(), &request, report, group)?;
         // The keys and values the plan fitted are the process's resident pool: a unit is a cache
         // unit, and the plan charged them all against the same device allowance the pools are
         // booked against. A plan that fitted no cache (a rank that serves none) states zero.
@@ -1718,7 +1680,6 @@ impl ModelRunner {
             },
             storage,
         )
-        .map_err(|error| error)
         .context("opening the rank's resident memory")?;
         // The plan's own account of this rank is what the scheduler is told about its pool: the
         // capacities it fitted, the cache it holds and where it is. It is the same `MainProcessInfo` the
@@ -1746,11 +1707,6 @@ impl ModelRunner {
     /// The ranks of this process's group; one process holds one pool, so it is the deployment's.
     pub(crate) fn world_size(&self) -> usize {
         self.world_size
-    }
-
-    /// The keys a row reads at most: the cache's bound, from the epoch's context length.
-    pub(crate) fn max_kv_len(&self, _served: &Served) -> Result<u32> {
-        Ok(self.engine_config().model.max_model_len)
     }
 }
 
@@ -2138,33 +2094,6 @@ fn cache_dtype(
         DType::F8E4M3 => Ok(proto::request::PrefixCacheDtype::Float8E4m3Fn),
         other => bail!("this build plans no KV cache in a model whose activations are {other:?}"),
     }
-}
-
-/// The page size the resident cache was planned with, checked against the model's (§4.5, §8).
-///
-/// The model states the page it reads; the capacity plan states the page it could afford, and the
-/// two must be the same page. A runner that served the model's figure while the pool held another
-/// would read another request's tokens out of the cache - wrong tokens with no error - so this is a
-/// refusal at spawn, naming both figures, and the block table and the sampler read the same one.
-fn cache_page_size(memory: &Memory, model: &qwen3_moe::Qwen3Moe) -> Result<u32> {
-    let cache = memory
-        .shared_cache()
-        .context("the model reads a paged cache and this rank opened none")?;
-    let cache = cache
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let planned = cache
-        .layer_planes(0, 0)
-        .context("reading the resident cache's planned page size")?
-        .block_size;
-    let stated = model.page_tokens();
-    if planned != stated {
-        bail!(
-            "the model reads {stated} tokens per cache page and the resident cache was planned \
-             with {planned}; the pool would hold pages the runner does not address"
-        );
-    }
-    Ok(planned)
 }
 
 /// The targets this rank resolves a module for: the architecture-specific instruction set of every

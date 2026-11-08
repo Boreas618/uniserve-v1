@@ -41,7 +41,6 @@ use std::sync::Arc;
 use platform::Stream;
 
 use self::buffer::BufferPool;
-use self::latent::LatentStorage;
 use self::pinned_pool::PinnedPool;
 use self::products::ProductStore;
 use self::request_slots::RequestSlots;
@@ -58,10 +57,8 @@ use crate::Result;
 pub struct Memory {
     /// The KV cache planes, their block tables and their host pages, or `None` on a rank that
     /// keeps no paged cache: a media rank's resident state is each request's own footprint, and
-    /// what it opens here is the product store, the latent pages and the request slots.
+    /// what it opens here is the product store and the request slots.
     pub prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
-    /// The latent pages of diffusion and media calls, on a rank that stores a pool.
-    pub latents: Option<LatentStorage>,
     /// The products of cross-call tensors.
     pub products: ProductStore,
     /// The banks of the layers a request keeps per slot.
@@ -202,19 +199,8 @@ impl Memory {
                 Arc::clone(&request.conversion),
             )?),
             // A rank that keeps no paged cache still owns the rest: the products its runners
-            // publish, the latent pages a denoiser stages and the request slots its scheduler
-            // hands out. Only the cache planes and their block tables are absent.
+            // publish and the request slots its scheduler hands out. Only the cache planes and their block tables are absent.
             (None, _) => None,
-        };
-        let latents = match plan.latent.as_ref() {
-            Some(latent) => Some(LatentStorage::allocate(
-                latent,
-                request.device,
-                request.stream,
-                "latent",
-                storage,
-            )?),
-            None => None,
         };
         // One buffer pool per rank, given to the product store, which binds the scheduler's
         // dispatches into it; a second pool would allocate the same bytes twice.
@@ -238,7 +224,6 @@ impl Memory {
         let pinned = PinnedPool::new(request.device);
         Ok(Self {
             prefix_cache: cache.map(|cache| Arc::new(Mutex::new(cache))),
-            latents,
             products,
             slots,
             pinned,
@@ -251,14 +236,13 @@ impl Memory {
 
     /// Releases every owner, in the design's order: the products and the
     /// encoders first, then the cache planes (which give their segments back),
-    /// the latents, the slots, the buffer pool and the page-locked blocks.
+    /// the slots, the buffer pool and the page-locked blocks.
     ///
     /// The owners' storage returns itself as each owner goes, so this needs no
     /// storage handle; it is the main process's last call on `Memory`.
     pub fn close(self) -> Result<()> {
         let Memory {
             prefix_cache,
-            latents,
             products,
             slots,
             pinned,
@@ -272,7 +256,6 @@ impl Memory {
         if let Some(cache) = prefix_cache {
             lock(&cache).close()?;
         }
-        drop(latents);
         drop(slots);
         drop(pinned);
         Ok(())
@@ -281,7 +264,7 @@ impl Memory {
     /// The device bytes this rank's owners map, which the metrics report states
     /// as the `resident` pool.
     ///
-    /// It is the cache planes, the latent pages, the product store's arenas and
+    /// It is the cache planes, the product store's arenas and
     /// the request-slot banks, and it counts MAPPED device storage only: host and
     /// page-locked storage is outside the device's budget, and a sleeping rank's
     /// released segments are not in it. It excludes the graph pools and the
@@ -295,11 +278,7 @@ impl Memory {
             .prefix_cache
             .as_ref()
             .map_or(0, |cache| lock(cache).mapped_bytes());
-        let latents = self
-            .latents
-            .as_ref()
-            .map_or(0, |latents| latents.mapped_bytes());
-        planes + latents + self.products.mapped_bytes() + self.slots.mapped_bytes()
+        planes + self.products.mapped_bytes() + self.slots.mapped_bytes()
     }
 
     /// Release the resident cache segments: what a sleep gives back and a wake

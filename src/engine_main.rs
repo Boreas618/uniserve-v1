@@ -8112,7 +8112,7 @@ fn schedulers(
                 })
                 .collect(),
         },
-        max_model_len: model_runner.max_kv_len(model)?,
+        max_model_len: model_runner.engine_config().model.max_model_len,
     };
     let mut stated = worker::batch::Workers::shared(workers.iter().map(Arc::clone).collect())?
         .stating(vec![inventory])
