@@ -1106,7 +1106,6 @@ fn adopted_epoch(
         previous_policy: None,
         status: crate::epoch::Status::Serving,
         generation: None,
-        world,
     };
     let process = crate::epoch::ManagedProcess {
         role: crate::epoch::Role::MainProcess,
@@ -1141,7 +1140,6 @@ mod tests {
         let (record, process) =
             adopted_epoch(7, 12, &options, None).expect("the configuration resolves");
         assert_eq!(record.status, crate::epoch::Status::Serving);
-        assert_eq!(record.world, 7);
         assert_eq!(
             record.generation, None,
             "the model generation is not the launch generation the child reported"

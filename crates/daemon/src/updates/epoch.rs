@@ -97,10 +97,7 @@ pub(crate) fn epoch_arm(
         .request_socket()
         .to_string_lossy()
         .into_owned();
-    let mut record = record(previous, target, change.previous, epochs)?;
-    // The world allocation this epoch executes: the epoch number today, so
-    // the switch's claims and the record name the same world.
-    record.world = change.target;
+    let record = record(previous, target, change.previous, epochs)?;
 
     if dry_run {
         // Nothing is written and nothing starts: the plan names what the
@@ -334,7 +331,6 @@ mod tests {
             previous_policy: None,
             status: Status::Serving,
             generation: Some(4),
-            world: 11,
         }
     }
 
