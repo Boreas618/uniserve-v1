@@ -156,7 +156,7 @@ impl Scheduler {
         // A stated bound the executor cannot hold is lowered here, never refused, when nothing
         // checks a decision against it: these three size a batch. A policy's own limits are the
         // mechanism's check and are refused instead, before weights
-        // (`crate::engine_plan`'s `tier_refusal`). Each clamp names the option, the figure the
+        // (`crate::model_runner`'s `tier_refusal`). Each clamp names the option, the figure the
         // deployment stated and the figure the rank holds - a lowered bound whose numbers are
         // missing from the log is the same defect one severity down.
         let requested_seqs = config.max_running_requests.max(1);

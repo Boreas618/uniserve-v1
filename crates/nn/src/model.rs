@@ -4,7 +4,7 @@
 //! addressed by a name and a phase — and the consumer half is not wired yet. A model builds one of
 //! these with its own loader (`qwen3_moe::Qwen3Moe::into_model`,
 //! `minimax_h3::MinimaxH3::into_model`) and nothing in the tree hands it on: the engine's plan
-//! (`src/engine_plan.rs`) ends at `Arc<qwen3_moe::Qwen3Moe>`, and the executor's runners
+//! (`src/model_runner.rs`) ends at `Arc<qwen3_moe::Qwen3Moe>`, and the executor's runners
 //! (`crates/executor/src/runners/`) address work by `ipc::PhaseId` with no block registry. **The
 //! consumer is `exec`'s to land**; until it does, this is a stated contract whose other half is owed
 //! rather than a path a run exercises.

@@ -140,7 +140,7 @@ def program_target() -> str:
     """The target this host's modules are built for.
 
     The engine derives it from the device it serves — ``sm_{major}{minor}a``
-    (``src/engine_plan.rs``) — and a store built for another target describes
+    (``src/model_runner.rs``) — and a store built for another target describes
     nothing to overlay: the precopy then fails at the module lane rather than
     the build. So the default is the served device's own compute capability,
     read the way this file already reads that device; the environment's

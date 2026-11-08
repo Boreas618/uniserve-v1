@@ -579,7 +579,7 @@ pub fn token_plan(
 ) -> Result<Plan> {
     let mut layout = TokenLayout::new(report, request, queue_depth, facts)?;
     // A rank that fits no cache keeps no paged request, so nothing reads a page size and none is
-    // agreed: `plan_media` is that rank (`src/engine_plan.rs` reaches this for the media class).
+    // agreed: `plan_media` is that rank (`src/model_runner.rs` reaches this for the media class).
     // The halving loop must not see it - it asks every resident layer's attention for a size the
     // rank never addresses, halves to zero and reports "no block size is read" about a block size
     // nothing reads. One probe answers which rank this is; a preset needs none.

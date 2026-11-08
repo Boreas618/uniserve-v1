@@ -89,7 +89,7 @@ const CANDIDATE_TILE: u32 = 8192;
 ///
 /// It is the **vocabulary**, not a top-k bound: a request may ask for any top-k it likes, so the
 /// runner builds the sampler with a candidate buffer as wide as the vocabulary — a narrower one
-/// would silently sample a different set (`crates/executor/src/engine_plan.rs`, the one place a
+/// would silently sample a different set (`src/model_runner.rs`, the one place a
 /// runner's geometry is stated). A deployment that narrowed it would change these keys, which is
 /// why the width is a descriptor field at all.
 const CANDIDATE_WIDTH: u32 = VOCABULARY;

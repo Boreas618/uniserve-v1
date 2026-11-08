@@ -176,7 +176,7 @@ def _precompiler() -> Path:
 def _program_target() -> str:
     """The target this host's modules are built for: the served device's own ``sm_{major}{minor}a``.
 
-    ``src/engine_plan.rs`` derives the same string from the device it serves, and a store built for
+    ``src/model_runner.rs`` derives the same string from the device it serves, and a store built for
     another target describes nothing to overlay. ``UNISERVE_PROGRAM_TARGET`` names one instead, for
     a host whose store is provisioned elsewhere.
     """
