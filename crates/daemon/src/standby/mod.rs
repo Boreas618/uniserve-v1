@@ -1,7 +1,7 @@
 //! The standby main processes of the serving epoch (design §2.5).
 //!
 //! Beside every node's serving main process the daemon keeps a parked
-//! standby child of the same group, rank and world at the next launch
+//! standby child of the same group, rank and epoch at the next launch
 //! generation. The child has its own CUDA contexts, so a sticky error of the
 //! serving process cannot touch it; it maps the epoch's weights and cache
 //! read-only by the existing rules, captures its graphs on warmup scratch
@@ -16,7 +16,7 @@
 //! The failure-domain rules are the engine's (`crates/scheduler/src/worker/
 //! group/{spawn,standby,relaunch}.rs`), carried over to main processes:
 //!
-//! - One domain holds every main process that shares a cross-node world; a
+//! - One domain holds every main process that shares a cross-node epoch; a
 //!   node in no cross-node group is a domain of its own.
 //! - A domain promotes wholly or not at all: if any member has no parked
 //!   standby, every member is replaced by a relaunch instead.
@@ -56,9 +56,9 @@ pub struct MainProcess {
     /// nothing, and the caller takes a number, records it with
     /// [`Roster::allocated`] and asks again.
     pub standby_generation: u64,
-    /// The cross-node world the node's process joins; `None` when the node
+    /// The cross-node epoch the node's process joins; `None` when the node
     /// is in no cross-node group and is therefore a failure domain alone.
-    pub world: Option<u64>,
+    pub epoch: Option<u64>,
 }
 
 /// What a node's devices can keep of a parked standby.
@@ -211,16 +211,16 @@ pub struct Roster {
 
 impl Roster {
     /// The roster of the epoch's main processes, one per node; the failure
-    /// domains are derived from the cross-node worlds they join.
+    /// domains are derived from the cross-node epochs they join.
     pub fn new(processes: Vec<MainProcess>) -> Self {
         let mut domains: Vec<Vec<usize>> = Vec::new();
-        let mut world_domain: BTreeMap<u64, usize> = BTreeMap::new();
+        let mut epoch_domain: BTreeMap<u64, usize> = BTreeMap::new();
         let mut domain_of = vec![0; processes.len()];
         for (index, process) in processes.iter().enumerate() {
-            // The nodes of one cross-node world share a domain; a node in no
-            // world opens one of its own.
-            let domain = match process.world {
-                Some(world) => *world_domain.entry(world).or_insert_with(|| {
+            // The nodes of one cross-node epoch share a domain; a node in no
+            // epoch opens one of its own.
+            let domain = match process.epoch {
+                Some(epoch) => *epoch_domain.entry(epoch).or_insert_with(|| {
                     domains.push(Vec::new());
                     domains.len() - 1
                 }),
@@ -372,7 +372,7 @@ impl Roster {
     /// standby (the child mapped the epoch's weights and cache read-only,
     /// captured its graphs on warmup scratch and parked). A child whose
     /// preparation failed reports that failure instead, which the caller
-    /// feeds to [`Roster::standby_lost`]: a standby world is kept whole or not
+    /// feeds to [`Roster::standby_lost`]: a standby epoch is kept whole or not
     /// at all.
     pub fn parked(&mut self, host: &str, generation: u64) {
         let Some(domain) = self.domain_of(host) else {
@@ -394,7 +394,7 @@ impl Roster {
 
     /// A standby child of `host` is gone: it failed to start or died, or it
     /// reported that its preparation failed (`Report::Parked` never came). A
-    /// domain's standby is one world: a member's loss drops every member's
+    /// domain's standby is one epoch: a member's loss drops every member's
     /// standby, and the domain relaunches when it next fails.
     pub fn standby_lost(&mut self, host: &str) -> Vec<Action> {
         let Some(domain) = self.domain_of(host) else {
@@ -694,7 +694,7 @@ impl Roster {
             });
             return actions;
         }
-        // The members that remain shared a world with the dead node: their
+        // The members that remain shared an epoch with the dead node: their
         // serving children are replaced, and the requests migrate off the
         // node that cannot run. The epoch's rank layout loses the node, which
         // the caller decides.

@@ -1,19 +1,19 @@
-//! Moving a world's weights between its GPUs and host storage: a previous
-//! world kept in host storage on trial (`Request::Offload`), and returned
+//! Moving an epoch's weights between its GPUs and host storage: a previous
+//! epoch kept in host storage on trial (`Request::Offload`), and returned
 //! to its GPUs before it starts again at a rollback (`Request::Restore`).
 //!
 //! The server never copies a byte itself: its Transfer Server does. An
-//! offload takes every device storage of read-only tensors that the world
+//! offload takes every device storage of read-only tensors that the epoch
 //! alone retains, creates host storage of each one's size (admitted under
 //! the host rule as one, so a refused offload moves nothing), and has the
 //! Transfer Server copy each storage there. A restore takes every host
-//! storage an offload of the world left, has the Transfer Server create
+//! storage an offload of the epoch left, has the Transfer Server create
 //! device storage of each one's size on the GPU it came from (admitted
 //! against that GPU's ledger first) and copy it back. Only once every copy
 //! of a move ended do its tensors lie in the copies and the storages they
 //! left go: each GPU's ledger then books the move's effect at once, the
-//! device storage an offload freed for the other world, the device storage a
-//! restore took for the world that starts again. A copy that fails leaves
+//! device storage an offload freed for the other epoch, the device storage a
+//! restore took for the epoch that starts again. A copy that fails leaves
 //! every tensor where it was and releases the copies made so far.
 //!
 //! The head's request is answered when its move ends, and holds its
@@ -73,7 +73,7 @@ struct Item {
 
 impl Server {
     /// Checks a head's [`Request::Offload`] (`to_host`) or
-    /// [`Request::Restore`] of `world` of `deployment` and picks its
+    /// [`Request::Restore`] of `epoch` of `deployment` and picks its
     /// storages: answered at once when there is none, refused when the
     /// host (an offload) or a GPU's ledger (a restore) cannot hold them,
     /// or when no Transfer Server runs.
@@ -84,7 +84,7 @@ impl Server {
         &self,
         id: ClientId,
         deployment: &str,
-        world: u64,
+        epoch: u64,
         to_host: bool,
     ) -> Result<Outcome, (ErrorKind, String)> {
         if !self
@@ -93,18 +93,18 @@ impl Server {
             .is_some_and(|entry| entry.head == Some(id))
         {
             return Err(invalid(&format!(
-                "only the head that claimed {deployment} moves its worlds' weights"
+                "only the head that claimed {deployment} moves its epochs' weights"
             )));
         }
-        // The storages of read-only tensors the world alone retains (an
-        // offload), or that an offload of the world left in host storage (a
+        // The storages of read-only tensors the epoch alone retains (an
+        // offload), or that an offload of the epoch left in host storage (a
         // restore).
         let mut candidates: BTreeMap<StorageId, bool> = BTreeMap::new();
         for tensor in self.tensors.values() {
             let alone = tensor.access == Access::ReadOnly
                 && !tensor.retainers.is_empty()
                 && tensor.retainers.iter().all(|retainer| {
-                    retainer.scope.deployment == deployment && retainer.world == world
+                    retainer.scope.deployment == deployment && retainer.epoch == epoch
                 });
             let entry = candidates.entry(tensor.storage).or_insert(true);
             *entry &= alone;
@@ -147,7 +147,7 @@ impl Server {
                 *by_gpu.entry(item.gpu).or_default() += item.bytes;
             }
             for (gpu, bytes) in by_gpu {
-                self.admit_device(deployment, gpu, bytes, &format!("world {world}'s weights"))?;
+                self.admit_device(deployment, gpu, bytes, &format!("epoch {epoch}'s weights"))?;
             }
         }
         Ok(Outcome::Moving(Planned {
@@ -184,7 +184,7 @@ impl Server {
                 failure: None,
             },
         );
-        tracing::info!(storages = count, to_host, "moving a world's weights");
+        tracing::info!(storages = count, to_host, "moving an epoch's weights");
         for index in 0..count {
             if to_host {
                 let bytes = self.moves.active[&number].items[index].bytes;
@@ -373,7 +373,7 @@ impl Server {
                         entry.moving = false;
                     }
                     self.release_storage(item.source);
-                    // The world was retired while its weights moved: the
+                    // The epoch was retired while its weights moved: the
                     // copy holds nothing anyone retains.
                     if count == 0 {
                         self.release_storage(target);
@@ -389,7 +389,7 @@ impl Server {
                     storages = moving.items.len(),
                     bytes,
                     to_host = moving.to_host,
-                    "moved a world's weights"
+                    "moved an epoch's weights"
                 );
                 Reply::Moved {
                     storages: moving.items.len() as u64,

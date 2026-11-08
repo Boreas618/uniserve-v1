@@ -41,14 +41,14 @@ fn main() -> anyhow::Result<()> {
     )?;
 
     // A scheduler with no policy decides nothing — no plan, no admission, no
-    // batch — so a world that serves must be given the default one: `fcfs`
+    // batch — so an epoch that serves must be given the default one: `fcfs`
     // revision one, instantiated for the capacity this pool was built for.
     let (program, module) = scheduler::packaged_policy(capacity);
     sched
         .install_policy(program, &scheduler::PolicyBytes::new(module))
         .map_err(|error| anyhow::anyhow!("the fcfs policy is installed: {error}"))?;
 
-    // Prefix reuse is a world setting (`EngineConfig::prefix_cache`), off in a
+    // Prefix reuse is an epoch setting (`EngineConfig::prefix_cache`), off in a
     // scheduler built by hand: the `reuse` scenario is about the pages a second
     // request reads, so it is turned on as a deployment turns it on.
     sched.set_prefix_reuse(true);
@@ -127,7 +127,7 @@ fn main() -> anyhow::Result<()> {
         anyhow::Ok((id, request))
     };
 
-    // A scenario argument narrows the world to the kinds it names, so a
+    // A scenario argument narrows the epoch to the kinds it names, so a
     // failure can be attributed to one kind of request rather than to the mix.
     let wanted = std::env::args().nth(1);
     let wants = |kind: &str| {
@@ -166,7 +166,7 @@ fn main() -> anyhow::Result<()> {
     // second arrives before the first's pages are published and reads nothing,
     // which says nothing about reuse.
     // The reuse scenario is sequential, so it runs only when it is the one named:
-    // `all` is the concurrent world.
+    // `all` is the concurrent epoch.
     if wanted.as_deref() == Some("reuse") {
         let prompt: Vec<u32> = (0..600).map(|index| 2_000 + index % 500).collect();
         for id in 1..=2 {

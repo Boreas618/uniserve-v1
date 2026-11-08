@@ -1,7 +1,7 @@
 """A FastH3 video request preempted mid-trajectory continues exactly.
 
 Serves a FastH3 checkpoint (``UNISERVE_H3_MODEL``) on the two GPUs the
-GPU locks granted (``UNISERVE_WORLD_DEVICES``): a Ulysses-2 denoiser and a
+GPU locks granted (``UNISERVE_EPOCH_DEVICES``): a Ulysses-2 denoiser and a
 TP2 text encoder beside the decoders, and the CPU media group. One
 ``t2va`` request is served uninterrupted as the reference. The same
 request, as a video job, is then preempted at a denoising step boundary:
@@ -10,11 +10,11 @@ request, as a video job, is then preempted at a denoising step boundary:
   stores the trajectory in the host latent pools and the request waits in
   the hold until the wake, after which the engine restores the stored step
   and denoises the steps left;
-- by a world change whose denoising computes the same (a change of the
-  workers' watchdog): the serving world parks with the trajectory stored,
+- by an epoch change whose denoising computes the same (a change of the
+  workers' watchdog): the serving epoch parks with the trajectory stored,
   and the successor restores it and continues. A FastH3 request denoises
   in seconds while a successor prepares for tens of them, so the request
-  starts once the successor prepares, and the serving world's model group
+  starts once the successor prepares, and the serving epoch's model group
   is paused (``SIGSTOP``, as fault-injection suites pause a process) with
   the request mid-trajectory and resumed once the change warms the
   successor's cache (which reads the serving scheduler's requests between
@@ -25,11 +25,11 @@ Each preempted video is the reference video, frame for frame and sample
 for sample. Preemption starts only after the public job status reports
 that denoising has begun. The reference computes its
 prompt's conditioning and stores it in the host encoder pool; the job reads
-the same prompt, so each of its admissions, on the serving world and on the
+the same prompt, so each of its admissions, on the serving epoch and on the
 one that resumes it, reads the stored conditioning instead of encoding it,
 and the videos' equality shows the stored conditioning is the computed one.
 
-A world change of the denoiser's parallel configuration, from Ulysses 2 on
+An epoch change of the denoiser's parallel configuration, from Ulysses 2 on
 both GPUs to the whole denoiser on the first, computes the same: the
 successor's one denoising rank lays the pages both serving ranks stored
 out in its own pages and continues from the stored step. The re-layout
@@ -152,9 +152,9 @@ def _deployment(
     )
 
 
-# The model group's share of each GPU while a world change of the
-# denoiser's parallel configuration runs: both worlds lie on the two GPUs
-# during the change, the serving Ulysses-2 world with a transformer replica
+# The model group's share of each GPU while an epoch change of the
+# denoiser's parallel configuration runs: both epochs lie on the two GPUs
+# during the change, the serving Ulysses-2 epoch with a transformer replica
 # on each, and the default share leaves the successor's second rank, which
 # holds the text encoder and the decoders, less than one request slot's
 # tensors beside it.
@@ -305,7 +305,7 @@ def _wait_denoising(base_url: str, job: str, steps: int) -> int:
     raise TimeoutError("the job did not denoise")
 
 
-# A world change's phases in their order (``GET /admin/config``, the steps
+# An epoch change's phases in their order (``GET /admin/config``, the steps
 # ``docs/admin.md`` lists).
 _PHASES = (
     "eager",
@@ -323,7 +323,7 @@ _PHASES = (
 
 
 def _wait_phase(base_url: str, change: Future, *phases: str) -> None:
-    """Waits until the world change `change` is in one of `phases`, as
+    """Waits until the epoch change `change` is in one of `phases`, as
     ``GET /admin/config`` reports it; fails when the change answers or
     passes the last of them before.
     """  # noqa: D205
@@ -346,7 +346,7 @@ def _wait_phase(base_url: str, change: Future, *phases: str) -> None:
         if current in _PHASES and _PHASES.index(current) > last:
             pytest.fail(f"the change passed its {phase} phase: {current}")
         time.sleep(0.05)
-    raise TimeoutError(f"the world change did not reach its {phase} phase")
+    raise TimeoutError(f"the epoch change did not reach its {phase} phase")
 
 
 def _content(base_url: str, job: str) -> bytes:
@@ -398,13 +398,13 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
         assert woke.status_code == 200, woke.text
         _assert_same_video(_content(base_url, job), reference)
 
-        # A world change whose denoising computes the same parks the serving
-        # world at a step boundary; its successor continues the trajectory.
-        # The request starts once the serving world answered the change's
+        # An epoch change whose denoising computes the same parks the serving
+        # epoch at a step boundary; its successor continues the trajectory.
+        # The request starts once the serving epoch answered the change's
         # shrink (its scheduler answers between steps, which paused workers
-        # never end) and the successor prepares; the serving world's model
+        # never end) and the successor prepares; the serving epoch's model
         # group stays paused from the request's first step until the change
-        # warms the successor's cache or parks the serving world, well
+        # warms the successor's cache or parks the serving epoch, well
         # within the workers' five-minute watchdog.
         workers = _group_workers(runtime, "model")
         assert len(workers) == 2, workers
@@ -433,8 +433,8 @@ def test_a_preempted_video_request_continues_its_trajectory_exactly(
             changed = change.result()
         assert changed.status_code == 200, changed.text
         result = changed.json()["result"]
-        assert result["change"] == "world", result
-        assert result["world"]["numerics"] == "unchanged", result
+        assert result["change"] == "epoch", result
+        assert result["epoch"]["numerics"] == "unchanged", result
         _assert_same_video(_content(base_url, job), reference)
         committed = _admin(base_url, "config/commit")
         assert committed.status_code == 200, committed.text
@@ -457,8 +457,8 @@ def test_a_video_request_continues_under_another_parallel_configuration(
         assert reference.status_code == 200, reference.text
         reference = reference.content
 
-        # The change parks the Ulysses-2 world at a step boundary, as the
-        # world change of the other test does; its successor denoises on
+        # The change parks the Ulysses-2 epoch at a step boundary, as the
+        # epoch change of the other test does; its successor denoises on
         # the first GPU alone.
         workers = _group_workers(runtime, "model")
         assert len(workers) == 2, workers
@@ -490,8 +490,8 @@ def test_a_video_request_continues_under_another_parallel_configuration(
             changed = change.result()
         assert changed.status_code == 200, changed.text
         result = changed.json()["result"]
-        assert result["change"] == "world", result
-        assert result["world"]["numerics"] == "unchanged", result
+        assert result["change"] == "epoch", result
+        assert result["epoch"]["numerics"] == "unchanged", result
         video = _content(base_url, job)
         # Kept beside the server's log, for comparison with the reference.
         (tmp_path / "reference.mp4").write_bytes(reference)

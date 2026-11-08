@@ -434,7 +434,7 @@ impl crate::updates::switch::Roster for Uncommanded {
     fn claim(
         &mut self,
         _host: &str,
-        _world: u64,
+        _epoch: u64,
         _scopes: &[proto::process::Scope],
         _retire: &[u64],
     ) -> Result<(), String> {

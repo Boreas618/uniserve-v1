@@ -8,9 +8,9 @@
 //! stored rank's own share of the trajectory (a video model's float32
 //! values; an image model's latent rows, each of the bank's width and
 //! element type), in the order its banks held them. The pool is the rank's:
-//! the same rank (its worker group and its rank) of every world of the
+//! the same rank (its worker group and its rank) of every epoch of the
 //! deployment whose pages have that encoding maps it, whatever its parallel
-//! configuration, so a world that succeeds another finds the trajectories
+//! configuration, so an epoch that succeeds another finds the trajectories
 //! its predecessor stored, and it is sized for the trajectories that rank
 //! can have stored at once ([`pool_pages`]). A restore reads the pages of every stored rank on the
 //! host, so a rank also maps, on first use, the pools of the other ranks a
@@ -47,9 +47,9 @@ const PAGE_ENCODING: u32 = 1;
 /// - A stored trajectory is needed until the request's latent preparation
 ///   restores it. A video request that resumes one is admitted before
 ///   every request that starts one (`Scheduler::queue_media`), so the
-///   slots take the resumed requests first, and the trajectories a world
+///   slots take the resumed requests first, and the trajectories an epoch
 ///   still has to restore are at most those of its latest preemption.
-/// - A world on trial stores its own trajectories while the world it
+/// - An epoch on trial stores its own trajectories while the epoch it
 ///   succeeds keeps the ones it stored, which a rollback restores: as many
 ///   again.
 ///
@@ -128,7 +128,7 @@ pub(crate) const WHOLE_IMAGE: &str = "image latent rows, whole on every rank";
 /// The digest that identifies the rank's pool (`PageShape::layout`): the
 /// byte layout of its pages, and the worker group and rank it serves, so
 /// that each rank maps a pool of its own, sized for its own trajectories,
-/// which the same rank of a succeeding world maps again whatever its
+/// which the same rank of a succeeding epoch maps again whatever its
 /// parallel configuration.
 fn rank_pool(pages: &BankPages, scope: &::storage::Scope) -> [u8; 32] {
     let mut key = ::storage::key::Digest::new(b"latent-pool");

@@ -120,7 +120,7 @@ message Request {
     ThrottleTransfers throttle_transfers = 8;
     NodesQuery nodes = 9;
     DeviceQuery devices = 10;
-    PublishWorlds publish_worlds = 11;
+    PublishEpochs publish_epochs = 11;
   }
 }
 
@@ -139,7 +139,7 @@ message Reply {
     TransfersThrottled transfers_throttled = 9;
     NodesKnown nodes = 10;
     DeviceInventory devices = 11;
-    WorldsPublished worlds_published = 12;
+    EpochsPublished epochs_published = 12;
   }
 }
 
@@ -159,15 +159,15 @@ message DeviceQuery {
 message DeviceInventory {
   repeated uint32 available = 1;
 }
-// Publish the immutable pages of a committed set of worlds at one node.
+// Publish the immutable pages of a committed set of epochs at one node.
 // Every successor is published before any predecessor is retired.
-message PublishWorlds {
+message PublishEpochs {
   string host = 1;
   string deployment = 2;
-  repeated uint64 worlds = 3;
+  repeated uint64 epochs = 3;
 }
 
-message WorldsPublished {}
+message EpochsPublished {}
 
 // Start one process of a worker group on a node, as a child of its daemon.
 message Spawn {
@@ -234,23 +234,23 @@ message Reserved {
 // Have a node's daemon hold the deployment's claim at its Storage Server,
 // starting the server when the node has none. The claim lasts as long as the
 // daemon: a later claim of the same scopes answers the claim held. The
-// world's weights that an earlier `KeepWeights` moved to host storage return
+// epoch's weights that an earlier `KeepWeights` moved to host storage return
 // to the GPUs they left before the claim is answered (the server's
-// `Restore`), so that a world starting again at a rollback finds them where
+// `Restore`), so that an epoch starting again at a rollback finds them where
 // its workers map them.
 message Claim {
   string host = 1;
   string deployment = 2;
-  // The `(worker group, rank)` scopes `world` keeps on the node; the world's
+  // The `(worker group, rank)` scopes `epoch` keeps on the node; the epoch's
   // retention of every other scope of the deployment ends.
   repeated Scope scopes = 3;
   // Arguments a server the daemon starts is given beyond its socket: the
   // deployment's Mooncake connector settings.
   repeated string server_arguments = 4;
-  // The world whose scopes these are: the daemon's identity of the
+  // The epoch whose scopes these are: the daemon's identity of the
   // processes that execute one configuration of the deployment.
-  uint64 world = 5;
-  // Worlds of the deployment whose storage on the node ends: a world the
+  uint64 epoch = 5;
+  // Epochs of the deployment whose storage on the node ends: an epoch the
   // claiming one superseded at a commit, or one a rollback discarded.
   repeated uint64 retire = 6;
   reserved 7;
@@ -279,14 +279,14 @@ message LedgerQuery {
   string deployment = 2;
 }
 
-// Retain weights and the exact completed rollback cache copies of `worlds`
+// Retain weights and the exact completed rollback cache copies of `epochs`
 // after their processes exit. Their other exclusive storages are released.
 message KeepWeights {
   string host = 1;
   string deployment = 2;
-  repeated uint64 worlds = 3;
-  // The worlds keep their weights in host storage
-  // (`update_config.previous_world = "host"`): the weights each world alone
+  repeated uint64 epochs = 3;
+  // The epochs keep their weights in host storage
+  // (`update_config.previous_epoch = "host"`): the weights each epoch alone
   // retains then move there through the server's Transfer Server (the
   // server's `Offload`). A node whose server cannot move them (it runs no
   // Transfer Server, or the host cannot hold them) keeps them on its GPUs

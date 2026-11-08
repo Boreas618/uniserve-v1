@@ -30,7 +30,7 @@
 //! | another host's GPU or host storage → this host | NIXL READs this host's agent posts, through the network adapters ([`network`]) |
 //!
 //! No compute kernel runs: copies use copy engines or the network adapters
-//! only, so the world executing beside them keeps its compute units. A
+//! only, so the epoch executing beside them keeps its compute units. A
 //! same-GPU read-only mapping instead of a copy is the worker's own (it
 //! maps the storage from the server). A link from another host has a lane
 //! of its own, measured by its first copies long enough to time and then
@@ -48,7 +48,7 @@
 //! events and the lanes' reports meanwhile, and places the bookings the
 //! other threads wait for.
 //!
-//! It also creates device storage the server holds from then on: a world's
+//! It also creates device storage the server holds from then on: an epoch's
 //! weights returning from host storage need storage on their GPUs, and the
 //! server creates no CUDA context ([`Event::Allocate`]). It creates the
 //! allocation on a helper, retainable through a POSIX descriptor, sends the
@@ -91,8 +91,8 @@ use storage::{Fabric, Mapped};
 #[derive(Debug, Clone)]
 pub struct Options {
     /// How long one chunk of a copy lasts at its link's bandwidth: far
-    /// below one scheduler step of the world that executes beside the
-    /// copies, so a copy engine turns to that world's copies, and to
+    /// below one scheduler step of the epoch that executes beside the
+    /// copies, so a copy engine turns to that epoch's copies, and to
     /// higher-priority tasks, between chunks.
     pub chunk: Duration,
     /// NIXL's C API library (`libnixl_capi.so`) of the release the `nixl`

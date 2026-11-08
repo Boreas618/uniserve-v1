@@ -5,7 +5,7 @@
 //! The load is the worker's to measure, so the test states it: the routed
 //! tokens per expert are published through the scheduler's handle, a step asks
 //! the policy about them, and the layout it answers is what
-//! `take_expert_order` hands to the world setup (§7.6). The programs are toy
+//! `take_expert_order` hands to the epoch setup (§7.6). The programs are toy
 //! policy modules written as WebAssembly text, as in the switch's tests, so the
 //! answer is whatever the test wants it to be.
 
@@ -103,11 +103,11 @@ fn load() -> ExpertLoad {
 }
 
 /// A scheduler thread serving with a policy that is already switched in.
-struct World {
+struct Epoch {
     handle: CommandSender,
 }
 
-impl World {
+impl Epoch {
     fn start(order: ExpertOrder) -> Self {
         let mut sim = SimEngine::new();
         sim.set_text_len(16);
@@ -123,7 +123,7 @@ impl World {
         thread::spawn(move || {
             let _ = scheduler.run(rx);
         });
-        let world = Self {
+        let epoch = Self {
             handle: CommandSender::new(tx),
         };
         let program = PolicyProgram {
@@ -133,9 +133,9 @@ impl World {
             stated: Default::default(),
         };
         let source: Arc<dyn PolicySource + Send + Sync> = Arc::new(PolicyBytes::new(toy(order)));
-        wait(world.handle.precopy_policy(program, source)).expect("the program's precopy");
-        wait(world.handle.switchover_policy()).expect("the switchover puts it in");
-        world
+        wait(epoch.handle.precopy_policy(program, source)).expect("the program's precopy");
+        wait(epoch.handle.switchover_policy()).expect("the switchover puts it in");
+        epoch
     }
 
     /// Puts another program in, keeping the one it replaces as the policy a
@@ -180,26 +180,26 @@ fn eventually<T>(mut poll: impl FnMut() -> Option<T>) -> T {
 #[test]
 fn a_published_load_is_asked_about_and_the_order_reaches_the_handoff() {
     // Two experts, two ranks: placing them on opposite ranks is a legal answer
-    // and the one the world setup would apply.
-    let world = World::start(ExpertOrder { layout: vec![1, 0] });
+    // and the one the epoch setup would apply.
+    let epoch = Epoch::start(ExpertOrder { layout: vec![1, 0] });
 
     // Until the worker publishes the routed tokens there is nothing to
     // decide, so no order is waiting.
     assert!(
-        world.handle.take_expert_order().is_none(),
+        epoch.handle.take_expert_order().is_none(),
         "no load, no expert decision"
     );
 
-    world.handle.publish_expert_load(Some(load()));
+    epoch.handle.publish_expert_load(Some(load()));
 
     // The next step asks, the answer is checked, and the layout is waiting
     // at the handoff point.
-    let order = eventually(|| world.handle.take_expert_order());
+    let order = eventually(|| epoch.handle.take_expert_order());
     assert_eq!(order.layout, vec![1, 0]);
 
     // Taken once: a layout is applied once.
     assert!(
-        world.handle.take_expert_order().is_none(),
+        epoch.handle.take_expert_order().is_none(),
         "the handoff takes the layout once"
     );
 }
@@ -209,14 +209,14 @@ fn an_illegal_expert_order_fails_the_policy() {
     // Both experts on rank 0 is not a layout: two ranks would leave one
     // holding every expert while the other idles, which `validate_experts`
     // refuses (§4.4: an illegal permutation is the policy's failure).
-    let world = World::start(ExpertOrder { layout: vec![1, 0] });
+    let epoch = Epoch::start(ExpertOrder { layout: vec![1, 0] });
     // A policy that fails serves on under the one it replaced (§7.3), so the
     // illegal program is put in over a legal one.
-    world.replace(ExpertOrder { layout: vec![0, 0] });
+    epoch.replace(ExpertOrder { layout: vec![0, 0] });
 
-    world.handle.publish_expert_load(Some(load()));
+    epoch.handle.publish_expert_load(Some(load()));
 
-    let report = eventually(|| world.handle.take_policy_report().recv().ok().flatten());
+    let report = eventually(|| epoch.handle.take_policy_report().recv().ok().flatten());
     assert!(
         format!("{report:?}").contains("expert"),
         "the report names the decision that failed: {report:?}"

@@ -7,7 +7,7 @@
 //! vision and latent features of each image it reads, its input images and
 //! the images it generated and feeds back. Every rank that executes an
 //! encoder maps its host's encoder pool (`ipc::EncoderPoolInfo`), shared by
-//! the deployment's ranks on that host in every world of the deployment. An
+//! the deployment's ranks on that host in every epoch of the deployment. An
 //! output is stored whole, its rows in order, in the pages its bytes fill; a
 //! page's key combines its output's content key and page index. The output
 //! key uses the shared storage key builder over:
@@ -18,8 +18,8 @@
 //! the daemon computes from the request's facts; for an image request
 //! `crate::encodings`, over the image's digest and, for an
 //! encoder that samples, the request's draw). Requests that read the same in
-//! worlds that compute it the same, a resumed request among them, so find
-//! each other's outputs, and a world that computes otherwise finds none.
+//! epochs that compute it the same, a resumed request among them, so find
+//! each other's outputs, and an epoch that computes otherwise finds none.
 //!
 //! - **Lookup.** Every page of an output is pinned before its encoder calls
 //!   are planned. When every page is pinned, the output's calls read their
@@ -37,8 +37,8 @@
 //!
 //! The scheduler plans an output's encoder calls only once its lookup
 //! resolved, so all of them import, or all compute. Like the host latent
-//! pools, the store connects as a head of its engine's world, so what a
-//! world on trial stores stays its own until its commit, and requests to the
+//! pools, the store connects as a head of its engine's epoch, so what a
+//! epoch on trial stores stays its own until its commit, and requests to the
 //! servers never block the scheduler.
 
 use std::collections::{BTreeMap, HashMap};
@@ -187,14 +187,14 @@ pub(crate) struct EncoderStore {
 
 impl EncoderStore {
     /// Connect to this host's Storage Server, at `socket`, as a head of
-    /// `deployment` in `world`.
+    /// `deployment` in `epoch`.
     pub(crate) fn connect(
         socket: &std::path::Path,
         deployment: &str,
-        world: u64,
+        epoch: u64,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            servers: Servers::connect(socket, deployment, world, "host encoder pools")?,
+            servers: Servers::connect(socket, deployment, epoch, "host encoder pools")?,
             workers: HashMap::new(),
             requests: HashMap::new(),
             calls: HashMap::new(),

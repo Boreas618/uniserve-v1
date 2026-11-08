@@ -5,8 +5,8 @@
 //! computes it (`ipc::HostOutput`).
 //!
 //! The pool is the deployment's on the rank's host: every rank there that
-//! executes an encoder maps the same pool, in every world of the
-//! deployment, so an output one rank or world stored is found by another
+//! executes an encoder maps the same pool, in every epoch of the
+//! deployment, so an output one rank or epoch stored is found by another
 //! that computes the same, and a resumed request's encoders read their
 //! outputs instead of computing them again. A stored output takes the pages
 //! its bytes fill, rows in order; the engine decides what is stored and
@@ -50,7 +50,7 @@ pub(crate) const OUTPUTS: [&str; 4] = [
 /// features of one image of an image request).
 ///
 /// A request's outputs are needed while it is in flight, to be read again
-/// when it resumes. A world runs at most `request_slots` requests at once,
+/// when it resumes. An epoch runs at most `request_slots` requests at once,
 /// and as many preempted ones wait to resume (a video request that resumes
 /// is admitted before every request that starts, `Scheduler::queue_media`):
 /// twice the request slots' outputs. An image request reads and generates

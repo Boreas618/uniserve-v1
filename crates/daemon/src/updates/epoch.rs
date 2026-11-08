@@ -30,8 +30,8 @@ use crate::updates::switch::{Node, Roster, Start, Switch};
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct Unavailable {
     pub digest: String,
-    /// The world that executed it and was rolled back.
-    pub world: u64,
+    /// The epoch that executed it and was rolled back.
+    pub epoch: u64,
     pub reason: String,
     /// Seconds since the Unix epoch.
     pub at: f64,
@@ -50,8 +50,8 @@ pub(crate) struct EpochChange {
     pub(crate) group: String,
     /// How the target's main processes are started.
     pub(crate) start: Start,
-    /// The world the serving epoch executes.
-    pub(crate) previous_world: u64,
+    /// The epoch the serving epoch executes.
+    pub(crate) previous_epoch: u64,
     /// The serving epoch's launch generation.
     pub(crate) previous_generation: u64,
     /// The launch generation the target's children are spawned at, from
@@ -59,8 +59,8 @@ pub(crate) struct EpochChange {
     /// and rank, the serving epoch's standby included.
     pub(crate) spawn_generation: u64,
     /// What the previous epoch keeps through the trial
-    /// (`update_config.previous_world`).
-    pub(crate) keeps: crate::options::PreviousWorld,
+    /// (`update_config.previous_epoch`).
+    pub(crate) keeps: crate::options::PreviousEpoch,
 }
 
 /// Runs the epoch layer of a change into `running`, or says the change is
@@ -117,7 +117,7 @@ pub(crate) fn epoch_arm(
         change.update,
         change.target,
         record,
-        (change.previous, change.previous_world),
+        (change.previous, change.previous_epoch),
         change.previous_generation,
         change.spawn_generation,
         change.group,
@@ -214,7 +214,7 @@ pub(crate) fn report(switch: &Switch) -> Value {
             "reason": failure.reason,
             "device": failure.device,
         })),
-        "previous_world_kept": switch.previous_kept(),
+        "previous_epoch_kept": switch.previous_kept(),
         "host_refused": switch.host_refused(),
         "moved_to_host_bytes": switch.moved_bytes(),
     })
@@ -249,12 +249,12 @@ mod tests {
         fn claim(
             &mut self,
             host: &str,
-            world: u64,
+            epoch: u64,
             scopes: &[process::Scope],
             retire: &[u64],
         ) -> Result<(), String> {
             self.claims
-                .push((host.to_owned(), world, scopes.to_vec(), retire.to_vec()));
+                .push((host.to_owned(), epoch, scopes.to_vec(), retire.to_vec()));
             Ok(())
         }
 
@@ -357,7 +357,7 @@ mod tests {
                     devices: vec![0],
                     group: "engine".to_owned(),
                     rank: 0,
-                    world: 13,
+                    epoch: 13,
                     scheduler_node: true,
                     peers: Vec::new(),
                     watchdog_timeout_s: None,
@@ -367,10 +367,10 @@ mod tests {
                 },
                 environment: HashMap::new(),
             },
-            previous_world: 11,
+            previous_epoch: 11,
             previous_generation: 5,
             spawn_generation: 7,
-            keeps: crate::options::PreviousWorld::Parked,
+            keeps: crate::options::PreviousEpoch::Parked,
         }
     }
 

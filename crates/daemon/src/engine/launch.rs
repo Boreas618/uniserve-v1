@@ -82,7 +82,7 @@ mod tests {
     use super::*;
     use crate::options::ServerArgs;
 
-    /// The launch of a standby (engine 7) of world 12 beside the process of world 11 it succeeds,
+    /// The launch of a standby (engine 7) of epoch 12 beside the process of epoch 11 it succeeds,
     /// with a rebalanced expert order.
     fn launch() -> EngineArgs {
         use proto::request::wire::{CacheSegment, CacheSegments, ExpertOrder, Predecessor};
@@ -90,13 +90,13 @@ mod tests {
             engine_config: ServerArgs::default()
                 .engine_config()
                 .expect("the configuration resolves"),
-            world: 12,
+            epoch: 12,
             predecessor: Some(Predecessor {
-                world: 11,
+                epoch: 11,
                 segments: vec![CacheSegments {
                     worker_group: "engine".to_owned(),
                     segments: vec![CacheSegment {
-                        world: 11,
+                        epoch: 11,
                         ordinal: 0,
                         units: 64,
                     }],
@@ -162,7 +162,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         let expected = [
             "engine_config",
-            "world",
+            "epoch",
             "predecessor",
             "expert_order",
             "host",
@@ -185,11 +185,11 @@ mod tests {
         .collect::<BTreeSet<_>>();
         assert_eq!(keys, expected);
         assert_eq!(value["engine"], json!(7));
-        assert_eq!(value["world"], json!(12));
+        assert_eq!(value["epoch"], json!(12));
         assert_eq!(value["devices"], json!([0, 1]));
         assert_eq!(value["queue_depth"], json!(4));
         assert_eq!(value["world_size"], json!(1));
-        assert_eq!(value["predecessor"]["world"], json!(11));
+        assert_eq!(value["predecessor"]["epoch"], json!(11));
         assert_eq!(
             value["expert_order"]["model.layers.0.mlp"]["experts"],
             json!([1, 0])

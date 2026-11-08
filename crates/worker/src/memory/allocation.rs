@@ -573,7 +573,7 @@ impl Storage {
     }
 
     /// Maps segment `index` read-only from the descriptor of storage another
-    /// world writes: a fault of this process cannot change its bytes.
+    /// epoch writes: a fault of this process cannot change its bytes.
     pub(crate) fn import_segment_read_only(
         &self,
         index: usize,
@@ -586,7 +586,7 @@ impl Storage {
         )?)
     }
 
-    /// Changes segment `index`'s access in place, as a world takes the
+    /// Changes segment `index`'s access in place, as an epoch takes the
     /// storage of a segment it mapped read-only once its writer is gone.
     pub(crate) fn protect_segment(&self, index: usize, protection: Protection) -> Result<()> {
         Ok(lock(&self.segments()?.mapping).protect_segment(index, protection)?)

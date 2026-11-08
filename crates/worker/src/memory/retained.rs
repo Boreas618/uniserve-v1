@@ -3,16 +3,16 @@
 //! An owner whose contents must outlive the worker process takes its storage
 //! here instead of allocating it: the device prefix cache planes, the buffer
 //! pool and the latent banks are exclusive storages, one writer at a time,
-//! keyed by the world that created them and what determines their shape. A
-//! restarted worker of the same scope and world maps the storage its
+//! keyed by the epoch that created them and what determines their shape. A
+//! restarted worker of the same scope and epoch maps the storage its
 //! predecessor left, at whatever address, instead of allocating it again;
 //! the server first shoots the predecessor down if it still holds write
-//! access. A worker of a world that succeeds another maps the KV cache
+//! access. A worker of an epoch that succeeds another maps the KV cache
 //! segments of the predecessor's worker of its scope read-only and creates
-//! everything else of its own, so neither world writes the other's storage;
+//! everything else of its own, so neither epoch writes the other's storage;
 //! once the predecessor is gone, the successor takes write access to the
 //! segments it mapped. A worker makes no Storage Server call while it
-//! serves: only at startup, at its world's promotion and commit, and at its
+//! serves: only at startup, at its epoch's promotion and commit, and at its
 //! orderly close.
 //!
 //! The library loaded into another process (tests, harnesses) allocates the
@@ -62,7 +62,7 @@ pub struct Exclusive {
 pub struct SegmentedSpec<'a> {
     /// The storage's name within the worker's scope; the part of segment `s`
     /// that column `c` holds is retained as `{name}#{c}/{s.ordinal}` of
-    /// `s.world`.
+    /// `s.epoch`.
     pub name: &'a str,
     pub device: DeviceId,
     /// The storage's parts in address order.
@@ -78,9 +78,9 @@ pub struct SegmentPart {
     /// Bytes, a multiple of the allocation granularity.
     pub length: usize,
     pub column: u32,
-    /// The segment: the world that created its storage and its ordinal there.
+    /// The segment: the epoch that created its storage and its ordinal there.
     pub segment: ipc::CacheSegment,
-    /// Whether the segment is the predecessor world's: it is mapped
+    /// Whether the segment is the predecessor epoch's: it is mapped
     /// read-only and never created here.
     pub inherited: bool,
     /// Whether the part is created when its storage does not exist; one that
@@ -166,7 +166,7 @@ impl ExclusiveStorage for LocalStorage {
     fn segmented(&mut self, spec: &SegmentedSpec<'_>) -> Result<SegmentedExclusive> {
         if spec.parts.iter().any(|part| part.inherited) {
             return Err(Error::Invalid(
-                "storage local to a process inherits no other world's segments".into(),
+                "storage local to a process inherits no other epoch's segments".into(),
             ));
         }
         let storage = Storage::segmented(spec.device, &spec.lengths(), spec.access)?;
@@ -215,11 +215,11 @@ impl ExclusiveStorage for LocalStorage {
 /// the control thread calls it.
 pub struct Retained {
     scope: Scope,
-    /// The world the worker belongs to, which creates its exclusive
+    /// The epoch the worker belongs to, which creates its exclusive
     /// storages.
-    world: u64,
-    /// The world whose exclusive storages this worker keys: its own, or a standby's predecessor's.
-    storage_world: u64,
+    epoch: u64,
+    /// The epoch whose exclusive storages this worker keys: its own, or a standby's predecessor's.
+    storage_epoch: u64,
     state: Mutex<State>,
 }
 
@@ -248,9 +248,9 @@ struct State {
     /// A standby worker's exclusive storages, until it is promoted; `None`
     /// for a worker that takes write access at once.
     standby: Option<Standby>,
-    /// The predecessor world's segments the worker maps, read-only unless
+    /// The predecessor epoch's segments the worker maps, read-only unless
     /// the predecessor lent them, until the worker takes them at its
-    /// world's commit.
+    /// epoch's commit.
     inherited: Vec<InheritedPart>,
 }
 
@@ -259,7 +259,7 @@ fn hex_key(key: &[u8; 32]) -> String {
     key.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-/// One part of a predecessor world's segment that a worker maps.
+/// One part of a predecessor epoch's segment that a worker maps.
 struct InheritedPart {
     key: Key,
     /// The storage that maps the part, as its part `index`.
@@ -302,7 +302,7 @@ impl Retained {
         group: &str,
         rank: u32,
         generation: u64,
-        predecessor_world: Option<u64>,
+        predecessor_epoch: Option<u64>,
     ) -> Result<Arc<Self>> {
         let scope = Scope {
             deployment: launch.deployment.clone(),
@@ -315,18 +315,18 @@ impl Retained {
                 scope: scope.clone(),
                 generation,
                 claim: Claim(launch.claim),
-                world: launch.world,
+                epoch: launch.epoch,
             },
         )
         .map_err(|error| storage_error("connecting to the storage server", error))?;
         Ok(Arc::new(Self {
             scope,
-            world: launch.world,
+            epoch: launch.epoch,
             // A standby maps what its predecessor holds, and an epoch switch's target serves
-            // another world than the one those storages were created in.
-            storage_world: predecessor_world
+            // another epoch than the one those storages were created in.
+            storage_epoch: predecessor_epoch
                 .filter(|_| launch.standby)
-                .unwrap_or(launch.world),
+                .unwrap_or(launch.epoch),
             state: Mutex::new(State {
                 client,
                 gpus: BTreeMap::new(),
@@ -340,26 +340,26 @@ impl Retained {
         }))
     }
 
-    /// The key of an exclusive storage of the worker's world: the digest of
-    /// its scope, world, name, layout and GPU. It covers its shape only, so
-    /// a restart of the world reuses the storage whatever else changed.
+    /// The key of an exclusive storage of the worker's epoch: the digest of
+    /// its scope, epoch, name, layout and GPU. It covers its shape only, so
+    /// a restart of the epoch reuses the storage whatever else changed.
     pub(crate) fn exclusive_key(&self, spec: &ExclusiveSpec<'_>, gpu: &[u8; 16]) -> Key {
-        self.storage_key(spec.name, spec.bytes, gpu, self.storage_world)
+        self.storage_key(spec.name, spec.bytes, gpu, self.storage_epoch)
     }
 
     /// The key of one part of a segmented storage, as the exclusive storage
     /// `{name}#{column}/{ordinal}` of the part's length that the segment's
-    /// world created.
+    /// epoch created.
     pub(crate) fn segment_key(&self, name: &str, part: &SegmentPart, gpu: &[u8; 16]) -> Key {
         self.storage_key(
             &segment_name(name, part),
             part.length,
             gpu,
-            part.segment.world,
+            part.segment.epoch,
         )
     }
 
-    fn storage_key(&self, name: &str, bytes: usize, gpu: &[u8; 16], world: u64) -> Key {
+    fn storage_key(&self, name: &str, bytes: usize, gpu: &[u8; 16], epoch: u64) -> Key {
         let mut digest = Sha256::new();
         digest.update(b"uniserve-exclusive-storage\0");
         for part in [
@@ -371,7 +371,7 @@ impl Retained {
             digest.update(part);
         }
         digest.update(self.scope.rank.to_le_bytes());
-        digest.update(world.to_le_bytes());
+        digest.update(epoch.to_le_bytes());
         // A byte storage: dtype uint8, shape [bytes], stride 1.
         digest.update(b"uint8");
         digest.update((bytes as u64).to_le_bytes());
@@ -397,7 +397,7 @@ impl Retained {
             bytes,
             // The ledgers book the segment's storages together, as the cache's.
             segment: Some(::storage::Segment {
-                world: part.segment.world,
+                epoch: part.segment.epoch,
                 ordinal: part.segment.ordinal,
             }),
             fabric: None,
@@ -533,8 +533,8 @@ impl Retained {
     /// or `None` when the server holds nothing under it.
     ///
     /// `key` is a weight's §8 key and nothing else is mixed in: the bytes
-    /// outlive the world that wrote them, so their record carries no segment
-    /// and no world, and a rank that finds them answers the region another rank
+    /// outlive the epoch that wrote them, so their record carries no segment
+    /// and no epoch, and a rank that finds them answers the region another rank
     /// published rather than publishing its own. A miss is not an error - it is
     /// the loader's cue to convert the checkpoint and store it.
     ///
@@ -633,12 +633,12 @@ impl Retained {
             .device_bytes
             .iter()
             .filter(|entry| {
-                entry.gpu == Some(gpu) && entry.scope == self.scope && entry.world == self.world
+                entry.gpu == Some(gpu) && entry.scope == self.scope && entry.epoch == self.epoch
             })
             .map(|entry| entry.bytes)
             .sum();
         // Every exclusive tensor is a storage of its own. Those another
-        // world uses, as the predecessor segments a successor maps, are
+        // epoch uses, as the predecessor segments a successor maps, are
         // not free.
         let reclaimable: u64 = listing
             .tensors
@@ -650,7 +650,7 @@ impl Retained {
                     && tensor
                         .retainers
                         .iter()
-                        .all(|retainer| retainer.world == self.world)
+                        .all(|retainer| retainer.epoch == self.epoch)
                     && !state.written.contains(&tensor.key)
                     && !state.used.contains(&tensor.key)
             })
@@ -700,31 +700,31 @@ impl Retained {
         Ok(())
     }
 
-    /// The worker's scope, which its world's ledger entries name.
+    /// The worker's scope, which its epoch's ledger entries name.
     pub(crate) fn scope(&self) -> &Scope {
         &self.scope
     }
 
-    /// The world whose name keys this worker's exclusive storages: the one that created them.
-    pub fn storage_world(&self) -> u64 {
-        self.storage_world
+    /// The epoch whose name keys this worker's exclusive storages: the one that created them.
+    pub fn storage_epoch(&self) -> u64 {
+        self.storage_epoch
     }
 
-    /// The worker's world.
-    pub(crate) fn world(&self) -> u64 {
-        self.world
+    /// The worker's epoch.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     /// Whether `entry` is one the worker's process books itself: an item of
-    /// its scope and world that a process books ([`Item::booked`]). A
+    /// its scope and epoch that a process books ([`Item::booked`]). A
     /// measurement of the process stands for these.
     pub(crate) fn books(&self, entry: &::storage::LedgerEntry) -> bool {
         entry.item.booked()
             && entry.scope.as_ref() == Some(&self.scope)
-            && entry.worlds == [self.world]
+            && entry.epochs == [self.epoch]
     }
 
-    /// States this world's quota of the GPU of `device`, `fraction` of the whole of it: every storage
+    /// States this epoch's quota of the GPU of `device`, `fraction` of the whole of it: every storage
     /// retained there from now on fits it or is refused, and the cache's segments are given back
     /// against it (`docs/admin.md`, The KV cache's storage and the weights). What this rank holds
     /// already stays.
@@ -755,7 +755,7 @@ impl Retained {
     }
 
     /// Books `items` of the worker on the GPU of `device` of `total` bytes,
-    /// stating the world's quota there (see `Request::Book`), and returns
+    /// stating the epoch's quota there (see `Request::Book`), and returns
     /// the deployment's ledger of the GPU after it. Fails with the server's
     /// refusal, which names every entry of the ledger, when the booking
     /// would take it past its quota.
@@ -802,12 +802,12 @@ impl Retained {
             })
     }
 
-    /// Whether the worker's scope retains `tensor` in the worker's world.
+    /// Whether the worker's scope retains `tensor` in the worker's epoch.
     fn retains(&self, tensor: &::storage::protocol::ListedTensor) -> bool {
         tensor
             .retainers
             .iter()
-            .any(|retainer| retainer.scope == self.scope && retainer.world == self.world)
+            .any(|retainer| retainer.scope == self.scope && retainer.epoch == self.epoch)
     }
 
     /// Release every tensor of the scope the worker's startup did not use.
@@ -935,15 +935,15 @@ impl ExclusiveStorage for &Retained {
                         .iter()
                         .filter(|tensor| &tensor.name == name)
                         .filter_map(|tensor| {
-                            let worlds: Vec<u64> = tensor
+                            let epochs: Vec<u64> = tensor
                                 .retainers
                                 .iter()
                                 .filter(|retainer| retainer.scope == retained.scope)
-                                .map(|retainer| retainer.world)
+                                .map(|retainer| retainer.epoch)
                                 .collect();
-                            (!worlds.is_empty()).then(|| {
+                            (!epochs.is_empty()).then(|| {
                                 format!(
-                                    "{} bytes on {:?} in worlds {worlds:?}",
+                                    "{} bytes on {:?} in epochs {epochs:?}",
                                     tensor.storage_bytes, tensor.location
                                 )
                             })
@@ -953,10 +953,10 @@ impl ExclusiveStorage for &Retained {
                 .unwrap_or_default();
             return Err(Error::Invalid(format!(
                 "the standby worker found no {name} of its predecessor's shape: it asks for \
-                 {} bytes on GPU {} in world {}, and its scope holds {}",
+                 {} bytes on GPU {} in epoch {}, and its scope holds {}",
                 spec.bytes,
                 ::storage::protocol::gpu_name(gpu),
-                retained.world,
+                retained.epoch,
                 if held.is_empty() {
                     "none".to_owned()
                 } else {
@@ -1084,8 +1084,8 @@ impl crate::memory::weights::WeightStorage for Retained {
 
     /// Publish `bytes` under `key` and answer the region they are mapped at.
     ///
-    /// The bytes outlive the world that stores them, so their record carries no
-    /// segment and no world and lies on the host the server retains; the
+    /// The bytes outlive the epoch that stores them, so their record carries no
+    /// segment and no epoch and lies on the host the server retains; the
     /// mapping a store answers is the same read-only one a fetch would find,
     /// so a second store of the same key republishes rather than failing.
     fn granularity(&self, device: DeviceId) -> Result<usize> {
@@ -1450,7 +1450,7 @@ impl Retained {
     /// Takes the parts of a segmented storage: as
     /// [`ExclusiveStorage::exclusive`] takes whole ones, except that a
     /// standby leaves a part its predecessor gave back absent, and that the
-    /// parts of the predecessor world's segments are mapped read-only in
+    /// parts of the predecessor epoch's segments are mapped read-only in
     /// standby, never created: the predecessor's worker of the scope writes
     /// them until the successor's commit.
     fn take_segmented(&self, spec: &SegmentedSpec<'_>) -> Result<SegmentedExclusive> {
@@ -1484,7 +1484,7 @@ impl Retained {
                     .position(|key| key == missing)
                     .unwrap_or_default();
                 return Err(Error::Invalid(format!(
-                    "the predecessor world holds no {} any more",
+                    "the predecessor epoch holds no {} any more",
                     segment_name(spec.name, &spec.parts[index])
                 )));
             }
@@ -1527,11 +1527,11 @@ impl Retained {
         if standby && found.is_empty() {
             return Err(Error::Invalid(format!(
                 "the standby worker found no {} of its predecessor's shape: its scope holds no \
-                 segment of these lengths in world {}",
+                 segment of these lengths in epoch {}",
                 spec.name,
                 spec.parts
                     .first()
-                    .map_or(self.world, |part| part.segment.world),
+                    .map_or(self.epoch, |part| part.segment.epoch),
             )));
         }
         let storage = Storage::segmented(spec.device, &spec.lengths(), spec.access)?;
@@ -1600,7 +1600,7 @@ impl Retained {
         self.release_keys(&mut state, &given, "giving back segments")
     }
 
-    /// Creates the parts `indices` again, as the worker's world's own
+    /// Creates the parts `indices` again, as the worker's epoch's own
     /// segments, and publishes them.
     fn create_segments(
         &self,
@@ -1620,20 +1620,20 @@ impl Retained {
         Ok(())
     }
 
-    /// Maps exclusive storages the predecessor world `world` created,
+    /// Maps exclusive storages the predecessor epoch `epoch` created,
     /// read-only, as the worker of its scope keeps them: a successor reads
     /// the predecessor's cache flags and scales once it parked. Fails when
     /// one is missing.
     pub(crate) fn map_inherited(
         &self,
         specs: &[ExclusiveSpec<'_>],
-        world: u64,
+        epoch: u64,
     ) -> Result<Vec<(Key, Arc<Storage>)>> {
         let mut state = lock(&self.state);
         let mut keys = Vec::with_capacity(specs.len());
         for spec in specs {
             let gpu = state.gpu(spec.device)?;
-            keys.push(self.storage_key(spec.name, spec.bytes, &gpu, world));
+            keys.push(self.storage_key(spec.name, spec.bytes, &gpu, epoch));
         }
         let got = state
             .client
@@ -1645,7 +1645,7 @@ impl Retained {
                 .position(|key| key == missing)
                 .map_or("an exclusive storage", |index| specs[index].name);
             return Err(Error::Invalid(format!(
-                "the predecessor world holds no {name} of this shape any more"
+                "the predecessor epoch holds no {name} of this shape any more"
             )));
         }
         let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> =
@@ -1685,8 +1685,8 @@ impl Retained {
             .collect()
     }
 
-    /// Ends the worker's world's retention of storages `keys` it mapped from
-    /// its predecessor and no longer reads: the predecessor's world keeps
+    /// Ends the worker's epoch's retention of storages `keys` it mapped from
+    /// its predecessor and no longer reads: the predecessor's epoch keeps
     /// them until it is retired.
     pub(crate) fn forget(&self, keys: &[Key]) -> Result<()> {
         let mut state = lock(&self.state);
@@ -1701,8 +1701,8 @@ impl Retained {
         )
     }
 
-    /// Ends the world's retention of `keys` alone. The server's retention is
-    /// the scope's in the world, which every worker of the scope shares: a
+    /// Ends the epoch's retention of `keys` alone. The server's retention is
+    /// the scope's in the epoch, which every worker of the scope shares: a
     /// standby maps its predecessor's storages under it, and the worker's own
     /// owners take theirs later in its startup, so every other storage the
     /// scope retains stays.
@@ -1728,9 +1728,9 @@ impl Retained {
         Ok(())
     }
 
-    /// Maps the predecessor world's `segments` writable, every column's
-    /// part: the predecessor lent them for the world's trial, and its
-    /// writer, parked, writes none of them until the world's processes are
+    /// Maps the predecessor epoch's `segments` writable, every column's
+    /// part: the predecessor lent them for the epoch's trial, and its
+    /// writer, parked, writes none of them until the epoch's processes are
     /// gone. The worker takes them like the others at the commit. Returns
     /// how many parts it mapped writable.
     ///
@@ -1752,9 +1752,9 @@ impl Retained {
         Ok(borrowed)
     }
 
-    /// Takes write access to the predecessor world's segments the worker
+    /// Takes write access to the predecessor epoch's segments the worker
     /// maps, once their writer is gone, and makes them writable at
-    /// unchanged addresses: the world's commit, after which they are its
+    /// unchanged addresses: the epoch's commit, after which they are its
     /// own. Returns how many segments it took.
     pub(crate) fn take_inherited(&self) -> Result<usize> {
         let mut state = lock(&self.state);
@@ -1774,7 +1774,7 @@ impl Retained {
         state.written.extend(keys);
         tracing::info!(
             segments = inherited.len(),
-            "took the predecessor world's cache segments"
+            "took the predecessor epoch's cache segments"
         );
         Ok(inherited.len())
     }

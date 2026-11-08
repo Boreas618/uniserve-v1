@@ -1,10 +1,10 @@
-//! A world that succeeds a running one, over the in-process pool.
+//! An epoch that succeeds a running one, over the in-process pool.
 //!
 //! The launched path states the same events with two deployments: a successor
-//! starts beside the running world under the same claim, is promoted with the
-//! running world's prefix cache index once it parks, commits once the running
-//! world closed, and continues a request the running one generated part of.
-//! Here both worlds are handles over `support::Serving`, which completes every
+//! starts beside the running epoch under the same claim, is promoted with the
+//! running epoch's prefix cache index once it parks, commits once the running
+//! epoch closed, and continues a request the running one generated part of.
+//! Here both epochs are handles over `support::Serving`, which completes every
 //! batch in process, and the commands are the launched path's own: `describe_cache`,
 //! `park`, `promote`, `commit`.
 //!
@@ -27,9 +27,9 @@ use crate::support::{self, Serving};
 /// How long a command answer may take.
 /// How long a command answer may take.
 ///
-/// The first answer of each world is its policy's precopy, which compiles the
-/// `fcfs` module inside a debug build; this case builds three worlds, and a
-/// bound that does not cover the compile reports a timeout for a world that is
+/// The first answer of each epoch is its policy's precopy, which compiles the
+/// `fcfs` module inside a debug build; this case builds three epochs, and a
+/// bound that does not cover the compile reports a timeout for an epoch that is
 /// booting. Three boots measured near a hundred seconds between them, so the
 /// bound is three times that: a careful margin costs nothing when the case is
 /// green and costs a whole round trip when it is short. The margin is the
@@ -37,13 +37,13 @@ use crate::support::{self, Serving};
 /// fails here, only later.
 const ANSWER: Duration = Duration::from_secs(300);
 
-/// How long a park may take once the world has been asked.
+/// How long a park may take once the epoch has been asked.
 ///
-/// A park waits for the world to hold nothing, which is a drained world rather
+/// A park waits for the epoch to hold nothing, which is a drained epoch rather
 /// than a compiling one, so this bound is the mechanism's and not the build's.
 const PARK: Duration = Duration::from_secs(30);
 
-/// How many tokens the running world generates before it parks.
+/// How many tokens the running epoch generates before it parks.
 const GENERATED: usize = 3;
 
 /// How many tokens the continuation may generate.
@@ -126,13 +126,13 @@ fn terminal(events: &mut scheduler::EventRx) -> Event {
     panic!("the request never ended within {ANSWER:?}");
 }
 
-/// A world that succeeds a running one takes over the running world's prefix
+/// An epoch that succeeds a running one takes over the running epoch's prefix
 /// cache index and continues a request the running one generated part of: the
 /// continuation samples what the uninterrupted request sampled next.
 /// Ignored while the in-process arm cannot park: `poll_park` waits on seven
 /// empty sets and `retiring_requests` drains only through a `BatchCommand::
 /// Finish` carried by a command-only batch, which no scheduling pass produces
-/// once the world's requests have migrated and nothing else runs
+/// once the epoch's requests have migrated and nothing else runs
 /// (`scheduler/execution.rs:453`). The case stays here because it is the arm's
 /// requirement written down — a command-only batch produced from the queued
 /// `Finish` — and it is the first thing that proves the requirement if it
@@ -140,17 +140,17 @@ fn terminal(events: &mut scheduler::EventRx) -> Event {
 /// fails every run blocks every other case's evidence.
 #[ignore = "the in-process arm produces no command-only batch, so a park never completes"]
 #[test]
-fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
+fn a_successor_epoch_continues_the_requests_of_the_epoch_it_replaces() {
     // The reference: the same request, generated without interruption.
     let reference_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
-    let (mut reference_config, reference_limits) = support::config(&reference_pool, "worlds");
-    reference_config.world = 1;
+    let (mut reference_config, reference_limits) = support::config(&reference_pool, "epochs");
+    reference_config.epoch = 1;
     let reference = SchedulerHandle::over_batches(
         &reference_config,
         reference_limits,
         reference_pool.clone() as Arc<dyn Batches>,
     )
-    .expect("the reference world serves");
+    .expect("the reference epoch serves");
     install(&reference, &reference_pool);
     let mut reference_events = reference
         .submit(request(91, 8, 100, Vec::new()))
@@ -185,58 +185,58 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
     );
     reference.shutdown();
 
-    // The running world generates the first part.
+    // The running epoch generates the first part.
     let running_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
-    let (mut running_config, running_limits) = support::config(&running_pool, "worlds");
-    running_config.world = 1;
+    let (mut running_config, running_limits) = support::config(&running_pool, "epochs");
+    running_config.epoch = 1;
     let running = SchedulerHandle::over_batches(
         &running_config,
         running_limits,
         running_pool.clone() as Arc<dyn Batches>,
     )
-    .expect("the running world serves");
+    .expect("the running epoch serves");
     install(&running, &running_pool);
     let mut running_events = running
         .submit(request(91, 8, 100, Vec::new()))
-        .expect("the running world takes the request");
+        .expect("the running epoch takes the request");
     let (first, _) = support::wait_for_tokens(&mut running_events, GENERATED, ANSWER);
     assert_eq!(
         first,
         expected[..GENERATED],
-        "the running world generates the reference's first tokens"
+        "the running epoch generates the reference's first tokens"
     );
 
     // Its successor starts beside it.
-    answer("the running world's cache", running.describe_cache())
-        .expect("the running world states its cache");
+    answer("the running epoch's cache", running.describe_cache())
+        .expect("the running epoch states its cache");
     let successor_pool = Arc::new(Serving::by_extent(vec![support::pool("model")]));
-    let (mut successor_config, successor_limits) = support::config(&successor_pool, "worlds");
-    successor_config.world = 2;
+    let (mut successor_config, successor_limits) = support::config(&successor_pool, "epochs");
+    successor_config.epoch = 2;
     let successor = SchedulerHandle::over_batches(
         &successor_config,
         successor_limits,
         successor_pool.clone() as Arc<dyn Batches>,
     )
-    .expect("the successor starts beside the running world");
+    .expect("the successor starts beside the running epoch");
     install(&successor, &successor_pool);
 
-    // The running world parks, the successor is promoted with its index, and
-    // the running world closes.
+    // The running epoch parks, the successor is promoted with its index, and
+    // the running epoch closes.
     // The park is waited for with a bound of its own, and a park that does not
-    // answer is reported with what the world was doing: steps taken since the
+    // answer is reported with what the epoch was doing: steps taken since the
     // command and whether it is still answering at all.
     //
     // `poll_park` answers only when seven sets are empty: running requests,
     // running media, retiring requests, waiting requests, waiting media,
-    // batches in flight and pending submissions (`scheduler/world.rs:232`). A
+    // batches in flight and pending submissions (`scheduler/epoch.rs:232`). A
     // request's `Finish` leaves inside a batch, so a close that never rides one
-    // keeps the park from answering: a world still counting steps is that
-    // case, and a world answering nothing has a stopped control thread. Two
+    // keeps the park from answering: an epoch still counting steps is that
+    // case, and an epoch answering nothing has a stopped control thread. Two
     // owners, which is why the timeout names which one it met.
     let steps_before = running
         .counters()
         .recv_timeout(PARK)
-        .expect("the running world answers its counters")
+        .expect("the running epoch answers its counters")
         .steps;
     let parked = match running.park(true).recv_timeout(PARK) {
         Ok(result) => result,
@@ -246,18 +246,18 @@ fn a_successor_world_continues_the_requests_of_the_world_it_replaces() {
                 .recv_timeout(PARK)
                 .map(|counters| format!("{} steps, {} batches", counters.steps, counters.batches))
                 .unwrap_or_else(|why| format!("no counters ({why})"));
-            let cache = answer("the running world's cache", running.describe_cache())
+            let cache = answer("the running epoch's cache", running.describe_cache())
                 .map(|groups| format!("{} group(s)", groups.len()))
                 .unwrap_or_else(|why| format!("no answer ({why})"));
             panic!(
-                "the running world did not park within {PARK:?} ({error}): it had taken \
+                "the running epoch did not park within {PARK:?} ({error}): it had taken \
                  {steps_before} steps before the command, and afterwards {alive} and {cache} — \
-                 a world still counting steps is parking and never meets the condition, a \
-                 world that stopped answering is stuck"
+                 an epoch still counting steps is parking and never meets the condition, a \
+                 epoch that stopped answering is stuck"
             );
         }
     };
-    let index = parked.expect("the running world parks");
+    let index = parked.expect("the running epoch parks");
     successor
         .promote(index, false, false)
         .expect("the successor is promoted with the parked index");

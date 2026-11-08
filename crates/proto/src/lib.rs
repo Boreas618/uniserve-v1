@@ -1,6 +1,6 @@
 //! UniServe's interfaces across builds.
 //!
-//! A deployment's daemons outlive its engines: a world change replaces the
+//! A deployment's daemons outlive its engines: an epoch change replaces the
 //! engine with one of another build while the daemons serve on. The
 //! interfaces between them are therefore Protobuf schemas that change only by
 //! additions (`process.proto`, `request.proto`), compiled into this crate:
@@ -61,7 +61,7 @@ pub const PROTOCOL_MAJOR: u32 = 3;
 
 /// The interfaces' minor version: the additions this build knows. Minor 1
 /// adds the leader's answer of the nodes it knows now (`NodesQuery`). Minor 2
-/// adds explicit publication of committed worlds' immutable pages. Minor 3
+/// adds explicit publication of committed epochs' immutable pages. Minor 3
 /// carries generated artifacts over TCP in bounded parts. Minor 4 adds the
 /// management of a main process's epoch: the commands parking, promotion and
 /// program switch (`Park`, `Promote`, `Precopy`, `Switchover`, `Commit`,

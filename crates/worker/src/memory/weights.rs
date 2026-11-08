@@ -33,8 +33,8 @@ const WEIGHT_KEY_DOMAIN: &[u8] = b"uniserve-retained-weight\0";
 ///
 /// Both calls take the storage key [`retained_key`] derives, and both answer an
 /// [`nn::Backing`]: a read-only device region a layer's view is carved from. The bytes outlive the
-/// epoch's worlds - a new epoch on the same build config maps what an earlier one published - so a
-/// weight's storage record names no world and no segment.
+/// epoch - a new epoch on the same build config maps what an earlier one published - so a weight's
+/// storage record names no epoch and no segment.
 pub trait WeightStorage: Send + Sync {
     /// The bytes already retained under `key`, mapped read-only, or `None` when the Storage Server
     /// holds none.

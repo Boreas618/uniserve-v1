@@ -6,7 +6,7 @@
 //! session's) withdraws the tail's units from allocation, revoking the cached
 //! pages they hold (whose host KV cache copies stay), and lets the requests
 //! that hold them run to their end, admitting new ones on the units left: the
-//! serving world's capacity drops, and nothing pauses. Once no request holds a
+//! serving epoch's capacity drops, and nothing pauses. Once no request holds a
 //! withdrawn unit, the workers give the tail back. A request holding the tail
 //! that cannot get a unit to continue, because the requests running hold every
 //! unit left to allocation, is recomputed at once: it could not run on to its
@@ -871,9 +871,9 @@ impl Scheduler {
 
     /// Creates as many of the given-back segments as every device's ledger
     /// has room for within its quota, beside everything the deployment's
-    /// worlds and the Transfer Server hold there (and its free storage
+    /// epochs and the Transfer Server hold there (and its free storage
     /// holds, beside processes outside the deployment), and returns their
-    /// units to allocation: what a previous world released is the
+    /// units to allocation: what a previous epoch released is the
     /// successor's on the ledger at once.
     fn grow_cache(&mut self) -> Result<Vec<String>, String> {
         let Some(reports) = self.cache_storage()? else {

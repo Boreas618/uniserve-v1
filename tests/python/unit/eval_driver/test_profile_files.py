@@ -45,7 +45,7 @@ def _file(path: Path, version: int = 1) -> Path:
     db.execute("INSERT INTO schema_version VALUES (?)", (version,))
     db.executemany(
         "INSERT INTO metadata VALUES (?, ?)",
-        [("session", "3"), ("world", "1"), ("rank", "2"), ("device", "0")],
+        [("session", "3"), ("epoch", "1"), ("rank", "2"), ("device", "0")],
     )
     db.executemany(
         "INSERT INTO strings VALUES (?, ?)",

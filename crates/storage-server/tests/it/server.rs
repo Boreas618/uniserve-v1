@@ -118,7 +118,7 @@ pub(crate) fn head(socket: &Path) -> Client {
         socket,
         Role::Head {
             deployment: "model".into(),
-            world: 0,
+            epoch: 0,
         },
     )
     .unwrap()
@@ -131,7 +131,7 @@ pub(crate) fn worker(socket: &Path, scope: Scope, generation: u64, claim: Claim)
             scope,
             generation,
             claim,
-            world: 0,
+            epoch: 0,
         },
     )
     .unwrap()
@@ -309,7 +309,7 @@ fn rekeying_moves_read_only_tensors_only_the_callers_deployment_holds() {
     let claim = model_head
         .claim(0, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
-    model_head.publish_worlds(vec![0]).unwrap();
+    model_head.publish_epochs(vec![0]).unwrap();
     let mut first = worker(&server.socket, scope("text", 0), 1, claim);
     let storage = memfd(b"abcdefgh");
     first
@@ -598,7 +598,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
         &server.tcp,
         Role::Head {
             deployment: "model".into(),
-            world: 0,
+            epoch: 0,
         },
     )
     .unwrap();
@@ -632,7 +632,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
     assert!(matches!(
         ask(Request::Claim {
             scopes: Vec::new(),
-            world: 0,
+            epoch: 0,
             retire: Vec::new(),
         }),
         Reply::Error {
@@ -649,7 +649,7 @@ fn a_head_on_another_host_moves_pages_through_a_workers_pool() {
                 scope: scope("text", 0),
                 generation: 1,
                 claim,
-                world: 0,
+                epoch: 0,
             },
         ),
         Err(Error::Refused(_))
@@ -681,7 +681,7 @@ fn the_connector_extends_lookups_fills_prefetches_and_uploads_committed_pages() 
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(0, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_worlds(vec![0]).unwrap();
+    head.publish_epochs(vec![0]).unwrap();
     let mut worker = worker(&server.socket, scope("text", 0), 1, claim);
     let shape = PageShape {
         layout: key(3),
@@ -858,7 +858,7 @@ fn head_of(socket: &Path, deployment: &str) -> Client {
         socket,
         Role::Head {
             deployment: deployment.into(),
-            world: 0,
+            epoch: 0,
         },
     )
     .unwrap()
@@ -1063,15 +1063,15 @@ fn a_page_pool_the_hosts_storage_cannot_hold_is_refused() {
     assert!(listing.page_pools.is_empty());
 }
 
-/// A worker of `scope` in `world`.
-pub(crate) fn world_worker(socket: &Path, scope: Scope, world: u64, claim: Claim) -> Client {
+/// A worker of `scope` in `epoch`.
+pub(crate) fn epoch_worker(socket: &Path, scope: Scope, epoch: u64, claim: Claim) -> Client {
     Client::connect(
         socket,
         Role::Worker {
             scope,
             generation: 1,
             claim,
-            world,
+            epoch,
         },
     )
     .unwrap()
@@ -1090,20 +1090,20 @@ fn retained_names(client: &mut Client) -> Vec<String> {
     names
 }
 
-/// Two worlds of one deployment share a scope without touching each other's
-/// storage: the head keeps one claim token for both, each world's `retain`
-/// releases its own tensors alone, and a claim that retires a world releases
-/// the tensors no other world retains.
+/// Two epochs of one deployment share a scope without touching each other's
+/// storage: the head keeps one claim token for both, each epoch's `retain`
+/// releases its own tensors alone, and a claim that retires an epoch releases
+/// the tensors no other epoch retains.
 #[test]
-fn worlds_retain_their_own_storage_and_a_claim_retires_one() {
+fn epochs_retain_their_own_storage_and_a_claim_retires_one() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let first_claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_worlds(vec![1]).unwrap();
+    head.publish_epochs(vec![1]).unwrap();
 
-    // World 1's worker publishes shared weights, its exclusive planes and a
+    // Epoch 1's worker publishes shared weights, its exclusive planes and a
     // buffer of its own.
-    let mut first = world_worker(&server.socket, scope("text", 0), 1, first_claim);
+    let mut first = epoch_worker(&server.socket, scope("text", 0), 1, first_claim);
     let storages = [memfd(&[1; 4]), memfd(&[2; 4]), memfd(&[3; 4])];
     first
         .put(
@@ -1120,11 +1120,11 @@ fn worlds_retain_their_own_storage_and_a_claim_retires_one() {
         )
         .unwrap();
 
-    // World 2 claims the same scope under the same token: world 1's worker
+    // Epoch 2 claims the same scope under the same token: epoch 1's worker
     // stays current.
     let second_claim = head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
     assert_eq!(first_claim, second_claim);
-    let mut second = world_worker(&server.socket, scope("text", 0), 2, second_claim);
+    let mut second = epoch_worker(&server.socket, scope("text", 0), 2, second_claim);
     let got = second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     assert_eq!(got.tensors.len(), 1);
     let got = second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
@@ -1137,8 +1137,8 @@ fn worlds_retain_their_own_storage_and_a_claim_retires_one() {
         )
         .unwrap();
 
-    // World 2's worker retains what it uses; world 1's buffer, which it
-    // never took, stays world 1's.
+    // Epoch 2's worker retains what it uses; epoch 1's buffer, which it
+    // never took, stays epoch 1's.
     assert_eq!(
         second
             .retain(vec![key(1), key(2), key(4)], Vec::new())
@@ -1155,19 +1155,19 @@ fn worlds_retain_their_own_storage_and_a_claim_retires_one() {
         .iter()
         .find(|tensor| tensor.name == "planes")
         .unwrap();
-    let worlds: Vec<u64> = planes
+    let epochs: Vec<u64> = planes
         .retainers
         .iter()
-        .map(|retainer| retainer.world)
+        .map(|retainer| retainer.epoch)
         .collect();
-    assert_eq!(worlds, vec![1, 2]);
+    assert_eq!(epochs, vec![1, 2]);
 
-    // World 1's worker keeps writing what it holds.
+    // Epoch 1's worker keeps writing what it holds.
     first
         .retain(vec![key(1), key(2), key(3)], Vec::new())
         .unwrap();
 
-    // The commit of world 2 retires world 1: its buffer goes, what world 2
+    // The commit of epoch 2 retires epoch 1: its buffer goes, what epoch 2
     // retains stays.
     head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
     assert_eq!(
@@ -1179,18 +1179,18 @@ fn worlds_retain_their_own_storage_and_a_claim_retires_one() {
         listing
             .tensors
             .iter()
-            .all(|tensor| tensor.retainers.iter().all(|retainer| retainer.world == 2)),
+            .all(|tensor| tensor.retainers.iter().all(|retainer| retainer.epoch == 2)),
         "{listing:?}"
     );
 }
 
-/// The engine of `world` of the deployment, which sends its page requests.
-fn engine_head(socket: &Path, world: u64) -> Client {
+/// The engine of `epoch` of the deployment, which sends its page requests.
+fn engine_head(socket: &Path, epoch: u64) -> Client {
     Client::connect(
         socket,
         Role::Head {
             deployment: "model".into(),
-            world,
+            epoch,
         },
     )
     .unwrap()
@@ -1278,18 +1278,18 @@ fn levels(head: &mut Client, pool: u64, keys: &[Key]) -> Vec<::storage::protocol
     levels
 }
 
-/// A world on trial beside the world it succeeds keeps the pages it commits
-/// to itself: the serving world neither reads them nor finds them in the KV
-/// storage, which takes them only once the world is explicitly committed. The world on trial reads the serving world's pages.
+/// An epoch on trial beside the epoch it succeeds keeps the pages it commits
+/// to itself: the serving epoch neither reads them nor finds them in the KV
+/// storage, which takes them only once the epoch is explicitly committed. The epoch on trial reads the serving epoch's pages.
 #[test]
-fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
+fn a_epoch_on_trial_publishes_its_pages_to_itself_until_its_commit() {
     use ::storage::protocol::{Event, PageLevel, Request};
 
     let server = Running::start();
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_worlds(vec![1]).unwrap();
-    let mut worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+    daemon.publish_epochs(vec![1]).unwrap();
+    let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let pool = trial_pool(&mut worker);
     let mut connector = Client::connect(&server.socket, Role::Connector).unwrap();
     assert!(matches!(next_event(&mut connector).0, Event::Pool { .. }));
@@ -1299,18 +1299,18 @@ fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
             .unwrap();
     };
 
-    // The serving world's pages are every world's, and the KV storage
+    // The serving epoch's pages are every epoch's, and the KV storage
     // takes them at once.
     let mut serving = engine_head(&server.socket, 1);
     publish(&mut serving, pool, &[key(1)]);
     let (Event::Upload { task, pages, .. }, _) = next_event(&mut connector) else {
-        panic!("the serving world's page was not uploaded");
+        panic!("the serving epoch's page was not uploaded");
     };
     assert_eq!(pages.len(), 1);
     assert_eq!(pages[0].0, key(1));
     finish(&mut connector, task, vec![true]);
 
-    // World 2 starts on trial and commits a page of its own.
+    // Epoch 2 starts on trial and commits a page of its own.
     daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
     let mut trial = engine_head(&server.socket, 2);
     publish(&mut trial, pool, &[key(2)]);
@@ -1319,7 +1319,7 @@ fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
         vec![PageLevel::Host, PageLevel::Host]
     );
 
-    // The serving world asks the KV storage for the page it does not read:
+    // The serving epoch asks the KV storage for the page it does not read:
     // the connector's next task is that lookup, so no upload preceded it.
     let lookup = serving
         .submit(
@@ -1331,7 +1331,7 @@ fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
         )
         .unwrap();
     let (Event::Exists { task, keys, .. }, _) = next_event(&mut connector) else {
-        panic!("a page of the world on trial was uploaded before its commit");
+        panic!("a page of the epoch on trial was uploaded before its commit");
     };
     assert_eq!(keys, vec![key(2)]);
     finish(&mut connector, task, vec![false]);
@@ -1358,12 +1358,12 @@ fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
     };
     assert_eq!(slots, vec![None]);
 
-    // The commit publishes world 2 before retiring world 1, and
+    // The commit publishes epoch 2 before retiring epoch 1, and
     // the KV storage takes them.
-    daemon.publish_worlds(vec![2]).unwrap();
+    daemon.publish_epochs(vec![2]).unwrap();
     daemon.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
     let (Event::Upload { task, pages, .. }, _) = next_event(&mut connector) else {
-        panic!("the committed world's pages were not uploaded");
+        panic!("the committed epoch's pages were not uploaded");
     };
     assert_eq!(
         pages.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
@@ -1379,7 +1379,7 @@ fn a_world_on_trial_publishes_its_pages_to_itself_until_its_commit() {
 
 /// Independent replicas share committed pages while each candidate stays
 /// private. A group commit publishes all successors together, regardless
-/// of the numerical order of the world identifiers.
+/// of the numerical order of the epoch identifiers.
 #[test]
 fn independent_replicas_publish_successors_as_a_group() {
     use ::storage::protocol::PageLevel::{Absent, Host};
@@ -1388,8 +1388,8 @@ fn independent_replicas_publish_successors_as_a_group() {
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(9, vec![scope("text", 0)], Vec::new()).unwrap();
     daemon.claim(3, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_worlds(vec![9, 3]).unwrap();
-    let mut worker = world_worker(&server.socket, scope("text", 0), 9, claim);
+    daemon.publish_epochs(vec![9, 3]).unwrap();
+    let mut worker = epoch_worker(&server.socket, scope("text", 0), 9, claim);
     let pool = trial_pool(&mut worker);
     let mut first = engine_head(&server.socket, 9);
     let mut second = engine_head(&server.socket, 3);
@@ -1411,7 +1411,7 @@ fn independent_replicas_publish_successors_as_a_group() {
     publish(&mut candidate, pool, &[key(3)]);
     publish(&mut peer, pool, &[key(4)]);
     assert_eq!(
-        server_error(candidate.publish_worlds(vec![4])),
+        server_error(candidate.publish_epochs(vec![4])),
         ErrorKind::Invalid
     );
     assert_eq!(
@@ -1425,14 +1425,14 @@ fn independent_replicas_publish_successors_as_a_group() {
 
     // A rejected set publishes none of its otherwise valid members.
     assert_eq!(
-        server_error(daemon.publish_worlds(vec![4, 99])),
+        server_error(daemon.publish_epochs(vec![4, 99])),
         ErrorKind::Invalid
     );
     assert_eq!(
         levels(&mut first, pool, &[key(3), key(4)]),
         vec![Absent, Absent]
     );
-    daemon.publish_worlds(vec![4, 8]).unwrap();
+    daemon.publish_epochs(vec![4, 8]).unwrap();
     assert_eq!(
         levels(&mut first, pool, &[key(3), key(4)]),
         vec![Host, Host]
@@ -1444,24 +1444,24 @@ fn independent_replicas_publish_successors_as_a_group() {
     );
 }
 
-/// A rollback discards what the world on trial published: its pages leave
+/// A rollback discards what the epoch on trial published: its pages leave
 /// the pool, and the read-only tensors it alone put leave the server. Until
-/// then the serving world reads none of them, and a tensor of the same key
-/// that the serving world puts carries the serving world's bytes.
+/// then the serving epoch reads none of them, and a tensor of the same key
+/// that the serving epoch puts carries the serving epoch's bytes.
 #[test]
-fn a_rollback_discards_what_the_world_on_trial_published() {
+fn a_rollback_discards_what_the_epoch_on_trial_published() {
     use ::storage::protocol::PageLevel;
 
     let server = Running::start();
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_worlds(vec![1]).unwrap();
-    let mut serving_worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+    daemon.publish_epochs(vec![1]).unwrap();
+    let mut serving_worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let pool = trial_pool(&mut serving_worker);
     daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
-    let mut trial_worker = world_worker(&server.socket, scope("text", 0), 2, claim);
+    let mut trial_worker = epoch_worker(&server.socket, scope("text", 0), 2, claim);
 
-    // World 2 publishes a page and two read-only tensors.
+    // Epoch 2 publishes a page and two read-only tensors.
     let mut trial = engine_head(&server.socket, 2);
     publish(&mut trial, pool, &[key(5)]);
     let trial_bytes = [memfd(b"bad!"), memfd(b"new!")];
@@ -1478,7 +1478,7 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
         )
         .unwrap();
 
-    // The serving world reads none of them and retains none.
+    // The serving epoch reads none of them and retains none.
     let mut serving = engine_head(&server.socket, 1);
     assert_eq!(
         levels(&mut serving, pool, &[key(5)]),
@@ -1490,7 +1490,7 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
     assert!(got.tensors.is_empty());
     assert_eq!(got.missing, vec![key(6), key(7)]);
     serving_worker.retain(vec![key(6)], Vec::new()).unwrap();
-    // A key it puts itself holds its own bytes, for every world.
+    // A key it puts itself holds its own bytes, for every epoch.
     let serving_bytes = memfd(b"good");
     serving_worker
         .put(
@@ -1503,7 +1503,7 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
         .unwrap();
     assert_eq!(contents(got.storages.remove(0).1), b"good");
 
-    // World 2 reserves a page it commits only after the rollback.
+    // Epoch 2 reserves a page it commits only after the rollback.
     let ::storage::protocol::Reply::Reserved { .. } = trial
         .call(
             &::storage::protocol::Request::Reserve {
@@ -1520,8 +1520,8 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
         panic!("the reservation was refused");
     };
 
-    // The rollback retires world 2. Neither its committed page nor the one
-    // it commits as it leaves is read by any world, nor what it reserves
+    // The rollback retires epoch 2. Neither its committed page nor the one
+    // it commits as it leaves is read by any epoch, nor what it reserves
     // after.
     daemon.claim(1, vec![scope("text", 0)], vec![2]).unwrap();
     trial
@@ -1553,16 +1553,16 @@ fn a_rollback_discards_what_the_world_on_trial_published() {
     assert_eq!(contents(got.storages.remove(0).1), b"good");
 }
 
-/// What the serving world published stays the serving world's to read when
-/// only the world on trial still retains it: a previous world restarted on
+/// What the serving epoch published stays the serving epoch's to read when
+/// only the epoch on trial still retains it: a previous epoch restarted on
 /// its weights maps the cache segments it published again.
 #[test]
-fn a_world_reads_what_it_published_that_only_a_world_on_trial_retains() {
+fn a_epoch_reads_what_it_published_that_only_a_epoch_on_trial_retains() {
     let server = Running::start();
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_worlds(vec![1]).unwrap();
-    let mut serving = world_worker(&server.socket, scope("text", 0), 1, claim);
+    daemon.publish_epochs(vec![1]).unwrap();
+    let mut serving = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let planes = memfd(&[1; 4]);
     serving
         .put(
@@ -1571,29 +1571,29 @@ fn a_world_reads_what_it_published_that_only_a_world_on_trial_retains() {
         )
         .unwrap();
     daemon.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
-    let mut trial = world_worker(&server.socket, scope("text", 0), 2, claim);
+    let mut trial = epoch_worker(&server.socket, scope("text", 0), 2, claim);
     trial.get(vec![key(10)], Mode::Standby, Vec::new()).unwrap();
     serving.retain(Vec::new(), Vec::new()).unwrap();
     drop(serving);
 
-    let mut restarted = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let mut restarted = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let got = restarted
         .get(vec![key(10)], Mode::Standby, Vec::new())
         .unwrap();
     assert_eq!(got.tensors.len(), 1, "{:?}", got.missing);
 }
 
-/// A world's ranks on a host hold one token count in its host KV cache:
-/// what the world asks for, unless the host's budget over the bytes a token
+/// An epoch's ranks on a host hold one token count in its host KV cache:
+/// what the epoch asks for, unless the host's budget over the bytes a token
 /// takes on all of them holds fewer.
 #[test]
-fn a_host_sizes_the_host_kv_cache_of_a_world_in_tokens() {
+fn a_host_sizes_the_host_kv_cache_of_a_epoch_in_tokens() {
     use ::storage::protocol::{Reply, Request};
 
     let server = Running::start();
     let mut daemon = head(&server.socket);
     daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_worlds(vec![1]).unwrap();
+    daemon.publish_epochs(vec![1]).unwrap();
     let mut engine = engine_head(&server.socket, 1);
     let mut ask = |tokens: u64, host_bytes: Option<u64>| {
         let answer = engine
@@ -1625,7 +1625,7 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
         let server = Running::reserving(if refused { u64::MAX } else { 0 });
         let mut head = head(&server.socket);
         let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-        let mut worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+        let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
         let result = worker.allocate_host(key(42), "staged cache".into(), 4096);
         if refused {
             assert_eq!(server_error(result), ErrorKind::Resource);
@@ -1644,7 +1644,7 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
         assert_eq!(worker.list().unwrap().tensors.len(), 1);
         drop(worker);
         assert_eq!(head.keep_weights(vec![1], vec![key(42)]).unwrap(), 0);
-        let mut resumed = world_worker(&server.socket, scope("text", 0), 1, claim);
+        let mut resumed = epoch_worker(&server.socket, scope("text", 0), 1, claim);
         let got = resumed
             .get(vec![key(42)], Mode::Standby, Vec::new())
             .unwrap();
@@ -1660,7 +1660,7 @@ fn host_storage_is_admitted_before_allocation_and_retires_with_its_owner() {
 }
 
 /// A host that admits no page pool, its whole storage reserved, holds no
-/// token of a world's host KV cache and refuses its pools. Once a KV
+/// token of an epoch's host KV cache and refuses its pools. Once a KV
 /// storage keeps what the pools commit (a connector connected), it holds
 /// what a staging pool of `STAGING_POOL_BYTES` holds on each rank, and
 /// admits such a pool from its reserve, though no larger one: pages pass
@@ -1673,7 +1673,7 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
     let server = Running::reserving(u64::MAX);
     let mut daemon = head(&server.socket);
     let claim = daemon.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    daemon.publish_worlds(vec![1]).unwrap();
+    daemon.publish_epochs(vec![1]).unwrap();
     let mut engine = engine_head(&server.socket, 1);
     let mut ask = |tokens: u64, host_bytes: Option<u64>| {
         let answer = engine
@@ -1691,7 +1691,7 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
         };
         tokens
     };
-    let mut worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     // The slots of a pool of pages of 16 bytes the worker asks for of
     // `bytes`, or `None` when the host refuses it.
     let mut pool = |bytes: u64| {
@@ -1727,17 +1727,13 @@ fn a_host_that_admits_no_pool_stages_pages_for_the_kv_storage() {
     assert_eq!(pool(STAGING_POOL_BYTES), Some(STAGING_POOL_BYTES / 16));
 }
 
-/// A server serves clients of its protocol and of every earlier one from
-/// `MIN_VERSION` on, and refuses a later one, which restarts it with its
-/// own build first; an operator's connection speaks what the server serves.
+/// A server serves clients of its own protocol only and refuses any other version.
 #[test]
-fn a_server_serves_earlier_clients_and_refuses_later_ones() {
-    use ::storage::protocol::{MIN_VERSION, VERSION};
+fn a_server_serves_its_own_protocol_only() {
+    use ::storage::protocol::VERSION;
 
     let server = Running::start();
-    let operator = Client::connect_operator(&server.socket).unwrap();
-    assert_eq!(operator.version(), VERSION);
-    const { assert!(MIN_VERSION < VERSION) };
+    Client::connect_operator(&server.socket).unwrap();
 
     let welcome = |version: u32| {
         let mut connection = ::storage::transport::Connection::new(
@@ -1758,13 +1754,17 @@ fn a_server_serves_earlier_clients_and_refuses_later_ones() {
             .0
     };
     assert!(matches!(
-        welcome(MIN_VERSION),
+        welcome(VERSION),
         ::storage::protocol::ServerMessage::Welcome(::storage::protocol::Welcome::Accepted { .. })
     ));
-    assert!(matches!(
-        welcome(VERSION + 1),
-        ::storage::protocol::ServerMessage::Welcome(::storage::protocol::Welcome::Refused { .. })
-    ));
+    for other in [VERSION - 1, VERSION + 1] {
+        assert!(matches!(
+            welcome(other),
+            ::storage::protocol::ServerMessage::Welcome(
+                ::storage::protocol::Welcome::Refused { .. }
+            )
+        ));
+    }
 }
 
 #[test]
@@ -1870,9 +1870,9 @@ pub(crate) fn device(bytes: u64, segment: Option<::storage::Segment>) -> Storage
     }
 }
 
-/// Segment `ordinal` of `world`.
-fn segment(world: u64, ordinal: u32) -> Option<::storage::Segment> {
-    Some(::storage::Segment { world, ordinal })
+/// Segment `ordinal` of `epoch`.
+fn segment(epoch: u64, ordinal: u32) -> Option<::storage::Segment> {
+    Some(::storage::Segment { epoch, ordinal })
 }
 
 /// The deployment's ledger of [`GPU`] as `client` reads it.
@@ -1882,9 +1882,9 @@ pub(crate) fn ledger(client: &mut Client) -> ::storage::GpuLedger {
     ledgers.into_iter().next().unwrap()
 }
 
-/// The bytes of `ledger`'s entries of `item` held by exactly `worlds`.
-pub(crate) fn booked(ledger: &::storage::GpuLedger, item: Item, worlds: &[u64]) -> u64 {
-    ledger.bytes(|entry| entry.item == item && entry.worlds == worlds)
+/// The bytes of `ledger`'s entries of `item` held by exactly `epochs`.
+pub(crate) fn booked(ledger: &::storage::GpuLedger, item: Item, epochs: &[u64]) -> u64 {
+    ledger.bytes(|entry| entry.item == item && entry.epochs == epochs)
 }
 
 /// Waits until `client` reads `used` bytes booked in the ledger: a
@@ -1901,22 +1901,22 @@ fn await_used(client: &mut Client, used: u64) {
     panic!("the ledger books {booked} bytes, not {used}");
 }
 
-/// Two worlds of a deployment share a GPU within one quota: each storage is
-/// booked once, however many worlds map it, a world's booked items end with
+/// Two epochs of a deployment share a GPU within one quota: each storage is
+/// booked once, however many epochs map it, an epoch's booked items end with
 /// its processes, nothing takes the ledger past its quota, and a commit
 /// hands the predecessor's segments the successor maps to the successor on
 /// the ledger, as a transfer rather than a release and an allocation.
 #[test]
-fn two_worlds_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
+fn two_epochs_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_worlds(vec![1]).unwrap();
+    head.publish_epochs(vec![1]).unwrap();
 
-    // World 1 states its quota of 700 bytes of the GPU's 1000 and books its
+    // Epoch 1 states its quota of 700 bytes of the GPU's 1000 and books its
     // process and graph pool, then publishes its weights, a KV cache
     // segment and its buffer.
-    let mut first = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     first
         .book(
             GPU,
@@ -1948,10 +1948,10 @@ fn two_worlds_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
     assert_eq!(booked(&book, Item::CacheSegment, &[1]), 50);
     assert_eq!(booked(&book, Item::Exclusive, &[1]), 20);
 
-    // World 2 maps the weights and the segment: each is booked once, held
-    // by both worlds, beside the process and graph pool world 2 books.
+    // Epoch 2 maps the weights and the segment: each is booked once, held
+    // by both epochs, beside the process and graph pool epoch 2 books.
     head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
-    let mut second = world_worker(&server.socket, scope("text", 0), 2, claim);
+    let mut second = epoch_worker(&server.socket, scope("text", 0), 2, claim);
     second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
     let book = second
@@ -1988,11 +1988,11 @@ fn two_worlds_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
         }) => {
             assert!(message.contains("past its quota of 700 bytes"), "{message}");
             assert!(
-                message.contains("graph_pool of model/text/0 of world 1: 100 bytes"),
+                message.contains("graph_pool of model/text/0 of epoch 1: 100 bytes"),
                 "{message}"
             );
             assert!(
-                message.contains("cache_segment 1/0 of model/text/0 of world 1 and 2: 50 bytes"),
+                message.contains("cache_segment 1/0 of model/text/0 of epoch 1 and 2: 50 bytes"),
                 "{message}"
             );
         }
@@ -2000,9 +2000,9 @@ fn two_worlds_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
     }
     assert_eq!(ledger(&mut head).used(), 700);
 
-    // The commit: world 1's processes end in order, withdrawing what they
-    // booked, and the claim retires world 1, which releases its buffer. The
-    // segment world 2 maps is world 2's alone, its bytes unchanged.
+    // The commit: epoch 1's processes end in order, withdrawing what they
+    // booked, and the claim retires epoch 1, which releases its buffer. The
+    // segment epoch 2 maps is epoch 2's alone, its bytes unchanged.
     first
         .book(
             GPU,
@@ -2022,19 +2022,19 @@ fn two_worlds_share_a_gpus_quota_and_a_commit_transfers_the_segments() {
     assert_eq!(book.quota, Some(700));
 }
 
-/// A previous world kept as its weights keeps nothing else once its
+/// A previous epoch kept as its weights keeps nothing else once its
 /// processes exited: what they booked ends with them, and the head ends its
 /// retention of every exclusive storage, so its buffer is released and the
 /// segment its successor maps is the successor's alone, while the weights
 /// both map stay booked once for both. The successor's room on the ledger
 /// grows by all of it.
 #[test]
-fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
+fn a_epoch_kept_as_its_weights_leaves_its_successor_the_rest() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_worlds(vec![1]).unwrap();
-    let mut first = world_worker(&server.socket, scope("text", 0), 1, claim);
+    head.publish_epochs(vec![1]).unwrap();
+    let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     first
         .book(GPU, 1000, Some(700), vec![(Item::Process, 100)])
         .unwrap();
@@ -2054,13 +2054,13 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
         )
         .unwrap();
     head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
-    let mut second = world_worker(&server.socket, scope("text", 0), 2, claim);
+    let mut second = epoch_worker(&server.socket, scope("text", 0), 2, claim);
     second.get(vec![key(1)], Mode::Read, Vec::new()).unwrap();
     second.get(vec![key(2)], Mode::Standby, Vec::new()).unwrap();
     assert_eq!(ledger(&mut head).used(), 370);
 
-    // The previous world's processes exit; the head keeps its weights.
-    // The kept world's processes end in order, withdrawing what they booked.
+    // The previous epoch's processes exit; the head keeps its weights.
+    // The kept epoch's processes end in order, withdrawing what they booked.
     first
         .book(GPU, 1000, Some(700), vec![(Item::Process, 0)])
         .unwrap();
@@ -2076,7 +2076,7 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
     let refused = second
         .call(
             &::storage::protocol::Request::KeepWeights {
-                worlds: vec![1],
+                epochs: vec![1],
                 cache_keys: Vec::new(),
             },
             &[],
@@ -2095,9 +2095,9 @@ fn a_world_kept_as_its_weights_leaves_its_successor_the_rest() {
     );
 }
 
-/// A head moves a world's weights between its GPUs and host storage only
+/// A head moves an epoch's weights between its GPUs and host storage only
 /// through the Transfer Server: without one, an offload of weights is
-/// refused and moves nothing, while a world with no weights to move (none
+/// refused and moves nothing, while an epoch with no weights to move (none
 /// that it alone retains on a GPU, none in host storage) is answered at once.
 /// Only the head moves weights.
 #[test]
@@ -2105,8 +2105,8 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_worlds(vec![1]).unwrap();
-    let mut first = world_worker(&server.socket, scope("text", 0), 1, claim);
+    head.publish_epochs(vec![1]).unwrap();
+    let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     let storages = [memfd(&[1; 4]), memfd(&[2; 4])];
     first
         .put(
@@ -2126,12 +2126,12 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
         ErrorKind::Unavailable
     );
     assert_eq!(booked(&ledger(&mut head), Item::Weights, &[1]), 200);
-    // World 2 retains nothing; world 1 has nothing in host storage.
+    // Epoch 2 retains nothing; epoch 1 has nothing in host storage.
     assert_eq!(head.move_weights(2, true).unwrap(), (0, 0));
     assert_eq!(head.move_weights(1, false).unwrap(), (0, 0));
     // A worker is no head.
     let refused = first
-        .call(&::storage::protocol::Request::Offload { world: 1 }, &[])
+        .call(&::storage::protocol::Request::Offload { epoch: 1 }, &[])
         .unwrap();
     assert!(
         matches!(
@@ -2146,7 +2146,7 @@ fn a_weight_move_without_a_transfer_server_is_refused_and_moves_nothing() {
     );
 }
 
-/// The processes of one scope and world serve in turn: a standby or a
+/// The processes of one scope and epoch serve in turn: a standby or a
 /// relaunch that books beside the rank it replaces counts once, as the
 /// larger booking.
 #[test]
@@ -2154,11 +2154,11 @@ fn the_processes_of_one_scope_count_as_their_largest_booking() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_worlds(vec![1]).unwrap();
-    let mut rank = world_worker(&server.socket, scope("text", 0), 1, claim);
+    head.publish_epochs(vec![1]).unwrap();
+    let mut rank = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     rank.book(GPU, 1000, Some(700), vec![(Item::Process, 300)])
         .unwrap();
-    let mut standby = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let mut standby = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     standby
         .book(GPU, 1000, Some(700), vec![(Item::Process, 350)])
         .unwrap();
@@ -2177,8 +2177,8 @@ fn a_lost_rank_s_booking_stays_reserved_for_its_relaunch() {
     let claim = head
         .claim(1, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
-    head.publish_worlds(vec![1]).unwrap();
-    let mut rank = world_worker(&server.socket, scope("text", 0), 1, claim);
+    head.publish_epochs(vec![1]).unwrap();
+    let mut rank = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     rank.book(
         GPU,
         1000,
@@ -2189,7 +2189,7 @@ fn a_lost_rank_s_booking_stays_reserved_for_its_relaunch() {
     drop(rank);
 
     // The lost rank's 500 bytes leave 200 of the quota to another scope.
-    let mut other = world_worker(&server.socket, scope("text", 1), 1, claim);
+    let mut other = epoch_worker(&server.socket, scope("text", 1), 1, claim);
     assert_eq!(
         server_error(other.book(GPU, 1000, Some(700), vec![(Item::Process, 300)])),
         ErrorKind::Quota
@@ -2198,7 +2198,7 @@ fn a_lost_rank_s_booking_stays_reserved_for_its_relaunch() {
 
     // The relaunch books a smaller process and takes that item over; the
     // graph pool it has not booked yet stays reserved.
-    let mut relaunch = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let mut relaunch = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     relaunch
         .book(GPU, 1000, Some(700), vec![(Item::Process, 250)])
         .unwrap();
@@ -2211,16 +2211,16 @@ fn a_lost_rank_s_booking_stays_reserved_for_its_relaunch() {
 
 /// A rank that withdraws its bookings before its connection ends, as a
 /// worker that ends in order does, leaves nothing reserved, and a lost
-/// rank's reservation ends with its world's retirement.
+/// rank's reservation ends with its epoch's retirement.
 #[test]
-fn reservations_end_with_a_withdrawal_or_the_world_s_retirement() {
+fn reservations_end_with_a_withdrawal_or_the_epoch_s_retirement() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head
         .claim(1, vec![scope("text", 0), scope("text", 1)], Vec::new())
         .unwrap();
-    head.publish_worlds(vec![1]).unwrap();
-    let mut closed = world_worker(&server.socket, scope("text", 0), 1, claim);
+    head.publish_epochs(vec![1]).unwrap();
+    let mut closed = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     closed
         .book(GPU, 1000, Some(700), vec![(Item::Process, 300)])
         .unwrap();
@@ -2230,13 +2230,13 @@ fn reservations_end_with_a_withdrawal_or_the_world_s_retirement() {
     drop(closed);
     await_used(&mut head, 0);
 
-    let mut lost = world_worker(&server.socket, scope("text", 1), 1, claim);
+    let mut lost = epoch_worker(&server.socket, scope("text", 1), 1, claim);
     lost.book(GPU, 1000, Some(700), vec![(Item::Process, 300)])
         .unwrap();
     drop(lost);
     assert_eq!(ledger(&mut head).used(), 300);
     head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_worlds(vec![2]).unwrap();
+    head.publish_epochs(vec![2]).unwrap();
     head.claim(2, vec![scope("text", 0)], vec![1]).unwrap();
     // Nothing is booked on the GPU any more: it has no ledger, or an empty
     // one.
@@ -2248,15 +2248,15 @@ fn reservations_end_with_a_withdrawal_or_the_world_s_retirement() {
 }
 
 /// A worker books only its own items, and a booking that leaves a ledger
-/// past its quota (as a smaller fraction a world states since may) shrinks
+/// past its quota (as a smaller fraction an epoch states since may) shrinks
 /// it but never grows it.
 #[test]
 fn a_ledger_past_its_quota_shrinks_but_never_grows() {
     let server = Running::start();
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    head.publish_worlds(vec![1]).unwrap();
-    let mut worker = world_worker(&server.socket, scope("text", 0), 1, claim);
+    head.publish_epochs(vec![1]).unwrap();
+    let mut worker = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     worker
         .book(GPU, 1000, Some(700), vec![(Item::Process, 600)])
         .unwrap();

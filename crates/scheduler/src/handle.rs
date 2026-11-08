@@ -578,7 +578,7 @@ pub enum Command {
     /// Parks the scheduler (`Scheduler::park`): ends every token request
     /// that resumes from its generated tokens as migratable, lets the
     /// others finish, and answers with the prefix cache index once nothing
-    /// runs, having lent the world that succeeds it the cache segments no
+    /// runs, having lent the epoch that succeeds it the cache segments no
     /// request in flight continues from when it `lend`s; it executes
     /// nothing more until resumed.
     Park {
@@ -605,12 +605,12 @@ pub enum Command {
     /// Commits a successor scheduler (`Scheduler::commit`), and answers
     /// with what each worker reported.
     Commit(crossbeam_channel::Sender<Result<Vec<String>, String>>),
-    /// Publishes the committed world's immutable pages on every claimed node.
-    PublishWorld(crossbeam_channel::Sender<Result<(), String>>),
-    /// Ends the storage of other worlds on the nodes of the scheduler's
+    /// Publishes the committed epoch's immutable pages on every claimed node.
+    PublishEpoch(crossbeam_channel::Sender<Result<(), String>>),
+    /// Ends the storage of other epochs on the nodes of the scheduler's
     /// workers (`Worker::retire`), and answers whether it did.
     Retire {
-        worlds: Vec<u64>,
+        epochs: Vec<u64>,
         answer: crossbeam_channel::Sender<Result<(), String>>,
     },
     /// Reads the storage ledgers of the nodes of the scheduler's workers
@@ -623,11 +623,11 @@ pub enum Command {
         halve: bool,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
     },
-    /// Keeps the weights alone of other worlds on the nodes of the
+    /// Keeps the weights alone of other epochs on the nodes of the
     /// scheduler's workers, in host storage when `to_host`
     /// (`Worker::keep_weights`), and answers with each node's report.
     KeepWeights {
-        worlds: Vec<u64>,
+        epochs: Vec<u64>,
         to_host: bool,
         cache_keys: Vec<Vec<u8>>,
         answer: crossbeam_channel::Sender<Result<Vec<String>, String>>,
@@ -635,7 +635,7 @@ pub enum Command {
     /// Reports the KV cache each worker group holds now
     /// (`Scheduler::describe_cache`).
     DescribeCache(crossbeam_channel::Sender<Result<Vec<crate::GroupCache>, String>>),
-    /// Accepted prefixes of running requests that can move to another world.
+    /// Accepted prefixes of running requests that can move to another epoch.
     DescribeRequests(crossbeam_channel::Sender<Vec<proto::request::wire::RequestPrefix>>),
     /// §7.3 step 2: prepares `program`'s policy on this scheduler's state,
     /// without putting it in. The load and the instantiation run on a blocking
@@ -699,7 +699,7 @@ pub enum Command {
         load: Option<scheduling::guest::view::ExpertLoad>,
     },
     /// Takes the expert layout the policy last answered: the handoff to the
-    /// worker's world setup, which applies it (§7.6).
+    /// worker's epoch setup, which applies it (§7.6).
     TakeExpertOrder(crossbeam_channel::Sender<Option<scheduling::guest::view::ExpertOrder>>),
     /// Reports the state a policy is instantiated with, as seen from this
     /// scheduler with every rank's load the control thread named (§7.3).
@@ -1001,33 +1001,33 @@ impl CommandSender {
         promoted
     }
 
-    /// Publishes the committed world's immutable pages on every claimed node.
-    pub fn publish_world(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+    /// Publishes the committed epoch's immutable pages on every claimed node.
+    pub fn publish_epoch(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, published) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::PublishWorld(answer));
+        let _ = self.send(Command::PublishEpoch(answer));
         published
     }
 
-    /// Ends the storage of `worlds` on the nodes of the scheduler's workers
+    /// Ends the storage of `epochs` on the nodes of the scheduler's workers
     /// (`Command::Retire`); the receiver gets whether it did.
-    pub fn retire(&self, worlds: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
+    pub fn retire(&self, epochs: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, retired) = crossbeam_channel::bounded(1);
-        let _ = self.send(Command::Retire { worlds, answer });
+        let _ = self.send(Command::Retire { epochs, answer });
         retired
     }
 
-    /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
+    /// Keeps the weights alone of `epochs` on the nodes of the scheduler's
     /// workers, in host storage when `to_host` (`Command::KeepWeights`); the
     /// receiver gets each node's report.
     pub fn keep_weights(
         &self,
-        worlds: Vec<u64>,
+        epochs: Vec<u64>,
         to_host: bool,
         cache_keys: Vec<Vec<u8>>,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, kept) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::KeepWeights {
-            worlds,
+            epochs,
             to_host,
             cache_keys,
             answer,
@@ -1296,7 +1296,7 @@ impl CommandSender {
     }
 
     /// Takes the expert layout the policy last answered, for the worker's
-    /// world setup that applies it (§7.6). `None` when no layout is waiting.
+    /// epoch setup that applies it (§7.6). `None` when no layout is waiting.
     pub fn take_expert_order(&self) -> Option<scheduling::guest::view::ExpertOrder> {
         let (answer, taken) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::TakeExpertOrder(answer));
@@ -1354,7 +1354,7 @@ impl CommandSender {
         response
     }
 
-    /// Commits a successor scheduler's world (`Command::Commit`); the
+    /// Commits a successor scheduler's epoch (`Command::Commit`); the
     /// receiver gets what each worker reported.
     pub fn commit(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, committed) = crossbeam_channel::bounded(1);

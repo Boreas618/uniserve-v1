@@ -200,7 +200,7 @@ class ProfileFile:
             "path": str(self.path),
             "schema_version": self.version,
             "session": self.session,
-            "world": self.metadata.get("world"),
+            "epoch": self.metadata.get("epoch"),
             "rank": self.rank,
             "device": self.metadata.get("device"),
             "chip": self.metadata.get("chip"),

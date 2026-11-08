@@ -62,7 +62,7 @@ impl Dispatch {
     /// protocol's default component for an undivided model.
     pub(super) fn worker_candidates<'a>(
         &'a self,
-        world: &'a dyn super::submission::World,
+        epoch: &'a dyn super::submission::Epoch,
         info: &'a MainProcessInfo,
         kind: CallKind,
     ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)> {
@@ -73,7 +73,7 @@ impl Dispatch {
                 .map_or(DEFAULT_BLOCK, String::as_str),
             _ => DEFAULT_BLOCK,
         };
-        self.component_candidates(world, kind, component)
+        self.component_candidates(epoch, kind, component)
     }
 
     /// Enumerates workers that support `kind` and can serve `component`, with
@@ -85,11 +85,11 @@ impl Dispatch {
     /// Other workers are excluded.
     pub(super) fn component_candidates<'a>(
         &'a self,
-        world: &'a dyn super::submission::World,
+        epoch: &'a dyn super::submission::Epoch,
         kind: CallKind,
         component: &'a str,
     ) -> impl Iterator<Item = (&'a crate::WorkerGroupId, &'a str, &'a MainProcessInfo)> {
-        world.info().workers.iter().filter_map(move |(id, info)| {
+        epoch.info().workers.iter().filter_map(move |(id, info)| {
             if !info.supported_calls.contains(&kind) {
                 return None;
             }
@@ -130,7 +130,7 @@ impl Dispatch {
     /// choice.
     pub(super) fn component_target<'a>(
         &'a self,
-        world: &'a dyn super::submission::World,
+        epoch: &'a dyn super::submission::Epoch,
         request: RequestKey,
         kind: CallKind,
         component: &'a str,
@@ -140,7 +140,7 @@ impl Dispatch {
         // install, which a prefill replica could serve, hands the request to
         // a decode replica.
         let candidates = self
-            .component_candidates(world, kind, component)
+            .component_candidates(epoch, kind, component)
             .filter(|(id, _, _)| !decodes(kind) || !self.prefill_groups.contains(*id))
             .collect::<Vec<_>>();
         let bound = candidates.first()?.1;
@@ -155,7 +155,7 @@ impl Dispatch {
         };
         if let Some(owner) = pinned.get(&(request, bound.to_owned())) {
             let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == owner)?;
-            return world.has_capacity(id).then_some((id, component));
+            return epoch.has_capacity(id).then_some((id, component));
         }
 
         // A request that has not run here yet runs where the policy says
@@ -164,7 +164,7 @@ impl Dispatch {
         // substitutes a replica the policy did not choose.
         if let Choice::Target(named) = choice {
             let (id, component, _) = candidates.into_iter().find(|(id, _, _)| *id == named)?;
-            return world.has_capacity(id).then_some((id, component));
+            return epoch.has_capacity(id).then_some((id, component));
         }
 
         // Prefer a worker already selected for another component of this
@@ -180,7 +180,7 @@ impl Dispatch {
             .copied()
             .find(|(id, _, _)| resident.contains(id))
         {
-            return world.has_capacity(id).then_some((id, component));
+            return epoch.has_capacity(id).then_some((id, component));
         }
 
         // Among replicas with queue capacity, a new request goes to the one
@@ -190,7 +190,7 @@ impl Dispatch {
         // `WorkerInfo::workers`.
         candidates
             .into_iter()
-            .filter(|(id, _, _)| world.has_capacity(id))
+            .filter(|(id, _, _)| epoch.has_capacity(id))
             .min_by_key(|(id, _, _)| {
                 self.affinity
                     .iter()
@@ -205,7 +205,7 @@ impl Dispatch {
     /// `info`, as `worker_candidates` does, while preserving residency.
     pub(super) fn worker_target<'a>(
         &'a self,
-        world: &'a dyn super::submission::World,
+        epoch: &'a dyn super::submission::Epoch,
         info: &'a MainProcessInfo,
         request: RequestKey,
         kind: CallKind,
@@ -218,7 +218,7 @@ impl Dispatch {
                 .map_or("model", String::as_str),
             _ => "model",
         };
-        self.component_target(world, request, kind, component, choice)
+        self.component_target(epoch, request, kind, component, choice)
     }
 
     /// Places `request`'s calls of `kind` on the replica that will execute
@@ -229,13 +229,13 @@ impl Dispatch {
     /// submission capacity.
     pub(super) fn place(
         &mut self,
-        world: &dyn super::submission::World,
+        epoch: &dyn super::submission::Epoch,
         info: &MainProcessInfo,
         request: RequestKey,
         kind: CallKind,
     ) -> Option<crate::WorkerGroupId> {
         let (id, bound_component) =
-            self.worker_target(world, info, request, kind, &Choice::Existing)?;
+            self.worker_target(epoch, info, request, kind, &Choice::Existing)?;
         let target = (id.clone(), bound_component.to_owned());
         let pinned = if decodes(kind) {
             &mut self.decode_affinity
@@ -252,15 +252,15 @@ impl Dispatch {
     /// eligible replica with submission capacity.
     pub(super) fn select_worker(
         &mut self,
-        world: &dyn super::submission::World,
+        epoch: &dyn super::submission::Epoch,
         info: &MainProcessInfo,
         call: &Call,
         choice: &Choice,
     ) -> Option<(crate::WorkerGroupId, String)> {
         let (id, bound_component) = if call.component == DEFAULT_BLOCK {
-            self.worker_target(world, info, call.request_key, call.kind, choice)
+            self.worker_target(epoch, info, call.request_key, call.kind, choice)
         } else {
-            self.component_target(world, call.request_key, call.kind, &call.component, choice)
+            self.component_target(epoch, call.request_key, call.kind, &call.component, choice)
         }?;
         let target = (id.clone(), bound_component.to_owned());
         let pinned = if decodes(call.kind) {

@@ -3,7 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 /// A complete page held by the scheduler until its transfer finishes.
-/// `request` identifies the source request across source and target worlds;
+/// `request` identifies the source request across source and target epochs;
 /// it does not identify the physical pool or the page size.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page {
@@ -24,10 +24,10 @@ pub struct Page {
 /// Accepted token facts and complete pages held by one source request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Prefix {
-    pub world: u64,
+    pub epoch: u64,
     pub request: u64,
-    /// Origin world and request of the private continuation. Unlike the
-    /// current source above, this survives successive world changes.
+    /// Origin epoch and request of the private continuation. Unlike the
+    /// current source above, this survives successive epoch changes.
     pub resume: (u64, u64),
     /// The admitted request's logical extent, fixed across copy rounds.
     pub capacity_tokens: u32,
@@ -88,7 +88,7 @@ pub struct Copy {
 /// spans each owner submits as one Transfer Server task, at `priority`.
 /// The promotion's backfill and a rollback's restore run at
 /// [`crate::protocol::Priority::Promotion`], since the pause waits for them;
-/// the rounds that warm a successor while the serving world runs, at
+/// the rounds that warm a successor while the serving epoch runs, at
 /// [`crate::protocol::Priority::Warming`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Transfer {
@@ -101,7 +101,7 @@ pub struct Transfer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Operation {
     Snapshot {
-        world: u64,
+        epoch: u64,
         after: Vec<(u64, u32)>,
     },
     Reserve {

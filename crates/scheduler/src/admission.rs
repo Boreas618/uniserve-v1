@@ -138,7 +138,7 @@ impl Scheduler {
         }
         if req.is_migratable() && req.cache.resume.is_none() {
             req.cache.resume = Some(proto::request::CacheResume {
-                world: self.world,
+                epoch: self.epoch,
                 request_id: req.request_id.0,
             });
         }
@@ -743,7 +743,7 @@ impl Scheduler {
     ///
     /// A stored trajectory stays needed until its request's latent
     /// preparation restores it, so taking the resumed requests first keeps
-    /// the trajectories a world still has to restore to those of its latest
+    /// the trajectories an epoch still has to restore to those of its latest
     /// preemption, at most its request slots, which the host latent pools
     /// are sized by; the resumed requests also arrived first.
     fn queue_media(&mut self, pending: PendingMedia) {
@@ -1421,7 +1421,7 @@ impl Scheduler {
     /// spends its resources on first is the mechanism's decision, and the
     /// queue's order carries rules a policy cannot see. `queue_media` puts a
     /// request that resumes a stored trajectory ahead of one that starts one,
-    /// so a world restores at most the trajectories of its latest preemption —
+    /// so an epoch restores at most the trajectories of its latest preemption —
     /// a host latent pool is sized by that. Re-ordering the queue by the plan
     /// would discard it (the policy learns of arrivals, not of the mechanism's
     /// queue), so this is a stable partition, never a re-sort.
@@ -1526,8 +1526,8 @@ impl Scheduler {
                 let cached_tokens = prefix_hit.cached_tokens.min(n);
                 // The host KV cache may hold the reusable pages that follow
                 // the device match; the head waits for its pins. A request
-                // continuing another world's state reads none: the host's
-                // pages are keyed by the world that serves.
+                // continuing another epoch's state reads none: the host's
+                // pages are keyed by the epoch that serves.
                 let mut host_tokens = 0;
                 let mut answer =
                     host_prefix(&mut self.kv_offload, head, &target, cached_tokens, n, 0);
@@ -1954,7 +1954,7 @@ const HOST_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_millis(2
 /// What the host KV cache says about a request's prompt beyond its device hit.
 pub(super) enum HostHit {
     /// Nothing to look for: no host cache serves that worker, the request
-    /// reads another world's pages or continues context images, or its prompt
+    /// reads another epoch's pages or continues context images, or its prompt
     /// is on the device already.
     Nothing,
     /// The host serves the prompt up to this token boundary.

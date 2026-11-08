@@ -45,7 +45,7 @@ type ClientId = u64;
 pub const DEFAULT_POOL_BYTES: u64 = 64 << 30;
 
 /// The host storage a rank's page pools take at most when the host's storage
-/// holds none of the pools a world asks for and a KV storage keeps every
+/// holds none of the pools an epoch asks for and a KV storage keeps every
 /// page the pools commit: staging pools, through which pages pass into the
 /// KV storage on their way out of the device (`specs/online-operations.md`
 /// §6.5). The server admits them from its reserve, never past the host's
@@ -61,9 +61,9 @@ enum Slot {
         writer: Scope,
         /// The head that reserved the slot, while it is connected.
         head: Option<ClientId>,
-        /// The world whose head reserved the slot, which publishes its page.
+        /// The epoch whose head reserved the slot, which publishes its page.
         #[serde(default)]
-        world: u64,
+        epoch: u64,
     },
     /// Reserved for the connector, which reads the page from the
     /// KV storage.
@@ -79,37 +79,37 @@ enum Slot {
         pins: Vec<(Scope, Option<ClientId>)>,
         /// The connector's uploads of the page in flight.
         uploads: u32,
-        /// The world that published the page (`Visibility`); zero for a
-        /// page every world shares, such as one read from the KV storage.
+        /// The epoch that published the page (`Visibility`); zero for a
+        /// page every epoch shares, such as one read from the KV storage.
         #[serde(default)]
-        world: u64,
+        epoch: u64,
     },
 }
 
-/// The world a discarded page is published by: no world reads it, and it
+/// The epoch a discarded page is published by: no epoch reads it, and it
 /// leaves the pool once nobody reads it.
 pub(super) const DISCARDED: u64 = u64::MAX;
 
-/// Which pages a head reads: those its own world published, and those every
-/// world of its deployment shares. A world on trial beside the world it
+/// Which pages a head reads: those its own epoch published, and those every
+/// epoch of its deployment shares. An epoch on trial beside the epoch it
 /// succeeds (`private`) keeps what it publishes to itself until its commit
 /// retires its predecessor; a rollback discards it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Visibility {
-    /// The world of the head that reads.
-    pub(super) world: u64,
-    /// The deployment's uncommitted or discarded worlds.
+    /// The epoch of the head that reads.
+    pub(super) epoch: u64,
+    /// The deployment's uncommitted or discarded epochs.
     pub(super) private: BTreeSet<u64>,
 }
 
 impl Visibility {
-    /// Whether a page `published` by that world is read.
+    /// Whether a page `published` by that epoch is read.
     pub(super) fn sees(&self, published: u64) -> bool {
-        published == self.world || self.shared(published)
+        published == self.epoch || self.shared(published)
     }
 
-    /// Whether every world of the deployment reads a page `published` by
-    /// that world.
+    /// Whether every epoch of the deployment reads a page `published` by
+    /// that epoch.
     pub(super) fn shared(&self, published: u64) -> bool {
         published != DISCARDED && !self.private.contains(&published)
     }
@@ -166,8 +166,8 @@ pub(super) struct Pool {
     /// since [`Pools::settle`] last took them.
     removed: Vec<Key>,
     ended: Vec<(u64, Option<PageAnchor>)>,
-    /// The scopes, by world, whose workers mapped the pool: a pool no
-    /// claimed world maps is the server's to release.
+    /// The scopes, by epoch, whose workers mapped the pool: a pool no
+    /// claimed epoch maps is the server's to release.
     users: BTreeSet<(Scope, u64)>,
 }
 
@@ -427,23 +427,23 @@ impl Pools {
             .sum()
     }
 
-    /// `world`'s worker of `scope` maps `pool`.
-    pub(super) fn add_user(&mut self, pool: u64, scope: &Scope, world: u64) {
+    /// `epoch`'s worker of `scope` maps `pool`.
+    pub(super) fn add_user(&mut self, pool: u64, scope: &Scope, epoch: u64) {
         if let Some(entry) = self.pools.get_mut(&pool) {
-            entry.users.insert((scope.clone(), world));
+            entry.users.insert((scope.clone(), epoch));
         }
     }
 
-    /// `retired` worlds of `deployment` map no pool any more.
+    /// `retired` epochs of `deployment` map no pool any more.
     pub(super) fn retire_users(&mut self, deployment: &str, retired: &BTreeSet<u64>) {
         for pool in self.pools.values_mut() {
             if pool.deployment == deployment {
-                pool.users.retain(|(_, world)| !retired.contains(world));
+                pool.users.retain(|(_, epoch)| !retired.contains(epoch));
             }
         }
     }
 
-    /// The live pools of `deployment` no world maps, with their bytes.
+    /// The live pools of `deployment` no epoch maps, with their bytes.
     pub(super) fn unreferenced(&self, deployment: &str) -> Vec<(u64, u64)> {
         self.pools
             .iter()
@@ -558,10 +558,10 @@ impl Pools {
         Some(slots)
     }
 
-    /// Discard the pages `world` of `deployment` published while on trial
+    /// Discard the pages `epoch` of `deployment` published while on trial
     /// ([`Pool::discard_where`]).
-    pub(super) fn discard_world(&mut self, deployment: &str, world: u64) {
-        self.discard_where(deployment, |published| published == world);
+    pub(super) fn discard_epoch(&mut self, deployment: &str, epoch: u64) {
+        self.discard_where(deployment, |published| published == epoch);
     }
 
     fn discard_where(&mut self, deployment: &str, discarded: impl Fn(u64) -> bool) -> u64 {
@@ -575,12 +575,12 @@ impl Pools {
         pages
     }
 
-    /// The pages `world` of `deployment` published, by pool.
-    pub(super) fn published_by(&self, deployment: &str, world: u64) -> Vec<(u64, Vec<(Key, u32)>)> {
+    /// The pages `epoch` of `deployment` published, by pool.
+    pub(super) fn published_by(&self, deployment: &str, epoch: u64) -> Vec<(u64, Vec<(Key, u32)>)> {
         self.pools
             .iter()
             .filter(|(id, pool)| pool.deployment == deployment && !self.releasing.contains(id))
-            .map(|(&id, pool)| (id, pool.published_by(world)))
+            .map(|(&id, pool)| (id, pool.published_by(epoch)))
             .filter(|(_, pages)| !pages.is_empty())
             .collect()
     }
@@ -674,7 +674,7 @@ impl Pool {
                 let Some(&slot) = self.index.get(key) else {
                     return false;
                 };
-                if !matches!(self.slots[slot as usize], Slot::Ready { world, .. } if visibility.sees(world))
+                if !matches!(self.slots[slot as usize], Slot::Ready { epoch, .. } if visibility.sees(epoch))
                 {
                     return false;
                 }
@@ -704,7 +704,7 @@ impl Pool {
 
     /// A slot for each key the pool holds no page of that `visibility`
     /// reads, written by the worker of `writer` for `head`. A page of the
-    /// key that another world keeps to itself, and nobody reads, gives way.
+    /// key that another epoch keeps to itself, and nobody reads, gives way.
     /// With `window`, the pages of `keys` the pool reserves or holds become
     /// one window, whose id is returned.
     fn reserve(
@@ -728,7 +728,7 @@ impl Pool {
                     key: *key,
                     writer: writer.clone(),
                     head: Some(head),
-                    world: visibility.world,
+                    epoch: visibility.epoch,
                 };
                 self.index.insert(*key, slot);
                 PageSlot::Reserved {
@@ -820,25 +820,25 @@ impl Pool {
             let Some(&slot) = self.index.get(key) else {
                 continue;
             };
-            let Slot::Reserved { world, .. } = self.slots[slot as usize] else {
+            let Slot::Reserved { epoch, .. } = self.slots[slot as usize] else {
                 continue;
             };
-            self.ready(*key, slot, world);
+            self.ready(*key, slot, epoch);
             committed.push((*key, slot));
         }
         committed
     }
 
-    /// `slot` holds `key`'s page, which `world` published, readable and the
+    /// `slot` holds `key`'s page, which `epoch` published, readable and the
     /// most recently used.
-    fn ready(&mut self, key: Key, slot: u32, world: u64) {
+    fn ready(&mut self, key: Key, slot: u32, epoch: u64) {
         let tick = self.touch();
         self.slots[slot as usize] = Slot::Ready {
             key,
             touched: tick,
             pins: Vec::new(),
             uploads: 0,
-            world,
+            epoch,
         };
         self.evictable.insert(tick, slot);
     }
@@ -847,14 +847,14 @@ impl Pool {
     /// reads.
     pub(super) fn holds(&self, key: &Key, visibility: &Visibility) -> bool {
         self.index.get(key).is_some_and(|&slot| {
-            matches!(self.slots[slot as usize], Slot::Ready { world, .. } if visibility.sees(world))
+            matches!(self.slots[slot as usize], Slot::Ready { epoch, .. } if visibility.sees(epoch))
         })
     }
 
-    /// The world that published the committed page in `slot`.
+    /// The epoch that published the committed page in `slot`.
     pub(super) fn publisher(&self, slot: u32) -> Option<u64> {
         match self.slots.get(slot as usize)? {
-            Slot::Ready { world, .. } => Some(*world),
+            Slot::Ready { epoch, .. } => Some(*epoch),
             _ => None,
         }
     }
@@ -868,8 +868,8 @@ impl Pool {
         };
         let unseen_idle = matches!(
             &self.slots[held as usize],
-            Slot::Ready { world, pins, uploads, .. }
-                if !visibility.sees(*world) && Slot::idle(pins, *uploads)
+            Slot::Ready { epoch, pins, uploads, .. }
+                if !visibility.sees(*epoch) && Slot::idle(pins, *uploads)
         );
         if unseen_idle {
             self.free_slot(held);
@@ -914,7 +914,7 @@ impl Pool {
             }
             if results.get(index).copied().unwrap_or(false) {
                 self.fetching -= 1;
-                // The KV storage holds only pages every world shares.
+                // The KV storage holds only pages every epoch shares.
                 self.ready(*key, *slot, 0);
             } else {
                 self.free_slot(*slot);
@@ -1036,8 +1036,8 @@ impl Pool {
         self.leave(slot, key);
     }
 
-    /// Discard the pages published by an uncommitted world that a rollback
-    /// retires: those nobody reads leave the pool, and no world
+    /// Discard the pages published by an uncommitted epoch that a rollback
+    /// retires: those nobody reads leave the pool, and no epoch
     /// reads the others, which leave it once their readers unpin them, nor
     /// the pages they reserved and commit later. Returns how many.
     pub(super) fn discard_where(&mut self, discarded: impl Fn(u64) -> bool) -> u64 {
@@ -1045,7 +1045,7 @@ impl Pool {
         for slot in 0..self.slots.len() as u32 {
             let idle = match &mut self.slots[slot as usize] {
                 Slot::Ready {
-                    world: published,
+                    epoch: published,
                     pins,
                     uploads,
                     ..
@@ -1055,7 +1055,7 @@ impl Pool {
                     Slot::idle(pins, *uploads)
                 }
                 Slot::Reserved {
-                    world: published, ..
+                    epoch: published, ..
                 } if *published != DISCARDED && discarded(*published) => {
                     *published = DISCARDED;
                     pages += 1;
@@ -1070,18 +1070,18 @@ impl Pool {
         pages
     }
 
-    /// The pages `world` published, with their slots: those every world
-    /// shares once the commit of `world` retires its predecessor.
-    pub(super) fn published_by(&self, world: u64) -> Vec<(Key, u32)> {
+    /// The pages `epoch` published, with their slots: those every epoch
+    /// shares once the commit of `epoch` retires its predecessor.
+    pub(super) fn published_by(&self, epoch: u64) -> Vec<(Key, u32)> {
         self.slots
             .iter()
             .enumerate()
             .filter_map(|(slot, state)| match state {
                 Slot::Ready {
                     key,
-                    world: published,
+                    epoch: published,
                     ..
-                } if *published == world => Some((*key, slot as u32)),
+                } if *published == epoch => Some((*key, slot as u32)),
                 _ => None,
             })
             .collect()
@@ -1104,13 +1104,13 @@ impl Pool {
                     touched,
                     pins,
                     uploads,
-                    world,
+                    epoch,
                     ..
                 } = &mut self.slots[slot as usize]
                 else {
                     return None;
                 };
-                if !visibility.sees(*world) {
+                if !visibility.sees(*epoch) {
                     return None;
                 }
                 if Slot::idle(pins, *uploads) {
@@ -1154,13 +1154,13 @@ impl Pool {
     }
 
     /// A ready `slot`, last touched at `touched`, that nobody reads any more:
-    /// a discarded page, which no world reads, leaves the pool; another
+    /// a discarded page, which no epoch reads, leaves the pool; another
     /// waits for eviction, least recently used first.
     fn idle_again(&mut self, touched: u64, slot: u32) {
         if matches!(
             self.slots[slot as usize],
             Slot::Ready {
-                world: DISCARDED,
+                epoch: DISCARDED,
                 ..
             }
         ) {
@@ -1258,7 +1258,7 @@ impl Pool {
 
 /// A memfd named `name` of `bytes`, backed by huge pages when the host has
 /// them to give, whose pages are allocated on `numa_node` when one is
-/// given: a page pool, or the host copy of a world's weights.
+/// given: a page pool, or the host copy of an epoch's weights.
 pub(crate) fn shared_memory(name: &str, bytes: u64, numa_node: Option<u32>) -> io::Result<OwnedFd> {
     use rustix::fs::{MemfdFlags, ftruncate, memfd_create};
 
@@ -1382,10 +1382,10 @@ mod tests {
         Key([byte; 32])
     }
 
-    /// What a head of a deployment with no world on trial reads.
+    /// What a head of a deployment with no epoch on trial reads.
     fn all() -> Visibility {
         Visibility {
-            world: 0,
+            epoch: 0,
             private: BTreeSet::new(),
         }
     }

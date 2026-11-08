@@ -14,7 +14,7 @@
 //! `Leader::apply` decides in that order and answers what it applied;
 //! `Leader::commit` and `Leader::rollback` are the switch's. A change that
 //! fits no layer is refused by name: the mechanism that moved a deployment
-//! to a successor world, with its trial and its rollback, is gone, and
+//! to a successor epoch, with its trial and its rollback, is gone, and
 //! nothing here starts a second engine beside the one that serves.
 
 use std::collections::BTreeMap;
@@ -32,17 +32,17 @@ use crate::options::ServerArgs;
 use crate::updates::change::{Applied, ApplyRequest, resolve};
 use crate::updates::epoch::Unavailable;
 
-/// The deployment's worlds as the leader tracks them.
+/// The deployment's epochs as the leader tracks them.
 #[derive(Default)]
-pub(crate) struct WorldState {
-    /// The world the executing engine runs.
+pub(crate) struct EpochState {
+    /// The epoch the executing engine runs.
     pub(crate) executing: u64,
     pub(crate) unavailable: BTreeMap<String, Unavailable>,
-    /// What the last world change, commit or rollback reported.
+    /// What the last epoch change, commit or rollback reported.
     pub(crate) last: Option<serde_json::Value>,
 }
 
-/// The GPUs the deployment's worlds hold storage on, from every node's
+/// The GPUs the deployment's epochs hold storage on, from every node's
 /// storage report (`nodes`): each one's host and name (`GPU-…`, as
 /// `nvidia-smi` prints its UUID), its total and quota and the bytes the
 /// deployment's ledger books there. A manager of several deployments reads
@@ -80,7 +80,7 @@ pub(crate) fn digest(config: &ServerArgs) -> anyhow::Result<String> {
         .collect())
 }
 
-/// How long the closed engine of a world takes to exit.
+/// How long the closed engine of an epoch takes to exit.
 const CLOSED_EXIT: Duration = Duration::from_secs(60);
 
 /// How long the status waits for the storage ledgers, which each node's
@@ -89,10 +89,10 @@ const LEDGER_READ: Duration = Duration::from_secs(10);
 
 /// Whether `target` differs from `served` in the fence probes' switch
 /// alone, which the workers change in place. Every other part of the
-/// profiling configuration shapes the CUDA graphs a world captures at its
+/// profiling configuration shapes the CUDA graphs an epoch captures at its
 /// start, the probed components and whether PC sampling was enabled before
 /// the capture (`profiling_config.graph_pc_sampling`), and takes a new
-/// world.
+/// epoch.
 fn switches_probes_only(served: &EngineConfig, target: &EngineConfig) -> bool {
     let mut switched = comparable(served);
     switched.profiling.fence_probes = target.profiling.fence_probes;
@@ -139,7 +139,7 @@ fn retain_devices(served: &EngineConfig, target: &mut EngineConfig) {
 }
 
 /// Changes outside a successor's current process-control contract. Rank
-/// resources and numerical layouts are planned by the target world.
+/// resources and numerical layouts are planned by the target epoch.
 fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> {
     let mut parts = Vec::new();
     if served.deployment != target.deployment {
@@ -149,7 +149,7 @@ fn differing(served: &EngineConfig, target: &EngineConfig) -> Vec<&'static str> 
 }
 
 impl Leader {
-    /// Applies a configuration through the replica that owns its worlds.
+    /// Applies a configuration through the replica that owns its epochs.
     pub async fn apply(&self, request: ApplyRequest) -> Result<Applied, UpdateError> {
         let _replacing = self
             .replicas
@@ -292,7 +292,7 @@ impl Leader {
         // names its peers' request addresses, which this daemon does not know
         // for a node it does not run on, so it can state a world of one only.
         // A world of more is refused by name instead of silently writing
-        // `world_size = 1` for two processes (exec's rule: the world is its
+        // `world_size = 1` for two processes (exec's rule: the epoch is its
         // peers and itself).
         // One main process, not only one node: a data-parallel deployment runs
         // one replica per main process, and this daemon writes one launch file
@@ -307,14 +307,14 @@ impl Leader {
             return Err(UpdateError::Refused(format!(
                 "the target epoch runs {processes} data-parallel replicas, and the epoch layer \
                  starts one main process per node: a replica's launch needs the contents carried \
-                 in `process::Spawn` or a world that states every replica's addresses"
+                 in `process::Spawn` or an epoch that states every replica's addresses"
             )));
         }
         if target.nnodes.get() != 1 {
             return Err(UpdateError::Refused(format!(
                 "the target epoch runs {} nodes, and a launch file written here names no peer: a \
                  multi-node epoch needs the launch contents carried in `process::Spawn` or a \
-                 world that states its peers' request addresses",
+                 epoch that states its peers' request addresses",
                 target.nnodes.get()
             )));
         }
@@ -361,9 +361,8 @@ impl Leader {
             .map(|rank| epochs.next_generation(group, rank))
             .max()
             .unwrap_or(0);
-        // The epoch's number is the world it executes, so it is above every epoch the daemon
-        // knows: an epoch a revert retired keeps its number, and a world's storage ends with the
-        // world it was claimed for.
+        // The target's number is above every epoch the daemon knows: an epoch a revert retired
+        // keeps its number, and an epoch's storage ends with the epoch it was claimed for.
         let target_epoch = epochs
             .records()
             .iter()
@@ -396,16 +395,16 @@ impl Leader {
             }
         }
         let mut args = proto::config::EngineArgs::new(engine);
-        args.world = target_epoch;
+        args.epoch = target_epoch;
         // §7.4 step 1: the target's main processes start as the serving
         // process's standby — they map the predecessor's cache read-only and
         // park — so the storage of an epoch has one writer while both run.
         // The predecessor's segments are the ones it holds now, which only its
         // engine can state; without them the child would map nothing and the
         // launch would be a serving process's, claiming the same scopes
-        // writably. The engine states as well the world that created them, which
-        // is what they are keyed by, and not the target's own `args.world`: the
-        // successor reads one world while it serves the next, an epoch that took
+        // writably. The engine states as well the epoch that created them, which
+        // is what they are keyed by, and not the target's own `args.epoch`: the
+        // successor reads one epoch while it serves the next, an epoch that took
         // storage over keys it as its creator did, and one relaunched created
         // its own.
         args.predecessor = Some(serving_client.describe_cache().await.map_err(|reason| {
@@ -423,10 +422,10 @@ impl Leader {
             start: control
                 .epoch_start(&args, spawn_generation)
                 .map_err(UpdateError::Failed)?,
-            previous_world: previous_epoch,
+            previous_epoch: previous_epoch,
             previous_generation,
             spawn_generation,
-            keeps: update.previous_world,
+            keeps: update.previous_epoch,
         };
         let programs = next.programs.clone();
         let servers = self.program_servers(&target);
@@ -434,7 +433,7 @@ impl Leader {
         // A session does not cross epochs (`docs/profiling.md`): its ranks write their files while
         // the epoch still executes, before the switch parks it.
         if !dry_run {
-            self.end_profiles("world change").await;
+            self.end_profiles("epoch change").await;
         }
         let applied = self.updates.apply(&previous, &next, change, dry_run);
         if let (Ok(_), Some(args)) = (&applied, joining) {
@@ -477,7 +476,7 @@ impl Leader {
     async fn end_profiles(&self, reason: &str) {
         for replica in self.replicas() {
             let client = replica.hold().client();
-            crate::profiling::end_for_world(&replica, client.as_deref(), reason).await;
+            crate::profiling::end_for_epoch(&replica, client.as_deref(), reason).await;
         }
     }
 
@@ -598,35 +597,35 @@ impl Replica {
         let config = locked(&self.config).clone();
         let printed = crate::options::printed(&config).unwrap_or_default();
         let digest = digest(&config).unwrap_or_default();
-        let worlds = locked(&self.worlds);
+        let epochs = locked(&self.epochs);
         let hold = self.hold();
-        let slot = |world: u64, state: &str| serde_json::json!({ "world": world, "state": state });
-        let unavailable = |world: u64, reason: &str| serde_json::json!({ "world": world, "state": "unavailable", "reason": reason });
+        let slot = |epoch: u64, state: &str| serde_json::json!({ "epoch": epoch, "state": state });
+        let unavailable = |epoch: u64, reason: &str| serde_json::json!({ "epoch": epoch, "state": "unavailable", "reason": reason });
         let executing = match hold.client() {
             Some(client) => {
-                let world = client.world();
+                let epoch = client.epoch();
                 match client.state() {
-                    EngineState::Standby => slot(world, "preparing"),
-                    EngineState::Ready => slot(world, "executing"),
-                    EngineState::Parked => slot(world, "parked"),
-                    EngineState::Failed(reason) => unavailable(world, &reason),
-                    EngineState::Closed => unavailable(world, "its engine process ended"),
+                    EngineState::Standby => slot(epoch, "preparing"),
+                    EngineState::Ready => slot(epoch, "executing"),
+                    EngineState::Parked => slot(epoch, "parked"),
+                    EngineState::Failed(reason) => unavailable(epoch, &reason),
+                    EngineState::Closed => unavailable(epoch, "its engine process ended"),
                 }
             }
             // A hold that closed names why it closed, and it names it to the
             // requests it fails: the status states the same reason rather
             // than that requests merely wait for an engine that will not come.
             None => match hold.state() {
-                HoldState::Closed(reason) => unavailable(worlds.executing, &reason),
-                _ => unavailable(worlds.executing, "requests wait for its engine"),
+                HoldState::Closed(reason) => unavailable(epochs.executing, &reason),
+                _ => unavailable(epochs.executing, "requests wait for its engine"),
             },
         };
         serde_json::json!({
             "config": printed,
             "digest": digest,
             "executing": executing,
-            "unavailable": worlds.unavailable.values().collect::<Vec<_>>(),
-            "last": worlds.last,
+            "unavailable": epochs.unavailable.values().collect::<Vec<_>>(),
+            "last": epochs.last,
         })
     }
 
@@ -635,11 +634,11 @@ impl Replica {
     fn available(&self, target: &ServerArgs, force: bool) -> Result<String, UpdateError> {
         let target_digest =
             digest(target).map_err(|error| UpdateError::Failed(error.context("digest")))?;
-        if !force && let Some(unavailable) = locked(&self.worlds).unavailable.get(&target_digest) {
+        if !force && let Some(unavailable) = locked(&self.epochs).unavailable.get(&target_digest) {
             return Err(UpdateError::Refused(format!(
-                "the configuration {target_digest} was rolled back from world {} ({}); \
+                "the configuration {target_digest} was rolled back from epoch {} ({}); \
                  apply it again with force",
-                unavailable.world, unavailable.reason
+                unavailable.epoch, unavailable.reason
             )));
         }
         Ok(target_digest)
@@ -649,15 +648,15 @@ impl Replica {
     /// the module describes, choosing the least the change needs: nothing
     /// for the current configuration; the schedulers' next step for their
     /// limits alone; a hot restart of the daemon for its own options; and a
-    /// new world for anything a world executes.
+    /// new epoch for anything an epoch executes.
     ///
     /// # Errors
     ///
-    /// Refuses another change in progress or a world on trial (`409`), a
+    /// Refuses another change in progress or an epoch on trial (`409`), a
     /// configuration that does not parse or validate, one a rollback marked
     /// unavailable unless `force`, and a change the successor cannot map;
-    /// fails when the successor does not start (the serving world serves
-    /// on) or its promotion fails (the serving world resumes).
+    /// fails when the successor does not start (the serving epoch serves
+    /// on) or its promotion fails (the serving epoch resumes).
     pub(crate) async fn apply(
         self: &Arc<Self>,
         request: ApplyRequest,
@@ -791,7 +790,7 @@ impl Replica {
         // rank layout and the KV cache's options, all of them `proto::config::EngineConfig`),
         // the program layer what they execute, and this one the daemon's own
         // options and the scheduling limits, in place. A change that fits
-        // none of them would have needed a successor world, which this
+        // none of them would have needed a successor epoch, which this
         // daemon no longer runs: it is refused by name here rather than
         // half served.
         Err(UpdateError::Refused(format!(
@@ -814,7 +813,7 @@ mod tests {
     }
 
     /// The fence probes' switch, and a component's probes switched off, change in place; the
-    /// probed components and PC sampling shape the captured graphs and take a new world.
+    /// probed components and PC sampling shape the captured graphs and take a new epoch.
     #[test]
     fn only_the_fence_probes_switch_changes_profiling_in_place() {
         let profiled = |profiling: proto::config::ProfilingConfig| EngineConfig {
@@ -838,7 +837,7 @@ mod tests {
             ..served.profiling.clone()
         });
         assert!(switches_probes_only(&served, &thinned));
-        for world in [
+        for epoch in [
             proto::config::ProfilingConfig {
                 graph_pc_sampling: true,
                 ..served.profiling.clone()
@@ -848,7 +847,7 @@ mod tests {
                 ..served.profiling.clone()
             },
         ] {
-            assert!(!switches_probes_only(&served, &profiled(world)));
+            assert!(!switches_probes_only(&served, &profiled(epoch)));
         }
     }
 
@@ -930,13 +929,13 @@ mod tests {
         serde_json::json!({ "host": host, "ledgers": [], "transfers": transfers }).to_string()
     }
 
-    /// The status names each slot's state as a change goes: one world
+    /// The status names each slot's state as a change goes: one epoch
     /// executes beside an empty slot; a successor prepares beside it while
     /// the change reports its step, what the deployment's transfers moved
-    /// since it began and the serving world's steps against their
-    /// baseline; requests wait at the promotion; the previous world is
+    /// since it began and the serving epoch's steps against their
+    /// baseline; requests wait at the promotion; the previous epoch is
     /// parked once its successor serves and kept in host storage during the
-    /// trial; a rollback stops the world on trial; a world whose engine is
+    /// trial; a rollback stops the epoch on trial; an epoch whose engine is
     /// gone is unavailable.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_status_reports_the_executing_engine_and_the_gpus_the_deployment_books() {
@@ -954,13 +953,13 @@ mod tests {
             crate::test_support::sim_engine_over(crate::model::ModelParameters::Qwen3, vec![core]);
         let replica = Arc::clone(&leader.replicas()[0]);
         let client = replica.hold().client().expect("the replica serves");
-        let world = client.world();
+        let epoch = client.epoch();
         *locked(&nodes) = vec![node("rank-0", &[(Background, 100, 40)])];
 
         let status = leader.config_status().await;
         assert_eq!(
             status["executing"],
-            serde_json::json!({ "world": world, "state": "executing" })
+            serde_json::json!({ "epoch": epoch, "state": "executing" })
         );
         assert_eq!(status["gpus"], serde_json::json!([]));
 
@@ -973,7 +972,7 @@ mod tests {
             entries: vec![storage::protocol::LedgerEntry {
                 item: storage::protocol::Item::Weights,
                 scope: None,
-                worlds: vec![world],
+                epochs: vec![epoch],
                 segment: None,
                 bytes: 300,
             }],
@@ -1000,13 +999,13 @@ mod tests {
             }])
         );
 
-        // A world whose engine no longer serves is unavailable.
+        // An epoch whose engine no longer serves is unavailable.
         replica.hold().close("the engine process ended");
         let status = leader.config_status().await;
         assert_eq!(
             status["executing"],
             serde_json::json!({
-                "world": world,
+                "epoch": epoch,
                 "state": "unavailable",
                 "reason": "the engine process ended",
             })

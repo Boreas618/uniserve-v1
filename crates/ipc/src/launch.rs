@@ -17,7 +17,7 @@ pub struct StorageLaunch {
     pub claim: [u8; 16],
     /// Whether the engine copies the worker's cache pages through the host
     /// KV cache: the worker then maps a page pool per cache group, holding
-    /// the tokens the engine sizes the world's host KV cache at
+    /// the tokens the engine sizes the epoch's host KV cache at
     /// (`uniserve.host_cache`).
     pub host_kv_cache: bool,
     /// Where an engine on another host reaches the server (`host:port`), for
@@ -26,12 +26,12 @@ pub struct StorageLaunch {
     pub tcp: Option<String>,
     /// Where processes of this host reach the deployment's Storage Servers
     /// on its other nodes (`host:port`), each of which may hold the storage
-    /// of the deployment's other worlds: the weights a rank receives from
+    /// of the deployment's other epochs: the weights a rank receives from
     /// another host. Empty for a deployment of one node.
     pub peers: Vec<String>,
-    /// The world the worker belongs to: the exclusive storages it creates
-    /// are its world's, and it retains what it uses in its world.
-    pub world: u64,
+    /// The epoch the worker belongs to: the exclusive storages it creates
+    /// are its epoch's, and it retains what it uses in its epoch.
+    pub epoch: u64,
     /// Whether the worker stands by for the worker of its scope: it maps
     /// the exclusive storages that worker holds without taking write
     /// access, warms up on scratch units, parks with the storages read-only

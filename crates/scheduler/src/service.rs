@@ -117,7 +117,7 @@ struct Routing {
     state: AtomicI32,
     /// Whether the engine failed, once reported.
     failed: AtomicBool,
-    /// Whether the engine's world is on trial, until its commit: the
+    /// Whether the engine's epoch is on trial, until its commit: the
     /// engine fails once any scheduler stops, not every one, since the
     /// daemon rolls a failing trial back rather than serving on.
     trial: AtomicBool,
@@ -445,7 +445,7 @@ impl Routing {
             .find_map(|slot| slot.handle.failure())
             .unwrap_or_else(|| "a scheduler stopped on a worker failure".to_owned());
         Some(if trial {
-            format!("a scheduler of the world on trial stopped: {first}")
+            format!("a scheduler of the epoch on trial stopped: {first}")
         } else {
             format!("every scheduler stopped: {first}")
         })
@@ -1121,7 +1121,7 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
             let mut routes = crate::lock(&routing.cache_routes);
             for prefix in prefixes {
                 let resume = proto::request::CacheResume {
-                    world: prefix.resume.0,
+                    epoch: prefix.resume.0,
                     request_id: prefix.resume.1,
                 };
                 let next = continuation_slot(resume.request_id, routing.slots.len());
@@ -1143,7 +1143,7 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
             let requests = crate::lock(&routing.requests);
             for prefix in prefixes {
                 let resume = proto::request::CacheResume {
-                    world: prefix.resume.0,
+                    epoch: prefix.resume.0,
                     request_id: prefix.resume.1,
                 };
                 // Reserved successor pages have a continuation route; a
@@ -1168,7 +1168,7 @@ fn warm_cache(warm: wire::CacheWarm, front: usize, routing: &Arc<Routing>) {
         }
         Operation::Retain { requests } => {
             crate::lock(&routing.cache_routes)
-                .retain(|resume, _| requests.contains(&(resume.world, resume.request_id)));
+                .retain(|resume, _| requests.contains(&(resume.epoch, resume.request_id)));
             vec![Operation::Retain { requests }; routing.slots.len()]
         }
         operation => vec![operation; routing.slots.len()],
@@ -1210,13 +1210,13 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         answer_hooked(resize.id, answers, front, routing);
         return;
     }
-    // The worlds that keep their weights alone release the rest of their
+    // The epochs that keep their weights alone release the rest of their
     // storage on every node first, and move their weights to host storage when
     // asked (the deployment's claims cover every node, so the first
     // scheduler asks), on a thread of its own: the change then finds it on
     // each GPU's ledger. The answer carries each node's report of the
     // weights kept, wrapped as `{"kept": ...}`, before the schedulers'.
-    let (id, worlds, to_host, cache_keys) = (
+    let (id, epochs, to_host, cache_keys) = (
         resize.id,
         resize.keep_weights.clone(),
         resize.keep_in_host_storage,
@@ -1227,7 +1227,7 @@ fn resize_cache(resize: &wire::ResizeCache, front: usize, routing: &Arc<Routing>
         .name("keep-weights".to_owned())
         .spawn(move || {
             let kept = routing.slots.first().map_or(Ok(Vec::new()), |slot| {
-                match slot.handle.keep_weights(worlds, to_host, cache_keys).recv() {
+                match slot.handle.keep_weights(epochs, to_host, cache_keys).recv() {
                     Ok(kept) => kept,
                     Err(_) => Err("a scheduler stopped".to_owned()),
                 }
@@ -1395,7 +1395,7 @@ fn promote_schedulers(promote: wire::Promote, routing: &Arc<Routing>) {
                                         units: page.units.clone(),
                                         resume: page.resume.as_ref().map(|resume| {
                                             proto::request::CacheResume {
-                                                world: resume.world,
+                                                epoch: resume.epoch,
                                                 request_id: resume.request_id,
                                             }
                                         }),
@@ -1506,7 +1506,7 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
                                         tokens: page.tokens,
                                         units: page.units,
                                         resume: page.resume.map(|resume| wire::CacheResume {
-                                            world: resume.world,
+                                            epoch: resume.epoch,
                                             request_id: resume.request_id,
                                         }),
                                     })
@@ -1552,7 +1552,7 @@ fn park_schedulers(id: u64, lend: bool, front: usize, routing: &Arc<Routing>) {
     }
 }
 
-/// Resumes every parked scheduler, retires the worlds `resume` names first,
+/// Resumes every parked scheduler, retires the epochs `resume` names first,
 /// on a thread of its own, and answers the daemon `front` with `Hooked`;
 /// every daemon reads that the engine serves again.
 fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>) {
@@ -1561,7 +1561,7 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
         .slots
         .first()
         .map(|slot| slot.handle.retire(resume.retire.clone()));
-    // A world the resume retires writes none of the engine's storage any
+    // An epoch the resume retires writes none of the engine's storage any
     // more: each scheduler takes back the cache units it lent it.
     let reclaim = !resume.retire.is_empty();
     let answers: Vec<_> = routing
@@ -1616,13 +1616,13 @@ fn resume_schedulers(resume: wire::Resume, front: usize, routing: &Arc<Routing>)
     }
 }
 
-/// Commits the engine's world: publishes its pages, retires the worlds `commit` names (the
+/// Commits the engine's epoch: publishes its pages, retires the epochs `commit` names (the
 /// predecessor), then commits every scheduler, on a thread of its own, and
 /// answers the daemon `front` with `Hooked` and every worker's report.
 fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>) {
     tracing::info!(
         retire = ?commit.retire,
-        "the engine's world is committed"
+        "the engine's epoch is committed"
     );
     let routing = Arc::clone(routing);
     let spawned = std::thread::Builder::new()
@@ -1631,7 +1631,7 @@ fn commit_schedulers(commit: wire::Commit, front: usize, routing: &Arc<Routing>)
             let mut results = Vec::new();
             let mut error = String::new();
             if let Some(slot) = routing.slots.first() {
-                match slot.handle.publish_world().recv() {
+                match slot.handle.publish_epoch().recv() {
                     Ok(Ok(())) => {}
                     Ok(Err(failed)) => error = failed,
                     Err(_) => error = "a scheduler stopped".to_owned(),
@@ -1707,10 +1707,10 @@ fn describe_caches(id: u64, front: usize, routing: &Arc<Routing>) {
                 Frame::plain(from_engine::Kind::CacheDescribed(wire::CacheDescribed {
                     id,
                     error,
-                    storage_world: segments
+                    storage_epoch: segments
                         .iter()
                         .flat_map(|cache| &cache.segments)
-                        .map(|segment| segment.world)
+                        .map(|segment| segment.epoch)
                         .min()
                         .unwrap_or(0),
                     segments,
@@ -1765,7 +1765,7 @@ fn wire_cache(group: crate::GroupCache) -> wire::CacheSegments {
             .segments
             .into_iter()
             .map(|segment| wire::CacheSegment {
-                world: segment.world,
+                epoch: segment.epoch,
                 ordinal: segment.ordinal,
                 units: segment.units,
             })

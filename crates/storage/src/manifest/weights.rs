@@ -1,4 +1,4 @@
-//! The weight manifests ranks retain, and the source world they make.
+//! The weight manifests ranks retain, and the source epoch they make.
 //!
 //! A rank that retains its weights at its host's Storage Server retains,
 //! beside its chunks, a manifest: host bytes of JSON text under the name
@@ -6,23 +6,23 @@
 //! determines each tensor's bytes (`fingerprints`, by tensor name),
 //! the rank's tensors as its library describes them, and
 //! its storages ([`RetainedStorage`]): each one's device among the rank's
-//! devices, layout and chunks. The worker writes it; the ranks of a world
+//! devices, layout and chunks. The worker writes it; the ranks of an epoch
 //! that receives weights and the ranks a daemon plans its preparation with
-//! read the storages of every manifest a world retains as the source world
+//! read the storages of every manifest an epoch retains as the source epoch
 //! of a copy manifest ([`sources`]), all from the same listing and texts and
 //! by the fingerprints of the whole model, so all compute the same source
-//! world.
+//! epoch.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 
-use super::{Gpu, Rank, Storage, World};
+use super::{Epoch, Gpu, Rank, Storage};
 use crate::Key;
 use crate::protocol::{Access, LinkBandwidth, Listing, Location};
 
 /// The name a rank's manifest is retained under, by which the manifests a
-/// world retains are found.
+/// epoch retains are found.
 pub const NAME: &str = "weights manifest";
 
 /// The version of the manifest the worker writes and reads; a manifest of
@@ -39,7 +39,7 @@ pub struct RetainedStorage {
     pub storage: Storage,
 }
 
-/// What a rank plans of its weights before its world starts (`uniserve
+/// What a rank plans of its weights before its epoch starts (`uniserve
 /// worker --plan`), without reading the checkpoint or retaining anything:
 /// a daemon plans a change of the parallel configuration from every target
 /// rank's.
@@ -86,7 +86,7 @@ pub struct RankBudget {
     pub cache_segment: u64,
     pub weights: u64,
     pub pages: Vec<CachePage>,
-    /// A complete cross-world request reservation, when the caller routes
+    /// A complete cross-epoch request reservation, when the caller routes
     /// requests from multiple predecessor engines onto this target GPU.
     pub in_flight: Option<CacheReservation>,
 }
@@ -205,11 +205,11 @@ struct Read {
     storages: Vec<RetainedStorage>,
 }
 
-/// The weights one world retains on a host, as the source world of a copy
+/// The weights one epoch retains on a host, as the source epoch of a copy
 /// manifest, and the links its Transfer Server measured between the GPUs.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Sources {
-    pub world: World,
+    pub epoch: Epoch,
     pub links: Vec<LinkBandwidth>,
 }
 
@@ -221,22 +221,22 @@ pub struct Transfer {
     pub manifest: super::Manifest,
 }
 
-/// The weights the selected `worlds` of `deployment` retain on the host `listing`
+/// The weights the selected `epochs` of `deployment` retain on the host `listing`
 /// lists, for a model whose tensors have the digests `fingerprints` (hex,
 /// by tensor name, as a manifest states them).
 ///
-/// Every manifest the selected worlds retain names storages; the fields of
+/// Every manifest the selected epochs retain names storages; the fields of
 /// a storage on a device whose tensors have the model's digests hold bytes
-/// a rank of the model may need, on every GPU where the world retains all
+/// a rank of the model may need, on every GPU where the epoch retains all
 /// of the storage's chunks. Each GPU is one source rank, its storages once
 /// each in the order of their serialized form, so every reader of the same
-/// listing and texts with the same `fingerprints` computes the same world.
-/// The ranks that receive one copy manifest bind the world it was planned
+/// listing and texts with the same `fingerprints` computes the same epoch.
+/// The ranks that receive one copy manifest bind the epoch it was planned
 /// from, so `fingerprints` must name every tensor of the model, not only
 /// those the reading rank holds: a rank that leaves out tensors another
 /// rank holds selects fewer storages, at other positions. `read` returns
 /// the text of the host bytes of a key (`None` when the server no longer
-/// retains them). Returns `None` when the world retains no such storage,
+/// retains them). Returns `None` when the epoch retains no such storage,
 /// or no Transfer Server runs to copy them.
 ///
 /// # Errors
@@ -245,7 +245,7 @@ pub struct Transfer {
 pub fn sources<E>(
     listing: &Listing,
     deployment: &str,
-    worlds: Option<&[u64]>,
+    epochs: Option<&[u64]>,
     fingerprints: &BTreeMap<String, String>,
     mut read: impl FnMut(Key) -> Result<Option<String>, E>,
 ) -> Result<Option<Sources>, E> {
@@ -261,7 +261,7 @@ pub fn sources<E>(
         tensor.access == Access::ReadOnly
             && tensor.retainers.iter().any(|retainer| {
                 retainer.scope.deployment == deployment
-                    && worlds.is_none_or(|worlds| worlds.contains(&retainer.world))
+                    && epochs.is_none_or(|epochs| epochs.contains(&retainer.epoch))
             })
     };
     // The GPUs holding each chunk, and the manifests.
@@ -343,7 +343,7 @@ pub fn sources<E>(
         return Ok(None);
     }
     Ok(Some(Sources {
-        world: World { ranks },
+        epoch: Epoch { ranks },
         links,
     }))
 }

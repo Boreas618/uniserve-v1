@@ -825,7 +825,7 @@ impl PrefixCache {
 
     /// Publishes a slot's state page under the key the deployment derives (design 4.5, 8): the
     /// blocks of `pages` pages from `first_page`, gathered from this rank's own units into a
-    /// retained device block the Storage Server names, so a later world maps those bytes by handle
+    /// retained device block the Storage Server names, so a later epoch maps those bytes by handle
     /// instead of copying them.
     ///
     /// This runs between steps - at a precopy, before the generation is published as serving -
@@ -1669,7 +1669,7 @@ mod tests {
     /// that keeps state per unit cannot be imported without one, and a deployment that keeps none
     /// cannot be given one. Both are refusals by name, and neither writes a byte.
     #[test]
-    fn a_state_page_is_refused_where_the_two_worlds_disagree() -> Result<()> {
+    fn a_state_page_is_refused_where_the_two_epochs_disagree() -> Result<()> {
         let cache = PrefixCache::new(
             plan(),
             /* units */ 8,
@@ -1698,7 +1698,7 @@ mod tests {
             state,
         };
         // This deployment keeps no state per unit, so a page offered to it is a mistake one of
-        // the two worlds made, and the import says which.
+        // the two epochs made, and the import says which.
         let offered = transfer(vec![ipc::StateTransfer {
             rank: 0,
             first_row: 0,

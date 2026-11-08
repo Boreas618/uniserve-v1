@@ -588,7 +588,7 @@ impl WorkerGroupConfig {
 }
 
 /// Puts the shorthand's ranks, in rank order across `groups`, on the CUDA devices `devices` names
-/// by their index on each rank's host (`device_config.devices`): a world whose ranks a daemon
+/// by their index on each rank's host (`device_config.devices`): an epoch whose ranks a daemon
 /// assigned to the GPUs that already hold most of their weights, or an operator's order.
 fn order_devices(
     groups: &mut [WorkerGroupConfig],

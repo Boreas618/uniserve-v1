@@ -8,7 +8,7 @@
 //! (`schema_version`, and SQLite's `sqlite_schema`).
 //!
 //! Every raw record kind has a table of its own, beside the tables that
-//! describe them: `metadata` (the session, the world, the rank, its device,
+//! describe them: `metadata` (the session, the epoch, the rank, its device,
 //! the CUPTI version, the request, the clocks and what the identifiers
 //! mean), `strings` (kernel, API, NVTX and function names, by id), `clocks`
 //! (the alignment of every clock the records use) and `collectors` (what ran,

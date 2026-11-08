@@ -26,7 +26,7 @@ use ::worker::batch::{
 use ::worker::completion::Outcome;
 use ipc::BatchCommand;
 
-/// What dispatch and the views ask of the world: the pools it serves, and
+/// What dispatch and the views ask of the epoch: the pools it serves, and
 /// which of them can take a submission now.
 ///
 /// The step places calls on every path — a planned call, a media call, a
@@ -34,7 +34,7 @@ use ipc::BatchCommand;
 /// Stating it as this trait is what lets one dispatch serve the in-process
 /// worker and a simulated one: what differs between them is who answers, not
 /// what the step asks.
-pub(super) trait World {
+pub(super) trait Epoch {
     /// The pools, their ranks and their capabilities.
     fn info(&self) -> &WorkerInfo;
 
@@ -77,7 +77,7 @@ struct InProcess {
     info: WorkerInfo,
     /// The kernels this step's batches serve on. The scheduler reads its
     /// generation cell once per step and stamps every batch of that step, so a
-    /// switchover mid-step cannot split one step across two worlds.
+    /// switchover mid-step cannot split one step across two epochs.
     generation: u64,
     /// Completed reports, in the order the devices finished them.
     ready: crossbeam_channel::Receiver<Result<BatchReport, WorkerError>>,
@@ -249,7 +249,7 @@ impl Submissions {
     /// States the generation this step's batches serve on (4.2, 7.3).
     ///
     /// The scheduler calls this once per step, before it dispatches anything:
-    /// every batch of one step runs on one world's kernels.
+    /// every batch of one step runs on one epoch's kernels.
     pub(super) fn set_generation(&mut self, generation: u64) {
         match &mut self.path {
             #[cfg(feature = "testing")]
@@ -350,7 +350,7 @@ impl Submissions {
     /// The batch is one the step already submitted for serving: it carries the
     /// serving generation, and the shadow runs on another. A shadow batch never
     /// writes resident memory and never serves a request, and its failure is the
-    /// world update's, which the main process reports — the arm keeps the
+    /// epoch update's, which the main process reports — the arm keeps the
     /// submission alive and reads nothing from it.
     pub(super) fn shadow(
         &mut self,
@@ -442,46 +442,46 @@ impl Submissions {
         }
     }
 
-    /// Commits the pool's world: it takes the predecessor world's storage it
+    /// Commits the pool's epoch: it takes the predecessor epoch's storage it
     /// mapped read-only.
     pub(super) fn commit(&mut self) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(worker) => worker.commit(),
-            // The world this process serves is the worker's own, committed
+            // The epoch this process serves is the worker's own, committed
             // when it was spawned.
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
 
-    /// Publishes this world's immutable pages after its commit decision.
-    pub(super) fn publish_world(&mut self) -> Result<(), WorkerError> {
+    /// Publishes this epoch's immutable pages after its commit decision.
+    pub(super) fn publish_epoch(&mut self) -> Result<(), WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(worker) => worker.publish_world(),
+            Path::Supplied(worker) => worker.publish_epoch(),
             Path::InProcess(_) => Ok(()),
         }
     }
 
-    /// Ends the storage of every world of `worlds` on the pool's nodes.
-    pub(super) fn retire(&mut self, worlds: &[u64]) -> Result<(), WorkerError> {
+    /// Ends the storage of every epoch of `epochs` on the pool's nodes.
+    pub(super) fn retire(&mut self, epochs: &[u64]) -> Result<(), WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(worker) => worker.retire(worlds),
+            Path::Supplied(worker) => worker.retire(epochs),
             Path::InProcess(_) => Ok(()),
         }
     }
 
-    /// Keeps the weights alone of every world of `worlds`.
+    /// Keeps the weights alone of every epoch of `epochs`.
     pub(super) fn keep_weights(
         &mut self,
-        worlds: &[u64],
+        epochs: &[u64],
         to_host: bool,
         cache_keys: &[Vec<u8>],
     ) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(worker) => worker.keep_weights(worlds, to_host, cache_keys),
+            Path::Supplied(worker) => worker.keep_weights(epochs, to_host, cache_keys),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
@@ -561,7 +561,7 @@ impl Submissions {
     }
 }
 
-impl World for Submissions {
+impl Epoch for Submissions {
     fn info(&self) -> &WorkerInfo {
         Submissions::info(self)
     }
@@ -702,7 +702,7 @@ impl InProcess {
     }
 
     fn shadow(&mut self, batch: ExecutionBatch, generation: u64) -> Result<(), WorkerSubmitError> {
-        // A shadow batch reports nothing of its own: the passes are the world
+        // A shadow batch reports nothing of its own: the passes are the epoch
         // update's paired forwards, compared by each operator's tolerance on the
         // generation they name.
         let (device, _) = self
@@ -788,7 +788,7 @@ impl InProcess {
     /// The batch as the worker reads it, on generation `generation`.
     ///
     /// The serving path stamps the generation the step read; a shadow batch
-    /// names the world whose kernels it compares against, which is another.
+    /// names the epoch whose kernels it compares against, which is another.
     fn describe_with(
         &self,
         batch: &ExecutionBatch,
@@ -1230,7 +1230,7 @@ mod tests {
     }
 
     /// The generation is the step's, for every batch of the step: a switchover mid-step cannot
-    /// split one step across two worlds, so a token batch and a media batch of one step carry the
+    /// split one step across two epochs, so a token batch and a media batch of one step carry the
     /// same number.
     #[test]
     fn every_batch_of_a_step_carries_the_same_generation() {

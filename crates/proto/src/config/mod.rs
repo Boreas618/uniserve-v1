@@ -109,7 +109,7 @@ pub struct LoadConfig {
     pub weights: Option<String>,
     /// The tensor- and expert-parallel degrees the configurations of the
     /// deployment use, which retained weight storage is chunked for so that
-    /// a world of any of them maps the chunks it shares with another;
+    /// an epoch of any of them maps the chunks it shares with another;
     /// every degree up to the GPUs a worker sees when empty.
     pub parallel_degrees: Vec<NonZeroU32>,
 }
@@ -148,8 +148,8 @@ pub struct KvCacheConfig {
     /// Applies with `prefix_caching`.
     pub host_tier: bool,
     /// The host KV cache's token count over the device KV cache's, the
-    /// same on every rank of a world (as SGLang's `--hicache-ratio`); each
-    /// host's Storage Server lowers it for the whole world to what four
+    /// same on every rank of an epoch (as SGLang's `--hicache-ratio`); each
+    /// host's Storage Server lowers it for the whole epoch to what four
     /// fifths of its available storage hold. The engine's default (2.0)
     /// when unset.
     pub host_ratio: Option<f64>,
@@ -255,7 +255,7 @@ impl Default for SchedulerConfig {
 ///
 /// A deployment that speculates verifies each running request's draft
 /// tokens, which the model's drafter proposes from its draft cache, in one
-/// forward. A request whose draft cache is missing, such as one a world
+/// forward. A request whose draft cache is missing, such as one an epoch
 /// change moved, verifies none while its draft cache is refilled with the
 /// idle prefill budget of the steps, when the refill policy finds it worth
 /// its cost.
@@ -264,14 +264,14 @@ impl Default for SchedulerConfig {
 pub struct SpeculativeConfig {
     /// The most draft tokens one verification carries per request; zero
     /// does not speculate. The draft cache and the drafter's work belong
-    /// to the world, so a change of it is a world change.
+    /// to the epoch, so a change of it is an epoch change.
     pub num_draft_tokens: u32,
     /// The speedup speculation gives a request, the decode steps' time one
     /// of its verification steps takes the place of, stated in place of
-    /// the one the world measures; at least one, measured when unset.
+    /// the one the epoch measures; at least one, measured when unset.
     pub expected_speedup: Option<f64>,
     /// The time of evaluating one context token in a refill, in steps of
-    /// decoding, stated in place of the one the world measures; not
+    /// decoding, stated in place of the one the epoch measures; not
     /// negative, measured when unset.
     pub refill_token_cost: Option<f64>,
 }
@@ -445,18 +445,18 @@ pub struct WorkerConfig {
     /// replaces the group when it fails instead of a relaunch. A group whose
     /// ranks all run on the engine's host and that shares no expert world
     /// keeps a standby rank group of its own; the groups of an expert world,
-    /// or a group on several nodes, keep a standby world: a second launch of
+    /// or a group on several nodes, keep a standby epoch: a second launch of
     /// every group of the failure domain, with communicators of its own,
     /// promoted together when one of them fails. Each standby rank holds a
     /// CUDA context, graph pools and workspaces of its own, which the storage
     /// `mem_fraction_static` leaves must hold.
     pub standby: bool,
-    /// How a parked standby (a group's, a failure domain's world, or a hot
+    /// How a parked standby (a group's, a failure domain's epoch, or a hot
     /// update's engine) keeps the device storage of its graph pools, scratch,
     /// expert all-to-all workspaces and NCCL communicators: `auto` keeps it
     /// resident while every device has the share a serving worker leaves
     /// for graphs and activations to spare, and suspends it otherwise, every
-    /// rank of a world or group alike; `resident`; or `suspended`, released
+    /// rank of an epoch or group alike; `resident`; or `suspended`, released
     /// on the device and restored at the promotion, the graph storage with
     /// its contents at unchanged addresses; workspaces that cannot keep
     /// their addresses (DeepEP's windows, colocated MegaMoE's NVSHMEM heap)
@@ -654,8 +654,8 @@ pub struct ProfilingConfig {
     /// changed in place, at the engine's next step boundary.
     pub fence_probes: bool,
     /// Name patterns (`*` matches any run) of the components whose module
-    /// instances carry probes in the CUDA graphs a world captures; a change
-    /// takes a new world. Empty for no probe.
+    /// instances carry probes in the CUDA graphs an epoch captures; a change
+    /// takes a new epoch. Empty for no probe.
     pub fence_components: Vec<String>,
     /// Name patterns (`*` matches any run) of the probed components whose
     /// probes are off while `fence_probes` is on: the components whose
@@ -667,7 +667,7 @@ pub struct ProfilingConfig {
     /// that sessions attribute the samples of graph kernels. CUPTI then
     /// refuses PM sampling, the range profiler and whole-graph activity
     /// records, so sessions of those are refused. The graphs are captured
-    /// at a world's start, so a change takes a new world.
+    /// at an epoch's start, so a change takes a new epoch.
     pub graph_pc_sampling: bool,
 }
 
@@ -767,8 +767,8 @@ mod content_format {
 #[serde(default)]
 pub struct MigrationConfig {
     /// Migrations caused by lost workers, a lost engine process or a failed
-    /// world on trial that a request survives; it fails on the next.
-    /// Migrations of a world change or a rollback are not counted.
+    /// epoch on trial that a request survives; it fails on the next.
+    /// Migrations of an epoch change or a rollback are not counted.
     pub max_migrations: u32,
 }
 
@@ -922,8 +922,8 @@ impl EngineConfig {
 }
 
 /// Everything one engine process starts with (`uniserve engine --launch <path>`): the epoch's
-/// engine configuration, which every engine process of the epoch shares; the world it executes and
-/// what it takes over from the process it succeeds; where this process sits in the epoch; and the
+/// engine configuration, which every engine process of the epoch shares; the epoch's number and
+/// what the process takes over from the one it succeeds; where this process sits in the epoch; and the
 /// interfaces it reaches.
 ///
 /// A replica's record of what serves is the arguments its engine process started with: the daemon
@@ -936,9 +936,9 @@ impl EngineConfig {
 pub struct EngineArgs {
     /// The epoch's engine configuration, the same for every engine process of the epoch.
     pub engine_config: EngineConfig,
-    /// The world the epoch executes, which keys the storage it creates. It is zero until the first
-    /// process of a new world starts, and that process's engine number becomes the world's.
-    pub world: u64,
+    /// The epoch's number, which keys the storage the epoch creates. It is zero until the first
+    /// process of a new epoch starts, and that process's engine number becomes the epoch's.
+    pub epoch: u64,
     /// The process this one succeeds on the same devices, whose KV cache it maps read-only.
     ///
     /// It is present for the serving process's standby (§2.5), which claims its scope's storage
@@ -996,12 +996,12 @@ pub struct EngineArgs {
 
 impl EngineArgs {
     /// The arguments of an engine process of `engine_config` before the daemon's engine control
-    /// states the process's place and interfaces: a new world, succeeding no process, with the
+    /// states the process's place and interfaces: a new epoch, succeeding no process, with the
     /// checkpoint's expert order.
     pub fn new(engine_config: EngineConfig) -> Self {
         Self {
             engine_config,
-            world: 0,
+            epoch: 0,
             predecessor: None,
             expert_order: BTreeMap::new(),
             host: String::new(),

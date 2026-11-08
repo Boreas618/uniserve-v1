@@ -11,7 +11,7 @@
 //!
 //! What this program measures, on one Storage Server with no GPU:
 //!
-//! 1. one head claims one world with two scopes (rank 0 and rank 1) of one group;
+//! 1. one head claims one epoch with two scopes (rank 0 and rank 1) of one group;
 //! 2. two clients of this one process connect as the workers of those two
 //!    scopes, and each publishes an exclusive tensor of its own;
 //! 3. rank 1 asks for write access to rank 0's tensor — a second *rank* of the
@@ -144,15 +144,15 @@ fn tensor(key: Key, name: &str, storage: u32, access: Access) -> TensorRecord {
     }
 }
 
-/// The worker client of one rank scope in the claimed world.
-fn worker(socket: &Path, scope: Scope, claim: Claim, world: u64) -> Client {
+/// The worker client of one rank scope in the claimed epoch.
+fn worker(socket: &Path, scope: Scope, claim: Claim, epoch: u64) -> Client {
     Client::connect(
         socket,
         Role::Worker {
             scope,
             generation: 1,
             claim,
-            world,
+            epoch,
         },
     )
     .expect("a worker connection")
@@ -161,22 +161,22 @@ fn worker(socket: &Path, scope: Scope, claim: Claim, world: u64) -> Client {
 #[test]
 fn one_process_holds_two_rank_writer_identities() {
     let server = Running::start();
-    let world = 1;
+    let epoch = 1;
     let mut head = Client::connect(
         &server.socket,
         Role::Head {
             deployment: "probe".into(),
-            world,
+            epoch,
         },
     )
     .expect("a head connection");
     let claim = head
-        .claim(world, vec![scope(0), scope(1)], Vec::new())
-        .expect("the head claims the world with both ranks");
+        .claim(epoch, vec![scope(0), scope(1)], Vec::new())
+        .expect("the head claims the epoch with both ranks");
 
     // Each rank publishes an exclusive tensor of its own from this one process.
-    let mut rank0 = worker(&server.socket, scope(0), claim, world);
-    let mut rank1 = worker(&server.socket, scope(1), claim, world);
+    let mut rank0 = worker(&server.socket, scope(0), claim, epoch);
+    let mut rank1 = worker(&server.socket, scope(1), claim, epoch);
     for (rank, number) in [(0u32, 1u8), (1, 2)] {
         let storage = memfd(&[number; 4]);
         let client = if rank == 0 { &mut rank0 } else { &mut rank1 };

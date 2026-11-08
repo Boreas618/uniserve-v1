@@ -95,7 +95,7 @@ impl Scheduler {
                 continue;
             }
             // An update may have asked this step's batches to run in shadow too:
-            // the same work against the world whose kernels are being compared,
+            // the same work against the epoch whose kernels are being compared,
             // submitted beside the serving one (7.3 step 2). The copy is made
             // only when an update asked, and before the serving submit takes the
             // batch.
@@ -436,7 +436,7 @@ impl Scheduler {
 
         // A resize waits for the copies of the idle cached pages it evicts:
         // while no text batch carries them (nothing runs, as on a parked
-        // world), batches of page offloads alone do.
+        // epoch), batches of page offloads alone do.
         if self.resizing.is_some()
             && self.inflight.pending_submissions.is_empty()
             && self.inflight.pending_batches.is_empty()
@@ -608,8 +608,8 @@ impl Scheduler {
             // Today's capacity preemption, which the design keeps: a request
             // that must give its units away is marked migratable with `Drain`,
             // as `recompute_starved` does when it withdraws the units its
-            // requests hold. `Drain` asks the engine to hold the world the
-            // stream is in, and there is no world change here, so the daemon
+            // requests hold. `Drain` asks the engine to hold the epoch the
+            // stream is in, and there is no epoch change here, so the daemon
             // resubmits the request as a continuation carrying the state it
             // reached. Only a migratable request is marked: one the daemon
             // could not resubmit would be lost. The request retires at its next
@@ -720,7 +720,7 @@ impl Scheduler {
         };
         self.step += 1;
         // The kernels this step's batches serve on, read once: a switchover
-        // that completes mid-step must not split one step across two worlds
+        // that completes mid-step must not split one step across two epochs
         // (4.2, 7.3).
         let generation = self.serving_generation();
         self.worker.set_generation(generation);
@@ -795,7 +795,7 @@ impl Scheduler {
             return self.policy_failed(policy, error);
         }
         // §4.4's periodic row: the mechanism owns the interval, the worker
-        // publishes the load, and the order is checked and handed to the world
+        // publishes the load, and the order is checked and handed to the epoch
         // setup that applies it (§7.6). No load means nothing to decide, not a
         // zero one: the worker has published no routed tokens yet.
         let experts_due = self.expert_load_new
@@ -1198,7 +1198,7 @@ impl Scheduler {
     }
 
     /// The expert layout the policy last answered, taken by the point that
-    /// applies it: the worker's world setup (§7.6), which commits it with
+    /// applies it: the worker's epoch setup (§7.6), which commits it with
     /// `Worker::commit_experts` — the worker's own method for retaining an
     /// expert order. Taking it once is the handoff, so a layout is applied
     /// once; the mechanism keeps no second copy.

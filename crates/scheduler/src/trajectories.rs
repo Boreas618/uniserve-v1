@@ -11,7 +11,7 @@
 //! facts), which are derived state like a KV cache page. Each denoising
 //! rank whose host runs a Storage Server maps a host latent pool of its
 //! own, a page pool of pages the size of one page of its latent banks
-//! (`ipc::LatentPoolInfo`), which the same rank of every world of the
+//! (`ipc::LatentPoolInfo`), which the same rank of every epoch of the
 //! deployment maps again. The scheduler decides what moves:
 //!
 //! - **Offload.** A preempted request whose calls completed at step `k`
@@ -51,10 +51,10 @@
 //! request, [`image_trajectory`] for a token request's image) and the steps
 //! it took. The key is injective, since every input that determines a
 //! page's values is in it, and minimal, since no input that does not is:
-//! neither the world, the mesh, the rank nor the parallel configuration
+//! neither the epoch, the mesh, the rank nor the parallel configuration
 //! that wrote the page, so a page two configurations lay out alike is one
-//! page of the pool, and a world that computes other numerics finds none,
-//! unless a world change keeps the state of the requests in flight
+//! page of the pool, and an epoch that computes other numerics finds none,
+//! unless an epoch change keeps the state of the requests in flight
 //! (`Trajectory::state_seed`). Keys are never reused for other bytes, so a
 //! stale trajectory is never read: it leaves its pool least recently used
 //! first.
@@ -78,9 +78,9 @@
 //! of every request is the rank's own (`LatentPoolInfo::region`), or else
 //! the whole of every stored sample.
 //!
-//! The store connects as a head of its engine's world, so the trajectories
-//! a world on trial stores are its own until its commit: a rollback discards
-//! them, and the previous world computes the requests it takes back from
+//! The store connects as a head of its engine's epoch, so the trajectories
+//! an epoch on trial stores are its own until its commit: a rollback discards
+//! them, and the previous epoch computes the requests it takes back from
 //! what they named before.
 //!
 //! Requests to the servers never block the scheduler: they are submitted,
@@ -434,15 +434,15 @@ pub(crate) struct TrajectoryStore {
 
 impl TrajectoryStore {
     /// Connect to the Storage Server of `host`, the engine's, at `socket`,
-    /// as a head of `deployment` in `world`.
+    /// as a head of `deployment` in `epoch`.
     pub(crate) fn connect(
         socket: &std::path::Path,
         deployment: &str,
-        world: u64,
+        epoch: u64,
         host: &str,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            servers: Servers::connect(socket, deployment, world, "host latent pools")?,
+            servers: Servers::connect(socket, deployment, epoch, "host latent pools")?,
             host: host.to_owned(),
             workers: HashMap::new(),
             seed: 0,

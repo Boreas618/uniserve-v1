@@ -6,7 +6,7 @@
 //! scheduler asks of the workers at the worker boundary (the trajectory
 //! offloads a batch carries, the stored pages a latent preparation restores,
 //! the denoising calls a request runs) and the events its requests end
-//! with. A preemption in normal serving (a sleep) and a world change (a
+//! with. A preemption in normal serving (a sleep) and an epoch change (a
 //! park, and a successor scheduler that resumes the request) take the same
 //! path, whatever parallel configuration the successor's denoiser has, and
 //! a request whose stored trajectory is missing starts from noise.
@@ -740,7 +740,7 @@ fn a_video_request_whose_stored_trajectory_is_missing_starts_from_noise() {
 
 /// A request that resumes a stored trajectory is admitted before a request
 /// that starts one, whichever was submitted first: the request slots take
-/// the resumed requests first, so the trajectories a world still has to
+/// the resumed requests first, so the trajectories an epoch still has to
 /// restore are at most those of its latest preemption.
 #[test]
 fn a_resumed_video_request_is_admitted_before_one_that_starts() {
@@ -794,15 +794,15 @@ fn a_resumed_video_request_is_admitted_before_one_that_starts() {
     );
 }
 
-/// A world change: the serving scheduler parks, preempting the request at a
+/// An epoch change: the serving scheduler parks, preempting the request at a
 /// step boundary with its trajectory stored, and a successor whose
 /// denoising computes the same continues it from that step. A successor
 /// whose denoising computes other numerics finds no trajectory of its own
 /// latent seed and starts from noise (`in_flight = recompute`), unless the
-/// request names the parked world's seed (`in_flight = keep`), whose
+/// request names the parked epoch's seed (`in_flight = keep`), whose
 /// trajectory it continues.
 #[test]
-fn a_parked_worlds_video_request_continues_on_its_successor() {
+fn a_parked_epochs_video_request_continues_on_its_successor() {
     let (server, pool) = server();
     let (resumed, parked_seed, _) = park(&server, pool, ONE_RANK);
     let steps = resumed.denoised_steps;
@@ -817,7 +817,7 @@ fn a_parked_worlds_video_request_continues_on_its_successor() {
     assert_eq!(same.denoising, STEPS - steps);
 
     // Other numerics: the trajectory is recomputed, or kept when the
-    // request names the parked world's seed.
+    // request names the parked epoch's seed.
     let other = Denoiser::start(&server, pool, "another denoiser", None, ONE_RANK);
     assert_ne!(other.seed, parked_seed);
     let mut recomputed = other.handle.submit(request(resumed.clone())).unwrap();
@@ -837,8 +837,8 @@ fn a_parked_worlds_video_request_continues_on_its_successor() {
     assert_eq!(kept.denoising, STEPS - steps);
 }
 
-/// A world change of the denoiser's parallel configuration whose denoising
-/// computes the same: the serving world's two sequence-parallel ranks
+/// An epoch change of the denoiser's parallel configuration whose denoising
+/// computes the same: the serving epoch's two sequence-parallel ranks
 /// store their rows, and a successor of one rank continues the trajectory
 /// from that step, its one rank reading both stored ranks' pages; the
 /// reverse change hands the one stored rank's pages to both ranks. The

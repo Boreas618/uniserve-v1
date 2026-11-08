@@ -629,18 +629,13 @@ impl Epochs {
 
     /// Records epoch `epoch` as serving the `deployment` this node installed
     /// at startup: its build config and programs and the generation its main
-    /// processes numbered (§7.4). The epoch's number is the world it executes,
+    /// processes numbered (§7.4). The epoch is recorded under the number its launch gave it,
     /// as a switch's target and an adopted epoch are numbered. The daemon
     /// records nothing it did not install, so this is called with what the
     /// main processes answered, not with what the configuration asked for.
     ///
     /// Answers the epoch's number.
-    pub fn install(
-        &self,
-        epoch: u64,
-        deployment: &Deployment,
-        generations: &[u64],
-    ) -> u64 {
+    pub fn install(&self, epoch: u64, deployment: &Deployment, generations: &[u64]) -> u64 {
         self.record(
             epoch,
             EpochRecord {
@@ -1915,7 +1910,7 @@ mod tests {
 
     /// A refused precopy changes nothing that serves, and an update in flight
     /// is what a commit finds: with none, a commit answers that it is not a
-    /// program-layer update, so a caller falls through to the world path.
+    /// program-layer update, so a caller falls through to the epoch path.
     #[test]
     fn a_refused_precopy_records_no_probation_and_a_commit_falls_through() {
         use crate::engine::stand_in::{Answer, main_processes, process};
@@ -2049,7 +2044,7 @@ mod tests {
 
         // The batch the policy may hold follows the same catalog: the
         // deployment's own batch, or the largest decode graph when it states
-        // none, and a catalog that grows with a new world moves the derived
+        // none, and a catalog that grows with a new epoch moves the derived
         // figure with it.
         let mut config = ServerArgs::default();
         config.cuda_graph_config.decode_batch_sizes = Some(vec![
@@ -2074,7 +2069,7 @@ mod tests {
         assert_eq!(
             programs.policy.arguments["max_batch"],
             toml::Value::Integer(16),
-            "and it moves with the catalog a new world captures"
+            "and it moves with the catalog a new epoch captures"
         );
         // A batch the deployment states below the catalog keeps its own value.
         config.scheduler_config.max_batch = NonZeroUsize::new(4).unwrap();

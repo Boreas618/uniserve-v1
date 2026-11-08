@@ -203,7 +203,7 @@ pub struct SchedulerHandle {
     stats: Arc<SchedulerStats>,
     generation_limits: GenerationLimits,
     /// The worker group whose KV cache the scheduler's pool allocates, by
-    /// which a successor world matches the scheduler's prefix cache index;
+    /// which a successor epoch matches the scheduler's prefix cache index;
     /// `None` without a prefix cache.
     cache_group: Option<String>,
     /// The latent seed of what the scheduler's denoising computes, which
@@ -216,7 +216,7 @@ pub struct SchedulerHandle {
     dead: Arc<AtomicBool>,
     /// The first error of that fatal exit (`Scheduler::failure_handle`).
     failure: Arc<std::sync::OnceLock<String>>,
-    /// Whether the scheduler started on trial, as a successor world's do;
+    /// Whether the scheduler started on trial, as a successor epoch's do;
     /// its commit ends the trial.
     trial: bool,
     /// The device-side submission path of the worker's own crate. A handle
@@ -255,7 +255,7 @@ impl SchedulerHandle {
     /// `progress` told whenever a step produced events or an answer: what the
     /// thread reading them waits on.
     ///
-    /// The scheduler reads the process's arguments `args`: its world, its host
+    /// The scheduler reads the process's arguments `args`: its epoch, its host
     /// and its pool, and the engine configuration as the process resolved it
     /// (the model and its facts, the KV cache, the worker groups' roles). It
     /// takes `limits`, the mechanism's bounds for the ranks it drives
@@ -371,13 +371,13 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Applies the configuration's per-world settings to a freshly built
-    /// scheduler: its world identity, its prefix reuse and state interval, its
+    /// Applies the configuration's per-epoch settings to a freshly built
+    /// scheduler: its epoch identity, its prefix reuse and state interval, its
     /// prefill groups, and the host storages its ranks map.
     fn configured(mut scheduler: Scheduler, args: &EngineArgs) -> anyhow::Result<Scheduler> {
         let engine = &args.engine_config;
         let kv_cache = &engine.kv_cache;
-        scheduler.set_world(args.world);
+        scheduler.set_epoch(args.epoch);
         scheduler.set_prefix_reuse(kv_cache.prefix_caching);
         scheduler.set_state_interval(
             kv_cache
@@ -408,7 +408,7 @@ impl SchedulerHandle {
             scheduler
                 .enable_kv_offload(
                     &scope,
-                    args.world,
+                    args.epoch,
                     &args.host,
                     kv_cache
                         .boundary_interval
@@ -418,7 +418,7 @@ impl SchedulerHandle {
                     host_cache(kv_cache)?,
                     kv_cache.mooncake.is_some(),
                 )
-                .context("sizing the world's host KV cache")?;
+                .context("sizing the epoch's host KV cache")?;
         }
         // Denoising ranks that map host latent pools report them: a
         // preempted request's trajectory (a video's, or an image's) is
@@ -426,7 +426,7 @@ impl SchedulerHandle {
         scheduler.enable_trajectory_store(
             &storage::socket::default_socket(),
             &scope,
-            args.world,
+            args.epoch,
             &args.host,
         );
         // Ranks executing video encoders that map host encoder pools report
@@ -434,7 +434,7 @@ impl SchedulerHandle {
         scheduler.enable_encoder_store(
             &storage::socket::default_socket(),
             &scope,
-            args.world,
+            args.epoch,
             &args.host,
         );
         Ok(scheduler)
@@ -632,7 +632,7 @@ impl SchedulerHandle {
     }
 
     /// Returns the worker group whose KV cache the scheduler's pool
-    /// allocates, which names its prefix cache index for a successor world;
+    /// allocates, which names its prefix cache index for a successor epoch;
     /// `None` without a prefix cache.
     pub fn cache_group(&self) -> Option<String> {
         self.cache_group.clone()
@@ -645,14 +645,14 @@ impl SchedulerHandle {
         self.latent_seed
     }
 
-    /// Promotes the scheduler, whose world succeeds another: its workers
+    /// Promotes the scheduler, whose epoch succeeds another: its workers
     /// adopt the predecessor's cache flags of the units they inherit, and
     /// its pool imports the predecessor's published pages, from which
     /// requests reuse their prefixes. Blocks until it is done.
     ///
     /// # Errors
     ///
-    /// Fails when the world's own cache, grown into the predecessor's storage
+    /// Fails when the epoch's own cache, grown into the predecessor's storage
     /// freed at once when it `grows`, cannot hold the requests the
     /// predecessor hands over (which `recompute` from their tokens or not),
     /// a worker refuses or dies, or the scheduler has stopped.
@@ -699,7 +699,7 @@ impl SchedulerHandle {
         self.failure.get().cloned()
     }
 
-    /// Whether the scheduler started on trial, as a successor world's do.
+    /// Whether the scheduler started on trial, as a successor epoch's do.
     pub fn starts_on_trial(&self) -> bool {
         self.trial
     }
@@ -766,8 +766,8 @@ impl SchedulerHandle {
     /// flight drain, after every token it generated; the other requests
     /// finish; then it executes nothing more until resumed. The receiver
     /// gets its prefix cache index and what its migrating requests held
-    /// once it parked. When it `lend`s, the world that succeeds it maps its
-    /// cache: it lends that world the segments no request in flight
+    /// once it parked. When it `lend`s, the epoch that succeeds it maps its
+    /// cache: it lends that epoch the segments no request in flight
     /// continues from (`Scheduler::park`).
     pub fn park(
         &self,
@@ -777,7 +777,7 @@ impl SchedulerHandle {
     }
 
     /// Reports the KV cache each of the scheduler's worker groups holds now,
-    /// which a world succeeding this one maps; the receiver gets it.
+    /// which an epoch succeeding this one maps; the receiver gets it.
     pub fn describe_cache(
         &self,
     ) -> crossbeam_channel::Receiver<Result<Vec<crate::GroupCache>, String>> {
@@ -870,9 +870,9 @@ impl SchedulerHandle {
             .flatten()
     }
 
-    /// Publishes the committed world's immutable pages on every claimed node.
-    pub fn publish_world(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.publish_world()
+    /// Publishes the committed epoch's immutable pages on every claimed node.
+    pub fn publish_epoch(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.publish_epoch()
     }
 
     /// Pin or publish a scheduler's pages for a shared transfer round.
@@ -884,22 +884,22 @@ impl SchedulerHandle {
         self.commands.cache_warm(operation, together)
     }
 
-    /// Ends the storage of `worlds` on the nodes of the scheduler's workers,
+    /// Ends the storage of `epochs` on the nodes of the scheduler's workers,
     /// which the deployment's claims cover; the receiver gets whether it did.
-    pub fn retire(&self, worlds: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.retire(worlds)
+    pub fn retire(&self, epochs: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
+        self.commands.retire(epochs)
     }
 
-    /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
+    /// Keeps the weights alone of `epochs` on the nodes of the scheduler's
     /// workers, which the deployment's claims cover, in host storage when
     /// `to_host`; the receiver gets each node's report.
     pub fn keep_weights(
         &self,
-        worlds: Vec<u64>,
+        epochs: Vec<u64>,
         to_host: bool,
         cache_keys: Vec<Vec<u8>>,
     ) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
-        self.commands.keep_weights(worlds, to_host, cache_keys)
+        self.commands.keep_weights(epochs, to_host, cache_keys)
     }
 
     /// Reads the storage ledgers of the nodes of the scheduler's workers,
@@ -921,13 +921,13 @@ impl SchedulerHandle {
     }
 
     /// Resumes a parked scheduler; the receiver gets whether it did. When
-    /// it `reclaim`s, the world it lent cache units to writes none of them
+    /// it `reclaim`s, the epoch it lent cache units to writes none of them
     /// any more, and it takes them back.
     pub fn resume(&self, reclaim: bool) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.resume(reclaim)
     }
 
-    /// Commits the scheduler's world, which succeeded another: its workers
+    /// Commits the scheduler's epoch, which succeeded another: its workers
     /// take the predecessor's storage they mapped read-only. The receiver gets
     /// what each worker reported.
     pub fn commit(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {

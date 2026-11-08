@@ -28,7 +28,7 @@ its graphs captured, its device storage kept resident or suspended
 all-to-all workspaces and NCCL communicators, which its ranks restore
 together at the promotion, and frees DeepEP's windows, which cannot keep
 their addresses: the promotion rebuilds them and captures the graphs that
-run expert steps again). Killing a serving rank promotes that world in
+run expert steps again). Killing a serving rank promotes that epoch in
 place of a relaunch, and the request continues on it.
 
 Each test runs a Storage Server of its own: ``XDG_RUNTIME_DIR`` points the
@@ -329,13 +329,13 @@ def test_an_expert_world_promotes_its_standby_world_when_a_rank_is_lost(
             f"worker_config.standby_storage={standby_storage}",
         ),
         devices=granted_devices(2),
-        parked="the standby world of the failure domain is parked",
+        parked="the standby epoch of the failure domain is parked",
     )
 
     def logged(text: str) -> bool:
         return any(text in line for line in lines)
 
-    assert logged("the failure domain's standby world was promoted")
+    assert logged("the failure domain's standby epoch was promoted")
     assert not logged("relaunching the failure domain's worker groups")
     assert logged("a request migrated"), "the streaming request did not migrate"
     if standby_storage == "resident":

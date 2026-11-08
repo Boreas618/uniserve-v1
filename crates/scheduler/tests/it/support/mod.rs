@@ -122,11 +122,11 @@ pub(crate) fn scheduler_with_stating(
     Ok(scheduler)
 }
 
-/// The policy module every integration test's world serves with.
+/// The policy module every integration test's epoch serves with.
 ///
-/// A deployed epoch takes its policy from the Program Server; a test world has
+/// A deployed epoch takes its policy from the Program Server; a test epoch has
 /// none, and a scheduler with no policy decides nothing — no plan, no
-/// admission, no batch — so a world that submits a request must be given one.
+/// admission, no batch — so an epoch that submits a request must be given one.
 /// The module is the `fcfs` program this tree builds for
 /// `wasm32-unknown-unknown`, the one that reproduces the rules the tests were
 /// written against: `scheduler::packaged_module` builds it on first use, and a
@@ -135,11 +135,11 @@ pub(crate) fn policy_module() -> Vec<u8> {
     scheduler::packaged_module()
 }
 
-/// Installs `fcfs` with the ceilings a world advertises and the parameters the
-/// world states about itself.
+/// Installs `fcfs` with the ceilings an epoch advertises and the parameters the
+/// epoch states about itself.
 ///
 /// A judgement the views cannot carry is the policy's, weighed from the
-/// parameters the deployment states (design §7.7): a world that speculates
+/// parameters the deployment states (design §7.7): an epoch that speculates
 /// states its speedup and what a refilled token costs there, because the
 /// mechanism's own measurement is not a view a policy reads.
 pub(crate) fn install_policy_stating(
@@ -168,10 +168,10 @@ pub(crate) fn install_policy_stating(
         .unwrap_or_else(|error| panic!("the fcfs policy is installed: {error}"));
 }
 
-/// Installs `fcfs` on a handle's world through the command surface the launch
+/// Installs `fcfs` on a handle's epoch through the command surface the launch
 /// path uses: prepared by a precopy, then served at the switchover (§7.3).
 ///
-/// A handle's world serves nothing until a policy serves it — the epoch's
+/// A handle's epoch serves nothing until a policy serves it — the epoch's
 /// first policy is the daemon's to install, not the config's — so a test that
 /// submits to a handle installs one the same way a launched epoch receives it.
 pub(crate) fn install_policy_on(

@@ -166,14 +166,14 @@ impl Local {
                 Ok(claimed) => reply.kind = Some(reply::Kind::Claimed(claimed)),
                 Err(error) => reply.error = format!("{error:#}"),
             },
-            Some(request::Kind::PublishWorlds(publish)) => {
+            Some(request::Kind::PublishEpochs(publish)) => {
                 match self
                     .claims
-                    .publish_worlds(&publish.deployment, &publish.worlds)
+                    .publish_epochs(&publish.deployment, &publish.epochs)
                 {
                     Ok(()) => {
-                        reply.kind = Some(reply::Kind::WorldsPublished(
-                            proto::process::WorldsPublished {},
+                        reply.kind = Some(reply::Kind::EpochsPublished(
+                            proto::process::EpochsPublished {},
                         ))
                     }
                     Err(error) => reply.error = format!("{error:#}"),
@@ -182,7 +182,7 @@ impl Local {
             Some(request::Kind::KeepWeights(keep)) => {
                 match self.claims.keep_weights(
                     &keep.deployment,
-                    &keep.worlds,
+                    &keep.epochs,
                     keep.to_host,
                     &keep.cache_keys,
                 ) {
@@ -652,7 +652,7 @@ pub(crate) fn run_leader(
         }
 
         // Nodes joining the running deployment: an engine that connects
-        // from now on learns them, so the next world may run ranks there.
+        // from now on learns them, so the next epoch may run ranks there.
         if let Some(joins) = &mut joins {
             for member in joins.admit(&members)? {
                 nodes.push(member_node(&member));
@@ -1198,7 +1198,7 @@ fn route(
         Some(request::Kind::KeepWeights(keep)) => Some(keep.host.as_str()),
         Some(request::Kind::ThrottleTransfers(throttle)) => Some(throttle.host.as_str()),
         Some(request::Kind::Devices(query)) => Some(query.host.as_str()),
-        Some(request::Kind::PublishWorlds(publish)) => Some(publish.host.as_str()),
+        Some(request::Kind::PublishEpochs(publish)) => Some(publish.host.as_str()),
         Some(request::Kind::Stop(_) | request::Kind::Nodes(_)) | None => None,
     };
     let forward = |member: &mut Membership| {

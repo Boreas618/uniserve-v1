@@ -2,7 +2,7 @@
 //! budget, and the startup checks that refuse a runtime that does not fit.
 //!
 //! A deployment may use `⌊total × fraction⌋` of a GPU (its quota), and every
-//! world of the deployment that uses the GPU, with the host's Transfer
+//! epoch of the deployment that uses the GPU, with the host's Transfer
 //! Server, holds its storage within that one quota: the Storage Server keeps
 //! the GPU's ledger. A rank's grant is the quota less everything the ledger
 //! books beside the rank's own process, and less what the process holds now.
@@ -52,12 +52,12 @@ pub(crate) struct CacheDemand<'a> {
     pub available_bytes: Option<u64>,
     /// Units' worth of the grant that other storage occupies.
     pub reserved_units: u64,
-    /// Whether the rank's world succeeds another on its devices: its pool
+    /// Whether the rank's epoch succeeds another on its devices: its pool
     /// is laid out beside the predecessor's segments, and the part of a
     /// configured capacity its grant does not hold yet is created as the
     /// predecessor's storage frees (its deferred tail segments).
     pub successor: bool,
-    /// The units of a configured token capacity that a successor world maps
+    /// The units of a configured token capacity that a successor epoch maps
     /// from its predecessor's segments rather than allocates: the grant pays
     /// for the rest alone, since the ledger books those once, for the
     /// predecessor.
@@ -66,10 +66,10 @@ pub(crate) struct CacheDemand<'a> {
 
 impl CacheCapacity {
     /// Explicit token capacity counts whole pages of every K/V group and a
-    /// state checkpoint per request slot. A successor world's own units are
+    /// state checkpoint per request slot. A successor epoch's own units are
     /// those of the capacity past the ones it inherits, of which it creates
     /// now what its grant holds beside the reserved ones; the grant of any
-    /// other world must hold the whole capacity.
+    /// other epoch must hold the whole capacity.
     /// Automatic sizing gives the pool the complete units the grant holds
     /// beside the reserved ones; without a grant the pool takes
     /// [`DEFAULT_NUM_UNITS`]. Every mode leaves room for the sentinel unit
@@ -407,7 +407,7 @@ pub fn graph_scratch_bytes(total_device_bytes: i64) -> u64 {
 ///
 /// `online-operations.md` states the cost of a preparation as a SECOND graph
 /// pool of 10% of the device, with `eager_prepare` as the way to free it:
-/// making the serving world run eagerly gives its graph storage to the
+/// making the serving epoch run eagerly gives its graph storage to the
 /// successor's captures. So a rank that prepares a generation beside a serving
 /// one budgets two pools, and a rank that does not - or that prepares with the
 /// serving side eager - budgets one.

@@ -88,7 +88,7 @@ fn generation() -> GenerationRequest {
             isolation_key: Some(99),
             state_seeds: vec![7],
             resume: Some(proto::request::CacheResume {
-                world: 3,
+                epoch: 3,
                 request_id: 5,
             }),
         },

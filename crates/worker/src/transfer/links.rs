@@ -42,7 +42,7 @@ pub(crate) fn measure(
         })
     };
     let mut unmeasured = BTreeMap::new();
-    for rank in &sources.world.ranks {
+    for rank in &sources.epoch.ranks {
         for chunk in rank.storages.iter().flat_map(|storage| &storage.chunks) {
             let Binding::Remote { endpoint, at } = &chunk.binding else {
                 continue;
@@ -130,7 +130,7 @@ pub(crate) fn measure(
                 destination_pitch: 0,
             })
             .collect();
-        let task = retained.transfer(spans, Priority::Background, retained.world())?;
+        let task = retained.transfer(spans, Priority::Background, retained.epoch())?;
         retained.transferred(task)
     });
     retained.forget(&[key])?;

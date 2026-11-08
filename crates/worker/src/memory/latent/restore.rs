@@ -14,12 +14,12 @@
 //! A rank that restores a trajectory stored by ranks of another parallel
 //! configuration (another Ulysses degree, other ranks) holds other rows at
 //! other offsets than any stored rank did. Its copies are the manifest from
-//! the stored ranks' pages it reads (the source world) to its own slot pages
+//! the stored ranks' pages it reads (the source epoch) to its own slot pages
 //! (a target world of one rank): a page the rank lays out as a stored rank
 //! did has that page's key and is copied whole (a mapping, which host pages
 //! cannot be for device pages); every other region of the rank's samples is
 //! copied from the stored page that holds it, as byte runs split at the
-//! stored pages' bounds. Both worlds lie on the rank's GPU, which reads the
+//! stored pages' bounds. Both epochs lie on the rank's GPU, which reads the
 //! host pool pages directly, so the manifest's one link is the GPU's to
 //! itself. The copies of a rank depend on the sources and its own pages
 //! alone, so ranks plan their own without agreeing on anything.
@@ -83,10 +83,10 @@ pub(crate) fn copies(
         })
     };
     let request = manifest::Request {
-        source: manifest::World {
+        source: manifest::Epoch {
             ranks: sources.iter().map(rank).collect::<Result<_>>()?,
         },
-        target: manifest::World {
+        target: manifest::Epoch {
             ranks: vec![rank(target)?],
         },
         gpus: vec![gpu],

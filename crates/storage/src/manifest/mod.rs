@@ -10,9 +10,9 @@
 //! - its encoding on each GPU: where each held element lies in the bytes
 //!   of a storage ([`layout::Field`], [`layout::Encoding`]).
 //!
-//! A [`Manifest`] is computed once per pair of worlds, the source world
-//! that holds the state and the target world that needs it, from both
-//! worlds' storage layouts and chunk keys ([`World`]), the GPUs the target
+//! A [`Manifest`] is computed once per pair of epochs, the source epoch
+//! that holds the state and the target epoch that needs it, from both
+//! epochs' storage layouts and chunk keys ([`Epoch`]), the GPUs the target
 //! may use and the bandwidth of every link between them ([`Request`]):
 //!
 //! 1. For each target rank and GPU, the bytes the GPU already holds of the
@@ -41,8 +41,8 @@
 //! workers consume that concrete plan. [`BoundManifest::spans`]
 //! turns the copies into the spans of a transfer between the chunks the
 //! Storage Server retains ([`crate::protocol::Request::Transfer`]), which
-//! its Transfer Server executes. The source world of weights is what the
-//! manifests a world retains name ([`weights::sources`]).
+//! its Transfer Server executes. The source epoch of weights is what the
+//! manifests an epoch retains name ([`weights::sources`]).
 
 pub mod cache;
 pub mod layout;
@@ -205,7 +205,7 @@ impl Storage {
 /// it.
 pub type Gpu = [u8; 16];
 
-/// One rank of a world.
+/// One rank of an epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Rank {
     /// The rank's execution GPU; `None` for a target rank whose GPU is
@@ -214,9 +214,9 @@ pub struct Rank {
     pub storages: Vec<Storage>,
 }
 
-/// The ranks of one world under one parallel configuration.
+/// The ranks of one epoch under one parallel configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct World {
+pub struct Epoch {
     pub ranks: Vec<Rank>,
 }
 
@@ -238,7 +238,7 @@ impl Storage {
     }
 }
 
-impl World {
+impl Epoch {
     /// Whether the same ordered ranks retain the same numerical storage
     /// in the same physical storage ([`Storage::same_as`]).
     pub fn same_storage(&self, other: &Self) -> bool {
@@ -254,7 +254,7 @@ impl World {
             })
     }
 
-    /// Whether a rank on `gpu` of this world holds `storage` of a rank on
+    /// Whether a rank on `gpu` of this epoch holds `storage` of a rank on
     /// that GPU of another reading.
     fn holds(&self, gpu: Option<Gpu>, storage: &Storage) -> bool {
         self.ranks
@@ -264,13 +264,13 @@ impl World {
             .any(|own| own.same_as(gpu, storage, gpu))
     }
 
-    /// The storages of this world that every one of `others` holds too, in
-    /// this world's order and with its bindings; a rank left without
+    /// The storages of this epoch that every one of `others` holds too, in
+    /// this epoch's order and with its bindings; a rank left without
     /// storages is dropped. Readings of retained sources taken at other
     /// times or from other hosts list other storages and bind them from
     /// their own host; the ranks that plan one manifest together plan it
-    /// from this one world, which each of them binds ([`World::reading_of`]).
-    pub fn common<'a>(&self, others: impl IntoIterator<Item = &'a World> + Clone) -> World {
+    /// from this one epoch, which each of them binds ([`Epoch::reading_of`]).
+    pub fn common<'a>(&self, others: impl IntoIterator<Item = &'a Epoch> + Clone) -> Epoch {
         let ranks = self
             .ranks
             .iter()
@@ -290,14 +290,14 @@ impl World {
             })
             .filter(|rank| !rank.storages.is_empty())
             .collect();
-        World { ranks }
+        Epoch { ranks }
     }
 
     /// This reading's storages that `plan` names, in `plan`'s order and
-    /// with this reading's bindings: the source world a plan made from
+    /// with this reading's bindings: the source epoch a plan made from
     /// `plan` binds on this reader's host ([`Manifest::bind`]). `None` when
     /// this reading lacks one of them.
-    pub fn reading_of(&self, plan: &World) -> Option<World> {
+    pub fn reading_of(&self, plan: &Epoch) -> Option<Epoch> {
         let ranks = plan
             .ranks
             .iter()
@@ -320,16 +320,16 @@ impl World {
                 })
             })
             .collect::<Option<Vec<_>>>()?;
-        Some(World { ranks })
+        Some(Epoch { ranks })
     }
 }
 
 /// What a manifest is computed from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
-    pub source: World,
-    pub target: World,
-    /// The GPUs the target world's ranks may take, at least one per rank.
+    pub source: Epoch,
+    pub target: Epoch,
+    /// The GPUs the target epoch's ranks may take, at least one per rank.
     pub gpus: Vec<Gpu>,
     /// The bandwidth of every physical storage link, as the host's Transfer
     /// Server measured it (the listing's `transfer.links`): when it started
@@ -382,8 +382,8 @@ pub struct Endpoint {
     pub offset: u64,
 }
 
-/// `rows` copies of `length` bytes from the source world to the target
-/// world, row `r` from `source.offset + r * source_pitch` to
+/// `rows` copies of `length` bytes from the source epoch to the target
+/// epoch, row `r` from `source.offset + r * source_pitch` to
 /// `target.offset + r * target_pitch`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Copy {
@@ -402,7 +402,7 @@ impl Copy {
     }
 }
 
-/// Which world a staging space or conversion belongs to.
+/// Which epoch a staging space or conversion belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
@@ -463,7 +463,7 @@ pub struct LinkLoad {
     pub seconds: f64,
 }
 
-/// How a target world obtains the state a source world holds.
+/// How a target epoch obtains the state a source epoch holds.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     /// The digest of the request the manifest was computed from.
@@ -552,14 +552,14 @@ impl Manifest {
                     continue;
                 };
                 let staging = &self.stagings[staging as usize];
-                let world = match side {
+                let epoch = match side {
                     Side::Source => &request.source,
                     Side::Target => &request.target,
                 };
                 bytes += staging.bytes.div_ceil(granularity) * granularity;
                 if side == Side::Source {
                     let mut stored = 0u64;
-                    for field in world.ranks[staging.rank as usize].storages.iter()
+                    for field in epoch.ranks[staging.rank as usize].storages.iter()
                         .flat_map(|storage| &storage.layout.fields)
                         .filter(|field| matches!(&field.encoding, Encoding::Encoded { group, .. } if group == &staging.group))
                     {

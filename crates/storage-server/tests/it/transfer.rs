@@ -433,7 +433,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
         &server.socket,
         Role::Head {
             deployment: "other".into(),
-            world: 0,
+            epoch: 0,
         },
     )
     .unwrap();
@@ -495,7 +495,7 @@ fn a_transfer_is_refused_whole_unless_every_span_fits_storage_of_its_deployment(
         1,
     );
     assert_eq!(server_error(result), ErrorKind::Invalid);
-    // A worker does not throttle links: the head of the executing world
+    // A worker does not throttle links: the head of the executing epoch
     // does.
     let result = worker.throttle(vec![], Throttle::Halve);
     assert_eq!(server_error(result), ErrorKind::Invalid);
@@ -779,17 +779,17 @@ fn a_crashed_transfer_server_fails_its_tasks_and_the_server_starts_another() {
     );
 }
 
-/// An offload of a world's weights that the host cannot hold is refused
+/// An offload of an epoch's weights that the host cannot hold is refused
 /// whole under the host rule: nothing moves, and the GPU's ledger still
 /// books the weights.
 #[test]
 fn an_offload_the_host_cannot_hold_is_refused_and_moves_nothing() {
-    use crate::server::{booked, device, ledger, world_worker};
+    use crate::server::{booked, device, epoch_worker, ledger};
 
     let server = serving(Gpus::Hidden);
     let mut head = head(&server.socket);
     let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-    let mut first = world_worker(&server.socket, scope("text", 0), 1, claim);
+    let mut first = epoch_worker(&server.socket, scope("text", 0), 1, claim);
     // A storage's record states its size; no host holds an exbibyte.
     let bytes = 1 << 60;
     let storage = memfd(&[1; 4]);
@@ -830,7 +830,7 @@ pub(crate) mod device {
     };
 
     use super::{Gpus, end_of, pattern, read, serving, span, tensor_region};
-    use crate::server::{head, host, key, memfd, scope, tensor, worker, world_worker};
+    use crate::server::{epoch_worker, head, host, key, memfd, scope, tensor, worker};
 
     /// A retained device allocation of `bytes` on `device` holding
     /// `contents`, with its descriptor.
@@ -881,8 +881,8 @@ pub(crate) mod device {
     fn a_manifest_stages_borrowed_device_regions_through_host_storage() {
         use ::storage::manifest::Span as LogicalSpan;
         use ::storage::manifest::{
-            Binding, Chunk, Encoding, Field, Logical, Manifest, Rank, Request, Segment, Storage,
-            StorageLayout, World,
+            Binding, Chunk, Encoding, Epoch, Field, Logical, Manifest, Rank, Request, Segment,
+            Storage, StorageLayout,
         };
 
         let server = serving(Gpus::Visible);
@@ -960,13 +960,13 @@ pub(crate) mod device {
             (host_staging, device_target),
         ] {
             let request = Request {
-                source: World {
+                source: Epoch {
                     ranks: vec![Rank {
                         gpu: Some(gpu),
                         storages: vec![from],
                     }],
                 },
-                target: World {
+                target: Epoch {
                     ranks: vec![Rank {
                         gpu: Some(gpu),
                         storages: vec![into],
@@ -1236,27 +1236,27 @@ pub(crate) mod device {
     }
 
     /// The weights booked on `gpu` in `head`'s ledger of it: each entry's
-    /// worlds and bytes, sorted.
+    /// epochs and bytes, sorted.
     fn weights_on(head: &mut ::storage::Client, gpu: [u8; 16]) -> Vec<(Vec<u64>, u64)> {
         let ledgers = head.ledger(vec![gpu]).unwrap().ledgers;
         let mut weights: Vec<(Vec<u64>, u64)> = ledgers
             .iter()
             .flat_map(|ledger| &ledger.entries)
             .filter(|entry| entry.item == ::storage::Item::Weights)
-            .map(|entry| (entry.worlds.clone(), entry.bytes))
+            .map(|entry| (entry.epochs.clone(), entry.bytes))
             .collect();
         weights.sort();
         weights
     }
 
-    /// The weights a world alone retains move to host storage and back
+    /// The weights an epoch alone retains move to host storage and back
     /// through the Transfer Server, bytes intact: the offload leaves them in
     /// host storage and the GPU's ledger without them, while the weights its
     /// successor maps stay on the GPU; the restore returns them to the GPU
     /// they left and to its ledger.
     #[test]
     #[ignore = "requires a CUDA device"]
-    fn a_worlds_own_weights_move_to_host_storage_and_back() {
+    fn a_epochs_own_weights_move_to_host_storage_and_back() {
         let server = serving(Gpus::Visible);
         let first = DeviceId(0);
         let gpu = first.uuid().unwrap().0;
@@ -1267,8 +1267,8 @@ pub(crate) mod device {
 
         let mut head = head(&server.socket);
         let claim = head.claim(1, vec![scope("text", 0)], Vec::new()).unwrap();
-        head.publish_worlds(vec![1]).unwrap();
-        let mut previous = world_worker(&server.socket, scope("text", 0), 1, claim);
+        head.publish_epochs(vec![1]).unwrap();
+        let mut previous = epoch_worker(&server.socket, scope("text", 0), 1, claim);
         let (own, own_fd) = device_storage(first, &own_bytes);
         let (shared, shared_fd) = device_storage(first, &shared_bytes);
         previous
@@ -1284,11 +1284,11 @@ pub(crate) mod device {
             )
             .unwrap();
         head.claim(2, vec![scope("text", 0)], Vec::new()).unwrap();
-        let mut successor = world_worker(&server.socket, scope("text", 0), 2, claim);
+        let mut successor = epoch_worker(&server.socket, scope("text", 0), 2, claim);
         successor
             .get(vec![key(2)], ::storage::Mode::Read, Vec::new())
             .unwrap();
-        // The previous world's processes exited: the server alone holds its
+        // The previous epoch's processes exited: the server alone holds its
         // storage.
         drop(previous);
         drop((own, own_fd, shared, shared_fd));
@@ -1297,7 +1297,7 @@ pub(crate) mod device {
             [(vec![1], size), (vec![1, 2], size)]
         );
 
-        // The bytes of world 1's own weights wherever they lie, copied into
+        // The bytes of epoch 1's own weights wherever they lie, copied into
         // host storage of the successor's: a copy retains nothing.
         let copy = memfd(&vec![0; granularity]);
         successor

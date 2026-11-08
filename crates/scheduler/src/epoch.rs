@@ -1,9 +1,9 @@
-//! The scheduler's part in its world's changes.
+//! The scheduler's part in its epoch's changes.
 //!
-//! A deployment updates by starting a world that succeeds the serving one on
+//! A deployment updates by starting an epoch that succeeds the serving one on
 //! the same devices; the daemon decides each step, and each scheduler acts:
 //!
-//! - **Park** (the serving world, at a promotion): at its next step boundary
+//! - **Park** (the serving epoch, at a promotion): at its next step boundary
 //!   the scheduler ends every request that resumes from its generated tokens
 //!   as migratable, ends every video request as migratable at its next
 //!   denoising step boundary once its trajectory is stored (`preemption`),
@@ -21,9 +21,9 @@
 //!   writable (`uniserve.adopt_cache`), its pool imports the predecessor's
 //!   pages into those units, from which migrated requests reuse their
 //!   prefixes, and allocates the lent ones as its own.
-//! - **Resume** (the parked world, at a rollback): it admits and executes
+//! - **Resume** (the parked epoch, at a rollback): it admits and executes
 //!   again, with the index it parked with, and allocates the units it lent
-//!   once the world on trial writes none of them any more.
+//!   once the epoch on trial writes none of them any more.
 //! - **Commit** (the successor, once the predecessor is gone): its workers
 //!   take the segments they mapped read-only (`uniserve.take_cache`), and its
 //!   pool allocates the inherited units.
@@ -32,12 +32,12 @@
 //! logits fail it as a whole rather than being repaired, and its requests
 //! that resume from their generated tokens leave as migratable
 //! (`Scheduler::hand_back_requests`), for the daemon to continue on the
-//! previous world.
+//! previous epoch.
 
 use super::*;
 use crate::kv_cache::IndexedPage;
 
-/// One worker group's KV cache as a world that succeeds this one maps it:
+/// One worker group's KV cache as an epoch that succeeds this one maps it:
 /// its segments in unit order, the leading ones it holds, the units of its
 /// planes and the warmup scratch it lent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,7 +60,7 @@ struct CacheReport {
     scratch_units: u32,
 }
 
-/// What a parked scheduler hands the world that succeeds it: its public and
+/// What a parked scheduler hands the epoch that succeeds it: its public and
 /// private cache index, and the units and count of the requests it ended as
 /// migratable, which the successor's cache must hold to continue them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -86,7 +86,7 @@ pub struct ParkedCache {
 /// A park waiting for the scheduler's requests to end.
 pub(super) struct Parking {
     answer: crossbeam_channel::Sender<Result<ParkedCache, String>>,
-    /// Whether the world that succeeds this one maps its cache, and borrows
+    /// Whether the epoch that succeeds this one maps its cache, and borrows
     /// the segments it lends.
     lend: bool,
     held_units: u32,
@@ -97,7 +97,7 @@ pub(super) struct Parking {
 
 impl Scheduler {
     /// Parks the scheduler (see the module documentation), answering with
-    /// its prefix cache index once it is parked; when it `lend`s, the world
+    /// its prefix cache index once it is parked; when it `lend`s, the epoch
     /// that succeeds it maps its cache and borrows the segments it lends
     /// ([`Self::lend_cache`]).
     pub(super) fn park(
@@ -146,7 +146,7 @@ impl Scheduler {
         tracing::info!("parking: the requests that resume elsewhere end as migratable");
         self.migrate_requests(MigrationCause::Drain);
         // Video requests leave at their next denoising step boundary, their
-        // trajectories stored for the world that serves next.
+        // trajectories stored for the epoch that serves next.
         self.preempt_media(MigrationCause::Drain, |_| true);
         self.parking = Some(Parking {
             answer,
@@ -184,7 +184,7 @@ impl Scheduler {
                     .cache
                     .resume
                     .map(|resume| proto::request::wire::CacheResume {
-                        world: resume.world,
+                        epoch: resume.epoch,
                         request_id: resume.request_id,
                     }),
             });
@@ -277,7 +277,7 @@ impl Scheduler {
     }
 
     /// Resumes a parked scheduler: it admits and executes again. When it
-    /// `reclaim`s, the world it lent cache units to at its park writes none
+    /// `reclaim`s, the epoch it lent cache units to at its park writes none
     /// of them any more, and the pool allocates them again.
     pub(super) fn resume(&mut self, reclaim: bool) -> Result<(), String> {
         if self.parking.is_some() {
@@ -293,18 +293,18 @@ impl Scheduler {
             if reclaimed > 0 {
                 tracing::info!(
                     units = reclaimed,
-                    "took back the cache units lent to the successor world"
+                    "took back the cache units lent to the successor epoch"
                 );
             }
         }
         Ok(())
     }
 
-    /// Lends the world that succeeds this one, which maps this world's
+    /// Lends the epoch that succeeds this one, which maps this epoch's
     /// cache, the segments no request in flight continues from
     /// (`specs/online-operations.md` §6.4): the segments the planes hold
     /// past the first, which holds the padding and warmup units, and past
-    /// those the world inherited and does not own yet, none of whose units
+    /// those the epoch inherited and does not own yet, none of whose units
     /// holds a page of `index` under a private continuation alias. The
     /// successor maps them writable and allocates their units on trial, so
     /// the pool forgets their pages and allocates none of their units until
@@ -350,7 +350,7 @@ impl Scheduler {
             segments = lent.len(),
             of = segments.len(),
             forgotten_pages = forgotten,
-            "lent the successor world the cache segments no request in flight continues from"
+            "lent the successor epoch the cache segments no request in flight continues from"
         );
         lent
     }
@@ -361,7 +361,7 @@ impl Scheduler {
     /// published pages, each unit moved to where the workers map it, and
     /// allocates the lent units as its own.
     ///
-    /// Fails, changing nothing, when the world's KV cache limit in the
+    /// Fails, changing nothing, when the epoch's KV cache limit in the
     /// trial cannot hold what the requests the predecessor hands over
     /// compute: the whole cache a request reserved at admission (one with
     /// images), which it reserves again, and of every other request all the
@@ -372,7 +372,7 @@ impl Scheduler {
     /// storage ledger has room for: the quota less everything booked, the
     /// predecessor's kept storage included, and, when the predecessor's
     /// processes exit at the promotion (it `grows`), with what they booked
-    /// transferred to this world. The world has no more until its commit
+    /// transferred to this epoch. The epoch has no more until its commit
     /// gives it the predecessor's segments, and the requests would wait for
     /// it.
     pub(super) fn promote(
@@ -403,7 +403,7 @@ impl Scheduler {
             };
         let own_free = cache.block_pool.free_units() as u32;
         // The segments the predecessor lent, in this pool's units, where the
-        // workers map the predecessor's planes after the world's head.
+        // workers map the predecessor's planes after the epoch's head.
         let inherited = cache.block_pool.inherited();
         let borrowed: Vec<std::ops::Range<u32>> = parked
             .lent
@@ -435,7 +435,7 @@ impl Scheduler {
         let free = own_free + lent + growable;
         if needed > free {
             return Err(format!(
-                "the successor world's KV cache holds {free} free units within its storage \
+                "the successor epoch's KV cache holds {free} free units within its storage \
                  ledgers until its commit ({own_free} in its own segments, {lent} in the \
                  segments its predecessor lent, {growable} in the segments the ledgers have \
                  room for), and the {} requests in flight need {needed}{}{}",
@@ -517,7 +517,7 @@ impl Scheduler {
         self.trial = false;
         tracing::info!(
             units = self.storage.usable_units(),
-            "the scheduler's world is committed"
+            "the scheduler's epoch is committed"
         );
         Ok(results)
     }

@@ -18,7 +18,6 @@
 
 mod claims;
 
-pub(crate) use claims::restart_earlier;
 pub(crate) mod roster;
 mod service;
 mod supervisor;

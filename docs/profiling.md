@@ -64,7 +64,7 @@ curl -X DELETE http://127.0.0.1:8000/admin/profile   # end it now
 | `stages` | Every stage | The steps recorded, by call kind (`prefill`, `decode`, `verify`, `denoising`, ...) |
 | `workers` | Every worker | The workers recorded, by rank |
 | `components` | Every probed component | Name patterns (`*` matches any run) of the components whose fence records `fence_timeline` keeps |
-| `output_dir` | Required | The directory each worker writes `profile-SESSION-worldWORLD-rankRANK.sqlite` into; it is created |
+| `output_dir` | Required | The directory each worker writes `profile-SESSION-epochEPOCH-rankRANK.sqlite` into; it is created |
 | `timeline`, `pm_sampling`, `range_metrics`, `pc_sampling` | Below | Each collector's options |
 | `max_slowdown` | Unguarded | The quality-of-service guard's bound, a fraction of the step time before the session |
 
@@ -112,12 +112,12 @@ CUPTI also needs free device addresses among the lowest ones for a pass's storag
 
 ### Session files
 
-Each rank writes one SQLite file per session, in UniServe's own schema: every raw record kind has a table, beside `metadata` (the session, the epoch (`world`), the rank, the device, its chip, the CUPTI library and version, the request, and `doc.*` entries stating what every table's identifiers and clocks mean), `strings` (kernel, API, NVTX and domain names by id), `clocks`, `steps` and `collectors` (each collector's state over the session, the guard's releases among them). The schema states its version (`schema_version`) and changes only by additions. A writer thread of the process receives the records over a channel, commits them every 200 ms, and checkpoints the write-ahead log into the file when the session ends; a worker that exits during a session leaves what it committed in the file and its log.
+Each rank writes one SQLite file per session, in UniServe's own schema: every raw record kind has a table, beside `metadata` (the session, the epoch (`epoch`), the rank, the device, its chip, the CUPTI library and version, the request, and `doc.*` entries stating what every table's identifiers and clocks mean), `strings` (kernel, API, NVTX and domain names by id), `clocks`, `steps` and `collectors` (each collector's state over the session, the guard's releases among them). The schema states its version (`schema_version`) and changes only by additions. A writer thread of the process receives the records over a channel, commits them every 200 ms, and checkpoints the write-ahead log into the file when the session ends; a worker that exits during a session leaves what it committed in the file and its log.
 
 Every time is in nanoseconds of one of two clocks: CUPTI's (about `CLOCK_REALTIME`), for CUPTI's records, the steps and PM samples; and each device's `%globaltimer`, for the fence records. `clocks` holds samples of them at the session's start and end: CUPTI's clock with `CLOCK_REALTIME` and `CLOCK_MONOTONIC`, and each device's `%globaltimer`, read by a kernel that stores it into pinned host storage while the host times its appearance, with half that time as the sample's uncertainty. A client aligns a clock through the sample of least uncertainty. CUPTI's records carry the correlation id of the API call that issued them, a graph's nodes that of its launch.
 
 ```bash
-.venv/bin/python -m uniserve_eval.profile summary /data/profiles/profile-1-world1-rank0.sqlite
+.venv/bin/python -m uniserve_eval.profile summary /data/profiles/profile-1-epoch1-rank0.sqlite
 .venv/bin/python -m uniserve_eval.profile perfetto /data/profiles/profile-1-*.sqlite -o trace.json
 ```
 

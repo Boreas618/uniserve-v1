@@ -383,7 +383,7 @@ mod tests {
         fn claim(
             &mut self,
             _host: &str,
-            _world: u64,
+            _epoch: u64,
             _scopes: &[proto::process::Scope],
             _retire: &[u64],
         ) -> Result<(), String> {
@@ -457,7 +457,7 @@ mod tests {
                     devices: vec![0],
                     group: "engine".to_owned(),
                     rank: 0,
-                    world: 12,
+                    epoch: 12,
                     scheduler_node: true,
                     peers: Vec::new(),
                     watchdog_timeout_s: None,
@@ -467,10 +467,10 @@ mod tests {
                 },
                 environment: HashMap::new(),
             },
-            previous_world: 11,
+            previous_epoch: 11,
             previous_generation: 5,
             spawn_generation: 7,
-            keeps: crate::options::PreviousWorld::Parked,
+            keeps: crate::options::PreviousEpoch::Parked,
         }
     }
 

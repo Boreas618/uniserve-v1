@@ -3,7 +3,7 @@
 //!
 //! The daemon's HTTP server starts at once and answers the admin API. Its
 //! first `PUT /admin/config` brings a deployment up: its daemon, its first
-//! world and its routes, which the node then serves on the same address,
+//! epoch and its routes, which the node then serves on the same address,
 //! admin routes included, so that every later `PUT /admin/config` is the
 //! deployment's. The deployment's `POST /admin/shutdown` brings it down
 //! and, by default, releases its storage at the host's Storage Server; the
@@ -220,7 +220,7 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
     }
     let name = config.served_model_name().to_owned();
     if body.dry_run {
-        return Json(json!({ "change": "planned", "plan": { "deployment": name, "world": true } }))
+        return Json(json!({ "change": "planned", "plan": { "deployment": name, "epoch": true } }))
             .into_response();
     }
     {

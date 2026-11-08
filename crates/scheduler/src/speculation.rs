@@ -15,8 +15,8 @@
 //! (zero to the deployment's limit and the request's remaining tokens);
 //! otherwise it verifies none, a verification row of one token, and decodes
 //! correctly. A draft cache goes missing when the request reuses a prefix
-//! whose draft pages the pool lacks, when a world change moves it from a
-//! world that did not speculate, or when its draft pages were released to
+//! whose draft pages the pool lacks, when an epoch change moves it from a
+//! epoch that did not speculate, or when its draft pages were released to
 //! make room for another request's required pages. Its forwards keep
 //! writing the entries of their own positions ([`DraftCache::tail`]); a
 //! refill evaluates the target model again over the positions before them,
@@ -25,7 +25,7 @@
 //! Once the refill reaches the entries the request wrote itself, its draft
 //! cache is complete and it speculates.
 //!
-//! The refill policy weighs what the world measures ([`SpeculationMeter`]):
+//! The refill policy weighs what the epoch measures ([`SpeculationMeter`]):
 //! the tokens a verification carrying drafts commits, the worker's time of
 //! a decoding step with and without drafts, and its time per prompt token.
 
@@ -78,7 +78,7 @@ impl MeasuredStep {
     }
 }
 
-/// What the world measures of speculation, as moving averages over recent
+/// What the epoch measures of speculation, as moving averages over recent
 /// observations: the speedup a speculating request gets and the cost of a
 /// refilled token, in decode steps, which the refill policy weighs
 /// (`Plan::refill`).
@@ -87,7 +87,7 @@ impl MeasuredStep {
 /// worker's step takes `v` with drafts and `d` without, and `p` per prompt
 /// token. Speculating, a request takes `v / s` per token in place of `d`:
 /// its speedup is `g = s * d / v`, and a refilled token costs `k = p / d`
-/// decode steps. Until the world has measured a step without drafts
+/// decode steps. Until the epoch has measured a step without drafts
 /// (every one of its steps carried some), `d` is `v`: the request's
 /// speculation adds nothing to steps that carry drafts anyway.
 #[derive(Clone, Debug, Default)]
@@ -224,7 +224,7 @@ fn cached_token(state: &RequestState, position: u32) -> Option<u32> {
 
 impl Scheduler {
     /// Whether the deployment speculates and its pool keeps the draft cache:
-    /// the world's workers run the drafter.
+    /// the epoch's workers run the drafter.
     pub(crate) fn speculates(&self) -> bool {
         self.config.draft_tokens > 0
             && self
@@ -379,7 +379,7 @@ impl Scheduler {
     /// draft pages, without which no refill is planned. A checkpoint page
     /// the request holds from the prefix cache, such as the one a migrated
     /// request resumed from, takes fresh units for the chunk to write: other
-    /// requests read the shared page, and a predecessor world's is mapped
+    /// requests read the shared page, and a predecessor epoch's is mapped
     /// read-only. Returns `None` when no chunk fits or the tables cannot
     /// grow.
     pub(crate) fn plan_refill(&mut self, id: RequestId, budget: usize) -> Option<Call> {

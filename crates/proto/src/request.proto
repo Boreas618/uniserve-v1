@@ -175,12 +175,12 @@ message EngineInfo {
   reserved 8;
   reserved "prefix_seed";
   // The roots of the prefix hash chains of the pages the engine's workers
-  // compute: equal between worlds whose models and numerics agree, whose
+  // compute: equal between epochs whose models and numerics agree, whose
   // pages a successor reuses.
   repeated uint64 prefix_seeds = 10;
   // The seed of the keys of the latent trajectories the engine's denoiser
   // (a video model's, or an image model's) stores at preemption: equal
-  // between worlds whose denoising computes the same, which continue each
+  // between epochs whose denoising computes the same, which continue each
   // other's trajectories exactly; zero for an engine that stores none.
   uint64 latent_seed = 9;
 }
@@ -196,7 +196,7 @@ message BatchCapacity {
 }
 
 // The segments of one worker group's KV cache planes, in plane order: each
-// an allocation of whole units that a world created, which the world that
+// an allocation of whole units that an epoch created, which the epoch that
 // holds the planes gives back or creates again as a whole.
 message CacheSegments {
   string worker_group = 1;
@@ -211,9 +211,9 @@ message CacheSegments {
 }
 
 message CacheSegment {
-  // The world that created the segment's storage.
-  uint64 world = 1;
-  // The segment's ordinal among those its world created.
+  // The epoch that created the segment's storage.
+  uint64 epoch = 1;
+  // The segment's ordinal among those its epoch created.
   uint32 ordinal = 2;
   // The cache units the segment holds.
   uint32 units = 3;
@@ -470,13 +470,13 @@ message ResizeCache {
   uint64 id = 1;
   CacheChange change = 2;
   reserved 3, 5, 6, 8, 10, 12, 14;
-  // Before the change: worlds of the deployment that keep their weights
-  // alone on every node (a previous world kept as its weights, whose
+  // Before the change: epochs of the deployment that keep their weights
+  // alone on every node (a previous epoch kept as its weights, whose
   // processes exited), so that a growth takes the rest of their storage.
   repeated uint64 keep_weights = 4;
-  // With `keep_weights`: the worlds keep their weights in host storage
-  // (`update_config.previous_world = "host"`), which moves the weights each
-  // world alone retains there through every node's Transfer Server; a node
+  // With `keep_weights`: the epochs keep their weights in host storage
+  // (`update_config.previous_epoch = "host"`), which moves the weights each
+  // epoch alone retains there through every node's Transfer Server; a node
   // that cannot keeps them on its GPUs. The `Hooked` answer then carries
   // each node's report first, as JSON `{"kept": {"host", "released",
   // "moved_bytes", "refused"}}`, `refused` saying why a node kept the
@@ -544,10 +544,10 @@ message Promote {
 message Park {
   // Matches the `Parked` answer.
   uint64 id = 1;
-  // Whether the world that succeeds the engine maps its KV cache: each
+  // Whether the epoch that succeeds the engine maps its KV cache: each
   // scheduler then lends it the segments no request in flight continues
   // from (`GroupIndex.lent`), forgets their pages and allocates none of
-  // their units until a `Resume` retires that world.
+  // their units until a `Resume` retires that epoch.
   bool lend = 2;
 }
 
@@ -566,8 +566,8 @@ message Parked {
 message Resume {
   // Matches the `Hooked` answer.
   uint64 id = 1;
-  // Worlds whose storage ends on every node of the engine: the one a
-  // rollback discarded. A world named here writes none of the engine's
+  // Epochs whose storage ends on every node of the engine: the one a
+  // rollback discarded. An epoch named here writes none of the engine's
   // storage any more (its processes are gone, or it was never promoted),
   // so the engine takes back the cache units it lent it.
   repeated uint64 retire = 2;
@@ -577,7 +577,7 @@ message Resume {
 message Commit {
   // Matches the `Hooked` answer.
   uint64 id = 1;
-  // Worlds whose storage ends on every node of the engine: the predecessor,
+  // Epochs whose storage ends on every node of the engine: the predecessor,
   // whose processes are gone.
   repeated uint64 retire = 2;
   reserved 3;
@@ -595,10 +595,10 @@ message CacheDescribed {
   // Empty when every worker group reported.
   string error = 2;
   repeated CacheSegments segments = 3;
-  // The world that created the storage the engine executes on, whose name keys
+  // The epoch that created the storage the engine executes on, whose name keys
   // it: its own, or the one its predecessor took it from. Only the process that
-  // maps the storage knows, since a relaunch of a world creates it afresh.
-  uint64 storage_world = 4;
+  // maps the storage knows, since a relaunch of an epoch creates it afresh.
+  uint64 storage_epoch = 4;
 }
 
 // The published pages of one worker group's prefix cache.
@@ -693,9 +693,9 @@ message Trajectory {
   // engine that serves it continues from that step when its store holds the
   // trajectory, and from noise otherwise.
   uint32 denoised_steps = 2;
-  // The latent seed of the world whose stored trajectory the request
-  // continues although the serving world's denoising computes other
-  // numerics (a world change's `in_flight = keep`); absent, the engine reads
+  // The latent seed of the epoch whose stored trajectory the request
+  // continues although the serving epoch's denoising computes other
+  // numerics (an epoch change's `in_flight = keep`); absent, the engine reads
   // a trajectory of its own latent seed only.
   optional uint64 state_seed = 3;
   // Where the engine that stored the trajectory put its pages and how each
@@ -825,14 +825,14 @@ message CachePolicy {
   optional uint64 isolation_key = 3;
   reserved 4;
   reserved "state_seed";
-  // The prefix seeds of the world whose state a migrated request continues
-  // with (a world change's `in_flight = keep`).
+  // The prefix seeds of the epoch whose state a migrated request continues
+  // with (an epoch change's `in_flight = keep`).
   repeated uint64 state_seeds = 6;
   CacheResume resume = 5;
 }
 
 message CacheResume {
-  uint64 world = 1;
+  uint64 epoch = 1;
   uint64 request_id = 2;
 }
 
@@ -897,7 +897,7 @@ message DiffusionRequest {
   uint64 trajectory = 6;
   // The stored denoising step; zero starts the trajectory from noise.
   uint32 denoised_steps = 7;
-  // The source world's latent seed for in_flight=keep across numerics.
+  // The source epoch's latent seed for in_flight=keep across numerics.
   optional uint64 state_seed = 8;
   // The digests of what each encoder computation reads, which key its
   // outputs in the host tier; absent, the engine stores and finds none.
@@ -1162,9 +1162,9 @@ message ExpertOrder {
 
 // What an engine that succeeds another maps of it.
 message Predecessor {
-  // The world that created the storage the predecessor executes on, whose name
-  // keys it (`CacheDescribed.storage_world`).
-  uint64 world = 1;
+  // The epoch that created the storage the predecessor executes on, whose name
+  // keys it (`CacheDescribed.storage_epoch`).
+  uint64 epoch = 1;
   // Each worker group's KV cache segments the predecessor holds, which the
   // successor's ranks map read-only behind segments of their own.
   repeated CacheSegments segments = 2;

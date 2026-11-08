@@ -246,7 +246,7 @@ impl Scheduler {
             transfer_capacity,
             latent_dtype,
             engine_id: 1,
-            world: 0,
+            epoch: 0,
             next_product_generation: 1,
             next_request_epoch: 1,
             running_order: Vec::new(),
@@ -339,7 +339,7 @@ impl Scheduler {
         let beyond = |name: &str, value: usize, capacity: usize| {
             format!(
                 "scheduler_config.{name} = {value} exceeds the {capacity} the workers were \
-                 started for; a world change starts workers for it"
+                 started for; an epoch change starts workers for it"
             )
         };
         if limits.max_running_requests > running {
@@ -381,7 +381,7 @@ impl Scheduler {
             chunked_prefill_size: limits.chunked_prefill_size.max(1),
             max_queued_requests: limits.max_queued_requests.map(|bound| bound.max(1)),
             canvas: self.config.canvas,
-            // The draft limit is the world's; the refill policy is a
+            // The draft limit is the epoch's; the refill policy is a
             // scheduling choice.
             draft_tokens: self.config.draft_tokens,
             graph_tiers,
@@ -396,9 +396,9 @@ impl Scheduler {
         self.dispatch.prefill_groups = groups.into_iter().collect();
     }
 
-    /// Sets the world that owns new requests' private cache continuations.
-    pub(crate) fn set_world(&mut self, world: u64) {
-        self.world = world;
+    /// Sets the epoch that owns new requests' private cache continuations.
+    pub(crate) fn set_epoch(&mut self, epoch: u64) {
+        self.epoch = epoch;
     }
 
     /// Enables or disables reusable prefix caching.
@@ -417,12 +417,12 @@ impl Scheduler {
 
     /// Copy prompt pages of the worker groups whose ranks all map a page
     /// pool for every cache group through the host KV cache, as a head of
-    /// `world` of `deployment` on `host` (what a world on trial commits is
+    /// `epoch` of `deployment` on `host` (what an epoch on trial commits is
     /// its own until its commit): ranks on `host` through its Storage Server's
     /// socket, the others through their servers' TCP addresses. Sliding
     /// windows are offloaded every `boundary_interval` pages of a long
     /// prompt, and `kv_storage` states whether a KV storage keeps every
-    /// page the pools commit (`kv_cache_config.mooncake`). The world's host
+    /// page the pools commit (`kv_cache_config.mooncake`). The epoch's host
     /// KV cache holds one token count on every rank, of `size`
     /// (`crate::kv_cache::HostCacheDemand`): its device tokens times the
     /// ratio, or what the stated bytes of each host hold, which every rank
@@ -436,7 +436,7 @@ impl Scheduler {
     pub fn enable_kv_offload(
         &mut self,
         deployment: &str,
-        world: u64,
+        epoch: u64,
         host: &str,
         boundary_interval: usize,
         size: crate::kv_cache::HostCacheSize,
@@ -446,7 +446,7 @@ impl Scheduler {
         let mut kv_offload = match crate::kv_cache::KvOffloadManager::connect(
             &socket,
             deployment,
-            world,
+            epoch,
             boundary_interval,
             kv_storage,
         ) {
@@ -460,10 +460,10 @@ impl Scheduler {
         let Some(demand) = crate::kv_cache::HostCacheDemand::of(&rank_caches, size.ratio) else {
             return Ok(());
         };
-        // The world asks for its device tokens times the ratio, or, when
+        // The epoch asks for its device tokens times the ratio, or, when
         // the deployment states each host's bytes, for whatever those hold;
-        // each host lowers the count for the whole world to what its budget
-        // holds over the world's ranks there.
+        // each host lowers the count for the whole epoch to what its budget
+        // holds over the epoch's ranks there.
         let asked = match size.host_bytes {
             Some(_) => u64::MAX,
             None => demand.tokens,
@@ -479,7 +479,7 @@ impl Scheduler {
             )?;
             tokens = tokens.min(held);
         }
-        tracing::info!(asked, tokens, "sized the world's host KV cache");
+        tracing::info!(asked, tokens, "sized the epoch's host KV cache");
         for (worker, results) in self.worker.map_host_cache(tokens)? {
             let Some(ranks) = rank_caches.get_mut(&worker) else {
                 continue;
@@ -518,7 +518,7 @@ impl Scheduler {
     /// Server at `socket` for the ranks on `host` (the engine's) and over
     /// the TCP address another host's rank reports, when every rank that
     /// executes the denoiser reports one (`WorkerInfo::rank_latents`), as
-    /// a head of `deployment` in `world`, whose trajectories the servers
+    /// a head of `deployment` in `epoch`, whose trajectories the servers
     /// keep its own while it is on trial. The denoiser is the component
     /// that serves denoising calls, or the protocol's default component of
     /// a model that routes none. Without them a preempted request continues
@@ -527,7 +527,7 @@ impl Scheduler {
         &mut self,
         socket: &std::path::Path,
         deployment: &str,
-        world: u64,
+        epoch: u64,
         host: &str,
     ) {
         let component = self
@@ -566,7 +566,7 @@ impl Scheduler {
             return;
         }
         let mut store =
-            match crate::trajectories::TrajectoryStore::connect(socket, deployment, world, host) {
+            match crate::trajectories::TrajectoryStore::connect(socket, deployment, epoch, host) {
                 Ok(store) => store,
                 Err(error) => {
                     tracing::warn!(
@@ -595,13 +595,13 @@ impl Scheduler {
     /// for the ranks on `host` (the engine's) and over the TCP address
     /// another host's rank reports, for each group whose ranks executing an
     /// encoder report the same pool (`WorkerInfo::rank_encoders`), as a
-    /// head of `deployment` in `world`. Without them every request's
+    /// head of `deployment` in `epoch`. Without them every request's
     /// encoders compute its outputs.
     pub fn enable_encoder_store(
         &mut self,
         socket: &std::path::Path,
         deployment: &str,
-        world: u64,
+        epoch: u64,
         host: &str,
     ) {
         let info = self.worker.info();
@@ -633,7 +633,7 @@ impl Scheduler {
             return;
         }
         let mut store =
-            match crate::encoder_outputs::EncoderStore::connect(socket, deployment, world) {
+            match crate::encoder_outputs::EncoderStore::connect(socket, deployment, epoch) {
                 Ok(store) => store,
                 Err(error) => {
                     tracing::warn!(
@@ -667,7 +667,7 @@ impl Scheduler {
 
     /// Returns the first worker group with a prefix cache, whose units the
     /// pool allocates and whose identity names its index for a successor
-    /// world.
+    /// epoch.
     pub fn cache_group(&self) -> Option<String> {
         self.worker
             .info()
@@ -702,13 +702,13 @@ impl Scheduler {
         Arc::clone(&self.stats)
     }
 
-    /// Puts the scheduler's world on trial until its commit
-    /// (`Scheduler::trial`): a successor world's schedulers start on trial.
+    /// Puts the scheduler's epoch on trial until its commit
+    /// (`Scheduler::trial`): a successor epoch's schedulers start on trial.
     pub fn set_trial(&mut self, trial: bool) {
         self.trial = trial;
     }
 
-    /// Whether the scheduler's world is on trial.
+    /// Whether the scheduler's epoch is on trial.
     pub fn on_trial(&self) -> bool {
         self.trial
     }
@@ -755,7 +755,7 @@ impl Scheduler {
     /// engine must stop — a `Shutdown` command arrived or every sender has
     /// disconnected — and whether any command was applied, which is progress a
     /// tick made even when it formed no batch: a submission that only queues a
-    /// request still changed the world a step is planned from.
+    /// request still changed the epoch a step is planned from.
     pub(super) fn drain_commands(&mut self, commands: &Receiver<Command>) -> (bool, bool) {
         let mut handled = false;
         loop {

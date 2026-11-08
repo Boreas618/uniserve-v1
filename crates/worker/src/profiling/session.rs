@@ -124,7 +124,7 @@ impl Session {
     ) -> Result<(Option<Self>, Answer)> {
         let SessionStart {
             session,
-            world,
+            epoch,
             request,
         } = start;
         request.validate().map_err(Error::Invalid)?;
@@ -136,10 +136,10 @@ impl Session {
         })?;
         let path = request
             .output_dir
-            .join(format!("profile-{session}-world{world}-rank{rank}.sqlite"));
+            .join(format!("profile-{session}-epoch{epoch}-rank{rank}.sqlite"));
         let writer = Writer::create(
             path.clone(),
-            metadata(session, world, rank, device, &request),
+            metadata(session, epoch, rank, device, &request),
         )?;
         let rows = writer.rows();
         clocks(&rows, device, "start");
@@ -352,14 +352,14 @@ impl Session {
 /// The file's metadata at the session's start.
 fn metadata(
     session: u64,
-    world: u64,
+    epoch: u64,
     rank: u32,
     device: DeviceId,
     request: &SessionRequest,
 ) -> Vec<(String, String)> {
     let mut entries = vec![
         ("session".to_owned(), session.to_string()),
-        ("world".to_owned(), world.to_string()),
+        ("epoch".to_owned(), epoch.to_string()),
         ("rank".to_owned(), rank.to_string()),
         ("pid".to_owned(), std::process::id().to_string()),
         ("started".to_owned(), realtime().to_string()),

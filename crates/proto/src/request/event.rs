@@ -230,7 +230,7 @@ pub enum Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MigrationCause {
-    /// The engine parks for a world change or a rollback.
+    /// The engine parks for an epoch change or a rollback.
     Drain,
     /// The workers that held the request were lost.
     Loss,
@@ -388,10 +388,10 @@ pub struct Trajectory {
     /// A token request names the steps of the image it had begun, which
     /// the daemon forgets once the image completes.
     pub denoised_steps: u32,
-    /// The latent seed of the world whose stored trajectory the request
-    /// continues although the serving world's denoising computes other
-    /// numerics (a world change's `in_flight = keep`); `None` reads a
-    /// trajectory of the serving world's own latent seed only.
+    /// The latent seed of the epoch whose stored trajectory the request
+    /// continues although the serving epoch's denoising computes other
+    /// numerics (an epoch change's `in_flight = keep`); `None` reads a
+    /// trajectory of the serving epoch's own latent seed only.
     pub state_seed: Option<u64>,
     /// Where the engine that stored the trajectory put its pages and how
     /// each stored rank laid its part of the samples out, as that engine

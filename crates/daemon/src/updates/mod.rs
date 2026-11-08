@@ -21,7 +21,7 @@
 //! and the leader use and the epoch layer reads before it starts a switch.
 //!
 //! The update entry (`impl Leader`'s `apply`, `commit`, `rollback`,
-//! `config_status`) is still `worlds.rs`'s while the landing order moves the
+//! `config_status`) is still `epochs.rs`'s while the landing order moves the
 //! type definitions first; the switch here is driven by it once that entry
 //! moves.
 

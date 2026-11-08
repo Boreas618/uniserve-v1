@@ -695,7 +695,7 @@ impl Scheduler {
         // never submitted and the step serves nothing. Nothing downstream can
         // tell that from a step the policy planned empty, so each refusal names
         // itself at debug level (`RUST_LOG=scheduler::scheduler::batching=debug`),
-        // which is the one way a world that dispatches nothing says why.
+        // which is the one way an epoch that dispatches nothing says why.
         let Some(cache) = self.storage.cache() else {
             tracing::debug!("a batch is dropped: this scheduler holds no cache to address");
             return;

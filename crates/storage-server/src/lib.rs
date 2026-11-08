@@ -53,9 +53,9 @@ use rustix::event::{PollFd, PollFlags, poll};
 use crate::mooncake::BATCH_PAGES;
 use ::storage::protocol::{
     Access, Allocation, Claim, ClientMessage, ErrorKind, Event, GpuLedger, Hello, HostStorage,
-    Item, Key, ListedDeployment, ListedTensor, Listing, Location, MIN_VERSION, Mode, PageLevel,
-    Reply, Request, Retainer, Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorRecord,
-    VERSION, Welcome,
+    Item, Key, ListedDeployment, ListedTensor, Listing, Location, Mode, PageLevel, Reply, Request,
+    Retainer, Role, Scope, ScopeBytes, ServerMessage, StorageRecord, TensorRecord, VERSION,
+    Welcome,
 };
 use ::storage::transport::Connection;
 pub use child::Launch;
@@ -88,8 +88,8 @@ struct Holder {
     scope: Scope,
     generation: u64,
     claim: Claim,
-    /// The world the process belongs to.
-    world: u64,
+    /// The epoch the process belongs to.
+    epoch: u64,
 }
 
 impl Holder {
@@ -97,7 +97,7 @@ impl Holder {
     fn retainer(&self) -> Retainer {
         Retainer {
             scope: self.scope.clone(),
-            world: self.world,
+            epoch: self.epoch,
         }
     }
 }
@@ -126,7 +126,7 @@ struct StorageEntry {
     _descriptor: OwnedFd,
     /// Tensors over the storage; the storage is released with its last.
     tensors: usize,
-    /// For the host copy of a world's weights ([`moves`]): the GPU the
+    /// For the host copy of an epoch's weights ([`moves`]): the GPU the
     /// storage left, which a restore returns it to.
     moved_from: Option<[u8; 16]>,
     /// Whether a move is filling the storage, which holds no tensor until
@@ -142,12 +142,12 @@ struct TensorEntry {
     shape: Vec<u64>,
     strides: Vec<u64>,
     access: Access,
-    /// The scopes of the worlds that retain the tensor. A world retains what
+    /// The scopes of the epochs that retain the tensor. An epoch retains what
     /// its workers use until they release it or the head retires the
-    /// world, so a world's storage outlives its processes and is released
-    /// with the world.
+    /// epoch, so an epoch's storage outlives its processes and is released
+    /// with the epoch.
     retainers: BTreeSet<Retainer>,
-    /// The deployment and world whose worker put the tensor: a world on
+    /// The deployment and epoch whose worker put the tensor: an epoch on
     /// trial keeps what it publishes to itself until its commit.
     publisher: (String, u64),
     /// The process that may write an exclusive tensor.
@@ -159,19 +159,19 @@ struct TensorEntry {
 struct Deployment {
     claim: Claim,
     head: Option<ClientId>,
-    /// The worlds claimed and not retired.
-    worlds: BTreeSet<u64>,
-    /// Committed worlds whose tensors and pages every replica may read.
+    /// The epochs claimed and not retired.
+    epochs: BTreeSet<u64>,
+    /// Committed epochs whose tensors and pages every replica may read.
     published: BTreeSet<u64>,
-    /// The worlds a rollback retired while on trial: what they publish
+    /// The epochs a rollback retired while on trial: what they publish
     /// while their processes leave stays theirs.
     discarded: BTreeSet<u64>,
 }
 
 impl Deployment {
-    /// Uncommitted and discarded worlds keep their outputs private.
+    /// Uncommitted and discarded epochs keep their outputs private.
     fn private(&self) -> BTreeSet<u64> {
-        let trial = self.worlds.difference(&self.published);
+        let trial = self.epochs.difference(&self.published);
         trial.chain(&self.discarded).copied().collect()
     }
 }
@@ -220,11 +220,11 @@ pub struct Server {
     /// processes.
     host_reserve: u64,
     /// The GPUs' storage ledgers: what the processes book and the quotas
-    /// the worlds state ([`ledger`]).
+    /// the epochs state ([`ledger`]).
     ledgers: ledger::Ledgers,
     kv_storage: KvStorage,
     transfers: transfers::Transfers,
-    /// The worlds' weights moving between GPUs and host storage.
+    /// The epochs' weights moving between GPUs and host storage.
     moves: moves::Moves,
     /// Events to send once the request being handled is answered.
     events: Vec<(ClientId, Event, Vec<Attachment>)>,
@@ -520,10 +520,11 @@ impl Server {
 
     /// Admit a client's role, or refuse it.
     fn welcome(&mut self, id: ClientId, hello: Hello) -> Welcome {
-        if !(MIN_VERSION..=VERSION).contains(&hello.version) {
+        if hello.version != VERSION {
             return Welcome::Refused {
                 message: format!(
-                    "the storage server speaks protocols {MIN_VERSION} to {VERSION}, the client {}",
+                    "the storage server speaks protocol {VERSION}, the client {}: a server of \
+                     another protocol is stopped before a component of another build starts its own",
                     hello.version
                 ),
             };
@@ -759,22 +760,22 @@ impl Server {
             (
                 Request::Claim {
                     scopes,
-                    world,
+                    epoch,
                     retire,
                 },
                 Role::Head { deployment, .. },
-            ) => self.claim(id, &deployment, scopes, *world, retire),
-            (Request::PublishWorlds { worlds }, Role::Head { deployment, .. }) => {
-                self.publish_worlds(id, &deployment, worlds)
+            ) => self.claim(id, &deployment, scopes, *epoch, retire),
+            (Request::PublishEpochs { epochs }, Role::Head { deployment, .. }) => {
+                self.publish_epochs(id, &deployment, epochs)
             }
-            (Request::KeepWeights { worlds, cache_keys }, Role::Head { deployment, .. }) => {
-                self.keep_weights(id, &deployment, worlds, cache_keys)
+            (Request::KeepWeights { epochs, cache_keys }, Role::Head { deployment, .. }) => {
+                self.keep_weights(id, &deployment, epochs, cache_keys)
             }
-            (Request::Offload { world }, Role::Head { deployment, .. }) => {
-                self.plan_move(id, &deployment, *world, true)
+            (Request::Offload { epoch }, Role::Head { deployment, .. }) => {
+                self.plan_move(id, &deployment, *epoch, true)
             }
-            (Request::Restore { world }, Role::Head { deployment, .. }) => {
-                self.plan_move(id, &deployment, *world, false)
+            (Request::Restore { epoch }, Role::Head { deployment, .. }) => {
+                self.plan_move(id, &deployment, *epoch, false)
             }
             (
                 Request::Allocated {
@@ -815,10 +816,10 @@ impl Server {
                     quota,
                     items,
                 },
-                Role::Worker { scope, world, .. },
+                Role::Worker { scope, epoch, .. },
             ) => self.book(
                 id,
-                ledger::Booker::Worker { scope, world },
+                ledger::Booker::Worker { scope, epoch },
                 *gpu,
                 *total,
                 *quota,
@@ -836,7 +837,7 @@ impl Server {
                     scope,
                     generation,
                     claim,
-                    world,
+                    epoch,
                 },
             ) => {
                 let pidfd = client
@@ -850,7 +851,7 @@ impl Server {
                     scope,
                     generation,
                     claim,
-                    world,
+                    epoch,
                 };
                 match request {
                     Request::Retain { keys, at } => self.retain(&holder, keys, at),
@@ -883,7 +884,7 @@ impl Server {
         id: ClientId,
         deployment: &str,
         scopes: &[Scope],
-        world: u64,
+        epoch: u64,
         retire: &[u64],
     ) -> Result<Outcome, (ErrorKind, String)> {
         if let Some(entry) = self.deployments.get(deployment)
@@ -896,8 +897,8 @@ impl Server {
                 format!("deployment {deployment} has a connected head"),
             ));
         }
-        // The head that holds the claim keeps it for every world it claims:
-        // its workers, of any world, stay current.
+        // The head that holds the claim keeps it for every epoch it claims:
+        // its workers, of any epoch, stay current.
         let held = self
             .deployments
             .get(deployment)
@@ -926,7 +927,7 @@ impl Server {
                                 scope,
                                 generation,
                                 claim,
-                                world,
+                                epoch,
                             }),
                             Some(pidfd),
                         ) if scope.deployment == deployment => Some(Holder {
@@ -936,7 +937,7 @@ impl Server {
                             scope: scope.clone(),
                             generation: *generation,
                             claim: *claim,
-                            world: *world,
+                            epoch: *epoch,
                         }),
                         _ => None,
                     }),
@@ -958,17 +959,17 @@ impl Server {
             Some(claim) => claim,
             None => Claim(random_token().map_err(resource)?),
         };
-        // The head that holds the claim adds and retires worlds. A new head
-        // starts from its own world: the worlds a previous head kept on
+        // The head that holds the claim adds and retires epochs. A new head
+        // starts from its own epoch: the epochs a previous head kept on
         // trial are discarded with that head, never committed, and the
-        // pages of every world discarded before are relabelled as such, so
-        // that the new head's worlds may take their numbers.
-        let (trial, mut discarded, mut worlds, mut published) =
+        // pages of every epoch discarded before are relabelled as such, so
+        // that the new head's epochs may take their numbers.
+        let (trial, mut discarded, mut epochs, mut published) =
             match self.deployments.get(deployment) {
                 Some(entry) => (
-                    entry.worlds.difference(&entry.published).copied().collect(),
+                    entry.epochs.difference(&entry.published).copied().collect(),
                     entry.discarded.clone(),
-                    entry.worlds.clone(),
+                    entry.epochs.clone(),
                     entry.published.clone(),
                 ),
                 None => (
@@ -980,24 +981,24 @@ impl Server {
             };
         let mut retired: BTreeSet<u64> = retire.iter().copied().collect();
         if held.is_none() {
-            retired.extend(trial.iter().filter(|&&old| old != world));
-            worlds.clear();
+            retired.extend(trial.iter().filter(|&&old| old != epoch));
+            epochs.clear();
             published.clear();
         }
-        worlds.insert(world);
-        worlds.retain(|world| !retired.contains(world));
-        published.retain(|world| worlds.contains(world));
-        // Retiring an uncommitted world discards its private pages. A
-        // committed world's immutable pages remain reusable after retirement.
+        epochs.insert(epoch);
+        epochs.retain(|epoch| !retired.contains(epoch));
+        published.retain(|epoch| epochs.contains(epoch));
+        // Retiring an uncommitted epoch discards its private pages. A
+        // committed epoch's immutable pages remain reusable after retirement.
         for &old in &trial {
             if retired.contains(&old) {
-                self.pages.discard_world(deployment, old);
+                self.pages.discard_epoch(deployment, old);
                 discarded.insert(old);
             }
         }
         if held.is_none() {
             for &old in &discarded {
-                self.pages.discard_world(deployment, old);
+                self.pages.discard_epoch(deployment, old);
             }
             discarded.clear();
         }
@@ -1006,15 +1007,15 @@ impl Server {
             Deployment {
                 claim,
                 head: Some(id),
-                worlds,
+                epochs,
                 published,
                 discarded,
             },
         );
-        // The retired worlds map no page pool any more.
+        // The retired epochs map no page pool any more.
         self.pages.retire_users(deployment, &retired);
-        // The world's retention of the scopes it no longer places ends, and
-        // every retired world's retention ends.
+        // The epoch's retention of the scopes it no longer places ends, and
+        // every retired epoch's retention ends.
         let listed: BTreeSet<&Scope> = scopes.iter().collect();
         let released: Vec<TensorId> = self
             .tensors
@@ -1022,8 +1023,8 @@ impl Server {
             .filter_map(|(id, tensor)| {
                 tensor.retainers.retain(|retainer| {
                     retainer.scope.deployment != deployment
-                        || !(retired.contains(&retainer.world)
-                            || (retainer.world == world && !listed.contains(&retainer.scope)))
+                        || !(retired.contains(&retainer.epoch)
+                            || (retainer.epoch == epoch && !listed.contains(&retainer.scope)))
                 });
                 tensor.retainers.is_empty().then_some(*id)
             })
@@ -1032,12 +1033,12 @@ impl Server {
         for id in released {
             self.remove_tensor(&id);
         }
-        // A retired world's quota ends with its storage: the ledger then
+        // A retired epoch's quota ends with its storage: the ledger then
         // books what its successor alone holds, under the successor's.
         self.ledgers.retire(deployment, &retired);
         tracing::info!(
             deployment,
-            world,
+            epoch,
             ?retire,
             released = count,
             "a head claimed the deployment"
@@ -1051,32 +1052,32 @@ impl Server {
     }
 
     /// Publish a committed set atomically before any reader can observe it.
-    fn publish_worlds(
+    fn publish_epochs(
         &mut self,
         id: ClientId,
         deployment: &str,
-        worlds: &[u64],
+        epochs: &[u64],
     ) -> Result<Outcome, (ErrorKind, String)> {
         let entry = self
             .deployments
             .get_mut(deployment)
             .filter(|entry| entry.head == Some(id))
-            .ok_or_else(|| invalid("only the claiming head publishes committed worlds"))?;
-        if worlds.iter().any(|world| !entry.worlds.contains(world)) {
-            return Err(invalid("only claimed worlds can be published"));
+            .ok_or_else(|| invalid("only the claiming head publishes committed epochs"))?;
+        if epochs.iter().any(|epoch| !entry.epochs.contains(epoch)) {
+            return Err(invalid("only claimed epochs can be published"));
         }
-        let newly: Vec<_> = worlds
+        let newly: Vec<_> = epochs
             .iter()
             .copied()
-            .filter(|world| !entry.published.contains(world))
+            .filter(|epoch| !entry.published.contains(epoch))
             .collect();
-        entry.published.extend(worlds);
-        for world in newly {
-            for (pool, pages) in self.pages.published_by(deployment, world) {
+        entry.published.extend(epochs);
+        for epoch in newly {
+            for (pool, pages) in self.pages.published_by(deployment, epoch) {
                 self.upload(pool, pages);
             }
         }
-        Ok(Outcome::Reply(Reply::WorldsPublished, Vec::new()))
+        Ok(Outcome::Reply(Reply::EpochsPublished, Vec::new()))
     }
 
     /// The deployments other than `except` that hold a claim, a tensor or a
@@ -1202,7 +1203,7 @@ impl Server {
     }
 
     /// The retained device storages as the ledgers see them: each storage's
-    /// record, the access of its tensors and the scopes of the worlds that
+    /// record, the access of its tensors and the scopes of the epochs that
     /// retain any of them.
     fn held(&self) -> Vec<ledger::Held<'_>> {
         let mut held: HashMap<StorageId, ledger::Held<'_>> = HashMap::new();
@@ -1294,7 +1295,7 @@ impl Server {
         &mut self,
         id: ClientId,
         deployment: &str,
-        worlds: &[u64],
+        epochs: &[u64],
         cache_keys: &[Key],
     ) -> Result<Outcome, (ErrorKind, String)> {
         if !self
@@ -1303,7 +1304,7 @@ impl Server {
             .is_some_and(|entry| entry.head == Some(id))
         {
             return Err(invalid(&format!(
-                "only the head that claimed {deployment} keeps its worlds' weights"
+                "only the head that claimed {deployment} keeps its epochs' weights"
             )));
         }
         let released: Vec<(Key, Location)> = self
@@ -1314,7 +1315,7 @@ impl Server {
             })
             .filter_map(|(key, tensor)| {
                 tensor.retainers.retain(|retainer| {
-                    retainer.scope.deployment != deployment || !worlds.contains(&retainer.world)
+                    retainer.scope.deployment != deployment || !epochs.contains(&retainer.epoch)
                 });
                 tensor.retainers.is_empty().then_some(*key)
             })
@@ -1325,9 +1326,9 @@ impl Server {
         }
         tracing::info!(
             deployment,
-            ?worlds,
+            ?epochs,
             released = count,
-            "worlds retain their weights and rollback cache"
+            "epochs retain their weights and rollback cache"
         );
         Ok(Outcome::Reply(
             Reply::Retained { released: count },
@@ -1356,10 +1357,10 @@ impl Server {
         ))
     }
 
-    /// What a head of `world` of `deployment` reads.
-    fn visibility(&self, deployment: &str, world: u64) -> pages::Visibility {
+    /// What a head of `epoch` of `deployment` reads.
+    fn visibility(&self, deployment: &str, epoch: u64) -> pages::Visibility {
         pages::Visibility {
-            world,
+            epoch,
             private: self
                 .deployments
                 .get(deployment)
@@ -1368,7 +1369,7 @@ impl Server {
         }
     }
 
-    /// What the head connected as `client` reads; nothing of a world on
+    /// What the head connected as `client` reads; nothing of an epoch on
     /// trial once it is gone.
     fn head_visibility(&self, client: ClientId) -> pages::Visibility {
         match self
@@ -1376,22 +1377,22 @@ impl Server {
             .get(&client)
             .and_then(|client| client.role.as_ref())
         {
-            Some(Role::Head { deployment, world }) => self.visibility(deployment, *world),
+            Some(Role::Head { deployment, epoch }) => self.visibility(deployment, *epoch),
             _ => self.visibility("", 0),
         }
     }
 
-    /// Whether a worker of `holder`'s world reads `tensor`: its own world
-    /// published it, or a world every world of the publisher's deployment
-    /// reads did. What a world on trial publishes stays its own until its
-    /// commit, whichever worlds retain it.
+    /// Whether a worker of `holder`'s epoch reads `tensor`: its own epoch
+    /// published it, or an epoch every epoch of the publisher's deployment
+    /// reads did. What an epoch on trial publishes stays its own until its
+    /// commit, whichever epochs retain it.
     fn sees(&self, holder: &Holder, tensor: &TensorEntry) -> bool {
-        let (deployment, world) = &tensor.publisher;
-        (*deployment == holder.scope.deployment && *world == holder.world)
+        let (deployment, epoch) = &tensor.publisher;
+        (*deployment == holder.scope.deployment && *epoch == holder.epoch)
             || !self
                 .deployments
                 .get(deployment)
-                .is_some_and(|entry| entry.private().contains(world))
+                .is_some_and(|entry| entry.private().contains(epoch))
     }
 
     /// Whether `holder` is a worker of its deployment's current head.
@@ -1402,8 +1403,8 @@ impl Server {
     }
 
     /// `retain`: the copies on `at` of the listed keys that exist are held
-    /// for the caller's scope in its world, and the world releases every
-    /// other tensor of the scope; other worlds keep theirs.
+    /// for the caller's scope in its epoch, and the epoch releases every
+    /// other tensor of the scope; other epochs keep theirs.
     fn retain(
         &mut self,
         holder: &Holder,
@@ -1413,7 +1414,7 @@ impl Server {
         if !self.current(holder) {
             return Err(stale(holder));
         }
-        // A world retains only what it reads, at the locations it names.
+        // An epoch retains only what it reads, at the locations it names.
         let listed: std::collections::HashSet<TensorId> = keys
             .iter()
             .flat_map(|key| self.copies_of(key, at))
@@ -1439,7 +1440,7 @@ impl Server {
         if count > 0 {
             tracing::info!(
                 scope = %holder.scope,
-                world = holder.world,
+                epoch = holder.epoch,
                 generation = holder.generation,
                 pid = holder.pid,
                 released = count,
@@ -1512,7 +1513,7 @@ impl Server {
             return Err(stale(holder));
         }
         // The copies at the locations asked for that the caller sees: a
-        // tensor another world keeps to itself is missing to the caller.
+        // tensor another epoch keeps to itself is missing to the caller.
         let ids: Vec<TensorId> = keys
             .iter()
             .flat_map(|key| self.copies_of(key, at))
@@ -1696,14 +1697,14 @@ impl Server {
                 if !unseen {
                     continue;
                 }
-                // A world on trial, which the caller does not read,
+                // An epoch on trial, which the caller does not read,
                 // published the key: the caller's bytes take the place of
-                // that world's, so that no world reads them through the
-                // caller. The world on trial's processes keep the storage
+                // that epoch's, so that no epoch reads them through the
+                // caller. The epoch on trial's processes keep the storage
                 // they map.
                 let storage = ids[tensor.storage as usize];
                 let previous = std::mem::replace(&mut existing.storage, storage);
-                existing.publisher = (holder.scope.deployment.clone(), holder.world);
+                existing.publisher = (holder.scope.deployment.clone(), holder.epoch);
                 existing.name.clone_from(&tensor.name);
                 existing.offset = tensor.offset;
                 existing.dtype.clone_from(&tensor.dtype);
@@ -1732,7 +1733,7 @@ impl Server {
                     strides: tensor.strides.clone(),
                     access: tensor.access,
                     retainers: BTreeSet::from([holder.retainer()]),
-                    publisher: (holder.scope.deployment.clone(), holder.world),
+                    publisher: (holder.scope.deployment.clone(), holder.epoch),
                     writer: (tensor.access == Access::Exclusive).then(|| holder.clone()),
                     standby: Vec::new(),
                 },
@@ -2184,7 +2185,7 @@ impl Server {
                 .map(|((gpu, retainer), bytes)| ScopeBytes {
                     gpu: Some(gpu),
                     scope: retainer.scope,
-                    world: retainer.world,
+                    epoch: retainer.epoch,
                     bytes,
                 })
                 .collect(),
@@ -2193,7 +2194,7 @@ impl Server {
                 .map(|(retainer, bytes)| ScopeBytes {
                     gpu: None,
                     scope: retainer.scope,
-                    world: retainer.world,
+                    epoch: retainer.epoch,
                     bytes,
                 })
                 .collect(),
@@ -2491,8 +2492,8 @@ impl Server {
                         .slots_of(shape.page_bytes, *bytes)
                         .map_err(resource)?;
                     // A pool the host cannot hold first takes the place of
-                    // the deployment's pools no world maps any more, whose
-                    // pages a previous world left; a staging pool a KV
+                    // the deployment's pools no epoch maps any more, whose
+                    // pages a previous epoch left; a staging pool a KV
                     // storage stands behind is admitted from the reserve.
                     let bytes = slots * shape.page_bytes;
                     if self.admit_host(bytes).is_err() {
@@ -2519,8 +2520,8 @@ impl Server {
                         .map_err(resource)?
                 }
             };
-            if let Role::Worker { scope, world, .. } = role {
-                self.pages.add_user(pool, scope, *world);
+            if let Role::Worker { scope, epoch, .. } = role {
+                self.pages.add_user(pool, scope, *epoch);
             }
             let slots = self.pages.get(pool).map_or(0, pages::Pool::slots);
             self.offer_pools();
@@ -2533,13 +2534,13 @@ impl Server {
                 vec![Attachment::Pool(pool)],
             ));
         }
-        let Role::Head { deployment, world } = role else {
+        let Role::Head { deployment, epoch } = role else {
             return Err(invalid(&format!(
                 "{} is a request of a head",
                 request_name(request)
             )));
         };
-        let visibility = self.visibility(deployment, *world);
+        let visibility = self.visibility(deployment, *epoch);
         let of_deployment = |scope: &Scope| {
             if &scope.deployment == deployment {
                 Ok(())
@@ -2604,8 +2605,8 @@ impl Server {
             Request::Commit { pool, keys } => {
                 let entry = pool_of(&mut self.pages, *pool)?;
                 let mut committed = entry.commit(keys);
-                // The KV storage takes the pages every world reads; those of
-                // a world on trial wait for its commit.
+                // The KV storage takes the pages every epoch reads; those of
+                // an epoch on trial wait for its commit.
                 committed.retain(|(_, slot)| {
                     entry
                         .publisher(*slot)
@@ -2635,7 +2636,7 @@ impl Server {
             } => {
                 let per_token: u64 = token_bytes.iter().sum();
                 // What the host admits of new pools, counting the
-                // deployment's pools no world maps, which a new one
+                // deployment's pools no epoch maps, which a new one
                 // replaces.
                 let room = || -> Result<u64, (ErrorKind, String)> {
                     let releasable: u64 = self
@@ -2656,7 +2657,7 @@ impl Server {
                     Some(fits) => fits.min(*tokens),
                     None => *tokens,
                 };
-                // With a KV storage, a world the host holds fewer tokens
+                // With a KV storage, an epoch the host holds fewer tokens
                 // for, or whose stated bytes it cannot admit, still stages
                 // its pages through pools of at most `STAGING_POOL_BYTES`
                 // on each rank, which pass them into the KV storage.
@@ -2672,12 +2673,12 @@ impl Server {
                 }
                 tracing::info!(
                     deployment,
-                    world,
+                    epoch,
                     tokens,
                     per_token,
                     budget,
                     held,
-                    "sized the host KV cache of a world"
+                    "sized the host KV cache of an epoch"
                 );
                 reply(Reply::HostCache { tokens: held })
             }
@@ -2804,7 +2805,7 @@ fn resource(error: io::Error) -> (ErrorKind, String) {
 fn request_name(request: &Request) -> &'static str {
     match request {
         Request::Claim { .. } => "claim",
-        Request::PublishWorlds { .. } => "publish_worlds",
+        Request::PublishEpochs { .. } => "publish_epochs",
         Request::Retain { .. } => "retain",
         Request::KeepWeights { .. } => "keep_weights",
         Request::Get { .. } => "get",

@@ -507,7 +507,7 @@ pub(crate) fn router(
         .merge(generation)
         .layer(from_fn(middleware::track_http_metrics));
 
-    // A world change runs for as long as the successor world takes to
+    // An epoch change runs for as long as the successor epoch takes to
     // start, so the admin routes are held to no request timeout or
     // concurrency limit.
     let admin = admin::router(admin::AdminState {
@@ -677,7 +677,7 @@ mod tests {
                 "continue_generation 2 succeeded",
             ]
         );
-        // A world change this leader cannot run (it has no engine process
+        // An epoch change this leader cannot run (it has no engine process
         // of its own) fails and is logged as failed.
         let request = Request::builder()
             .method("PUT")
@@ -690,7 +690,7 @@ mod tests {
         let (status, _, body) = send(&app, request).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{body}");
         assert_eq!(body["state"], json!("failed"));
-        // Its configuration and worlds read back.
+        // Its configuration and epochs read back.
         let (status, _, body) = send(&app, get_request("/admin/config")).await;
         assert_eq!(status, StatusCode::OK);
         assert!(

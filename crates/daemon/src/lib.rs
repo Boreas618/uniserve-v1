@@ -46,7 +46,7 @@ pub mod standby;
 pub mod supervision;
 #[cfg(test)]
 pub(crate) mod test_support;
-// The epoch layer lands beside `worlds`, which commit C deletes; nothing drives
+// The epoch layer lands beside `epochs`, which commit C deletes; nothing drives
 // the switch until the update layer that owns it lands too.
 pub mod observe;
 #[allow(

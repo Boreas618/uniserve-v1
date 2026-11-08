@@ -26,7 +26,7 @@
 //!   reading one image share its output whatever their seeds;
 //! - **what computes it**: its output's name, and in the host tier the
 //!   identity its ranks report (`ipc::EncoderPoolInfo::identities`). The
-//!   device tier is its world's alone, whose encoders compute alike.
+//!   device tier is its epoch's alone, whose encoders compute alike.
 //!
 //! The device tier is the nearer: an input image's encoding it holds is
 //! pinned for the request without a call. Otherwise the encoding is looked

@@ -114,7 +114,7 @@ impl From<&GenerationRequest> for wire::GenerationRequest {
                 isolation_key: request.cache.isolation_key,
                 state_seeds: request.cache.state_seeds.clone(),
                 resume: request.cache.resume.map(|resume| wire::CacheResume {
-                    world: resume.world,
+                    epoch: resume.epoch,
                     request_id: resume.request_id,
                 }),
             }),
@@ -243,7 +243,7 @@ impl TryFrom<wire::GenerationRequest> for GenerationRequest {
                 isolation_key: cache.isolation_key,
                 state_seeds: cache.state_seeds,
                 resume: cache.resume.map(|resume| CacheResume {
-                    world: resume.world,
+                    epoch: resume.epoch,
                     request_id: resume.request_id,
                 }),
             },

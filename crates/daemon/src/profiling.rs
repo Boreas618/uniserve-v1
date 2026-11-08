@@ -1,7 +1,7 @@
-//! Profiling sessions of the world that executes (`/admin/profile`,
+//! Profiling sessions of the epoch that executes (`/admin/profile`,
 //! `specs/online-operations.md` section 11).
 //!
-//! A session starts on every worker of the executing world at the engine's
+//! A session starts on every worker of the executing epoch at the engine's
 //! next step boundary (the worker hook `uniserve.profile_start`), records
 //! within each worker's window of steps (`docs/profiling.md`) and ends, with
 //! every worker's file written (`uniserve.profile_stop`), when the first of
@@ -11,12 +11,12 @@
 //!   with their batch results (`ForwardStats::profile`);
 //! - its window of seconds passed;
 //! - the operator ends it (`DELETE /admin/profile`);
-//! - its world stops executing: a world change promotes a successor, or a
-//!   trial rolls back. Neither carries a session into the next world;
+//! - its epoch stops executing: an epoch change promotes a successor, or a
+//!   trial rolls back. Neither carries a session into the next epoch;
 //! - the quality-of-service guard ends it.
 //!
 //! At most one session runs. The guard measures the average step time of
-//! the session's world over the [`BASELINE`] before the session started and
+//! the session's epoch over the [`BASELINE`] before the session started and
 //! over the last [`GUARD_WINDOW`] of the session. With `max_slowdown`, a
 //! step time past the baseline by more than that fraction turns off the
 //! session's costliest collector still running (`uniserve.profile_release`,
@@ -66,7 +66,7 @@ pub struct GuardAction {
 /// What the guard measured.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct Overhead {
-    /// The world's average step before the session, microseconds.
+    /// The epoch's average step before the session, microseconds.
     pub baseline_step_us: f64,
     /// The session's average step over its last [`GUARD_WINDOW`].
     pub step_us: f64,
@@ -78,13 +78,13 @@ pub struct Overhead {
 #[derive(Debug, Clone, Serialize)]
 pub struct Session {
     pub id: u64,
-    pub world: u64,
+    pub epoch: u64,
     /// `running` or `ended`.
     pub state: String,
     /// Seconds since the Unix epoch.
     pub started: f64,
     pub ended: Option<f64>,
-    /// Why it ended: `window`, `seconds`, `operator`, `world change`,
+    /// Why it ended: `window`, `seconds`, `operator`, `epoch change`,
     /// `rollback`, `quality of service`, or a failure.
     pub end_reason: Option<String>,
     pub request: SessionRequest,
@@ -179,7 +179,7 @@ impl Leader {
 }
 
 impl Replica {
-    /// Start a session of `request` on the executing world.
+    /// Start a session of `request` on the executing epoch.
     ///
     /// # Errors
     ///
@@ -209,26 +209,26 @@ impl Replica {
             )));
         }
         let client = self.hold().client().ok_or(UpdateError::NoEngine)?;
-        let world = client.world();
+        let epoch = client.epoch();
         let id = profiles
             .next
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             + 1;
         let started_at = Instant::now();
         let baseline = self.observer.rates(
-            world,
+            epoch,
             started_at.checked_sub(BASELINE).unwrap_or(started_at),
             BASELINE,
         );
         let payload = serde_json::to_string(&SessionStart {
             session: id,
-            world,
+            epoch,
             request: request.clone(),
         })
         .map_err(|error| UpdateError::Failed(error.into()))?;
         // The device storage the collectors hold on each selected worker's
         // GPU must fit its storage ledger: where it lacks room, the KV cache
-        // gives back tail segments first, as a world change's preparation
+        // gives back tail segments first, as an epoch change's preparation
         // does, the requests holding them running on.
         let device_storage = request.device_storage();
         if device_storage > 0 {
@@ -275,7 +275,7 @@ impl Replica {
             .collect();
         let session = Session {
             id,
-            world,
+            epoch,
             state: "running".to_owned(),
             started: now(),
             ended: None,
@@ -295,7 +295,7 @@ impl Replica {
         let answer = serde_json::to_value(&session).unwrap_or_default();
         *locked(&profiles.session) = Some(session);
         *locked(&profiles.acted) = None;
-        info!(session = id, world, "a profiling session started");
+        info!(session = id, epoch, "a profiling session started");
         tokio::spawn(watch(Arc::clone(self), id, started_at));
         Ok(answer)
     }
@@ -357,7 +357,7 @@ impl Profiles {
         session.windows_ended = ended;
         session.overhead = session.baseline.and_then(|baseline| {
             let since = Instant::now().checked_sub(GUARD_WINDOW)?;
-            let current = observer.rates(session.world, since, GUARD_WINDOW)?;
+            let current = observer.rates(session.epoch, since, GUARD_WINDOW)?;
             (baseline.step_us > 0.0).then(|| Overhead {
                 baseline_step_us: baseline.step_us,
                 step_us: current.step_us,
@@ -368,9 +368,9 @@ impl Profiles {
 }
 
 /// End session `id` for `reason` on the workers of `client`, when it still
-/// runs: every worker writes its file. A session whose world no longer
+/// runs: every worker writes its file. A session whose epoch no longer
 /// executes on `client` ends without its workers' answers, which wrote what
-/// they recorded as their world closed or keep it in their files' logs.
+/// they recorded as their epoch closed or keep it in their files' logs.
 /// Grow the engine's KV cache back into the room session `id` made for its
 /// device storage, once the workers released it.
 async fn grow_back(client: &EngineClient, id: u64) {
@@ -386,10 +386,10 @@ async fn grow_back(client: &EngineClient, id: u64) {
     }
 }
 
-/// End session `id` for `reason`: the workers of a world that still serves
+/// End session `id` for `reason`: the workers of an epoch that still serves
 /// write their files, and, with `grow`, the KV cache grows back into the
-/// room the session made for its device storage; a world that stops
-/// executing (a world change's promotion, a rollback) keeps its cache as
+/// room the session made for its device storage; an epoch that stops
+/// executing (an epoch change's promotion, a rollback) keeps its cache as
 /// the change left it.
 pub(crate) async fn end(
     replica: &crate::leader::Replica,
@@ -398,7 +398,7 @@ pub(crate) async fn end(
     reason: &str,
     grow: bool,
 ) {
-    let (world, device_storage) = {
+    let (epoch, device_storage) = {
         let mut session = locked(&replica.profiles.session);
         let Some(running) = session
             .as_mut()
@@ -409,14 +409,14 @@ pub(crate) async fn end(
         replica.profiles.progress(running, &replica.observer);
         // Ending from here on: a second end finds it ended.
         running.state = "ending".to_owned();
-        (running.world, running.device_storage)
+        (running.epoch, running.device_storage)
     };
     let mut files = Vec::new();
     let mut failure = None;
-    // Only a world that still serves writes its files: a failed one's
+    // Only an epoch that still serves writes its files: a failed one's
     // workers keep what they committed (the files' write-ahead logs).
     if let Some(client) =
-        client.filter(|client| client.world() == world && client.state() == EngineState::Ready)
+        client.filter(|client| client.epoch() == epoch && client.state() == EngineState::Ready)
     {
         let payload = serde_json::json!({ "session": id, "reason": reason }).to_string();
         match tokio::time::timeout(STOP_TIMEOUT, client.hook("uniserve.profile_stop", &payload))
@@ -451,9 +451,9 @@ pub(crate) async fn end(
     }
 }
 
-/// End the running session, if any, because its world stops executing:
+/// End the running session, if any, because its epoch stops executing:
 /// before a successor's promotion parks it, or as a trial rolls back.
-pub(crate) async fn end_for_world(
+pub(crate) async fn end_for_epoch(
     replica: &crate::leader::Replica,
     client: Option<&EngineClient>,
     reason: &str,

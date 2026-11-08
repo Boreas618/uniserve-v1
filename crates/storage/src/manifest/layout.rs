@@ -15,9 +15,9 @@
 //! # Chunks
 //!
 //! A storage's storage is allocated in chunks, each a CUDA VMM allocation of
-//! its own mapped back to back with the next, so that another world can
+//! its own mapped back to back with the next, so that another epoch can
 //! map any chunk it needs on its GPU without the rest. A chunk can be
-//! mapped into another world's storage only if it starts and ends at the
+//! mapped into another epoch's storage only if it starts and ends at the
 //! same byte layout there, on allocation-granularity boundaries.
 //! [`StorageLayout::chunks`] cuts a storage where another parallel
 //! configuration would cut the logical tensor: at its fields' bounds, at
@@ -25,9 +25,9 @@
 //! divides a dimension's partition units, each along a field's outermost
 //! dimension, where a cut keeps the parts contiguous. Every cut rounds down
 //! and up to the granularity, so the chunks between two cuts are those any
-//! world holding the same region at the same phase also has. A chunk's key
+//! epoch holding the same region at the same phase also has. A chunk's key
 //! ([`StorageLayout::chunk_key`]) names the logical regions its bytes hold
-//! and where they lie in it, so equal keys hold equal bytes whatever world
+//! and where they lie in it, so equal keys hold equal bytes whatever epoch
 //! wrote them.
 
 use std::ops::Range;

@@ -70,14 +70,14 @@ impl StageAnswer {
 }
 
 /// An update's ask that the following step's batches also run in shadow for a
-/// world generation (§7.3 step 2), with the answer that waits for the step which
+/// epoch generation (§7.3 step 2), with the answer that waits for the step which
 /// shadows them.
 ///
 /// The ask is kept until it is answered: a refused shadow submission answers it
 /// at once with the worker's reason, and a submitted one answers it when its
 /// step has ended, so an answer never claims a pass that has not run.
 pub(super) struct ShadowPass {
-    /// The world generation whose operators the shadow pass runs.
+    /// The epoch generation whose operators the shadow pass runs.
     pub(super) generation: u64,
     /// One of the step's batches was submitted as a shadow: the step that owns
     /// the answer has begun, and ends before the answer is sent.
@@ -206,29 +206,29 @@ impl Scheduler {
             Command::Commit(answer) => {
                 let _ = answer.send(self.commit());
             }
-            Command::PublishWorld(answer) => {
+            Command::PublishEpoch(answer) => {
                 let published = self
                     .worker
-                    .publish_world()
+                    .publish_epoch()
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(published);
             }
-            Command::Retire { worlds, answer } => {
+            Command::Retire { epochs, answer } => {
                 let retired = self
                     .worker
-                    .retire(&worlds)
+                    .retire(&epochs)
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(retired);
             }
             Command::KeepWeights {
-                worlds,
+                epochs,
                 to_host,
                 cache_keys,
                 answer,
             } => {
                 let kept = self
                     .worker
-                    .keep_weights(&worlds, to_host, &cache_keys)
+                    .keep_weights(&epochs, to_host, &cache_keys)
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(kept);
             }
@@ -431,9 +431,9 @@ impl Scheduler {
     /// §7.3's two stages run here on the calling thread: the precopy
     /// instantiates the program on this boundary's state and trials every
     /// decision of §4.4's table against it, and the switchover puts it in. A
-    /// world with no control thread — the integration tests, and a simulated
+    /// epoch with no control thread — the integration tests, and a simulated
     /// engine's — has no other way to have a policy, and a scheduler with no
-    /// policy decides nothing, so without this such a world schedules no work
+    /// policy decides nothing, so without this such an epoch schedules no work
     /// at all.
     ///
     /// Production installs a policy through the `PrecopyPolicy` and
@@ -443,7 +443,7 @@ impl Scheduler {
     /// only: the caller pays the whole cost of the precopy.
     ///
     /// The stage is applied where a stage is always applied — at a boundary with
-    /// nothing in flight — so the first call happens before the world submits
+    /// nothing in flight — so the first call happens before the epoch submits
     /// anything.
     pub fn install_policy(
         &mut self,
@@ -486,7 +486,7 @@ impl Scheduler {
     }
 
     /// §7.3 step 2's shadow pass: the following step's batches also run in
-    /// shadow for `generation`, the worker pairing that world's operators
+    /// shadow for `generation`, the worker pairing that epoch's operators
     /// against the serving one's resident data without writing resident memory.
     ///
     /// The ask is kept until a step has shadowed its batches, which is when it
@@ -517,7 +517,7 @@ impl Scheduler {
         });
     }
 
-    /// The world generation the following step's batches also run in shadow
+    /// The epoch generation the following step's batches also run in shadow
     /// for, if an update asked (§7.3 step 2). The step reads it before it
     /// submits, since it names the kernels the shadow pass compares against.
     pub(super) fn shadow_generation(&self, batch: &ExecutionBatch) -> Option<u64> {

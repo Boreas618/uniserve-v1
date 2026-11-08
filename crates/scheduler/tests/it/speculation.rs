@@ -1,11 +1,11 @@
-//! Draft cache refills in a world that speculates, weighed by what the
-//! world measures: a request that reuses a prefix whose draft cache pages
+//! Draft cache refills in an epoch that speculates, weighed by what the
+//! epoch measures: a request that reuses a prefix whose draft cache pages
 //! end before its context's verifies no drafts, and the scheduler refills
 //! the missing entries only when the decode time speculation would save
 //! over the tokens the request may still generate exceeds the time of
 //! evaluating them again.
 //!
-//! Each world first measures its steps: a request that speculates (the
+//! Each epoch first measures its steps: a request that speculates (the
 //! drafter's tokens per verification step and a step with drafts), a
 //! request of two tokens (a step without drafts) and both prompts (the
 //! time per prompt token). Then requests reuse the first one's prompt,
@@ -68,7 +68,7 @@ fn reusing(suffix: u32) -> Vec<u32> {
 /// A scheduler that speculates three drafts per request over the
 /// simulator, which speculates and times its steps as `speculation`
 /// states, and the batches it submits.
-struct World {
+struct Epoch {
     handle: CommandSender,
     thread: thread::JoinHandle<()>,
     batches: Receiver<BatchEvent>,
@@ -76,7 +76,7 @@ struct World {
     calls: Vec<ipc::Call>,
 }
 
-impl World {
+impl Epoch {
     fn start(speculation: SimSpeculation) -> Self {
         let mut sim = SimEngine::new();
         sim.set_text_len(10_000);
@@ -92,13 +92,13 @@ impl World {
                 draft_tokens: 3,
                 ..Default::default()
             },
-            // What this world's own steps cost, as the policy weighs them:
+            // What this epoch's own steps cost, as the policy weighs them:
             // the tokens a verification commits over the decode steps it
             // takes, and a refilled token's cost in decode steps. The
             // mechanism measures both, but a policy reads stated parameters
-            // (design §7.7), so the world states what it measures.
+            // (design §7.7), so the epoch states what it measures.
             //
-            // Leaving them unstated is not the same world: `refill_due` has no
+            // Leaving them unstated is not the same epoch: `refill_due` has no
             // value to weigh then and refills whatever the steps cost, so the
             // two cases below measure the stated path only. A deployment that
             // does not state both refills regardless of whether it pays.
@@ -152,7 +152,7 @@ impl World {
         tokens
     }
 
-    /// Measures the world's steps: a request that speculates over the
+    /// Measures the epoch's steps: a request that speculates over the
     /// shared prompt, and a request of two tokens whose second step
     /// carries no drafts.
     fn measure(&mut self) {
@@ -188,49 +188,49 @@ impl World {
     }
 }
 
-/// A world whose verification step costs more decode steps than the
+/// An epoch whose verification step costs more decode steps than the
 /// tokens it commits (two tokens a step, at three decode steps' time)
 /// refills nothing: a request of two hundred tokens left verifies no
 /// drafts to its end.
 #[test]
-fn a_world_whose_speculation_does_not_pay_refills_nothing() {
-    let mut world = World::start(SimSpeculation {
+fn a_epoch_whose_speculation_does_not_pay_refills_nothing() {
+    let mut epoch = Epoch::start(SimSpeculation {
         accepted: 1,
         decode_us: 1_000,
         verify_us: 3_000,
         prompt_token_us: 100,
     });
-    world.measure();
+    epoch.measure();
 
-    let read = world.run(request(3, reusing(6_000), 200));
+    let read = epoch.run(request(3, reusing(6_000), 200));
     assert_eq!(read, 200);
-    assert!(!world.refilled(3));
-    assert!(world.verifications(3).all(|drafts| drafts == 0));
-    world.stop();
+    assert!(!epoch.refilled(3));
+    assert!(epoch.verifications(3).all(|drafts| drafts == 0));
+    epoch.stop();
 }
 
-/// A world whose speculation pays (four tokens a step at one and a half
+/// An epoch whose speculation pays (four tokens a step at one and a half
 /// decode steps' time, a refilled token at a tenth of a decode step)
 /// refills a request with two hundred tokens left, which then speculates,
 /// and not one with four, whose remaining tokens save less than the
 /// refill's thirty-two tokens cost.
 #[test]
-fn a_world_whose_speculation_pays_refills_long_requests_only() {
-    let mut world = World::start(SimSpeculation {
+fn a_epoch_whose_speculation_pays_refills_long_requests_only() {
+    let mut epoch = Epoch::start(SimSpeculation {
         accepted: 3,
         decode_us: 1_000,
         verify_us: 1_500,
         prompt_token_us: 100,
     });
-    world.measure();
+    epoch.measure();
 
-    world.run(request(3, reusing(6_000), 4));
-    assert!(!world.refilled(3));
-    assert!(world.verifications(3).all(|drafts| drafts == 0));
+    epoch.run(request(3, reusing(6_000), 4));
+    assert!(!epoch.refilled(3));
+    assert!(epoch.verifications(3).all(|drafts| drafts == 0));
 
-    let read = world.run(request(4, reusing(7_000), 200));
+    let read = epoch.run(request(4, reusing(7_000), 200));
     assert_eq!(read, 200);
-    assert!(world.refilled(4));
-    assert!(world.verifications(4).any(|drafts| drafts > 0));
-    world.stop();
+    assert!(epoch.refilled(4));
+    assert!(epoch.verifications(4).any(|drafts| drafts > 0));
+    epoch.stop();
 }

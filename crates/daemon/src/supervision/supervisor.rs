@@ -25,7 +25,7 @@
 //!
 //! Every process is keyed by the engine connection that started it and by
 //! its group, rank and launch generation: two engines of one deployment (the
-//! serving world's and its successor's) name the same groups, and a
+//! serving epoch's and its successor's) name the same groups, and a
 //! group's standby ranks run beside its serving ones under a later
 //! generation. A `Stop` ends one group of one engine, every generation of
 //! it; an engine whose connection closes takes its remaining processes with
@@ -57,7 +57,7 @@ pub const LIFELINE_ENV: &str = "UNISERVE_LIFELINE";
 /// asked for it, its worker group, its rank and the generation of the group's
 /// launch. The connection is the launch's own: every client of the socket
 /// shares the deployment's owner, and two of them may name one group and rank,
-/// as two engines do during a world change. Its exit report goes down that
+/// as two engines do during an epoch change. Its exit report goes down that
 /// connection, and it ends with that connection.
 type Key = (u64, u64, String, u32, u64);
 

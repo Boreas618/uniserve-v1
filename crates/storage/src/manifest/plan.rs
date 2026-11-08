@@ -19,7 +19,7 @@ use crate::protocol::LinkEnd;
 const TIED_ASSIGNMENTS: usize = 120;
 
 /// The most target ranks whose GPU assignments are enumerated; larger
-/// worlds take the assignment of most local bytes the Hungarian method
+/// epochs take the assignment of most local bytes the Hungarian method
 /// finds.
 const ENUMERATED_RANKS: usize = 8;
 
@@ -184,11 +184,11 @@ impl<'r> Context<'r> {
     }
 
     fn field(&self, side: Side, at: FieldRef) -> &'r Field {
-        let world = match side {
+        let epoch = match side {
             Side::Source => &self.request.source,
             Side::Target => &self.request.target,
         };
-        &world.ranks[at.rank as usize].storages[at.storage as usize]
+        &epoch.ranks[at.rank as usize].storages[at.storage as usize]
             .layout
             .fields[at.field as usize]
     }
@@ -657,14 +657,14 @@ impl<'c, 'r> Draft<'c, 'r> {
         if let Some(&index) = self.staging_index.get(&(side, rank, group.to_owned())) {
             return Ok(index);
         }
-        let world = match side {
+        let epoch = match side {
             Side::Source => &self.context.request.source,
             Side::Target => &self.context.request.target,
         };
         let mut bytes = 0;
         let mut fields = Vec::new();
         let mut encoding = None;
-        for (storage, held) in world.ranks[rank as usize].storages.iter().enumerate() {
+        for (storage, held) in epoch.ranks[rank as usize].storages.iter().enumerate() {
             for field in &held.layout.fields {
                 if let Encoding::Encoded {
                     name,
@@ -1153,7 +1153,7 @@ impl<'c, 'r> Draft<'c, 'r> {
         form: Form,
         offset: u64,
     ) -> Result<(LinkEnd, u64)> {
-        let (world, gpu) = match side {
+        let (epoch, gpu) = match side {
             Side::Source => (
                 &self.context.request.source,
                 self.context.request.source.ranks[field.rank as usize].gpu,
@@ -1166,7 +1166,7 @@ impl<'c, 'r> Draft<'c, 'r> {
         if form == Form::Canonical {
             return Ok((Binding::Rank.end(gpu)?, u64::MAX));
         }
-        let chunks = &world.ranks[field.rank as usize].storages[field.storage as usize].chunks;
+        let chunks = &epoch.ranks[field.rank as usize].storages[field.storage as usize].chunks;
         let index = chunks.partition_point(|chunk| chunk.offset + chunk.length <= offset);
         let chunk = chunks
             .get(index)

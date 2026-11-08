@@ -1,4 +1,4 @@
-//! Same-world expert redistribution through retained weight copy manifests.
+//! Same-epoch expert redistribution through retained weight copy manifests.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
@@ -25,7 +25,7 @@ struct Planned {
 }
 
 impl Leader {
-    /// Redistribute experts without changing numerical shapes or world identity.
+    /// Redistribute experts without changing numerical shapes or epoch identity.
     ///
     /// Copies run alongside inference. Only publication drains computations,
     /// remaps their fixed weight addresses and changes routing tensor contents.
@@ -120,7 +120,7 @@ async fn rebalance(
         })?;
     Ok(serde_json::json!({
         "replica": replica.ordinal,
-        "world": client.world(),
+        "epoch": client.epoch(),
         "order": orders,
         "allocations": plans,
     }))

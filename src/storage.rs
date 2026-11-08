@@ -59,7 +59,7 @@ pub(crate) enum StorageCommand {
         mooncake: Mooncake,
         /// How long one chunk of the Transfer Server's copies lasts at its
         /// link's bandwidth, in microseconds: a copy engine turns to the
-        /// executing world's own copies, and to transfers of a higher
+        /// executing epoch's own copies, and to transfers of a higher
         /// priority, between chunks, so a chunk is kept far below one
         /// scheduler step.
         #[arg(long, default_value_t = 1000)]

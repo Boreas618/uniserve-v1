@@ -630,7 +630,7 @@ impl Pools {
     }
 
     /// Unmaps every pool's storage while keeping its reservation, so the device's memory can
-    /// serve another generation or another owner (design 8's exchange transport, and a world
+    /// serve another generation or another owner (design 8's exchange transport, and an epoch
     /// switch that must take a generation's storage away while its graphs stay).
     ///
     /// The virtual ranges stay reserved, so every address a captured graph holds stays valid;

@@ -88,7 +88,7 @@ impl Rendezvous {
 pub struct HostGroup {
     /// This member's index in `ranks`.
     rank: usize,
-    /// Members' global ranks (process-world or union ranks), in member order.
+    /// Members' global ranks (process-epoch or union ranks), in member order.
     ranks: Vec<usize>,
     /// Connection to each member by index; `None` for this member.
     peers: Vec<Option<Arc<TcpStream>>>,

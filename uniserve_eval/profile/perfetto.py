@@ -89,7 +89,7 @@ def _file_events(profile: ProfileFile) -> list[dict[str, Any]]:
             "ph": "M",
             "pid": pid,
             "args": {
-                "name": f"rank {pid} (world {meta.get('world')}, "
+                "name": f"rank {pid} (epoch {meta.get('epoch')}, "
                 f"device {meta.get('device')}, session {meta.get('session')})"
             },
         }

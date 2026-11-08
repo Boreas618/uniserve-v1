@@ -190,8 +190,8 @@ impl PrefixCacheManager {
             // The units of the segments the planes do not hold (a
             // successor's tail its storage does not hold yet, or what a
             // standby's predecessor gave back) stay withdrawn until they are
-            // created; the units mapped from a predecessor world stay out of
-            // allocation until the world takes them.
+            // created; the units mapped from a predecessor epoch stay out of
+            // allocation until the epoch takes them.
             let usable = prefix_cache.allocatable_units();
             if usable < prefix_cache.num_units {
                 block_pool.withdraw(usable);

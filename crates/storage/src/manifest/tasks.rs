@@ -12,7 +12,7 @@
 //! of one row. The submitter keeps the sources unchanged and the
 //! destinations unread until the transfer ends.
 
-use super::{Binding, Copy, Endpoint, Error, Gpu, Manifest, Request, Result, Side, Space, World};
+use super::{Binding, Copy, Endpoint, Epoch, Error, Gpu, Manifest, Request, Result, Side, Space};
 use crate::Key;
 use crate::protocol::{Location, Region, Span};
 
@@ -29,7 +29,7 @@ impl Manifest {
     /// host. `sources` must describe the same ranks, layouts and retained
     /// chunks as `request.source`, in the same order; only their transport
     /// bindings may differ. GPU assignments and numerical copies stay fixed.
-    pub fn bind<'m>(&'m self, request: &'m Request, sources: &'m World) -> BoundManifest<'m> {
+    pub fn bind<'m>(&'m self, request: &'m Request, sources: &'m Epoch) -> BoundManifest<'m> {
         BoundManifest {
             manifest: self,
             request,
@@ -44,7 +44,7 @@ impl Manifest {
 pub struct BoundManifest<'m> {
     manifest: &'m Manifest,
     request: &'m Request,
-    sources: &'m World,
+    sources: &'m Epoch,
 }
 
 impl<'m> BoundManifest<'m> {
@@ -64,7 +64,7 @@ impl<'m> BoundManifest<'m> {
     /// `side`, the offset in it, and the bytes the region holds from there
     /// on.
     fn locate(&self, side: Side, endpoint: &Endpoint, offset: u64) -> Result<(Region, u64, u64)> {
-        let (world, gpu): (&World, Option<Gpu>) = match side {
+        let (epoch, gpu): (&Epoch, Option<Gpu>) = match side {
             Side::Source => (
                 self.sources,
                 self.sources
@@ -97,7 +97,7 @@ impl<'m> BoundManifest<'m> {
                 ))
             }
             Space::Storage { storage } => {
-                let chunks = &world
+                let chunks = &epoch
                     .ranks
                     .get(endpoint.rank as usize)
                     .and_then(|rank| rank.storages.get(storage as usize))
