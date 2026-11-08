@@ -15,6 +15,7 @@
 //! simulation backend instead.
 
 use ipc::MediaCall;
+#[cfg(any(test, feature = "testing"))]
 use proto::config::DEFAULT_BLOCK;
 use std::collections::BTreeMap;
 
@@ -22,12 +23,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
+#[cfg(feature = "testing")]
 use crate::DEFAULT_MAX_RUNNING_REQUESTS;
 use crate::guidance_prefix_rows;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::worker::Worker;
-#[cfg(feature = "testing")]
 use crate::{CommandWaker, GenerationLimits, Request};
 use crate::{Scheduler, SpecialTokenIds};
 use crate::{SchedulerConfig, SchedulerStats};
@@ -36,7 +37,9 @@ use ipc::MainProcessInfo;
 use ipc::RequestId;
 #[cfg(test)]
 use proto::config::{BlockConfig, BlockDistribution};
-use proto::config::{EngineArgs, EngineConfig};
+use proto::config::EngineArgs;
+#[cfg(feature = "testing")]
+use proto::config::EngineConfig;
 pub use proto::config::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 use worker::batch::Batches;
 
