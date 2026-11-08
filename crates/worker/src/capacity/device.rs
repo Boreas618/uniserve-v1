@@ -61,27 +61,6 @@ pub(crate) struct DeviceBudget {
     synchronize: Arc<dyn Fn(DeviceId) -> Result<()> + Send + Sync>,
 }
 
-/// A device's storage grant and its free bytes, at one measurement.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Budget {
-    /// Bytes the rank may still allocate on the device.
-    pub available: u64,
-    /// Bytes the rank may hold beside its process once every other epoch
-    /// of its deployment has left the device: the quota less the process
-    /// and what the ledger books for the rank's own epoch and the Transfer
-    /// Server.
-    pub full: u64,
-    /// Bytes the device reports free, with the scope's reclaimable
-    /// retained bytes.
-    pub free: u64,
-    /// Bytes the process holds, with the storages its scope retains.
-    pub process: u64,
-    /// Total device bytes.
-    pub total: u64,
-    /// The deployment's ledger of the device's GPU at the measurement.
-    pub ledger: GpuLedger,
-}
-
 impl DeviceBudget {
     pub(crate) fn new(
         synchronize: Arc<dyn Fn(DeviceId) -> Result<()> + Send + Sync>,
@@ -127,46 +106,6 @@ impl DeviceBudget {
     )]
     pub(crate) fn process_bytes(&self, device: DeviceId) -> Result<u64> {
         Ok(self.own_bytes(device)? + self.retained.scope_bytes(device)?.held)
-    }
-
-    /// The storage grant on `device` for a rank allowed `fraction` of it,
-    /// stating the rank's epoch's quota in the GPU's ledger.
-    pub(crate) fn budget(&self, device: DeviceId, fraction: f64) -> Result<Budget> {
-        let own = self.own_bytes(device)?;
-        let scope = self.retained.scope_bytes(device)?;
-        let storage = device.memory_info()?;
-        // Stating the quota books nothing: the rank books its own items
-        // once it is warm.
-        let ledger = self.retained.book(
-            device,
-            storage.total,
-            quota(storage.total, fraction),
-            Vec::new(),
-        )?;
-        let quota = ledger.quota.unwrap_or(quota(storage.total, fraction));
-        // The measurement of the process stands for what it, or another
-        // process of its scope and epoch it replaces, booked; the
-        // reclaimable storages count as free.
-        let others = ledger
-            .used()
-            .saturating_sub(ledger.bytes(|entry| self.retained.books(entry)))
-            .saturating_sub(scope.reclaimable);
-        let epoch = self.retained.epoch();
-        let stays = ledger
-            .bytes(|entry| {
-                !self.retained.books(entry)
-                    && (entry.epochs.contains(&epoch) || entry.epochs.is_empty())
-            })
-            .saturating_sub(scope.reclaimable);
-        let free = storage.free + scope.reclaimable;
-        Ok(Budget {
-            available: quota.saturating_sub(own + others).min(free),
-            full: quota.saturating_sub(own + stays),
-            free,
-            process: own + scope.held,
-            total: storage.total,
-            ledger,
-        })
     }
 
     /// What the warm rank books on `device`, for `fraction` of it: its graph

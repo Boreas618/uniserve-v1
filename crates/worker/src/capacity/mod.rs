@@ -12,13 +12,12 @@
 //! parameters as [`CapacityRequest`], which the engine builds from the launch
 //! description it already holds.
 
-pub mod checks;
 pub mod device;
 mod plan;
 
 pub use plan::{
-    CacheGeometry, CapacityRequest, MediaFacts, Plan, RankFacts, Report, TokenFacts, TokenPlan,
-    plan_media, plan_rank, token_plan,
+    CacheGeometry, CapacityRequest, Plan, RankFacts, Report, TokenFacts, TokenPlan, plan_media,
+    plan_rank, token_plan,
 };
 
 use ipc::Call;
@@ -189,17 +188,6 @@ pub(crate) fn call_window(depth: usize, calls: usize) -> Result<usize> {
     Ok((depth * calls).min(depth.max(2)))
 }
 
-/// Media slots keep two unresolved outputs and one position for retirement.
-pub(crate) fn request_tensor_window(depth: usize, slots: usize) -> Result<usize> {
-    if slots == 0 || depth / slots < 3 {
-        return Err(Error::Invalid(
-            "request tensor pipeline requires two unresolved outputs per slot".into(),
-        ));
-    }
-
-    Ok(depth / slots - 1)
-}
-
 /// Storage and concurrency bounds consumed by the worker's physical owners.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArenaCapacity {
@@ -252,26 +240,6 @@ pub(crate) struct TokenBounds {
     pub device_exports: bool,
 }
 
-/// The batching bounds of a media worker's arena.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct RequestBounds {
-    /// Submitted batches the rank holds at once.
-    pub depth: usize,
-    /// Calls per batch.
-    pub calls: usize,
-    /// Request slots.
-    pub requests: usize,
-    /// Ranks of the deployment, every one of which may read this rank's
-    /// products.
-    pub ranks: usize,
-    /// Bytes of the products one request retains on this rank.
-    pub product_bytes_per_request: u64,
-    /// Artifact imports one request may have in flight.
-    pub concurrent_imports: usize,
-    /// Whether the rank exports device products over CUDA VMM.
-    pub device_exports: bool,
-}
-
 impl ArenaCapacity {
     /// The arena of a token worker: relay entries for every unresolved call of
     /// every request slot and the one before them, whose completion the
@@ -304,48 +272,6 @@ impl ArenaCapacity {
                 0
             },
             host_task_inflight: transfer_tickets,
-        })
-    }
-
-    /// A media rank retains every local product in full. It holds a read
-    /// ticket per queued call or per concurrent artifact import of every
-    /// slot, whichever is more, and at least one per rank of the
-    /// deployment, since assembly reads from every producing rank,
-    /// including stateless ranks.
-    ///
-    /// The engine queues a request's latent preparation and denoising steps
-    /// without waiting for their resolution, each predicated on the
-    /// completion of the one before it, so one request may hold a call in
-    /// every batch in flight on the rank (`depth`, one call of a request per
-    /// media batch). Every slot therefore has a relay entry per batch in
-    /// flight, and one more for the completion the oldest of those calls
-    /// still reads on the device.
-    pub(crate) fn for_requests(bounds: &RequestBounds) -> Result<Self> {
-        let RequestBounds {
-            depth,
-            calls,
-            requests,
-            ranks,
-            product_bytes_per_request,
-            concurrent_imports,
-            device_exports,
-        } = *bounds;
-        let window = request_tensor_window(depth, requests)?;
-        let slots = (depth * calls).max(requests * concurrent_imports);
-        let relay_depth = depth + 1;
-        let device_product_bytes = relay_bytes(requests, relay_depth);
-
-        Ok(Self {
-            relay_depth,
-            device_product_bytes,
-            transfer_bytes: (requests as u64 * product_bytes_per_request).max(1),
-            transfer_tickets: ranks.max(slots),
-            export_pool_bytes: if device_exports {
-                export_pool_bytes(device_product_bytes)
-            } else {
-                0
-            },
-            host_task_inflight: requests * (window + 1),
         })
     }
 
