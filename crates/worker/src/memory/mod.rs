@@ -25,9 +25,7 @@ pub mod weights;
 pub use prefix_cache::block_tables::{
     BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
 };
-pub use prefix_cache::plan::{
-    CacheDescription, CacheGroupPlan, CachePlan, Checkpoint, GroupAxis, StateField,
-};
+pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, Checkpoint, GroupAxis, StateField};
 pub use prefix_cache::planes::{CachePlanes, LaidSegment, PlaneLayout, UnitColumn};
 pub use prefix_cache::{PendingImport, PrefixCache};
 pub(crate) use prefix_cache::{TransferBases, UnitAccesses};

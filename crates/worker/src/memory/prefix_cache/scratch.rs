@@ -277,21 +277,16 @@ impl PrefixCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::{CacheDescription, CachePlan};
+    use crate::memory::CachePlan;
 
     /// A page spans every column of the plan, because a layer's cell is `column * num_units + unit`:
     /// sizing a set by one column gave forty-eight layers one layer's bytes. The figure is Qwen3-30B-A3B's
     /// cache, a BF16 page of 64 tokens over 48 layers of four KV heads of 128.
     #[test]
     fn a_page_of_the_set_spans_every_column() {
-        let plan = CachePlan::new(CacheDescription::dense(
-            64,
-            48,
-            4,
-            128,
-            ipc::PrefixCacheDtype::BFloat16,
-        ))
-        .expect("a dense plan");
+        let plan = (CachePlan::dense(64, 48, 4, 128, ipc::PrefixCacheDtype::BFloat16))
+            .validated()
+            .expect("a dense plan");
         let page = 48 * (2 * 65_536 + 2);
         let bytes = 1_237_319_680;
         let reserved = 7 * SCRATCH_GRANULARITY;

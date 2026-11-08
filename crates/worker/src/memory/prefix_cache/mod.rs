@@ -1633,7 +1633,7 @@ mod tests {
     /// A pool of one dense group of two layers with 8 tokens per page.
     fn plan() -> Arc<CachePlan> {
         Arc::new(
-            CachePlan::new(plan::CacheDescription {
+            (CachePlan {
                 columns: 2,
                 plane_bytes: 128,
                 quantized: false,
@@ -1661,6 +1661,7 @@ mod tests {
                 states: Vec::new(),
                 checkpoints: Vec::new(),
             })
+            .validated()
             .expect("a dense plan of two layers"),
         )
     }

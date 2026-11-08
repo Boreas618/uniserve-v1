@@ -8,7 +8,7 @@
 //! occupies `units_per_page` units.
 //!
 //! The model owns the geometry of its cache layers, so it supplies the plan:
-//! [`CachePlan::new`] validates the description and derives nothing hidden
+//! [`CachePlan::validated`] checks the description and derives nothing hidden
 //! from it. The worker owns the pool the plan describes: its size, its
 //! Storage Server keys and its resets.
 
@@ -136,32 +136,7 @@ pub struct CachePlan {
     pub checkpoints: Vec<Checkpoint>,
 }
 
-/// The pool a model's cache layers describe, before it is validated.
-///
-/// The model owns its cache geometry: it counts its own layers, states the
-/// widest row and the block size of each group, and names the fields its
-/// request states hold. The worker plans the pool from that description.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CacheDescription {
-    /// Layers per unit: one column each.
-    pub columns: u32,
-    /// Bytes of one (column, field) of one unit.
-    pub plane_bytes: u64,
-    /// Whether the planes hold FP8 values with per-plane scales.
-    pub quantized: bool,
-    /// Bytes one unit occupies: planes, flags and FP8 scales.
-    pub unit_bytes: u64,
-    /// The published stored element type.
-    pub dtype: PrefixCacheDtype,
-    /// The resident groups, in table order; the state group is last.
-    pub groups: Vec<CacheGroupPlan>,
-    /// The fields of the layers kept per request slot.
-    pub states: Vec<StateField>,
-    /// Each resident layer's checkpoint layout, when the model packs one.
-    pub checkpoints: Vec<Checkpoint>,
-}
-
-impl CacheDescription {
+impl CachePlan {
     /// The pool one group of `layers` dense layers describes: one column holding
     /// `layers` rows of `kv_heads x head_dim` of `dtype`, a scale per cell when
     /// `dtype` is a quantized one, no state fields and no checkpoints.
@@ -253,7 +228,7 @@ impl CachePlan {
         u64::from(rows) * self.plane_bytes + u64::from(rows) * 8
     }
 
-    /// Plan the unit pool a model describes.
+    /// The unit pool a model describes, once its fields are checked against each other.
     ///
     /// # Errors
     ///
@@ -261,8 +236,8 @@ impl CachePlan {
     /// unit or more units than its block size allows, the groups' layer
     /// counts share no column count, the state group is not the last group,
     /// or a field of the pool is inconsistent with its groups.
-    pub fn new(description: CacheDescription) -> Result<Self> {
-        let CacheDescription {
+    pub fn validated(self) -> Result<Self> {
+        let Self {
             columns,
             plane_bytes,
             quantized,
@@ -271,7 +246,7 @@ impl CachePlan {
             groups,
             states,
             checkpoints,
-        } = description;
+        } = self;
         if groups.is_empty() {
             return Err(Error::Invalid(
                 "the cache plan needs at least one resident group".into(),
@@ -577,7 +552,7 @@ mod tests {
     ///
     /// The geometry was written for a one-column pool and the pools have been per-layer since R8:
     /// a unit holds each column's key and value plane and its two flags, which `CachePlanes`
-    /// addresses as `column * num_units + unit`. A one-column figure made `CachePlan::new` refuse
+    /// addresses as `column * num_units + unit`. A one-column figure made `CachePlan::validated` refuse
     /// every model with more than two layers, which is every model.
     #[test]
     fn a_dense_pool_spans_every_column_in_its_unit() -> Result<()> {
@@ -585,13 +560,14 @@ mod tests {
         let block_size = 16;
         let kv_heads = 4;
         let head_dim = 128;
-        let plan = CachePlan::new(CacheDescription::dense(
+        let plan = (CachePlan::dense(
             block_size,
             layers,
             kv_heads,
             head_dim,
             PrefixCacheDtype::BFloat16,
-        ))?;
+        ))
+        .validated()?;
         let column = u64::from(kv_heads) * u64::from(head_dim) * 2 * u64::from(block_size);
         assert_eq!(plan.columns, layers);
         assert_eq!(plan.unit_bytes, u64::from(layers) * (2 * column + 2));

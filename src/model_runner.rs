@@ -1651,19 +1651,19 @@ impl ModelRunner {
                 // `config()`, so a checkpoint whose shape this build cannot state is refused by name
                 // rather than planned with a literal.
                 let config = model.config();
-                let cache =
-                    worker::memory::CachePlan::new(worker::memory::CacheDescription::dense(
-                        model.page_tokens(),
-                        narrow(config.num_hidden_layers, "num_hidden_layers")?,
-                        // A tensor rank stores the heads its attention holds.
-                        narrow(
-                            model.partition().local_key_value_heads(config),
-                            "num_key_value_heads",
-                        )?,
-                        narrow(config.head_dim, "head_dim")?,
-                        cache_dtype(model, self.engine_config().kv_cache.dtype)?,
-                    ))
-                    .context("describing the model's KV cache")?;
+                let cache = (worker::memory::CachePlan::dense(
+                    model.page_tokens(),
+                    narrow(config.num_hidden_layers, "num_hidden_layers")?,
+                    // A tensor rank stores the heads its attention holds.
+                    narrow(
+                        model.partition().local_key_value_heads(config),
+                        "num_key_value_heads",
+                    )?,
+                    narrow(config.head_dim, "head_dim")?,
+                    cache_dtype(model, self.engine_config().kv_cache.dtype)?,
+                ))
+                .validated()
+                .context("describing the model's KV cache")?;
                 let request = worker::capacity::MemoryRequest {
                     device: worker::config::Device::Cuda(device),
                     epoch: self.cache_epoch.unwrap_or(self.launch.epoch),
