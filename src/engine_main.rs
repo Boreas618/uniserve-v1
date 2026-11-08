@@ -93,7 +93,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, bail};
 
-use crate::engine_plan::{EpochPlan, PrefillCatalogue};
+use crate::model_runner::{ModelRunner, PrefillCatalogue};
 use engine::{PolicyProgram, PolicySource, ProgramSource};
 use executor::batch::Submission;
 use executor::blocking::{BlockingKind, ThreadPool};
@@ -356,14 +356,14 @@ impl ProcessInterface {
 
 /// One rank of this process, loaded: what its executor is built from.
 struct LoadedRank {
-    /// The rank's own plan, whose one device is the rank's.
-    plan: EpochPlan,
+    /// The rank's own model runner, whose one device is the rank's.
+    model_runner: ModelRunner,
     /// The weights its load reached, in order: what an update of §7.6 pairs against.
     weights: Vec<executor::memory::weights::LoadedWeight>,
     /// The rank's Storage Server client, whose scope is the rank's.
     client: Arc<Retained>,
     /// The rank's partition of the model, mapped on its device.
-    model: crate::engine_plan::Served,
+    model: crate::model_runner::Served,
     /// The rank's resident owners.
     memory: Memory,
     /// What the rank reports of itself.
@@ -371,7 +371,7 @@ struct LoadedRank {
     /// The rank's graph storage figures.
     graph: executor::device::GraphStorage,
     /// The collective groups its runners issue on.
-    groups: crate::engine_plan::RankGroups,
+    groups: crate::model_runner::RankGroups,
 }
 
 // SAFETY: a rank is built on its load thread and handed once to the thread that spawns its executor,
@@ -388,12 +388,12 @@ unsafe impl Send for LoadedRank {}
 /// weights of four ranks then also load at once. The group is the one the design's capacity plan
 /// agrees over, formed here over the loopback because this process holds all its members.
 fn load_ranks(
-    plans: Vec<EpochPlan>,
+    model_runners: Vec<ModelRunner>,
     storage: &ipc::StorageLaunch,
     launch: &EngineArgs,
     epoch: &Epoch,
 ) -> Result<Vec<LoadedRank>> {
-    let count = plans.len();
+    let count = model_runners.len();
     let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
         .context("binding the rendezvous of this process's ranks")?;
     let address = listener
@@ -403,7 +403,7 @@ fn load_ranks(
     let mut listener = Some(listener);
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(count);
-        for (index, plan) in plans.into_iter().enumerate() {
+        for (index, model_runner) in model_runners.into_iter().enumerate() {
             let rendezvous = match listener.take() {
                 Some(listener) => Rendezvous::serve(address.clone(), listener),
                 None => Rendezvous::connect(address.clone()),
@@ -411,7 +411,15 @@ fn load_ranks(
             let handle = std::thread::Builder::new()
                 .name(format!("rank-load-{index}"))
                 .spawn_scoped(scope, move || {
-                    load_rank(plan, rendezvous, index, count, storage, launch, epoch)
+                    load_rank(
+                        model_runner,
+                        rendezvous,
+                        index,
+                        count,
+                        storage,
+                        launch,
+                        epoch,
+                    )
                 })
                 .context("starting a rank's load")?;
             handles.push(handle);
@@ -429,7 +437,7 @@ fn load_ranks(
 
 /// Joins the group, opens the rank's collectives, loads its partition and opens its memory.
 fn load_rank(
-    plan: EpochPlan,
+    model_runner: ModelRunner,
     rendezvous: Rendezvous,
     index: usize,
     count: usize,
@@ -454,7 +462,7 @@ fn load_rank(
                 .collect(),
             held: cache.held,
         });
-    let plan = plan.sharing_cache_of(
+    let model_runner = model_runner.sharing_cache_of(
         epoch.predecessor_world.filter(|_| launch.standby()),
         adopted,
     );
@@ -466,21 +474,21 @@ fn load_rank(
     let client = Retained::connect(
         storage,
         &launch.group,
-        plan.rank(),
+        model_runner.rank(),
         epoch.generation,
         epoch.predecessor_world,
     )
     .context("connecting to the Storage Server")?;
     // A weight's region is one device's address, so the store maps on the device this rank's model
     // is loaded for; the client is shared, the mapping is not.
-    let device = *plan
+    let device = *model_runner
         .devices()
         .first()
         .context("this rank serves no device to map its weights on")?;
-    let shape = plan.parallel_shape()?;
+    let shape = model_runner.parallel_shape()?;
     // NCCL keeps its own device buffers, so a communicator opens before the capacity plan measures
     // what is left of the device.
-    let groups = crate::engine_plan::RankGroups {
+    let groups = crate::model_runner::RankGroups {
         sequence: group_over(&host, device, shape.sequence, shape.sequence_rank, count)
             .context("forming the sequence group")?,
         tensor: group_over(&host, device, shape.tensor, shape.tensor_rank, count)
@@ -490,13 +498,13 @@ fn load_rank(
     // The load and the capacity plan are one call because the order between them is the plan's: the
     // weights are mapped first, so what the plan measures is what is left of the device rather than
     // what was there before the model.
-    let (model, memory, inventory, graph) = plan
+    let (model, memory, inventory, graph) = model_runner
         .load_and_open(&mut weights, &mut &*client, &host, &epoch.experts)
         .context("loading the epoch's model")?;
-    tracing::info!(rank = plan.rank(), "the rank loaded its model");
+    tracing::info!(rank = model_runner.rank(), "the rank loaded its model");
     let weights = weights.take_log();
     Ok(LoadedRank {
-        plan,
+        model_runner,
         weights,
         client,
         model,
@@ -917,12 +925,12 @@ impl MainProcess {
     /// threads in the order §2.4 lists.
     ///
     /// The epoch's configuration is resolved against this process's launch first
-    /// ([`EpochPlan`]), because three of the things the main process needs are the
+    /// ([`ModelRunner`]), because three of the things the main process needs are the
     /// node's rather than the epoch's: which devices it serves, where its Program
     /// Server is, and what those devices measure.
     fn start(launch: &EngineArgs) -> Result<Self> {
         let build = &launch.engine_config;
-        let plan = EpochPlan::of(launch)?;
+        let model_runner = ModelRunner::of(launch)?;
         let mut control = Control::connect(
             &Endpoints {
                 requests: launch.requests.clone(),
@@ -960,7 +968,7 @@ impl MainProcess {
         // The daemon waits for what this process became, so a start that fails says why: the
         // process ends and its connection closes, which says only that it went.
         let mut control = Some(control);
-        let started = Self::load(&mut control, plan, epoch, launch, build);
+        let started = Self::load(&mut control, model_runner, epoch, launch, build);
         if let (Err(error), Some(control)) = (&started, control.as_mut()) {
             state_failure(control, &format!("{error:#}"));
         }
@@ -971,7 +979,7 @@ impl MainProcess {
     /// leaves it to the caller when it fails before that.
     fn load(
         control: &mut Option<Control>,
-        plan: EpochPlan,
+        model_runner: ModelRunner,
         epoch: Epoch,
         launch: &EngineArgs,
         build: &proto::config::EngineConfig,
@@ -1000,8 +1008,8 @@ impl MainProcess {
         // so the process subscribes before it loads a module (`docs/profiling.md`).
         executor::profiling::counters::subscribe();
         // §2.1: this process serves every rank of its node, each on its own device.
-        let rank_plans = plan.ranks()?;
-        let rank_numbers: Vec<u32> = rank_plans.iter().map(EpochPlan::rank).collect();
+        let rank_runners = model_runner.ranks()?;
+        let rank_numbers: Vec<u32> = rank_runners.iter().map(ModelRunner::rank).collect();
         let storage = claim(
             &mut process,
             launch,
@@ -1009,16 +1017,16 @@ impl MainProcess {
             host_kv_cache,
             &rank_numbers,
         )?;
-        let ranks = load_ranks(rank_plans, &storage, launch, &epoch)?;
+        let ranks = load_ranks(rank_runners, &storage, launch, &epoch)?;
 
         // The owners of §4 are opened before any thread that borrows them, and
         // released in reverse order by `close`. The weights are mapped before the capacity plan
         // measures, so the plan sees a device with the model already in it - the figure it computes
         // is what is left, not what was there before the load. Pools sized first and weights after
         // would over-commit the device by exactly the model's size.
-        let blocking = ThreadPool::new(plan.blocking_limits());
+        let blocking = ThreadPool::new(model_runner.blocking_limits());
         let modules = blocking.lane::<ModuleWork>(BlockingKind::ModuleLoad)?;
-        let programs = Arc::new(Mutex::new(Client::connect(plan.program_server())?));
+        let programs = Arc::new(Mutex::new(Client::connect(model_runner.program_server())?));
 
         // §2.4's watchdog exists before any device command: `start`'s own commands
         // are bounded by the same stall bound as every command the control thread
@@ -1026,22 +1034,22 @@ impl MainProcess {
         let watchdog = Watchdog::new(
             launch
                 .watchdog_timeout()
-                .unwrap_or_else(|| plan.watchdog_timeout()),
+                .unwrap_or_else(|| model_runner.watchdog_timeout()),
         )?;
         let update = HotUpdate::new(epoch.generation);
 
-        let mut executors = Vec::with_capacity(plan.devices().len());
-        let mut generations = Vec::with_capacity(plan.devices().len());
+        let mut executors = Vec::with_capacity(model_runner.devices().len());
+        let mut generations = Vec::with_capacity(model_runner.devices().len());
         // A rank with no device serves nothing, and saying it here names the deployment's fault
         // rather than leaving the pool's figure to a plan that never sized one.
-        if plan.devices().is_empty() {
+        if model_runner.devices().is_empty() {
             bail!("this rank serves no device");
         }
         // Every capture of this process carries the probes the deployment names, and the graphs
         // keep them for good: only their switch changes while the process serves.
         if !epoch.profiling.fence_components.is_empty() {
             executor::profiling::fences::Fences::install(
-                plan.devices(),
+                model_runner.devices(),
                 epoch.profiling.fence_components.clone(),
                 epoch.profiling.fence_probes,
                 &epoch.profiling.fence_probes_off,
@@ -1051,7 +1059,7 @@ impl MainProcess {
         // CUPTI attributes a graph kernel's PC samples only when sampling was enabled before the
         // graph was captured.
         if epoch.profiling.graph_pc_sampling {
-            for device in plan.devices() {
+            for device in model_runner.devices() {
                 let context = platform::PrimaryContext::retain(*device)?;
                 executor::profiling::pc_sampling::enable(&context)
                     .context("enabling PC sampling for this rank's graphs")?;
@@ -1064,7 +1072,7 @@ impl MainProcess {
         let mut data_ranks = Vec::with_capacity(ranks.len());
         let first_plan = ranks
             .first()
-            .map(|rank| rank.plan.scheduled())
+            .map(|rank| rank.model_runner.scheduled())
             .context("this process serves no rank")?;
         // Each rank of an expert union is a scheduler's own; the ranks of a media group are one
         // pool, which the first rank's plan describes.
@@ -1075,7 +1083,7 @@ impl MainProcess {
         let rank_count = ranks.len() as u32;
         for (rank_index, rank) in ranks.into_iter().enumerate() {
             let LoadedRank {
-                plan: rank_plan,
+                model_runner: rank_runner,
                 weights,
                 client,
                 model,
@@ -1100,9 +1108,9 @@ impl MainProcess {
             let shadow = graph.shadow;
             let products: Arc<dyn executor::runners::products::Products> =
                 Arc::new(RankProducts::new(Arc::clone(&group_products), rank_index));
-            for device in rank_plan.devices() {
+            for device in rank_runner.devices() {
                 let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
-                let runners = rank_plan.runners(
+                let runners = rank_runner.runners(
                     *device,
                     &model,
                     &mut memory,
@@ -1113,7 +1121,7 @@ impl MainProcess {
                 let executor = Executor::spawn(
                     *device,
                     runners,
-                    rank_plan.events(),
+                    rank_runner.events(),
                     Arc::clone(&pools),
                     Arc::clone(&products),
                     scratch,
@@ -1136,7 +1144,7 @@ impl MainProcess {
                 // which owns the stream a wake resets its units on, so the client is bound beside
                 // the cache handle rather than kept only here.
                 executor.bind_storage(Arc::clone(&client));
-                if let Some((union, member)) = rank_plan.union() {
+                if let Some((union, member)) = rank_runner.union() {
                     union.bind(
                         member,
                         Arc::clone(executor.queue()),
@@ -1145,19 +1153,19 @@ impl MainProcess {
                 }
                 let executor = Arc::new(executor);
                 data_ranks.push(executor::data_plane::Rank {
-                    rank: rank_plan.rank(),
+                    rank: rank_runner.rank(),
                     executor: Arc::downgrade(&executor),
                     device: *device,
                     storage: Arc::clone(&client),
                     cache: memory.shared_cache(),
-                    model: Arc::new(crate::engine_plan::RankModel::new(rank_plan.clone())),
+                    model: Arc::new(crate::model_runner::RankModel::new(rank_runner.clone())),
                     serving: weights.clone(),
                     host: epoch.host.clone(),
                 });
                 executors.push(executor);
                 generations.push(generation);
             }
-            scheduled.push(rank_plan.scheduled());
+            scheduled.push(rank_runner.scheduled());
             memories.push(memory);
             clients.push(client);
             models.push(model);
@@ -1186,13 +1194,13 @@ impl MainProcess {
         // and holds none would accept requests and dispatch nothing, which is refused by name.
         let schedulers = if union.is_some() {
             let mut handles = Vec::with_capacity(executors.len());
-            for (index, plan) in scheduled.iter().enumerate() {
+            for (index, model_runner) in scheduled.iter().enumerate() {
                 // A dedicated expert rank takes no request: it joins the steps the others open.
-                if !plan.schedules() {
+                if !model_runner.schedules() {
                     continue;
                 }
                 handles.extend(schedulers(
-                    plan,
+                    model_runner,
                     launch,
                     &models[index],
                     &executors[index..=index],
@@ -1271,8 +1279,8 @@ impl MainProcess {
             prepared: Vec::new(),
             retired: Vec::new(),
             generations,
-            targets: plan.targets().to_vec(),
-            program_server: plan.program_server().to_path_buf(),
+            targets: model_runner.targets().to_vec(),
+            program_server: model_runner.program_server().to_path_buf(),
             process,
             stopping: false,
             streams: Vec::new(),
@@ -1287,7 +1295,7 @@ impl MainProcess {
             admission_owed: false,
             max_running_requests: u32::try_from(build.max_running_requests.get())
                 .unwrap_or(u32::MAX),
-            catalogue: plan.prefill_catalogue(),
+            catalogue: model_runner.prefill_catalogue(),
             serving_programs: Programs::new(),
             retired_programs: Programs::new(),
             prepared_programs: Programs::new(),
@@ -2446,7 +2454,7 @@ impl MainProcess {
             let device = platform::Device::new(ordinal)
                 .map_err(|error| invalid(format!("opening device {}: {error}", ordinal.0)))?;
             // `targets` holds each distinct architecture once, so a device's own is read from it.
-            let target = crate::engine_plan::target_of(&device);
+            let target = crate::model_runner::target_of(&device);
             if !self.targets.contains(&target) {
                 return Err(invalid(format!("device {} has no build target", ordinal.0)));
             }
@@ -8055,9 +8063,9 @@ fn device_command(
 /// it, and the scheduler reads the result - nothing crosses threads except the batch and its
 /// result.
 fn schedulers(
-    plan: &EpochPlan,
+    model_runner: &ModelRunner,
     launch: &EngineArgs,
-    model: &crate::engine_plan::Served,
+    model: &crate::model_runner::Served,
     executors: &[Arc<Executor>],
     rank: &ipc::MainProcessInfo,
     memory: &Memory,
@@ -8076,10 +8084,10 @@ fn schedulers(
     // a page holds what the union computed. A scheduler over several devices would copy one
     // device's share of every page, so it keeps none, and no text model runs one today: a rank
     // maps its model on one device.
-    let host_cache = plan.host_kv_cache(model) && executors.len() == 1;
+    let host_cache = model_runner.host_kv_cache(model) && executors.len() == 1;
     // One scheduler per scheduler thread: it reads the engine configuration as this rank resolves
     // it, with the model's facts, and the limits this rank captured.
-    let (args, limits) = plan.scheduler_args(launch, model, host_cache)?;
+    let (args, limits) = model_runner.scheduler_args(launch, model, host_cache)?;
     let mut rank = rank.clone();
     if host_cache && let Some(cache) = rank.prefix_cache.as_mut() {
         cache.host_token_bytes = memory.host_token_bytes();
@@ -8095,8 +8103,8 @@ fn schedulers(
         group: launch.group.clone(),
         ranks: vec![rank.clone()],
         layout: executor::batch::PoolLayout {
-            queue_depth: plan.queue_depth(),
-            ranks: plan.world_size(),
+            queue_depth: model_runner.queue_depth(),
+            ranks: model_runner.world_size(),
             // Every component the rank reports is placed on the group's ranks. A text rank reports
             // the one default component, and a media rank one per block of its pipeline, which the
             // scheduler reads a call's width and owner from.
@@ -8104,11 +8112,14 @@ fn schedulers(
                 .components
                 .iter()
                 .flat_map(|component| {
-                    engine::WorkerGroupConfig::single_component(&component.name, plan.world_size())
+                    engine::WorkerGroupConfig::single_component(
+                        &component.name,
+                        model_runner.world_size(),
+                    )
                 })
                 .collect(),
         },
-        max_model_len: plan.max_kv_len(model)?,
+        max_model_len: model_runner.max_kv_len(model)?,
     };
     let mut stated =
         executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?

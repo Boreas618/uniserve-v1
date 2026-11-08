@@ -138,7 +138,7 @@ pub struct DenoiserShape {
     /// by while `source`, holding what the encoder wrote, is sized by [`Self::width`].
     ///
     /// **The shape is where the model's statement lives, not the runner.** The planning boundary asks
-    /// the model once (`src/engine_plan.rs`) and puts the answer here, so a runner never asks the model
+    /// the model once (`src/model_runner.rs`) and puts the answer here, so a runner never asks the model
     /// a second time and two statements of one width cannot drift.
     pub text_width: u32,
 }

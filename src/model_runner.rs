@@ -1,4 +1,5 @@
-//! How the parked main process is built from one epoch's build config.
+//! Each rank's model runner: how a main process loads, sizes and captures one rank of the epoch's
+//! engine configuration.
 //!
 //! `src/engine_main.rs` is the main process itself: the control thread, the device executors, the
 //! schedulers and the hot update. Everything it needs *before* it can start a thread comes from an
@@ -9,9 +10,9 @@
 //! does not hold every input, because half of what the main process needs is a property of the node
 //! it runs on (`EngineArgs`) or of the devices it measured.
 //!
-//! So the derivation lives here, on the consumer's side of the daemon/engine seam: [`EpochPlan`] is
-//! an epoch's build config resolved against the node's arguments, and the accessors below are the
-//! whole of what the main process asks of it. [`EpochPlan::runners`] is the one place in the tree
+//! So the derivation lives here, on the consumer's side of the daemon/engine seam: a
+//! [`ModelRunner`] is one rank of the epoch's engine configuration resolved against the process's
+//! arguments, and the accessors below are the whole of what the main process asks of it. [`ModelRunner::runners`] is the one place in the tree
 //! that names a concrete model class (§4.3): the capability dispatch every other line obeys has
 //! exactly one entry, and this is it.
 //!
@@ -155,14 +156,15 @@ pub(crate) enum Served {
     Media(Arc<minimax_h3::load::MinimaxH3>),
 }
 
-/// How the data plane loads this rank's model again (§7.6): the rank's plan, pointed at the target.
+/// How the data plane loads this rank's model again (§7.6): the rank's model runner, pointed at the
+/// target.
 pub(crate) struct RankModel {
-    plan: EpochPlan,
+    model_runner: ModelRunner,
 }
 
 impl RankModel {
-    pub(crate) fn new(plan: EpochPlan) -> Self {
-        Self { plan }
+    pub(crate) fn new(model_runner: ModelRunner) -> Self {
+        Self { model_runner }
     }
 }
 
@@ -172,19 +174,22 @@ impl executor::data_plane::ModelLoad for RankModel {
         target: &executor::data_plane::Target,
         weights: &mut dyn nn::RetainedWeights,
     ) -> std::result::Result<(), String> {
-        let mut plan = self.plan.clone();
-        Arc::make_mut(&mut plan.launch).engine_config.model.model =
-            target.checkpoint.to_string_lossy().into_owned();
-        plan.load_model(weights, &target.experts)
+        let mut model_runner = self.model_runner.clone();
+        Arc::make_mut(&mut model_runner.launch)
+            .engine_config
+            .model
+            .model = target.checkpoint.to_string_lossy().into_owned();
+        model_runner
+            .load_model(weights, &target.experts)
             .map(drop)
             .map_err(|error| format!("{error:#}"))
     }
 
     fn expert_layers(&self) -> BTreeMap<String, u32> {
-        let Ok(ModelClass::CausalLm) = ModelClass::of(self.plan.checkpoint()) else {
+        let Ok(ModelClass::CausalLm) = ModelClass::of(self.model_runner.checkpoint()) else {
             return BTreeMap::new();
         };
-        let Ok(config) = qwen3_moe::Config::read(self.plan.checkpoint()) else {
+        let Ok(config) = qwen3_moe::Config::read(self.model_runner.checkpoint()) else {
             return BTreeMap::new();
         };
         let experts = u32::try_from(config.num_experts).unwrap_or(0);
@@ -205,12 +210,15 @@ impl Served {
     }
 }
 
+/// One rank's model runner: it loads the rank's model on its devices, sizes the KV cache from what
+/// the device has left, captures the rank's CUDA graphs and builds its compute runners. The ranks
+/// of a process share the process's launch arguments; the rest is each rank's own.
 #[derive(Clone)]
-pub(crate) struct EpochPlan {
-    /// The output and the media lane the ranks of this plan share, once the first rank made them.
+pub(crate) struct ModelRunner {
+    /// The output and the media lane the ranks of this process share, once the first rank made them.
     codec: Arc<std::sync::Mutex<Option<SharedCodec>>>,
     /// The process's arguments, which every rank of it shares: the epoch's engine configuration
-    /// (§7.2), the checkpoint, the world and the node's interfaces. A plan that loads another
+    /// (§7.2), the checkpoint, the world and the node's interfaces. A model runner that loads another
     /// checkpoint holds its own copy, whose configuration names that checkpoint.
     launch: Arc<EngineArgs>,
     /// This rank's devices, as the executor's names for them.
@@ -231,7 +239,7 @@ pub(crate) struct EpochPlan {
     /// Ranks in the deployment, whose minimum the cache plan's block size and slot count are
     /// agreed by (§4.1): the launch's, or this process's devices when its ranks are its devices.
     world_size: usize,
-    /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the plan.
+    /// This rank's part of the epoch's parallel shape (§4.3, §5.1), resolved with the model runner.
     mapping: Mapping,
     /// The expert union of this node's ranks, on a deployment whose experts are split.
     union: Option<Arc<executor::runners::experts::Union>>,
@@ -309,7 +317,7 @@ fn tier_refusal(
     ))
 }
 
-impl EpochPlan {
+impl ModelRunner {
     /// The epoch `build` builds, with this node's arguments resolved against it.
     ///
     /// The devices and the Program Server socket are the node's, not the epoch's: the daemon
@@ -404,12 +412,12 @@ impl EpochPlan {
         Path::new(&self.launch.engine_config.model.model)
     }
 
-    /// One plan per rank this process serves (§2.1: one main process drives every device of its
+    /// One model runner per rank this process serves (§2.1: one main process drives every device of its
     /// node, one executor each).
     ///
     /// A media deployment's ranks are its devices: a rank holds its own partition of the model on
     /// its own device, so each is planned, loaded and opened as a rank of its own. The text class
-    /// keeps one plan, whose second device is refused where its runner is built.
+    /// keeps one model runner, whose second device is refused where its runner is built.
     pub(crate) fn ranks(&self) -> Result<Vec<Self>> {
         let text = matches!(ModelClass::of(self.checkpoint())?, ModelClass::CausalLm);
         let attention = self.attention_ranks()?;
@@ -447,12 +455,12 @@ impl EpochPlan {
                 .iter()
                 .enumerate()
                 .map(|(index, device)| {
-                    let mut plan = self.clone();
-                    plan.devices = vec![*device];
-                    plan.rank = self.rank + index as u32;
-                    plan.world_size = count;
-                    plan.mapping.tensor_rank = index as u32;
-                    plan
+                    let mut rank_runner = self.clone();
+                    rank_runner.devices = vec![*device];
+                    rank_runner.rank = self.rank + index as u32;
+                    rank_runner.world_size = count;
+                    rank_runner.mapping.tensor_rank = index as u32;
+                    rank_runner
                 })
                 .collect());
         }
@@ -474,23 +482,23 @@ impl EpochPlan {
             .iter()
             .enumerate()
             .map(|(index, device)| {
-                let mut plan = self.clone();
-                plan.devices = vec![*device];
-                plan.rank = self.rank + index as u32;
-                plan.world_size = count;
+                let mut rank_runner = self.clone();
+                rank_runner.devices = vec![*device];
+                rank_runner.rank = self.rank + index as u32;
+                rank_runner.world_size = count;
                 if text {
                     // An attention rank holds the first rank's window and computes nothing with
                     // it; `ExchangeViews::source_only` keeps it out of its forward.
-                    plan.mapping.union_rank = index as u32;
-                    plan.mapping.attention_ranks = attention;
-                    plan.mapping.expert_parallel = expert_ranks;
-                    plan.mapping.expert_rank = (index as u32).saturating_sub(attention);
-                    plan.mapping.load_options.exchange_capacity = capacity;
-                    plan.mapping.load_options.exchange_attention = attention;
-                    plan.union.clone_from(&union);
-                    plan.buckets = expert_classes(&plan.buckets, capacity);
+                    rank_runner.mapping.union_rank = index as u32;
+                    rank_runner.mapping.attention_ranks = attention;
+                    rank_runner.mapping.expert_parallel = expert_ranks;
+                    rank_runner.mapping.expert_rank = (index as u32).saturating_sub(attention);
+                    rank_runner.mapping.load_options.exchange_capacity = capacity;
+                    rank_runner.mapping.load_options.exchange_attention = attention;
+                    rank_runner.union.clone_from(&union);
+                    rank_runner.buckets = expert_classes(&rank_runner.buckets, capacity);
                 }
-                plan
+                rank_runner
             })
             .collect())
     }
@@ -583,7 +591,7 @@ impl EpochPlan {
             .map(|union| (union, self.mapping.union_rank as usize))
     }
 
-    /// This plan on the cache planes of `world`, when this rank stands by for that world's process.
+    /// This model runner on the cache planes of `world`, when this rank stands by for that world's process.
     pub(crate) fn sharing_cache_of(
         mut self,
         world: Option<u64>,
@@ -599,13 +607,13 @@ impl EpochPlan {
     /// The ranks of a group run one batch together, and `executor::batch::Executors` hands it to
     /// each of them, so a scheduler sees the deployment as one rank whose batches are the group's.
     pub(crate) fn scheduled(&self) -> Self {
-        let mut plan = self.clone();
-        plan.world_size = 1;
+        let mut rank_runner = self.clone();
+        rank_runner.world_size = 1;
         // A scheduler of an expert union plans its one rank as a pool of its own.
-        if plan.union.is_some() {
-            plan.rank = 0;
+        if rank_runner.union.is_some() {
+            rank_runner.rank = 0;
         }
-        plan
+        rank_runner
     }
 
     /// The parallel groups this rank joins: `(sequence group's ranks, tensor group's ranks)` and its
@@ -1225,7 +1233,7 @@ impl EpochPlan {
 
     /// The streams `device` maps graphs on: one per runner it serves, plus one for a preparation.
     ///
-    /// The count is the number of `NamedRunner`s [`EpochPlan::runners`] builds for this class, and
+    /// The count is the number of `NamedRunner`s [`ModelRunner::runners`] builds for this class, and
     /// the two are checked against each other where the runners exist: `Executor::spawn` refuses a
     /// device whose runners outnumber the streams its graph range was divided for, naming both
     /// figures. That refusal is what keeps this constant honest - a runner added without the count
@@ -1249,7 +1257,7 @@ impl EpochPlan {
     /// The runners `device` serves: one per block of the loaded model (§4.3).
     ///
     /// The model's class was resolved once, when it was loaded and its resident memory opened
-    /// ([`EpochPlan::load_and_open`]), so this builds the runner that class needs from the model it
+    /// ([`ModelRunner::load_and_open`]), so this builds the runner that class needs from the model it
     /// is handed. Everything downstream - the buckets, the arena, the sampler, the graphs - is
     /// written against `nn`'s capability traits.
     pub(crate) fn runners(
@@ -1394,7 +1402,7 @@ impl EpochPlan {
         Ok((served, memory, info, graph))
     }
 
-    /// The model this plan's checkpoint holds, its weights reached through `weights` in the order
+    /// The model this rank's checkpoint holds, its weights reached through `weights` in the order
     /// the model's load asks for them. An update walks the same code (§7.6), so what this function
     /// reads is exactly what a load of another checkpoint or another expert order would.
     pub(crate) fn load_model(
@@ -2954,11 +2962,11 @@ impl Mapping {
 }
 
 /// The phases this node's runner serves, in the numbering the scheduler plans with: one id per phase
-/// kind this plan's own buckets are launched as.
+/// kind this rank's own buckets are launched as.
 ///
-/// The kinds come from the buckets - what this rank's plan can launch - and the ids from
+/// The kinds come from the buckets - what this rank's model runner can launch - and the ids from
 /// `engine::phase_id`, the table the scheduler's `Plan` numbers a request's work with. Never from a
-/// literal: a plan that stated `PhaseId(0)` for its device (text encoding) served no phase the
+/// literal: a model runner that stated `PhaseId(0)` for its device (text encoding) served no phase the
 /// scheduler ever planned, and the executor refused the deployment's first completion with `no
 /// device of this rank serves phase PhaseId(3)`.
 /// The frames of each video unit of a `frames`-frame timeline, as the model states them.
@@ -3300,15 +3308,15 @@ mod tests {
         );
     }
 
-    /// A plan serves the phases its buckets are launched as, in the scheduler's numbering, and no
+    /// A model runner serves the phases its buckets are launched as, in the scheduler's numbering, and no
     /// phase it does not run.
     ///
-    /// The defect this pins: the plan stated `PhaseId(0)` for its device, so the executor refused
+    /// The defect this pins: the model runner stated `PhaseId(0)` for its device, so the executor refused
     /// the deployment's first completion with `no device of this rank serves phase PhaseId(3)`.
-    /// `PhaseId(3)` is a whole-prompt forward and `PhaseId(0)` is text encoding: the plan and the
+    /// `PhaseId(3)` is a whole-prompt forward and `PhaseId(0)` is text encoding: the model runner and the
     /// scheduler were numbering phases in two tables.
     #[test]
-    fn a_plan_serves_the_phases_its_buckets_are_planned_as() {
+    fn a_model_runner_serves_the_phases_its_buckets_are_planned_as() {
         let buckets = Buckets::causal_lm(&[8], &[64], true);
         let phases = served_phases(&buckets);
         let id = |kind| PhaseId(u16::try_from(engine::phase_id(kind).0).expect("a phase id fits"));
