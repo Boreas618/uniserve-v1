@@ -2,7 +2,7 @@
 //!
 //! Every table here is a function of the *request*, not of a step: the prompt's token ids and the
 //! grids of its condition media decide them once, before the encode is captured or replayed
-//! (specs/worker.md 4.3, 9). The executor's encoder runner calls these functions when it prepares a
+//! (specs/worker.md 4.3, 9). The worker's encoder runner calls these functions when it prepares a
 //! request and uploads the results into the views [`crate::text_encoder`] reads; the model crate
 //! itself owns no device storage and copies nothing (`AGENTS.md`, Model Library Boundary).
 //!

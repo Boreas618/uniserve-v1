@@ -3,7 +3,7 @@
 //! It serves the HTTP and OpenAI API, processes every request's input and
 //! output, keeps the facts of the requests in flight and migrates them between
 //! epochs, and exports the serving address's metrics. It links no numerical
-//! code: models, the scheduler and the executors are the main process's
+//! code: models, the scheduler and the workers are the main process's
 //! (`specs/worker.md` §2.1, §3).
 //!
 //! The daemon starts it, tells it which epoch serves, and hands it a successor

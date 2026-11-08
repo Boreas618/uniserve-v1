@@ -1,7 +1,7 @@
 //! Serving warmup through the scheduler.
 //!
 //! Once the epoch's first policy serves, the engine admits real requests of the
-//! shapes the executors prepared for, so the serving path of every captured row
+//! shapes the workers prepared for, so the serving path of every captured row
 //! count, guidance-branch count and diffusion LM step has run before the first
 //! client request that needs it.
 //!
@@ -56,13 +56,13 @@ use proto::config::EngineArgs;
 /// prepared latent and a step from a denoised one.
 const IMAGE_STEPS: u16 = 2;
 
-/// Runs the warmup requests the executors' reports call for on `core`.
+/// Runs the warmup requests the workers' reports call for on `core`.
 ///
 /// Returns once every request has finished. Fails, naming the group, when a
 /// request is rejected, ends in an error, or the engine dies first.
 ///
-/// Warmup runs only where the executors execute on CUDA devices: a CPU or stub
-/// executor has no kernels or graphs to warm.
+/// Warmup runs only where the workers execute on CUDA devices: a CPU or stub
+/// worker has no kernels or graphs to warm.
 /// What a warm-up needs of a scheduler, so a thread of the engine's can warm a
 /// rank without holding the handle the engine serves with.
 pub(crate) struct Warm {
@@ -233,7 +233,7 @@ pub(crate) fn groups(
 
     if info.diffusion_lm_step_rows > 0 {
         let sampling = facts.canvas_sampling.context(
-            "executors report diffusion LM step rows but the deployment has no block sampling",
+            "workers report diffusion LM step rows but the deployment has no block sampling",
         )?;
         let length = sampling.canvas_length as usize;
         // Requests of different lengths stop stepping together once the
@@ -438,7 +438,7 @@ mod tests {
     use ipc::ImageWarmup;
 
     use super::*;
-    use crate::sim::{SimEngine, SimExecutor};
+    use crate::sim::{SimEngine, SimWorker};
 
     /// The warm-up's groups on `sim`, which reports running on a CUDA device, in
     /// the deployment `deployment` adjusts.
@@ -450,11 +450,11 @@ mod tests {
         let mut args = crate::core::sim_args("warmup");
         args.engine_config.parallel.worker_groups[0].ranks[0].device = "cuda:0".to_owned();
         deployment(&mut args);
-        let executor = SimExecutor::new(sim);
-        let core = SchedulerHandle::with_executor(
+        let worker = SimWorker::new(sim);
+        let core = SchedulerHandle::with_worker(
             &args,
             crate::scheduler::SchedulerConfig::default(),
-            Box::new(executor),
+            Box::new(worker),
         )
         .unwrap();
         let mut id = 0;
@@ -511,11 +511,11 @@ mod tests {
     fn a_cpu_deployment_runs_no_warmup() {
         // `sim_args` runs on CPU, where no serving path is captured.
         let args = crate::core::sim_args("warmup");
-        let executor = SimExecutor::new(SimEngine::new());
-        let core = SchedulerHandle::with_executor(
+        let worker = SimWorker::new(SimEngine::new());
+        let core = SchedulerHandle::with_worker(
             &args,
             crate::scheduler::SchedulerConfig::default(),
-            Box::new(executor),
+            Box::new(worker),
         )
         .unwrap();
         let intent = core.warmup();

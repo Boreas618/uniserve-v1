@@ -17,7 +17,7 @@ use platform::{
 
 use crate::gpu::{DEVICE, exclusive_driver, read};
 
-/// The budget the executor implements over the storage client's booking
+/// The budget the worker implements over the storage client's booking
 /// request (design 8): it records every total booked and refuses totals above
 /// a limit the test can change.
 struct RecordingBudget {
@@ -72,7 +72,7 @@ impl Budget for RecordingBudget {
     }
 }
 
-/// An allocator that books against `budget`, which stands for the executor's
+/// An allocator that books against `budget`, which stands for the worker's
 /// budget over its storage client.
 fn with_budget(device: &platform::Device, budget: &Arc<RecordingBudget>) -> Allocator {
     let recording: Arc<RecordingBudget> = Arc::clone(budget);

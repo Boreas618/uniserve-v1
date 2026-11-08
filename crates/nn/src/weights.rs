@@ -22,7 +22,7 @@
 //! ## Publishing
 //!
 //! Conversion happens here and nowhere else, and its output goes straight to retained storage
-//! through [`RetainedWeights`], which the executor implements over the Storage Server and its
+//! through [`RetainedWeights`], which the worker implements over the Storage Server and its
 //! device mappings. `nn` owns no device memory: a [`Weight`] is a [`Backing`] plus the view the
 //! operator reads.
 
@@ -503,7 +503,7 @@ impl fmt::Display for WeightKey {
 
 /// Retained storage, as the loader publishes converted weights to it.
 ///
-/// The executor implements this over the Storage Server and its read-only device mappings: a
+/// The worker implements this over the Storage Server and its read-only device mappings: a
 /// weight already retained under the key is handed back without reading the checkpoint again, and a
 /// converted weight is published once (specs/worker.md 8, "只转换一次").
 pub trait RetainedWeights {

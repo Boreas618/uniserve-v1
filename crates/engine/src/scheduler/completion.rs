@@ -2,9 +2,9 @@
 //! mechanism reads them.
 //!
 //! Design §4.4's completion path is the mechanism's own: it is fed by whichever
-//! executor ran the batch. This module is that shape. `notes/sched/completion.md`
+//! worker ran the batch. This module is that shape. `notes/sched/completion.md`
 //! states, field by field, whether the device produces a value or the mechanism
-//! already owns it; the short version is that the executor states *what
+//! already owns it; the short version is that the worker states *what
 //! execution did* — the tokens it accepted, the cache extent it initialized and
 //! what a successor may read, the log-probabilities a client asked for, the
 //! artifact and the cache export — and the mechanism keeps *its own rules*: the
@@ -16,10 +16,10 @@
 //! neither inventing a value:
 //!
 //! - [`BatchReport::from_output`] / [`CallCompletion::from_output`] for the
-//!   in-process executor, which reports `executor::batch::BatchOutput`: the
+//!   in-process worker, which reports `worker::batch::BatchOutput`: the
 //!   device's own account of each call (2.4).
 //! - `CallCompletion::from_wire` / `BatchReport::from_wire` for a simulated
-//!   executor, which reports in `ipc`'s types; built only with the `testing`
+//!   worker, which reports in `ipc`'s types; built only with the `testing`
 //!   feature.
 
 use std::sync::Arc;
@@ -30,7 +30,7 @@ use ipc::{
 };
 
 #[cfg(feature = "testing")]
-use crate::executor::{BatchResult, CallResult};
+use crate::worker::{BatchResult, CallResult};
 
 /// One call's completion, as the mechanism reads it.
 #[derive(Clone, Debug)]
@@ -107,13 +107,13 @@ impl CallCompletion {
     /// The in-process edge: what a device's runner reported, in the mechanism's
     /// type (2.4).
     ///
-    /// The mechanism names the call: the executor numbers a batch's calls by
+    /// The mechanism names the call: the worker numbers a batch's calls by
     /// their index, so the pair comes from the batch that was submitted. A host
     /// call publishes its artifact into a POSIX shared-memory object and names
     /// it, and that name is claimed here — the mapping is what the mechanism
     /// delivers, and claiming it is what unlinks the name.
     ///
-    /// Two things the device reports differently from an executor, both stated
+    /// Two things the device reports differently from a worker, both stated
     /// rather than filled in: a call has no timing of its own (the batch
     /// measures the step, and `BatchReport::timing` carries it), and a token's
     /// log-probability arrives as one number per accepted token, not as ranked
@@ -122,7 +122,7 @@ impl CallCompletion {
     /// token is stated as the one candidate the device named, never a
     /// neighbour invented to fill the list.
     pub(crate) fn from_output(
-        output: executor::batch::CallOutput,
+        output: worker::batch::CallOutput,
         request_key: RequestKey,
         call_id: CallId,
     ) -> Self {
@@ -164,14 +164,14 @@ impl CallCompletion {
 
 /// Claims the artifact an in-process host call published.
 ///
-/// The executor's media stage copies the mux's bytes into a shared-memory object and relinquishes
+/// The worker's media stage copies the mux's bytes into a shared-memory object and relinquishes
 /// it (`ipc::MediaSource::into_locator`), which states the object's name and its exact length; the
 /// claim is the mechanism's, and it is the call that unlinks the name and maps the bytes.
 ///
 /// # Safety
 ///
 /// The publisher writes nothing after it relinquishes the object and never resizes it, which is the
-/// contract `SharedMedia::open` requires. The mechanism is the only claimer of a name the executor
+/// contract `SharedMedia::open` requires. The mechanism is the only claimer of a name the worker
 /// published for one completion.
 fn claim(published: &ipc::MediaOutput) -> Result<Option<Arc<SharedMedia>>, SharedMediaError> {
     let ipc::ArtifactHandle::PosixShm { name } = &published.handle;
@@ -186,16 +186,16 @@ fn claim(published: &ipc::MediaOutput) -> Result<Option<Arc<SharedMedia>>, Share
 pub(crate) struct BatchReport {
     /// The batch's number, which the mechanism assigned at assembly.
     pub batch_id: u64,
-    /// One completion per call that finished, in the executor's order.
+    /// One completion per call that finished, in the worker's order.
     pub calls: Vec<CallCompletion>,
     /// The receipts of the batch's lifecycle commands.
-    pub command_results: Vec<crate::executor::CommandResult>,
+    pub command_results: Vec<crate::worker::CommandResult>,
     /// Whether this report ends the batch.
     pub done: bool,
     /// The batch's own measurements: the execution time the report is measured
     /// by.
     pub timing: TimingCounters,
-    /// Per-executor model-forward statistics.
+    /// Per-worker model-forward statistics.
     pub forward_stats: Vec<ForwardStats>,
 }
 
@@ -212,7 +212,7 @@ impl BatchReport {
                 .collect(),
             command_results: result.command_results,
             done: result.done,
-            // The wire states a duration per executor; the mechanism measures a
+            // The wire states a duration per worker; the mechanism measures a
             // step by the device work it waited for, which is their sum.
             timing: TimingCounters {
                 device_us: result
@@ -229,7 +229,7 @@ impl BatchReport {
     /// mechanism's type.
     ///
     /// `calls` names the batch's calls as the mechanism named them: the
-    /// executor numbers a batch's calls by their index in `Batch.calls`, so a
+    /// worker numbers a batch's calls by their index in `Batch.calls`, so a
     /// report's call is resolved against the batch that was submitted, and a
     /// report naming a call the batch does not have is refused rather than
     /// filed against a neighbour.
@@ -243,21 +243,19 @@ impl BatchReport {
     /// is worse than stopping.
     pub(crate) fn from_output(
         batch: u64,
-        outcome: executor::completion::Outcome<executor::batch::BatchOutput>,
+        outcome: worker::completion::Outcome<worker::batch::BatchOutput>,
         calls: &[(RequestKey, CallId)],
-    ) -> Result<Self, crate::executor::ExecutorError> {
+    ) -> Result<Self, crate::worker::WorkerError> {
         let output = match outcome {
-            executor::completion::Outcome::Success(output) => output,
-            executor::completion::Outcome::Failed(error) => {
+            worker::completion::Outcome::Success(output) => output,
+            worker::completion::Outcome::Failed(error) => {
                 return Err(anyhow::anyhow!("batch {batch} failed: {error}"));
             }
-            executor::completion::Outcome::Cancelled => {
-                return Err(anyhow::anyhow!(
-                    "batch {batch} was cancelled by the executor"
-                ));
+            worker::completion::Outcome::Cancelled => {
+                return Err(anyhow::anyhow!("batch {batch} was cancelled by the worker"));
             }
         };
-        let mut reported: Vec<Option<executor::batch::CallOutput>> = vec![None; calls.len()];
+        let mut reported: Vec<Option<worker::batch::CallOutput>> = vec![None; calls.len()];
         for completion in output.calls {
             let index = completion.call.0 as usize;
             anyhow::ensure!(
@@ -297,7 +295,7 @@ impl BatchReport {
             // its commands' own delivery, and a command that failed failed the
             // batch.
             command_results: Vec::new(),
-            // A submission completes the batch: the device executor reports a
+            // A submission completes the batch: the device worker reports a
             // batch's calls together, never a part of one.
             done: true,
             timing: output.timing,
@@ -310,9 +308,9 @@ impl BatchReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use executor::batch::{BatchOutput, CallId as DeviceCallId, CallOutput as DeviceCall};
-    use executor::completion::Outcome;
     use ipc::CallStatus;
+    use worker::batch::{BatchOutput, CallId as DeviceCallId, CallOutput as DeviceCall};
+    use worker::completion::Outcome;
 
     /// What one device call reports: `committed` tokens, the batches it stands
     /// at, and the log-probability of each when the deployment planned them.
@@ -320,7 +318,7 @@ mod tests {
         let mut call = DeviceCall::completed(
             DeviceCallId(index),
             committed.to_vec(),
-            executor::batch::RowState {
+            worker::batch::RowState {
                 step_index: 1,
                 cache_computed_len: 3,
                 cache_visible_len: 3,
@@ -391,7 +389,7 @@ mod tests {
     }
 
     /// A call the batch does not have is refused, not filed against a
-    /// neighbour: the executor numbers calls by their index into `Batch.calls`.
+    /// neighbour: the worker numbers calls by their index into `Batch.calls`.
     #[test]
     fn a_call_the_batch_does_not_have_is_refused() {
         let error =
@@ -441,7 +439,7 @@ mod tests {
     fn a_failed_batch_is_an_error() {
         let error = BatchReport::from_output(
             4,
-            Outcome::Failed(std::sync::Arc::new(executor::Error::State("device gone"))),
+            Outcome::Failed(std::sync::Arc::new(worker::Error::State("device gone"))),
             &submitted(1),
         )
         .expect_err("a failed batch is not a completion");

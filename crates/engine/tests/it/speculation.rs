@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use engine::{
-    BatchEvent, CommandSender, Event, SchedulerConfig, SimEngine, SimExecutor, SimSpeculation,
+    BatchEvent, CommandSender, Event, SchedulerConfig, SimEngine, SimSpeculation, SimWorker,
 };
 use engine::{GenerationConstraint, GenerationRequest, ImageGenerationConfig};
 use ipc::{CallKind, ForwardMode, ImageParams, RequestId, SamplingParams};
@@ -83,10 +83,10 @@ impl World {
         sim.set_block_size(BLOCK);
         sim.add_draft_group(SPAN);
         sim.set_speculation(speculation);
-        let mut executor = SimExecutor::new(sim);
-        let batches = executor.observe();
+        let mut worker = SimWorker::new(sim);
+        let batches = worker.observe();
         let scheduler = support::scheduler_with_stating(
-            Box::new(executor),
+            Box::new(worker),
             SimEngine::special_tokens(),
             SchedulerConfig {
                 draft_tokens: 3,

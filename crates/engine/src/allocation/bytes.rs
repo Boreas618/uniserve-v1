@@ -1,4 +1,4 @@
-//! First-fit byte-range allocation over an executor storage the scheduler
+//! First-fit byte-range allocation over a worker storage the scheduler
 //! places products in.
 
 use std::collections::BTreeMap;

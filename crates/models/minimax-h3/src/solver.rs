@@ -21,15 +21,15 @@
 //! `scaled_residual` (`hidden += update * scale`), whose scale is a device view. A step's
 //! coefficient is a host value of the checkpoint's fixed schedule, so this module publishes the
 //! coefficients as one FP32 `[steps, 1]` constant per modality at load and gathers the evaluated
-//! step's word **on the device**, indexed by the executor's `step` table, into one staged word per
+//! step's word **on the device**, indexed by the worker's `step` table, into one staged word per
 //! forward. The launch therefore addresses one buffer whose *contents* change per evaluation
 //! instead of one buffer per evaluation: every evaluation of a layout runs the same graph, so one
 //! capture serves the whole trajectory and the solver may sit inside the captured stack. Only the
-//! step table's four bytes are the executor's per-replay write.
+//! step table's four bytes are the worker's per-replay write.
 //!
 //! ## What the solver writes
 //!
-//! Nothing but the sample. The samples are the executor's buffers, the velocity is the network's
+//! Nothing but the sample. The samples are the worker's buffers, the velocity is the network's
 //! output for this evaluation, and both arrive borrowed. A model holds no host-to-device path, which
 //! is why the coefficients are constants rather than a per-step upload.
 //!
@@ -83,7 +83,7 @@ pub struct Solver {
 /// starts from.
 struct Track {
     /// `[steps, 1]` FP32: evaluation `i` advances the sample by `coefficients[i]`, gathered on the
-    /// device from the executor's `step` table so one capture serves every evaluation.
+    /// device from the worker's `step` table so one capture serves every evaluation.
     coefficients: Weight,
     /// Scales a fresh draw to the schedule's first level: `sample += sample * (sigma_0 - 1)`.
     ///
@@ -137,7 +137,7 @@ impl Solver {
             )));
         }
         let (sample, velocity) = self.check(sample, velocity, modality)?;
-        // The coefficient is read on the device from the executor's `step` table, so the launch that
+        // The coefficient is read on the device from the worker's `step` table, so the launch that
         // follows addresses one buffer whose contents change per evaluation rather than one buffer
         // per evaluation: one capture serves them all.
         nn::layers::gather_rows(f, track.coefficients.view(), index, gathered)?;
@@ -173,7 +173,7 @@ impl Solver {
     /// schedule's own final sigma: the last step lands the sample on its clean estimate.
     ///
     /// This is the schedule's arithmetic without a launch, for the loading boundary's tests and for
-    /// the executor's own diagnostics.
+    /// the worker's own diagnostics.
     pub fn coefficients(schedule: &Schedule, modality: Modality) -> Result<Vec<f32>> {
         let steps = schedule.steps(modality)?;
         Ok(steps

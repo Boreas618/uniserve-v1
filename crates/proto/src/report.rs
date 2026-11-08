@@ -82,7 +82,7 @@ pub struct DomainSchedulerStats {
     /// after an execution failure.
     #[serde(default)]
     pub error_calls: u64,
-    /// Submission attempts rejected by executor backpressure.
+    /// Submission attempts rejected by worker backpressure.
     #[serde(default)]
     pub backpressure_events: u64,
     /// Scheduling credits returned on completion or execution failure.
@@ -157,7 +157,7 @@ pub struct SchedulerStats {
     #[serde(default)]
     pub batch_count: u64,
     /// Query tokens the `batch_count` batches computed. The scheduler counts them from the calls it
-    /// planned, so a report states the interval's throughput whatever its executor reports
+    /// planned, so a report states the interval's throughput whatever its worker reports
     /// (`worker_forward_stats` is empty for a main process).
     #[serde(default)]
     pub batch_tokens: u64,

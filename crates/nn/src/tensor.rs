@@ -5,7 +5,7 @@
 //! depends on `platform` alone (specs/worker.md 4.2, 4.3); `nn` re-exports them so a model writes
 //! `nn::TensorView`, not two names for one thing.
 //!
-//! What `nn` adds is [`Backing`]: the retained region a weight view borrows. The executor publishes
+//! What `nn` adds is [`Backing`]: the retained region a weight view borrows. The worker publishes
 //! a converted weight to retained storage and binds the storage read-only; a layer receives the
 //! view and the region together, so nothing in a layer has to assume a lifetime.
 
@@ -15,7 +15,7 @@ pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 
 /// The device storage a borrowed view is carved from.
 ///
-/// The executor owns the storage (a read-only mapping of retained weights, or a region of the graph
+/// The worker owns the storage (a read-only mapping of retained weights, or a region of the graph
 /// pool) and keeps it alive for as long as the model is loaded; [`Backing`] is only the address and
 /// size that prove a view's bytes are there. It owns nothing and copies nothing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

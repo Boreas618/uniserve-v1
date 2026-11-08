@@ -1,7 +1,7 @@
 //! Installing one module of a program layer by operator name.
 //!
 //! A program layer arrives as modules keyed by operator name and descriptor key (specs/worker.md
-//! 5.3), and the executor's precopy has to turn each one into a kernel of a generation without
+//! 5.3), and the worker's precopy has to turn each one into a kernel of a generation without
 //! knowing any operator's type. This is that entry: it takes the operator's name, the descriptor
 //! key the module was compiled for, and the module's image or path, and hands back the loaded
 //! kernel inside a [`KernelEntry`] for the caller to put in a [`crate::Generation`].
@@ -131,7 +131,7 @@ const OPERATORS: &[&str] = &[
 
 /// `name`, interned, when this build has an operator by that name.
 ///
-/// The executor's precopy reads a package's operator names as text; this gives back the static name
+/// The worker's precopy reads a package's operator names as text; this gives back the static name
 /// the generation is keyed by, or `None` when no operator of this build answers to `name`.
 pub fn operator_name(name: &str) -> Option<&'static str> {
     OPERATORS

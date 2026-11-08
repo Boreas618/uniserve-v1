@@ -3,7 +3,7 @@
 # one decoder, one encoder, and the condition encoders the denoiser's first step reads through.
 #
 # Every component is placed on this rank, the media ones included: `video_codec`, `muxer` and
-# `media_reader` work on the host inside the main process (the executor's `Media` lane, `MediaStage`),
+# `media_reader` work on the host inside the main process (the worker's `Media` lane, `MediaStage`),
 # and a main process serves CUDA devices only. A card of 141 GiB or more holds the weights: about
 # 65 GiB of DiT, 48 GiB of text encoder and 10 GiB of VAE.
 [[worker_groups]]

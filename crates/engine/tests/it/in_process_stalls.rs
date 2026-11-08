@@ -1,6 +1,6 @@
 //! A rank's stall report becomes the engine's first error, naming the forward
 //! that stalled, its batch and the calls it held, over the simulated
-//! executor.
+//! worker.
 //!
 //! The launched case stalls a rank's builder thread under a running request
 //! and asserts that the failure it surfaces names the same three things. The
@@ -13,7 +13,7 @@
 use std::thread;
 use std::time::{Duration, Instant};
 
-use engine::{SimEngine, SimExecutor, SpecialTokenIds, WorkerGroupId};
+use engine::{SimEngine, SimWorker, SpecialTokenIds, WorkerGroupId};
 use ipc::{CallId, ErrorCallIdentity, RequestKey, Stall};
 
 use crate::support;
@@ -21,7 +21,7 @@ use crate::support;
 /// How long the engine may take to report the stall.
 const DEADLINE: Duration = Duration::from_secs(30);
 
-/// The group the simulated executor serves.
+/// The group the simulated worker serves.
 fn group() -> WorkerGroupId {
     WorkerGroupId("sim".to_owned())
 }
@@ -45,10 +45,10 @@ fn special_tokens() -> SpecialTokenIds {
 /// fails with it.
 #[test]
 fn a_reported_stall_names_the_forward_and_the_requests_it_held() {
-    let executor = SimExecutor::new(SimEngine::new());
-    let reports = executor.loss();
-    let scheduler = support::scheduler(Box::new(executor), special_tokens(), 32)
-        .expect("the scheduler is built over the simulated executor");
+    let worker = SimWorker::new(SimEngine::new());
+    let reports = worker.loss();
+    let scheduler = support::scheduler(Box::new(worker), special_tokens(), 32)
+        .expect("the scheduler is built over the simulated worker");
     let failure = scheduler.failure_handle();
     let (tx, rx) = crossbeam_channel::unbounded();
     let commands = engine::CommandSender::new(tx);

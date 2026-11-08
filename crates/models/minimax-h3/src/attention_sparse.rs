@@ -537,7 +537,7 @@ pub struct Segments {
 
 /// Every temporary view the sparse branch reads, reserved once for the whole stack.
 ///
-/// The shapes do not depend on the layer, and the executor's arena is a bump allocator reset once
+/// The shapes do not depend on the layer, and the worker's arena is a bump allocator reset once
 /// per forward, so a per-layer reservation would multiply the arena by the layer count - two
 /// `tiles * tiles * heads` matrices per layer is gigabytes at a served canvas.
 pub struct Scratch {

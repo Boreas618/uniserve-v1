@@ -1,7 +1,7 @@
-//! The capability traits a model implements and the executor calls, and the borrowed inputs and
+//! The capability traits a model implements and the worker calls, and the borrowed inputs and
 //! outputs they exchange (specs/worker.md 4.3).
 //!
-//! The executor dispatches by capability, never by concrete model: a runner owns a
+//! The worker dispatches by capability, never by concrete model: a runner owns a
 //! `Box<dyn Encoder>`, `Box<dyn Denoiser>`, `Box<dyn Decoder>` or `Box<dyn CausalLm>` and calls only
 //! the methods declared here. Every input and output is a borrowed view or a small plain value: no
 //! request identity, no sampling state, no pool slot and no execution observation crosses this
@@ -10,7 +10,7 @@
 //! ## What the mechanism writes and what the model reads
 //!
 //! A batch has two halves. [`BatchRows`] is the host half: the scheduler's mechanism assembles the
-//! per-call rows and their column values, the executor uploads them, and they are not visible to a
+//! per-call rows and their column values, the worker uploads them, and they are not visible to a
 //! model. [`TokenBatch`] is the device half: the views a model's layers read, laid out exactly as
 //! the attention and KV-write kernels read them, so a forward does no host conversion (specs/worker.md
 //! 4.3, 4.4, 9).
@@ -29,7 +29,7 @@ use crate::tensor::{DType, Shape, TensorView};
 
 /// One host-side call of a batch: which request, which phase, which rows it occupies.
 ///
-/// The mechanism builds these from the scheduler's plan; the executor turns them into the device
+/// The mechanism builds these from the scheduler's plan; the worker turns them into the device
 /// columns [`BatchRows`] carries and uploads them into a [`TokenBatch`]. A call's `rows` are the
 /// half-open row range it owns in the batch's device columns.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -55,11 +55,11 @@ pub enum RowKind {
     Verify,
 }
 
-/// The host columns of one batch, as the mechanism writes them and the executor uploads them.
+/// The host columns of one batch, as the mechanism writes them and the worker uploads them.
 ///
-/// Every column is already in the layout the device views of [`TokenBatch`] have: the executor
+/// Every column is already in the layout the device views of [`TokenBatch`] have: the worker
 /// copies these into the pinned arena and uploads them before the graph replay. The columns are
-/// long-lived buffers the executor reuses every step, so assembling a batch does not allocate.
+/// long-lived buffers the worker reuses every step, so assembling a batch does not allocate.
 #[derive(Clone, Default, Debug)]
 pub struct BatchRows {
     /// The calls of the batch, in issue order.
@@ -317,7 +317,7 @@ pub struct EncoderInputs<'a> {
     pub batch: TokenBatch,
     /// The images of a multimodal tower, empty for a text-only encoder.
     pub images: &'a [ImageInput],
-    /// The layout the encode fills, as the executor got it from [`Encoder::layout`].
+    /// The layout the encode fills, as the worker got it from [`Encoder::layout`].
     ///
     /// The model reads the grids and counts from it: a device table cannot be read back, so without
     /// the layout a tower could not tell which of its per-layout rows belong to which image. It is
@@ -335,7 +335,7 @@ pub struct EncoderInputs<'a> {
 /// One image a multimodal tower reads: its pixels.
 ///
 /// The image's geometry and its tables are the **layout's**, not the image's: two images of one
-/// grid need the same tap tables, and the executor cannot produce any of them. They are therefore
+/// grid need the same tap tables, and the worker cannot produce any of them. They are therefore
 /// [`Encoder::state_tables`]' and reach the encode through [`EncoderInputs::state`], while this
 /// value carries only what the caller decoded.
 #[derive(Clone, Copy)]
@@ -380,7 +380,7 @@ pub struct EncoderOutputs {
 
 /// A video request's numerical layout input: what the denoiser must lay out (specs/worker.md 4.3).
 ///
-/// Every field is a request fact the executor already holds — it decoded the media, encoded the
+/// Every field is a request fact the worker already holds — it decoded the media, encoded the
 /// prompt and knows the canvas — and none is derivable from the others: the packed layout needs the
 /// canvas, the roles' counts, the prompt's token count and each condition's raster.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -465,7 +465,7 @@ pub enum VideoTask {
 
 /// The latent layout a denoiser prepares for one request.
 ///
-/// Ordered and hashed as a plain value of numbers: it is a bucket's extent (`executor::plan::Extent`),
+/// Ordered and hashed as a plain value of numbers: it is a bucket's extent (`worker::plan::Extent`),
 /// and a captured graph is keyed by the bucket it holds.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Layout {
@@ -502,7 +502,7 @@ pub struct LatentShape {
 
 /// A table a model needs on the device but does not own.
 ///
-/// The executor allocates; the model says what it is and fills it. Four kinds exist, they differ
+/// The worker allocates; the model says what it is and fills it. Four kinds exist, they differ
 /// in **who writes them, when, and how many times**, and that is the whole of the protocol:
 ///
 /// - **constants** ([`Denoiser::constant_tables`]) are device memory written by
@@ -512,23 +512,23 @@ pub struct LatentShape {
 ///   nothing back and synchronizes nothing.
 /// - **layout** ([`Denoiser::layout_tables`]) is per *layout* and needs no request: the video VAE's
 ///   rotary positions of its raster, the packed row of each clip's latent voxel. These are the
-///   model's mathematical layout, which the executor cannot compute, and they are the same for
+///   model's mathematical layout, which the worker cannot compute, and they are the same for
 ///   every request of one shape — so they are filled once per layout
 ///   ([`Denoiser::prepare_layout`], host bytes only) and shared.
 /// - **state** ([`Denoiser::state_tables`]) is per *request* of a layout: a table derived from the
 ///   request itself (its prompt clock, its spans, its mask) is one table per request.
-///   [`Denoiser::prepare_state`] writes **host bytes only**; the executor allocates each table and
-///   uploads those bytes. The list is deterministic for a layout, and the executor keys its storage
+///   [`Denoiser::prepare_state`] writes **host bytes only**; the worker allocates each table and
+///   uploads those bytes. The list is deterministic for a layout, and the worker keys its storage
 ///   by `(layout, name)` beside the layout constants'.
 /// - **evaluation** ([`Denoiser::prepare_evaluation`]) is per *evaluation index*: one solver
-///   coefficient set, again host bytes the executor uploads, so a request's schedule is chosen
+///   coefficient set, again host bytes the worker uploads, so a request's schedule is chosen
 ///   without capturing a graph per step.
 ///
 /// No `prepare_*` allocates, takes an allocator, synchronizes or reads anything back; allocation is
-/// the executor's and uploads are the executor's.
+/// the worker's and uploads are the worker's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct StateTable {
-    /// The table's name: unique within its kind and layout, and what the executor keys storage by.
+    /// The table's name: unique within its kind and layout, and what the worker keys storage by.
     pub name: &'static str,
     /// The element type the model writes and the forward reads.
     pub dtype: DType,
@@ -629,7 +629,7 @@ pub struct ConditionPiece {
 ///
 /// The media reader decodes bytes into RGB frames and stereo PCM, which are the media's own forms.
 /// What an encoder reads is the model's arithmetic: its channel order and normalisation, its patch
-/// rows, the padding of a track. The executor owns the decoding and the buffers and asks the model
+/// rows, the padding of a track. The worker owns the decoding and the buffers and asks the model
 /// for these conversions, so no model constant reaches it.
 pub trait MediaFormat: Send + Sync {
     /// Writes `[frames, height, width, 3]` RGB bytes as `out`, the pixels
@@ -758,9 +758,9 @@ pub struct DecodedMedia {
 /// A tower that turns inputs into conditioning (a text encoder, a vision tower, a video encoder).
 ///
 /// The protocol is the denoiser's, in the denoiser's words: the model says what shape an encode
-/// has, which tables that shape needs and writes their host bytes; the executor allocates and
+/// has, which tables that shape needs and writes their host bytes; the worker allocates and
 /// uploads them. A tower's per-grid tables (its rotary clocks, its tap tables, the prompt rows its
-/// images replace) are mathematics the executor cannot reproduce, and they are the same for every
+/// images replace) are mathematics the worker cannot reproduce, and they are the same for every
 /// request of one shape.
 pub trait Encoder {
     /// The shape an encode of `batch`'s rows and `images`' grids has.
@@ -768,7 +768,7 @@ pub trait Encoder {
 
     /// The tables an encode of `layout` reads, in [`Self::prepare_state`]'s order.
     ///
-    /// Deterministic for a layout, so the executor keys storage by `(layout, name)` and shares one
+    /// Deterministic for a layout, so the worker keys storage by `(layout, name)` and shares one
     /// set between every request of that shape.
     fn state_tables(&self, layout: &EncoderLayout) -> Vec<StateTable>;
 
@@ -781,7 +781,7 @@ pub trait Encoder {
     /// counts, only the bytes follow from the ids, so two prompts of one shape share one capture.
     ///
     /// `out[i]` is `state_tables(layout)[i]`'s bytes, row-major in its element type, already the
-    /// right length; the executor uploads it. No allocation, no synchronization, no read-back.
+    /// right length; the worker uploads it. No allocation, no synchronization, no read-back.
     fn prepare_state(
         &self,
         prompt: &EncoderPrompt<'_>,
@@ -803,11 +803,11 @@ pub trait Denoiser {
     /// This is the one number a caller cannot derive and must not transcribe: it is the total of
     /// the model's plan for the layout this request names, so a caller allocating from a literal
     /// beside the plan holds a second statement of a value only the model owns. The plan is derived
-    /// here from `request` in the order the executor already uses - [`layout`](Self::layout) and
+    /// here from `request` in the order the worker already uses - [`layout`](Self::layout) and
     /// then the model's own plan - so a caller never has two ways to name the same plan.
     ///
     /// It is a pure function of the request: two requests with one layout answer the same bytes,
-    /// because the executor caches a capture by bucket and a plan that varied inside a layout would
+    /// because the worker caches a capture by bucket and a plan that varied inside a layout would
     /// be an allocation that fits one request and not the next. It allocates nothing and touches no
     /// device: the model states what its forward needs and the runtime owner allocates to it.
     ///
@@ -901,7 +901,7 @@ pub trait Denoiser {
 
     /// Fold the conditioner's output into `cond.text`, before the request's first evaluation.
     ///
-    /// The executor calls this once per request, before it captures anything and outside a captured
+    /// The worker calls this once per request, before it captures anything and outside a captured
     /// replay: the launches are captured with everything else, so the forward must be capture-safe -
     /// no host read, no synchronization, no allocation. `cond.source` is the buffer the conditioner
     /// reads; `cond.text` is written in place over its own rows.
@@ -934,7 +934,7 @@ pub trait Denoiser {
 
     /// Fill `out` with the constants, in [`Self::constant_tables`]' order.
     ///
-    /// The executor calls this once after loading and before it captures anything: the launches are
+    /// The worker calls this once after loading and before it captures anything: the launches are
     /// captured with everything else, so the forward must be capture-safe — no host read, no
     /// synchronization, no allocation.
     fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> Result<()>;
@@ -942,7 +942,7 @@ pub trait Denoiser {
     /// The constants a layout needs, in the order [`Self::prepare_layout`] fills them.
     ///
     /// These are the layout's alone: the video VAE's per-voxel rotary positions, the packed row of
-    /// each clip's voxel. They are filled once per layout, not once per request, so the executor
+    /// each clip's voxel. They are filled once per layout, not once per request, so the worker
     /// keys its storage by `(layout, name)` beside the request's state and shares one set between
     /// every request of that shape.
     fn layout_tables(&self, layout: &Layout) -> Result<Vec<StateTable>>;
@@ -950,19 +950,19 @@ pub trait Denoiser {
     /// Write the host bytes of each layout constant of `layout`, in [`Self::layout_tables`]' order.
     ///
     /// Same rule as [`Self::prepare_state`]: host bytes only, already the right length, uploaded by
-    /// the executor, and deterministic for a layout so two requests of one shape agree.
+    /// the worker, and deterministic for a layout so two requests of one shape agree.
     fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
 
     /// The tables a request of `layout` needs, in the order [`Self::prepare_state`] fills them.
     ///
-    /// Deterministic for a layout: the executor keys its storage by `(layout, name)`, so two
+    /// Deterministic for a layout: the worker keys its storage by `(layout, name)`, so two
     /// requests of the same shape share one set.
     fn state_tables(&self, layout: &Layout) -> Vec<StateTable>;
 
     /// Write the host bytes of each table of `layout`, in [`Self::state_tables`]' order.
     ///
     /// `out[i]` is `state_tables(layout)[i]`'s bytes, row-major in its element type, and is already
-    /// the right length; the executor uploads it.
+    /// the right length; the worker uploads it.
     fn prepare_state(
         &self,
         request: &VideoRequest<'_>,
@@ -1002,7 +1002,7 @@ pub trait Decoder {
     ///
     /// Every decoder table is layout-keyed: the copy blocks' offsets, the per-voxel rotary
     /// positions and the packed row of each clip's voxel all follow from the layout's counts, not
-    /// from a request's seed or schedule. Deterministic for a layout, so the executor keys storage
+    /// from a request's seed or schedule. Deterministic for a layout, so the worker keys storage
     /// by `(layout, name)` and shares one set between every request of that shape.
     ///
     /// A layout the block cannot serve is a **named error**, not an empty list: a block with no
@@ -1014,7 +1014,7 @@ pub trait Decoder {
     /// Write the host bytes of each table of `layout`, in [`Self::layout_tables`]' order.
     ///
     /// `out[i]` is `layout_tables(layout)[i]`'s bytes, row-major in its element type, and is
-    /// already the right length; the executor uploads it. Host bytes only: no allocation, no
+    /// already the right length; the worker uploads it. Host bytes only: no allocation, no
     /// synchronization and no read-back, so a decode captured after this call is capture-safe.
     fn prepare_layout(&self, layout: &Layout, out: &mut [Vec<u8>]) -> Result<()>;
 
@@ -1103,7 +1103,7 @@ pub trait Decoder {
     ///
     /// The same contract as [`Denoiser::arena_bytes`], for the subject a decoder already has: it is
     /// the total of the model's plan for the layout, a pure function of it - two clips of one layout
-    /// answer the same bytes, because the executor keys a capture and its arena by layout - and it
+    /// answer the same bytes, because the worker keys a capture and its arena by layout - and it
     /// allocates nothing and touches no device.
     ///
     /// It takes a layout rather than a request because a decoder is handed a layout:
@@ -1199,7 +1199,7 @@ pub trait Decoder {
 /// An autoregressive token model.
 ///
 /// The batch is already in the layout the kernels read (the mechanism writes [`BatchRows`], the
-/// executor uploads the [`TokenBatch`] views), so no method here converts or gathers on the host.
+/// worker uploads the [`TokenBatch`] views), so no method here converts or gathers on the host.
 pub trait CausalLm {
     /// Write the embeddings of `ids` into `out` (`[tokens, hidden]`).
     fn embed_input_ids(&self, f: &Forward, ids: TensorView, out: TensorView) -> Result<()>;
@@ -1216,7 +1216,7 @@ pub trait CausalLm {
     /// Project the rows of `hidden` onto the vocabulary, writing the logits to `out`.
     ///
     /// `hidden` is the `[rows, hidden]` view of the rows named by `TokenBatch::logits_rows`; the
-    /// executor gathered them. `out` is `[rows, vocabulary]`.
+    /// worker gathered them. `out` is `[rows, vocabulary]`.
     fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()>;
 
     /// Runs every expert layer of one step with no tokens of this rank's own.

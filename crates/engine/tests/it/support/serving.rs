@@ -10,13 +10,13 @@ use std::sync::Mutex;
 use engine::SchedulerConfig;
 use proto::config::EngineArgs;
 
-use executor::batch::{
+use ipc::{MainProcessEndpoint, MainProcessInfo, TimingCounters};
+use proto::config::BlockConfig;
+use worker::batch::{
     Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
     SubmissionId,
 };
-use executor::completion::Outcome;
-use ipc::{MainProcessEndpoint, MainProcessInfo, TimingCounters};
-use proto::config::BlockConfig;
+use worker::completion::Outcome;
 
 /// The token this pool samples for the `index`th call of every batch.
 pub(crate) const SAMPLED: u32 = 1000;
@@ -126,7 +126,7 @@ impl Serving {
 }
 
 impl Batches for Serving {
-    fn submit(&self, batch: Batch) -> Result<Submission, executor::Error> {
+    fn submit(&self, batch: Batch) -> Result<Submission, worker::Error> {
         self.submitted
             .lock()
             .expect("the pool's batches")
@@ -134,7 +134,7 @@ impl Batches for Serving {
         Ok(self.serve(batch))
     }
 
-    fn shadow(&self, batch: Batch) -> Result<Submission, executor::Error> {
+    fn shadow(&self, batch: Batch) -> Result<Submission, worker::Error> {
         Ok(self.serve(batch))
     }
 
@@ -162,7 +162,7 @@ pub(crate) fn rank(host: &str) -> MainProcessInfo {
         // No `prefix_cache` here on purpose: `MainProcessInfo::default` states the
         // paged KV pool every token-serving rank advertises, and setting it to
         // `None` makes the engine refuse every generation request with
-        // "generation request requires executor KV resources"
+        // "generation request requires worker KV resources"
         // (`scheduler/admission.rs`). A media-only rank is the one that states
         // none, and that is not this pool.
         buffer_pool_bytes: 1 << 20,

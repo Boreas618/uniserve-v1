@@ -2,7 +2,7 @@
 //!
 //! A request is snapped to a legal frame count and a legal canvas, packed into the row order the
 //! transformer reads (`[video | audio | prefix | padding]`, [`crate::packing`]), and evaluated once
-//! per schedule point. This module owns what surrounds the evaluation: the layout the executor
+//! per schedule point. This module owns what surrounds the evaluation: the layout the worker
 //! captures against, and the tables that make a captured graph independent of the prompt.
 //!
 //! ## Layouts, not requests
@@ -11,7 +11,7 @@
 //! capacity - and replayed for every request that fits it. So the layout snaps: frames to `17n + 5`
 //! ([`crate::packing::align_num_frames`]), sides to the checkpoint's 32-pixel grid, and both prefix
 //! capacities up to whole capacity units (64 rows under dense attention, the sparse tile
-//! otherwise). Two requests of one layout share one set of tables, and the executor keys its
+//! otherwise). Two requests of one layout share one set of tables, and the worker keys its
 //! storage by `(layout, name)`.
 //!
 //! ## The prefix source is one buffer
@@ -34,7 +34,7 @@
 //!
 //! ## Host bytes
 //!
-//! Everything a request changes arrives as device tables the executor allocates: the rotary
+//! Everything a request changes arrives as device tables the worker allocates: the rotary
 //! coordinates, the modulation tags, the timestep groups, the prefix index of every packed row, the
 //! AdaLN row each row reads, and the step index. `Layouts::prepare_state` writes their host bytes
 //! in the order `Layouts::state_tables` names them; nothing of a request reaches a capture as a
@@ -474,7 +474,7 @@ impl Layouts {
 
     /// The audio latent a generated frame count holds.
     ///
-    /// The layout's `channels * frames` is the latent's element count and the executor sizes the
+    /// The layout's `channels * frames` is the latent's element count and the worker sizes the
     /// buffer and its noise draw from that product; the denoiser reads those elements as
     /// `AUDIO_CHANNELS * steps` rows of `audio_channels` features, channel-major. So the stereo pair
     /// of channel planes is the `channels`, and a `steps` count is the `frames` - stating
@@ -534,7 +534,7 @@ impl Layouts {
     /// The tables one request of `layout` needs, in the order `Layouts::prepare_state` fills them.
     ///
     /// Sorted by name, so the order is a property of the layout alone and two requests of one shape
-    /// share one set. Every table is one the forward reads; none is a host value the executor would
+    /// share one set. Every table is one the forward reads; none is a host value the worker would
     /// otherwise have to pass through a launch.
     pub fn table_specs(&self, layout: &Layout) -> Result<Vec<StateTable>> {
         if matches!(
@@ -620,7 +620,7 @@ impl Layouts {
                 dtype: DType::I32,
                 shape: Shape::new(&[2]),
             },
-            // The step the schedule evaluates: written by the executor before each replay, one
+            // The step the schedule evaluates: written by the worker before each replay, one
             // value per (request, capture) rather than per row.
             StateTable {
                 name: "step",
@@ -844,7 +844,7 @@ impl Layouts {
                 .ok_or_else(|| Error::config(format!("{name} is not a table of this layout")))?;
             let buffer = out
                 .get_mut(position)
-                .ok_or_else(|| Error::config(format!("the executor holds no buffer for {name}")))?;
+                .ok_or_else(|| Error::config(format!("the worker holds no buffer for {name}")))?;
             if buffer.len() != bytes.len() {
                 return Err(Error::config(format!(
                     "{name} is {} bytes, its buffer {}",
@@ -860,7 +860,7 @@ impl Layouts {
             .ok_or_else(|| Error::config("the block-size table is missing".to_owned()))?;
         let buffer = out
             .get_mut(position)
-            .ok_or_else(|| Error::config("the executor holds no block-size buffer".to_owned()))?;
+            .ok_or_else(|| Error::config("the worker holds no block-size buffer".to_owned()))?;
         let bytes = integers(&sizes);
         if buffer.len() != bytes.len() || tiles != sizes.len() {
             return Err(Error::config(format!(
@@ -875,7 +875,7 @@ impl Layouts {
 
     /// Write one request's tables, in `Layouts::state_tables`' order.
     ///
-    /// The bytes are host bytes in each table's own element type: the executor uploads them once
+    /// The bytes are host bytes in each table's own element type: the worker uploads them once
     /// per request, before the capture it will replay. `text_tokens` is the prompt's row count,
     /// which the media clock starts at; a prompt that does not fit the layout's capacity is
     /// refused here rather than captured.
@@ -950,7 +950,7 @@ impl Layouts {
                 .ok_or_else(|| Error::config(format!("{name} is not a table of this layout")))?;
             let Some(buffer) = out.get_mut(position) else {
                 return Err(Error::config(format!(
-                    "the executor holds no buffer for {name}"
+                    "the worker holds no buffer for {name}"
                 )));
             };
             if buffer.len() != bytes.len() {
@@ -962,7 +962,7 @@ impl Layouts {
             }
             buffer.copy_from_slice(&bytes);
         }
-        // The step is the executor's to write through `prepare_evaluation`: one i32 a replay
+        // The step is the worker's to write through `prepare_evaluation`: one i32 a replay
         // changes.
         let position = specs
             .iter()
@@ -1571,10 +1571,10 @@ fn modulation_indices(groups: &[i32], tags: &[i32]) -> Vec<u8> {
 /// filled by one post-load launch.
 ///
 /// That is a declared deviation from the capability's constant-table mechanism: [`Denoiser::constant_tables`]
-/// is empty and [`Denoiser::prepare_constants`] writes the model's own region, so the executor
+/// is empty and [`Denoiser::prepare_constants`] writes the model's own region, so the worker
 /// allocates nothing and no table is duplicated. It is one model's load-time fold, sized by that
 /// model from its config alone and read only by it; a capability field carrying those views would
-/// make every executor size a table it never reads. The launch stays capture-safe, writing a region
+/// make every worker size a table it never reads. The launch stays capture-safe, writing a region
 /// allocated once.
 pub struct Denoiser {
     config: DenoiserConfig,
@@ -1662,7 +1662,7 @@ fn flattened(error: Error) -> nn::Error {
     }
 }
 
-/// The capability surface the executor binds: layouts, tables, and the step.
+/// The capability surface the worker binds: layouts, tables, and the step.
 ///
 /// Every method delegates to the inherent one, so the model's own API stays the one the tests and
 /// the runner's documentation read.
@@ -1713,7 +1713,7 @@ impl nn::capability::Denoiser for Denoiser {
     /// column, so its scratch and the graph's buffers occupy the same offsets by construction: the
     /// graph clobbers the fold's scratch, which is dead, and never the fold's output, which is a
     /// column. Adding the two would refuse a deployment that serves - and the plan's entries are
-    /// storage the executor allocates by name, so an added entry is memory rather than a bound.
+    /// storage the worker allocates by name, so an added entry is memory rather than a bound.
     ///
     /// The larger, then, and not the sum: at every deployment here the evaluation is the larger (the
     /// fold is 532 MiB against the evaluation's 6.1 GiB at a 1024-row capacity), and the `max` is
@@ -1962,7 +1962,7 @@ impl nn::capability::Denoiser for Denoiser {
         }
         // An evaluation has no host bytes of its own: every coefficient a step reads is a constant
         // the loader wrote once (`constant_tables` is empty), and the step index is device data the
-        // executor writes before each replay. A buffer offered here means the caller and
+        // worker writes before each replay. A buffer offered here means the caller and
         // `constant_tables` disagree about what an evaluation owns.
         if !out.is_empty() {
             return Err(flattened(Error::config(format!(
@@ -2063,7 +2063,7 @@ impl<'a> Tables<'a> {
         self.views
             .get(position)
             .copied()
-            .ok_or_else(|| Error::config(format!("the executor passed no {name} table")))
+            .ok_or_else(|| Error::config(format!("the worker passed no {name} table")))
     }
 }
 
@@ -2104,7 +2104,7 @@ pub fn packed_rows(
 
 /// Every buffer one evaluation reserves at `layout`, in the order the forward reserves them.
 ///
-/// The executor sizes the denoiser's arena by the sum of this plan and keys its storage by the names,
+/// The worker sizes the denoiser's arena by the sum of this plan and keys its storage by the names,
 /// as it does for the decoder's two plans and the splice's. The list is the forward's own reservation
 /// order - `Denoiser::denoise_traced`, then the transformer's forward, then each modality's head in
 /// the order the forward reaches them - because the arena is one cursor: a buffer listed before
@@ -2116,7 +2116,7 @@ pub fn packed_rows(
 /// the one repeated entry, gathered once per modality.
 ///
 /// The rows are this layout's own packed count, so a plan is exact for a canvas rather than a bound,
-/// and the executor takes the largest layout it will serve.
+/// and the worker takes the largest layout it will serve.
 ///
 /// This is the plan itself, with every value the deployment supplies passed in, so a host tool that
 /// has a configuration and no checkpoint can size a stage from it.
@@ -2555,7 +2555,7 @@ impl Denoiser {
 
     /// Every buffer one evaluation at `layout` reserves, in the forward's own reservation order.
     ///
-    /// The executor sizes the denoiser's arena by the sum of this plan and keys its storage by the
+    /// The worker sizes the denoiser's arena by the sum of this plan and keys its storage by the
     /// names, as it does for the decoder's two plans and the splice's. It is [`denoise_arena`] with
     /// this deployment's own numbers - the checkpoint's element type and the schedule's group count -
     /// so the plan and the forward read one configuration.
@@ -2912,7 +2912,7 @@ impl Denoiser {
     /// Refine one request's conditioning: the text encoder's features into the DiT's width.
     ///
     /// `source` is the encoder's `[rows, text_dim]` output and `text` the request's `[rows, hidden]`
-    /// conditioning buffer; both are the executor's, and neither is retained. The refiner's
+    /// conditioning buffer; both are the worker's, and neither is retained. The refiner's
     /// document boundaries are the `refiner_cu_seq_lens_*` tables of `state`, so its queries are
     /// every padded row and its keys stop at the prompt's last row.
     ///
@@ -3503,7 +3503,7 @@ impl Denoiser {
         )?;
         let velocity = arena.tensor(sample_dtype, video.shape)?;
         unpatch.forward(f, velocity_rows, velocity)?;
-        // The solver's coefficient is gathered on the device from the executor's `step` table, so
+        // The solver's coefficient is gathered on the device from the worker's `step` table, so
         // this launch addresses one staging word whose contents change per evaluation rather than
         // one buffer per evaluation; the same word serves the audio step's gather.
         self.solver.step(
@@ -3836,7 +3836,7 @@ impl Denoiser {
     pub fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> Result<()> {
         if !out.is_empty() {
             return Err(Error::config(format!(
-                "the H3 AdaLN cache is model memory; {} executor views were offered",
+                "the H3 AdaLN cache is model memory; {} worker views were offered",
                 out.len()
             )));
         }
@@ -4181,7 +4181,7 @@ mod tests {
 
     #[test]
     fn an_arena_plan_names_every_buffer_once_and_declares_a_known_element() {
-        // The executor keys the arena's storage by these names and sizes it by the sum of the element
+        // The worker keys the arena's storage by these names and sizes it by the sum of the element
         // counts, so a repeated name aliases two buffers and a letter outside the plan vocabulary is
         // charged four bytes an element (`Buffer::width`'s fallback) - both silent at a canvas, both
         // wrong for the whole deployment. The group count is an input: the plan scales two entries by
@@ -4661,7 +4661,7 @@ mod tests {
 
     #[test]
     fn the_layout_declares_every_element_the_audio_branch_reads() {
-        // The executor sizes the audio latent and its draw from `channels * frames`, so that product
+        // The worker sizes the audio latent and its draw from `channels * frames`, so that product
         // is what the denoiser must read as rows. The latent is the stereo pair of channel planes:
         // `AUDIO_CHANNELS * audio_channels * steps` elements, read as `AUDIO_CHANNELS * steps` rows
         // of `audio_channels`. Declaring `audio_channels` alone would state half of them.
@@ -4872,7 +4872,7 @@ mod tests {
     }
 
     #[test]
-    fn the_tables_are_the_layout_s_and_the_step_is_the_executor_s_to_write() {
+    fn the_tables_are_the_layout_s_and_the_step_is_the_worker_s_to_write() {
         let rule = layouts();
         // A prompt of twelve rows, the configuration `write_state` is exercised with below: every
         // write index then points into the text rows rather than at the zero row, so a table the
@@ -4882,13 +4882,13 @@ mod tests {
         let (layout, packing) = rule.layout(&request).unwrap();
         let tables = rule.table_specs(&layout).unwrap();
         let names: Vec<_> = tables.iter().map(|table| table.name).collect();
-        // The executor addresses a table by name, so a name may appear once and no position is
+        // The worker addresses a table by name, so a name may appear once and no position is
         // promised: the tables are sorted by name, and any positional claim about them goes stale
         // the moment a table is added. The set itself is the code's own list, which
         // `each_kind_resolves_its_state_tables_by_its_own_names` pins against `table_specs`.
         let unique: std::collections::BTreeSet<_> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "a name repeats: {names:?}");
-        // The step is the one table the model never fills: the executor writes its single index
+        // The step is the one table the model never fills: the worker writes its single index
         // before each replay, so `write_state` must leave its bytes as the caller offered them.
         const OFFERED: u8 = 0xAB;
         let mut state: Vec<Vec<u8>> = tables
@@ -4906,7 +4906,7 @@ mod tests {
             if table.name == "step" {
                 assert!(
                     bytes.iter().all(|byte| *byte == OFFERED),
-                    "the executor writes the step index; the model must not"
+                    "the worker writes the step index; the model must not"
                 );
             } else {
                 assert!(
@@ -5124,7 +5124,7 @@ mod tests {
     }
     #[test]
     fn each_kind_resolves_its_state_tables_by_its_own_names() {
-        // The names are positional: the executor passes its views in `table_specs`' order, so a set
+        // The names are positional: the worker passes its views in `table_specs`' order, so a set
         // that is not exactly that order reads another tensor without any shape complaining.
         let dense = layouts();
         let layout = dense.cover(&request(22, 1344, 768));

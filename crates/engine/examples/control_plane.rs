@@ -1,8 +1,8 @@
 //! Demonstrates concurrent text and image requests through the simulated engine.
 //!
 //! The example exercises scheduling and lifecycle events without requiring a
-//! model executor or GPU. Three text-only and two image-only requests share one
-//! scheduler thread over `SimExecutor`; the run passes when every request
+//! model worker or GPU. Three text-only and two image-only requests share one
+//! scheduler thread over `SimWorker`; the run passes when every request
 //! finishes within the deadline, each text request emits at least one text
 //! token, and each image request emits at least one image. The process exits
 //! with status 1 on failure, and reports an error when the simulation cannot
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use engine::Event;
 use engine::{
-    CommandWaker, Executor, Scheduler, SchedulerConfig, SchedulerHandle, SimEngine, SimExecutor,
+    CommandWaker, Scheduler, SchedulerConfig, SchedulerHandle, SimEngine, SimWorker, Worker,
 };
 use engine::{
     FeedbackNextToken, FeedbackSource, GenerationConstraint, GenerationLimits, GenerationRequest,
@@ -27,10 +27,10 @@ fn main() -> anyhow::Result<()> {
     // Two batches may be in flight at once, so a step never waits on the one
     // before it to be retired.
     sim.set_queue_depth(2);
-    let executor = Box::new(SimExecutor::new(sim));
-    let capacity = engine::BatchCapacity::of(&executor.info().runtime_info()?);
+    let worker = Box::new(SimWorker::new(sim));
+    let capacity = engine::BatchCapacity::of(&worker.info().runtime_info()?);
     let mut sched = Scheduler::new(
-        engine::Submissions::new(executor),
+        engine::Submissions::new(worker),
         SimEngine::special_tokens(),
         SchedulerConfig {
             max_batch: 32,
@@ -85,7 +85,7 @@ fn main() -> anyhow::Result<()> {
         };
         let cache = Default::default();
         // These limits only check the request locally before submission; the
-        // scheduler resolves its limits separately against the executor.
+        // scheduler resolves its limits separately against the worker.
         let limits = GenerationLimits {
             features: engine::GenerationFeatures::UNDERSTANDING
                 | engine::GenerationFeatures::VISION_ENCODE

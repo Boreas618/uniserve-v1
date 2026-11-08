@@ -15,7 +15,7 @@
 //! ```
 //!
 //! The step's AdaLN rows are device data ([`crate::modulation`]), so one captured stack serves
-//! every step of the schedule. The tables themselves are the executor's: the model reads the cache
+//! every step of the schedule. The tables themselves are the worker's: the model reads the cache
 //! through the borrow it is handed, never through state of its own.
 
 use crate::attention::{self, Factors, Visible};
@@ -387,7 +387,7 @@ impl Trace<'_> {
 /// once, on the host, at the loading boundary; what a forward does is pick one row.
 ///
 /// The table is laid out `[blocks, out * hidden]` so that one evaluation's head is **one table
-/// row**: `gather_rows` indexed by the executor's `step` view (`[1]` int32) gives `[1, out *
+/// row**: `gather_rows` indexed by the worker's `step` view (`[1]` int32) gives `[1, out *
 /// hidden]`, and a projection over that view's element type is the ordinary output projection. The
 /// gathered buffers sit at fixed arena addresses with contents that change per evaluation, so the
 /// graph does not change: one capture serves every step of a layout.
@@ -1129,7 +1129,7 @@ fn chunks(table: TensorView, width: u64, first: u64) -> Result<(Weight, Weight, 
 
 /// A weight over memory the caller owns: a table gathered for one step.
 ///
-/// Nothing is retained: the executor keeps the table alive for the length of the capture and its
+/// Nothing is retained: the worker keeps the table alive for the length of the capture and its
 /// replays, which is the same guarantee every other request table has.
 fn borrowed(view: TensorView) -> Result<Weight> {
     let bytes = view.numel() * view.dtype.bytes().unwrap_or(1);
@@ -1352,8 +1352,8 @@ impl Transformer {
 
     /// The stack over `hidden` `[tokens, hidden_size]`, in place, at one step.
     ///
-    /// `adaln` is the cache the executor bound for this request, `step` the `[1]` i32 step index
-    /// the executor wrote before the replay, and `rows` the `[tokens]` AdaLN row of each token.
+    /// `adaln` is the cache the worker bound for this request, `step` the `[1]` i32 step index
+    /// the worker wrote before the replay, and `rows` the `[tokens]` AdaLN row of each token.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -1454,7 +1454,7 @@ impl Transformer {
 
 /// Every temporary view the stack reads, reserved once for the whole forward.
 ///
-/// The executor's arena is a bump allocator reset once per forward, so scratch that does not depend
+/// The worker's arena is a bump allocator reset once per forward, so scratch that does not depend
 /// on the layer is reserved once: reserving it per layer would multiply the arena by the layer
 /// count, which a 50-layer stack cannot afford at a served canvas.
 pub struct Scratch {

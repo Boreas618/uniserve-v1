@@ -1,0 +1,509 @@
+//! The runner a block's phase is served by, and the registry the device worker holds.
+//!
+//! A runner serves one block's phases (specs/worker.md 4.5): it owns the captured graphs of those
+//! phases, the arena their activations live in, and the slot state a token batch advances. It is
+//! called only on the device worker's thread and only one job at a time, which is why the design
+//! gives it `&mut self` and no synchronization.
+//!
+//! [`Runner`] is the design's trait verbatim. Its `precopy`, `switchover` and `purge` are the
+//! runner's half of the program-layer update (7.3): precopy prepares the next generation's graphs
+//! from the current one, switchover takes effect at a batch boundary, and purge releases the graphs
+//! that still reference a replaced generation after its last batch.
+
+use std::sync::Arc;
+
+use ipc::PhaseId;
+use ops::Generation;
+
+use crate::Error;
+use crate::Result;
+use crate::batch::{Batch, Jobs};
+
+/// The worker's name for one runner on a device.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct RunnerId(pub u32);
+
+/// What the design calls a runner (4.5).
+///
+/// A runner serves the phases it names. `submit` turns one batch into the device work that serves
+/// it, after staging the batch's host columns; `precopy` prepares the graphs the next generation
+/// needs and returns the jobs that finish the preparation on the device; `switchover` and `purge`
+/// are executed at batch boundaries by the device worker.
+pub trait Runner: Send {
+    /// The phases this runner serves, as the scheduler addresses them (4.5).
+    fn phases(&self) -> &[PhaseId];
+
+    /// The stream this runner issues its work on, when it has one.
+    ///
+    /// The worker waits on the runners' streams after each job: a runner owns the stream its
+    /// graphs replay on, and the worker has none of its own.
+    fn stream(&self) -> Option<&platform::Stream> {
+        None
+    }
+
+    /// Whether a replay of this runner may be launched while its previous replay still runs.
+    ///
+    /// Launching a large graph takes the driver milliseconds, and the device sits idle for them
+    /// when the launch waits for the previous replay to end. A runner that says yes reads nothing
+    /// of a replay's staging from memory the next `submit` or `serve` writes.
+    fn overlaps_replays(&self) -> bool {
+        false
+    }
+
+    /// Whether the batch just staged may stay in flight once launched, which a runner whose answer
+    /// feeds the next launch refuses for that batch alone.
+    fn overlaps_staged(&self) -> bool {
+        self.overlaps_replays()
+    }
+
+    /// Turns `output`, the answer a replay gave when it launched, into its answer now that its work
+    /// has landed.
+    fn landed(&mut self, output: crate::batch::BatchOutput) -> Result<crate::batch::BatchOutput> {
+        Ok(output)
+    }
+
+    /// Serves one batch: stage its inputs, choose its bucket, and return the device work.
+    fn submit(&mut self, batch: Batch) -> Result<Jobs>;
+
+    /// The media buckets this runner's plan captures, stated at spawn (2.4).
+    ///
+    /// Stated here rather than answered on demand because the mechanism chooses a device without
+    /// asking the device thread: the worker's handle mirrors this list beside the phases, the way
+    /// it mirrors those, and the mechanism's planner selects from the mirror. A causal-LM runner
+    /// states none - its plan holds no media graph (`plan::Bucket::causal_lm` refuses one).
+    fn media_plan(&self) -> Vec<crate::plan::Bucket> {
+        Vec::new()
+    }
+
+    /// The buckets the next generation captures, in capture order, as this runner sees them.
+    ///
+    /// The first generation of an epoch has nothing to compare against, so every operator of every
+    /// bucket is new and one capture per bucket records them all: this list is that work stated
+    /// before it begins, which is the only way a run can see the number before paying for it. It is
+    /// the same set `warmup` walks, in the same order.
+    fn capture_plan(&self) -> Vec<crate::plan::Bucket> {
+        Vec::new()
+    }
+
+    /// The resident cache this runner reads, when it reads one: what a sleep gives back and a wake
+    /// maps again (2.5).
+    ///
+    /// The caller dedups by the handle's address, because two runners of one device may share one
+    /// cache and a second wake would reset units the first had just mapped.
+    fn cache(
+        &self,
+    ) -> Option<std::sync::Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
+        None
+    }
+
+    /// The rank's weights changed at their addresses (7.6): a runner fills again what it folded
+    /// from them. It runs on the device thread with nothing in flight, and its work completes
+    /// before a batch reads the weights. A runner that folds nothing has nothing to do.
+    fn weights_changed(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Hands the runner the device's record of the operators a program-layer update could not
+    /// compare (7.3 step 2).
+    ///
+    /// The record lives on the device worker because the control thread reports it when a
+    /// precopy finishes, and the runners themselves run on the device thread. A runner that
+    /// compares nothing ignores it.
+    fn attach_uncompared(&mut self, sink: std::sync::Arc<std::sync::Mutex<Vec<String>>>) {
+        let _ = sink;
+    }
+
+    /// Turns one shadow batch of the scheduler's `shadow` pass into the paired forwards it needs
+    /// (7.3 step 2).
+    ///
+    /// `batch.generation` is the generation being prepared: the batch's columns say what to run and
+    /// the runner compares that generation's kernels against the serving one's, operator by
+    /// operator, without writing resident memory. A runner that shadows no operator returns no
+    /// job.
+    fn shadow(&mut self, batch: Batch) -> Result<Jobs> {
+        let _ = batch;
+        Err(crate::Error::Invariant(
+            "this runner has no shadow pass".into(),
+        ))
+    }
+
+    /// Captures every bucket of the serving generation that has no graph yet, largest first
+    /// (`specs/replaceable-processes.md` 9.4 step 3: the worker captures before it serves).
+    ///
+    /// The returned jobs are the captures, each performed by this runner when the device worker
+    /// reaches it, so a warmup interleaves with anything else the device is doing. A runner whose
+    /// buckets are all captured returns no job.
+    fn warmup(&mut self) -> Result<Jobs>;
+
+    /// Prepares the next generation (7.3): rebind the buckets whose program change leaves the
+    /// launch structure intact, recapture those whose structure changes, and return the jobs the
+    /// device must run between serving batches to finish it.
+    ///
+    /// Which of the two a bucket needs is a fact about the walk's launch structure against the
+    /// captured graph, so a runner returns the walk job and decides inside it (4.5).
+    ///
+    /// Precopy leaves the current generation serving. The runner holds both generations until
+    /// `purge` releases the old one.
+    fn precopy(&mut self, next: &Arc<Generation>) -> Result<Jobs>;
+
+    /// Switches to `generation` at a batch boundary: from the next batch on, `submit` serves with
+    /// its kernels and graphs. The runner keeps the previous generation for a revert (7.3).
+    ///
+    /// A generation this runner did not prepare is refused by name: the daemon asks for the
+    /// cut-over only after `precopy` built the generation, so a switchover that finds nothing to
+    /// switch to is the two disagreeing about what was prepared - and the alternative, taking the
+    /// generation's number with no kernels and no graphs behind it, would serve an empty
+    /// generation that answers every later batch with "no graph for this bucket".
+    fn switchover(&mut self, generation: u64) -> Result<()>;
+
+    /// Reverts a generation (7.3 step 4).
+    ///
+    /// After a switchover this is the switchover reversed: the generation kept for a revert serves
+    /// again and the failed one takes its place as the kept generation, so its graphs and kernels
+    /// live until `purge` releases them after the last batch that used them. A generation that
+    /// never took over has its graphs released here and the serving generation is untouched.
+    ///
+    /// Design 4.5's method list does not name it and a failed precopy cannot do without it, so it
+    /// is a filled silence beside `serve` and `warmup`.
+    fn revert(&mut self, generation: u64);
+
+    /// Releases everything that references a generation older than `generation` (7.3): the graphs
+    /// and the kernels they held. It runs after the last batch of the old generation completed.
+    fn purge(&mut self, generation: u64);
+
+    /// Releases everything that references `generation`, which was prepared and never served
+    /// (7.3 step 2): its graphs, the kernels they held, and its arena regions where nothing else
+    /// addresses them.
+    ///
+    /// This is not `purge`, which drops what is *older* than the serving generation: a precopy that
+    /// was abandoned leaves a generation *newer* than it, and only this call reaches that.
+    /// Abandons a prepared generation: its graphs go, then the arena regions no live generation
+    /// holds. A generation this runner serves - the serving one or probation's old one - is refused
+    /// by name: discarding it would take away the graphs that answer batches.
+    fn discard(&mut self, generation: u64) -> Result<()>;
+
+    /// States what this runner's stream needs of the device's graph range, from the model's plan.
+    ///
+    /// Called once the pools are attached and before any capture maps a range. A runner whose model
+    /// states no plan keeps the even share.
+    fn claim_arena(&mut self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    /// Gives the runner the device's graph pools, before its first capture.
+    ///
+    /// One pool set exists per device and every runner issuing on it books into the same one
+    /// (4.1): two runners each reserving their own range would double-book the device's graph
+    /// storage. The device worker calls this when it starts.
+    fn attach_pools(&mut self, pools: std::sync::Arc<std::sync::Mutex<crate::arena::Pools>>) {
+        let _ = pools;
+    }
+
+    /// Gives the runner the shadow harness of its device (7.3): the paired forward needs an
+    /// allocator-backed twin region, so the worker carves it and installs it here. A runner that
+    /// shadows no operator ignores it.
+    fn attach_shadow(&mut self, shadow: crate::shadow::Shadow, page_set_bytes: u64) {
+        let _ = (shadow, page_set_bytes);
+    }
+
+    /// Gives the runner the device's counters, when its work adds to them.
+    ///
+    /// The device worker calls this when it starts, beside [`Runner::attach_pools`]. A runner
+    /// that launches kernels adds their number here as it replays, so the metrics report's
+    /// `kernel_launches` is the device's figure and not a per-runner estimate.
+    fn attach_counters(&mut self, counters: std::sync::Arc<crate::device::SharedCounters>) {
+        let _ = counters;
+    }
+
+    /// Gives the runner the epoch's product store: the conditioning and trajectories one call
+    /// produces and another call of the same request reads.
+    ///
+    /// The device worker calls this when it starts, beside [`Runner::attach_pools`]. A runner that
+    /// produces or reads no product across calls ignores it; one that does refuses a call whose
+    /// product no call produced, rather than reading a region nobody wrote
+    /// ([`crate::runners::products`]).
+    fn attach_products(
+        &mut self,
+        products: std::sync::Arc<dyn crate::runners::products::Products>,
+    ) {
+        let _ = products;
+    }
+
+    /// Performs one job this runner returned from `submit` or `precopy`, on the device worker's
+    /// thread, when the worker reaches it in submission order.
+    ///
+    /// The design's trait has no such method and needs one: 4.5 has a recapture run "as a job on
+    /// the worker, alternating with serving batches", and only the runner owns the model and the
+    /// arena that a capture, a replay or a rebind needs. The worker cannot perform those jobs
+    /// itself, so the runner that returned them performs them here.
+    fn serve(&mut self, job: &crate::batch::Job) -> Result<crate::batch::BatchOutput>;
+}
+
+/// One runner the device worker owns: its name, the phases it serves, and the runner itself.
+///
+/// What binds a runner to the worker: its name, the phases it serves, and the device it issues
+/// on.
+///
+/// The four travel together - a runner is named once, serves a fixed set of phases, and issues
+/// every job on one device's one stream - so a constructor that took them apart could be called
+/// with answers that belong to different runners.
+pub struct Binding {
+    /// The worker's name for this runner.
+    pub id: RunnerId,
+    /// The phases it serves, in scheduler order.
+    pub phases: Vec<PhaseId>,
+    /// The device it computes on.
+    pub device: platform::DeviceId,
+    /// The stream every job it issues runs on.
+    pub stream: platform::Stream,
+}
+
+/// The device worker keeps these in [`RunnerId`] order and serves a batch through the runner
+/// whose phase it names.
+pub struct NamedRunner {
+    /// The worker's name for this runner.
+    pub id: RunnerId,
+    /// The phases it serves, in the order its `phases` returns them.
+    pub phases: Vec<PhaseId>,
+    /// The runner itself.
+    pub runner: Box<dyn Runner>,
+}
+
+impl NamedRunner {
+    /// A named runner, taking the phase list from the runner itself.
+    pub fn new(id: RunnerId, runner: Box<dyn Runner>) -> Self {
+        let phases = runner.phases().to_vec();
+        Self { id, phases, runner }
+    }
+
+    /// Whether this runner serves `phase`.
+    pub fn serves(&self, phase: PhaseId) -> bool {
+        self.phases.contains(&phase)
+    }
+}
+
+/// The runner of a device that serves `computation` in `phase`.
+///
+/// A device's runners are chosen by **two** declarations, not one: the phase a batch names, which
+/// several runners may claim (a media deployment has one decoder per canvas, and a denoiser with one
+/// bucket per served layout has one runner per layout), and the plan a runner holds, which says
+/// which computations of that phase it can run. A rule that read only the phase would serve every
+/// clip of a device through the first decoder and every layout through the first denoiser, silently:
+/// both would be captured for a shape the batch does not have.
+///
+/// A computation that **two** runners claim is refused rather than resolved by order. Two claims
+/// mean the deployment double-booked a shape, and picking one is how a device serves a graph whose
+/// plan was sized for something else - the same failure the phase-only rule produced, only harder to
+/// see.
+pub fn server_of<'a>(
+    runners: &'a [NamedRunner],
+    phase: ipc::PhaseId,
+    computation: &crate::plan::Computation,
+) -> Result<&'a NamedRunner> {
+    let variant = computation.variant().ok_or_else(|| {
+        Error::Invalid(format!(
+            "a batch states computation {computation:?}, which is not a media computation: it has \
+             no variant, so no plan of any runner can hold it"
+        ))
+    })?;
+    let mut claims: Vec<&'a NamedRunner> = Vec::new();
+    for named in runners {
+        if !named.phases.contains(&phase) {
+            continue;
+        }
+        // The bucket's own rule, so the plan's selection and this routing cannot disagree about
+        // which shapes a bucket holds (a host bucket holds every canvas; a captured one holds its
+        // own extent, or any when the caller states none).
+        let holds = named
+            .runner
+            .media_plan()
+            .iter()
+            .any(|bucket| bucket.holds_computation(computation));
+        if holds {
+            claims.push(named);
+        }
+    }
+    match claims.as_slice() {
+        [one] => Ok(one),
+        [] => Err(Error::Invalid(format!(
+            "no runner of this device serves {variant:?} for computation {computation:?} in phase \
+             {phase}: the phase is served and no plan of it holds this extent"
+        ))),
+        many => Err(Error::Invalid(format!(
+            "runners {} all claim computation {computation:?} in phase {phase}: a computation is \
+             served by one plan, and two claims mean the deployment booked one shape twice",
+            many.iter()
+                .map(|named| named.id.0.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ))),
+    }
+}
+
+impl std::fmt::Debug for NamedRunner {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("NamedRunner")
+            .field("id", &self.id)
+            .field("phases", &self.phases)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod server_tests {
+    use super::*;
+
+    use crate::plan::{Bucket, Computation, Extent};
+    use nn::capability::{LatentShape, Layout};
+
+    /// A runner that declares a plan and does nothing else: the selection rule reads no behaviour
+    /// beyond the declarations, so nothing else may be exercised by these tests.
+    struct Declaring {
+        plan: Vec<Bucket>,
+    }
+
+    impl Runner for Declaring {
+        fn phases(&self) -> &[ipc::PhaseId] {
+            &[]
+        }
+
+        fn media_plan(&self) -> Vec<Bucket> {
+            self.plan.clone()
+        }
+
+        fn submit(&mut self, _: Batch) -> Result<Jobs> {
+            unreachable!("the selection rule issues nothing")
+        }
+
+        fn warmup(&mut self) -> Result<Jobs> {
+            unreachable!("the selection rule warms nothing")
+        }
+
+        fn precopy(&mut self, _: &Arc<Generation>) -> Result<Jobs> {
+            unreachable!("the selection rule prepares nothing")
+        }
+
+        fn switchover(&mut self, _: u64) -> Result<()> {
+            unreachable!("the selection rule switches nothing")
+        }
+
+        fn revert(&mut self, _: u64) {
+            unreachable!("the selection rule reverts nothing")
+        }
+
+        fn purge(&mut self, _: u64) {
+            unreachable!("the selection rule purges nothing")
+        }
+
+        fn discard(&mut self, _: u64) -> Result<()> {
+            unreachable!("the selection rule discards nothing")
+        }
+
+        fn serve(&mut self, _: &crate::batch::Job) -> Result<crate::batch::BatchOutput> {
+            unreachable!("the selection rule serves nothing")
+        }
+    }
+
+    fn named(id: u32, phase: ipc::PhaseId, plan: Vec<Bucket>) -> NamedRunner {
+        NamedRunner {
+            id: RunnerId(id),
+            phases: vec![phase],
+            runner: Box::new(Declaring { plan }),
+        }
+    }
+
+    fn layout(width: u32) -> Layout {
+        Layout {
+            video: LatentShape {
+                channels: 16,
+                frames: 7,
+                height: 60,
+                width,
+            },
+            audio: None,
+            text_rows: 256,
+            condition_rows: 0,
+            condition_elements: 0,
+        }
+    }
+
+    fn step(at: Layout) -> Computation {
+        Computation {
+            call: ipc::MediaCall::Denoising,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::Latents(at),
+        }
+    }
+
+    /// The rule a device with one runner per layout needs: two runners of one phase are told apart
+    /// by their plans, so each layout reaches the graph captured for it rather than the first.
+    #[test]
+    fn two_runners_of_one_phase_are_told_apart_by_their_plans() {
+        let phase = ipc::PhaseId(3);
+        let runners = vec![
+            named(1, phase, vec![Bucket::denoise(1, layout(32))]),
+            named(2, phase, vec![Bucket::denoise(1, layout(64))]),
+        ];
+
+        let narrow = server_of(&runners, phase, &step(layout(32))).expect("a plan holds it");
+        assert_eq!(narrow.id, RunnerId(1), "the narrow layout reaches its own");
+
+        let wide = server_of(&runners, phase, &step(layout(64))).expect("a plan holds it");
+        assert_eq!(wide.id, RunnerId(2), "the wide layout reaches its own");
+    }
+
+    /// A computation no plan holds is refused by name, naming the phase and the extent: the
+    /// alternative is a runner serving a batch its graph was not captured for.
+    #[test]
+    fn a_computation_no_plan_holds_is_refused_by_name() {
+        let phase = ipc::PhaseId(3);
+        let runners = vec![named(1, phase, vec![Bucket::denoise(1, layout(32))])];
+
+        let refusal = server_of(&runners, phase, &step(layout(48)))
+            .expect_err("no plan holds this layout")
+            .to_string();
+        assert!(
+            refusal.contains("no runner of this device serves"),
+            "the refusal says the device does not serve it: {refusal}"
+        );
+        assert!(
+            refusal.contains("Denoise"),
+            "the refusal names the variant: {refusal}"
+        );
+    }
+
+    /// A runner serving another phase is not a candidate, even when its plan holds the extent: the
+    /// phase is what a batch names, and a plan alone cannot move work to another phase's runner.
+    #[test]
+    fn a_runner_of_another_phase_is_not_a_candidate() {
+        let denoising = ipc::PhaseId(3);
+        let encoding = ipc::PhaseId(1);
+        let runners = vec![named(1, encoding, vec![Bucket::denoise(1, layout(32))])];
+
+        assert!(
+            server_of(&runners, denoising, &step(layout(32))).is_err(),
+            "a plan of the phase's extent is not enough without the phase"
+        );
+    }
+
+    /// Two claims on one computation are refused naming both, because a device that serves a shape
+    /// twice cannot choose: one of the two graphs was planned for something else.
+    #[test]
+    fn two_claims_on_one_computation_are_refused_naming_both() {
+        let phase = ipc::PhaseId(3);
+        let runners = vec![
+            named(1, phase, vec![Bucket::denoise(1, layout(32))]),
+            named(2, phase, vec![Bucket::denoise(2, layout(32))]),
+        ];
+
+        let refusal = server_of(&runners, phase, &step(layout(32)))
+            .expect_err("two plans claim one computation")
+            .to_string();
+        assert!(
+            refusal.contains("runners 1, 2 all claim"),
+            "the refusal names both runners in id order: {refusal}"
+        );
+    }
+}

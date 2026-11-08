@@ -3,7 +3,7 @@
 //! A request's noise is a function of the request's sampling key and the element's position, so the
 //! same request regenerates the same latents without the host holding a sample (specs/worker.md 9,
 //! "Philox"; `ops::noise`). The layer holds only the element type and the tile; the key is the
-//! caller's, because the executor computes it from the request seed and the phase.
+//! caller's, because the worker computes it from the request seed and the phase.
 //!
 //! The key comes in one of two forms, and which one a caller has decides the launch shape:
 //!

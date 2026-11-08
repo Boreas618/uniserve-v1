@@ -15,7 +15,7 @@
 //! addresses a captured graph holds never move while the pool lives. Physical
 //! storage returns to the driver when the pool is dropped.
 //!
-//! The budget is the Storage Server's per-device ledger, which the executor
+//! The budget is the Storage Server's per-device ledger, which the worker
 //! implements over its storage client ([`Budget`]); this crate never talks to
 //! the Server. Every mapping books the pool's new cumulative total first, so
 //! an allocation that would exceed the device's budget fails before any
@@ -77,7 +77,7 @@ impl PoolKind {
 /// is the new cumulative total for `(device, pool)`, not a delta, so a
 /// booking either fits and is recorded or is refused and changes nothing.
 ///
-/// The executor implements this over the storage client's booking request;
+/// The worker implements this over the storage client's booking request;
 /// `platform` never talks to the Storage Server itself.
 pub trait Budget: Send + Sync {
     /// Books `bytes` as the total of `pool` on `device`, failing with no room.

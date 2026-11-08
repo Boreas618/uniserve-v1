@@ -1,4 +1,4 @@
-//! `uniserve engine`: a node's main process for one epoch (`specs/executor.md`
+//! `uniserve engine`: a node's main process for one epoch (`specs/worker.md`
 //! §2.1, §2.3, §2.4, §4).
 //!
 //! The daemon starts one main process per node and epoch, from the epoch's build
@@ -8,13 +8,13 @@
 //! - the [`Control`] thread, which serves the daemon's request interface and the
 //!   epoch's peer main processes and never waits for a job (§2.3, §2.4);
 //! - one `engine::Scheduler` per DP rank, on the node that holds them;
-//! - one `executor::device::Executor` per device, the only thread that issues to
+//! - one `worker::device::Worker` per device, the only thread that issues to
 //!   that device's streams;
 //! - the node's resident memory ([`Memory`]);
 //! - the blocking pool host work runs on ([`ThreadPool`]),
 //!
 //! and drives the program-layer update of §7.3 between them: precopy on the
-//! blocking pool and the executors, shadow execution against the scheduler's
+//! blocking pool and the workers, shadow execution against the scheduler's
 //! resident requests, switchover at a batch boundary, probation, commit or
 //! revert, and purge after the old generation's last batch.
 //!
@@ -30,7 +30,7 @@
 //!   Arc<dyn Batches>), submit, shadow, stage, command, engine_command,
 //!   counters, stop}` (M505, M714). `stage(Stage, generation)` applies §7.3
 //!   steps 3-6 at a batch boundary and answers the step it applied at, because
-//!   an expert group's executors must switch at the same step on every rank.
+//!   an expert group's workers must switch at the same step on every rank.
 //!   `schedulers` stays empty until it exists, and a node that holds no
 //!   scheduler serves only what its peers ask of it.
 //! - **front** (`crates/proto`): the epoch's programs and the serving revision
@@ -38,8 +38,8 @@
 //!   `process.proto` mirroring [`ipc::ProgramCommand`]/[`ipc::ProgramStatus`],
 //!   and the per-device counters `FromEngine::Device` that [`Self::send_metrics`]
 //!   fills (§2.3).
-//! - **builder03** (`crates/executor`): `capacity::plan(&CapacityRequest) ->
-//!   Result<Plan>`, whose producer the retired executor held and which is still
+//! - **builder03** (`crates/worker`): `capacity::plan(&CapacityRequest) ->
+//!   Result<Plan>`, whose producer the retired worker held and which is still
 //!   entangled with the launch machinery §4 deletes, and the Storage
 //!   Server client's publish/map surface that a weight store stands on.
 //! - **nobody yet**: the `nn::RetainedWeights` production implementation. Its two
@@ -80,9 +80,9 @@
 //! exactly those names. Nothing program-content crosses that protocol: a node
 //! resolves its modules from the Program Server itself.
 //!
-//! The executor's own calls (`Executor::{spawn, submit, precopy, switchover,
+//! The worker's own calls (`Worker::{spawn, submit, precopy, switchover,
 //! purge, watchdog, probe, close}`, `Submission::wait`) are published in
-//! `crates/executor` and are used as they are written there.
+//! `crates/worker` and are used as they are written there.
 
 use proto::config::EngineArgs;
 use std::collections::BTreeMap;
@@ -95,19 +95,6 @@ use anyhow::{Context as _, Result, bail};
 
 use crate::model_runner::{ModelRunner, PrefillCatalogue};
 use engine::{PolicyProgram, PolicySource, ProgramSource};
-use executor::batch::Submission;
-use executor::blocking::{BlockingKind, ThreadPool};
-use executor::completion::Outcome;
-use executor::control::{Control, Endpoints, Ready};
-use executor::device::{Executor, Probe};
-use executor::host::{HostAction, HostTask, Lane};
-use executor::hot_update::{Action, HotUpdate};
-use executor::memory::Memory;
-use executor::memory::retained::Retained;
-use executor::memory::weights::WeightStore;
-use executor::parallel::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT};
-use executor::runners::products::{GroupProducts, RankProducts};
-use executor::watchdog::{Running, Watchdog};
 use ipc::{ProgramCommand, ProgramStatus, UpdateFailure};
 use ops::{Generation, KernelEntry};
 use program_server::program::Programs;
@@ -115,6 +102,19 @@ use program_server::{
     Client, Descriptors, PhaseKind, PrepareRequest, Program, ProgramRequest, ProgramSlot, Selector,
     Target,
 };
+use worker::batch::Submission;
+use worker::blocking::{BlockingKind, ThreadPool};
+use worker::completion::Outcome;
+use worker::control::{Control, Endpoints, Ready};
+use worker::device::{Probe, Worker};
+use worker::host::{HostAction, HostTask, Lane};
+use worker::hot_update::{Action, HotUpdate};
+use worker::memory::Memory;
+use worker::memory::retained::Retained;
+use worker::memory::weights::WeightStore;
+use worker::parallel::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT};
+use worker::runners::products::{GroupProducts, RankProducts};
+use worker::watchdog::{Running, Watchdog};
 
 /// The epoch as this node takes it at start.
 ///
@@ -340,7 +340,7 @@ impl ProcessInterface {
     fn file(&mut self, event: proto::process::Event) {
         match event.kind {
             Some(proto::process::event::Kind::Command(command)) => self.pending.push_back(command),
-            // A group's exit is an executor's report; this process supervises no group.
+            // A group's exit is a worker's report; this process supervises no group.
             Some(proto::process::event::Kind::Exit(exit)) => {
                 tracing::warn!(
                     group = %exit.group,
@@ -354,12 +354,12 @@ impl ProcessInterface {
     }
 }
 
-/// One rank of this process, loaded: what its executor is built from.
+/// One rank of this process, loaded: what its worker is built from.
 struct LoadedRank {
     /// The rank's own model runner, whose one device is the rank's.
     model_runner: ModelRunner,
     /// The weights its load reached, in order: what an update of §7.6 pairs against.
-    weights: Vec<executor::memory::weights::LoadedWeight>,
+    weights: Vec<worker::memory::weights::LoadedWeight>,
     /// The rank's Storage Server client, whose scope is the rank's.
     client: Arc<Retained>,
     /// The rank's partition of the model, mapped on its device.
@@ -369,12 +369,12 @@ struct LoadedRank {
     /// What the rank reports of itself.
     inventory: ipc::MainProcessInfo,
     /// The rank's graph storage figures.
-    graph: executor::device::GraphStorage,
+    graph: worker::device::GraphStorage,
     /// The collective groups its runners issue on.
     groups: crate::model_runner::RankGroups,
 }
 
-// SAFETY: a rank is built on its load thread and handed once to the thread that spawns its executor,
+// SAFETY: a rank is built on its load thread and handed once to the thread that spawns its worker,
 // and nothing in it belongs to the thread that built it. The field that needs this is the model: its
 // `nn::Block` holds `Arc<dyn Encoder>` and its siblings, whose trait objects state no `Send`, while the
 // concrete blocks behind them are the ones a runner already moves to its device thread
@@ -630,7 +630,7 @@ pub(crate) fn run(
 ) -> Result<ExitCode> {
     crate::follow_lifeline(lifeline);
     // Before any thread reads the environment and before the first NVTX call.
-    executor::profiling::counters::inject();
+    worker::profiling::counters::inject();
     crate::logging::init_tracing(
         "Engine",
         log.log_level.as_deref(),
@@ -664,7 +664,7 @@ pub(crate) fn run(
 /// One node's main process for one epoch: the object model of §4.
 ///
 /// Every field is owned by exactly one thread: the control thread owns itself,
-/// each executor thread owns its runners and streams, each scheduler thread its
+/// each worker thread owns its runners and streams, each scheduler thread its
 /// mechanism. The fields below are the handles those threads were handed and the
 /// owners that must outlive them.
 /// How many of a request's events this process keeps for a takeover to replay.
@@ -736,7 +736,7 @@ pub(crate) struct MainProcess {
     /// command channel carries the mutation (§2.4).
     schedulers: Vec<engine::SchedulerHandle>,
     /// The expert union of this node's ranks, ended before their device threads are.
-    union: Option<Arc<executor::runners::experts::Union>>,
+    union: Option<Arc<worker::runners::experts::Union>>,
     /// One statistics reporter per scheduler, in the schedulers' order.
     ///
     /// A reporter keeps the cumulative baselines of the counters it has already
@@ -745,13 +745,13 @@ pub(crate) struct MainProcess {
     /// and its kind).
     stats_reporters: Vec<engine::SchedulerStatsReporter>,
     /// CUPTI's always-on counters, for as long as the process serves.
-    _counters: Option<executor::profiling::counters::Counters>,
+    _counters: Option<worker::profiling::counters::Counters>,
     /// The control thread's driver calls that waited for the device, as of its last report.
     control_calls: platform::cupti::blocking::Calls,
-    /// This node's device executors, shared with the schedulers that submit through them: one
-    /// executor thread per device, reached both by this process's own verbs (`precopy`,
+    /// This node's device workers, shared with the schedulers that submit through them: one
+    /// worker thread per device, reached both by this process's own verbs (`precopy`,
     /// `switchover`, `warmup`, `purge`) and by the scheduler's `Batches`.
-    executors: Vec<Arc<Executor>>,
+    workers: Vec<Arc<Worker>>,
     memory: Vec<Memory>,
     /// The rank's Storage Server client, kept for the two calls of §2.5 that reach its ledger and no
     /// other: a park gives the cache's segments back, and a wake maps them again. Every caller takes
@@ -823,14 +823,14 @@ pub(crate) struct MainProcess {
     policy_probe_at: Option<Instant>,
     policy_missing_since: Option<Instant>,
     /// The generations the last precopy built and the switchover has not taken:
-    /// one per device, in `executors` order. A revert drops them, because the
+    /// one per device, in `workers` order. A revert drops them, because the
     /// generation they hold never serves.
     prepared: Vec<Arc<Generation>>,
     /// The generations serving before the current ones, kept through probation so
     /// a revert can serve them again (§7.3 step 4). Their graphs stay in the
-    /// executors either way; this is the process's own record of what to serve.
+    /// workers either way; this is the process's own record of what to serve.
     retired: Vec<Arc<Generation>>,
-    /// The generation each device serves now, in `executors` order.
+    /// The generation each device serves now, in `workers` order.
     generations: Vec<Arc<Generation>>,
     /// The kernel programs the serving generation was built from, by slot (§7.3 step 2). The shadow
     /// pass pairs a *changed* operator's kernel with the one serving, so "changed" is a fact about
@@ -880,7 +880,7 @@ pub(crate) struct MainProcess {
     /// last submission finishes (`advance_warmup`), and a `Drain` drops what was owed (§4.5).
     admission_owed: bool,
     /// The launch's own request-slot count, which the daemon records as the epoch's capacity: the
-    /// executor's row count includes the guidance prefix, which is not a request.
+    /// worker's row count includes the guidance prefix, which is not a request.
     max_running_requests: u32,
     /// The catalogue of prefill buckets this rank captures and whether the deployment stated it
     /// (§4.5): the ceiling a policy's `max_num_batched_tokens` is refused against (§4.4), named
@@ -905,7 +905,7 @@ pub(crate) struct MainProcess {
     /// second request for one of them is answered rather than run again.
     released: std::collections::BTreeSet<u64>,
     /// What this process's storage operations reach (§7.6).
-    data: Arc<executor::data_plane::DataPlane>,
+    data: Arc<worker::data_plane::DataPlane>,
     /// The commands of §7.6 still working, each answered by the pass that sees it end: the
     /// control thread waits for none of them.
     owed: Vec<Owed>,
@@ -1006,7 +1006,7 @@ impl MainProcess {
         let host_kv_cache = build.kv_cache.host_tier && build.kv_cache.prefix_caching;
         // CUPTI accepts one subscriber per process, and what it observes begins at the subscription,
         // so the process subscribes before it loads a module (`docs/profiling.md`).
-        executor::profiling::counters::subscribe();
+        worker::profiling::counters::subscribe();
         // §2.1: this process serves every rank of its node, each on its own device.
         let rank_runners = model_runner.ranks()?;
         let rank_numbers: Vec<u32> = rank_runners.iter().map(ModelRunner::rank).collect();
@@ -1038,7 +1038,7 @@ impl MainProcess {
         )?;
         let update = HotUpdate::new(epoch.generation);
 
-        let mut executors = Vec::with_capacity(model_runner.devices().len());
+        let mut workers = Vec::with_capacity(model_runner.devices().len());
         let mut generations = Vec::with_capacity(model_runner.devices().len());
         // A rank with no device serves nothing, and saying it here names the deployment's fault
         // rather than leaving the pool's figure to a plan that never sized one.
@@ -1048,7 +1048,7 @@ impl MainProcess {
         // Every capture of this process carries the probes the deployment names, and the graphs
         // keep them for good: only their switch changes while the process serves.
         if !epoch.profiling.fence_components.is_empty() {
-            executor::profiling::fences::Fences::install(
+            worker::profiling::fences::Fences::install(
                 model_runner.devices(),
                 epoch.profiling.fence_components.clone(),
                 epoch.profiling.fence_probes,
@@ -1061,7 +1061,7 @@ impl MainProcess {
         if epoch.profiling.graph_pc_sampling {
             for device in model_runner.devices() {
                 let context = platform::PrimaryContext::retain(*device)?;
-                executor::profiling::pc_sampling::enable(&context)
+                worker::profiling::pc_sampling::enable(&context)
                     .context("enabling PC sampling for this rank's graphs")?;
             }
         }
@@ -1096,7 +1096,7 @@ impl MainProcess {
             // pool holds every rank's host tasks.
             inventory.host_task_capacity *= rank_count;
             // The device's one pool set is the resident owners' allocator (§4.1): it is opened with
-            // the memory and handed to the executor thread, so every owner and every runner books
+            // the memory and handed to the worker thread, so every owner and every runner books
             // against the same allowance.
             let pools = memory.pools();
             // The scratch pool's figure comes from the one call that sized it, with the memory: the
@@ -1106,7 +1106,7 @@ impl MainProcess {
             // The shadow region alone: the twins allocate it, and the reservation beside it holds
             // the state group's snapshot too (7.3, 4.5).
             let shadow = graph.shadow;
-            let products: Arc<dyn executor::runners::products::Products> =
+            let products: Arc<dyn worker::runners::products::Products> =
                 Arc::new(RankProducts::new(Arc::clone(&group_products), rank_index));
             for device in rank_runner.devices() {
                 let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
@@ -1118,7 +1118,7 @@ impl MainProcess {
                     &blocking,
                     &groups,
                 )?;
-                let executor = Executor::spawn(
+                let worker = Worker::spawn(
                     *device,
                     runners,
                     rank_runner.events(),
@@ -1128,7 +1128,7 @@ impl MainProcess {
                     shadow,
                 )?;
                 // §7.3 step 2 shadows a replaced operator beside the serving one, so the region it
-                // runs in is mapped before any batch: the executor books it from the scratch pool
+                // runs in is mapped before any batch: the worker books it from the scratch pool
                 // the graph storage sized. Nothing is serving yet, so the control thread waits here;
                 // `serve` never does (§2.4).
                 //
@@ -1137,24 +1137,24 @@ impl MainProcess {
                 // switch) fills it from the store's built programs - so there is no bucket to warm
                 // yet. It runs at the first switchover, which is the boundary the first request is
                 // served at.
-                let shadow = executor.set_shadow()?;
+                let shadow = worker.set_shadow()?;
                 device_command(&watchdog, *device, "shadow region", shadow)
                     .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
                 // §2.5's two commands reach the Storage Server's ledger from the device thread,
                 // which owns the stream a wake resets its units on, so the client is bound beside
                 // the cache handle rather than kept only here.
-                executor.bind_storage(Arc::clone(&client));
+                worker.bind_storage(Arc::clone(&client));
                 if let Some((union, member)) = rank_runner.union() {
                     union.bind(
                         member,
-                        Arc::clone(executor.queue()),
-                        executor::runner::RunnerId(0),
+                        Arc::clone(worker.queue()),
+                        worker::runner::RunnerId(0),
                     )?;
                 }
-                let executor = Arc::new(executor);
-                data_ranks.push(executor::data_plane::Rank {
+                let worker = Arc::new(worker);
+                data_ranks.push(worker::data_plane::Rank {
                     rank: rank_runner.rank(),
-                    executor: Arc::downgrade(&executor),
+                    worker: Arc::downgrade(&worker),
                     device: *device,
                     storage: Arc::clone(&client),
                     cache: memory.shared_cache(),
@@ -1162,7 +1162,7 @@ impl MainProcess {
                     serving: weights.clone(),
                     host: epoch.host.clone(),
                 });
-                executors.push(executor);
+                workers.push(worker);
                 generations.push(generation);
             }
             scheduled.push(rank_runner.scheduled());
@@ -1180,20 +1180,20 @@ impl MainProcess {
                 .context("stating this rank's quota of its device")?;
         }
         // §7.6: the storage operations and the loads that change what the ranks hold.
-        let data = Arc::new(executor::data_plane::DataPlane::new(
+        let data = Arc::new(worker::data_plane::DataPlane::new(
             data_ranks,
-            executor::data_plane::Target {
+            worker::data_plane::Target {
                 checkpoint: PathBuf::from(&launch.engine_config.model.model),
                 experts: epoch.experts.clone(),
             },
             build.mem_fraction_static,
         ));
-        // This node's schedulers, one thread per DP rank, each handing its batches to the executors
-        // above through `executor::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
+        // This node's schedulers, one thread per DP rank, each handing its batches to the workers
+        // above through `worker::Batches` (§2.4, §4.4). A node that holds none keeps an empty list
         // and serves only what its peers' schedulers ask of it; a node that is the scheduler node
         // and holds none would accept requests and dispatch nothing, which is refused by name.
         let schedulers = if union.is_some() {
-            let mut handles = Vec::with_capacity(executors.len());
+            let mut handles = Vec::with_capacity(workers.len());
             for (index, model_runner) in scheduled.iter().enumerate() {
                 // A dedicated expert rank takes no request: it joins the steps the others open.
                 if !model_runner.schedules() {
@@ -1203,7 +1203,7 @@ impl MainProcess {
                     model_runner,
                     launch,
                     &models[index],
-                    &executors[index..=index],
+                    &workers[index..=index],
                     &inventories[index],
                     &memories[index],
                     connected.wake(),
@@ -1216,7 +1216,7 @@ impl MainProcess {
                 &first_plan,
                 launch,
                 &models[0],
-                &executors,
+                &workers,
                 &inventories[0],
                 &memories[0],
                 connected.wake(),
@@ -1226,17 +1226,17 @@ impl MainProcess {
 
         // The always-on counters: every stream a runner computes on is `device`, and the one the
         // host KV cache's pages move on is `copy`.
-        let observed: Vec<(&'static str, platform::Stream)> = executors
+        let observed: Vec<(&'static str, platform::Stream)> = workers
             .iter()
-            .flat_map(|executor| executor.streams().iter().cloned())
+            .flat_map(|worker| worker.streams().iter().cloned())
             .map(|stream| ("device", stream))
             .chain(
-                executors
+                workers
                     .iter()
-                    .map(|executor| ("copy", executor.copy_stream().clone())),
+                    .map(|worker| ("copy", worker.copy_stream().clone())),
             )
             .collect();
-        let counters = executor::profiling::counters::Counters::start(
+        let counters = worker::profiling::counters::Counters::start(
             &observed,
             !epoch.profiling.graph_pc_sampling,
         );
@@ -1252,7 +1252,7 @@ impl MainProcess {
             stats_reporters,
             _counters: counters,
             control_calls: platform::cupti::blocking::Calls::default(),
-            executors,
+            workers,
             memory: memories,
             storage: clients,
             blocking,
@@ -1370,7 +1370,7 @@ impl MainProcess {
     /// Serves until the daemon closes the process or a failure ends it.
     ///
     /// The control thread waits on its channels, never later than the §2.4
-    /// deadline; each pass runs the watchdog over the executors and handles what
+    /// deadline; each pass runs the watchdog over the workers and handles what
     /// arrived.
     fn serve(&mut self) -> Result<Option<UpdateFailure>> {
         let mut running = Vec::new();
@@ -1396,7 +1396,7 @@ impl MainProcess {
             if self.rollback.is_some()
                 && matches!(
                     self.update.phase(),
-                    executor::hot_update::Phase::Probation { .. }
+                    worker::hot_update::Phase::Probation { .. }
                 )
             {
                 due = due.min(Instant::now() + PROBATION_POLL);
@@ -1488,7 +1488,7 @@ impl MainProcess {
                 return Ok(Some(failure));
             }
 
-            running = self.read_executors();
+            running = self.read_workers();
             if let Some(failure) = self.watch(&running)? {
                 return Ok(Some(failure));
             }
@@ -1513,14 +1513,14 @@ impl MainProcess {
         }
     }
 
-    /// The oldest unfinished command of each executor, in rank order, as §2.4
+    /// The oldest unfinished command of each worker, in rank order, as §2.4
     /// reads them.
-    fn read_executors(&self) -> Vec<Running> {
-        self.executors
+    fn read_workers(&self) -> Vec<Running> {
+        self.workers
             .iter()
             .enumerate()
-            .filter_map(|(rank, executor)| {
-                let reading = executor.watchdog();
+            .filter_map(|(rank, worker)| {
+                let reading = worker.watchdog();
                 let watch = reading.longest()?;
                 Some(Running {
                     rank,
@@ -1549,8 +1549,8 @@ impl MainProcess {
             // device that errored and one that is healthy are read in one pass, and only then is
             // the update's decision table applied to what was found.
             let mut sticky = Vec::new();
-            for (rank, executor) in self.executors.iter().enumerate() {
-                let Probe::Sticky(error) = executor.probe()? else {
+            for (rank, worker) in self.workers.iter().enumerate() {
+                let Probe::Sticky(error) = worker.probe()? else {
                     continue;
                 };
                 let batch = running
@@ -1558,7 +1558,7 @@ impl MainProcess {
                     .find(|job| job.rank == rank)
                     .and_then(|job| job.batch);
                 sticky.push(UpdateFailure::Device {
-                    device: u32::try_from(executor.device().0).unwrap_or_default(),
+                    device: u32::try_from(worker.device().0).unwrap_or_default(),
                     error: error.to_string(),
                     batch,
                 });
@@ -1627,7 +1627,7 @@ impl MainProcess {
                 batch: stall
                     .batch_id
                     .map_or_else(String::new, |batch| batch.to_string()),
-                // The job's own name, as the executor classifies it: what stalled, not which
+                // The job's own name, as the worker classifies it: what stalled, not which
                 // operator it was in.
                 job: stall
                     .route
@@ -2044,7 +2044,7 @@ impl MainProcess {
         }
 
         // A `Precopy` that names no kernel program is the startup switch: the daemon states the
-        // scheduling policy alone, because on a host that runs the executor path there is no kernel
+        // scheduling policy alone, because on a host that runs the worker path there is no kernel
         // package to prepare (`crates/daemon/src/leader.rs`, `install_programs`). This process
         // installs what it can actually launch, so the store's listing is read first, on the module
         // lane, rather than capturing an empty generation.
@@ -2129,7 +2129,7 @@ impl MainProcess {
                 .values()
                 .filter(|ordered| ordered.len() > 1)
                 .count(),
-            devices = self.executors.len(),
+            devices = self.workers.len(),
             "this process is installing the generation the daemon named"
         );
         let (tasks, unavailable) = match self.admit_installs(programs, &BTreeMap::new()) {
@@ -2445,12 +2445,12 @@ impl MainProcess {
             merge_request(group, slot, program, keys);
         }
 
-        let mut tasks = Vec::with_capacity(self.executors.len());
+        let mut tasks = Vec::with_capacity(self.workers.len());
         // One cell shared by every device's load of this generation: the first structured refusal
         // any of them meets is the one the walk answers with another candidate program.
         let unavailable = UnavailableCell::default();
-        for (index, executor) in self.executors.iter().enumerate() {
-            let ordinal = executor.device();
+        for (index, worker) in self.workers.iter().enumerate() {
+            let ordinal = worker.device();
             let device = platform::Device::new(ordinal)
                 .map_err(|error| invalid(format!("opening device {}: {error}", ordinal.0)))?;
             // `targets` holds each distinct architecture once, so a device's own is read from it.
@@ -2700,13 +2700,13 @@ impl MainProcess {
             // The thread that is stuck cannot say what it is stuck in, so each device states the job
             // it performs: a bucket's capture and a launch look identical from outside and are
             // different defects.
-            for executor in &self.executors {
+            for worker in &self.workers {
                 tracing::warn!(
-                    device = executor.device().0,
-                    performing = executor
+                    device = worker.device().0,
+                    performing = worker
                         .performing()
                         .unwrap_or_else(|| "between commands".to_owned()),
-                    captures = executor.capturing(),
+                    captures = worker.capturing(),
                     "a device that has not finished its warmup"
                 );
             }
@@ -2721,8 +2721,8 @@ impl MainProcess {
     /// that every operator the update replaced was compared.
     fn uncompared(&self) -> Vec<String> {
         let mut entries: Vec<String> = Vec::new();
-        for executor in &self.executors {
-            for entry in executor.uncompared() {
+        for worker in &self.workers {
+            for entry in worker.uncompared() {
                 if !entries.contains(&entry) {
                     entries.push(entry);
                 }
@@ -2758,7 +2758,7 @@ impl MainProcess {
             tracing::warn!(
                 generation,
                 stage = entered,
-                waiting_on = %pending_work(&precopy.stage, &self.executors, &precopy.policies),
+                waiting_on = %pending_work(&precopy.stage, &self.workers, &precopy.policies),
                 waited_s = precopy.since.elapsed().as_secs(),
                 "the precopy has stood in this stage past the watchdog's stall bound and nothing \
                  has answered: the Program Server, a device or a scheduler is the one to look at"
@@ -2767,7 +2767,7 @@ impl MainProcess {
         // What the stage was waiting on, read before the stage is taken out: a bound that named
         // `no stage` because the driver had already replaced it would say nothing at all, which is
         // the opposite of what the line is for.
-        let pending = pending_work(&precopy.stage, &self.executors, &precopy.policies);
+        let pending = pending_work(&precopy.stage, &self.workers, &precopy.policies);
         let stage = std::mem::replace(&mut precopy.stage, PrecopyStage::Done);
 
         match stage {
@@ -2835,7 +2835,7 @@ impl MainProcess {
                         .values()
                         .filter(|ordered| ordered.len() > 1)
                         .count(),
-                    devices = self.executors.len(),
+                    devices = self.workers.len(),
                     "this process is installing the generation the daemon named"
                 );
                 let (tasks, unavailable) = match self.admit_installs(&resolved, &BTreeMap::new()) {
@@ -2925,7 +2925,7 @@ impl MainProcess {
                 }
                 self.after_modules(precopy, loaded)
             }
-            PrecopyStage::Executors(submissions) => {
+            PrecopyStage::Workers(submissions) => {
                 // A device that never answers is a process that serves nothing until the epoch
                 // ends: the stage is polled, so without this bound the only line it prints is the
                 // stall warning, and the run waits out the daemon's whole prepare bound to learn
@@ -2964,7 +2964,7 @@ impl MainProcess {
                 // device cuts over, which is what §4.4's dry run is for.
                 match poll_answers(&mut precopy.policies) {
                     Some(StageFailure::Pending) => {
-                        precopy.stage = PrecopyStage::Executors(submissions);
+                        precopy.stage = PrecopyStage::Workers(submissions);
                         self.precopy = Some(precopy);
                         return Ok(());
                     }
@@ -2986,7 +2986,7 @@ impl MainProcess {
                 if let Some(failure) = unfinished(&submissions, "preparing this node's devices") {
                     match failure {
                         StageFailure::Pending => {
-                            precopy.stage = PrecopyStage::Executors(submissions);
+                            precopy.stage = PrecopyStage::Workers(submissions);
                             self.precopy = Some(precopy);
                             return Ok(());
                         }
@@ -3166,7 +3166,7 @@ impl MainProcess {
     }
 
     /// A precopy that needs no further stage: its generation is built, its policy instantiated and
-    /// its executors rebound or recaptured, so it waits as *prepared* for the switchover.
+    /// its workers rebound or recaptured, so it waits as *prepared* for the switchover.
     ///
     /// Reached from the shadow stage and, directly, from a precopy whose changed set is empty - the
     /// two are the same finished state, and a first generation takes the second because there is no
@@ -3218,7 +3218,7 @@ impl MainProcess {
     }
 
     /// The generations the loaded kernels build, the candidate policy
-    /// instantiated, and the executors' rebind or recapture admitted.
+    /// instantiated, and the workers' rebind or recapture admitted.
     fn after_modules(&mut self, precopy: Precopy, loaded: Vec<Vec<KernelEntry>>) -> Result<()> {
         let generation = precopy.generation;
         // One generation per device: a kernel belongs to the device context
@@ -3257,7 +3257,7 @@ impl MainProcess {
         // Rebind or recapture, as jobs between serving batches (§4.5).
         let mut submissions = Vec::with_capacity(next.len());
         for (index, built) in next.iter().enumerate() {
-            submissions.push(self.executors[index].precopy(Arc::clone(built))?);
+            submissions.push(self.workers[index].precopy(Arc::clone(built))?);
         }
         let mut precopy = precopy;
         precopy.next = next;
@@ -3265,7 +3265,7 @@ impl MainProcess {
             precopy.policies = policies;
             precopy.policy_requested = true;
         }
-        precopy.stage = PrecopyStage::Executors(submissions);
+        precopy.stage = PrecopyStage::Workers(submissions);
         self.precopy = Some(precopy);
         Ok(())
     }
@@ -3279,16 +3279,16 @@ impl MainProcess {
         reply: Option<u32>,
     ) -> Result<()> {
         self.discard_policy();
-        // The executors already rebound or recaptured this generation's graphs, and a generation
+        // The workers already rebound or recaptured this generation's graphs, and a generation
         // that never serves must give its captures back (§7.3 step 2). A purge names a generation a
         // switchover or a revert released, and this one was never cut over, so it is discarded: the
-        // executor drops exactly this generation's graphs and kernels. A device still busy with the
+        // worker drops exactly this generation's graphs and kernels. A device still busy with the
         // capture is answered by the queue's own order.
-        for executor in &self.executors {
-            match executor.discard(generation) {
+        for worker in &self.workers {
+            match worker.discard(generation) {
                 Ok(submission) => {
                     if let Err(error) =
-                        device_command(&self.watchdog, executor.device(), "discard", submission)
+                        device_command(&self.watchdog, worker.device(), "discard", submission)
                     {
                         tracing::warn!(%error, "discarding a failed generation on a device failed");
                     }
@@ -3359,9 +3359,9 @@ impl MainProcess {
         // step stamps its batches with is the one whose graphs the runner has to find.
         self.record_generation(generation);
         self.switchover_policy(generation, step);
-        for executor in &self.executors {
-            let device = executor.device();
-            let submission = executor.switchover(generation)?;
+        for worker in &self.workers {
+            let device = worker.device();
+            let submission = worker.switchover(generation)?;
             if let Err(error) = device_command(&self.watchdog, device, "switchover", submission) {
                 // A device that did not cut over would leave this node serving two generations at
                 // once, so §7.3 step 4's revert runs on every device: the generation that served
@@ -3411,10 +3411,10 @@ impl MainProcess {
         // the daemon waits two minutes for `Switched` - and a control thread that waited here would
         // answer no command, no request event and no metrics for the same minutes. `advance_warmup`
         // reads them on the passes that follow, and a device that fails reverts the update.
-        for executor in &self.executors {
-            let device = executor.device();
+        for worker in &self.workers {
+            let device = worker.device();
             let ordinal = u32::try_from(device.0).unwrap_or_default();
-            match executor.warmup() {
+            match worker.warmup() {
                 Ok(submission) => self.warming.push((ordinal, submission, generation)),
                 Err(error) => {
                     let failure = UpdateFailure::Device {
@@ -3435,7 +3435,7 @@ impl MainProcess {
 
         tracing::info!(
             generation,
-            devices = self.executors.len(),
+            devices = self.workers.len(),
             queued = self.warming.len(),
             "the switchover queued the epoch's warmup and set the boundary"
         );
@@ -3487,7 +3487,7 @@ impl MainProcess {
         let status = answer_commit(&mut self.update, generation);
         if matches!(status, ProgramStatus::Committed { .. }) {
             // Probation ended in a commit, so the generation before the update can never serve
-            // again. Its graphs and kernels live until the purge, which is the executor's book to
+            // again. Its graphs and kernels live until the purge, which is the worker's book to
             // keep - and the programs it was built from go with the record of it, since no revert
             // can serve it.
             self.retired.clear();
@@ -3596,11 +3596,11 @@ impl MainProcess {
             return Ok(());
         };
         self.discard_policy();
-        for executor in &self.executors {
-            match executor.discard(generation) {
+        for worker in &self.workers {
+            match worker.discard(generation) {
                 Ok(submission) => {
                     if let Err(error) =
-                        device_command(&self.watchdog, executor.device(), "discard", submission)
+                        device_command(&self.watchdog, worker.device(), "discard", submission)
                     {
                         // The generation never serves: a discard that did not finish holds storage
                         // until the purge, and the epoch that drained is not made to fail for it.
@@ -3978,9 +3978,9 @@ impl MainProcess {
                 .context("resuming the generation a revert went back to")?;
         }
         let current = self.update.current();
-        for executor in &self.executors {
-            let device = executor.device();
-            // §7.3 step 4's revert is the reverse switchover, and `Executor::revert` is the verb
+        for worker in &self.workers {
+            let device = worker.device();
+            // §7.3 step 4's revert is the reverse switchover, and `Worker::revert` is the verb
             // that runs it: a `switchover` back to the kept generation would find nothing prepared
             // (the cut-over took `next`) and refuse by name - the current generation would be left
             // serving with no kernels and no graphs.
@@ -3992,8 +3992,8 @@ impl MainProcess {
                 // §7.3 step 2's discard: the generation's graphs and kernels go, and the generation
                 // that serves is untouched. A reverse switchover here would be refused by name -
                 // nothing was switched over - and would end the epoch over an update that never cut.
-                executor::hot_update::Phase::Precopied { .. } => executor.discard(generation),
-                _ => executor.revert(current),
+                worker::hot_update::Phase::Precopied { .. } => worker.discard(generation),
+                _ => worker.revert(current),
             };
             let submission = queued.with_context(|| {
                 format!(
@@ -4008,7 +4008,7 @@ impl MainProcess {
         // would otherwise keep its graphs, its kernels and its arena until the process exits - a
         // whole generation of device memory - so it is released here, now that every device has
         // finished going back and no batch of it can be in flight.
-        if matches!(phase, executor::hot_update::Phase::Probation { .. }) {
+        if matches!(phase, worker::hot_update::Phase::Probation { .. }) {
             match self.purge(generation) {
                 Ok(ProgramStatus::Purged { .. }) => {}
                 Ok(other) => tracing::warn!(
@@ -4029,7 +4029,7 @@ impl MainProcess {
     }
 
     /// §7.3 step 6: release the generation before the serving one, once its last
-    /// batch completed. The executor's queue orders the purge behind every batch
+    /// batch completed. The worker's queue orders the purge behind every batch
     /// it already holds, and `Captured` keeps each kernel alive until the graph
     /// that uses it is rebound or destroyed.
     fn purge(&mut self, generation: u64) -> Result<ProgramStatus> {
@@ -4050,9 +4050,9 @@ impl MainProcess {
         }
         // A purge has no policy half: the scheduling policy is one program per epoch and its
         // modules are released with the scheduler, not with a generation's graphs.
-        for executor in &self.executors {
-            let device = executor.device();
-            let submission = executor.purge(generation)?;
+        for worker in &self.workers {
+            let device = worker.device();
+            let submission = worker.purge(generation)?;
             if let Err(error) = device_command(&self.watchdog, device, "purge", submission) {
                 // The generation still serves nothing, so a purge that did not finish leaks its
                 // storage rather than breaking correctness: it is reported and the epoch serves on.
@@ -4333,7 +4333,7 @@ impl MainProcess {
                 }
                 return Ok(None);
             }
-            // The executor era's park, resume and trial commit move an executor world between
+            // The worker era's park, resume and trial commit move a worker world between
             // processes. The epoch parks, resumes and commits through the process connection, in
             // front of the frontend rather than behind it (§2.5, §7.4).
             Some(proto::request::wire::engine_command::Kind::Park(park)) => Some(
@@ -4386,7 +4386,7 @@ impl MainProcess {
             // What the prefix cache holds is answered here, from what this process announced.
             //
             // A standby that starts on these devices maps the serving epoch's segments read-only
-            // (`specs/executor.md` 7.4 step 1), so reading them moves nothing and is not a lifecycle
+            // (`specs/worker.md` 7.4 step 1), so reading them moves nothing and is not a lifecycle
             // command. The answer is the description this process gave the daemon when it became
             // ready: the segments are the pool's, and they are the same for as long as the epoch
             // serves. Asking every scheduler afresh is what cannot be done from here - a scheduler
@@ -4441,7 +4441,7 @@ impl MainProcess {
     /// Answers one operation of an epoch's warming from every scheduler.
     ///
     /// Only the operations that stay inside a scheduler are this process's: the copies of the
-    /// executor era's warming ran on its workers' hooks, and an epoch's pages reach a target through
+    /// worker era's warming ran on its workers' hooks, and an epoch's pages reach a target through
     /// the host KV cache. The operations asked here take no fence, so a scheduler answers at its
     /// next pass; the bound is the one a scheduler that stopped answering is named by.
     fn warm_cache(
@@ -4484,9 +4484,9 @@ impl MainProcess {
     }
 
     /// Sends the engine's counters to the daemon, one report a second and a
-    /// final flush when the process ends (`specs/executor.md` §2.3).
+    /// final flush when the process ends (`specs/worker.md` §2.3).
     ///
-    /// The executor states its own figures: the launches and device nanoseconds
+    /// The worker states its own figures: the launches and device nanoseconds
     /// its runners counted, the jobs in flight the control thread's watchdog
     /// reads, and the pools the arena books against the rank's budget - which is
     /// the invariant of §4.1 and §8, a device never mapping more than its budget
@@ -4497,28 +4497,28 @@ impl MainProcess {
         // The driver calls this thread waited in, and the fence records an idle device left unread,
         // reach the next batch result.
         let current = platform::cupti::blocking::Calls::current();
-        executor::profiling::counters::add_blocking("control", &current.since(&self.control_calls));
+        worker::profiling::counters::add_blocking("control", &current.since(&self.control_calls));
         self.control_calls = current;
-        if let Some(fences) = executor::profiling::fences::Fences::installed() {
+        if let Some(fences) = worker::profiling::fences::Fences::installed() {
             fences.poll(false);
         }
         let mut kernel_launches = 0_u64;
         let mut device_ns = 0_u64;
-        let mut queue = Vec::with_capacity(self.executors.len());
-        let mut memory = Vec::with_capacity(self.executors.len());
-        for (rank, executor) in self.executors.iter().enumerate() {
-            let counters = executor.counters();
+        let mut queue = Vec::with_capacity(self.workers.len());
+        let mut memory = Vec::with_capacity(self.workers.len());
+        for (rank, worker) in self.workers.iter().enumerate() {
+            let counters = worker.counters();
             kernel_launches += counters.kernel_launches;
             device_ns += counters.device_ns;
             queue.push(proto::request::wire::QueueDepth {
                 rank: rank as u32,
-                depth: executor.watchdog().jobs.len() as u32,
+                depth: worker.watchdog().jobs.len() as u32,
             });
             // One allocator books the device's three pools (`arena::DeviceMemory`), so the three
             // figures sum against one budget and item 5's invariant is reported as it is decided.
-            let pools = executor.memory();
+            let pools = worker.memory();
             memory.push(proto::request::wire::DeviceMemory {
-                device: executor.device().0 as u32,
+                device: worker.device().0 as u32,
                 budget: pools.budget,
                 pools: ["graph", "scratch", "resident"]
                     .into_iter()
@@ -4530,7 +4530,7 @@ impl MainProcess {
                     .collect(),
             });
         }
-        // The schedulers state their own figures; a node that holds none reports the executors'
+        // The schedulers state their own figures; a node that holds none reports the workers'
         // and a step count of zero, because no step happened here.
         let (mut steps, mut batches, mut tokens, mut policy_fuel, mut policy_calls) =
             (0, 0, 0, 0, 0);
@@ -4545,7 +4545,7 @@ impl MainProcess {
             tokens += counters.tokens;
             policy_fuel += counters.policy_fuel;
             policy_calls += counters.policy_calls;
-            // The launches and the device time are the executors', counted where they are issued:
+            // The launches and the device time are the workers', counted where they are issued:
             // a scheduler's copy of them would be a second source for one figure.
         }
         let metrics = proto::request::wire::Metrics {
@@ -4804,7 +4804,7 @@ impl MainProcess {
         tracing::info!(
             state = ?state,
             schedulers = self.schedulers.len(),
-            devices = self.executors.len(),
+            devices = self.workers.len(),
             "stating what this process is to the daemon"
         );
         if matches!(
@@ -4827,11 +4827,11 @@ impl MainProcess {
     }
 
     /// What the daemon records of this process: the limits every request is checked against, the
-    /// batch the executors were started for, and the KV cache segments a successor on the same
+    /// batch the workers were started for, and the KV cache segments a successor on the same
     /// devices maps (§7.3 step 1).
     ///
-    /// The figures are the executors' own (`SchedulerHandle::info`), except the cache segments, which
-    /// each scheduler describes for itself: a successor needs what the executors hold now, not what
+    /// The figures are the workers' own (`SchedulerHandle::info`), except the cache segments, which
+    /// each scheduler describes for itself: a successor needs what the workers hold now, not what
     /// this process planned.
     fn engine_info(&self) -> Result<proto::request::wire::EngineInfo> {
         let first = self
@@ -4852,7 +4852,7 @@ impl MainProcess {
             {
                 Ok(Ok(groups)) => groups,
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, "an executor group did not describe its cache");
+                    tracing::warn!(%error, "a worker group did not describe its cache");
                     continue;
                 }
                 Err(error) => {
@@ -4892,7 +4892,7 @@ impl MainProcess {
             capacity: Some(proto::request::wire::BatchCapacity {
                 max_batch: info.max_batch_calls,
                 max_num_batched_tokens: u64::from(info.max_batch_tokens),
-                // The launch's own figure, not the executor's row count: the rows include the
+                // The launch's own figure, not the worker's row count: the rows include the
                 // guidance prefix, which is not a request.
                 max_running_requests: self.max_running_requests,
             }),
@@ -4940,19 +4940,19 @@ impl MainProcess {
         if let Some(union) = &self.union {
             union.end();
         }
-        // The schedulers go first: their `Batches` holds a clone of every executor, and a device
+        // The schedulers go first: their `Batches` holds a clone of every worker, and a device
         // thread cannot be joined while a scheduler could still submit to it.
         self.schedulers.clear();
-        for executor in std::mem::take(&mut self.executors) {
-            let Some(executor) = Arc::into_inner(executor) else {
+        for worker in std::mem::take(&mut self.workers) {
+            let Some(worker) = Arc::into_inner(worker) else {
                 tracing::warn!(
-                    "a device executor is still held after its schedulers ended; its thread ends \
+                    "a device worker is still held after its schedulers ended; its thread ends \
                      when the last holder drops it"
                 );
                 continue;
             };
-            if let Err(error) = executor.close() {
-                tracing::warn!(%error, "closing a device executor failed");
+            if let Err(error) = worker.close() {
+                tracing::warn!(%error, "closing a device worker failed");
             }
         }
         for error in self.blocking.close() {
@@ -5016,17 +5016,17 @@ enum WeightStage {
     /// The pass moving it from one stage to the next.
     Between,
     /// The checkpoint's load is walked, moving no byte.
-    Planning(crossbeam_channel::Receiver<executor::Result<executor::data_plane::Planned>>),
+    Planning(crossbeam_channel::Receiver<worker::Result<worker::data_plane::Planned>>),
     /// The schedulers quiesce: for `recompute` and `abort` they sleep, so the cache's storage holds
     /// the new checkpoint, and for a `keep` the free storage does not hold, they stop forming
     /// batches. The load waits.
-    Quiescing(Vec<DataAnswer>, Option<executor::data_plane::Planned>),
+    Quiescing(Vec<DataAnswer>, Option<worker::data_plane::Planned>),
     /// The new weights are published, beside the weights that serve.
-    Loading(crossbeam_channel::Receiver<executor::Result<executor::data_plane::Planned>>),
+    Loading(crossbeam_channel::Receiver<worker::Result<worker::data_plane::Planned>>),
     /// The schedulers put the new weights in place at a boundary.
     Applying(Vec<DataAnswer>),
     /// The graph storage a `keep` load took comes back.
-    Restoring(crossbeam_channel::Receiver<executor::Result<()>>),
+    Restoring(crossbeam_channel::Receiver<worker::Result<()>>),
     /// The schedulers wake, or form batches again.
     Resuming(Vec<DataAnswer>),
 }
@@ -5104,7 +5104,7 @@ impl MainProcess {
         &mut self,
         front: usize,
         id: u64,
-        work: impl FnOnce(&executor::data_plane::DataPlane) -> executor::Result<Vec<String>>
+        work: impl FnOnce(&worker::data_plane::DataPlane) -> worker::Result<Vec<String>>
         + Send
         + 'static,
     ) {
@@ -5287,7 +5287,7 @@ impl MainProcess {
             .name("weight-plan".into())
             .spawn(move || {
                 let _ =
-                    answer.send(data.plan(target, executor::memory::reload::Matching::SameTensors));
+                    answer.send(data.plan(target, worker::memory::reload::Matching::SameTensors));
             });
         if spawned.is_err() {
             self.refuse(
@@ -5417,7 +5417,7 @@ impl MainProcess {
     fn quiesce(
         &mut self,
         update: &mut WeightUpdate,
-        planned: &executor::data_plane::Planned,
+        planned: &worker::data_plane::Planned,
     ) -> std::result::Result<Vec<DataAnswer>, String> {
         if self.asleep {
             return Ok(Vec::new());
@@ -5466,11 +5466,7 @@ impl MainProcess {
     /// Starts publishing the new weights beside the ones that serve, after giving the graph storage
     /// up to them when `suspend` says so. A thread of its own: the load reads a checkpoint for
     /// minutes, and neither a scheduler nor this thread may wait for it.
-    fn load_weights(
-        &mut self,
-        planned: executor::data_plane::Planned,
-        suspend: bool,
-    ) -> WeightStage {
+    fn load_weights(&mut self, planned: worker::data_plane::Planned, suspend: bool) -> WeightStage {
         let (answer, answered) = crossbeam_channel::bounded(1);
         let data = Arc::clone(&self.data);
         let spawned = std::thread::Builder::new()
@@ -5741,7 +5737,7 @@ fn fence_switch(payload: &str) -> std::result::Result<Vec<String>, String> {
             .map_err(|error| format!("fence_switch off: {error}"))?,
         _ => Vec::new(),
     };
-    let switched = executor::profiling::fences::Fences::installed()
+    let switched = worker::profiling::fences::Fences::installed()
         .map(|fences| fences.switch(enabled, &off))
         .transpose()
         .map_err(|error| error.to_string())?;
@@ -5811,15 +5807,15 @@ fn report_of(status: &ProgramStatus) -> Option<proto::process::Report> {
 /// descriptor is what the model's forward computes for a bucket and nothing outside the forward can
 /// list them.
 fn missing_kernel(submissions: &[Submission]) -> Option<(String, String)> {
-    /// The kernel an error names as missing, whether it reached the executor as an operator's
+    /// The kernel an error names as missing, whether it reached the worker as an operator's
     /// error or wrapped in the model layer's: a capture reports it through
     /// `nn::Forward::operate`, which resolves the kernel and converts the operator's error into the
     /// layer's own. Matching only the operator's arm would leave every capture's miss unrecognised,
     /// and the discovery loop would abandon a generation it could have completed.
-    fn named(error: &executor::Error) -> Option<(&'static str, &str)> {
+    fn named(error: &worker::Error) -> Option<(&'static str, &str)> {
         let ops = match error {
-            executor::Error::Ops(ops) => ops,
-            executor::Error::Nn(nn::Error::Ops(ops)) => ops,
+            worker::Error::Ops(ops) => ops,
+            worker::Error::Nn(nn::Error::Ops(ops)) => ops,
             _ => return None,
         };
         match ops {
@@ -6123,14 +6119,14 @@ struct ListStore {
 impl HostAction for ListStore {
     type Output = program_server::Listing;
 
-    fn run(&self) -> executor::Result<Self::Output> {
+    fn run(&self) -> worker::Result<Self::Output> {
         tracing::info!("asking the Program Server for its installed programs");
         let mut client = self
             .programs
             .lock()
-            .map_err(|_| executor::Error::State("the Program Server client was poisoned".into()))?;
+            .map_err(|_| worker::Error::State("the Program Server client was poisoned".into()))?;
         let listing = client.list().map_err(|error| {
-            executor::Error::Invalid(format!("reading the Program Server's store: {error}"))
+            worker::Error::Invalid(format!("reading the Program Server's store: {error}"))
         })?;
         tracing::info!(
             packages = listing.packages.len(),
@@ -6141,7 +6137,7 @@ impl HostAction for ListStore {
 
     /// Nothing to give back: the client this action borrows belongs to the process, and its reply
     /// holds no device or pinned memory.
-    fn release(&self) -> executor::Result<()> {
+    fn release(&self) -> worker::Result<()> {
         Ok(())
     }
 
@@ -6164,14 +6160,14 @@ enum ModuleWork {
 impl HostAction for ModuleWork {
     type Output = ModuleAnswer;
 
-    fn run(&self) -> executor::Result<Self::Output> {
+    fn run(&self) -> worker::Result<Self::Output> {
         match self {
             Self::List(list) => list.run().map(ModuleAnswer::Listed),
             Self::Install(install) => install.run().map(ModuleAnswer::Installed),
         }
     }
 
-    fn release(&self) -> executor::Result<()> {
+    fn release(&self) -> worker::Result<()> {
         match self {
             Self::List(list) => list.release(),
             Self::Install(install) => install.release(),
@@ -6276,7 +6272,7 @@ impl Unavailable {
     }
 }
 
-/// One module the Program Server resolved, held open while its kernel loads (`specs/executor.md`
+/// One module the Program Server resolved, held open while its kernel loads (`specs/worker.md`
 /// §4.2, §6.3).
 ///
 /// The server sends the module's files as open handles rather than as paths, so the image is read
@@ -6345,8 +6341,8 @@ impl Drop for NativeModule {
 fn native_library(
     files: Vec<program_server::ModuleFile>,
     entry: &str,
-) -> executor::Result<NativeModule> {
-    let invalid = |reason: String| executor::Error::Invalid(reason);
+) -> worker::Result<NativeModule> {
+    let invalid = |reason: String| worker::Error::Invalid(reason);
     let siblings = files.len() > 1;
     let chosen = match files.len() {
         0 => return Err(invalid("a native module carries no library".to_owned())),
@@ -6447,11 +6443,11 @@ fn as_raw_fd(file: &program_server::ModuleFile) -> std::os::fd::RawFd {
 fn native_module(
     file: &program_server::ModuleFile,
     copy_allowed: bool,
-) -> executor::Result<NativeModule> {
+) -> worker::Result<NativeModule> {
     use std::io::Read as _;
     use std::os::fd::AsRawFd as _;
 
-    let invalid = |reason: String| executor::Error::Invalid(reason);
+    let invalid = |reason: String| worker::Error::Invalid(reason);
     let link = format!("/proc/self/fd/{}", file.file.as_raw_fd());
     if let Ok(target) = std::fs::read_link(&link) {
         let named = !target.to_string_lossy().ends_with(" (deleted)");
@@ -6518,7 +6514,7 @@ impl Resolved {
     }
 
     /// The module as `ops::install` takes it.
-    fn as_ops(&self) -> executor::Result<ops::Module<'_>> {
+    fn as_ops(&self) -> worker::Result<ops::Module<'_>> {
         match (&self.image, &self.native) {
             (Some(image), _) => Ok(ops::Module::Cubin {
                 image,
@@ -6529,7 +6525,7 @@ impl Resolved {
                 path: native.path.as_path(),
                 entry: &self.entry,
             }),
-            (None, None) => Err(executor::Error::Invalid(
+            (None, None) => Err(worker::Error::Invalid(
                 "a resolved module carries neither a cubin image nor a native library".to_owned(),
             )),
         }
@@ -6712,10 +6708,10 @@ fn quarter(bytes: &[u8], at: usize) -> Option<u32> {
 /// Reads a resolved module into the form `ops::install` takes, or refuses a form this build cannot
 /// install (§4.2): a scheduling policy's wasm program and a program the main process runs as its
 /// own process are not kernels.
-fn resolved(module: program_server::Module) -> executor::Result<Resolved> {
+fn resolved(module: program_server::Module) -> worker::Result<Resolved> {
     use std::io::Read as _;
 
-    let invalid = |reason: String| executor::Error::Invalid(reason);
+    let invalid = |reason: String| worker::Error::Invalid(reason);
     let mut files = module.files.into_iter();
     match module.form {
         program_server::manifest::ModuleForm::Cubin => {
@@ -6793,7 +6789,7 @@ impl Install {
         &self,
         client: &mut Client,
         request: &PrepareRequest,
-    ) -> executor::Result<PackageInstall> {
+    ) -> worker::Result<PackageInstall> {
         // The one call that leaves this process while a generation is prepared: a run that hangs
         // before it reaches the Program Server and one that hangs inside it look the same from the
         // daemon, so both sides state it.
@@ -6850,7 +6846,7 @@ impl Install {
             })
             .map_err(|error| {
                 self.note(&error);
-                executor::Error::Invalid(format!("building the new generation: {}", causes(&error)))
+                worker::Error::Invalid(format!("building the new generation: {}", causes(&error)))
             })?;
 
         let mut entries = Vec::new();
@@ -6858,7 +6854,7 @@ impl Install {
         let mut asked: Vec<(String, usize)> = Vec::with_capacity(prepared.programs.len());
         for chosen in &prepared.programs {
             let operator = ops::operator_name(&chosen.slot.op).ok_or_else(|| {
-                executor::Error::Invalid(format!(
+                worker::Error::Invalid(format!(
                     "operator {} has no implementation in this build",
                     chosen.slot.op
                 ))
@@ -6896,7 +6892,7 @@ impl Install {
                             error = ?error,
                             "resolving this generation's module failed"
                         );
-                        executor::Error::Invalid(format!(
+                        worker::Error::Invalid(format!(
                             "resolving {} for {key}: {}",
                             chosen.slot.op,
                             causes(&error)
@@ -6919,7 +6915,7 @@ impl Install {
                             "installing this generation's kernel failed"
                         );
                         report_missing_entry(&error);
-                        return Err(executor::Error::Invalid(format!(
+                        return Err(worker::Error::Invalid(format!(
                             "installing {operator} for {key}: {}",
                             causes(&error)
                         )));
@@ -6985,11 +6981,11 @@ impl HostAction for Install {
     /// The lane is admitted one task per device, so the packages are asked one after another under
     /// one lock of the client: each is its own request, and the entries of all of them are this
     /// device's kernels for the generation.
-    fn run(&self) -> executor::Result<Self::Output> {
+    fn run(&self) -> worker::Result<Self::Output> {
         let mut client = self
             .programs
             .lock()
-            .map_err(|_| executor::Error::State("the Program Server client was poisoned".into()))?;
+            .map_err(|_| worker::Error::State("the Program Server client was poisoned".into()))?;
         let mut entries = Vec::new();
         let mut copies = 0_usize;
         let mut prepared: Vec<(String, usize)> = Vec::new();
@@ -7017,7 +7013,7 @@ impl HostAction for Install {
                 "the Program Server prepared this generation's programs and this device installed \
                  no module of any of them"
             );
-            return Err(executor::Error::Invalid(format!(
+            return Err(worker::Error::Invalid(format!(
                 "the Program Server prepared {} program(s) for target {} and this device installed \
                  no module of any of them ({asked}): a program given no key was never asked for a \
                  module, and one given keys built nothing",
@@ -7043,7 +7039,7 @@ impl HostAction for Install {
         Ok(entries)
     }
 
-    fn release(&self) -> executor::Result<()> {
+    fn release(&self) -> worker::Result<()> {
         Ok(())
     }
 
@@ -7248,7 +7244,7 @@ struct Precopy {
     /// Whether every scheduler has already been asked for the candidate policy: the discovery loop
     /// re-enters the stages, and the policy is prepared once.
     policy_requested: bool,
-    /// The generation built for each device, in `executors` order.
+    /// The generation built for each device, in `workers` order.
     next: Vec<Arc<Generation>>,
     /// The answers of every scheduler that is preparing the update's policy program. The build runs
     /// on the schedulers' own blocking threads, so the serve pass polls them instead of waiting.
@@ -7273,8 +7269,8 @@ impl Precopy {
 enum PrecopyStage {
     /// The module-load lane, in the two steps the update runs it in (§7.3 step 2).
     Modules(ModuleLane),
-    /// The executors rebind or recapture their buckets.
-    Executors(Vec<Submission>),
+    /// The workers rebind or recapture their buckets.
+    Workers(Vec<Submission>),
     /// The shadow pass compares the new implementations on the resident requests, one step per
     /// scheduler; each answers when its step ran.
     Shadow(Vec<crossbeam_channel::Receiver<std::result::Result<(), String>>>),
@@ -7350,7 +7346,7 @@ impl Wait {
 fn stage_name(stage: &PrecopyStage) -> &'static str {
     match stage {
         PrecopyStage::Modules(_) => "the module load lane",
-        PrecopyStage::Executors(_) => "this node's devices",
+        PrecopyStage::Workers(_) => "this node's devices",
         PrecopyStage::Shadow(_) => "the schedulers' shadow step",
         PrecopyStage::Done => "done",
     }
@@ -7369,7 +7365,7 @@ enum StageFailure {
 /// What one stage is still waiting for, in one phrase.
 ///
 /// A stage's name says where a hang is, not which of the stage's several waits it is: the module
-/// lane holds one task per device, the executor stage one submission per device, and the shadow
+/// lane holds one task per device, the worker stage one submission per device, and the shadow
 /// stage one step per scheduler. The stall line prints the counts so a run names the wait that
 /// never answered without a second run built for the purpose.
 /// What a device stage is waiting on: each unanswered device's own account, and each scheduler's
@@ -7381,7 +7377,7 @@ enum StageFailure {
 /// the wait the devices' own account cannot show.
 fn device_work(
     submissions: &[Submission],
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
 ) -> String {
     // The label alone says which stage stood; the device thread's own account says whether it is
@@ -7392,16 +7388,14 @@ fn device_work(
         if submission.outcome().is_some() {
             continue;
         }
-        let Some(executor) = executors.get(rank) else {
-            pending.push(format!("rank {rank}: no executor"));
+        let Some(worker) = workers.get(rank) else {
+            pending.push(format!("rank {rank}: no worker"));
             continue;
         };
-        let performing = executor
-            .performing()
-            .unwrap_or_else(|| "nothing".to_owned());
+        let performing = worker.performing().unwrap_or_else(|| "nothing".to_owned());
         pending.push(format!(
             "rank {rank}: {performing}, {} open capture(s)",
-            executor.capturing()
+            worker.capturing()
         ));
     }
     let answered = submissions.len() - pending.len();
@@ -7421,7 +7415,7 @@ fn device_work(
 
 fn pending_work(
     stage: &PrecopyStage,
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     policies: &[crossbeam_channel::Receiver<std::result::Result<(), String>>],
 ) -> String {
     match stage {
@@ -7433,7 +7427,7 @@ fn pending_work(
             let answered = tasks.iter().filter(|task| task.outcome().is_some()).count();
             format!("{answered} of {} kernel load(s) answered", tasks.len())
         }
-        PrecopyStage::Executors(submissions) => device_work(submissions, executors, policies),
+        PrecopyStage::Workers(submissions) => device_work(submissions, workers, policies),
         PrecopyStage::Shadow(answers) => {
             let answered = answers.iter().filter(|answer| !answer.is_empty()).count();
             format!("{answered} of {} shadow step(s) answered", answers.len())
@@ -7508,11 +7502,11 @@ fn switchover_answer(warming: usize, generation: u64) -> SwitchoverAnswer {
     }
 }
 
-fn answer_commit(update: &mut executor::hot_update::HotUpdate, generation: u64) -> ProgramStatus {
+fn answer_commit(update: &mut worker::hot_update::HotUpdate, generation: u64) -> ProgramStatus {
     // An epoch switch commits its target, whose programs were committed when the daemon handed them
     // over: the generation it names already serves with nothing on trial, so the answer is that.
     if update.current() == generation
-        && matches!(update.phase(), executor::hot_update::Phase::Serving)
+        && matches!(update.phase(), worker::hot_update::Phase::Serving)
     {
         return ProgramStatus::Committed { generation };
     }
@@ -8024,7 +8018,7 @@ fn descriptor_keys(generation: &Generation, operator: &'static str) -> Vec<Strin
         .collect()
 }
 
-/// The oldest of the executors' jobs.
+/// The oldest of the workers' jobs.
 fn oldest(running: &[Running]) -> Option<Running> {
     running.iter().min_by_key(|job| job.since).copied()
 }
@@ -8053,29 +8047,29 @@ fn device_command(
 }
 
 /// The handshake with the daemon, which answers with the epoch this node serves
-/// (`specs/executor.md` §2.3).
+/// (`specs/worker.md` §2.3).
 ///
 /// This node's scheduler threads, one per DP rank (§2.4, §4.4).
 ///
 /// A node that is not the scheduler node serves only what its peers' schedulers ask of it, so it
 /// builds none. The scheduler node builds one thread per data-parallel rank, each handed this
-/// node's executors through `executor::Batches`: the scheduler forms a batch, the executor issues
+/// node's workers through `worker::Batches`: the scheduler forms a batch, the worker issues
 /// it, and the scheduler reads the result - nothing crosses threads except the batch and its
 /// result.
 fn schedulers(
     model_runner: &ModelRunner,
     launch: &EngineArgs,
     model: &crate::model_runner::Served,
-    executors: &[Arc<Executor>],
+    workers: &[Arc<Worker>],
     rank: &ipc::MainProcessInfo,
     memory: &Memory,
     control: ipc::Wake,
-    data: &Arc<executor::data_plane::DataPlane>,
+    data: &Arc<worker::data_plane::DataPlane>,
 ) -> Result<Vec<engine::SchedulerHandle>> {
     if !launch.scheduler_node {
         return Ok(Vec::new());
     }
-    if executors.is_empty() {
+    if workers.is_empty() {
         bail!("the scheduler node holds no device to serve a batch on");
     }
     // The host KV cache copies a rank's pages on that rank's copy stream, into the pool the one rank
@@ -8084,7 +8078,7 @@ fn schedulers(
     // a page holds what the union computed. A scheduler over several devices would copy one
     // device's share of every page, so it keeps none, and no text model runs one today: a rank
     // maps its model on one device.
-    let host_cache = model_runner.host_kv_cache(model) && executors.len() == 1;
+    let host_cache = model_runner.host_kv_cache(model) && workers.len() == 1;
     // One scheduler per scheduler thread: it reads the engine configuration as this rank resolves
     // it, with the model's facts, and the limits this rank captured.
     let (args, limits) = model_runner.scheduler_args(launch, model, host_cache)?;
@@ -8093,16 +8087,16 @@ fn schedulers(
         cache.host_token_bytes = memory.host_token_bytes();
     }
     // The scheduler submits through the same devices this process drives, so a batch and a
-    // switchover reach one executor thread per device and never two.
+    // switchover reach one worker thread per device and never two.
     // The scheduler plans against a description of the pool, and this process is the one pool it
     // holds: its single rank is this one, its capacities are the launch's (the rank reports what it
     // holds, not what it was launched for), and its longest sequence is the model's bound. The
-    // inventory is the executor's to hold and the boot's to state, because neither number can be
+    // inventory is the worker's to hold and the boot's to state, because neither number can be
     // derived from a batch (4.4).
-    let inventory = executor::batch::Inventory {
+    let inventory = worker::batch::Inventory {
         group: launch.group.clone(),
         ranks: vec![rank.clone()],
-        layout: executor::batch::PoolLayout {
+        layout: worker::batch::PoolLayout {
             queue_depth: model_runner.queue_depth(),
             ranks: model_runner.world_size(),
             // Every component the rank reports is placed on the group's ranks. A text rank reports
@@ -8121,17 +8115,16 @@ fn schedulers(
         },
         max_model_len: model_runner.max_kv_len(model)?,
     };
-    let mut stated =
-        executor::batch::Executors::shared(executors.iter().map(Arc::clone).collect())?
-            .stating(vec![inventory])
-            .with_data_plane(Arc::clone(data));
+    let mut stated = worker::batch::Workers::shared(workers.iter().map(Arc::clone).collect())?
+        .stating(vec![inventory])
+        .with_data_plane(Arc::clone(data));
     if host_cache {
-        stated = stated.keeping_host_cache(executor::batch::HostCacheKeys {
+        stated = stated.keeping_host_cache(worker::batch::HostCacheKeys {
             fingerprints: vec![data.serving_identity()?; memory.cache_groups()],
             endpoint: None,
         });
     }
-    let batches: Arc<dyn executor::batch::Batches> = Arc::new(stated);
+    let batches: Arc<dyn worker::batch::Batches> = Arc::new(stated);
     // The control thread forwards what a scheduler produced, so it sleeps until a step says there
     // is something: a request's tokens reach the daemon when they exist, not at the next pass.
     let progress = engine::CommandWaker::new(move || control.wake());
@@ -9303,8 +9296,8 @@ mod tests {
 
     /// The state a daemon's late messages meet: an update that went to probation and was reverted by
     /// the rollback threshold, so every command still in flight names a generation no longer there.
-    fn update_on_probation_then_reverted() -> executor::hot_update::HotUpdate {
-        let mut update = executor::hot_update::HotUpdate::new(1);
+    fn update_on_probation_then_reverted() -> worker::hot_update::HotUpdate {
+        let mut update = worker::hot_update::HotUpdate::new(1);
         update.begin_precopy(2).expect("a precopy may begin");
         update.precopied(2).expect("the precopy lands");
         update

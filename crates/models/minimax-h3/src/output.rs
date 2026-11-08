@@ -275,7 +275,7 @@ impl VideoPostprocessor {
     /// `clip` is the clip's decoded raster `[3, frames, rows, columns]` in [`Self::dtype`]; `previous`
     /// is the predecessor's tail `[3, overlap, rows, columns]` and is `None` for the timeline's first
     /// clip, which has nothing to fade against; `out` is `[splice.frames(), rows, columns, 3]` bytes.
-    /// The fade's scratch is reserved here, in the arena the executor sized from the plan: the model is
+    /// The fade's scratch is reserved here, in the arena the worker sized from the plan: the model is
     /// the one reserver, and a buffer the runner placed would be a second mechanism.
     ///
     /// The fade replaces the body's **first** frames, which are the ones the predecessor's tail shares
@@ -737,7 +737,7 @@ impl Raster {
 /// [`VideoPostprocessor::forward`] fades the head of a clip's body against its predecessor's tail into a
 /// buffer of the tail's shape, because the clip's own raster stays the runner's to keep the tail from;
 /// that buffer and one frame for the second product are all the splice reserves, and they are named
-/// here so the executor sizes the arena from arithmetic rather than from the module's own guess. A clip
+/// here so the worker sizes the arena from arithmetic rather than from the module's own guess. A clip
 /// with no predecessor reserves nothing.
 pub fn splice_arena(
     config: &crate::VideoVaeConfig,
@@ -812,7 +812,7 @@ mod tests {
     use super::*;
 
     fn constants(values: [f32; 3]) -> Weight {
-        // The constants are host bytes the executor uploads; a test only needs a weight that names
+        // The constants are host bytes the worker uploads; a test only needs a weight that names
         // three values, never a device that holds them.
         let bytes: &'static [u8] = Box::leak(
             values

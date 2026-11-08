@@ -74,7 +74,7 @@ impl StageAnswer {
 /// shadows them.
 ///
 /// The ask is kept until it is answered: a refused shadow submission answers it
-/// at once with the executor's reason, and a submitted one answers it when its
+/// at once with the worker's reason, and a submitted one answers it when its
 /// step has ended, so an answer never claims a pass that has not run.
 pub(super) struct ShadowPass {
     /// The world generation whose operators the shadow pass runs.
@@ -86,7 +86,7 @@ pub(super) struct ShadowPass {
     /// 2): a pass that shadowed every batch of a shape would keep a slow
     /// comparison in flight for as long as traffic lasts, and it would neither
     /// settle nor leave the device to the requests it serves.
-    pub(super) shapes: std::collections::HashSet<executor::plan::Shape>,
+    pub(super) shapes: std::collections::HashSet<worker::plan::Shape>,
     /// Where the ask's answer goes, in the shape every stage's answer takes.
     pub(super) answer: StageAnswer,
 }
@@ -113,7 +113,7 @@ impl Scheduler {
     /// Aborts every queued/gated/running request with a terminal event.
     ///
     /// `Scheduler::run` calls this on shutdown and after engine-fatal, and
-    /// `Scheduler::step` on shutdown, each right before closing the executor.
+    /// `Scheduler::step` on shutdown, each right before closing the worker.
     /// Shutdown covers both a `Shutdown` command and a disconnected command
     /// channel. Running requests finish immediately rather than waiting for
     /// their in-flight calls, and batches assembled but not yet submitted are
@@ -165,7 +165,7 @@ impl Scheduler {
     /// Applies one command; returns true on shutdown.
     ///
     /// Every submission is validated by `enqueue` or `enqueue_media`, which
-    /// refuse what the loaded executors cannot serve and report their own
+    /// refuse what the loaded workers cannot serve and report their own
     /// rejections.
     pub(super) fn handle_command(&mut self, cmd: Command) -> bool {
         // Work that finished on another thread before this command arrived is
@@ -208,14 +208,14 @@ impl Scheduler {
             }
             Command::PublishWorld(answer) => {
                 let published = self
-                    .executor
+                    .worker
                     .publish_world()
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(published);
             }
             Command::Retire { worlds, answer } => {
                 let retired = self
-                    .executor
+                    .worker
                     .retire(&worlds)
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(retired);
@@ -227,21 +227,18 @@ impl Scheduler {
                 answer,
             } => {
                 let kept = self
-                    .executor
+                    .worker
                     .keep_weights(&worlds, to_host, &cache_keys)
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(kept);
             }
             Command::Ledgers(answer) => {
-                let read = self
-                    .executor
-                    .ledgers()
-                    .map_err(|error| format!("{error:#}"));
+                let read = self.worker.ledgers().map_err(|error| format!("{error:#}"));
                 let _ = answer.send(read);
             }
             Command::Throttle { halve, answer } => {
                 let throttled = self
-                    .executor
+                    .worker
                     .throttle(halve)
                     .map_err(|error| format!("{error:#}"));
                 let _ = answer.send(throttled);
@@ -314,7 +311,7 @@ impl Scheduler {
             } => {
                 let committed = self.run_together(&together, |scheduler| {
                     scheduler
-                        .executor
+                        .worker
                         .commit_experts(&order)
                         .map_err(|error| format!("{error:#}"))
                 });
@@ -489,19 +486,19 @@ impl Scheduler {
     }
 
     /// §7.3 step 2's shadow pass: the following step's batches also run in
-    /// shadow for `generation`, the executor pairing that world's operators
+    /// shadow for `generation`, the worker pairing that world's operators
     /// against the serving one's resident data without writing resident memory.
     ///
     /// The ask is kept until a step has shadowed its batches, which is when it
-    /// is answered; a shadow submission the executor refuses answers it at once
-    /// with the executor's reason. Only the in-process arm shadows: a supplied
-    /// executor runs no shadow pass, so the ask is refused there rather than
+    /// is answered; a shadow submission the worker refuses answers it at once
+    /// with the worker's reason. Only the in-process arm shadows: a supplied
+    /// worker runs no shadow pass, so the ask is refused there rather than
     /// left waiting for a step that cannot run it.
     fn ask_shadow(&mut self, generation: u64, answer: StageAnswer) {
-        if !self.executor.serves_in_process() {
+        if !self.worker.serves_in_process() {
             answer.send(Err(format!(
                 "the shadow pass of generation {generation} starts when a step submits through \
-                 executor::Batches; this scheduler submits its batches to a supplied executor"
+                 worker::Batches; this scheduler submits its batches to a supplied worker"
             )));
             return;
         }
@@ -540,14 +537,14 @@ impl Scheduler {
     /// Records that a batch of this step was submitted as a shadow pass: the
     /// ask is answered when the step ends, so an answer never claims a pass
     /// that has not run.
-    pub(super) fn note_shadowed(&mut self, shape: Option<executor::plan::Shape>) {
+    pub(super) fn note_shadowed(&mut self, shape: Option<worker::plan::Shape>) {
         if let Some(pass) = self.shadow_pass.as_mut() {
             pass.shadowed = true;
             pass.shapes.extend(shape);
         }
     }
 
-    /// A shadow submission the executor refused: a shadow pass's failure is the
+    /// A shadow submission the worker refused: a shadow pass's failure is the
     /// update's (§7.3 step 2), so the ask is answered with it and the epoch
     /// serves on.
     pub(super) fn shadow_failed(&mut self, reason: impl Into<String>) {
@@ -568,7 +565,7 @@ impl Scheduler {
         if !shadowed {
             return;
         }
-        match self.executor.shadow_status() {
+        match self.worker.shadow_status() {
             // A device still working: the next pass of the loop asks again, and
             // the completion that ends it wakes this thread.
             crate::scheduler::submission::ShadowStatus::Pending => {}
@@ -862,7 +859,7 @@ impl Scheduler {
     /// command for the same request. Other requests remain independently eligible.
     ///
     /// A command is deferred when `include` rejects it or
-    /// `Executor::command_has_capacity` reports a full destination; deferred
+    /// `Worker::command_has_capacity` reports a full destination; deferred
     /// commands keep their relative order in `pending_commands`.
     pub(super) fn take_commands(
         &mut self,
@@ -876,7 +873,7 @@ impl Scheduler {
             // of that request is deferred with it.
             if blocked.contains(&request)
                 || !include(&command)
-                || !self.executor.command_has_capacity(&command)
+                || !self.worker.command_has_capacity(&command)
             {
                 blocked.insert(request);
                 self.inflight.pending_commands.push_back(command);

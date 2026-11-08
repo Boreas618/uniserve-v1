@@ -208,7 +208,7 @@ impl Op for KvWrite {
         }
         for initialized in [&args.key_initialized, &args.value_initialized] {
             initialized.require_rank(Self::NAME, 4)?;
-            // One byte per page, because the plane is one byte per page: the executor's
+            // One byte per page, because the plane is one byte per page: the worker's
             // conversion, units and Storage Server all carry `u8`, and `cache_copy_region` already
             // loads and stores these same flags as `u8`. A flag is a byte of the page's plane, and
             // a four-byte store into it would clobber the three pages that follow.

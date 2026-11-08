@@ -3,7 +3,7 @@
 //! Each layer holds borrowed weight views and the geometry it was built for, and its forward calls
 //! operators (specs/worker.md 4.3): no layer allocates, synchronizes, captures, looks up a program
 //! or names a device. Activations a layer needs beyond its arguments come from
-//! [`Forward::arena`](crate::Forward::arena), which the executor sizes per captured bucket.
+//! [`Forward::arena`](crate::Forward::arena), which the worker sizes per captured bucket.
 //!
 //! ## Tuning constants
 //!

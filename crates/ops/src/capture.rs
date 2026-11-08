@@ -1,14 +1,14 @@
 //! Which graph nodes a capture belongs to.
 //!
 //! A captured graph is replayed as a whole, but a kernel program may be replaced one operator at a
-//! time (specs/worker.md 4.5): the executor hands a graph node new parameters for the operator whose
+//! time (specs/worker.md 4.5): the worker hands a graph node new parameters for the operator whose
 //! program changed. The capture records node handles in launch order, so it needs the same order
 //! annotated with the operator each launch belongs to. That annotation travels through this module:
 //! the layer that launches installs a [`Sink`] for the duration of a capture, and every launch calls
 //! [`launched`] with the operator's name and its descriptor key.
 //!
 //! The sink is one thread's, because one capture runs on one thread. It is not a runtime object of
-//! any model: the executor owns it, installs it around its own capture, and removes it afterwards.
+//! any model: the worker owns it, installs it around its own capture, and removes it afterwards.
 
 use std::cell::Cell;
 use std::ptr::NonNull;
@@ -28,7 +28,7 @@ thread_local! {
 ///
 /// The caller keeps `sink` alive and exclusively borrowed from this call until it removes it with
 /// `None` on the same thread; a sink may not launch operators itself, directly or through a layer.
-/// A sink owns its data (it borrows nothing), which is what lets one thread hold it: the executor's
+/// A sink owns its data (it borrows nothing), which is what lets one thread hold it: the worker's
 /// capture recorder collects handles it owns.
 pub fn set_sink(sink: Option<&mut (dyn Sink + 'static)>) {
     let pointer = sink.map(NonNull::from);

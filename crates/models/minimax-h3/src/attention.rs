@@ -628,7 +628,7 @@ pub struct Scratch {
 impl Scratch {
     /// Reserve one layer's scratch for `normalized` and a key set of `total_rows` rows.
     ///
-    /// The shapes do not depend on the layer, and the executor's arena is a bump allocator reset
+    /// The shapes do not depend on the layer, and the worker's arena is a bump allocator reset
     /// once per forward, so the stack reserves this once rather than once per layer: 50 layers of
     /// ten change-shaped buffers is what a served canvas cannot hold.
     pub fn reserve(

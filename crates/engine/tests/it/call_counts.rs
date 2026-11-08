@@ -32,14 +32,14 @@ use engine::{
     BatchCapacity, Event, GenerationConstraint, GenerationRequest, Parameters, PolicyProgram,
     PolicySource, Progress, SchedulerConfig, SchedulerHandle, Stage,
 };
-use executor::batch::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
-    SubmissionId,
-};
-use executor::completion::Outcome;
 use ipc::{ImageParams, MainProcessEndpoint, MainProcessInfo, SamplingParams, TimingCounters};
 use proto::config::BlockConfig;
 use scheduling::Call;
+use worker::batch::{
+    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
+    SubmissionId,
+};
+use worker::completion::Outcome;
 
 /// How long a command answer may take: a precopy loads and instantiates a
 /// module on its own thread.
@@ -76,7 +76,7 @@ fn rank(host: &str) -> MainProcessInfo {
         max_batch_calls: 16,
         max_batch_tokens: 512,
         // A text pool serves token generation, so it advertises the paged KV
-        // pool every such executor has (`MainProcessInfo::default`): an executor with no
+        // pool every such worker has (`MainProcessInfo::default`): a worker with no
         // prefix cache is refused a token request at submission, which is the
         // rule for a media-only rank and not for this one.
         buffer_pool_bytes: 1 << 20,
@@ -163,11 +163,11 @@ impl Serving {
 }
 
 impl Batches for Serving {
-    fn submit(&self, batch: Batch) -> Result<Submission, executor::Error> {
+    fn submit(&self, batch: Batch) -> Result<Submission, worker::Error> {
         Ok(self.serve(batch))
     }
 
-    fn shadow(&self, batch: Batch) -> Result<Submission, executor::Error> {
+    fn shadow(&self, batch: Batch) -> Result<Submission, worker::Error> {
         Ok(self.serve(batch))
     }
 

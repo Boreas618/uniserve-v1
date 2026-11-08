@@ -14,7 +14,7 @@ pub(crate) struct UnitMeta {
     ///
     /// Every unit of one logical page shares its page's references, so the
     /// units of a page reach zero together and enter the free queue as one
-    /// consecutive run. Unit zero is the executor's padding sentinel: it keeps
+    /// consecutive run. Unit zero is the worker's padding sentinel: it keeps
     /// a zero count but is never enqueued or allocated.
     pub ref_cnt: u32,
     /// First unit of the published prefix page this unit belongs to, which

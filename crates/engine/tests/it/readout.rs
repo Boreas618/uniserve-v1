@@ -5,7 +5,7 @@
 //! and answers once with every candidate's log-probability before finishing.
 //! The simulator reports `sim_candidate_logprob(request, token)` for each
 //! candidate, so the expected answer is known exactly. Tests observe calls at
-//! the executor boundary, the protocol the executor consumes.
+//! the worker boundary, the protocol the worker consumes.
 
 use crate::support;
 
@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 
 use engine::{
     BatchEvent, BlockConfig, CommandSender, EventRx, ExecutionBatch, SchedulerConfig,
-    SchedulerStats, SimEngine, SimExecutor, sim_candidate_logprob,
+    SchedulerStats, SimEngine, SimWorker, sim_candidate_logprob,
 };
 use engine::{
     CachePolicy, Event, FinishReason, GenerationConstraint, GenerationRequest, ImageEncoderInput,
@@ -29,7 +29,7 @@ use ipc::{ImageParams, RequestId, SamplingParams};
 /// Canvas token that marks an answer slot.
 const MASK: u32 = 4;
 
-/// A block-diffusion executor: prompt prefill, canvas denoising and vision
+/// A block-diffusion worker: prompt prefill, canvas denoising and vision
 /// encoding, no token decode, with 16-token cache pages.
 fn readout_worker() -> SimEngine {
     let mut sim = SimEngine::new();
@@ -107,7 +107,7 @@ fn expected_logprobs(request: &GenerationRequest) -> Vec<f32> {
 }
 
 /// A block-diffusion scheduler running on its own thread, with the batches
-/// its executor accepts.
+/// its worker accepts.
 struct Running {
     handle: CommandSender,
     batches: crossbeam_channel::Receiver<BatchEvent>,
@@ -117,11 +117,10 @@ struct Running {
 
 impl Running {
     fn start(sim: SimEngine, config: SchedulerConfig) -> Self {
-        let mut executor = SimExecutor::new(sim);
-        let batches = executor.observe();
+        let mut worker = SimWorker::new(sim);
+        let batches = worker.observe();
         let scheduler =
-            support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config)
-                .unwrap();
+            support::scheduler_with(Box::new(worker), SimEngine::special_tokens(), config).unwrap();
         let stats = scheduler.stats_handle();
         let (tx, rx) = crossbeam_channel::unbounded();
         let handle = CommandSender::new(tx);
@@ -150,7 +149,7 @@ impl Running {
     }
 
     /// Stops the scheduler and returns every submission and resolution the
-    /// executor saw, in order.
+    /// worker saw, in order.
     fn stop_with_resolutions(self) -> Vec<BatchEvent> {
         self.handle.shutdown();
         assert!(!self.thread.join().unwrap(), "the scheduler failed");
@@ -283,7 +282,7 @@ fn a_readout_prefills_without_sampling_and_answers_every_candidate_once() {
     assert_eq!(readout.candidate_ids, vec![7, 8, 9, 10, 11, 12]);
 }
 
-/// An executor reporting a non-finite candidate log-probability fails the
+/// A worker reporting a non-finite candidate log-probability fails the
 /// readout without an answer, and the request's terminal error names the
 /// field, the readout row and slot the value belongs to, and why it was
 /// rejected.
@@ -576,7 +575,7 @@ fn a_context_prefill_writes_every_image_it_reaches() {
     assert_eq!(forward.seq_lens, vec![4, 9, 17, 24, 32]);
 }
 
-/// The rows an executor stages per call bound numerical segments, even when one
+/// The rows a worker stages per call bound numerical segments, even when one
 /// request's context has more segments than a call can hold.
 #[test]
 fn image_contexts_respect_the_workers_staged_row_capacity() {
@@ -681,9 +680,9 @@ fn a_context_chunk_ends_before_an_image_block_it_cannot_hold() {
     );
 }
 
-/// The executor prepares each inline input image as one task on its rank's
+/// The worker prepares each inline input image as one task on its rank's
 /// host task pool, so an image encode waits in the scheduler while the pool
-/// is full instead of reaching the executor: with one host task per rank,
+/// is full instead of reaching the worker: with one host task per rank,
 /// image encodes of different requests are never in flight together, and
 /// every request is still answered.
 #[test]
@@ -781,10 +780,10 @@ fn a_ready_canvas_pass_runs_before_waiting_prefill() {
     };
     // Both requests are queued before the scheduler starts, so the first
     // step prefills all of the short prompt and the start of the long one.
-    let mut executor = SimExecutor::new(sim);
-    let batches = executor.observe();
+    let mut worker = SimWorker::new(sim);
+    let batches = worker.observe();
     let scheduler =
-        support::scheduler_with(Box::new(executor), SimEngine::special_tokens(), config).unwrap();
+        support::scheduler_with(Box::new(worker), SimEngine::special_tokens(), config).unwrap();
     let (tx, rx) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let short = readout_request(7, prompt(16, 1000), vec![row(32, &[(1, &[60])])]);

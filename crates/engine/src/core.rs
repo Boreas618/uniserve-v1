@@ -1,4 +1,4 @@
-//! The deployment's composition: its executor groups, its schedulers and their
+//! The deployment's composition: its worker groups, its schedulers and their
 //! handles.
 //!
 //! A deployment runs one scheduler per DP rank. [`SchedulerHandle`] owns a
@@ -11,7 +11,7 @@
 //! (`proto::config::EngineConfig`) as its process resolved it, the process's
 //! launch, and the mechanism's limits for its ranks ([`SchedulerConfig::of`]). A main process builds one scheduler per
 //! rank it holds with `SchedulerHandle::over_batches_telling`, over the
-//! devices of its own process; `SchedulerHandle::with_executor` takes the CPU
+//! devices of its own process; `SchedulerHandle::with_worker` takes the CPU
 //! simulation backend instead.
 
 use ipc::MediaCall;
@@ -22,24 +22,24 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-#[cfg(feature = "testing")]
-use crate::executor::Executor;
-use crate::executor::WorkerGroupId;
 use crate::handle::{CommandSender, EventRx, SubmitError};
 #[cfg(feature = "testing")]
 use crate::scheduler::DEFAULT_MAX_RUNNING_REQUESTS;
 use crate::scheduler::guidance_prefix_rows;
 use crate::scheduler::{Scheduler, SpecialTokenIds};
 use crate::scheduler::{SchedulerConfig, SchedulerStats};
+#[cfg(feature = "testing")]
+use crate::worker::Worker;
+use crate::worker::WorkerGroupId;
 use crate::{CommandWaker, GenerationLimits, Request};
 use anyhow::Context as _;
-use executor::batch::Batches;
 use ipc::MainProcessInfo;
 use ipc::RequestId;
 #[cfg(test)]
 use proto::config::{BlockConfig, BlockDistribution};
 use proto::config::{EngineArgs, EngineConfig};
 pub use proto::config::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
+use worker::batch::Batches;
 
 /// A storage scope no other deployment names.
 pub(crate) fn unnamed_deployment() -> String {
@@ -48,7 +48,7 @@ pub(crate) fn unnamed_deployment() -> String {
 
 /// The arguments of an engine process of `model` on the CPU simulation backend: one pool of one
 /// rank on this host, named as its worker group, the simulator's generation limits and end of
-/// text, and every other section's default. Pair them with [`SchedulerHandle::with_executor`] and
+/// text, and every other section's default. Pair them with [`SchedulerHandle::with_worker`] and
 /// [`SchedulerConfig::default`].
 #[cfg(feature = "testing")]
 pub fn sim_args(model: impl Into<String>) -> EngineArgs {
@@ -189,22 +189,22 @@ impl SchedulerConfig {
 /// One DP rank's scheduler, running on a thread of its own, and the front
 /// door through which its requests are submitted and controlled.
 ///
-/// The thread owns the [`Scheduler`] and its executor; the handle reaches
+/// The thread owns the [`Scheduler`] and its worker; the handle reaches
 /// it only through the scheduler's command channel, and keeps what the
-/// scheduler reported at start: the executor capabilities, the media units of
+/// scheduler reported at start: the worker capabilities, the media units of
 /// each routed media call, the generation limits and the live statistics.
-/// The dead latch records a fatal executor or executor failure, after which
+/// The dead latch records a fatal worker or worker failure, after which
 /// the handle refuses submissions. Dropping the handle shuts the scheduler
 /// down and joins its thread.
 pub struct SchedulerHandle {
     commands: CommandSender,
     info: MainProcessInfo,
     /// Media units one call of each routed media call covers at once
-    /// (`ExecutorInfo::media_units`).
+    /// (`WorkerInfo::media_units`).
     media_units: BTreeMap<MediaCall, u32>,
     stats: Arc<SchedulerStats>,
     generation_limits: GenerationLimits,
-    /// The executor group whose KV cache the scheduler's pool allocates, by
+    /// The worker group whose KV cache the scheduler's pool allocates, by
     /// which a successor world matches the scheduler's prefix cache index;
     /// `None` without a prefix cache.
     cache_group: Option<String>,
@@ -213,7 +213,7 @@ pub struct SchedulerHandle {
     latent_seed: u64,
     /// The served model identifier.
     model: String,
-    /// Set after `Scheduler::run` returns a fatal exit (executor or executor
+    /// Set after `Scheduler::run` returns a fatal exit (worker or worker
     /// failure). A scheduler thread panic does not set it.
     dead: Arc<AtomicBool>,
     /// The first error of that fatal exit (`Scheduler::failure_handle`).
@@ -221,8 +221,8 @@ pub struct SchedulerHandle {
     /// Whether the scheduler started on trial, as a successor world's do;
     /// its commit ends the trial.
     trial: bool,
-    /// The device-side submission path of the executor's own crate. A handle
-    /// built over a simulated executor has none; the shadow pass and the
+    /// The device-side submission path of the worker's own crate. A handle
+    /// built over a simulated worker has none; the shadow pass and the
     /// in-process submission both need it.
     batches: Option<Arc<dyn Batches>>,
     /// Request ids, shared with the warm-up's view of this scheduler.
@@ -252,7 +252,7 @@ impl SchedulerHandle {
         Self::over_batches_telling(args, limits, batches, CommandWaker::noop())
     }
 
-    /// Starts one scheduler thread over the executor crate's batch path — the
+    /// Starts one scheduler thread over the worker crate's batch path — the
     /// in-process submission path of §2.4 — and returns its handle, with
     /// `progress` told whenever a step produced events or an answer: what the
     /// thread reading them waits on.
@@ -262,12 +262,12 @@ impl SchedulerHandle {
     /// (the model and its facts, the KV cache, the worker groups' roles). It
     /// takes `limits`, the mechanism's bounds for the ranks it drives
     /// ([`SchedulerConfig::of`]). The pool's capabilities come from what the
-    /// executor reports (`Batches::inventory`), and the batches go to `batches`
+    /// worker reports (`Batches::inventory`), and the batches go to `batches`
     /// itself. The scheduler decides nothing until a policy serves it: the
     /// daemon's first `Precopy` and `Switchover` install one (§7.3), and until
     /// then a step forms no batch.
     ///
-    /// Fails when the configuration states no model facts, when the executor
+    /// Fails when the configuration states no model facts, when the worker
     /// reports no pool, pools that disagree about a component, or not the
     /// launch's pool, when a pool serves fewer request rows than the running
     /// requests need, or when the scheduler's thread cannot be started.
@@ -279,7 +279,7 @@ impl SchedulerHandle {
     ) -> anyhow::Result<Self> {
         let engine = &args.engine_config;
         let facts = model_facts(engine)?;
-        let info = crate::executor::ExecutorInfo::from_inventory(batches.inventory())?;
+        let info = crate::worker::WorkerInfo::from_inventory(batches.inventory())?;
         Self::check_pool(args, &info)?;
         let runtime = info.runtime_info()?;
         Self::check_rows(&runtime, limits.max_running_requests)?;
@@ -303,22 +303,22 @@ impl SchedulerHandle {
         Ok(handle)
     }
 
-    /// Runs a scheduler over a simulated executor, as
+    /// Runs a scheduler over a simulated worker, as
     /// [`Self::over_batches_telling`] reads `args` and `limits`.
     ///
     /// The command waker is a no-op, so a command does not interrupt the
-    /// scheduler's idle park, and the executor's pools are not compared with
+    /// scheduler's idle park, and the worker's pools are not compared with
     /// the launch's.
     #[cfg(feature = "testing")]
-    pub fn with_executor(
+    pub fn with_worker(
         args: &EngineArgs,
         limits: SchedulerConfig,
-        executor: Box<dyn Executor>,
+        worker: Box<dyn Worker>,
     ) -> anyhow::Result<Self> {
         let engine = &args.engine_config;
         let facts = model_facts(engine)?;
         let scheduler = Scheduler::new(
-            crate::scheduler::submissions(executor),
+            crate::scheduler::submissions(worker),
             control_tokens(facts),
             limits,
             engine.model.dtype,
@@ -328,12 +328,12 @@ impl SchedulerHandle {
         Self::spawn(scheduler, engine.model.model.clone(), CommandWaker::noop())
     }
 
-    /// Refuses a token runtime whose executors hold fewer request rows than
+    /// Refuses a token runtime whose workers hold fewer request rows than
     /// `max_running_requests` running requests need.
     ///
-    /// A token runtime serves those requests only while its executors hold that
+    /// A token runtime serves those requests only while its workers hold that
     /// many rows beyond the guidance prefix's; the scheduler would otherwise
-    /// lower the limit. Executors without a prefix cache fit their request pools
+    /// lower the limit. Workers without a prefix cache fit their request pools
     /// to device storage, and the scheduler bounds their requests by the rows
     /// they report.
     fn check_rows(info: &MainProcessInfo, max_running_requests: usize) -> anyhow::Result<()> {
@@ -347,26 +347,26 @@ impl SchedulerHandle {
         Ok(())
     }
 
-    /// Refuses an executor that does not serve the launch's pool: the process's
+    /// Refuses a worker that does not serve the launch's pool: the process's
     /// own group (`EngineArgs::group`), on its world's ranks.
     ///
-    /// A scheduler started for a pool the executor does not serve, or for a
+    /// A scheduler started for a pool the worker does not serve, or for a
     /// rank count it does not serve, would place calls on ranks it does not
-    /// have; the launch and the executor are two statements of one process,
+    /// have; the launch and the worker are two statements of one process,
     /// so they are compared before anything runs.
-    fn check_pool(args: &EngineArgs, info: &crate::executor::ExecutorInfo) -> anyhow::Result<()> {
+    fn check_pool(args: &EngineArgs, info: &crate::worker::WorkerInfo) -> anyhow::Result<()> {
         let group = WorkerGroupId(args.group.clone());
         anyhow::ensure!(
             info.workers.iter().any(|(served, _)| *served == group),
-            "the launch names the pool {}, which the executor does not serve",
+            "the launch names the pool {}, which the worker does not serve",
             group.0
         );
-        // `from_inventory` states every pool's rank count; an executor
+        // `from_inventory` states every pool's rank count; a worker
         // that reports none places the pool on one rank.
         let served = info.layouts.get(&group).map_or(1, |layout| layout.ranks);
         anyhow::ensure!(
             u32::try_from(served).is_ok_and(|served| served == args.world_size),
-            "the launch places {} ranks of pool {}, but the executor serves {served}",
+            "the launch places {} ranks of pool {}, but the worker serves {served}",
             args.world_size,
             group.0
         );
@@ -444,12 +444,12 @@ impl SchedulerHandle {
 
     /// Runs `scheduler`, which serves `model`, on a thread of its own.
     /// `waker` is fired after every command is enqueued; it is the
-    /// executor's command waker for an executor that parks between steps, or
+    /// worker's command waker for a worker that parks between steps, or
     /// the no-op waker for one the scheduler polls.
     ///
     /// # Errors
     ///
-    /// Fails when the executor's media routing is inconsistent or the thread
+    /// Fails when the worker's media routing is inconsistent or the thread
     /// cannot be started.
     pub fn spawn(
         scheduler: Scheduler,
@@ -613,27 +613,27 @@ impl SchedulerHandle {
         self.commands.counters()
     }
 
-    /// Returns the executor-reported runtime capabilities.
+    /// Returns the worker-reported runtime capabilities.
     ///
-    /// With several ExecutorGroups this is the executor's merged view
-    /// (`ExecutorInfo::runtime_info`), not any single group's report.
+    /// With several WorkerGroups this is the worker's merged view
+    /// (`WorkerInfo::runtime_info`), not any single group's report.
     pub fn info(&self) -> &MainProcessInfo {
         &self.info
     }
 
     /// Returns the media units one call of `call` covers at once: the ranks
     /// of a distributed serving component times its units per rank, or one;
-    /// `None` when no executor serves `call`.
+    /// `None` when no worker serves `call`.
     pub fn media_units(&self, call: MediaCall) -> Option<u32> {
         self.media_units.get(&call).copied()
     }
 
-    /// Returns the generation limits resolved against executor capabilities.
+    /// Returns the generation limits resolved against worker capabilities.
     pub fn generation_limits(&self) -> GenerationLimits {
         self.generation_limits.clone()
     }
 
-    /// Returns the executor group whose KV cache the scheduler's pool
+    /// Returns the worker group whose KV cache the scheduler's pool
     /// allocates, which names its prefix cache index for a successor world;
     /// `None` without a prefix cache.
     pub fn cache_group(&self) -> Option<String> {
@@ -647,7 +647,7 @@ impl SchedulerHandle {
         self.latent_seed
     }
 
-    /// Promotes the scheduler, whose world succeeds another: its executors
+    /// Promotes the scheduler, whose world succeeds another: its workers
     /// adopt the predecessor's cache flags of the units they inherit, and
     /// its pool imports the predecessor's published pages, from which
     /// requests reuse their prefixes. Blocks until it is done.
@@ -657,7 +657,7 @@ impl SchedulerHandle {
     /// Fails when the world's own cache, grown into the predecessor's storage
     /// freed at once when it `grows`, cannot hold the requests the
     /// predecessor hands over (which `recompute` from their tokens or not),
-    /// an executor refuses or dies, or the scheduler has stopped.
+    /// a worker refuses or dies, or the scheduler has stopped.
     pub fn promote(
         &self,
         parked: crate::scheduler::ParkedCache,
@@ -689,8 +689,8 @@ impl SchedulerHandle {
         RequestId(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// Returns whether the scheduler stopped on a terminal executor or
-    /// executor failure: from its first fatal error on, before its thread
+    /// Returns whether the scheduler stopped on a terminal worker or
+    /// worker failure: from its first fatal error on, before its thread
     /// ends the requests it holds.
     pub fn is_dead(&self) -> bool {
         self.dead.load(Ordering::SeqCst) || self.failure.get().is_some()
@@ -778,7 +778,7 @@ impl SchedulerHandle {
         self.commands.park(lend)
     }
 
-    /// Reports the KV cache each of the scheduler's executor groups holds now,
+    /// Reports the KV cache each of the scheduler's worker groups holds now,
     /// which a world succeeding this one maps; the receiver gets it.
     pub fn describe_cache(
         &self,
@@ -864,7 +864,7 @@ impl SchedulerHandle {
         &self,
         ranks: Vec<scheduling::guest::view::RankView>,
     ) -> Option<crate::scheduler::TrialState> {
-        // A scheduler answers at its next command boundary, and one whose executor has no wake
+        // A scheduler answers at its next command boundary, and one whose worker has no wake
         // reaches it when its park ends, which is `IDLE_LIVENESS_POLL` away at most.
         const POLICY_STATE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
         self.commands
@@ -888,14 +888,14 @@ impl SchedulerHandle {
         self.commands.cache_warm(operation, together)
     }
 
-    /// Ends the storage of `worlds` on the nodes of the scheduler's executors,
+    /// Ends the storage of `worlds` on the nodes of the scheduler's workers,
     /// which the deployment's claims cover; the receiver gets whether it did.
     pub fn retire(&self, worlds: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.retire(worlds)
     }
 
     /// Keeps the weights alone of `worlds` on the nodes of the scheduler's
-    /// executors, which the deployment's claims cover, in host storage when
+    /// workers, which the deployment's claims cover, in host storage when
     /// `to_host`; the receiver gets each node's report.
     pub fn keep_weights(
         &self,
@@ -906,7 +906,7 @@ impl SchedulerHandle {
         self.commands.keep_weights(worlds, to_host, cache_keys)
     }
 
-    /// Reads the storage ledgers of the nodes of the scheduler's executors,
+    /// Reads the storage ledgers of the nodes of the scheduler's workers,
     /// which the deployment's claims cover; the receiver gets each node's
     /// as JSON.
     pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
@@ -915,7 +915,7 @@ impl SchedulerHandle {
 
     /// Halves, or restores when not `halve`, the byte budgets of the links
     /// the deployment's transfers use on the nodes of the scheduler's
-    /// executors, which the deployment's claims cover; the receiver gets the
+    /// workers, which the deployment's claims cover; the receiver gets the
     /// hosts it throttled.
     pub fn throttle(
         &self,
@@ -931,9 +931,9 @@ impl SchedulerHandle {
         self.commands.resume(reclaim)
     }
 
-    /// Commits the scheduler's world, which succeeded another: its executors
+    /// Commits the scheduler's world, which succeeded another: its workers
     /// take the predecessor's storage they mapped read-only. The receiver gets
-    /// what each executor reported.
+    /// what each worker reported.
     pub fn commit(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         self.commands.commit()
     }
@@ -943,10 +943,10 @@ impl SchedulerHandle {
         self.commands.flush_cache();
     }
 
-    /// Runs the executor hook `name` with the JSON `payload` on every executor
+    /// Runs the worker hook `name` with the JSON `payload` on every worker
     /// once the batches in flight complete, together with the other
     /// schedulers of `together` (`HookBarrier`); the receiver gets each
-    /// executor's result, or why the hook failed.
+    /// worker's result, or why the hook failed.
     pub fn hook(
         &self,
         name: String,
@@ -967,7 +967,7 @@ impl SchedulerHandle {
 
     /// Rewrites the weights in place from the checkpoint at `model_path`,
     /// the requests in flight continuing as `in_flight` says; the receiver
-    /// gets what each executor reported, or why the update failed.
+    /// gets what each worker reported, or why the update failed.
     pub fn update_weights(
         &self,
         model_path: String,
@@ -986,7 +986,7 @@ impl SchedulerHandle {
     }
 
     /// Gives back or restores KV cache storage; the receiver gets what each
-    /// executor reported, or why the change failed.
+    /// worker reported, or why the change failed.
     pub fn resize_cache(
         &self,
         change: crate::handle::CacheChange,
@@ -994,12 +994,12 @@ impl SchedulerHandle {
         self.commands.resize_cache(change)
     }
 
-    /// Shuts down the scheduler, tears down its executor, and joins its
+    /// Shuts down the scheduler, tears down its worker, and joins its
     /// thread. Idempotent.
     ///
     /// Blocks until the scheduler thread exits; on shutdown `Scheduler::run`
     /// first finishes queued and running requests with `Aborted` and closes
-    /// the executor. A poisoned thread lock or a panicked scheduler thread is
+    /// the worker. A poisoned thread lock or a panicked scheduler thread is
     /// logged, not propagated.
     pub fn shutdown(&self) {
         self.commands.shutdown();
@@ -1018,8 +1018,8 @@ impl SchedulerHandle {
     }
 
     /// Shuts every scheduler of `schedulers` down together: each is asked
-    /// before any is joined. Schedulers whose executors share an expert world
-    /// must close those executors at once, since a closing expert rank waits
+    /// before any is joined. Schedulers whose workers share an expert world
+    /// must close those workers at once, since a closing expert rank waits
     /// for every peer to leave the union.
     pub fn shutdown_all<'a, I>(schedulers: I)
     where
@@ -1160,7 +1160,7 @@ mod tests {
             assert_eq!(
                 worker.blocks[entry].ranks.len(),
                 8,
-                "{entry} spans the executor group"
+                "{entry} spans the worker group"
             );
         }
         assert_eq!(worker.blocks["alone"].ranks, vec![0]);

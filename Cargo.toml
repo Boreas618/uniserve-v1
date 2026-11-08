@@ -8,7 +8,7 @@ members = [
     "crates/platform",
     "crates/daemon",
     "crates/engine",
-    "crates/executor",
+    "crates/worker",
     "crates/frontend",
     "crates/ipc",
     "crates/manager",
@@ -42,7 +42,7 @@ anyhow.workspace = true
 clap.workspace = true
 daemon.workspace = true
 engine.workspace = true
-executor.workspace = true
+worker.workspace = true
 frontend.workspace = true
 ipc.workspace = true
 nn.workspace = true
@@ -89,7 +89,7 @@ readme = "README.md"
 platform = { path = "crates/platform" }
 daemon = { path = "crates/daemon" }
 engine = { path = "crates/engine" }
-executor = { path = "crates/executor" }
+worker = { path = "crates/worker" }
 frontend = { path = "crates/frontend" }
 ipc = { path = "crates/ipc" }
 media = { path = "crates/media" }

@@ -936,7 +936,7 @@ impl Epochs {
 
     /// Reverts the program-layer update on probation because a main process
     /// failed, and records that failure as the update's first one (§7.3
-    /// step 4): a main process that exits, an executor it can no longer use, a
+    /// step 4): a main process that exits, a worker it can no longer use, a
     /// stuck job, a non-finite logit or a policy error all end the probation in
     /// favour of the generation that served before it, and the update stays
     /// unavailable with this failure until it is applied with `force` (§7.2).
@@ -1704,7 +1704,7 @@ mod tests {
 
         let failure = Failure {
             kind: "illegal_address".to_owned(),
-            reason: "the executor can no longer run".to_owned(),
+            reason: "the worker can no longer run".to_owned(),
             device: Some(0),
         };
         assert!(

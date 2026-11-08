@@ -1,4 +1,4 @@
-//! Generation lifecycle state and executor-call planning.
+//! Generation lifecycle state and worker-call planning.
 //!
 //! A request advances through context ingestion, then either understanding
 //! decode, image generation and optional feedback, block-diffusion canvases
@@ -12,7 +12,7 @@
 //! by request key (which includes the request epoch), producer call, output
 //! index, and generation.
 //!
-//! On completion, `validate_generation_result` checks an executor result against
+//! On completion, `validate_generation_result` checks a worker result against
 //! the submitted call and the request's limits, and
 //! `RequestState::process_generation_result` applies its accepted progress.
 //! Token semantics (stop conditions, image-branch triggers, public events)
@@ -78,8 +78,8 @@ fn dynamic_element_bound(bytes: u64, dtype: DType) -> Result<ShapeBound, Plannin
 ///
 /// The raw size counts three bytes per pixel plus one byte per row. The bound
 /// doubles it, adds 1 MiB, and applies base64's expansion of three bytes to
-/// four characters. It reaches the executor as part of `max_completion_bytes`,
-/// and the executor's encoder refuses a larger artifact.
+/// four characters. It reaches the worker as part of `max_completion_bytes`,
+/// and the worker's encoder refuses a larger artifact.
 fn png_base64_bound(width: u32, height: u32) -> Result<u64, PlanningError> {
     let raw = u64::from(height)
         .checked_mul(u64::from(width).saturating_mul(3).saturating_add(1))
@@ -103,7 +103,7 @@ const RANKED_LOGPROB_BYTES: u64 = 12;
 /// (`n_logprobs` or `n_prompt_logprobs`). A call reports at most
 /// `generated_rows` generated rows, one per token it may commit (a
 /// verification's current token and drafts), and `prompt_positions` prompt
-/// rows. The executor leases a batch's completion storage from the sum of its
+/// rows. The worker leases a batch's completion storage from the sum of its
 /// calls' `max_completion_bytes` and refuses a capture beyond its lease.
 fn logprob_result_bytes(
     sampling: &SamplingParams,
@@ -320,7 +320,7 @@ impl RequestState {
                 self.context_features.drain(..written);
             }
             CallKind::Forward(ForwardMode::Prefill) if consumes_image_features(call) => {
-                // The executor reports the cache extent the feature write reached.
+                // The worker reports the cache extent the feature write reached.
                 // Logical positions advance by the image's position count once,
                 // after its last encoder.
                 self.cache_visible_len = record.cache_visible_len;
@@ -519,7 +519,7 @@ impl RequestState {
         // verification installs the tokens a drafter proposed without drawing,
         // and a prompt chunk that samples nothing draws nothing either. The
         // call declares that it sampled by carrying the output it sampled into
-        // (`Call::token_output`); `consumer_slots` is the executor's, filled after
+        // (`Call::token_output`); `consumer_slots` is the worker's, filled after
         // this call was planned and never reported back.
         if matches!(
             call.kind,
@@ -696,7 +696,7 @@ pub(super) fn plan_readout(
 /// `block`, the number of blocks already committed to its context, under the
 /// deployment's `canvas` sampling.
 ///
-/// The call carries no tokens: the executor keeps the block's canvas and
+/// The call carries no tokens: the worker keeps the block's canvas and
 /// sampler state in the request's slot. Its `max_tokens` is the canvas
 /// length, which the step denoises and which a stopping step reports as its
 /// committed tokens; its completion payload bound covers those tokens at
@@ -1158,7 +1158,7 @@ fn feedback_image_output(request: &GenerationRequest) -> Result<Option<TensorRef
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-/// Failure while constructing the next executor call.
+/// Failure while constructing the next worker call.
 pub(crate) enum PlanningError {
     #[error(transparent)]
     Capacity(#[from] crate::GenerationResourceError),
@@ -1184,7 +1184,7 @@ pub(crate) enum PlanningError {
     MissingImageInput,
     #[error("product bound must be nonzero")]
     MissingProductBound,
-    #[error("executor did not report a latent dtype")]
+    #[error("worker did not report a latent dtype")]
     MissingLatentDType,
     #[error("product bound {bytes} bytes exceeds the IPC representation")]
     ProductBoundTooLarge { bytes: u64 },
@@ -1607,17 +1607,17 @@ pub(crate) enum GenerationResultError {
     MissingCallId,
     #[error("generation call produced no latent product")]
     MissingLatentProduct,
-    #[error("executor status invalid: {detail}")]
+    #[error("worker status invalid: {detail}")]
     Status { detail: &'static str },
-    #[error("executor identity invalid: {detail}")]
+    #[error("worker identity invalid: {detail}")]
     Identity { detail: &'static str },
-    #[error("executor progress invalid: {detail}")]
+    #[error("worker progress invalid: {detail}")]
     Progress { detail: &'static str },
-    #[error("executor token result invalid: {detail}")]
+    #[error("worker token result invalid: {detail}")]
     Token { detail: &'static str },
-    #[error("executor logprob result invalid: {detail}")]
+    #[error("worker logprob result invalid: {detail}")]
     Logprob { detail: &'static str },
-    #[error("executor readout result invalid: {0}")]
+    #[error("worker readout result invalid: {0}")]
     Readout(ReadoutRejection),
 }
 
@@ -1653,7 +1653,7 @@ pub(crate) struct RequestState {
     /// resolution advance it; scheduling changes it only on an encoder-cache
     /// hit, which moves the request to `IngestState` without a call.
     pub(super) phase: Phase,
-    /// Prompt token range already accepted by the executor.
+    /// Prompt token range already accepted by the worker.
     pub(super) num_computed_prompt_tokens: u32,
     /// Context images whose every encoder feature has been written into the prefix cache.
     pub(super) num_ingested_images: usize,
@@ -1717,10 +1717,10 @@ pub(crate) struct RequestState {
     pub(super) feedback_source: Option<TensorRef>,
     /// Feedback encoder feature awaiting its cache write.
     pub(super) feedback_features: Option<TensorRef>,
-    /// Whether the current epoch is registered with its execution executors.
+    /// Whether the current epoch is registered with its execution workers.
     pub(super) worker_registered: bool,
     /// Allocation serial of the request's cache units already declared to the
-    /// executors: units allocated at or after it are fresh for the next
+    /// workers: units allocated at or after it are fresh for the next
     /// dispatch (`CacheAllocation::allocated_units`).
     pub(super) num_cache_units_sent: u64,
     /// Whether admission reserves the complete multimodal cache requirement.
@@ -1735,7 +1735,7 @@ pub(crate) struct RequestState {
     /// cache, or reused from it.
     pub(super) prefix_published: Vec<usize>,
     /// The host KV cache's keys of the request's full prompt pages, by cache
-    /// group, when the host KV cache serves its prefill executor
+    /// group, when the host KV cache serves its prefill worker
     /// (`KvOffloadManager::page_keys`).
     pub(super) page_keys: Vec<Vec<storage::Key>>,
     /// The prompt tokens through which the request's sliding windows were
@@ -1783,7 +1783,7 @@ pub(crate) struct RequestState {
     /// Unix time, in seconds, at which the request state was created.
     pub queued_at: f64,
     pub(crate) terminal_intent: TerminalIntent,
-    /// Cause of the first rejected executor result, which
+    /// Cause of the first rejected worker result, which
     /// `Scheduler::fail_after_inflight` reports as the request's terminal
     /// error and its error finish logs.
     pub(super) failure: Option<String>,

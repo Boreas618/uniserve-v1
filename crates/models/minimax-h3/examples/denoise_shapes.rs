@@ -326,7 +326,7 @@ fn run() -> Result<(), String> {
     let fold_rows = layout.text_rows.saturating_add(layout.condition_rows);
     let fold = minimax_h3::conditioning::fold_bytes(&denoiser.transformer, fold_rows, args.dtype);
     // The plan's own reservation, not the element count times one width: a plan carries `f32`,
-    // `bf16` and `i32` entries, and the executor sums each entry's own width.
+    // `bf16` and `i32` entries, and the worker sums each entry's own width.
     let evaluation = minimax_h3::decoding::arena_reservation(&plan);
     println!(
         "floor  max(evaluation {} MiB, fold {} MiB) = {} MiB",
@@ -345,7 +345,7 @@ fn run() -> Result<(), String> {
 
     // 5. The state tables the runner writes from this layout, with their values.
     //
-    // `prepare_state` is the executor's per-request call and `write_state` is a host function, so
+    // `prepare_state` is the worker's per-request call and `write_state` is a host function, so
     // this runs the same code the served walk runs before its first launch - and it is where
     // `write_segment_state` refuses a table whose rows are not the packing's own.
     let specs = layouts

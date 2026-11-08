@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use crossbeam_channel::Receiver;
 use engine::{
-    CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimExecutor, Stage,
+    CommandSender, PolicyBytes, PolicyProgram, PolicySource, SimEngine, SimWorker, Stage,
     StageApplied,
 };
 use scheduling::guest::decision::Plan;
@@ -38,7 +38,7 @@ const EXPERTS: u32 = 24576;
 /// module on its own thread.
 const ANSWER: Duration = Duration::from_secs(30);
 
-/// A toy policy program: limits that fit what the simulated executors were
+/// A toy policy program: limits that fit what the simulated workers were
 /// started for, and an empty plan.
 ///
 /// An empty plan asks for nothing, so a scheduler that serves under the toy
@@ -144,7 +144,7 @@ impl World {
         let mut sim = SimEngine::new();
         sim.set_text_len(16);
         let scheduler = support::scheduler(
-            Box::new(SimExecutor::new(sim)),
+            Box::new(SimWorker::new(sim)),
             SimEngine::special_tokens(),
             8,
         )
@@ -276,7 +276,7 @@ fn the_slot_names_the_program_serving_and_the_one_a_precopy_prepared() {
     assert_eq!(
         (counters.kernel_launches, counters.device_ns),
         (0, 0),
-        "the device's counters are the executor's, not this mechanism's"
+        "the device's counters are the worker's, not this mechanism's"
     );
 }
 
@@ -370,16 +370,16 @@ fn the_program_layers_commands_reach_one_scheduler_and_name_what_they_need() {
 }
 
 #[test]
-fn a_scheduler_over_a_supplied_executor_refuses_a_shadow_pass_and_names_why() {
+fn a_scheduler_over_a_supplied_worker_refuses_a_shadow_pass_and_names_why() {
     let world = World::start();
 
-    // §7.3 step 2's paired pass is the in-process arm's: a supplied executor
+    // §7.3 step 2's paired pass is the in-process arm's: a supplied worker
     // runs none, so the ask is answered with that rather than left waiting for
     // a step that cannot run it.
     let refused = answer(world.handle.shadow(7))
-        .expect_err("a scheduler over a supplied executor runs no shadow pass");
+        .expect_err("a scheduler over a supplied worker runs no shadow pass");
     assert!(
-        refused.contains("supplied executor"),
+        refused.contains("supplied worker"),
         "the refusal says which arm shadows: {refused}"
     );
 }

@@ -2565,7 +2565,7 @@ fn two_rank_half(rank: i32, id: UniqueId) -> Result<(), String> {
 }
 
 /// Two ranks in one process, one thread per device (design 2.4): the shape the
-/// executor runs a world plan in, and the only test here that would catch a
+/// worker runs a world plan in, and the only test here that would catch a
 /// collective's per-peer count being confused with a buffer's element count.
 #[test]
 #[ignore = "requires two CUDA devices and NCCL"]

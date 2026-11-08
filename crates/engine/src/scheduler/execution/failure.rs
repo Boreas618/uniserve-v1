@@ -1,20 +1,20 @@
-//! Failure reconciliation: `on_executor_error` retires only the work a
-//! `ExecutorFailure` invalidates. Any other executor error, and an executor failure
+//! Failure reconciliation: `on_worker_error` retires only the work a
+//! `WorkerFailure` invalidates. Any other worker error, and a worker failure
 //! classified as a control-plane invariant violation, is engine-fatal.
 
 use super::*;
 
 impl Scheduler {
-    /// Preserves unrelated requests after a reconciled Executor failure. Unclassified
-    /// executor errors and control-plane invariant violations remain fatal.
+    /// Preserves unrelated requests after a reconciled Worker failure. Unclassified
+    /// worker errors and control-plane invariant violations remain fatal.
     ///
-    /// A `ExecutorFailure` is reconciled by `fail_after_worker_failure`; the
+    /// A `WorkerFailure` is reconciled by `fail_after_worker_failure`; the
     /// failure class `InvariantViolation` also latches engine-fatal. Losing
-    /// every execution-capable executor also stops the engine, so later
+    /// every execution-capable worker also stops the engine, so later
     /// admissions cannot wait for capacity that will never return. Any other error latches engine-fatal and fails every in-flight
     /// call.
-    pub(in crate::scheduler) fn on_executor_error(&mut self, error: anyhow::Error) {
-        if let Some(failure) = error.downcast_ref::<ExecutorFailure>() {
+    pub(in crate::scheduler) fn on_worker_error(&mut self, error: anyhow::Error) {
+        if let Some(failure) = error.downcast_ref::<WorkerFailure>() {
             let execution = failure.execution.as_ref();
             let code = execution.and_then(|value| value.code);
             // Requests refused earlier keep their place while a call of
@@ -51,19 +51,19 @@ impl Scheduler {
             struck.sort_unstable();
             if code == Some(ipc::ErrorCode::InvariantViolation) {
                 self.fail(format!(
-                    "an executor's control-plane invariant failed: {error:#}"
+                    "a worker's control-plane invariant failed: {error:#}"
                 ));
                 tracing::error!(worker = %failure.worker_id, ?code, "control-plane invariant failed: {error}");
             } else if code == Some(ipc::ErrorCode::InputError) {
-                tracing::info!(worker = %failure.worker_id, ?code, "Executor rejected request: {error}");
+                tracing::info!(worker = %failure.worker_id, ?code, "Worker rejected request: {error}");
             } else if refused {
                 tracing::info!(
                     worker = %failure.worker_id,
                     refusals = ?failure.refusals,
-                    "Executor refused requests as invalid"
+                    "Worker refused requests as invalid"
                 );
             } else {
-                tracing::warn!(worker = %failure.worker_id, ?code, "Executor failed affected work: {error}");
+                tracing::warn!(worker = %failure.worker_id, ?code, "Worker failed affected work: {error}");
             }
             self.fail_after_worker_failure(failure);
             if refused {
@@ -76,8 +76,8 @@ impl Scheduler {
                     .collect::<Vec<_>>();
                 self.inflight.refused.extend(in_flight);
             }
-            // A world on trial is not repaired: an executor fault, rather than a
-            // request its executors rejected, fails it as a whole, and the
+            // A world on trial is not repaired: a worker fault, rather than a
+            // request its workers rejected, fails it as a whole, and the
             // daemon rolls back to the previous world.
             // The failure names the batch it struck and its requests, which
             // the rollback keeps with its reason for diagnosis.
@@ -104,18 +104,18 @@ impl Scheduler {
             // meanwhile. Keep independent groups usable, but an expert-only
             // group cannot serve requests once every model group has closed.
             if !self
-                .executor
+                .worker
                 .info()
                 .workers
                 .iter()
-                .any(|(id, info)| !info.supported_calls.is_empty() && !self.executor.is_closed(id))
+                .any(|(id, info)| !info.supported_calls.is_empty() && !self.worker.is_closed(id))
             {
-                self.fail(format!("every model executor group closed: {error:#}"));
+                self.fail(format!("every model worker group closed: {error:#}"));
             }
             return;
         }
-        self.fail(format!("the executor failed: {error:#}"));
-        tracing::error!("fatal executor error: {error}");
+        self.fail(format!("the worker failed: {error:#}"));
+        tracing::error!("fatal worker error: {error}");
         self.fail_all_inflight(&error.to_string());
     }
 }
@@ -249,7 +249,7 @@ impl Scheduler {
         }
     }
 
-    /// Whether running request `id` leaves as migratable when the executors
+    /// Whether running request `id` leaves as migratable when the workers
     /// that hold it are lost: a token request that resumes from its
     /// generated tokens, not already finishing, on a deployment that does
     /// not generate in canvases.
@@ -264,20 +264,20 @@ impl Scheduler {
     /// Reconciles failed work without resetting allocations owned by live consumers.
     ///
     /// Only the request epochs `loss` names fail, together with requests whose
-    /// queued work targets an invalidated executor incarnation or reads an
+    /// queued work targets an invalidated worker incarnation or reads an
     /// invalidated buffer; every other request continues. A media request
-    /// `loss` names as refused is rejected with the reason the executor stated
+    /// `loss` names as refused is rejected with the reason the worker stated
     /// rather than failed. A retired call that has no pending record latches
     /// engine-fatal and stops reconciliation.
-    fn fail_after_worker_failure(&mut self, loss: &ExecutorFailure) {
-        // Blocks published from an invalidated executor incarnation leave
+    fn fail_after_worker_failure(&mut self, loss: &WorkerFailure) {
+        // Blocks published from an invalidated worker incarnation leave
         // prefix-cache lookup; pages still referenced keep their owners.
         if let Some(cache) = &self.storage.cache {
             for endpoint in &loss.endpoints {
                 cache.block_pool.invalidate_source(endpoint);
             }
         }
-        // The failed executor's page offloads are aborted and its admission pins
+        // The failed worker's page offloads are aborted and its admission pins
         // released.
         if let Some(kv_offload) = self.kv_offload.as_mut() {
             kv_offload.worker_failed(&loss.worker_id);
@@ -293,7 +293,7 @@ impl Scheduler {
 
         // Close the affected set over work not yet submitted: a queued call
         // is affected when it reads an invalidated buffer, or is placed on
-        // the failed executor and the failure invalidated incarnations, and the
+        // the failed worker and the failure invalidated incarnations, and the
         // outputs of an affected request's queued calls are invalidated in
         // turn. Repeat until neither set grows.
         let mut requests = loss.requests.iter().copied().collect::<HashSet<_>>();
@@ -352,7 +352,7 @@ impl Scheduler {
                     batch_id,
                     ?request,
                     ?call_id,
-                    "Executor failure named an unknown pending call"
+                    "Worker failure named an unknown pending call"
                 );
                 return;
             };
@@ -367,7 +367,7 @@ impl Scheduler {
         }
 
         // An affected request's queued `Finish` and `Free` commands still
-        // retire its executor state; only its admissions are dropped.
+        // retire its worker state; only its admissions are dropped.
         self.inflight.pending_commands.retain_mut(|command| {
             if !requests.contains(&command.request_key()) {
                 return true;
@@ -376,10 +376,10 @@ impl Scheduler {
         });
 
         // Fail each affected request that is still on the named epoch: a media
-        // request records a failure intent, or a rejection with the executor's
-        // reason when the executor refused it. A token request that resumes from
+        // request records a failure intent, or a rejection with the worker's
+        // reason when the worker refused it. A token request that resumes from
         // its generated tokens leaves as migratable once its in-flight calls
-        // drain, after every token it generated, unless the executor refused it
+        // drain, after every token it generated, unless the worker refused it
         // or it already finishes; the daemon submits it again, and it waits
         // for the group's replacement. Any other token request emits an error
         // unless an error finish is already pending, and defers an error
@@ -401,9 +401,9 @@ impl Scheduler {
                 .get(&id)
                 .is_some_and(|finish| finish.reason == FinishReason::Error);
             if let Some(state) = self.media_state_mut(id) {
-                // A video request whose executors were lost leaves as
+                // A video request whose workers were lost leaves as
                 // migratable once its calls drain, its trajectory lost with
-                // them, unless the executor refused it or it already fails;
+                // them, unless the worker refused it or it already fails;
                 // the daemon submits it again.
                 if state.admission.request_key == request {
                     state.terminal_intent = match refusal {

@@ -1,7 +1,7 @@
 //! Request algorithms and the single-owner engine control loop.
 //!
 //! The loop combines request progress, scheduler policy, storage allocations, and
-//! asynchronous executor completions. All mutable engine state stays on its
+//! asynchronous worker completions. All mutable engine state stays on its
 //! owner thread.
 //!
 //! Scheduling admits from its waiting queue and chunks prefill against sequence
@@ -11,7 +11,7 @@
 //! cache capacity is rejected. A resident request is never relocated or
 //! preempted: when capacity is short, admission waits.
 //!
-//! Static executor state crosses the boundary once in [`NewRequest`]; subsequent
+//! Static worker state crosses the boundary once in [`NewRequest`]; subsequent
 //! calls carry only step-specific deltas.
 //!
 //! Submodules:
@@ -28,10 +28,10 @@
 //! - `inflight`: submitted batches and calls, and request-local completion
 //!   ordering.
 //! - `output`: public events, semantic result resolution, and termination.
-//! - `allocation` and `dispatch`: storage ownership and executor dispatch.
+//! - `allocation` and `dispatch`: storage ownership and worker dispatch.
 //! - `control`: cancellation and frontend lifecycle commands.
 //! - `config`, `stats`, and `stats_report`: limits and statistics.
-//! - `image_artifact`: metadata of executor-produced PNG artifacts.
+//! - `image_artifact`: metadata of worker-produced PNG artifacts.
 
 mod completion;
 mod config;
@@ -56,8 +56,8 @@ pub(crate) use run::guidance_prefix_rows;
 /// keeps it rather than restated by whoever needs a phase id.
 pub use scheduling::guest::view::PhaseKind;
 pub use stats::{
-    DomainStats, EncoderStats, ExecutionDomainStats, ExecutorStats, GeneralStats, PrefixCacheUsage,
-    PrefixStats, SchedulerStats, TimingStats,
+    DomainStats, EncoderStats, ExecutionDomainStats, GeneralStats, PrefixCacheUsage, PrefixStats,
+    SchedulerStats, TimingStats, WorkerStats,
 };
 pub use stats_report::SchedulerStatsReporter;
 pub use views::phase_id;
@@ -89,16 +89,16 @@ pub(crate) mod submission;
 #[cfg(feature = "testing")]
 pub(crate) mod testing;
 
-/// The mechanism's door to an executor a test supplies.
+/// The mechanism's door to a worker a test supplies.
 #[cfg(feature = "testing")]
-pub(crate) fn submissions(executor: Box<dyn Executor>) -> submission::Submissions {
-    submission::Submissions::new(executor)
+pub(crate) fn submissions(worker: Box<dyn Worker>) -> submission::Submissions {
+    submission::Submissions::new(worker)
 }
 
-/// The mechanism's door to the executor crate's batch path, the in-process
+/// The mechanism's door to the worker crate's batch path, the in-process
 /// submission path of §2.4 and §7.3's splice.
 pub(crate) fn submissions_over(
-    batches: Arc<dyn executor::batch::Batches>,
+    batches: Arc<dyn worker::batch::Batches>,
 ) -> anyhow::Result<submission::Submissions> {
     submission::Submissions::over_batches(batches)
 }
@@ -107,8 +107,8 @@ mod warming;
 mod world;
 
 #[cfg(feature = "testing")]
-pub(crate) use crate::executor::Executor;
-pub(crate) use crate::executor::{ExecutionBatch, ExecutorSubmitError, RequestDispatch};
+pub(crate) use crate::worker::Worker;
+pub(crate) use crate::worker::{ExecutionBatch, RequestDispatch, WorkerSubmitError};
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
@@ -146,8 +146,8 @@ use ipc::{SharedMedia, TokenLogprob};
 use proto::config::DEFAULT_BLOCK;
 use proto::request::MigrationCause;
 
-use crate::executor::{ExecutorFailure, RankBuffer};
 use crate::scheduler::image_artifact::png_artifact_info;
+use crate::worker::{RankBuffer, WorkerFailure};
 use allocation::{
     MediaAllocations, MediaStorage, MediaTensorAllocation, RequestAllocations, RetiringRequest,
     UnknownMediaGroup,
@@ -171,8 +171,8 @@ enum BatchKind {
     Media,
 }
 
-/// Timeout of `Executor::poll` while the loop parks
-/// (`Scheduler::park_for_progress`). A result ends the park, and an executor
+/// Timeout of `Worker::poll` while the loop parks
+/// (`Scheduler::park_for_progress`). A result ends the park, and a worker
 /// with wake integration also returns early on commands and consumer reads;
 /// the timeout is only a liveness deadline.
 const IDLE_LIVENESS_POLL: Duration = Duration::from_millis(500);
@@ -246,7 +246,7 @@ pub(crate) enum TerminalIntent {
     /// given, once its calls in flight drain (`Scheduler::migrate_requests`).
     Migrate(MigrationCause),
     Failure(String),
-    /// An executor refused the request itself, for the reason its input-error
+    /// A worker refused the request itself, for the reason its input-error
     /// completion states; the client receives an invalid-request rejection.
     Rejected(String),
 }
@@ -272,7 +272,7 @@ impl TerminalIntent {
 struct GuidancePrefix {
     allocations: RequestAllocations,
     /// Units per cache group, as `(group_id, unit_ids)`, not yet declared to the
-    /// executor; the next denoising call drains them as fresh-unit allocations.
+    /// worker; the next denoising call drains them as fresh-unit allocations.
     new_units: Vec<(u32, Vec<UnitId>)>,
     /// Tokens the prefix holds, which the denoising calls prefill until one
     /// completes.
@@ -295,7 +295,7 @@ impl GuidancePrefix {
 /// than one guidance branch (`Scheduler::ensure_guidance_prefix`).
 ///
 /// The text-unconditional branch attends to the request's negative prompt
-/// tokens. The image-unconditional branch attends to the prefix the executor
+/// tokens. The image-unconditional branch attends to the prefix the worker
 /// states for its model (`MainProcessInfo::image_unconditional_token_ids`), or to
 /// the request's own context when it states none. Each distinct prefix holds
 /// its own slot until `Scheduler::free_guidance_prefix` releases them after
@@ -369,10 +369,10 @@ struct MediaFlowState {
     /// Encoded products carried by the muxing call in flight, retired with it.
     muxing_inputs: Vec<TensorRef>,
     audio: Option<TensorRef>,
-    /// Static executor admission, sent as a `BatchCommand::Start` in the batch
+    /// Static worker admission, sent as a `BatchCommand::Start` in the batch
     /// of the request's first scheduled call.
     admission: NewRequest,
-    admission_state: ExecutorRegistration,
+    admission_state: WorkerRegistration,
     media_reading_scheduled: bool,
     vision_encoding_scheduled: bool,
     text_encoding_scheduled: bool,
@@ -440,10 +440,10 @@ struct HostTrajectory {
     layouts: BTreeMap<u32, String>,
 }
 
-/// Progress of a media request's executor admission (`NewRequest`).
+/// Progress of a media request's worker admission (`NewRequest`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExecutorRegistration {
-    /// No scheduled call has carried the admission yet; no executor holds
+enum WorkerRegistration {
+    /// No scheduled call has carried the admission yet; no worker holds
     /// state for the request, so retirement needs no `Finish` command.
     Unsubmitted,
     /// The call carrying the admission is in flight; the request offers no
@@ -476,12 +476,12 @@ struct PendingMedia {
 
 /// Single-threaded owner of scheduling, storage, execution, and request state.
 pub struct Scheduler {
-    executor: submission::Submissions,
+    worker: submission::Submissions,
     inflight: inflight::Inflight,
     /// Resident resource ownership and reservation accounting.
     storage: allocation::Storage,
     dispatch: dispatch::Dispatch,
-    /// Aggregate capacity view of the loaded executors.
+    /// Aggregate capacity view of the loaded workers.
     info: MainProcessInfo,
     generation_limits: crate::GenerationLimits,
     special_tokens: SpecialTokenIds,
@@ -495,7 +495,7 @@ pub struct Scheduler {
     /// What the world measures of speculation, which the refill policy
     /// weighs.
     speculation_meter: speculation::SpeculationMeter,
-    /// Finished requests whose storage stays allocated until their executors
+    /// Finished requests whose storage stays allocated until their workers
     /// acknowledge the `Finish` command.
     retiring_requests: HashMap<RequestId, RetiringRequest>,
     /// The step's policy: the instance that decides, installed when the
@@ -508,17 +508,17 @@ pub struct Scheduler {
     /// The report of a policy failure the mechanism did not take from `fail`'s
     /// answer, for the control thread.
     policy_report: Option<policy::PolicyReverted>,
-    /// The routed tokens per expert the executor last published (§4.4's
+    /// The routed tokens per expert the worker last published (§4.4's
     /// `experts`): the one fact the mechanism cannot measure. `None` until the
-    /// executor publishes it, so the periodic call asks nothing it cannot state.
+    /// worker publishes it, so the periodic call asks nothing it cannot state.
     expert_load: Option<scheduling::guest::ExpertLoad>,
     /// The expert layout the policy last answered, validated and waiting for
-    /// the executor's world setup, which applies it (§7.6).
+    /// the worker's world setup, which applies it (§7.6).
     expert_order: Option<scheduling::guest::ExpertOrder>,
     /// The step the policy last answered an expert layout on, so the
     /// mechanism's interval is measured from the decision, not from step zero.
     expert_asked: Option<u64>,
-    /// A load the executor published since the last decision: a new load is
+    /// A load the worker published since the last decision: a new load is
     /// worth asking about at once, rather than after a full interval.
     expert_load_new: bool,
     /// §7.3 step 2's paired pass: an update asked that the following step's
@@ -600,25 +600,25 @@ pub struct Scheduler {
     /// `assembly_priority`.
     running_order: Vec<RequestId>,
     output: output::OutputSender,
-    /// Engine-fatal latch: set when the executor/executor dies or a scheduler
+    /// Engine-fatal latch: set when the worker/worker dies or a scheduler
     /// invariant breaks; the control loop exits and the host converts this
     /// into engine-dead.
     fatal: bool,
     /// Shared scheduler counters and latency accumulators.
     pub stats: Arc<SchedulerStats>,
-    /// The host KV cache, when it serves an executor group
+    /// The host KV cache, when it serves a worker group
     /// (`Scheduler::enable_kv_offload`).
     kv_offload: Option<crate::kv_cache::KvOffloadManager>,
     /// The decoded tokens between two checkpoints of a request's state
     /// groups (`Scheduler::set_state_interval`).
     state_interval: usize,
     /// The host latent pools of the video denoiser, when they serve its
-    /// executor group (`Scheduler::enable_trajectory_store`).
+    /// worker group (`Scheduler::enable_trajectory_store`).
     trajectories: Option<crate::trajectories::TrajectoryStore>,
     /// The host encoder pools of the video encoders, when they serve their
-    /// executor groups (`Scheduler::enable_encoder_store`).
+    /// worker groups (`Scheduler::enable_encoder_store`).
     encoder_outputs: Option<crate::encoder_outputs::EncoderStore>,
-    /// Set once the scheduler closes its executors: it admits and schedules
+    /// Set once the scheduler closes its workers: it admits and schedules
     /// nothing more while it offloads its last pages to the host KV cache
     /// (`Scheduler::flush_offloads`).
     closing: bool,
@@ -633,7 +633,7 @@ pub struct Scheduler {
     /// its assembly notes them again (`Scheduler::reclaim_shortage`,
     /// `Scheduler::recompute_starved`), and admission waits while any is here.
     starved: Vec<(RequestId, usize)>,
-    /// The executors gave back the cache and graph storage: the scheduler
+    /// The workers gave back the cache and graph storage: the scheduler
     /// admits and runs nothing until it wakes.
     asleep: bool,
     /// A park waiting for the scheduler's requests to end
@@ -659,7 +659,7 @@ impl Scheduler {
     ///
     /// Scheduling cannot continue from inconsistent state, so the control loop
     /// stops at its next check and fails every request, as it does when a
-    /// executor dies. The caller abandons the operation that found the violation.
+    /// worker dies. The caller abandons the operation that found the violation.
     fn invariant_broken(&mut self, invariant: &str) {
         tracing::error!(invariant, "scheduler invariant broken; stopping the engine");
         self.fail(format!("a scheduler invariant broke: {invariant}"));
@@ -682,7 +682,7 @@ fn now() -> f64 {
     crate::clock::now_unix_secs()
 }
 
-/// Maps a model dtype to the IPC dtype of executor latents; `None` maps to
+/// Maps a model dtype to the IPC dtype of worker latents; `None` maps to
 /// `None`.
 fn worker_float_dtype(value: Option<crate::ModelDtype>) -> Option<ipc::DType> {
     match value {
@@ -693,7 +693,7 @@ fn worker_float_dtype(value: Option<crate::ModelDtype>) -> Option<ipc::DType> {
     }
 }
 
-/// Adds each per-key delta of an executor forward statistic into the shared
+/// Adds each per-key delta of a worker forward statistic into the shared
 /// cumulative map in `SchedulerStats`. A poisoned lock is recovered rather
 /// than propagated.
 fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMap<String, u64>) {
@@ -713,7 +713,7 @@ fn add_worker_forward_map(target: &Mutex<BTreeMap<String, u64>>, delta: &BTreeMa
 /// The sorted, deduplicated list holds the request's stop token ids, the EOS
 /// ids unless `ignore_eos` is set, and the image-generation trigger when the
 /// request generates images through a direct trigger token. It reaches the
-/// executor in `GenerationParams::finish_token_ids` and bounds verified-draft
+/// worker in `GenerationParams::finish_token_ids` and bounds verified-draft
 /// prefixes in `validate_generation_result`.
 ///
 /// Terminal stop/EOS tokens end the request. A direct Gen trigger instead ends

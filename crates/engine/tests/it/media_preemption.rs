@@ -3,7 +3,7 @@
 //! simulator and a Storage Server in the test's process.
 //!
 //! The simulator copies no bytes: what the tests observe is what the
-//! scheduler asks of the executors at the executor boundary (the trajectory
+//! scheduler asks of the workers at the worker boundary (the trajectory
 //! offloads a batch carries, the stored pages a latent preparation restores,
 //! the denoising calls a request runs) and the events its requests end
 //! with. A preemption in normal serving (a sleep) and a world change (a
@@ -12,7 +12,7 @@
 //! a request whose stored trajectory is missing starts from noise.
 //!
 //! The simulated denoising ranks state how their request slot pages hold a
-//! request's samples as executors do (`CallOutput::latent_layouts`): one
+//! request's samples as workers do (`CallOutput::latent_layouts`): one
 //! `[48, 16]` float32 video sample, of which each rank holds a run of rows
 //! from its first page on, three pages for the whole sample.
 
@@ -23,9 +23,9 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Receiver;
 use engine::{
-    BatchEvent, BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Executor,
-    ExecutorError, ExecutorInfo, ExecutorSubmitError, Request, SchedulerConfig, SimEngine,
-    SimExecutor, Trajectory, WorkerGroupId,
+    BatchEvent, BatchResult, CacheChange, CommandSender, Event, EventRx, ExecutionBatch, Request,
+    SchedulerConfig, SimEngine, SimWorker, Trajectory, Worker, WorkerError, WorkerGroupId,
+    WorkerInfo, WorkerSubmitError,
 };
 use ipc::{
     CallKind, LatentPageCopy, LatentPoolInfo, LatentPoolRef, LatentRestore, MediaCall,
@@ -97,13 +97,13 @@ impl Gate {
 }
 
 /// The simulator behind a [`Gate`].
-struct GatedExecutor {
-    inner: SimExecutor,
+struct GatedWorker {
+    inner: SimWorker,
     gate: Option<Arc<Gate>>,
 }
 
-impl Executor for GatedExecutor {
-    fn info(&self) -> &ExecutorInfo {
+impl Worker for GatedWorker {
+    fn info(&self) -> &WorkerInfo {
         self.inner.info()
     }
 
@@ -123,7 +123,7 @@ impl Executor for GatedExecutor {
         self.inner.command_has_capacity(command)
     }
 
-    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
         let denoises = batch
             .requests
             .iter()
@@ -139,22 +139,22 @@ impl Executor for GatedExecutor {
         Ok(())
     }
 
-    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError> {
+    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, WorkerError> {
         self.inner.poll(timeout)
     }
 
-    fn close(&mut self) -> Result<(), ExecutorError> {
+    fn close(&mut self) -> Result<(), WorkerError> {
         self.inner.close()
     }
 
-    fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, ExecutorError> {
+    fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, WorkerError> {
         self.inner.hook(name, payload)
     }
 }
 
 /// How a rank holding rows `start..start + count` of the sample lays them
 /// out in its slot pages (`storage::manifest::StorageLayout`), from byte
-/// zero on, as a video executor declares it.
+/// zero on, as a video worker declares it.
 fn share(start: u64, count: u64) -> String {
     serde_json::json!({
         "bytes": count * WIDTH * 4,
@@ -270,10 +270,10 @@ impl Denoiser {
                 })
                 .collect(),
         );
-        let mut inner = SimExecutor::new(sim);
+        let mut inner = SimWorker::new(sim);
         let boundary = inner.observe();
         let mut scheduler = support::scheduler_with(
-            Box::new(GatedExecutor { inner, gate }),
+            Box::new(GatedWorker { inner, gate }),
             SimEngine::special_tokens(),
             config,
         )
@@ -511,7 +511,7 @@ fn an_image_resumes_after_its_stored_step_and_recomputes_missing_pages() {
     serving.stop();
 }
 
-/// What the executors were asked of a request's admissions, each in order of
+/// What the workers were asked of a request's admissions, each in order of
 /// admission (its request epoch): the trajectory pages its batches
 /// offloaded, the stored trajectory its latent preparation restored, and its
 /// denoising calls.
@@ -639,10 +639,10 @@ fn park(server: &StorageServer, pool: u64, shares: &[(u64, u64)]) -> (Trajectory
     (stored, seed, preempted)
 }
 
-/// A sleep, which gives back the executors' storage in normal serving,
+/// A sleep, which gives back the workers' storage in normal serving,
 /// preempts a denoising video request at its next step boundary: the
 /// trajectory's pages reach the host latent pool, and the request leaves
-/// with the steps it took. Submitted again once the executors woke, it
+/// with the steps it took. Submitted again once the workers woke, it
 /// continues from that step: its latent preparation restores every page and
 /// only the steps left are denoised, and it completes with its video.
 #[test]

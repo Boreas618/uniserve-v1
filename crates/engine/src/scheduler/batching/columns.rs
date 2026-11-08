@@ -1,11 +1,11 @@
-//! One batch's executor columns, filled from the calls the mechanism planned.
+//! One batch's worker columns, filled from the calls the mechanism planned.
 //!
 //! A batch is one numerical call of one phase on one component (§4.4, `M499`),
-//! and the executor reads it in the layout the kernels address: `nn::BatchRows`
+//! and the worker reads it in the layout the kernels address: `nn::BatchRows`
 //! — one [`nn::BatchRow`] per call with the half-open row range it owns, then
 //! the token and row columns — beside the sampler's own columns. Nothing is
 //! converted between the mechanism and the model: the mechanism writes exactly
-//! what the kernels read, and the executor stages it into the pinned arena.
+//! what the kernels read, and the worker stages it into the pinned arena.
 //!
 //! The columns this module fills are the ones the calls themselves state:
 //!
@@ -31,8 +31,8 @@
 //! of them: a token column is as long as the batch's tokens, a row column as
 //! long as its rows — the sequences, so a verification of three candidates is
 //! one call and three rows — and the commit table as long as its calls. Their
-//! single statement is [`executor::batch::BatchColumns`]' own documentation,
-//! which the executor's `check` and its staging both read: compare a column
+//! single statement is [`worker::batch::BatchColumns`]' own documentation,
+//! which the worker's `check` and its staging both read: compare a column
 //! with the wrong one of the three and a legitimate batch is refused.
 //!
 //! - **commit**: the eight columns `ops::commit::column` names, one row per
@@ -40,7 +40,7 @@
 //!   its sampled token; a prefill that samples installs its token at the host
 //!   coordinates; a prefill that samples nothing only states its cache extent;
 //!   a verification installs the base its accepted span advances from. The
-//!   rules are the reference's (`uniserve/executor/text/commit.py`), which is
+//!   rules are the reference's (`uniserve/worker/text/commit.py`), which is
 //!   where every cell of the table is decided, and nothing here is a default:
 //!   a call the table cannot state — a decode or a verification that samples
 //!   nothing, a row writing past its block table — answers `None`.
@@ -48,23 +48,23 @@
 //! A batch whose calls disagree with what the layout promises — a call whose
 //! rows belong to several requests, a token outside its table, a call a token
 //! batch cannot carry — answers `None`: a planning fault, never a batch that
-//! would run on plausible values. The executor's own `BatchColumns::check` is
+//! would run on plausible values. The worker's own `BatchColumns::check` is
 //! the second line of that defence.
 
 use std::ops::Range;
 
-use executor::batch::{BatchColumns, commit};
 use ipc::{Call, CallKind, ForwardMode};
 use nn::{BatchRow, BatchRows, RowKind};
 use proto::request::SamplingParams;
+use worker::batch::{BatchColumns, commit};
 
 use super::slots::{self, PageGeometry};
-use crate::executor::RequestDispatch;
+use crate::worker::RequestDispatch;
 
 /// The kind of row a call occupies in a token batch, or `None` for a call a
 /// token batch does not carry.
 ///
-/// A media call's numerical extent is its own (`executor`'s media runners), and
+/// A media call's numerical extent is its own (`worker`'s media runners), and
 /// a transfer moves bytes: neither is a token row. `ForwardMode::TokenDenoising`
 /// likewise runs on the diffusion LM's canvas rather than on token rows, so it
 /// is not a token batch of this shape either — the media fold's batch is the
@@ -129,7 +129,7 @@ const TEMPERATURE_COLUMN: usize = 0;
 ///
 /// `page` is the cache's page geometry and `max_kv_len` the attention
 /// descriptor's static bound on a sequence, both of which the mechanism states
-/// to the executor rather than letting each side derive them.
+/// to the worker rather than letting each side derive them.
 ///
 /// The slot mapping is written through the deployment's cache group: the batch
 /// types one KV kind, and a deployment with more than one cache group (a hybrid
@@ -204,7 +204,7 @@ pub(crate) fn columns(
         // The tables this call addresses, which the caller states for every
         // call: a call declares a table on the wire only when it changed
         // (`batching::call`), so reading the declaration here left every later
-        // call of the same request without a layout and the executor without a
+        // call of the same request without a layout and the worker without a
         // batch it could serve.
         let table = tables
             .get(index)?
@@ -260,7 +260,7 @@ pub(crate) fn columns(
         let query = *forward.query_lens.last()?;
         // A call samples when it declares a sampled-token output: a decode and
         // a verification always do, and a prompt chunk does only when it is the
-        // chunk that ends the prompt. `consumer_slots` is the executor's, filled
+        // chunk that ends the prompt. `consumer_slots` is the worker's, filled
         // after this runs, so the mechanism's own answer is `token_output`.
         let sampled = call.token_output.is_some();
         if matches!(kind, RowKind::Decode | RowKind::Verify) && !sampled {
@@ -383,8 +383,8 @@ pub(crate) fn columns(
 ///
 /// A verification's candidates are decode-class rows: they draw, so they are
 /// sampled too.
-pub(crate) fn batch_shape(columns: &BatchColumns) -> executor::plan::Shape {
-    use executor::plan::Variant;
+pub(crate) fn batch_shape(columns: &BatchColumns) -> worker::plan::Shape {
+    use worker::plan::Variant;
 
     let rows = u32::try_from(columns.rows()).unwrap_or(u32::MAX);
     let tokens = u32::try_from(columns.tokens()).unwrap_or(u32::MAX);
@@ -416,7 +416,7 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> executor::plan::Shape {
     } else {
         Variant::DecodeSampled
     };
-    executor::plan::Shape {
+    worker::plan::Shape {
         rows,
         tokens,
         variant,
@@ -426,7 +426,7 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> executor::plan::Shape {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::WorkerGroupId;
+    use crate::worker::WorkerGroupId;
 
     /// Four tokens per page, one unit per page: the geometry every token group
     /// reports today.
@@ -443,7 +443,7 @@ mod tests {
     /// layout: the dispatch's own declaration, which is the whole table in a
     /// fixture.
     fn tables_of(
-        requests: &[(Call, crate::executor::RequestDispatch)],
+        requests: &[(Call, crate::worker::RequestDispatch)],
     ) -> Vec<Vec<crate::scheduler::IpcBlockTable>> {
         requests
             .iter()
@@ -471,7 +471,7 @@ mod tests {
         );
         // A call that samples declares the output it samples into, which is
         // what the planner sets (`plan_decode`, `plan_verify`, a sampling
-        // `plan_prefill`); `consumer_slots` is the executor's, filled later.
+        // `plan_prefill`); `consumer_slots` is the worker's, filled later.
         call.token_output = Some(ipc::TensorRef {
             request_key: ipc::RequestKey::new(1, ipc::RequestId(1), 1),
             producer_call_id: ipc::CallId::new(1, 0),
@@ -908,13 +908,13 @@ mod tests {
         );
         assert_eq!(
             batch_shape(&columns).variant,
-            executor::plan::Variant::PrefillOutput,
+            worker::plan::Variant::PrefillOutput,
             "the batch ends a prompt, so it projects logits"
         );
     }
 
     #[test]
-    fn a_filled_batch_states_one_sampler_row_per_row_and_passes_the_executors_check() {
+    fn a_filled_batch_states_one_sampler_row_per_row_and_passes_the_workers_check() {
         let requests = vec![(call(prefill(), 8, &[4]), dispatch(1, &[4], &[true]))];
         let columns = columns(
             &requests,
@@ -932,10 +932,10 @@ mod tests {
             &[0.5, 40.0, 0.9, 0.05, 1.1, 0.2, 0.3],
             "ops::sampler's order: temperature, top-k, top-p, min-p, repetition, frequency, presence"
         );
-        let shape = executor::plan::Shape::prefill(
+        let shape = worker::plan::Shape::prefill(
             columns.rows() as u32,
             columns.tokens() as u32,
-            executor::plan::Variant::PrefillWrite,
+            worker::plan::Variant::PrefillWrite,
         );
         columns
             .check(&shape)
@@ -958,7 +958,7 @@ mod tests {
         )
         .expect("a sampling prefill");
         let shape = batch_shape(&sampling_batch);
-        assert_eq!(shape.variant, executor::plan::Variant::PrefillOutput);
+        assert_eq!(shape.variant, worker::plan::Variant::PrefillOutput);
         assert_eq!(
             (shape.rows, shape.tokens),
             (sampling_batch.rows() as u32, sampling_batch.tokens() as u32),
@@ -982,7 +982,7 @@ mod tests {
         )
         .expect("a chunked prefill");
         let shape = batch_shape(&writing_batch);
-        assert_eq!(shape.variant, executor::plan::Variant::PrefillWrite);
+        assert_eq!(shape.variant, worker::plan::Variant::PrefillWrite);
         writing_batch
             .check(&shape)
             .expect("a chunked prefill is a well-formed PrefillWrite batch");
@@ -1008,7 +1008,7 @@ mod tests {
         .expect("a greedy decode");
         assert_eq!(
             batch_shape(&one_greedy).variant,
-            executor::plan::Variant::DecodeGreedy,
+            worker::plan::Variant::DecodeGreedy,
             "no draw path produces a greedy token, so a greedy row is served from the greedy bucket"
         );
 
@@ -1024,7 +1024,7 @@ mod tests {
         .expect("a sampling decode");
         assert_eq!(
             batch_shape(&one_sampling).variant,
-            executor::plan::Variant::DecodeSampled
+            worker::plan::Variant::DecodeSampled
         );
 
         // One batch serves one variant, so a burst that mixes the two is
@@ -1048,7 +1048,7 @@ mod tests {
         .expect("a mixed decode");
         assert_eq!(
             batch_shape(&mixed).variant,
-            executor::plan::Variant::DecodeSampled,
+            worker::plan::Variant::DecodeSampled,
             "the sampler graph serves both rows, and a greedy row's token is its argmax"
         );
 
@@ -1071,7 +1071,7 @@ mod tests {
         .expect("a greedy verification");
         assert_eq!(
             batch_shape(&greedy_verify).variant,
-            executor::plan::Variant::DecodeGreedy
+            worker::plan::Variant::DecodeGreedy
         );
         let sampling_verify = columns(
             &requests,
@@ -1085,7 +1085,7 @@ mod tests {
         .expect("a sampling verification");
         assert_eq!(
             batch_shape(&sampling_verify).variant,
-            executor::plan::Variant::DecodeSampled
+            worker::plan::Variant::DecodeSampled
         );
     }
 
@@ -1144,11 +1144,11 @@ mod tests {
         // A verification is served from a decode bucket: one token per row,
         // three candidate rows, and the sampler graph because they draw.
         columns
-            .check(&executor::plan::Shape::decode(
+            .check(&worker::plan::Shape::decode(
                 3,
-                executor::plan::Variant::DecodeSampled,
+                worker::plan::Variant::DecodeSampled,
             ))
-            .expect("the fill satisfies the executor's check for a multi-row call");
+            .expect("the fill satisfies the worker's check for a multi-row call");
     }
 
     #[test]

@@ -1044,7 +1044,7 @@ fn stage_decode(args: &Args) -> Result<()> {
 /// recorded.
 /// Print the decoder's arena plan, and the tile grid it is derived from, with no device and no weights.
 ///
-/// The plan is what the executor sizes the arena by, so a plan that is wrong is a run that stops with
+/// The plan is what the worker sizes the arena by, so a plan that is wrong is a run that stops with
 /// "the arena cannot give out" partway through a clip - the most expensive place to learn it. Every
 /// entry here is computed from the config and the canvas alone, so this stage answers on a host with no
 /// GPU, no store and no checkpoint shards, and it answers for a canvas the caller names rather than for

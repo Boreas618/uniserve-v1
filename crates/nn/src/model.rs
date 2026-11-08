@@ -1,11 +1,11 @@
-//! A loaded model as the executor is to see it: named blocks, each implementing one capability.
+//! A loaded model as the worker is to see it: named blocks, each implementing one capability.
 //!
 //! This is the **producer half** of the seam `specs/worker.md` 4.3 states — a block per capability,
 //! addressed by a name and a phase — and the consumer half is not wired yet. A model builds one of
 //! these with its own loader (`qwen3_moe::Qwen3Moe::into_model`,
 //! `minimax_h3::MinimaxH3::into_model`) and nothing in the tree hands it on: the engine's plan
-//! (`src/model_runner.rs`) ends at `Arc<qwen3_moe::Qwen3Moe>`, and the executor's runners
-//! (`crates/executor/src/runners/`) address work by `ipc::PhaseId` with no block registry. **The
+//! (`src/model_runner.rs`) ends at `Arc<qwen3_moe::Qwen3Moe>`, and the worker's runners
+//! (`crates/worker/src/runners/`) address work by `ipc::PhaseId` with no block registry. **The
 //! consumer is `exec`'s to land**; until it does, this is a stated contract whose other half is owed
 //! rather than a path a run exercises.
 //!
@@ -26,7 +26,7 @@ use crate::capability::{CausalLm, Decoder, Denoiser, Encoder};
 /// The name a deployment gives one block of a model, e.g. `backbone` or `text_encoder`.
 ///
 /// The name comes from the deployment file's block assignment and travels with every phase the
-/// executor schedules, so a log line or a scheduling decision says which block it is about.
+/// worker schedules, so a log line or a scheduling decision says which block it is about.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct BlockName(Arc<str>);
 
@@ -66,7 +66,7 @@ pub type PhaseId = (BlockName, PhaseKind);
 /// `Arc<TextEncoder>`, `Arc<VideoDecoder>` and so on — it is the owner of its computation, and it is
 /// also the party that must answer what programs those components launch. `Model` carries the same
 /// objects as capability views, so there is one of each, one load, and no drift between the object
-/// the model computes with and the trait object the executor dispatches on. `Arc<T>` coerces to
+/// the model computes with and the trait object the worker dispatches on. `Arc<T>` coerces to
 /// `Arc<dyn Capability>` at the construction site, as `Box<T>` did.
 pub enum Block {
     /// A tower that turns inputs into conditioning.
@@ -92,7 +92,7 @@ impl fmt::Debug for Block {
 
 /// A loaded model: its named blocks.
 ///
-/// A deployment places each block on a worker group; the executor builds one runner per resident
+/// A deployment places each block on a worker group; the worker builds one runner per resident
 /// block from the capability it implements (specs/worker.md 4.3, 4.5).
 #[derive(Debug)]
 pub struct Model {

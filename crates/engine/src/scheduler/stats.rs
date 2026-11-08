@@ -25,7 +25,7 @@ pub struct GeneralStats {
     /// Current number of token and media requests waiting for admission.
     pub pending: AtomicUsize,
     /// Current number of batches registered in flight, from planning until
-    /// their final result or an executor failure that empties them, including
+    /// their final result or a worker failure that empties them, including
     /// batches still awaiting submission.
     pub in_flight: AtomicUsize,
     /// Cumulative calls whose forward produced non-finite logits
@@ -78,10 +78,10 @@ pub struct EncoderStats {
 /// Batch-timing and queueing/admission latency counters.
 #[derive(Default)]
 pub struct TimingStats {
-    /// Executor-reported execution time of the most recently completed batch, in
+    /// Worker-reported execution time of the most recently completed batch, in
     /// microseconds.
     pub last_worker_exec_us: AtomicU64,
-    /// Cumulative executor execution time, in microseconds.
+    /// Cumulative worker execution time, in microseconds.
     pub worker_exec_us_total: AtomicU64,
     /// Cumulative submission-to-completion latency, in microseconds.
     pub batch_roundtrip_us_total: AtomicU64,
@@ -102,7 +102,7 @@ pub struct TimingStats {
 /// Each call holds one credit from its in-flight registration until its result
 /// is reconciled or its execution fails. The per-batch timing fields add, once
 /// per batch result report that contains calls of this domain, the maximum of
-/// each executor-reported `TimingCounters` field over those calls; a batch
+/// each worker-reported `TimingCounters` field over those calls; a batch
 /// returned in several partial reports contributes once per report.
 #[derive(Default)]
 pub struct DomainStats {
@@ -119,7 +119,7 @@ pub struct DomainStats {
     /// Cumulative calls that returned an error status or whose credit was
     /// reclaimed after an execution failure.
     pub error_calls: AtomicU64,
-    /// Cumulative submissions rejected by executor backpressure.
+    /// Cumulative submissions rejected by worker backpressure.
     pub backpressure_events: AtomicU64,
     /// Cumulative credits returned, on normal completion or execution failure.
     pub reclaimed_credits: AtomicU64,
@@ -129,12 +129,12 @@ pub struct DomainStats {
     /// flight, in microseconds. Calls of media requests, planned by
     /// `plan_media_call`, contribute zero.
     pub queue_us: AtomicU64,
-    /// Cumulative executor-reported wait before execution
+    /// Cumulative worker-reported wait before execution
     /// (`TimingCounters::queued_us`), in microseconds.
     pub launch_us: AtomicU64,
     /// Cumulative device execution time, in microseconds.
     pub device_us: AtomicU64,
-    /// Cumulative executor completion copy and host processing time
+    /// Cumulative worker completion copy and host processing time
     /// (`copy_us + host_us`), in microseconds.
     pub completion_us: AtomicU64,
 }
@@ -193,29 +193,29 @@ impl ExecutionDomainStats {
     }
 }
 
-/// Executor-local forward/kernel counters, aggregated as completed batches
-/// resolve so OpenMetrics can explain scheduler vs executor/kernel latency.
+/// Worker-local forward/kernel counters, aggregated as completed batches
+/// resolve so OpenMetrics can explain scheduler vs worker/kernel latency.
 #[derive(Default)]
-pub struct ExecutorStats {
-    /// Forward invocation counts keyed by executor runtime mode.
+pub struct WorkerStats {
+    /// Forward invocation counts keyed by worker runtime mode.
     pub forward_mode_counts: Mutex<BTreeMap<String, u64>>,
-    /// Forward query-token counts keyed by executor runtime mode; modes without
+    /// Forward query-token counts keyed by worker runtime mode; modes without
     /// a token notion have no entry.
     pub forward_mode_tokens: Mutex<BTreeMap<String, u64>>,
-    /// Forward execution time keyed by executor runtime mode, in microseconds.
+    /// Forward execution time keyed by worker runtime mode, in microseconds.
     pub forward_mode_us: Mutex<BTreeMap<String, u64>>,
-    /// Forward execution time keyed by executor component, in microseconds.
+    /// Forward execution time keyed by worker component, in microseconds.
     pub forward_component_us: Mutex<BTreeMap<String, u64>>,
-    /// Executor stream device time keyed `{stream}/{state}`, in microseconds
+    /// Worker stream device time keyed `{stream}/{state}`, in microseconds
     /// (`ForwardStats::stream_us`).
     pub stream_us: Mutex<BTreeMap<String, u64>>,
-    /// Executor driver calls that waited for the device, keyed
+    /// Worker driver calls that waited for the device, keyed
     /// `{thread}/{call}` (`ForwardStats::blocking_calls`).
     pub blocking_calls: Mutex<BTreeMap<String, u64>>,
     /// Fence probe step durations keyed `{stage}/{component}`
     /// (`ForwardStats::fence_us`).
     pub fence_us: Mutex<BTreeMap<String, ipc::FenceHistogram>>,
-    /// Cumulative fence probe records the executors lost.
+    /// Cumulative fence probe records the workers lost.
     pub fence_records_lost: AtomicU64,
     /// Profiling session progress keyed `{session}/{counter}`
     /// (`ForwardStats::profile`).
@@ -238,7 +238,7 @@ pub struct ExecutorStats {
     pub cuda_graph_unpadded_tokens: AtomicU64,
     /// Cumulative padding token slots CUDA graph buckets added.
     pub cuda_graph_padded_tokens: AtomicU64,
-    /// CUDA graph dispatch counts keyed by executor runtime mode.
+    /// CUDA graph dispatch counts keyed by worker runtime mode.
     pub cuda_graph_runtime_mode_counts: Mutex<BTreeMap<String, u64>>,
     /// Cumulative decode rows that reused a relayed token.
     pub text_decode_token_relay_hits: AtomicU64,
@@ -292,6 +292,6 @@ pub struct SchedulerStats {
     pub timing: TimingStats,
     /// Per-execution-domain accounting.
     pub domains: ExecutionDomainStats,
-    /// Executor forward and kernel accounting.
-    pub worker: ExecutorStats,
+    /// Worker forward and kernel accounting.
+    pub worker: WorkerStats,
 }

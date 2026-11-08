@@ -9,7 +9,7 @@
 //!
 //! ## What the caller gets back
 //!
-//! [`MinimaxH3`]: the blocks the executor serves, and the same components behind them as handles.
+//! [`MinimaxH3`]: the blocks the worker serves, and the same components behind them as handles.
 //! A block is boxed as `Arc<dyn Encoder>` or `Arc<dyn Decoder>` and those traits publish no
 //! descriptors, so a deployment that can answer "which programs must be compiled for me?" can only
 //! answer it from the concrete components - and that is what the handles are for. They are the same
@@ -17,7 +17,7 @@
 //!
 //! ## Testing
 //!
-//! A load publishes every tensor through `nn::weights::RetainedWeights`, which only the executor
+//! A load publishes every tensor through `nn::weights::RetainedWeights`, which only the worker
 //! implements, so this module has no unit test of its own: the block constructors are tested where
 //! they live, and the composition is exercised by the caller's load of a real checkpoint. What can
 //! be checked here without a device is checked - `Partition`'s rules, the packing's tables, and the
@@ -52,7 +52,7 @@ pub use crate::partition::Component;
 /// A loaded deployment: the blocks this rank serves, and the components they were built from.
 ///
 /// The runner needs the first and only the first: [`MinimaxH3::into_model`] hands it over and the
-/// executor serves each block by the capability it implements. The second is what makes the
+/// worker serves each block by the capability it implements. The second is what makes the
 /// deployment able to answer for itself: a block is boxed as `Arc<dyn Encoder>` and the trait does
 /// not publish descriptors, so the model's programs can only be enumerated from the components
 /// before they are erased - `keys` walks these handles, and nothing else in the crate reads them.
@@ -106,7 +106,7 @@ impl std::fmt::Debug for MinimaxH3 {
 }
 
 impl MinimaxH3 {
-    /// The blocks this rank serves, as the executor consumes them.
+    /// The blocks this rank serves, as the worker consumes them.
     pub fn model(&self) -> &nn::Model {
         &self.model
     }

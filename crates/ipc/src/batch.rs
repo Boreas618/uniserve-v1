@@ -479,7 +479,7 @@ impl BufferAllocation {
 /// buckets are derived by the worker.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Batch {
-    /// Batch identity assigned by the executor, strictly increasing in each
+    /// Batch identity assigned by the worker, strictly increasing in each
     /// worker's Submit order.
     pub batch_id: u64,
     /// Monotonic sequence shared by collective participants.

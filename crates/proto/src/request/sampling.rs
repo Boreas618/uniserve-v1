@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 /// tensors — so they can cross the worker boundary without carrying device
 /// state.
 ///
-/// The executor receives these fields in a request's admission message and
+/// The worker receives these fields in a request's admission message and
 /// stages them for the sampler's kernels. All consumers share this FP32
 /// representation and its numerical validation.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

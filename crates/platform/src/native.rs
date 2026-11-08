@@ -5,7 +5,7 @@
 //! FlashInfer's launch code and planner, the cuDNN frontend — is compiled to
 //! a shared object with a C ABI, with its cubin embedded. This process
 //! `dlopen`s that object and calls the entry point the package declares,
-//! passing it the stream the executor issues on and the arguments of the
+//! passing it the stream the worker issues on and the arguments of the
 //! launch. The object's own launches are captured with the stream, so a
 //! native kernel is captured into a graph exactly like a cubin one.
 //!

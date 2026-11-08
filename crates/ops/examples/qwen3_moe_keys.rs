@@ -24,8 +24,8 @@
 //! - **the model's**, which `Qwen3Moe::keys()` reproduces from the layers' own descriptor
 //!   accessors (`crates/models/qwen3-moe/src/keys.rs`); if this generator and that walk disagree,
 //!   the walk is right;
-//! - **the executor's**, whose geometry is request and scheduling state the model does not hold:
-//!   the sampler's chain and the logits gathers. Those are keyed where the executor compiles its
+//! - **the worker's**, whose geometry is request and scheduling state the model does not hold:
+//!   the sampler's chain and the logits gathers. Those are keyed where the worker compiles its
 //!   plans, and the rows here are its list, not this file's invention.
 //!
 //! Gaps this file does not fill, named rather than invented, so that the 85 declared operators are
@@ -35,11 +35,11 @@
 //!   `route_gemm_nvfp4`, `act_and_mul_fp8`, `value_first_swiglu_fp8` and `expert_exchange`. Their descriptors carry the export's own choices — the block-scale dtype,
 //!   the expert packing, the exchange's ranks — and no NVFP4 shard exists in this workspace, so a
 //!   key here would be a guess about an artifact nobody has opened.
-//! - **The executor's path, not the model's**: `slot_commit` (its views are the sampler's state),
+//! - **The worker's path, not the model's**: `slot_commit` (its views are the sampler's state),
 //!   `attention_gather_rows`, `attention_gather_decode_inputs`, `page_conversion`,
 //!   `cache_block_snapshot`, `cache_block_scatter` and `cache_copy_region` (the page geometry and
-//!   the block shapes are the executor's scheduling), and `paged_attention`, whose decode attention
-//!   is trtllm-gen. These are keyed where the executor compiles its own plans.
+//!   the block shapes are the worker's scheduling), and `paged_attention`, whose decode attention
+//!   is trtllm-gen. These are keyed where the worker compiles its own plans.
 //! - `logprob_gather`, `logits_gather`, `vocab_unpad` and the sampler's chain are above: they are the
 //!   slice's, and the widths are its request state.
 
@@ -124,7 +124,7 @@ fn main() {
     let mut lines: Vec<(String, String)> = Vec::new();
 
     // A model walk's print, when one is given, is merged in rather than restated: the rows a layer
-    // launches are the walk's statement (`Qwen3Moe::keys`), and this file may only add the executor's
+    // launches are the walk's statement (`Qwen3Moe::keys`), and this file may only add the worker's
     // own — so a merged print is the file, and a difference between the two is visible as a row.
     let mut arguments = std::env::args().skip(1);
     let mut model_keys: Option<std::path::PathBuf> = None;

@@ -2615,7 +2615,7 @@ def test_a_process_of_two_devices_keeps_the_host_kv_cache(
         if kind == "expert":
             assert _occurrences(log, "schedulers=2 devices=2"), _log_trouble(log)
             assert (
-                _occurrences(log, "the host KV cache serves the executor group") == 2
+                _occurrences(log, "the host KV cache serves the worker group") == 2
             ), _log_trouble(log)
         assert (
             answers[0]["choices"][0]["message"]["content"]

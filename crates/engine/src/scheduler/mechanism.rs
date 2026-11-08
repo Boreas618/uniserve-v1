@@ -50,11 +50,11 @@
 //!   layout is validated against the ranks the load states
 //!   ([`validate_experts`]), and the order is handed over with
 //!   `Command::TakeExpertOrder` — `SchedulerHandle::take_expert_order` is that
-//!   hand-off. **The application is the executor's**, and it is deferred on
+//!   hand-off. **The application is the worker's**, and it is deferred on
 //!   that side with a named owner (§7.6): applying a layout moves weights
 //!   across ranks and pools, which is device and world state, and the mechanism
-//!   owns none of it; `Executor::commit_experts` is the method that retains an
-//!   order. Nothing in this tree takes the order yet, so until the executor
+//!   owns none of it; `Worker::commit_experts` is the method that retains an
+//!   order. Nothing in this tree takes the order yet, so until the worker
 //!   applies it the order changes nothing — stated here so the row is not a
 //!   surprise to a reader rather than dropped by the mechanism.
 
@@ -1207,7 +1207,7 @@ impl Recorder {
     /// hit by.
     ///
     /// Neither is a view's to compute: the device hit is the answer of the
-    /// prefill executor admission probed (`admission::prefill_target`), and the
+    /// prefill worker admission probed (`admission::prefill_target`), and the
     /// host deepening is the boundary `KvOffloadManager::admission` answers,
     /// less the device hit. Both are known only where admission computes them,
     /// so they are recorded there and `views.rs` reads them back from

@@ -5,7 +5,7 @@
 //! and every item the deployment's worlds and the Transfer Server hold on it
 //! (weights, each KV cache segment, the other exclusive storages, graph
 //! pools, process storage, staging, the Transfer Server's context), each once
-//! however many worlds map it. Every executor reports its cache's GPU's ledger
+//! however many worlds map it. Every worker reports its cache's GPU's ledger
 //! with its segments (`uniserve.cache_storage`), and two limits follow from it:
 //!
 //! - **Room** ([`room`]): device storage beside the cache, a profiling
@@ -17,32 +17,32 @@
 use serde::{Deserialize, Serialize};
 use storage::{GpuLedger, Item, LedgerEntry, Scope};
 
-/// What `uniserve.cache_storage` reports of one executor.
+/// What `uniserve.cache_storage` reports of one worker.
 #[derive(Debug, Clone, Deserialize)]
 pub(super) struct CacheStorage {
     /// The segments of each cache plane, in unit order; empty when the
     /// planes are not split.
     #[serde(default)]
     pub(super) segments: Vec<ipc::CacheSegment>,
-    /// Segments the executor holds: the first given back.
+    /// Segments the worker holds: the first given back.
     #[serde(default)]
     pub(super) held: u32,
-    /// Device bytes of one unit across the executor's planes.
+    /// Device bytes of one unit across the worker's planes.
     #[serde(default)]
     pub(super) unit_bytes: u64,
-    /// Free bytes of the executor's device, which bound what the cache
+    /// Free bytes of the worker's device, which bound what the cache
     /// creates beside processes outside the deployment.
     #[serde(default)]
     pub(super) free_bytes: u64,
-    /// The executor's host.
+    /// The worker's host.
     #[serde(default)]
     pub(super) host: String,
-    /// The executor's scope and world, which name its entries in the ledger.
+    /// The worker's scope and world, which name its entries in the ledger.
     #[serde(default)]
     pub(super) scope: Option<Scope>,
     #[serde(default)]
     pub(super) world: Option<u64>,
-    /// The deployment's ledger of the cache's GPU; `None` for an executor that
+    /// The deployment's ledger of the cache's GPU; `None` for a worker that
     /// keeps its storage itself, which no other world shares.
     #[serde(default)]
     pub(super) ledger: Option<GpuLedger>,
@@ -113,11 +113,11 @@ pub(super) struct Room {
 /// back the first `floor`: the cache keeps all it holds when the ledger's
 /// room and the device's free storage hold `bytes` already, and otherwise
 /// the largest prefix whose given-back tail makes the rest (each segment
-/// given back frees its bytes of both). Fails for an executor that reports no
+/// given back frees its bytes of both). Fails for a worker that reports no
 /// ledger or no quota.
 pub(super) fn room(report: &CacheStorage, bytes: u64, floor: u32) -> Result<Room, String> {
     let Some(ledger) = &report.ledger else {
-        return Err("an executor that holds a split KV cache reports no storage ledger".to_owned());
+        return Err("a worker that holds a split KV cache reports no storage ledger".to_owned());
     };
     let gpu = storage::protocol::gpu_name(&ledger.gpu);
     let quota = ledger

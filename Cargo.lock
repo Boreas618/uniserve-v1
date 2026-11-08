@@ -1183,7 +1183,6 @@ dependencies = [
  "base64 0.22.1",
  "crossbeam-channel",
  "engine",
- "executor",
  "fnv",
  "ipc",
  "libc",
@@ -1205,6 +1204,7 @@ dependencies = [
  "tracing",
  "uuid",
  "wat",
+ "worker",
 ]
 
 [[package]]
@@ -1230,36 +1230,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d817e038c30374a4bcb22f94d0a8a0e216958d4c3dcde369b1439fec4bdda6e6"
 dependencies = [
  "cc",
-]
-
-[[package]]
-name = "executor"
-version = "2.0.0"
-dependencies = [
- "bytemuck",
- "crossbeam-channel",
- "indexmap 2.14.0",
- "ipc",
- "libc",
- "libloading",
- "media",
- "models",
- "nn",
- "nvtx",
- "ops",
- "platform",
- "proto",
- "rusqlite",
- "rustix",
- "serde",
- "serde_json",
- "sha2",
- "storage",
- "tempfile",
- "thiserror",
- "time",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -4682,7 +4652,6 @@ dependencies = [
  "crossbeam-channel",
  "daemon",
  "engine",
- "executor",
  "frontend",
  "ipc",
  "libc",
@@ -4708,6 +4677,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "worker",
 ]
 
 [[package]]
@@ -5676,6 +5646,36 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser 0.244.0",
+]
+
+[[package]]
+name = "worker"
+version = "2.0.0"
+dependencies = [
+ "bytemuck",
+ "crossbeam-channel",
+ "indexmap 2.14.0",
+ "ipc",
+ "libc",
+ "libloading",
+ "media",
+ "models",
+ "nn",
+ "nvtx",
+ "ops",
+ "platform",
+ "proto",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2",
+ "storage",
+ "tempfile",
+ "thiserror",
+ "time",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -3,7 +3,7 @@
 //! A transformer reads packed rows — one video row is one `1×2×2` patch of the latent's channels —
 //! while the capability boundary and the video VAE speak a `[channels, frames, height, width]`
 //! latent. The mapping is a device program (`ops::patch`), because a captured step can only replay
-//! what the device does and the executor owns every upload.
+//! what the device does and the worker owns every upload.
 //!
 //! The layer holds the channel count and the latent's rows and columns, which a request's layout
 //! fixes; the frame count is a launch value, so a short clip and a long one differ in the arguments

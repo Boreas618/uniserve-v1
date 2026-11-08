@@ -2813,7 +2813,7 @@ impl AudioEncoder {
 /// output where the level downsamples, and the moments convolution's output.
 ///
 /// **A caller that encodes several tiles must hoist these buffers out of its loop.** The arena never
-/// rewinds - its only rewind is the executor's per-forward `reset` - so a driver that calls `encode` once
+/// rewinds - its only rewind is the worker's per-forward `reset` - so a driver that calls `encode` once
 /// per tile multiplies this whole list by the tile count. The level-0 buffers are the pixels at the
 /// encoder's first width, so at a 256-by-64-pixel tile they are ~143 MB each: four of them is most of a
 /// gigabyte for one tile, and a tiled reference clip is tens of tiles. This function states one tile so

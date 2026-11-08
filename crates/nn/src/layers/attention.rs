@@ -522,7 +522,7 @@ impl Attention {
     ///
     /// `query` and `out` are `[tokens, q_heads, head_dim]`, `key` and `value`
     /// `[tokens, kv_heads, head_dim]`; `workspace` is `[bytes]` of the attention program's transient
-    /// scratch (512 MiB for the trtllm-gen program), zeroed by the executor before its first use.
+    /// scratch (512 MiB for the trtllm-gen program), zeroed by the worker before its first use.
     #[allow(
         clippy::too_many_arguments,
         reason = "the design's attention call carries the batch, the cache, the layer index and the \
@@ -942,7 +942,7 @@ fn page_scale(plane: TensorView, scale: Option<TensorView>) -> Result<Option<Ten
 
 /// The bytes the trtllm-gen attention program needs as its workspace.
 ///
-/// The program's `workspace_size` argument (specs/worker.md 9); the executor carves it from its
+/// The program's `workspace_size` argument (specs/worker.md 9); the worker carves it from its
 /// scratch pool and zeroes it once (specs/worker.md 5.4, `D4`).
 pub const TRTLLM_WORKSPACE_BYTES: u64 = 512 << 20;
 

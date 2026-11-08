@@ -342,7 +342,7 @@ impl Pcm {
 /// The post activation's output and the mono signal the PCM step reads close the list. `frames` is the
 /// request's latent frame count, so every length grows by the rates.
 ///
-/// The list matters because the arena never rewinds - its only rewind is the executor's per-forward
+/// The list matters because the arena never rewinds - its only rewind is the worker's per-forward
 /// `reset` - so every reservation in this walk accumulates and the sum is what a request needs. It is
 /// therefore large: at 207 latent frames each buffer of stages one to six is `[2, c, L]` with `c · L` near
 /// 1.32 M, about 10.6 MB, so those six stages carry most of the total against the decoder's 248 MiB of weights - the

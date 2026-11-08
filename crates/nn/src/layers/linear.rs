@@ -445,7 +445,7 @@ impl Nvfp4Linear {
     /// `rows` is the request's row count and **not** the descriptor's `m`: the key states the row
     /// class that holds `rows` ([`packed_rows`]), because the module is compiled per class and its
     /// entry refuses any other row count. The product's grid is the row count, which is why a
-    /// deployment enumerates the classes its executor builds rather than an unbounded row count.
+    /// deployment enumerates the classes its worker builds rather than an unbounded row count.
     #[allow(clippy::too_many_arguments)]
     pub fn descriptor_of(
         rows: u32,

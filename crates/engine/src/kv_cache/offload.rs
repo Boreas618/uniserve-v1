@@ -2,7 +2,7 @@
 //! behind it, as the scheduler drives them.
 //!
 //! Every host's Storage Server keeps page pools of host storage; each rank
-//! of an executor group maps one for each of its cache groups and reports them
+//! of a worker group maps one for each of its cache groups and reports them
 //! (`PrefixCacheInfo::page_pools`). The server's Mooncake connector, when it
 //! runs one, keeps every committed page in the KV storage and reads pages
 //! back into the pools on request. The scheduler decides which pages move,
@@ -38,7 +38,7 @@
 //!   which the pool evicts whole and with the last full-attention page before
 //!   its boundary, its anchor; they are reserved while the request's table
 //!   still holds them, so the reference keeps their units from being
-//!   recycled until the copy commits. The next text batch the executor group
+//!   recycled until the copy commits. The next text batch the worker group
 //!   runs copies the pages (`Batch::page_offloads`), and the batch's output
 //!   commits them, or aborts them when the batch failed.
 //! - **Evictions.** A world change evicts idle cached pages from the device
@@ -95,7 +95,7 @@ use storage::{Client, Key, Role, Scope};
 
 use super::manager::{self, AttentionManager};
 use super::{CachedTokens, GroupShape, PageRef};
-use crate::executor::WorkerGroupId;
+use crate::worker::WorkerGroupId;
 
 /// The fewest tokens an L3 hit must add to the pools' hit to be prefetched:
 /// a shorter hit is computed faster than it is fetched.
@@ -162,7 +162,7 @@ pub(crate) struct HostCacheDemand {
 }
 
 impl HostCacheDemand {
-    /// The demand of the ranks of `ranks` (by executor group, each rank's host
+    /// The demand of the ranks of `ranks` (by worker group, each rank's host
     /// and cache) whose pages the host KV cache copies, at `ratio`; `None`
     /// when none does. A rank's device KV cache holds its allocatable units,
     /// those beside the sentinel and the units its warmup lends, of the
@@ -228,7 +228,7 @@ struct RankPool {
     pool: u64,
 }
 
-/// The page pools of one cache group of an executor group, one per rank.
+/// The page pools of one cache group of a worker group, one per rank.
 #[derive(Clone)]
 struct CachePools {
     ranks: Vec<RankPool>,
@@ -240,7 +240,7 @@ struct CachePools {
     draft: bool,
 }
 
-/// The cache groups of one executor group.
+/// The cache groups of one worker group.
 #[derive(Clone)]
 struct GroupCachePools {
     groups: Vec<CachePools>,
@@ -470,9 +470,9 @@ pub(crate) struct KvOffloadManager {
     hits: HashMap<RequestId, Hit>,
     reservations: HashMap<u64, Reservation>,
     next_reservation: u64,
-    /// Offloads reserved and waiting for a batch of their executor group.
+    /// Offloads reserved and waiting for a batch of their worker group.
     queued: HashMap<WorkerGroupId, Vec<Offload>>,
-    /// Offloads carried by submitted batches, by batch, with the executor
+    /// Offloads carried by submitted batches, by batch, with the worker
     /// group that runs it.
     carried: HashMap<u64, (WorkerGroupId, Vec<Offload>)>,
     /// Whether a KV storage keeps every page the pools commit
@@ -585,7 +585,7 @@ impl KvOffloadManager {
         }
     }
 
-    /// Serve `executor`, whose ranks (`ranks`, in rank order) are the scopes
+    /// Serve `worker`, whose ranks (`ranks`, in rank order) are the scopes
     /// of the deployment named by the group and their ranks, when every rank
     /// reports a page pool for every one of its cache groups, of the same
     /// content for a group on every rank, and its server is reachable.
@@ -650,14 +650,14 @@ impl KvOffloadManager {
             .unwrap_or(1);
         self.workers
             .insert(worker.clone(), GroupCachePools { groups, step });
-        tracing::info!(worker = %worker.0, groups = shapes.len(), "the host KV cache serves the executor group");
+        tracing::info!(worker = %worker.0, groups = shapes.len(), "the host KV cache serves the worker group");
         true
     }
 
-    /// Key `executor`'s pages from now on by `contents`, the seed of each of
+    /// Key `worker`'s pages from now on by `contents`, the seed of each of
     /// its cache groups' pages after its weights changed: the pages written
     /// before keep the old keys, which no later prompt finds. Does nothing
-    /// for an executor the host KV cache does not serve.
+    /// for a worker the host KV cache does not serve.
     pub(crate) fn reseed(
         &mut self,
         worker: &WorkerGroupId,
@@ -668,7 +668,7 @@ impl KvOffloadManager {
         };
         if pools.groups.len() != contents.len() {
             return Err(format!(
-                "executor group {} reports {} page key seeds for {} cache groups",
+                "worker group {} reports {} page key seeds for {} cache groups",
                 worker.0,
                 contents.len(),
                 pools.groups.len()
@@ -680,18 +680,18 @@ impl KvOffloadManager {
         Ok(())
     }
 
-    /// Whether the host KV cache serves `executor`.
+    /// Whether the host KV cache serves `worker`.
     pub(crate) fn serves(&self, worker: &WorkerGroupId) -> bool {
         self.workers.contains_key(worker)
     }
 
-    /// The largest block size of `executor`'s cache groups, in tokens: every
+    /// The largest block size of `worker`'s cache groups, in tokens: every
     /// reuse boundary is a multiple of it.
     pub(crate) fn step(&self, worker: &WorkerGroupId) -> Option<usize> {
         self.workers.get(worker).map(|pools| pools.step)
     }
 
-    /// The reuse rules of `executor`'s cache groups, in group order.
+    /// The reuse rules of `worker`'s cache groups, in group order.
     pub(crate) fn managers(&self, worker: &WorkerGroupId) -> Vec<AttentionManager> {
         self.workers
             .get(worker)
@@ -699,7 +699,7 @@ impl KvOffloadManager {
             .unwrap_or_default()
     }
 
-    /// The first full-attention cache group of `executor`, whose pages anchor
+    /// The first full-attention cache group of `worker`, whose pages anchor
     /// the sliding windows.
     pub(crate) fn anchor_group(&self, worker: &WorkerGroupId) -> Option<usize> {
         self.workers
@@ -710,7 +710,7 @@ impl KvOffloadManager {
     }
 
     /// The aligned boundaries in `(from, to]` of a prompt of `prompt_len`
-    /// tokens on `executor`, before which its sliding windows are offloaded:
+    /// tokens on `worker`, before which its sliding windows are offloaded:
     /// every multiple of `boundary_interval` pages of the largest block
     /// size, the last boundary a reissue of the prompt can reuse (one prompt
     /// token is always computed), and the last boundary of the prompt's
@@ -736,7 +736,7 @@ impl KvOffloadManager {
             .collect()
     }
 
-    /// The keys of `executor`'s cache groups for the full pages of the first
+    /// The keys of `worker`'s cache groups for the full pages of the first
     /// `tokens` tokens of `prompt`, by group.
     pub(crate) fn page_keys(
         &self,
@@ -762,8 +762,8 @@ impl KvOffloadManager {
     /// `tokens` it does not cover yet, as [`Self::page_keys`] chains a
     /// prompt's pages, so that the pages a request generated carry the keys
     /// of the same pages of its migration's prompt. `keys` holds one chain
-    /// per group of `executor`, each a prefix of the chain over `tokens`; it is
-    /// left as it is for an executor the host KV cache does not serve.
+    /// per group of `worker`, each a prefix of the chain over `tokens`; it is
+    /// left as it is for a worker the host KV cache does not serve.
     pub(crate) fn extend_page_keys(
         &self,
         worker: &WorkerGroupId,
@@ -822,7 +822,7 @@ impl KvOffloadManager {
         }
     }
 
-    /// The host KV cache's answer for admitting `request` to `executor`, whose
+    /// The host KV cache's answer for admitting `request` to `worker`, whose
     /// device cache matched its first `device` tokens and which may reuse at
     /// most `limit`: `None` while pins, lookups or prefetches are in flight,
     /// else the boundary of the hit (at least `device`), which the caller
@@ -1364,10 +1364,10 @@ impl KvOffloadManager {
                 .any(|pins| matches!(pins.stage, Stage::Fetching { .. }))
     }
 
-    /// Offload published pages of `executor`'s cache group `group` to the host
+    /// Offload published pages of `worker`'s cache group `group` to the host
     /// KV cache: `keys[i]` is the key of the page `pages[i]` references. A
     /// slot is reserved for each page in every rank's pool; a reserved page
-    /// waits for a batch of `executor`. A window that a rank's pool cannot
+    /// waits for a batch of `worker`. A window that a rank's pool cannot
     /// reserve whole is not offloaded to it.
     pub(crate) fn offload(
         &mut self,
@@ -1443,7 +1443,7 @@ impl KvOffloadManager {
                 .any(|purpose| matches!(purpose, Purpose::Reserve { .. } | Purpose::Settle))
     }
 
-    /// The executor groups whose reserved page offloads wait for a batch.
+    /// The worker groups whose reserved page offloads wait for a batch.
     pub(crate) fn queued_workers(&self) -> Vec<WorkerGroupId> {
         self.queued
             .iter()
@@ -1452,7 +1452,7 @@ impl KvOffloadManager {
             .collect()
     }
 
-    /// The page offloads queued for `executor`, which the batch `batch`
+    /// The page offloads queued for `worker`, which the batch `batch`
     /// carries.
     pub(crate) fn take_offloads(&mut self, worker: &WorkerGroupId, batch: u64) -> Vec<PageCopy> {
         let Some(offloads) = self.queued.remove(worker) else {
@@ -1503,7 +1503,7 @@ impl KvOffloadManager {
         }
     }
 
-    /// `executor`'s ranks were replaced: the offloads waiting for its batches
+    /// `worker`'s ranks were replaced: the offloads waiting for its batches
     /// and those its batches carried are aborted, the pages of its
     /// evictions waiting for slots released, and its admission pins
     /// released.
@@ -1941,7 +1941,7 @@ mod tests {
         })
     }
 
-    /// An executor of one rank on `server`, which maps a page pool for each of
+    /// A worker of one rank on `server`, which maps a page pool for each of
     /// `contents`, and the pools.
     fn worker_pools(server: &Running, contents: &[u8]) -> (Client, Vec<u64>) {
         let scope = Scope {
@@ -2149,7 +2149,7 @@ mod tests {
         mooncake.join().unwrap();
     }
 
-    /// A hybrid executor's hit ends at the deepest boundary whose sliding
+    /// A hybrid worker's hit ends at the deepest boundary whose sliding
     /// window the host KV cache holds, though its full-attention pages go
     /// further: the full-attention group loads every page before the
     /// boundary, the sliding window only the pages of its window.

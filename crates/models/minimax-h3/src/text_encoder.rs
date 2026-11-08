@@ -71,13 +71,13 @@ const PREFIX: &str = "model.language_model";
 ///
 /// The runner plans a bucket from these numbers: the prompt's rows, the images of the request (one
 /// patch grid each) and the widths this rank holds. [`Plan::bytes`] then states the arena region one
-/// such call reserves, which the executor keeps for as long as a captured graph addresses it.
+/// such call reserves, which the worker keeps for as long as a captured graph addresses it.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Plan {
     /// Rows the call writes: the packed prompt tokens, placeholders included.
     ///
     /// An encoder's output is one row per presented token, so this is the batch's `num_tokens`; the
-    /// layout's `rows` is the capacity an executor reserves and must equal it (the model refuses a
+    /// layout's `rows` is the capacity a worker reserves and must equal it (the model refuses a
     /// padded output, whose rows the batch's offsets do not describe).
     pub rows: u32,
     /// Merged vision rows of all the request's images together.
@@ -150,7 +150,7 @@ impl Plan {
         Self::new(config, partition, tokens, &[])
     }
 
-    /// The plan of the layout an executor prepared.
+    /// The plan of the layout a worker prepared.
     ///
     /// A layout that reserves more output rows than the prompt presents is refused: the batch's
     /// query offsets describe exactly the presented rows, and nothing masks a pad row.
@@ -174,7 +174,7 @@ impl Plan {
         Ok(plan)
     }
 
-    /// The layout this plan describes, as the executor keys its state by.
+    /// The layout this plan describes, as the worker keys its state by.
     pub fn layout(&self) -> EncoderLayout {
         EncoderLayout {
             rows: self.rows,
@@ -382,7 +382,7 @@ impl Buffers {
 
     /// The named plan of exactly the buffers [`Buffers::new`] reserves.
     ///
-    /// Each reservation above has one line here, in the same order, so an executor's name-keyed
+    /// Each reservation above has one line here, in the same order, so a worker's name-keyed
     /// arena and a deployment row read the same object. The sum must equal [`Buffers::bytes`]: that
     /// equality is what makes a name added twice - the class that aliased 8.9 MB with 52,992 B in
     /// the audio plan - or a buffer this list forgot show up as two numbers that disagree instead of
@@ -989,7 +989,7 @@ impl TextEncoder {
     ///
     /// Two tables follow the *prompt* - its M-RoPE positions and the prompt rows its vision rows
     /// land on - so their bytes change with every request; the five vision tables follow the
-    /// *layout* alone, so an executor uploads them once per bucket. A layout with no images needs
+    /// *layout* alone, so a worker uploads them once per bucket. A layout with no images needs
     /// the two prompt tables only.
     fn tables(&self, plan: &Plan, rows: u32) -> Vec<StateTable> {
         table_specs(&self.config, rows, &plan.images, &plan.time, plan.merged)
@@ -1035,7 +1035,7 @@ impl TextEncoder {
         write_state(&self.config, prompt.ids, layout, out)
     }
 
-    /// The encoder as the executor sees it: one block under the deployment's component name.
+    /// The encoder as the worker sees it: one block under the deployment's component name.
     pub fn into_block(self) -> (BlockName, Block) {
         (
             BlockName::new(Component::TextEncoder.name()),
@@ -1385,7 +1385,7 @@ struct Prepared<'a> {
 ///
 /// The arithmetic is the reference's request arithmetic, evaluated in FP32 on the host
 /// (`positions::*`): a captured call reads only the device copies. Nothing here allocates device
-/// memory, synchronizes or reads anything back - `out` holds the executor's host buffers.
+/// memory, synchronizes or reads anything back - `out` holds the worker's host buffers.
 fn write_state(
     config: &TextEncoderConfig,
     ids: &[u32],
@@ -1526,7 +1526,7 @@ fn write_state(
 /// This is the whole of [`Encoder::prepare_state`] without an encoder: the arithmetic depends on the
 /// configuration and the prompt, not on the weights, so the block-by-block diagnosis can compare the
 /// tables against the reference without loading a checkpoint (specs/worker.md 10). Serving does not
-/// call it: the executor owns the buffers there, and `prepare_state` writes into them in place.
+/// call it: the worker owns the buffers there, and `prepare_state` writes into them in place.
 pub fn table_bytes(
     config: &TextEncoderConfig,
     ids: &[u32],
@@ -1565,7 +1565,7 @@ type GridRuns = (Vec<[u32; 3]>, Vec<[u32; 3]>);
 /// The five vision tables' names and shapes for a concatenation of `patches` patch rows over
 /// `time` time steps.
 ///
-/// Total in its arguments: the shapes are arithmetic on the row counts, so an executor can ask for
+/// Total in its arguments: the shapes are arithmetic on the row counts, so a worker can ask for
 /// them before it knows whether the layout can be served.
 fn table_specs(
     config: &TextEncoderConfig,

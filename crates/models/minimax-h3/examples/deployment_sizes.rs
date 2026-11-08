@@ -108,7 +108,7 @@ fn mib(bytes: u64) -> String {
 
 /// Report a plan that names one buffer twice, and remember to fail the run.
 ///
-/// The executor keys the arena's storage by these names, so a repeated name aliases two regions: the
+/// The worker keys the arena's storage by these names, so a repeated name aliases two regions: the
 /// plan stops saying what the block reserves while its arithmetic still adds up, which is a defect
 /// no size a reader checks can find. One plan carried it (`audio.wide`, a patch widening and a head
 /// widening, `f2e1ef10c`), so every plan this example builds is scanned.

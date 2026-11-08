@@ -17,7 +17,7 @@
 //! - **Offload.** A preempted request whose calls completed at step `k`
 //!   (`0 < k <` its schedule) has every page of its trajectory that holds
 //!   its samples reserved in its rank's pool under the page's key; the next
-//!   batch to the denoiser's executor group, one of latent offloads alone,
+//!   batch to the denoiser's worker group, one of latent offloads alone,
 //!   copies the pages of the committed bank into the reserved slots
 //!   (`Batch::latent_offloads`), and its output commits them, or aborts
 //!   them when it failed. A page the pool holds already (the same part of
@@ -29,7 +29,7 @@
 //!   preparation is offered. When every page is pinned, every restoring
 //!   rank lays the stored values out in its own pages through the copy
 //!   manifest from the stored ranks' layouts to its own
-//!   (`executor::storage::latent::restore`), copying a page it lays out as a
+//!   (`worker::storage::latent::restore`), copying a page it lays out as a
 //!   stored rank did whole, and the preparation commits the trajectory at
 //!   the stored step (`Call::latent_restore`); when one is missing, it
 //!   starts from noise, which computes the same trajectory, and the pages
@@ -66,7 +66,7 @@
 //! trajectory records, for every stored rank, its pool, the host the pool
 //! lies on and the rank's pages of the trajectory as its latent
 //! preparation's completion declared them (`CallOutput::latent_layouts`: a
-//! video executor's statement of its slot pages, an image rank's whole
+//! video worker's statement of its slot pages, an image rank's whole
 //! latent rows). The record travels with the request's
 //! facts through the daemon (`Trajectory::stored_layout`), as the stored
 //! steps do; the engine that resumes the request computes the stored pages'
@@ -99,8 +99,8 @@ use storage::manifest::{Storage as PagedStorage, StorageLayout};
 use storage::protocol::{PageSlot, Reply, Request};
 use storage::{Key, Scope};
 
-use crate::executor::WorkerGroupId;
 use crate::host_tier::Servers;
+use crate::worker::WorkerGroupId;
 
 /// The version of [`Record`]: a record of another version names no pages.
 const RECORD_VERSION: u32 = 1;
@@ -329,7 +329,7 @@ enum OffloadStage {
     /// Reservations submitted; each rank's slots once it answered.
     Reserving(Vec<Option<Vec<PageSlot>>>),
     /// Every rank reserved what it does not hold: the copies wait for a
-    /// batch of the denoiser's executor group.
+    /// batch of the denoiser's worker group.
     Queued,
     /// The copies are carried by the submitted batch.
     Carried(u64),
@@ -423,7 +423,7 @@ pub(crate) struct TrajectoryStore {
     servers: Servers<Purpose>,
     /// The engine's host.
     host: String,
-    /// The denoising ranks of each executor group the store serves, in rank
+    /// The denoising ranks of each worker group the store serves, in rank
     /// order.
     workers: HashMap<WorkerGroupId, Vec<RankPool>>,
     /// The latent seed of what the scheduler's denoising computes.
@@ -458,7 +458,7 @@ impl TrajectoryStore {
         self.servers.client(local, endpoint)
     }
 
-    /// Serve `executor`, whose denoising ranks (`ranks`, each with its rank
+    /// Serve `worker`, whose denoising ranks (`ranks`, each with its rank
     /// index in the group) report host latent pools of equal trajectory
     /// pages, when every one's server is reachable. Returns whether the
     /// store serves it.
@@ -496,7 +496,7 @@ impl TrajectoryStore {
             worker = %worker.0,
             ranks = pools.len(),
             trajectory_pages,
-            "the host latent pools serve the executor group"
+            "the host latent pools serve the worker group"
         );
         self.workers.insert(worker.clone(), pools);
         true
@@ -514,17 +514,17 @@ impl TrajectoryStore {
         self.seed
     }
 
-    /// Whether the store serves `executor`.
+    /// Whether the store serves `worker`.
     pub(crate) fn serves(&self, worker: &WorkerGroupId) -> bool {
         self.workers.contains_key(worker)
     }
 
     /// Start storing `request`'s trajectory `trajectory` after `steps` steps
-    /// in the pools of `executor`'s denoising ranks, whose committed bank
+    /// in the pools of `worker`'s denoising ranks, whose committed bank
     /// holds it (`request_key`'s slot) laid out as `layouts` state, each
     /// rank's pages of the trajectory by its rank index
     /// (`CallOutput::latent_layouts`). Returns `false`, starting nothing,
-    /// when the store does not serve `executor` or a rank's layout is missing
+    /// when the store does not serve `worker` or a rank's layout is missing
     /// or malformed; an offload a server could not be asked for fails
     /// ([`Self::offloaded`]) once the others answered.
     pub(crate) fn offload(
@@ -610,7 +610,7 @@ impl TrajectoryStore {
     }
 
     /// The copies of `request`'s offload once every rank reserved its
-    /// pages, for a batch of the denoiser's executor group with id `batch`,
+    /// pages, for a batch of the denoiser's worker group with id `batch`,
     /// which carries them from now on; `None` while the reservations are
     /// answered, or once the copies were taken.
     pub(crate) fn take_offload(
@@ -709,7 +709,7 @@ impl TrajectoryStore {
         self.sweep();
     }
 
-    /// `executor` was lost: the offloads its batches carried did not happen.
+    /// `worker` was lost: the offloads its batches carried did not happen.
     pub(crate) fn worker_failed(&mut self, worker: &WorkerGroupId) {
         let failed: Vec<RequestId> = self
             .offloads
@@ -855,8 +855,8 @@ impl TrajectoryStore {
     /// Pin `request`'s trajectory `trajectory` after `steps` steps, stored
     /// under `state_seed` or the store's own seed where `stored_layout` (the
     /// storing engine's record, `Trajectory::stored_layout`) says, for the
-    /// denoising ranks of `executor` to lay out in their own pages. Returns
-    /// `false`, starting nothing, when the store does not serve `executor`; a
+    /// denoising ranks of `worker` to lay out in their own pages. Returns
+    /// `false`, starting nothing, when the store does not serve `worker`; a
     /// restore whose record names no pages, or whose pages lie where a
     /// restoring rank that needs them cannot read them, resolves as a miss.
     pub(crate) fn restore(

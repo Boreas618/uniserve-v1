@@ -5,10 +5,10 @@
 //! ordering, its state — because the workspace layout is the program's, and dispatches and combines
 //! through it (specs/worker.md 9, "Expert Parallel"; `ops::moe::exchange`).
 //!
-//! A model layer cannot build that transport: it may not create runtime objects, and the executor
+//! A model layer cannot build that transport: it may not create runtime objects, and the worker
 //! is the one that calls the package's creation entry. What travels through [`Forward`] is
 //! therefore only the views the transport wrote and the layer reads, lent by whoever owns them.
-//! The executor builds one [`ExchangeViews`] per device and group after loading the model, and
+//! The worker builds one [`ExchangeViews`] per device and group after loading the model, and
 //! lends it on every forward of a block whose experts are split.
 //!
 //! [`Forward`]: crate::Forward
@@ -28,7 +28,7 @@ pub struct ExchangeViews {
     /// The package's transport for this device and group.
     ///
     /// Opaque: the layer only hands it back to the exchange operator. Its lifetime belongs to the
-    /// executor, which keeps it alive for every forward that borrows it.
+    /// worker, which keeps it alive for every forward that borrows it.
     pub transport: ExchangeTransport,
     /// Ranks in the expert-parallel group; the leading axis of the received layout.
     pub ranks: u32,
@@ -127,7 +127,7 @@ impl ExchangeViews {
 
     /// Check that the views have the extents the exchange laid them out with.
     ///
-    /// The executor builds this value, so a wrong extent is a wiring error; checking it here keeps
+    /// The worker builds this value, so a wrong extent is a wiring error; checking it here keeps
     /// it out of a launch that would read unrelated memory.
     pub fn require_extents(&self, name: &'static str) -> crate::Result<()> {
         let rows = u64::from(self.ranks) * u64::from(self.capacity);
@@ -171,7 +171,7 @@ mod tests {
         ExchangeViews {
             transport: {
                 // SAFETY: the transport is opaque and never dereferenced by these tests; the null
-                // handle only stands in for a value the executor would build.
+                // handle only stands in for a value the worker would build.
                 unsafe { ExchangeTransport::from_handle(core::ptr::null_mut()) }
             },
             ranks,

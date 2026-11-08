@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use engine::{
     CommandSender, GenerationConstraint, GenerationRequest, PolicyBytes, PolicyProgram,
-    PolicySource, SimEngine, SimExecutor,
+    PolicySource, SimEngine, SimWorker,
 };
 use ipc::{ImageParams, SamplingParams};
 use scheduling::guest::Nanos;
@@ -241,7 +241,7 @@ impl World {
         let mut sim = SimEngine::new();
         sim.set_text_len(16);
         let scheduler = support::scheduler(
-            Box::new(SimExecutor::new(sim)),
+            Box::new(SimWorker::new(sim)),
             SimEngine::special_tokens(),
             8,
         )

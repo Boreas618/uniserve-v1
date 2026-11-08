@@ -2320,7 +2320,7 @@ pub(crate) mod tests {
     #[test]
     fn the_position_table_is_one_upload_for_every_canvas() {
         // The tiles are uniform, so the table is the largest tile's however large the canvas is: a
-        // layout costs the executor one upload of the same size whatever its extents. The two canvases
+        // layout costs the worker one upload of the same size whatever its extents. The two canvases
         // here are the served ones - 768p at 768 x 1344 (48 x 84 latents) and 672p at 672 x 1536
         // (42 x 96) - and they are the same table, not two of the same shape by coincidence.
         let config = video_config();
@@ -2338,7 +2338,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_layout_with_the_wrong_number_of_tables_is_refused() {
-        // The executor sizes `out` from `table_specs`, so a count that disagrees with the block is a
+        // The worker sizes `out` from `table_specs`, so a count that disagrees with the block is a
         // protocol error and must surface as one rather than as a partially written table.
         let config = video_config();
         let mut none: Vec<Vec<u8>> = Vec::new();

@@ -13,7 +13,7 @@
 //!
 //! [`TensorView`], [`Shape`], [`Strides`], [`DType`] and [`DevicePtr`] are [`ops`] types: they are
 //! the ABI of an operator's arguments, and `nn` re-exports them rather than defining a second
-//! representation. A [`Weight`] pairs a view with the [`Backing`] the executor's retained storage
+//! representation. A [`Weight`] pairs a view with the [`Backing`] the worker's retained storage
 //! gives it, so a layer's weights are plainly borrowed and plainly retained.
 //!
 //! ## The layers
@@ -34,8 +34,8 @@
 //!
 //! ## The capabilities
 //!
-//! A model hands the executor one [`Block`] per named capability it implements: [`Encoder`],
-//! [`Denoiser`], [`Decoder`] or [`CausalLm`] ([`capability`]). The executor dispatches by the
+//! A model hands the worker one [`Block`] per named capability it implements: [`Encoder`],
+//! [`Denoiser`], [`Decoder`] or [`CausalLm`] ([`capability`]). The worker dispatches by the
 //! capability, never by the concrete model.
 //!
 //! ## Checkpoints and weights

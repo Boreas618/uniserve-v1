@@ -4,7 +4,7 @@
 //! publishes finished media bytes through [`MediaSource`] and reports its
 //! name as an `ArtifactHandle::PosixShm` in the call result. The engine claims
 //! it with [`SharedMedia::open`] when it receives the batch result
-//! (`ExecutorResult::receive`), and the resulting `Arc<SharedMedia>` reaches the
+//! (`WorkerResult::receive`), and the resulting `Arc<SharedMedia>` reaches the
 //! server through the engine's output events. Opening unlinks the name, so a
 //! later open of the same name fails and the kernel frees the storage when the
 //! last reference to it goes away.

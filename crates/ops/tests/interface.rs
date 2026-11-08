@@ -1,5 +1,5 @@
 //! The behaviour of the operator interface that a caller — the engine's loader, a program package's
-//! author, the executor's shadow harness — observes and relies on:
+//! author, the worker's shadow harness — observes and relies on:
 //!
 //! - descriptor keys are canonical text, because they are the last segment of a module's path;
 //! - a cubin's launch metadata is read from Triton's JSON, field for field;
@@ -406,7 +406,7 @@ fn modulation_keys_separate_every_compiled_variant() {
 
 #[test]
 fn an_operator_is_found_by_the_name_its_programs_are_filed_under() {
-    // A program layer's packages name their operators as text; the executor resolves one to the
+    // A program layer's packages name their operators as text; the worker resolves one to the
     // static name a generation is keyed by, and gets nothing when this build has no such operator.
     assert_eq!(
         ops::operator_name("rms_norm"),

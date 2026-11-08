@@ -1,7 +1,7 @@
 //! Scheduler construction shared by the engine's integration tests.
 //!
 //! Serving states a deployment's model limits from the model's description;
-//! these tests have no model, so a simulated executor's limits follow from the
+//! these tests have no model, so a simulated worker's limits follow from the
 //! call kinds it serves.
 
 pub(crate) mod serving;
@@ -51,35 +51,35 @@ pub(crate) fn image_digest(id: u64) -> [u8; 32] {
     digest
 }
 
-use engine::{
-    Executor, Parameters, PolicyProgram, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds,
-};
 use engine::{GenerationFeatures, GenerationLimits, ModelDtype};
+use engine::{
+    Parameters, PolicyProgram, Scheduler, SchedulerConfig, SimEngine, SpecialTokenIds, Worker,
+};
 use ipc::{CallKind, ForwardMode, MediaCall};
 
-/// Builds a scheduler whose model limits follow from `executor`'s call kinds.
+/// Builds a scheduler whose model limits follow from `worker`'s call kinds.
 ///
-/// A token-denoising executor without text decode serves canvas readouts over
+/// A token-denoising worker without text decode serves canvas readouts over
 /// prompts that may carry encoded images; one that prepares latents without
 /// decoding text serves video diffusion, which needs no generation feature.
-/// Any other denoising, vision-encoding or latent-encoding executor serves
+/// Any other denoising, vision-encoding or latent-encoding worker serves
 /// interleaved text and images without bound, and the rest serve text.
 pub(crate) fn scheduler_with(
-    executor: Box<dyn Executor>,
+    worker: Box<dyn Worker>,
     special_tokens: SpecialTokenIds,
     config: SchedulerConfig,
 ) -> anyhow::Result<Scheduler> {
-    scheduler_with_stating(executor, special_tokens, config, Parameters::default())
+    scheduler_with_stating(worker, special_tokens, config, Parameters::default())
 }
 
 /// [`scheduler_with`], installing a policy that also states `stated`.
 pub(crate) fn scheduler_with_stating(
-    executor: Box<dyn Executor>,
+    worker: Box<dyn Worker>,
     special_tokens: SpecialTokenIds,
     config: SchedulerConfig,
     stated: Parameters,
 ) -> anyhow::Result<Scheduler> {
-    let info = executor.info().runtime_info()?;
+    let info = worker.info().runtime_info()?;
     let calls = &info.supported_calls;
     let decodes = calls.contains(&CallKind::Forward(ForwardMode::Decode));
     let limits = if calls.contains(&CallKind::Forward(ForwardMode::TokenDenoising)) && !decodes {
@@ -112,7 +112,7 @@ pub(crate) fn scheduler_with_stating(
         }
     };
     let mut scheduler = Scheduler::new(
-        engine::Submissions::new(executor),
+        engine::Submissions::new(worker),
         special_tokens,
         config,
         ModelDtype::BFloat16,
@@ -206,12 +206,12 @@ pub(crate) fn install_policy_on(handle: &engine::SchedulerHandle, capacity: engi
 
 /// Builds a scheduler that batches at most `max_batch` calls per pass.
 pub(crate) fn scheduler(
-    executor: Box<dyn Executor>,
+    worker: Box<dyn Worker>,
     special_tokens: SpecialTokenIds,
     max_batch: usize,
 ) -> anyhow::Result<Scheduler> {
     scheduler_with(
-        executor,
+        worker,
         special_tokens,
         SchedulerConfig {
             max_batch,
@@ -223,12 +223,12 @@ pub(crate) fn scheduler(
 /// Builds a scheduler that batches at most `max_batch` calls per pass and
 /// orders waiting requests by `policy`.
 pub(crate) fn scheduler_with_depth(
-    executor: Box<dyn Executor>,
+    worker: Box<dyn Worker>,
     special_tokens: SpecialTokenIds,
     max_batch: usize,
 ) -> anyhow::Result<Scheduler> {
     scheduler_with(
-        executor,
+        worker,
         special_tokens,
         SchedulerConfig {
             max_batch,

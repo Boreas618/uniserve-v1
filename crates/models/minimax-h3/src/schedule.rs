@@ -32,8 +32,8 @@
 //! ## What this module is not
 //!
 //! It is host arithmetic: it holds no tensor and reaches no operator. The latents a step advances
-//! belong to the executor, which is why the crate also publishes [`Schedule::steps`] - the
-//! executor has to be told which evaluations to schedule, and `nn::Denoiser` has no way to ask
+//! belong to the worker, which is why the crate also publishes [`Schedule::steps`] - the
+//! worker has to be told which evaluations to schedule, and `nn::Denoiser` has no way to ask
 //! (`TO exec`).
 
 use nn::Step;
@@ -174,7 +174,7 @@ impl Schedule {
         Ok((scales && sigma != 1.0).then_some(sigma))
     }
 
-    /// The steps of one modality, as the executor schedules them: evaluation `i` runs from
+    /// The steps of one modality, as the worker schedules them: evaluation `i` runs from
     /// `sigma[i]` to `sigma[i + 1]`.
     pub fn steps(&self, modality: Modality) -> Result<Vec<Step>> {
         let sigmas = self.sigmas(modality);

@@ -9,7 +9,7 @@ publish = false
 anyhow.workspace = true
 base64.workspace = true
 crossbeam-channel.workspace = true
-executor.workspace = true
+worker.workspace = true
 fnv.workspace = true
 ipc.workspace = true
 nn.workspace = true
@@ -32,7 +32,7 @@ tracing.workspace = true
 uuid.workspace = true
 
 [features]
-# Exposes the GPU-free simulated executor to control-plane tests and examples.
+# Exposes the GPU-free simulated worker to control-plane tests and examples.
 # It is never part of a serving build.
 testing = ["dep:png", "dep:tempfile", "dep:wat"]
 

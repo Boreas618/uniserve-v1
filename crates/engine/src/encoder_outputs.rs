@@ -48,8 +48,8 @@ use storage::key::Digest;
 use storage::protocol::{PageSlot, Reply, Request};
 use storage::{Key, Scope};
 
-use crate::executor::WorkerGroupId;
 use crate::host_tier::Servers;
+use crate::worker::WorkerGroupId;
 
 /// One encoder output of a request: its name (the product an encoder
 /// writes) and its ordinal among the request's outputs of that name. A video
@@ -77,7 +77,7 @@ impl Access {
     };
 }
 
-/// The encoder pool an executor group's ranks share.
+/// The encoder pool a worker group's ranks share.
 #[derive(Clone)]
 struct GroupPool {
     worker: WorkerGroupId,
@@ -172,7 +172,7 @@ enum Purpose {
 /// The scheduler's side of the host encoder pools.
 pub(crate) struct EncoderStore {
     servers: Servers<Purpose>,
-    /// The pool of each executor group the store serves.
+    /// The pool of each worker group the store serves.
     workers: HashMap<WorkerGroupId, GroupPool>,
     /// Each admission's outputs.
     requests: HashMap<RequestKey, HashMap<OutputId, Output>>,
@@ -181,7 +181,7 @@ pub(crate) struct EncoderStore {
     /// The outputs whose lookups ended while calls of theirs were in flight
     /// (their admission left, or the scheduler no longer needs them), which
     /// may still read or write their pages: they end once the calls
-    /// completed, or once their executor group was lost.
+    /// completed, or once their worker group was lost.
     left: HashMap<(RequestKey, OutputId), Output>,
 }
 
@@ -202,7 +202,7 @@ impl EncoderStore {
         })
     }
 
-    /// Serve `executor`, whose ranks executing encoder calls (`ranks`, each
+    /// Serve `worker`, whose ranks executing encoder calls (`ranks`, each
     /// with its rank index in the group) report their host's encoder pool,
     /// when they all report the same one and its server is reachable: the
     /// group's calls read and write the same pages on every rank. An output
@@ -250,7 +250,7 @@ impl EncoderStore {
             worker = %worker.0,
             pool = first.pool.pool,
             outputs = identities.len(),
-            "the host encoder pool serves the executor group"
+            "the host encoder pool serves the worker group"
         );
         self.workers.insert(
             worker.clone(),
@@ -270,7 +270,7 @@ impl EncoderStore {
         true
     }
 
-    /// Whether `executor`'s pool stores outputs named `name`: the store serves
+    /// Whether `worker`'s pool stores outputs named `name`: the store serves
     /// the group and its ranks agree on what computes them.
     pub(crate) fn serves(&self, worker: &WorkerGroupId, name: &str) -> bool {
         self.workers
@@ -278,7 +278,7 @@ impl EncoderStore {
             .is_some_and(|pool| pool.identities.contains_key(name))
     }
 
-    /// Look up `output` of admission `request`, which `executor` computes from
+    /// Look up `output` of admission `request`, which `worker` computes from
     /// what `inputs` digests: at most `rows` rows of `row_bytes` bytes, as
     /// `access` allows. Returns whether the lookup started; without one the
     /// output's calls compute it.
@@ -550,7 +550,7 @@ impl EncoderStore {
         }
     }
 
-    /// `executor`'s ranks were lost, and with them the calls of theirs in
+    /// `worker`'s ranks were lost, and with them the calls of theirs in
     /// flight: the outputs whose lookups ended end now, and those of
     /// admissions still running count no call in flight, so they end when
     /// their admission leaves.

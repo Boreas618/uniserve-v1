@@ -15,7 +15,7 @@ use engine::{
     BatchEvent, CachePolicy, CommandSender, EncoderInputs, Event, EventRx, ExecutionBatch,
     FeedbackImage, FeedbackNextToken, FeedbackSource, GeneratedImage, GenerationConstraint,
     GenerationRequest, ImageEncoder, ImageEncoderInput, ImageGenerationConfig, ImageInput,
-    ImageTrigger, MultimodalInputs, Request, SchedulerConfig, SimEngine, SimExecutor,
+    ImageTrigger, MultimodalInputs, Request, SchedulerConfig, SimEngine, SimWorker,
 };
 use ipc::{
     CallKind, EncoderPoolInfo, ImageEncoderOutput, ImageParams, MediaCall, RequestId,
@@ -30,7 +30,7 @@ use crate::support::video::{video_request, video_worker};
 /// prompt's conditioning in one page.
 const PAGE_BYTES: u64 = 4096;
 
-/// A scheduler of a simulated executor whose rank maps a host encoder pool of
+/// A scheduler of a simulated worker whose rank maps a host encoder pool of
 /// a Storage Server, with its loop running: one world of a deployment.
 struct Encoders {
     handle: CommandSender,
@@ -59,7 +59,7 @@ impl Encoders {
                 endpoint: None,
             })),
         )]);
-        let mut inner = SimExecutor::new(sim);
+        let mut inner = SimWorker::new(sim);
         let boundary = inner.observe();
         let mut scheduler = support::scheduler_with(
             Box::new(inner),

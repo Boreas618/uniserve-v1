@@ -40,7 +40,7 @@ pub struct ForwardStats {
     pub stream_us: BTreeMap<String, u64>,
     /// Driver calls that made a serving thread of the rank wait for the
     /// device, keyed `{thread}/{call}` (`builder`, `control`). A serving
-    /// call of the executor that made one failed.
+    /// call of the worker that made one failed.
     pub blocking_calls: BTreeMap<String, u64>,
     /// Per-step durations from the fence probes, keyed `{stage}/{component}`:
     /// a step's summed durations of the component's probed instances, or

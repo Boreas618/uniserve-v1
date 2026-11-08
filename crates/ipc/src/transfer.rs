@@ -155,7 +155,7 @@ impl TensorTransfer {
     /// Partial rank reports are valid descriptors, so completeness is a separate question.
     ///
     /// Returns false for a descriptor that fails [`Self::validate`], including
-    /// one without locations. The engine's worker executor calls this after
+    /// one without locations. The engine's worker worker calls this after
     /// dropping the locators of lost ranks to decide which buffers are lost.
     pub fn has_complete_coverage(&self) -> bool {
         if self.validate().is_err() {

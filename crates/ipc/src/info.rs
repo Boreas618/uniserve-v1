@@ -6,9 +6,9 @@
 //! it with (world, devices, transfer mechanisms, queue depth and component
 //! layout), so the report does not echo those back. The engine requires
 //! every rank of a group to describe the group alike and a replacement rank to
-//! report an identical description apart from its endpoint; the executor then
+//! report an identical description apart from its endpoint; the worker then
 //! derives the capacity view the scheduler plans against from the
-//! descriptions of all workers (`ExecutorInfo::runtime_info`).
+//! descriptions of all workers (`WorkerInfo::runtime_info`).
 
 use super::*;
 
@@ -828,7 +828,7 @@ impl MainProcessInfo {
         // Here every named call must be one it advertises, with a non-empty
         // component name. The video graph may span workers, a model worker
         // decoding and a host worker encoding and muxing, so its completeness
-        // and its diffusion step count are the executor's checks over every
+        // and its diffusion step count are the worker's checks over every
         // worker.
         ensure_valid!(
             self.media_components.iter().all(|(call, component)| {

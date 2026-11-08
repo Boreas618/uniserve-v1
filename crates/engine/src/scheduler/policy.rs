@@ -164,7 +164,7 @@ fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T
 }
 
 /// The build config's hard bounds on what one step may be given to run (§4.4):
-/// the calls and tokens the epoch's executors were started for.
+/// the calls and tokens the epoch's workers were started for.
 ///
 /// These are the ceilings a policy's `limits()` is checked against, so they
 /// come from the build config — the captured graph tiers' call bound and token
@@ -172,14 +172,14 @@ fn argument<T: serde::de::DeserializeOwned>(value: &str, name: &str) -> Result<T
 /// vacuous.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BatchCapacity {
-    /// Calls one step may carry, from the executors' batch call bound.
+    /// Calls one step may carry, from the workers' batch call bound.
     pub max_batch: u32,
-    /// Tokens one step may carry, from the executors' batch token bound.
+    /// Tokens one step may carry, from the workers' batch token bound.
     pub max_num_batched_tokens: u32,
 }
 
 impl BatchCapacity {
-    /// The capacity the loaded executors were started for.
+    /// The capacity the loaded workers were started for.
     pub fn of(info: &ipc::MainProcessInfo) -> Self {
         Self {
             max_batch: info.max_batch_calls,

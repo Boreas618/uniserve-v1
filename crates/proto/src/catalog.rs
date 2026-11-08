@@ -23,7 +23,7 @@ pub struct Tiers {
 /// says nothing about how many requests a decode step may hold. `tokens` is the
 /// largest of either list, because a decode bucket's token cost is its rows.
 /// Both are `None` when the deployment states no catalog, in which case the
-/// executor's own catalog bounds the batch and there is no stated figure to
+/// worker's own catalog bounds the batch and there is no stated figure to
 /// hold a policy's limits against.
 #[must_use]
 pub fn largest_tier(decode_batch_sizes: &[u32], prefill_token_sizes: &[u32]) -> Tiers {

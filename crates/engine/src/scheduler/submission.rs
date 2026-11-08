@@ -4,10 +4,10 @@
 //! it does not know what runs the batch (design §2.4). This module is the door:
 //! every path of the mechanism that executes something comes through it.
 //!
-//! A serving scheduler's door is `executor::Batches` (2.4, 4.4): the mechanism's
-//! own completion type is filled from `executor::batch::BatchOutput` there, and
-//! nothing of the wire is involved. A test supplies a simulated executor through
-//! the `Executor` trait instead; that arm is built only with the `testing`
+//! A serving scheduler's door is `worker::Batches` (2.4, 4.4): the mechanism's
+//! own completion type is filled from `worker::batch::BatchOutput` there, and
+//! nothing of the wire is involved. A test supplies a simulated worker through
+//! the `Worker` trait instead; that arm is built only with the `testing`
 //! feature, so a serving build holds the first alone.
 
 use std::collections::{BTreeMap, HashMap};
@@ -15,16 +15,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::WorkerGroupId;
-use crate::executor::ExecutionBatch;
-#[cfg(feature = "testing")]
-use crate::executor::Executor;
-use crate::executor::{ExecutorError, ExecutorInfo, ExecutorSubmitError};
 use crate::scheduler::completion::BatchReport;
-use executor::batch::{
+use crate::worker::ExecutionBatch;
+#[cfg(feature = "testing")]
+use crate::worker::Worker;
+use crate::worker::{WorkerError, WorkerInfo, WorkerSubmitError};
+use ipc::BatchCommand;
+use worker::batch::{
     Batch as DeviceBatch, BatchId as DeviceBatchId, Batches, CallId as DeviceCallId, Submission,
 };
-use executor::completion::Outcome;
-use ipc::BatchCommand;
+use worker::completion::Outcome;
 
 /// What dispatch and the views ask of the world: the pools it serves, and
 /// which of them can take a submission now.
@@ -32,11 +32,11 @@ use ipc::BatchCommand;
 /// The step places calls on every path — a planned call, a media call, a
 /// request's first call, a prefill target — and none of that submits anything.
 /// Stating it as this trait is what lets one dispatch serve the in-process
-/// executor and a simulated one: what differs between them is who answers, not
+/// worker and a simulated one: what differs between them is who answers, not
 /// what the step asks.
 pub(super) trait World {
     /// The pools, their ranks and their capabilities.
-    fn info(&self) -> &ExecutorInfo;
+    fn info(&self) -> &WorkerInfo;
 
     /// Whether `worker` has an unclaimed submission slot.
     fn has_capacity(&self, worker: &WorkerGroupId) -> bool;
@@ -49,24 +49,24 @@ const REPORT_POLL: std::time::Duration = std::time::Duration::from_micros(50);
 ///
 /// Public because a scheduler is built with one: `Scheduler::new` takes a
 /// `Submissions`, made with `over_batches` over a process's own devices, or
-/// with `new` over a simulated executor.
+/// with `new` over a simulated worker.
 pub struct Submissions {
     path: Path,
 }
 
-/// Which executor serves this scheduler's batches.
+/// Which worker serves this scheduler's batches.
 enum Path {
-    /// An executor a test supplies.
+    /// A worker a test supplies.
     #[cfg(feature = "testing")]
-    Supplied(Box<dyn Executor>),
-    /// The device executor of this process (2.4). Boxed: the arm holds the
+    Supplied(Box<dyn Worker>),
+    /// The device worker of this process (2.4). Boxed: the arm holds the
     /// batch path, the waiting thread's two channels and the shadows.
     InProcess(Box<InProcess>),
 }
 
-/// The mechanism over `executor::Batches`: this process's own devices.
+/// The mechanism over `worker::Batches`: this process's own devices.
 ///
-/// A batch is converted to the executor's own description of it — the shape it
+/// A batch is converted to the worker's own description of it — the shape it
 /// pads to, the host columns the kernels read, the generation whose kernels
 /// serve it — and submitted. The completion comes back on a waiting thread, as
 /// the mechanism's own type: the scheduler thread must never block on a
@@ -74,13 +74,13 @@ enum Path {
 /// not a device has answered.
 struct InProcess {
     batches: Arc<dyn Batches>,
-    info: ExecutorInfo,
+    info: WorkerInfo,
     /// The kernels this step's batches serve on. The scheduler reads its
     /// generation cell once per step and stamps every batch of that step, so a
     /// switchover mid-step cannot split one step across two worlds.
     generation: u64,
     /// Completed reports, in the order the devices finished them.
-    ready: crossbeam_channel::Receiver<Result<BatchReport, ExecutorError>>,
+    ready: crossbeam_channel::Receiver<Result<BatchReport, WorkerError>>,
     /// The sending end of `nudged`, which `Submissions::waker` hands out.
     nudge: crossbeam_channel::Sender<()>,
     /// Ends a park that no result would end (`Submissions::waker`).
@@ -125,7 +125,7 @@ struct Pending {
     batch: u64,
     submission: Submission,
     /// Index for index with the batch's calls: the mechanism's name for the
-    /// call the executor numbers by its index.
+    /// call the worker numbers by its index.
     calls: Vec<(ipc::RequestKey, ipc::CallId)>,
 }
 
@@ -133,30 +133,30 @@ struct Pending {
     not(feature = "testing"),
     allow(
         unused_variables,
-        reason = "the arms that read them are a supplied executor's"
+        reason = "the arms that read them are a supplied worker's"
     )
 )]
 impl Submissions {
-    /// The mechanism over an executor a test supplies.
+    /// The mechanism over a worker a test supplies.
     #[cfg(feature = "testing")]
-    pub fn new(executor: Box<dyn Executor>) -> Self {
+    pub fn new(worker: Box<dyn Worker>) -> Self {
         Self {
-            path: Path::Supplied(executor),
+            path: Path::Supplied(worker),
         }
     }
 
     /// The mechanism over this process's own devices (2.4).
     ///
-    /// The pools come from the executor's own inventory and nowhere else: an
-    /// executor that states no pool is refused here rather than served with a
-    /// guessed one, for the same reason `ExecutorInfo::from_inventory` refuses
+    /// The pools come from the worker's own inventory and nowhere else: an
+    /// worker that states no pool is refused here rather than served with a
+    /// guessed one, for the same reason `WorkerInfo::from_inventory` refuses
     /// a pool that states no rank or no longest sequence — a mechanism that
     /// assumes a rank's cache makes the host KV path disappear at runtime.
     pub fn over_batches(batches: Arc<dyn Batches>) -> anyhow::Result<Submissions> {
-        let info = ExecutorInfo::from_inventory(batches.inventory())?;
+        let info = WorkerInfo::from_inventory(batches.inventory())?;
         anyhow::ensure!(
             !info.workers.is_empty(),
-            "the in-process executor states no pool to schedule against"
+            "the in-process worker states no pool to schedule against"
         );
         // A batch carries the columns the kernels read, and every KV view is
         // shaped to the longest sequence the deployment was built for: without
@@ -165,7 +165,7 @@ impl Submissions {
         // (design §4.3's layout, §4.4's hard limits).
         anyhow::ensure!(
             info.max_model_len > 0,
-            "the in-process executor states no longest sequence; a policy cannot be shaped to a \
+            "the in-process worker states no longest sequence; a policy cannot be shaped to a \
              KV view without one"
         );
         let (queue, pending) = crossbeam_channel::unbounded::<Pending>();
@@ -258,41 +258,41 @@ impl Submissions {
         }
     }
 
-    /// The pool's capabilities: its executors, components, pools, and limits.
-    pub(super) fn info(&self) -> &ExecutorInfo {
+    /// The pool's capabilities: its workers, components, pools, and limits.
+    pub(super) fn info(&self) -> &WorkerInfo {
         match &self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.info(),
+            Path::Supplied(worker) => worker.info(),
             Path::InProcess(arm) => &arm.info,
         }
     }
 
-    /// Whether every rank of the pool `worker` is ready to accept execution.
-    pub(super) fn is_ready(&self, worker: &WorkerGroupId) -> bool {
+    /// Whether every rank of the pool `group` is ready to accept execution.
+    pub(super) fn is_ready(&self, group: &WorkerGroupId) -> bool {
         match &self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.is_ready(worker),
+            Path::Supplied(worker) => worker.is_ready(group),
             // The arm serves the pools its inventory states and no others.
-            Path::InProcess(arm) => arm.info.workers.iter().any(|(id, _)| id == worker),
+            Path::InProcess(arm) => arm.info.workers.iter().any(|(id, _)| id == group),
         }
     }
 
-    /// Whether `worker` executes nothing further.
-    pub(super) fn is_closed(&self, worker: &WorkerGroupId) -> bool {
+    /// Whether the pool `group` executes nothing further.
+    pub(super) fn is_closed(&self, group: &WorkerGroupId) -> bool {
         match &self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.is_closed(worker),
+            Path::Supplied(worker) => worker.is_closed(group),
             // A device of this process is closed when the process ends.
             Path::InProcess(_) => false,
         }
     }
 
-    /// Whether `worker` has an unclaimed destination submission slot.
-    pub(super) fn has_capacity(&self, worker: &WorkerGroupId) -> bool {
+    /// Whether the pool `group` has an unclaimed destination submission slot.
+    pub(super) fn has_capacity(&self, group: &WorkerGroupId) -> bool {
         match &self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.has_capacity(worker),
-            Path::InProcess(arm) => arm.has_room(worker),
+            Path::Supplied(worker) => worker.has_capacity(group),
+            Path::InProcess(arm) => arm.has_room(group),
         }
     }
 
@@ -300,34 +300,34 @@ impl Submissions {
     pub(super) fn command_has_capacity(&self, command: &BatchCommand) -> bool {
         match &self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.command_has_capacity(command),
+            Path::Supplied(worker) => worker.command_has_capacity(command),
             // A lifecycle command travels inside the batch it belongs to.
             Path::InProcess(_) => true,
         }
     }
 
     /// Submits one logical batch without blocking for capacity.
-    pub(super) fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+    pub(super) fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.submit(batch),
+            Path::Supplied(worker) => worker.submit(batch),
             Path::InProcess(arm) => arm.submit(batch),
         }
     }
 
-    /// The bucket this executor would serve `computation` in, when it serves one (2.4).
+    /// The bucket this worker would serve `computation` in, when it serves one (2.4).
     ///
     /// The mechanism asks before it forms a media batch, because the batch states the extent its
-    /// kernels were captured for and only the executor's own plan knows it: a bucket planned for
+    /// kernels were captured for and only the worker's own plan knows it: a bucket planned for
     /// one canvas serves no other, and deriving the extent in the mechanism would be a second
     /// statement of the runner's plan. `None` is the answer for a computation no device of this
-    /// rank serves, and for a supplied executor, which serves media without the mechanism's own
+    /// rank serves, and for a supplied worker, which serves media without the mechanism's own
     /// batch assembly.
     pub(super) fn media(
         &self,
         phase: ipc::PhaseId,
-        computation: &executor::plan::Computation,
-    ) -> Option<executor::plan::Bucket> {
+        computation: &worker::plan::Computation,
+    ) -> Option<worker::plan::Bucket> {
         match &self.path {
             #[cfg(feature = "testing")]
             Path::Supplied(_) => None,
@@ -337,7 +337,7 @@ impl Submissions {
 
     /// Whether this door serves the devices of this process.
     ///
-    /// Only those shadow a batch: a scheduler over a supplied executor refuses
+    /// Only those shadow a batch: a scheduler over a supplied worker refuses
     /// the update's ask at command time rather than accepting one nothing will
     /// run (7.3 step 2).
     pub(super) fn serves_in_process(&self) -> bool {
@@ -356,11 +356,11 @@ impl Submissions {
         &mut self,
         batch: ExecutionBatch,
         generation: u64,
-    ) -> Result<(), ExecutorSubmitError> {
+    ) -> Result<(), WorkerSubmitError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(_) => Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
-                "a supplied executor shadows nothing: only this process's devices do"
+            Path::Supplied(_) => Err(WorkerSubmitError::Failed(anyhow::anyhow!(
+                "a supplied worker shadows nothing: only this process's devices do"
             ))),
             Path::InProcess(arm) => arm.shadow(batch, generation),
         }
@@ -368,7 +368,7 @@ impl Submissions {
 
     /// The state of the shadow submissions of the pass in flight (7.3 step 2).
     ///
-    /// A supplied executor submits no shadow batch, so a pass waiting on that
+    /// A supplied worker submits no shadow batch, so a pass waiting on that
     /// arm cannot exist: `shadow` refuses it at submission, and the pass is
     /// answered with that refusal.
     pub(super) fn shadow_status(&mut self) -> ShadowStatus {
@@ -381,19 +381,19 @@ impl Submissions {
 
     /// Waits up to `timeout` for one partial or terminal batch result, in the
     /// mechanism's own completion type.
-    pub(super) fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, ExecutorError> {
+    pub(super) fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => Ok(executor.poll(timeout)?.map(BatchReport::from_wire)),
+            Path::Supplied(worker) => Ok(worker.poll(timeout)?.map(BatchReport::from_wire)),
             Path::InProcess(arm) => arm.poll(timeout),
         }
     }
 
     /// Closes the pool.
-    pub(super) fn close(&mut self) -> Result<(), ExecutorError> {
+    pub(super) fn close(&mut self) -> Result<(), WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.close(),
+            Path::Supplied(worker) => worker.close(),
             // The devices of this process are its own: nothing outlives the call.
             Path::InProcess(_) => Ok(()),
         }
@@ -403,7 +403,7 @@ impl Submissions {
     pub(super) fn storage_nodes(&self) -> BTreeMap<String, String> {
         match &self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.storage_nodes(),
+            Path::Supplied(worker) => worker.storage_nodes(),
             // This process's devices hold no deployment storage of their own;
             // the engine's host KV path is served by the storage server it
             // reaches itself.
@@ -416,11 +416,11 @@ impl Submissions {
     pub(super) fn map_host_cache(
         &mut self,
         tokens: u64,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
+    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.map_host_cache(tokens),
-            // The ranks of this process map their pools through the executor that owns their
+            Path::Supplied(worker) => worker.map_host_cache(tokens),
+            // The ranks of this process map their pools through the worker that owns their
             // caches: its device threads issue the copies.
             Path::InProcess(in_process) => {
                 let mapped = in_process
@@ -444,30 +444,30 @@ impl Submissions {
 
     /// Commits the pool's world: it takes the predecessor world's storage it
     /// mapped read-only.
-    pub(super) fn commit(&mut self) -> Result<Vec<String>, ExecutorError> {
+    pub(super) fn commit(&mut self) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.commit(),
-            // The world this process serves is the executor's own, committed
+            Path::Supplied(worker) => worker.commit(),
+            // The world this process serves is the worker's own, committed
             // when it was spawned.
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
 
     /// Publishes this world's immutable pages after its commit decision.
-    pub(super) fn publish_world(&mut self) -> Result<(), ExecutorError> {
+    pub(super) fn publish_world(&mut self) -> Result<(), WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.publish_world(),
+            Path::Supplied(worker) => worker.publish_world(),
             Path::InProcess(_) => Ok(()),
         }
     }
 
     /// Ends the storage of every world of `worlds` on the pool's nodes.
-    pub(super) fn retire(&mut self, worlds: &[u64]) -> Result<(), ExecutorError> {
+    pub(super) fn retire(&mut self, worlds: &[u64]) -> Result<(), WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.retire(worlds),
+            Path::Supplied(worker) => worker.retire(worlds),
             Path::InProcess(_) => Ok(()),
         }
     }
@@ -478,37 +478,37 @@ impl Submissions {
         worlds: &[u64],
         to_host: bool,
         cache_keys: &[Vec<u8>],
-    ) -> Result<Vec<String>, ExecutorError> {
+    ) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.keep_weights(worlds, to_host, cache_keys),
+            Path::Supplied(worker) => worker.keep_weights(worlds, to_host, cache_keys),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
 
     /// Halves, or restores when not `halve`, the deployment's link budgets.
-    pub(super) fn throttle(&mut self, halve: bool) -> Result<Vec<String>, ExecutorError> {
+    pub(super) fn throttle(&mut self, halve: bool) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.throttle(halve),
+            Path::Supplied(worker) => worker.throttle(halve),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
 
     /// The storage ledgers of the pool's nodes.
-    pub(super) fn ledgers(&mut self) -> Result<Vec<String>, ExecutorError> {
+    pub(super) fn ledgers(&mut self) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.ledgers(),
+            Path::Supplied(worker) => worker.ledgers(),
             Path::InProcess(_) => Ok(Vec::new()),
         }
     }
 
-    /// Runs the executor hook `name` on every rank while none runs a batch.
-    pub(super) fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, ExecutorError> {
+    /// Runs the worker hook `name` on every rank while none runs a batch.
+    pub(super) fn hook(&mut self, name: &str, payload: &str) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.hook(name, payload),
+            Path::Supplied(worker) => worker.hook(name, payload),
             Path::InProcess(arm) => arm
                 .batches
                 .hook(name, payload)
@@ -516,16 +516,16 @@ impl Submissions {
         }
     }
 
-    /// Runs the executor hook `name`, answering each group with its ranks'
+    /// Runs the worker hook `name`, answering each group with its ranks'
     /// results.
     pub(super) fn hook_groups(
         &mut self,
         name: &str,
         payload: &str,
-    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, ExecutorError> {
+    ) -> Result<Vec<(WorkerGroupId, Vec<String>)>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.hook_groups(name, payload),
+            Path::Supplied(worker) => worker.hook_groups(name, payload),
             // This process's ranks are the one pool its inventory states, and its data plane
             // answers for them in rank order.
             Path::InProcess(arm) => {
@@ -549,10 +549,10 @@ impl Submissions {
     pub(super) fn commit_experts(
         &mut self,
         order: &BTreeMap<String, Vec<u32>>,
-    ) -> Result<Vec<String>, ExecutorError> {
+    ) -> Result<Vec<String>, WorkerError> {
         match &mut self.path {
             #[cfg(feature = "testing")]
-            Path::Supplied(executor) => executor.commit_experts(order),
+            Path::Supplied(worker) => worker.commit_experts(order),
             Path::InProcess(arm) => arm
                 .batches
                 .commit_experts(order)
@@ -562,7 +562,7 @@ impl Submissions {
 }
 
 impl World for Submissions {
-    fn info(&self) -> &ExecutorInfo {
+    fn info(&self) -> &WorkerInfo {
         Submissions::info(self)
     }
 
@@ -637,7 +637,7 @@ impl InProcess {
         pools
     }
 
-    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+    fn submit(&mut self, batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
         // Pages that wait while nothing runs ride no forward: they are a batch of their own, which
         // the mechanism reads the end of as it reads any other.
         if batch.requests.is_empty()
@@ -649,7 +649,7 @@ impl InProcess {
             let submission = self
                 .batches
                 .copy_pages(offloads.pages.clone())
-                .map_err(|error| ExecutorSubmitError::Failed(anyhow::anyhow!(error)))?;
+                .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
             return self
                 .queue
                 .send(Pending {
@@ -658,20 +658,20 @@ impl InProcess {
                     calls: Vec::new(),
                 })
                 .map_err(|error| {
-                    ExecutorSubmitError::Failed(anyhow::anyhow!(
+                    WorkerSubmitError::Failed(anyhow::anyhow!(
                         "the in-process waiting thread has gone: {error}"
                     ))
                 });
         }
         let pools = Self::pools(&batch);
         if !pools.iter().all(|pool| self.has_room(pool)) {
-            return Err(ExecutorSubmitError::WouldBlock(Box::new(batch)));
+            return Err(WorkerSubmitError::WouldBlock(Box::new(batch)));
         }
-        let (device, calls) = self.describe(&batch).map_err(ExecutorSubmitError::Failed)?;
+        let (device, calls) = self.describe(&batch).map_err(WorkerSubmitError::Failed)?;
         let submission = self
             .batches
             .submit(device)
-            .map_err(|error| ExecutorSubmitError::Failed(anyhow::anyhow!(error)))?;
+            .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
         for pool in &pools {
             *self.occupied.entry(pool.clone()).or_default() += 1;
         }
@@ -683,7 +683,7 @@ impl InProcess {
                 calls,
             })
             .map_err(|error| {
-                ExecutorSubmitError::Failed(anyhow::anyhow!(
+                WorkerSubmitError::Failed(anyhow::anyhow!(
                     "the in-process waiting thread has gone: {error}"
                 ))
             })
@@ -701,21 +701,17 @@ impl InProcess {
         }
     }
 
-    fn shadow(
-        &mut self,
-        batch: ExecutionBatch,
-        generation: u64,
-    ) -> Result<(), ExecutorSubmitError> {
+    fn shadow(&mut self, batch: ExecutionBatch, generation: u64) -> Result<(), WorkerSubmitError> {
         // A shadow batch reports nothing of its own: the passes are the world
         // update's paired forwards, compared by each operator's tolerance on the
         // generation they name.
         let (device, _) = self
             .describe_with(&batch, generation)
-            .map_err(ExecutorSubmitError::Failed)?;
+            .map_err(WorkerSubmitError::Failed)?;
         let submission = self
             .batches
             .shadow(device)
-            .map_err(|error| ExecutorSubmitError::Failed(anyhow::anyhow!(error)))?;
+            .map_err(|error| WorkerSubmitError::Failed(anyhow::anyhow!(error)))?;
         self.shadows.push(submission);
         self.shadows
             .retain(|submission| submission.outcome().is_none());
@@ -725,8 +721,8 @@ impl InProcess {
     /// A report the waiting thread collected, with its batch's slots given back.
     fn received(
         &mut self,
-        report: Result<BatchReport, ExecutorError>,
-    ) -> Result<Option<BatchReport>, ExecutorError> {
+        report: Result<BatchReport, WorkerError>,
+    ) -> Result<Option<BatchReport>, WorkerError> {
         match report {
             Ok(report) => {
                 self.resolved(&report);
@@ -742,7 +738,7 @@ impl InProcess {
         }
     }
 
-    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, ExecutorError> {
+    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchReport>, WorkerError> {
         let gone = || {
             anyhow::anyhow!("the in-process waiting thread has gone while batches were outstanding")
         };
@@ -765,21 +761,21 @@ impl InProcess {
         }
     }
 
-    /// The batch as the executor reads it, with the mechanism's names for its
+    /// The batch as the worker reads it, with the mechanism's names for its
     /// calls.
     ///
     /// The refusals are the mechanism's, stated here because this is where the
-    /// batch crosses into the executor's layout: a batch the mechanism could
+    /// batch crosses into the worker's layout: a batch the mechanism could
     /// not state the columns of, a batch of media or denoise calls (2.4 serves
     /// no media in process yet), and a batch whose call kinds name no device
     /// phase are refused rather than served on invented values. The shape is
     /// the assembly's, not this seam's (`batching::columns::batch_shape`), and
     /// it is checked against the columns before the batch leaves.
     ///
-    /// The batch's lifecycle commands do not travel: `executor::Batch` has no
+    /// The batch's lifecycle commands do not travel: `worker::Batch` has no
     /// field for them, because the resources such a command retires —
     /// a request's row, its buffers, its pages — belong to this process's
-    /// executor once it holds the columns. A batch that completes reports no
+    /// worker once it holds the columns. A batch that completes reports no
     /// command as failed, which the mechanism reads as its commands having
     /// been applied.
     fn describe(
@@ -789,7 +785,7 @@ impl InProcess {
         self.describe_with(batch, self.generation)
     }
 
-    /// The batch as the executor reads it, on generation `generation`.
+    /// The batch as the worker reads it, on generation `generation`.
     ///
     /// The serving path stamps the generation the step read; a shadow batch
     /// names the world whose kernels it compares against, which is another.
@@ -850,7 +846,7 @@ impl InProcess {
                 id: DeviceBatchId(batch.id),
                 phase,
                 calls: (0..calls.len() as u64).map(DeviceCallId).collect(),
-                shape: executor::plan::Shape {
+                shape: worker::plan::Shape {
                     rows: computation.rows,
                     tokens: computation.tokens,
                     variant,
@@ -933,7 +929,7 @@ impl InProcess {
                 .iter()
                 .flat_map(|(_, dispatch)| dispatch.new_cache_units.iter().cloned())
                 .collect(),
-            // Every call's tables, flattened: the executor installs these into the cache's pooled
+            // Every call's tables, flattened: the worker installs these into the cache's pooled
             // table before the replay, because the gather reads row `slot` of that table and a row
             // nobody wrote gathers another request's pages.
             block_tables: batch
@@ -961,9 +957,9 @@ impl InProcess {
     }
 }
 
-/// The phase id the device executor addresses a batch by (2.4, 4.4).
+/// The phase id the device worker addresses a batch by (2.4, 4.4).
 ///
-/// The mechanism names phases with `scheduling`'s ids and the executor with
+/// The mechanism names phases with `scheduling`'s ids and the worker with
 /// `ipc`'s; both are the same fixed vocabulary in the same order, and this is
 /// the one place the two meet, so neither type grows a second numbering.
 pub(super) fn wire_phase(kind: ipc::CallKind) -> Option<ipc::PhaseId> {
@@ -977,12 +973,12 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
-    use executor::batch::SubmissionId;
-    use executor::batch::{BatchOutput, Inventory, MediaColumns, PoolLayout, StagedRequest};
-    use executor::plan::{Bucket, Computation, Extent, Variant};
     use ipc::{Call, CallKind, MediaCall};
+    use worker::batch::SubmissionId;
+    use worker::batch::{BatchOutput, Inventory, MediaColumns, PoolLayout, StagedRequest};
+    use worker::plan::{Bucket, Computation, Extent, Variant};
 
-    /// What one in-process submission carried to the executor.
+    /// What one in-process submission carried to the worker.
     #[derive(Clone, Debug)]
     struct Delivered {
         phase: ipc::PhaseId,
@@ -990,7 +986,7 @@ mod tests {
         media: Option<MediaColumns>,
     }
 
-    /// The executor's own devices, as a double: it states one pool, answers the bucket its plan
+    /// The worker's own devices, as a double: it states one pool, answers the bucket its plan
     /// would serve, and records every batch the mechanism hands it.
     struct Devices {
         inventory: Vec<Inventory>,
@@ -1022,7 +1018,7 @@ mod tests {
     }
 
     impl Batches for Devices {
-        fn submit(&self, batch: DeviceBatch) -> executor::Result<Submission> {
+        fn submit(&self, batch: DeviceBatch) -> worker::Result<Submission> {
             self.delivered
                 .lock()
                 .expect("the recorder is not poisoned")
@@ -1037,7 +1033,7 @@ mod tests {
             ))
         }
 
-        fn shadow(&self, batch: DeviceBatch) -> executor::Result<Submission> {
+        fn shadow(&self, batch: DeviceBatch) -> worker::Result<Submission> {
             self.submit(batch)
         }
 
@@ -1045,7 +1041,7 @@ mod tests {
             &self,
             _phase: ipc::PhaseId,
             _computation: &Computation,
-        ) -> executor::Result<Option<Bucket>> {
+        ) -> worker::Result<Option<Bucket>> {
             Ok(self.bucket)
         }
 
@@ -1091,12 +1087,12 @@ mod tests {
     }
 
     /// One call as the plan hands it to the mechanism.
-    fn call(kind: CallKind, request_id: u64) -> (Call, crate::executor::RequestDispatch) {
+    fn call(kind: CallKind, request_id: u64) -> (Call, crate::worker::RequestDispatch) {
         let key = ipc::RequestKey::new(1, ipc::RequestId(request_id), 0);
         let call = Call::new(key, ipc::CallId::new(0, 0), kind);
         (
             call,
-            crate::executor::RequestDispatch {
+            crate::worker::RequestDispatch {
                 worker: WorkerGroupId("gpu".to_owned()),
                 request_pool_idx: None,
                 block_tables: Vec::new(),
@@ -1112,7 +1108,7 @@ mod tests {
     }
 
     /// A media batch as `batching::attach_media` stamps it: the computation the plan selected,
-    /// with the extent the executor answered.
+    /// with the extent the worker answered.
     fn media_batch(id: u64, call_kind: MediaCall, rows: u32) -> ExecutionBatch {
         let computation = Computation {
             call: call_kind,
@@ -1138,7 +1134,7 @@ mod tests {
         wire_phase(kind).expect("every call kind has a phase")
     }
 
-    /// A media batch reaches the executor at the phase its call names, with the generation the
+    /// A media batch reaches the worker at the phase its call names, with the generation the
     /// step read and the computation its kernels were captured for.
     ///
     /// The phase is checked against what the call kind states and against the token path's own
@@ -1191,7 +1187,7 @@ mod tests {
         assert_eq!(media.computation.rows, 1);
         assert!(
             matches!(media.computation.extent, Extent::Latents(_)),
-            "the extent is the bucket's, which is what the executor answered: {:?}",
+            "the extent is the bucket's, which is what the worker answered: {:?}",
             media.computation.extent
         );
     }
@@ -1215,7 +1211,7 @@ mod tests {
         assert!(!submissions.has_capacity(&pool), "the depth is taken");
         let refused = submissions.submit(media_batch(3, MediaCall::Denoising, 1));
         assert!(
-            matches!(refused, Err(ExecutorSubmitError::WouldBlock(_))),
+            matches!(refused, Err(WorkerSubmitError::WouldBlock(_))),
             "a batch past the depth waits for a slot"
         );
         assert_eq!(
@@ -1283,7 +1279,7 @@ mod tests {
                 .lock()
                 .expect("the recorder is not poisoned")
                 .is_empty(),
-            "nothing reaches the executor"
+            "nothing reaches the worker"
         );
     }
 
@@ -1295,7 +1291,7 @@ mod tests {
         let mut submissions = Submissions::over_batches(devices).expect("an in-process mechanism");
 
         let mut both = media_batch(6, MediaCall::Denoising, 1);
-        both.columns = Some(executor::batch::BatchColumns::default());
+        both.columns = Some(worker::batch::BatchColumns::default());
         let refusal = format!(
             "{}",
             submissions
@@ -1331,7 +1327,7 @@ mod tests {
         assert_eq!(
             variant.variant(),
             Some(Variant::Denoise),
-            "a denoise computation is the variant the executor plans"
+            "a denoise computation is the variant the worker plans"
         );
     }
 }

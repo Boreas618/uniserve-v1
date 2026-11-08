@@ -45,7 +45,7 @@ use crate::tensor::{DType, Shape, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-/// The columns of one row of sampling parameters, in the order the executor writes them.
+/// The columns of one row of sampling parameters, in the order the worker writes them.
 ///
 /// The offsets are fixed by `uniserve/sampling/top_k.py` (`PARAMETER_COLUMNS`, with the temperature
 /// first, the repetition, frequency and presence penalties at 4, 5 and 6, and the top-k width, the

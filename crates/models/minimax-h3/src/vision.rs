@@ -283,7 +283,7 @@ pub struct Buffers {
 impl Buffers {
     /// Reserve the block's buffers in `arena` for a grid of `patches` patches.
     ///
-    /// The reservations happen in one fixed order, so the plan an executor makes for a captured
+    /// The reservations happen in one fixed order, so the plan a worker makes for a captured
     /// bucket is the plan every replay follows.
     pub fn new(
         arena: &Arena,
@@ -343,7 +343,7 @@ impl Buffers {
     /// The bytes [`Buffers::new`] reserves for a grid of `patches` patches.
     ///
     /// The reservations are made against a region of exactly that size, so the number is the one
-    /// the executor plans a captured bucket with and cannot drift from the reservations.
+    /// the worker plans a captured bucket with and cannot drift from the reservations.
     pub fn bytes(config: &VisionConfig, patches: u32, dtype: nn::DType) -> Result<u64> {
         let arena = Arena::new(DevicePtr::new(0), u64::MAX);
         Self::new(&arena, config, patches, dtype)?;
@@ -352,7 +352,7 @@ impl Buffers {
 
     /// The named plan of exactly the buffers [`Self::new`] reserves for one image.
     ///
-    /// One line per reservation, in the same order, so a deployment row and an executor's name-keyed
+    /// One line per reservation, in the same order, so a deployment row and a worker's name-keyed
     /// arena read the same object. The caller prefixes each name with the image's index: the tower
     /// runs once per image, in prompt order, so these are `images.len()` sets and never one set
     /// multiplied by anything.

@@ -1,7 +1,7 @@
 //! Media occupancy scheduling and call graphs of video requests over the
 //! GPU-free simulator.
 //!
-//! The observation point is the executor boundary: the batches the simulator
+//! The observation point is the worker boundary: the batches the simulator
 //! accepts and the moment it hands each result back. The simulator delivers a
 //! result only when the scheduler waits for one, so every batch stays in
 //! flight until the scheduler blocks for a completion, and the record of
@@ -21,16 +21,16 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 
 use engine::{
-    BatchEvent, BatchResult, CommandSender, ExecutionBatch, Executor, ExecutorError, ExecutorInfo,
-    ExecutorSubmitError, PoolLayout, RequestDispatch, SchedulerConfig, SimEngine, SimExecutor,
-    WorkerGroupId,
+    BatchEvent, BatchResult, CommandSender, ExecutionBatch, PoolLayout, RequestDispatch,
+    SchedulerConfig, SimEngine, SimWorker, Worker, WorkerError, WorkerGroupId, WorkerInfo,
+    WorkerSubmitError,
 };
 use engine::{ConditionExtent, DiffusionRequest, Event, FinishReason, RejectionKind, Request};
 use ipc::{BufferId, Call, CallKind, DimBound, MediaCall};
 use ipc::{DiffusionSamplingParams, RequestId};
 use models::video::Canvas;
 
-/// One media call as the executor received it.
+/// One media call as the worker received it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ObservedCall {
     request: RequestId,
@@ -45,7 +45,7 @@ impl ObservedCall {
         self.request == request && self.call == call
     }
 
-    /// Whether the call runs on a rank's bounded host executor.
+    /// Whether the call runs on a rank's bounded host worker.
     fn is_host_task(&self) -> bool {
         matches!(
             self.call,
@@ -63,7 +63,7 @@ impl ObservedCall {
     }
 }
 
-/// One submission as the executor accepted it, with the calls of earlier
+/// One submission as the worker accepted it, with the calls of earlier
 /// submissions that were still in flight at that moment.
 #[derive(Debug, Clone)]
 struct Submission {
@@ -79,12 +79,12 @@ impl Submission {
     }
 }
 
-/// The record of one served workload: what the executor saw and what each
+/// The record of one served workload: what the worker saw and what each
 /// request's stream delivered.
 struct Served {
-    /// Media submissions in the order the executor accepted them.
+    /// Media submissions in the order the worker accepted them.
     submissions: Vec<Submission>,
-    /// Each submitted media call with the executor its dispatch names for
+    /// Each submitted media call with the worker its dispatch names for
     /// every component reading its products, in submission order.
     readers: Vec<(RequestId, MediaCall, BTreeMap<String, WorkerGroupId>)>,
     /// Every submitted media call with its dispatch, in submission order.
@@ -142,10 +142,9 @@ impl Served {
 /// output journal until the consumer drains the channel.
 #[test]
 fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
-    let mut executor = SimExecutor::new(video_worker(1, 1));
-    let boundary = executor.observe();
-    let scheduler =
-        support::scheduler(Box::new(executor), SimEngine::special_tokens(), 32).unwrap();
+    let mut worker = SimWorker::new(video_worker(1, 1));
+    let boundary = worker.observe();
+    let scheduler = support::scheduler(Box::new(worker), SimEngine::special_tokens(), 32).unwrap();
     let (tx, commands) = crossbeam_channel::unbounded();
     let handle = CommandSender::new(tx);
     let mut stream = handle
@@ -173,7 +172,7 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     // Let the entire workload finish while the caller retains an unread stream.
     // `Scheduler::finish_media` enqueues the terminal event on the request's
     // output before it queues the request's `Finish` lifecycle command, so a
-    // submitted `Finish` at the executor boundary shows the request has ended.
+    // submitted `Finish` at the worker boundary shows the request has ended.
     // A stalled workload instead exhausts the deadline and fails
     // `recv_timeout`.
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -250,21 +249,21 @@ fn serve_bounded(
     requests: Vec<Request>,
     max_queued_requests: Option<usize>,
 ) -> Served {
-    let mut executor = SimExecutor::new(sim);
-    let boundary = executor.observe();
-    serve_through(Box::new(executor), boundary, requests, max_queued_requests)
+    let mut worker = SimWorker::new(sim);
+    let boundary = worker.observe();
+    serve_through(Box::new(worker), boundary, requests, max_queued_requests)
 }
 
-/// Serves the requests through `executor`, whose accepted batches and
+/// Serves the requests through `worker`, whose accepted batches and
 /// resolved results `boundary` reports.
 fn serve_through(
-    executor: Box<dyn Executor>,
+    worker: Box<dyn Worker>,
     boundary: Receiver<BatchEvent>,
     requests: Vec<Request>,
     max_queued_requests: Option<usize>,
 ) -> Served {
     let scheduler = support::scheduler_with(
-        executor,
+        worker,
         SimEngine::special_tokens(),
         SchedulerConfig {
             max_batch: 32,
@@ -317,7 +316,7 @@ fn serve_through(
         "every request reaches a terminal event: {outcomes:?}"
     );
 
-    // The executor is gone with the scheduler, so the record is complete.
+    // The worker is gone with the scheduler, so the record is complete.
     // Replaying it attaches to each media submission the calls of earlier
     // media submissions not yet resolved when it was accepted; batches without
     // media calls are left out of the record.
@@ -365,7 +364,7 @@ fn serve_through(
 }
 
 /// Admission routes every component of a video request, so each call names
-/// the executor the request was routed to for every component that reads its
+/// the worker the request was routed to for every component that reads its
 /// products, and nothing for a call whose products no component reads.
 #[test]
 fn each_media_call_names_the_workers_routed_to_read_its_products() {
@@ -519,7 +518,7 @@ fn a_host_task_pool_admits_no_more_tasks_than_its_worker_advertises() {
         );
         served.assert_completed(request);
 
-        // Every host task of this executor lands on rank 0's host task pool,
+        // Every host task of this worker lands on rank 0's host task pool,
         // whose occupancy never exceeds the advertised capacity. With one rank
         // and one media unit, each host call places exactly one task, so
         // counting calls counts the pool's tasks.
@@ -736,7 +735,7 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
         "the vision tokens precede the text encoding"
     );
     // The text encoding is submitted once its vision features exist, so it
-    // never waits in its executor's queue ahead of other calls.
+    // never waits in its worker's queue ahead of other calls.
     let (text_submission, text_batch) = served.submissions_of(request, MediaCall::TextEncoding)[0];
     assert!(
         !text_batch
@@ -989,7 +988,7 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
     }
 }
 
-/// The simulator's components served from two executor pools: the condition
+/// The simulator's components served from two worker pools: the condition
 /// encoders on one, and the denoiser, decoders and muxer on the other, as a
 /// deployment that places its encoders apart from its denoiser serves them.
 ///
@@ -997,13 +996,13 @@ fn decoded_media_units_are_reserved_at_each_request_canvas() {
 /// pool without a free slot hands a batch back, as the encoder pool does
 /// once, for the first batch carrying the `hand_back` call. A call is
 /// accepted only after the call producing each of its inputs has been, since
-/// the executor learns where a product is published when its producer is
+/// the worker learns where a product is published when its producer is
 /// submitted; a batch reading any other product fails. Accepted batches run
 /// on the one simulator.
-struct PooledExecutor {
-    inner: SimExecutor,
-    info: ExecutorInfo,
-    /// The executor the simulator itself reports.
+struct PooledWorker {
+    inner: SimWorker,
+    info: WorkerInfo,
+    /// The worker the simulator itself reports.
     simulator: WorkerGroupId,
     /// The media call whose first batch is handed back, until it has been.
     hand_back: Option<MediaCall>,
@@ -1012,12 +1011,12 @@ struct PooledExecutor {
     published: HashSet<BufferId>,
 }
 
-impl PooledExecutor {
+impl PooledWorker {
     /// Splits the simulator's components into the two pools. Returns the
-    /// executor, its submission record and whether it has handed back the
+    /// worker, its submission record and whether it has handed back the
     /// `hand_back` batch.
     fn new(sim: SimEngine, hand_back: MediaCall) -> (Self, Receiver<BatchEvent>, Arc<AtomicBool>) {
-        let mut inner = SimExecutor::new(sim);
+        let mut inner = SimWorker::new(sim);
         let boundary = inner.observe();
         let (simulator, worker) = inner.info().workers[0].clone();
         let launched = inner.info().layouts[&simulator].clone();
@@ -1063,7 +1062,7 @@ impl PooledExecutor {
                 ]),
             ),
         ];
-        let mut info = ExecutorInfo::from_workers(
+        let mut info = WorkerInfo::from_workers(
             pools
                 .iter()
                 .map(|(id, (worker, _))| (id.clone(), worker.clone()))
@@ -1076,7 +1075,7 @@ impl PooledExecutor {
             .collect();
 
         let handed_back = Arc::new(AtomicBool::new(false));
-        let executor = Self {
+        let worker = Self {
             inner,
             info,
             simulator,
@@ -1084,12 +1083,12 @@ impl PooledExecutor {
             handed_back: Arc::clone(&handed_back),
             published: HashSet::new(),
         };
-        (executor, boundary, handed_back)
+        (worker, boundary, handed_back)
     }
 }
 
-impl Executor for PooledExecutor {
-    fn info(&self) -> &ExecutorInfo {
+impl Worker for PooledWorker {
+    fn info(&self) -> &WorkerInfo {
         &self.info
     }
 
@@ -1105,7 +1104,7 @@ impl Executor for PooledExecutor {
         self.inner.command_has_capacity(command)
     }
 
-    fn submit(&mut self, mut batch: ExecutionBatch) -> Result<(), ExecutorSubmitError> {
+    fn submit(&mut self, mut batch: ExecutionBatch) -> Result<(), WorkerSubmitError> {
         let hands_back = self.hand_back.is_some_and(|media_call| {
             batch
                 .requests
@@ -1115,7 +1114,7 @@ impl Executor for PooledExecutor {
         if hands_back {
             self.hand_back = None;
             self.handed_back.store(true, Ordering::SeqCst);
-            return Err(ExecutorSubmitError::WouldBlock(Box::new(batch)));
+            return Err(WorkerSubmitError::WouldBlock(Box::new(batch)));
         }
 
         // Every input is a product of an accepted call or supplied with the
@@ -1131,7 +1130,7 @@ impl Executor for PooledExecutor {
                         .iter()
                         .any(|export| export.source == input);
                 if !supplied && !self.published.contains(&input) {
-                    return Err(ExecutorSubmitError::Failed(anyhow::anyhow!(
+                    return Err(WorkerSubmitError::Failed(anyhow::anyhow!(
                         "input {input:?} of {:?} has no registered producer",
                         call.kind
                     )));
@@ -1156,21 +1155,21 @@ impl Executor for PooledExecutor {
                 self.published.extend(products);
                 Ok(())
             }
-            Err(ExecutorSubmitError::WouldBlock(mut batch)) => {
+            Err(WorkerSubmitError::WouldBlock(mut batch)) => {
                 for ((_, dispatch), pool) in batch.requests.iter_mut().zip(pools) {
                     dispatch.worker = pool;
                 }
-                Err(ExecutorSubmitError::WouldBlock(batch))
+                Err(WorkerSubmitError::WouldBlock(batch))
             }
             Err(error) => Err(error),
         }
     }
 
-    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, ExecutorError> {
+    fn poll(&mut self, timeout: Duration) -> Result<Option<BatchResult>, WorkerError> {
         self.inner.poll(timeout)
     }
 
-    fn close(&mut self) -> Result<(), ExecutorError> {
+    fn close(&mut self) -> Result<(), WorkerError> {
         self.inner.close()
     }
 }
@@ -1184,14 +1183,9 @@ impl Executor for PooledExecutor {
 #[test]
 fn a_call_reading_a_held_back_product_waits_for_its_producer_on_another_pool() {
     let request = RequestId(5);
-    let (executor, boundary, handed_back) =
-        PooledExecutor::new(video_worker(2, 2), MediaCall::LatentEncoding);
-    let served = serve_through(
-        Box::new(executor),
-        boundary,
-        vec![reference_request(5)],
-        None,
-    );
+    let (worker, boundary, handed_back) =
+        PooledWorker::new(video_worker(2, 2), MediaCall::LatentEncoding);
+    let served = serve_through(Box::new(worker), boundary, vec![reference_request(5)], None);
 
     served.assert_completed(request);
     assert!(
@@ -1204,7 +1198,7 @@ fn a_call_reading_a_held_back_product_waits_for_its_producer_on_another_pool() {
     assert!(latents.iter().all(|index| *index < preparation[0]));
 }
 
-/// A video executor's ranks each back only the results of the components they
+/// A video worker's ranks each back only the results of the components they
 /// execute and of the components that read them, and the engine places
 /// buffers in each rank's own pool: a rank that holds fewer results packs
 /// them from its own offset zero rather than at the offsets another rank's
