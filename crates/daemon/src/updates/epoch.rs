@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use serde_json::{Value, json};
 
-use crate::epoch::{Deployment, EpochRecord, Epochs, Layer, Status, Update, layer};
+use crate::epoch::{Epoch, EpochRecord, Epochs, Layer, Status, Update, layer};
 use crate::leader::UpdateError;
 use crate::options::ServerArgs;
 use crate::updates::change::Applied;
@@ -76,8 +76,8 @@ pub(crate) struct EpochChange {
 /// `running` must be empty: one change runs at a time (`UpdateError::
 /// InProgress` says another is under way).
 pub(crate) fn epoch_arm(
-    previous: &Deployment,
-    target: &Deployment,
+    previous: &Epoch,
+    target: &Epoch,
     change: EpochChange,
     epochs: &Arc<Epochs>,
     roster: &mut impl Roster,
@@ -140,8 +140,8 @@ pub(crate) fn epoch_arm(
 /// The serving record must exist: an epoch the daemon cannot describe cannot
 /// be drained or resumed, and naming it afresh would invent a generation.
 fn record(
-    previous: &Deployment,
-    target: &Deployment,
+    previous: &Epoch,
+    target: &Epoch,
     previous_epoch: u64,
     epochs: &Epochs,
 ) -> Result<EpochRecord, UpdateError> {
@@ -296,22 +296,21 @@ mod tests {
         }
     }
 
-    fn previous() -> Deployment {
-        Deployment::of(ServerArgs::default()).expect("the configuration resolves")
+    fn previous() -> Epoch {
+        Epoch::of(ServerArgs::default()).expect("the configuration resolves")
     }
 
     /// The same deployment at another executable: a change of the build
     /// config, so the epoch layer's.
-    fn epoch_target(base: &Deployment) -> Deployment {
+    fn epoch_target(base: &Epoch) -> Epoch {
         let mut config = base.config.clone();
         config.worker_config.executable = PathBuf::from("/opt/other-uniserve");
-        Deployment::with_programs(config, base.programs.clone())
-            .expect("the configuration resolves")
+        Epoch::with_programs(config, base.programs.clone()).expect("the configuration resolves")
     }
 
     /// The same deployment with one program revision changed: the program
     /// layer's, not the epoch's.
-    fn program_target(base: &Deployment) -> Deployment {
+    fn program_target(base: &Epoch) -> Epoch {
         let mut target = base.clone();
         let mut policy: Program = target.programs.policy.clone();
         policy.revision += 1;
@@ -322,7 +321,7 @@ mod tests {
         target
     }
 
-    fn serving_record(deployment: &Deployment) -> EpochRecord {
+    fn serving_record(deployment: &Epoch) -> EpochRecord {
         EpochRecord {
             config: deployment.engine.clone(),
             kernels: deployment.programs.kernels.clone(),
@@ -406,7 +405,7 @@ mod tests {
 
         let mut logged = previous.config.clone();
         logged.logging_config.log_requests = true;
-        let host = Deployment::with_programs(logged, previous.programs.clone())
+        let host = Epoch::with_programs(logged, previous.programs.clone())
             .expect("the configuration resolves");
         let mut running = None;
         let mut roster = Fake::default();

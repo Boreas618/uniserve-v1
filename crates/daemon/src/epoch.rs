@@ -220,7 +220,7 @@ pub struct Update {
     /// The update's number, from the daemon's sequence of operations.
     pub number: u64,
     /// What the update moves the deployment to.
-    pub target: Deployment,
+    pub target: Epoch,
     /// Where the update is.
     pub state: UpdateState,
     /// The first failure reported while the update ran.
@@ -323,7 +323,7 @@ impl Failure {
 impl Update {
     /// The update `number` that moves a deployment to `target`; its
     /// probation has not ended.
-    pub fn new(number: u64, target: Deployment) -> Self {
+    pub fn new(number: u64, target: Epoch) -> Self {
         Self {
             number,
             target,
@@ -532,7 +532,7 @@ impl Epochs {
     /// about the change and not about how it was asked for. The build is what
     /// a reverted epoch update was, whose programs most often did not change,
     /// so another build is another change.
-    pub fn unavailable(&self, target: &Deployment) -> Option<Failure> {
+    pub fn unavailable(&self, target: &Epoch) -> Option<Failure> {
         let update = locked(&self.update);
         let update = update.as_ref()?;
         let failure = update.unavailable()?;
@@ -635,7 +635,7 @@ impl Epochs {
     /// main processes answered, not with what the configuration asked for.
     ///
     /// Answers the epoch's number.
-    pub fn install(&self, epoch: u64, deployment: &Deployment, generations: &[u64]) -> u64 {
+    pub fn install(&self, epoch: u64, deployment: &Epoch, generations: &[u64]) -> u64 {
         self.record(
             epoch,
             EpochRecord {
@@ -729,12 +729,10 @@ impl Epochs {
     ) -> Result<(), Failure> {
         let record = programs.clone();
         let deployment =
-            Deployment::with_programs(config.clone(), programs.clone()).map_err(|error| {
-                Failure {
-                    kind: "invalid_config".to_owned(),
-                    reason: format!("{error:#}"),
-                    device: None,
-                }
+            Epoch::with_programs(config.clone(), programs.clone()).map_err(|error| Failure {
+                kind: "invalid_config".to_owned(),
+                reason: format!("{error:#}"),
+                device: None,
             })?;
         let process = crate::engine::control::EpochProcess {
             host: host.to_owned(),
@@ -1416,7 +1414,7 @@ pub enum Layer {
 /// the build config it builds a main process from, and the programs it
 /// fills.
 #[derive(Debug, Clone, PartialEq)]
-pub struct Deployment {
+pub struct Epoch {
     /// The configuration.
     pub config: ServerArgs,
     /// What it builds the epoch's engines from, resolved once from `config`.
@@ -1427,7 +1425,7 @@ pub struct Deployment {
     pub programs: FilledPrograms,
 }
 
-impl Deployment {
+impl Epoch {
     /// The deployment `config` describes, with the programs it fills and
     /// without the revisions `prepare` selects.
     ///
@@ -1459,7 +1457,7 @@ impl Deployment {
 /// differ, the epoch layer when the build config differs, the program layer
 /// when only the filled programs differ, and nothing otherwise. Nothing
 /// about a change is declared by the change itself.
-pub fn layer(previous: &Deployment, next: &Deployment) -> Layer {
+pub fn layer(previous: &Epoch, next: &Epoch) -> Layer {
     if host_layer_differ(&previous.config, &next.config) {
         Layer::Host
     } else if previous.engine.build_hash() != next.engine.build_hash() {
@@ -1569,13 +1567,13 @@ mod tests {
     /// the model's files that fell to the program layer would answer an update that moved nothing.
     #[test]
     fn a_change_of_the_models_files_is_an_epoch_change() {
-        let serving = Deployment::of(ServerArgs::default()).expect("the configuration resolves");
+        let serving = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
         let mut other = ServerArgs::default();
         other.model = Some("/models/other".to_owned());
         assert_eq!(
             layer(
                 &serving,
-                &Deployment::of(other).expect("the configuration resolves")
+                &Epoch::of(other).expect("the configuration resolves")
             ),
             Layer::Epoch
         );
@@ -1593,7 +1591,7 @@ mod tests {
             main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
+        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
         epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
@@ -1671,7 +1669,7 @@ mod tests {
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
+        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
         epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
@@ -1743,7 +1741,7 @@ mod tests {
         let (commands, _seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
+        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
         epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
@@ -1808,7 +1806,7 @@ mod tests {
         let (commands, seen) = main_processes(vec![(7, Answer::Serves(11))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
+        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
         epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
@@ -1854,7 +1852,7 @@ mod tests {
         let (commands, _) = main_processes(vec![(7, Answer::Serves(11)), (8, Answer::Serves(12))]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
+        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
         epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
 
@@ -1895,7 +1893,7 @@ mod tests {
         assert!(epochs.program_update().is_none());
         let mut another_checkpoint = target.config.clone();
         another_checkpoint.model = Some("another checkpoint".to_owned());
-        let another_build = Deployment::with_programs(another_checkpoint, target.programs.clone())
+        let another_build = Epoch::with_programs(another_checkpoint, target.programs.clone())
             .expect("the configuration resolves");
         assert!(
             epochs.unavailable(&another_build).is_none(),
@@ -1921,7 +1919,7 @@ mod tests {
         )]);
         let epochs = Epochs::new();
         let config = ServerArgs::default();
-        let serving = Deployment::of(config.clone()).expect("the configuration resolves");
+        let serving = Epoch::of(config.clone()).expect("the configuration resolves");
         epochs.install(3, &serving, &[10]);
         epochs.supervise(commands);
         assert!(!epochs.commit_programs().expect("nothing to commit"));
@@ -2205,11 +2203,11 @@ mod tests {
             ),
         ];
 
-        let base = Deployment::of(ServerArgs::default()).expect("the configuration resolves");
+        let base = Epoch::of(ServerArgs::default()).expect("the configuration resolves");
         assert_eq!(layer(&base, &base), Layer::None, "no change");
 
         for (what, change) in host_frontend.iter().chain(host_daemon.iter()) {
-            let next = Deployment::of(set(*change)).expect("the configuration resolves");
+            let next = Epoch::of(set(*change)).expect("the configuration resolves");
             assert_eq!(
                 layer(&base, &next),
                 Layer::Host,
@@ -2217,7 +2215,7 @@ mod tests {
             );
         }
         for (what, change) in &epoch {
-            let next = Deployment::of(set(*change)).expect("the configuration resolves");
+            let next = Epoch::of(set(*change)).expect("the configuration resolves");
             assert_eq!(
                 layer(&base, &next),
                 Layer::Epoch,
@@ -2225,7 +2223,7 @@ mod tests {
             );
         }
         for (what, change) in &program {
-            let next = Deployment::of(set(*change)).expect("the configuration resolves");
+            let next = Epoch::of(set(*change)).expect("the configuration resolves");
             assert_eq!(
                 layer(&base, &next),
                 Layer::Program,
@@ -2245,7 +2243,7 @@ mod tests {
         assert_eq!(
             layer(
                 &base,
-                &Deployment::of(exchange_only.clone()).expect("the configuration resolves")
+                &Epoch::of(exchange_only.clone()).expect("the configuration resolves")
             ),
             Layer::None,
             "at one rank the exchange setting moves nothing"
@@ -2256,8 +2254,8 @@ mod tests {
         spread_exchanged.moe_config.exchange = proto::request::ExpertExchange::DeepEp;
         assert_eq!(
             layer(
-                &Deployment::of(spread).expect("the configuration resolves"),
-                &Deployment::of(spread_exchanged).expect("the configuration resolves")
+                &Epoch::of(spread).expect("the configuration resolves"),
+                &Epoch::of(spread_exchanged).expect("the configuration resolves")
             ),
             Layer::Program,
             "in an expert-parallel deployment the exchange moves the programs"
@@ -2466,7 +2464,7 @@ mod tests {
     fn an_update_keeps_the_first_failure_and_is_unavailable_with_it() {
         let mut update = Update::new(
             1,
-            Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+            Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
         );
         update.commit();
         assert_eq!(
@@ -2477,7 +2475,7 @@ mod tests {
 
         let mut update = Update::new(
             2,
-            Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+            Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
         );
         let first = Failure {
             kind: "illegal_address".to_owned(),

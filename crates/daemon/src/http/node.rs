@@ -47,7 +47,7 @@ enum Serving {
     /// A deployment is starting.
     Starting(String),
     /// A deployment serves through its routes.
-    Deployment(String, Router),
+    Epoch(String, Router),
     /// A deployment is being brought down.
     Stopping(String),
 }
@@ -145,7 +145,7 @@ struct DeployBody {
 /// configuration and empty slots.
 async fn idle_config(State(node): State<Arc<Node>>) -> Response {
     let routes = match &*locked(&node.serving) {
-        Serving::Deployment(_, routes) => Some(routes.clone()),
+        Serving::Epoch(_, routes) => Some(routes.clone()),
         _ => None,
     };
     if let Some(routes) = routes {
@@ -175,7 +175,7 @@ async fn idle_config(State(node): State<Arc<Node>>) -> Response {
 /// the request to the deployment's own admin API.
 async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
     let routes = match &*locked(&node.serving) {
-        Serving::Deployment(_, routes) => Some(routes.clone()),
+        Serving::Epoch(_, routes) => Some(routes.clone()),
         _ => None,
     };
     if let Some(routes) = routes {
@@ -311,7 +311,7 @@ async fn serve_deployment(
             admin,
             None,
         );
-        *locked(&node.serving) = Serving::Deployment(name.clone(), routes);
+        *locked(&node.serving) = Serving::Epoch(name.clone(), routes);
         info!(deployment = name, "the node serves the deployment");
         token.cancelled().await;
 
@@ -357,7 +357,7 @@ async fn node_status(State(node): State<Arc<Node>>) -> Json<serde_json::Value> {
     let (state, deployment) = match &*locked(&node.serving) {
         Serving::Idle => ("idle", None),
         Serving::Starting(name) => ("starting", Some(name.clone())),
-        Serving::Deployment(name, _) => ("serving", Some(name.clone())),
+        Serving::Epoch(name, _) => ("serving", Some(name.clone())),
         Serving::Stopping(name) => ("stopping", Some(name.clone())),
     };
     Json(json!({
@@ -371,7 +371,7 @@ async fn node_status(State(node): State<Arc<Node>>) -> Json<serde_json::Value> {
 /// serves.
 async fn dispatch(State(node): State<Arc<Node>>, request: Request) -> Response {
     let routes = match &*locked(&node.serving) {
-        Serving::Deployment(_, routes) => Some(routes.clone()),
+        Serving::Epoch(_, routes) => Some(routes.clone()),
         _ => None,
     };
     match routes {

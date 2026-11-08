@@ -735,8 +735,8 @@ async fn program_update(
     // Server at all: only `None` and `Program` reach the prepare below, the
     // first because a prepared program reveals what the config alone cannot.
     let (Ok(previous), Ok(next)) = (
-        crate::epoch::Deployment::of(current.clone()),
-        crate::epoch::Deployment::of(target.clone()),
+        crate::epoch::Epoch::of(current.clone()),
+        crate::epoch::Epoch::of(target.clone()),
     ) else {
         // The configuration does not resolve; the epoch path refuses it with the reason.
         return Ok(None);

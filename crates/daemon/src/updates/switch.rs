@@ -1347,7 +1347,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::epoch::{Deployment, Program, UpdateState};
+    use crate::epoch::{Epoch, Program, UpdateState};
     use crate::options::ServerArgs;
 
     /// A roster that records what the switch asks of it and replays the
@@ -1540,7 +1540,7 @@ mod tests {
             Arc::clone(&epochs),
             Update::new(
                 7,
-                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+                Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
             ),
             12,
             record(),
@@ -2001,7 +2001,7 @@ mod tests {
             Arc::clone(&epochs),
             Update::new(
                 8,
-                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+                Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
             ),
             13,
             record(),
@@ -2175,7 +2175,7 @@ mod tests {
             Arc::clone(&epochs),
             Update::new(
                 7,
-                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+                Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
             ),
             12,
             record(),
@@ -2689,7 +2689,7 @@ mod tests {
             Arc::clone(&epochs),
             Update::new(
                 7,
-                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+                Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
             ),
             12,
             record(),
@@ -2939,7 +2939,7 @@ mod tests {
             Arc::clone(&epochs),
             Update::new(
                 7,
-                Deployment::of(ServerArgs::default()).expect("the configuration resolves"),
+                Epoch::of(ServerArgs::default()).expect("the configuration resolves"),
             ),
             12,
             record(),
