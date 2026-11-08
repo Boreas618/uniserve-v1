@@ -949,17 +949,30 @@ impl Scheduler {
     ///
     /// A request's steps are scheduled ahead of their results, so what has completed is behind what
     /// a call in the pipeline runs: two calls stating the completed count would run one step twice.
+    ///
+    /// The calls ahead are folded as the trajectory sees them (`Denoising::scheduled`): a latent
+    /// preparation still in flight opens it at the step it restores, so the steps after a restore
+    /// are numbered from the stored step even before the preparation's result arrives.
     fn step_of(&self, id: RequestId, call_id: CallId, state: &MediaFlowState) -> u32 {
-        let ahead = self
-            .inflight
-            .pending_calls
-            .get(&id)
-            .into_iter()
-            .flatten()
-            .take_while(|pending| pending.call.call_id != call_id)
-            .filter(|pending| pending.call.kind == CallKind::Media(ipc::MediaCall::Denoising))
-            .count();
-        state.denoising.completed() + ahead as u32
+        state.denoising.scheduled(
+            self.inflight
+                .pending_calls
+                .get(&id)
+                .into_iter()
+                .flatten()
+                .take_while(|pending| pending.call.call_id != call_id)
+                .filter_map(|pending| match pending.call.kind {
+                    CallKind::Media(media_call) => Some((
+                        media_call,
+                        pending
+                            .call
+                            .latent_restore
+                            .as_ref()
+                            .map_or(0, |restore| restore.steps),
+                    )),
+                    _ => None,
+                }),
+        )
     }
 
     /// The token columns of a text encoding batch: each request's prompt, packed, one row per request.
