@@ -19,15 +19,9 @@ use std::collections::BTreeMap;
 
 use std::sync::Arc;
 
-use ipc::{
-    CallKind, ComponentInfo, MainProcessEndpoint, MainProcessInfo, MediaCall, OutputInfo,
-    VideoDenoiserInfo,
-};
+use ipc::{CallKind, ComponentInfo, MainProcessEndpoint, MainProcessInfo, MediaCall};
 
-use super::{
-    ArenaCapacity, CacheCapacity, CacheDemand, RequestBounds, TokenBounds, call_window,
-    request_tensor_window,
-};
+use super::{ArenaCapacity, CacheCapacity, CacheDemand, TokenBounds, call_window};
 use crate::config::Device;
 use crate::memory::prefix_cache::planes::{PlaneLayout, UnitColumn};
 use crate::memory::{CachePlan, LatentPlan};
@@ -85,17 +79,6 @@ pub struct CapacityRequest {
     pub flow_graph_shapes: Vec<(usize, usize)>,
 }
 
-/// Bytes one product slot of a component's outputs retains: every output's
-/// largest extent, aligned to 256 bytes.
-pub(crate) fn product_bytes(outputs: &[OutputInfo]) -> u64 {
-    outputs
-        .iter()
-        .map(|output| {
-            (output.shape_bound.max_elements() * output.dtype.element_bytes()).div_ceil(256) * 256
-        })
-        .sum()
-}
-
 /// The largest KV block size the rank resolves to unless the launch
 /// presets one ([`resolve_block_size`]). It also bounds the latent rows of
 /// an image denoiser's latent page, one KV block of them
@@ -129,76 +112,7 @@ pub(crate) fn resolve_block_size(
     Ok(agreed[0] as usize)
 }
 
-/// The largest request-slot count every rank fits.
-///
-/// `requirements[i]` is this rank's storage for `minimum + i` slots. Every
-/// rank tests the same candidates, because a smaller slot count can lengthen
-/// the output horizon, so reducing local maxima would miss a common fit.
-pub(crate) fn request_slots(
-    requirements: &[u64],
-    minimum: usize,
-    available: u64,
-    group: &HostGroup,
-) -> Result<usize> {
-    if minimum == 0 || requirements.is_empty() {
-        return Err(Error::Invalid(
-            "request tensor capacity requires valid slot bounds".into(),
-        ));
-    }
-    let fits: Vec<i64> = requirements
-        .iter()
-        .map(|&bytes| i64::from(bytes <= available))
-        .collect();
-    let fits = group.all_reduce_min(&fits)?;
-    fits.iter()
-        .rposition(|&fits| fits != 0)
-        .map(|offset| minimum + offset)
-        .ok_or_else(|| {
-            // A slot holds one request's tensors at the deployment's
-            // capacities, so the operator either serves smaller ones or
-            // grants the storage.
-            Error::Unsupported(format!(
-                "insufficient device storage for a common request tensor slot count: candidate range {minimum}..{}, local requirements {requirements:?}, {available} bytes available; serve smaller prompt, condition or duration capacities, or give the worker more device storage (--mem-fraction-static)",
-                minimum + requirements.len() - 1,
-            ))
-        })
-}
-
-impl LatentPlan {
-    /// The pool of an image flow: pages of `block_size` units holding the
-    /// longest image (or the configured token budget, when larger). The
-    /// worker keeps the step workspace its forwards read beside it, which
-    /// it sizes for pages of at most [`MAX_BLOCK_SIZE`] units: a larger
-    /// block size is refused.
-    pub(crate) fn image(
-        slots: usize,
-        max_tokens: usize,
-        max_total_tokens: Option<usize>,
-        block_size: usize,
-        width: usize,
-        dtype: crate::memory::allocation::ElementType,
-    ) -> Result<Self> {
-        if block_size > MAX_BLOCK_SIZE {
-            return Err(Error::Unsupported(format!(
-                "an image denoiser's latent page holds one KV block of at most \
-                 {MAX_BLOCK_SIZE} latent rows, which its worker sizes its denoising \
-                 workspace by; kv_cache_request.block_size {block_size} exceeds it"
-            )));
-        }
-        let units = if max_tokens == 0 {
-            0
-        } else {
-            max_tokens.max(max_total_tokens.unwrap_or(max_tokens))
-        };
-        Ok(Self {
-            request_pool_size: slots,
-            num_pages: units.div_ceil(block_size) + 1,
-            page_units: block_size,
-            latent_width: width,
-            dtype,
-        })
-    }
-}
+impl LatentPlan {}
 
 /// Model-independent values of the report.
 pub struct Report {
@@ -210,32 +124,6 @@ pub struct Report {
     pub supported_calls: Vec<CallKind>,
     pub media_components: BTreeMap<MediaCall, String>,
     pub components: Vec<ComponentInfo>,
-}
-
-/// Media-timeline facts of a video model.
-#[derive(Debug, Clone, PartialEq)]
-pub struct MediaFacts {
-    pub video_denoiser: Option<VideoDenoiserInfo>,
-    /// Device bytes of one request's state buffers.
-    pub state_bytes: u64,
-    /// Product bytes this rank backs per request: those of the components it
-    /// executes and of the components it reads.
-    pub local_product_bytes: u64,
-    /// Latent pool of sampled trajectories, when the worker holds the
-    /// denoiser. Every rank of the worker reports its pages, because the engine
-    /// schedules a request's pages by the worker's report.
-    pub latent: Option<LatentPlan>,
-    /// Whether this rank stores the latent pool: it holds the denoiser.
-    pub stores_latent: bool,
-    /// Artifact regions imported from other codec ranks.
-    pub artifact_import_regions: usize,
-}
-
-impl MediaFacts {
-    /// The latent pool this rank stores.
-    fn stored_latent(&self) -> Option<LatentPlan> {
-        self.latent.filter(|_| self.stores_latent)
-    }
 }
 
 /// Inputs of the token layout taken from the loaded model.
@@ -877,11 +765,6 @@ impl TokenLayout {
         *self.fixed.entry(device).or_default() += bytes;
     }
 
-    /// Record the writable scratch capacity of the worker's warmup layouts.
-    pub(crate) fn reserve_warmup(&mut self, units: u32) {
-        self.warmup_units = units;
-    }
-
     /// Fit the cache pool beside the fixed storage and agree its unit count.
     ///
     /// The pool takes the grant left after the storage the rank reserved
@@ -1156,102 +1039,6 @@ impl TokenLayout {
             warmup_units: self.warmup_units,
         }
     }
-}
-
-/// The layout of a media worker, sized by its request slots.
-pub(crate) fn request_layout(
-    report: Report,
-    request: &CapacityRequest,
-    queue_depth: usize,
-    media: &MediaFacts,
-    host_components: bool,
-) -> Result<Plan> {
-    let device_exports = report.device_exports;
-    let mut info = base_info(report, request)?;
-    let slots = info.request_slots as usize;
-    info.max_unresolved_calls = narrow(
-        request_tensor_window(queue_depth, slots)?,
-        "unresolved calls",
-    )?;
-    info.max_batch_calls = info.max_batch_calls.min(info.request_slots);
-    info.max_batch_tokens = info.max_batch_calls;
-    // The pool this rank backs, which the engine places this rank's buffers
-    // in: the products of the components it executes and reads.
-    info.buffer_pool_bytes = slots as u64 * media.local_product_bytes;
-    info.video_denoiser = media.video_denoiser.clone();
-    if let Some(plan) = &media.latent {
-        info.latent_page_units = narrow(plan.page_units, "latent page units")?;
-        info.latent_pages = narrow(plan.num_pages, "latent pages")?;
-    }
-    let arena = ArenaCapacity::for_requests(&RequestBounds {
-        depth: queue_depth,
-        calls: info.max_batch_calls as usize,
-        requests: slots,
-        ranks: request.world_size,
-        product_bytes_per_request: media.local_product_bytes,
-        concurrent_imports: media.artifact_import_regions,
-        device_exports,
-    })?;
-    info.host_task_capacity = if host_components {
-        1
-    } else {
-        narrow(arena.host_task_inflight, "host task capacity")?
-    };
-    info.transfer_tickets = narrow(arena.transfer_tickets, "transfer tickets")?;
-    Ok(Plan {
-        info,
-        arena,
-        fixed_device_bytes: BTreeMap::new(),
-        latent: media.stored_latent(),
-        cache: None,
-        planes: None,
-        warmup_units: 0,
-    })
-}
-
-/// This rank's storage for every candidate slot count from `minimum` to
-/// `maximum`: state, retained products, the product store with its export
-/// pool (when `device_exports`) and the latent pool of each count.
-pub(crate) fn slot_requirements(
-    request: &CapacityRequest,
-    queue_depth: usize,
-    media: &MediaFacts,
-    device_exports: bool,
-    minimum: usize,
-    maximum: usize,
-) -> Result<Vec<u64>> {
-    let mut requirements = Vec::new();
-    for count in minimum..=maximum {
-        let arena = ArenaCapacity::for_requests(&RequestBounds {
-            depth: queue_depth,
-            calls: request.max_batch_calls.min(count),
-            requests: count,
-            ranks: request.world_size,
-            product_bytes_per_request: media.local_product_bytes,
-            concurrent_imports: 0,
-            device_exports,
-        })?;
-        let latent_bytes = match media.stored_latent() {
-            Some(plan) => {
-                // Every request slot owns the same run of pages after the
-                // padding page.
-                let pages = count * ((plan.num_pages - 1) / plan.request_pool_size) + 1;
-                LatentPlan {
-                    request_pool_size: count,
-                    num_pages: pages,
-                    ..plan
-                }
-                .bytes()?
-            }
-            None => 0,
-        };
-        requirements.push(
-            count as u64 * (media.state_bytes + media.local_product_bytes)
-                + arena.deferred_device_bytes()
-                + latent_bytes,
-        );
-    }
-    Ok(requirements)
 }
 
 #[cfg(test)]
