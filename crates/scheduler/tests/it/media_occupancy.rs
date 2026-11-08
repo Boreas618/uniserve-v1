@@ -24,8 +24,9 @@ use ipc::{BufferId, Call, CallKind, DimBound, MediaCall};
 use ipc::{DiffusionSamplingParams, RequestId};
 use models::video::Canvas;
 use scheduler::{
-    BatchEvent, BatchResult, CommandSender, ExecutionBatch, RequestDispatch, SchedulerConfig,
-    SimEngine, SimWorker, Worker, WorkerError, WorkerGroupId, WorkerInfo, WorkerSubmitError,
+    BatchEvent, BatchResult, CommandSender, ExecutionBatch, PoolLayout, RequestDispatch,
+    SchedulerConfig, SimEngine, SimWorker, Worker, WorkerError, WorkerGroupId, WorkerInfo,
+    WorkerSubmitError,
 };
 use scheduler::{ConditionExtent, DiffusionRequest, Event, FinishReason, RejectionKind, Request};
 
@@ -1033,14 +1034,15 @@ impl PooledWorker {
                 .keys()
                 .map(|call| CallKind::Media(*call))
                 .collect();
-            let layout = proto::config::WorkerGroupConfig {
-                blocks: launched
-                    .blocks
+            let layout = PoolLayout {
+                queue_depth: launched.queue_depth,
+                ranks: launched.ranks,
+                components: launched
+                    .components
                     .iter()
                     .filter(|(name, _)| components.contains(&name.as_str()))
                     .map(|(name, config)| (name.clone(), config.clone()))
                     .collect(),
-                ..launched.clone()
             };
             (info, layout)
         };

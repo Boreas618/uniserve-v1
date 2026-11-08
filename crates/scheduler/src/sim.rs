@@ -24,8 +24,8 @@ use std::time::Duration;
 use crate::CommandWaker;
 use crate::SpecialTokenIds;
 use crate::worker::{
-    BatchResult, BlockConfig, CallResult, CommandOutcome, CommandResult, ExecutionBatch, Worker,
-    WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
+    BatchResult, BlockConfig, CallResult, CommandOutcome, CommandResult, ExecutionBatch,
+    PoolLayout, Worker, WorkerFailure, WorkerGroupId, WorkerInfo, WorkerSubmitError,
 };
 use base64::Engine as _;
 use crossbeam_channel::{Receiver, Sender};
@@ -405,15 +405,7 @@ impl SimWorker {
                         .collect(),
                     layouts: groups
                         .iter()
-                        .map(|group| {
-                            (
-                                group.clone(),
-                                proto::config::WorkerGroupConfig {
-                                    id: group.clone(),
-                                    ..layout.clone()
-                                },
-                            )
-                        })
+                        .map(|group| (group.clone(), layout.clone()))
                         .collect(),
                     // The pool's own fact, as an inventory states it: the
                     // mechanism shapes a KV view to it, and refuses to shape
@@ -1209,9 +1201,9 @@ impl SimSpeculation {
 
 pub struct SimEngine {
     info: MainProcessInfo,
-    /// How the simulated pool is placed, as a deployment places a worker group: its ranks, its
-    /// queue depth and its blocks, which `SimWorker` states to the scheduler for each group.
-    layout: proto::config::WorkerGroupConfig,
+    /// How the simulated pool is placed: its queue depth and its components'
+    /// layout, which `SimWorker` states to the scheduler.
+    layout: PoolLayout,
     /// The longest sequence the simulated pool serves: the model's context
     /// length, which `SimWorker` states to the scheduler as
     /// `WorkerInfo::max_model_len`.
@@ -1417,13 +1409,11 @@ impl SimEngine {
         };
         Self {
             info,
-            layout: proto::config::WorkerGroupConfig::placed(
-                &["localhost".to_owned()],
-                "cpu",
-                1,
-                1,
-                BTreeMap::new(),
-            ),
+            layout: PoolLayout {
+                queue_depth: 1,
+                ranks: 1,
+                components: BTreeMap::new(),
+            },
             groups: vec![WorkerGroupId("sim".to_owned())],
             max_model_len: SIM_MAX_MODEL_LEN,
             text_len: DEFAULT_TEXT_LEN,
@@ -2082,18 +2072,12 @@ impl SimEngine {
     /// Places the pool's components, as a deployment places a worker
     /// group's, and gives the pool the ranks they span.
     pub fn place_components(&mut self, components: BTreeMap<String, BlockConfig>) {
-        let ranks = components
+        self.layout.ranks = components
             .values()
             .flat_map(|component| component.ranks.iter().copied())
             .max()
             .map_or(1, |last| last + 1);
-        self.layout = proto::config::WorkerGroupConfig::placed(
-            &["localhost".to_owned()],
-            "cpu",
-            ranks,
-            self.layout.queue_depth,
-            components,
-        );
+        self.layout.components = components;
     }
 
     /// Sets the number of synthetic tokens emitted before the configured EOS.

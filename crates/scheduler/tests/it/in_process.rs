@@ -121,25 +121,19 @@ fn a_pool_the_process_did_not_launch_serves_the_launched_paths_commands() {
 #[test]
 fn a_launch_of_ranks_the_worker_does_not_serve_is_refused() {
     let (mut args, limits) = config();
-    let stated = &mut args.engine_config.parallel.worker_groups[0];
-    *stated = proto::config::WorkerGroupConfig::placed(
-        &["localhost".to_owned()],
-        "cpu",
-        2,
-        stated.queue_depth,
-        stated.blocks.clone(),
-    );
+    args.world_size = 2;
     let batches: Arc<dyn Batches> = Arc::new(Pool::new(vec![crate::support::pool("model")]));
     let refused = SchedulerHandle::over_batches(&args, limits, batches)
         .err()
-        .expect("the deployment and the worker state one group over other ranks");
+        .expect("the launch and the worker state one pool");
     let refused = format!("{refused:#}");
-    assert!(refused.contains("the deployment places it"), "{refused}");
+    assert!(refused.contains("2 ranks"), "{refused}");
 }
 
 #[test]
 fn a_pool_that_states_no_ranks_is_refused_by_name() {
     let empty = Inventory {
+        group: "model".to_owned(),
         ranks: Vec::new(),
         ..crate::support::pool("model")
     };
