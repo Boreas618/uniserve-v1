@@ -36,7 +36,8 @@ use scheduler::{
 };
 use scheduling::Call;
 use worker::batch::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, RowState, Submission, SubmissionId,
+    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
+    SubmissionId,
 };
 use worker::completion::Outcome;
 
@@ -86,12 +87,12 @@ fn rank(host: &str) -> MainProcessInfo {
 /// A text pool of one rank named `model`.
 fn pool() -> Inventory {
     Inventory {
-        group: proto::config::WorkerGroupConfig::placed(
-            &["localhost".to_owned()],
-            "cpu",
-            1,
-            1,
-            std::collections::BTreeMap::from([(
+        group: "model".to_owned(),
+        ranks: vec![rank("gpu-a")],
+        layout: PoolLayout {
+            queue_depth: 1,
+            ranks: 1,
+            components: std::collections::BTreeMap::from([(
                 proto::config::DEFAULT_BLOCK.to_owned(),
                 BlockConfig {
                     ranks: vec![0],
@@ -103,8 +104,7 @@ fn pool() -> Inventory {
                     distribution: None,
                 },
             )]),
-        ),
-        ranks: vec![rank("gpu-a")],
+        },
         max_model_len: 4096,
     }
 }

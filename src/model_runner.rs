@@ -1088,8 +1088,8 @@ impl ModelRunner {
         // The host encoder pool a prompt's encoded states are stored in and found again by a
         // resumed request: one per host, shared by its ranks and epochs. This encoder writes the
         // conditioning alone; the vision and latent features are computed inside the calls that
-        // read them, so they are no output of their own. Every rank of a tensor group holds the
-        // whole states, so the first writes them.
+        // read them, so they are no output of their own. The engine counts this process's ranks as
+        // one, and the first writes the states it computed.
         let reports = report.is_some();
         let longest = u64::from(capacities.iter().copied().max().unwrap_or(0));
         let element = u64::from(
@@ -1108,7 +1108,7 @@ impl ModelRunner {
             None,
         )
         .context("mapping the host encoder pool")?;
-        let encoder = encoder.with_host_outputs(Arc::new(encoder_pool), reports && self.rank == 0);
+        let encoder = encoder.with_host_outputs(Arc::new(encoder_pool), reports);
         let warm = worker::runners::warm::distinct(&**denoiser, &candidates);
         // The denoiser's own buckets are the layouts those candidates collapse to: its phase is
         // derived from them rather than named, so a rank that captures no denoise bucket states no
@@ -1170,8 +1170,8 @@ impl ModelRunner {
         .in_group(self.rank, groups.sequence.clone());
         // The host latent pool a preempted request's trajectory is written to and a resumed one's
         // read from (§7.4), at this rank's Storage Server, its pages sized for the denoiser's
-        // largest trajectory. Every rank holds the whole samples, states its pool and its pages,
-        // and reads the stored pages of the ranks on its host.
+        // largest trajectory. The engine counts this process's ranks as one rank of the worker
+        // group, so every device reads stored pages as that rank, and the first states its pool.
         let trajectory = denoise.trajectory_bytes()?;
         let page_bytes = u64::from(LATENT_PAGE_VALUES) * 4;
         let pages = worker::memory::latent::host::BankPages {
@@ -1194,7 +1194,7 @@ impl ModelRunner {
             report.latent_pool = Some(Box::new(pool_info));
             report.encoder_pool = Some(Box::new(encoder_info));
         }
-        let denoise = denoise.with_host_latents(Arc::new(pool), self.rank, reports);
+        let denoise = denoise.with_host_latents(Arc::new(pool), 0, reports);
         let decoder = pipeline
             .video_decoder()
             .context("the checkpoint holds no video decoder, so no clip could be decoded")?;

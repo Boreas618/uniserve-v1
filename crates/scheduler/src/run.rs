@@ -119,7 +119,7 @@ impl Scheduler {
                     .info()
                     .layouts
                     .get(id)
-                    .map(|group| group.blocks.clone())
+                    .map(|layout| layout.components.clone())
                     .unwrap_or_default();
                 (
                     id.clone(),

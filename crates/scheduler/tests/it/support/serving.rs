@@ -13,7 +13,8 @@ use scheduler::SchedulerConfig;
 use ipc::{MainProcessEndpoint, MainProcessInfo, TimingCounters};
 use proto::config::BlockConfig;
 use worker::batch::{
-    Batch, BatchOutput, Batches, CallOutput, Inventory, RowState, Submission, SubmissionId,
+    Batch, BatchOutput, Batches, CallOutput, Inventory, PoolLayout, RowState, Submission,
+    SubmissionId,
 };
 use worker::completion::Outcome;
 
@@ -172,28 +173,24 @@ pub(crate) fn rank(host: &str) -> MainProcessInfo {
 /// A text pool of one rank in group `group`.
 pub(crate) fn pool(group: &str) -> Inventory {
     Inventory {
-        group: proto::config::WorkerGroupConfig {
-            id: proto::config::WorkerGroupId(group.to_owned()),
-            ..proto::config::WorkerGroupConfig::placed(
-                &["localhost".to_owned()],
-                "cpu",
-                1,
-                1,
-                std::collections::BTreeMap::from([(
-                    proto::config::DEFAULT_BLOCK.to_owned(),
-                    BlockConfig {
-                        ranks: vec![0],
-                        tensor_parallel_size: 1,
-                        pipeline_parallel_size: 1,
-                        sequence_parallel: Default::default(),
-                        units_per_rank: 1,
-                        weights: Default::default(),
-                        distribution: None,
-                    },
-                )]),
-            )
-        },
+        group: group.to_owned(),
         ranks: vec![rank("gpu-a")],
+        layout: PoolLayout {
+            queue_depth: 1,
+            ranks: 1,
+            components: std::collections::BTreeMap::from([(
+                proto::config::DEFAULT_BLOCK.to_owned(),
+                BlockConfig {
+                    ranks: vec![0],
+                    tensor_parallel_size: 1,
+                    pipeline_parallel_size: 1,
+                    sequence_parallel: Default::default(),
+                    units_per_rank: 1,
+                    weights: Default::default(),
+                    distribution: None,
+                },
+            )]),
+        },
         max_model_len: 4096,
     }
 }

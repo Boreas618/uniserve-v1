@@ -16,8 +16,9 @@ use std::collections::BTreeMap;
 use anyhow::ensure;
 use ipc::MainProcessInfo;
 
+use crate::WorkerGroupId;
 use crate::worker::codecs::video_unit_codecs;
-use crate::worker::{RankEncoderPools, WorkerInfo};
+use crate::worker::{PoolLayout, RankEncoderPools, WorkerInfo};
 
 impl WorkerInfo {
     /// The capability information of the pools `pools` describes, as the mechanism reads it.
@@ -37,11 +38,11 @@ impl WorkerInfo {
             ensure!(
                 !pool.ranks.is_empty(),
                 "pool {} reports no rank",
-                named(&pool.group.id.0)
+                named(&pool.group)
             );
             let info = pool_info(&pool.ranks)
-                .map_err(|error| error.context(format!("pool {}", named(&pool.group.id.0))))?;
-            reports.push((pool.group.id.clone(), info));
+                .map_err(|error| error.context(format!("pool {}", named(&pool.group))))?;
+            reports.push((WorkerGroupId(pool.group.clone()), info));
         }
         // Pool identities are unique and replicas of one component agree, which
         // is the same check every launch passes (`from_workers`).
@@ -55,21 +56,21 @@ impl WorkerInfo {
             ensure!(
                 pool.max_model_len > 0,
                 "pool {} states no longest sequence",
-                named(&pool.group.id.0)
+                named(&pool.group)
             );
             longest = Some(match longest {
                 Some((length, other)) => {
                     ensure!(
                         length == pool.max_model_len,
                         "pool {} was built for {} tokens and pool {} for {}",
-                        named(&pool.group.id.0),
+                        named(&pool.group),
                         pool.max_model_len,
                         named(other),
                         length
                     );
                     (length, other)
                 }
-                None => (pool.max_model_len, pool.group.id.0.as_str()),
+                None => (pool.max_model_len, pool.group.as_str()),
             });
         }
         info.max_model_len = longest.map_or(0, |(length, _)| length);
@@ -77,15 +78,22 @@ impl WorkerInfo {
         // The capacities come from the launch, not from the ranks' reports: a
         // rank reports what it holds, not how many it was launched for.
         for pool in pools {
-            let id = pool.group.id.clone();
+            let id = WorkerGroupId(pool.group.clone());
             ensure!(
-                pool.group.ranks.len() == pool.ranks.len(),
-                "worker group {} states {} ranks and reports {}",
-                named(&pool.group.id.0),
-                pool.group.ranks.len(),
+                pool.layout.ranks.max(1) == pool.ranks.len(),
+                "pool {} was launched for {} ranks and reports {}",
+                named(&pool.group),
+                pool.layout.ranks,
                 pool.ranks.len()
             );
-            info.layouts.insert(id.clone(), pool.group.clone());
+            info.layouts.insert(
+                id.clone(),
+                PoolLayout {
+                    queue_depth: pool.layout.queue_depth.max(1),
+                    ranks: pool.ranks.len(),
+                    components: pool.layout.components.clone(),
+                },
+            );
             // Each rank's own reports, in launch order: media buffers, the
             // prefix cache and its host page pools, and the host latent and
             // encoder pools resolve rank by rank.
@@ -132,12 +140,12 @@ impl WorkerInfo {
             .iter()
             .map(|pool| {
                 (
-                    pool.group.id.clone(),
+                    WorkerGroupId(pool.group.clone()),
                     pool.ranks
                         .iter()
                         .map(|rank| rank.endpoint.host.clone())
                         .collect::<Vec<_>>(),
-                    pool.group.blocks.clone(),
+                    pool.layout.components.clone(),
                 )
             })
             .collect::<Vec<_>>();
@@ -322,7 +330,6 @@ fn named(group: &str) -> &str {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::WorkerGroupId;
     use ipc::{MainProcessEndpoint, MediaCall};
     use proto::config::BlockConfig;
     use std::collections::BTreeSet;
@@ -374,17 +381,13 @@ mod tests {
         max_model_len: u32,
     ) -> worker::batch::Inventory {
         worker::batch::Inventory {
-            group: proto::config::WorkerGroupConfig {
-                id: WorkerGroupId(group.to_owned()),
-                ..proto::config::WorkerGroupConfig::placed(
-                    &["localhost".to_owned()],
-                    "cpu",
-                    placed_ranks,
-                    2,
-                    components,
-                )
-            },
+            group: group.to_owned(),
             ranks,
+            layout: worker::batch::PoolLayout {
+                queue_depth: 2,
+                ranks: placed_ranks,
+                components,
+            },
             max_model_len,
         }
     }
@@ -441,9 +444,9 @@ mod tests {
             "the caches are the ranks' own, in launch order"
         );
         let layout = info.layouts.get(&id).expect("the pool's launch");
-        assert_eq!(layout.ranks.len(), 2);
+        assert_eq!(layout.ranks, 2);
         assert_eq!(layout.queue_depth, 2);
-        assert_eq!(layout.blocks, components(&[("text", &[0, 1])]));
+        assert_eq!(layout.components, components(&[("text", &[0, 1])]));
         assert_eq!(info.max_model_len, 4096);
         assert_eq!(info.rank_count(&id), 2);
     }

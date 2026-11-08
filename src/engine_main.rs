@@ -1083,14 +1083,7 @@ impl MainProcess {
         let mut scheduled = Vec::with_capacity(ranks.len());
         // The group's products, which every rank's runners reach through their own view of them.
         let group_products = GroupProducts::new(ranks.len());
-        // What the ranks' derived state is computed with, which keys the pages of the host latent and
-        // encoder pools: the weights every rank loaded, as the data plane keys the host KV cache.
-        let identity = worker::data_plane::identity_of(
-            &ranks
-                .iter()
-                .flat_map(|rank| rank.weights.iter().cloned())
-                .collect::<Vec<_>>(),
-        );
+        let rank_count = ranks.len() as u32;
         for (rank_index, rank) in ranks.into_iter().enumerate() {
             let LoadedRank {
                 model_runner: rank_runner,
@@ -1102,6 +1095,9 @@ impl MainProcess {
                 graph,
                 groups,
             } = rank;
+            // The scheduler sees the group as one pool, and each rank encodes its own units, so the
+            // pool holds every rank's host tasks.
+            inventory.host_task_capacity *= rank_count;
             // The device's one pool set is the resident owners' allocator (§4.1): it is opened with
             // the memory and handed to the worker thread, so every owner and every runner books
             // against the same allowance.
@@ -1115,9 +1111,13 @@ impl MainProcess {
             let shadow = graph.shadow;
             let products: Arc<dyn worker::runners::products::Products> =
                 Arc::new(RankProducts::new(Arc::clone(&group_products), rank_index));
+            // What the rank's trajectories are computed with, which keys the pages of its host latent
+            // pool: the weights it loaded.
+            let identity = worker::data_plane::identity_of(&weights);
             for device in rank_runner.devices() {
                 let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
-                // Every rank states its own host latent pool and its share of the host encoder pool.
+                // The scheduler counts this process's ranks as one, the first rank's report, so the
+                // first rank states the host latent pool for all of them.
                 let runners = rank_runner.runners(
                     *device,
                     &model,
@@ -1127,7 +1127,7 @@ impl MainProcess {
                     &groups,
                     &client,
                     &identity,
-                    Some(&mut inventory),
+                    (rank_index == 0).then_some(&mut inventory),
                 )?;
                 let worker = Worker::spawn(
                     *device,
@@ -1216,7 +1216,7 @@ impl MainProcess {
                     &models[index],
                     &workers[index..=index],
                     Some(index),
-                    &inventories[index..=index],
+                    &inventories[index],
                     &memories[index],
                     connected.wake(),
                     &data,
@@ -1230,7 +1230,7 @@ impl MainProcess {
                 &models[0],
                 &workers,
                 None,
-                &inventories,
+                &inventories[0],
                 &memories[0],
                 connected.wake(),
                 &data,
@@ -8071,7 +8071,7 @@ fn device_command(
 /// result.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the rank, the launch, the model, its devices, its group and their reports, its memory, the wake and the data plane"
+    reason = "the rank, the launch, the model, its devices, its group, its report, its memory, the wake and the data plane"
 )]
 fn schedulers(
     model_runner: &ModelRunner,
@@ -8079,7 +8079,7 @@ fn schedulers(
     model: &crate::model_runner::Served,
     workers: &[Arc<Worker>],
     replica: Option<usize>,
-    ranks: &[ipc::MainProcessInfo],
+    rank: &ipc::MainProcessInfo,
     memory: &Memory,
     control: ipc::Wake,
     data: &Arc<worker::data_plane::DataPlane>,
@@ -8100,18 +8100,20 @@ fn schedulers(
     // One scheduler per scheduler thread: it reads the engine configuration as this rank resolves
     // it, with the model's facts, and the limits this rank captured.
     let (args, limits) = model_runner.scheduler_args(launch, model, host_cache)?;
-    let mut ranks = ranks.to_vec();
-    if host_cache
-        && let Some(cache) = ranks
-            .first_mut()
-            .and_then(|rank| rank.prefix_cache.as_mut())
-    {
+    let mut rank = rank.clone();
+    if host_cache && let Some(cache) = rank.prefix_cache.as_mut() {
         cache.host_token_bytes = memory.host_token_bytes();
     }
-    // The scheduler plans against the worker group as the deployment states it - its ranks, its queue
-    // depth and its blocks - and against what each of its ranks reported; its longest sequence is the
-    // model's bound. An expert union's ranks are each a scheduler's, one data-parallel group each, in
-    // the order the deployment states them; any other process serves one group with every rank.
+    // The scheduler submits through the same devices this process drives, so a batch and a
+    // switchover reach one worker thread per device and never two.
+    // The scheduler plans against a description of the pool, and this process is the one pool it
+    // holds: its single rank is this one, its capacities are the launch's (the rank reports what it
+    // holds, not what it was launched for), and its longest sequence is the model's bound. The
+    // inventory is the worker's to hold and the boot's to state, because neither number can be
+    // derived from a batch (4.4).
+    // The pool is named as the deployment names its worker group: an expert union's ranks are each
+    // a scheduler's, one data-parallel group each, in the order the deployment states them, and any
+    // other process serves the deployment's one group.
     let groups = &launch.engine_config.parallel.worker_groups;
     let group = match replica {
         Some(index) => groups.get(index).with_context(|| {
@@ -8123,16 +8125,32 @@ fn schedulers(
         None => match groups.as_slice() {
             [group] => group,
             _ => bail!(
-                "this process holds the ranks of one worker group and the deployment states {}: \
-                 {:?}",
+                "this process serves one worker group and the deployment states {}: {:?}",
                 groups.len(),
                 groups.iter().map(|group| &group.id.0).collect::<Vec<_>>()
             ),
         },
     };
     let inventory = worker::batch::Inventory {
-        group: group.clone(),
-        ranks,
+        group: group.id.0.clone(),
+        ranks: vec![rank.clone()],
+        layout: worker::batch::PoolLayout {
+            queue_depth: model_runner.queue_depth(),
+            ranks: model_runner.world_size(),
+            // Every component the rank reports is placed on the group's ranks. A text rank reports
+            // the one default component, and a media rank one per block of its pipeline, which the
+            // scheduler reads a call's width and owner from.
+            components: rank
+                .components
+                .iter()
+                .flat_map(|component| {
+                    scheduler::WorkerGroupConfig::single_component(
+                        &component.name,
+                        model_runner.world_size(),
+                    )
+                })
+                .collect(),
+        },
         max_model_len: model_runner.engine_config().model.max_model_len,
     };
     let mut stated = worker::batch::Workers::shared(workers.iter().map(Arc::clone).collect())?
