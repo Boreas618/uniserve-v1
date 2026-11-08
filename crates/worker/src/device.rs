@@ -998,14 +998,25 @@ impl Device {
     fn land(&mut self, queue: &JobQueue, launched: Launched) {
         let Launched {
             entry,
-            output,
+            mut output,
             pending,
         } = launched;
+        // The step's counters were read as it was issued (`end_step`), and a runner that answers a
+        // replay from its record of the flight builds the output anew: the counters go with the
+        // step to whichever output answers it, or the stream time and the blocking calls of every
+        // overlapped step never reach the scheduler.
+        let forward_stats = output.forward_stats.take();
         let result = pending
             .landed
             .synchronize()
             .map_err(Error::from)
-            .and_then(|()| self.runner_mut(pending.runner)?.runner.landed(output));
+            .and_then(|()| self.runner_mut(pending.runner)?.runner.landed(output))
+            .map(|mut landed| {
+                if landed.forward_stats.is_none() {
+                    landed.forward_stats = forward_stats;
+                }
+                landed
+            });
         if let Some(call) = pending.call {
             tracing::info!(
                 device = self.device.0,
