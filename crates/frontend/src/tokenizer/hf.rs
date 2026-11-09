@@ -167,7 +167,6 @@ impl HuggingFaceTokenizer {
         self.tokenizer.token_to_id(token)
     }
 
-
     /// Returns whether an identifier belongs to the special-token set.
     pub fn is_special_id(&self, token_id: u32) -> bool {
         self.special_token_ids.binary_search(&token_id).is_ok()

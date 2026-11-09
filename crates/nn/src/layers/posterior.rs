@@ -30,7 +30,6 @@ impl Posterior {
         Self { pdl: false }
     }
 
-
     /// `out[p, c] = round_to_f16(mean[p, c] + exp(0.5 · clamp(log_variance[p, c])) · noise[p, c])`.
     ///
     /// All four views are `[positions, channels]` f32 and each is read through its own two strides, so

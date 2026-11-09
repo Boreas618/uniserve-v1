@@ -154,9 +154,6 @@ pub struct DeviceBooking {
 }
 
 impl DeviceBooking {
-
-
-
     /// Books the items in the GPU's ledger, the graph pool only while
     /// `graphs` are resident: a sleeping rank's graph storage is released.
     /// Returns the ledger after the booking.

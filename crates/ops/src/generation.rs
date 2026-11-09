@@ -30,7 +30,6 @@ pub struct KernelEntry {
 }
 
 impl KernelEntry {
-
     /// The kernel of `operator` for an already-formatted key.
     pub fn keyed(operator: &'static str, key: impl Into<String>, kernel: Arc<Kernel>) -> Self {
         Self {

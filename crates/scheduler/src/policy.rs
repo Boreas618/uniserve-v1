@@ -524,8 +524,7 @@ pub struct Candidate {
     state: Snapshot,
 }
 
-impl Candidate {
-}
+impl Candidate {}
 
 /// What an epoch's policy has cost so far, in the two counters `Metrics`
 /// carries for it (design §12's deterministic proxy for per-step cost).
@@ -675,8 +674,7 @@ pub struct PolicyReverted {
     pub fatal: bool,
 }
 
-impl PolicyReverted {
-}
+impl PolicyReverted {}
 
 /// A request that has just reached the main process, as the control thread
 /// sees it before any scheduler does: what the `route` decision orders by
@@ -867,7 +865,6 @@ impl PolicySlot {
         cost.call(instance, |instance| instance.place(call, replicas))
     }
 
-
     /// `experts`: the layout of experts on ranks (§4.4).
     pub fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
         let (instance, cost) = (&mut self.instance, &mut self.cost);
@@ -1036,7 +1033,6 @@ impl PolicySlot {
     pub fn request(&mut self, stage: Stage) {
         self.pending = Some(stage);
     }
-
 
     /// Applies the stage a daemon asked for at a batch boundary, where no batch
     /// and no submission is in flight (§7.3 steps 3 to 6).
@@ -1274,7 +1270,6 @@ impl RoutePolicy {
         }
     }
 
-
     /// The program the route instance runs.
     pub fn program(&self) -> &PolicyProgram {
         &self.program
@@ -1389,7 +1384,6 @@ impl RoutePolicy {
         self.cost.replace(&replaced);
         self.previous = Some((replaced_program, replaced_module));
     }
-
 
     /// §7.3 step 4 for the control thread's instance, on `state`.
     pub fn revert(&mut self, state: &TrialState) -> Result<(), PolicyError> {

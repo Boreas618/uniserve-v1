@@ -111,7 +111,6 @@ impl Call {
     pub fn replies_with_index(self) -> bool {
         matches!(self, Call::Route | Call::Place)
     }
-
 }
 
 /// Packs a reply buffer's pointer and length.

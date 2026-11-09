@@ -668,7 +668,6 @@ impl Recording {
         }
     }
 
-
     /// The first failure a record reported, if any: a capture that failed part-way through.
     pub fn failure(&self) -> Option<&platform::Error> {
         self.failure.as_ref()

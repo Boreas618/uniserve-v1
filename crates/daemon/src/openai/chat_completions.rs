@@ -47,11 +47,10 @@ use crate::openai::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
 use crate::openai::{
     ApiError, AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
-    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse,
-    ChatLogProbs, ChatLogProbsContent, ChatMessage, ChatMessageDelta,
-    ChatModality, ContentPart, FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent,
-    Tool, ToolCall, ToolCallDelta, TopLogProb, Usage, ValidatedJson, check_model_served,
-    convert_logit_bias,
+    ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse, ChatLogProbs,
+    ChatLogProbsContent, ChatMessage, ChatMessageDelta, ChatModality, ContentPart,
+    FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent, Tool, ToolCall,
+    ToolCallDelta, TopLogProb, Usage, ValidatedJson, check_model_served, convert_logit_bias,
 };
 use crate::output::chat::{
     AssistantBlockKind, AssistantContentBlock, AssistantMessage, AssistantToolCall,
@@ -1373,9 +1372,6 @@ fn append_delta_text(slot: &mut Option<String>, delta: String) {
         None => *slot = Some(delta),
     }
 }
-
-
-
 
 /// Builds the initial assistant-role SSE chunk required by OpenAI streaming.
 fn start_chunk(

@@ -481,10 +481,7 @@ fn main() {
         let partition = minimax_h3::Partition::serving(
             &config,
             minimax_h3::VideoTask::ReferenceToVideoAudio,
-            minimax_h3::partition::Ulysses::of(
-                ulysses,
-                nn::family::Projection::Exchange,
-            ),
+            minimax_h3::partition::Ulysses::of(ulysses, nn::family::Projection::Exchange),
             tensor_parallel,
             0,
             0,

@@ -81,7 +81,6 @@ impl Read {
         lock(&self.state)
     }
 
-
     /// The physical retirement signal storage owners wait on.
     pub fn retirement(&self) -> Arc<Retirement> {
         Arc::clone(&self.lock().ticket.retirement)

@@ -36,15 +36,17 @@
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use minimax_h3::VideoTask;
 use minimax_h3::checkpoint::Dit;
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::{Denoiser, Layouts};
 use minimax_h3::encoding::Extent;
 use minimax_h3::partition::{Component, Components, Partition, Ulysses};
 use nn::capability::{Conditioning, Denoiser as _, MediaInput, MediaRole};
-use nn::{Arena, Backing, Checkpoint, ConditionRole, ConditionShape, DType, DevicePtr, Forward,
-    RetainedWeights, Shape, TensorView, VideoRequest, WeightKey, WeightLoader};
-use minimax_h3::VideoTask;
+use nn::{
+    Arena, Backing, Checkpoint, ConditionRole, ConditionShape, DType, DevicePtr, Forward,
+    RetainedWeights, Shape, TensorView, VideoRequest, WeightKey, WeightLoader,
+};
 
 /// The two checkpoint directories a conditioned deployment reads its media from.
 const VAE: &str = "vae";

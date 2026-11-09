@@ -336,11 +336,7 @@ mod tests {
         // source is read during the call.
         unsafe {
             let mut copies = CopyBatch::new(platform::SourceOrder::DuringCall);
-            copies.push(
-                destination.as_mut_ptr() as u64,
-                source.as_ptr() as u64,
-                4,
-            );
+            copies.push(destination.as_mut_ptr() as u64, source.as_ptr() as u64, 4);
             batch.on().copy(&copies)?;
         }
         batch.on().launch_host_fn(Box::new(move || {

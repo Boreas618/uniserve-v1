@@ -383,7 +383,6 @@ impl SharedRead {
         Ok(Arc::clone(&self.mapping))
     }
 
-
     pub(crate) fn release(&mut self) {
         if let Some(slot) = self.slot.take() {
             self.mapping
@@ -495,7 +494,6 @@ impl Transport {
         }
         Ok(locator)
     }
-
 }
 
 impl NativeRead {

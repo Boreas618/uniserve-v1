@@ -119,6 +119,9 @@ mod tests {
     #[test]
     fn a_canvas_is_named_by_its_aspect_ratio() {
         assert_eq!(NAMED_CANVASES[1].name(), "16:9");
-        assert_eq!((NAMED_CANVASES[1].width, NAMED_CANVASES[1].height), (1344, 768));
+        assert_eq!(
+            (NAMED_CANVASES[1].width, NAMED_CANVASES[1].height),
+            (1344, 768)
+        );
     }
 }

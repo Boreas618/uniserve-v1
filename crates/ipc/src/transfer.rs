@@ -481,8 +481,6 @@ impl CacheTransfer {
     pub fn tensors(&self) -> impl Iterator<Item = &TensorTransfer> {
         self.groups.iter().flat_map(|group| &group.tensors)
     }
-
-
 }
 
 /// Encoding represented by a reusable image-feature export.
@@ -565,7 +563,6 @@ impl TransferHandle {
             | Self::Latent { tensor, .. } => std::slice::from_ref(tensor),
         }
     }
-
 }
 
 /// Appends `source`'s locators to the matching tensors of `destination`,

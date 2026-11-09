@@ -217,12 +217,7 @@ impl CudaExports {
                     if let ShareableHandle::Descriptor(fd) = shareable {
                         state.descriptor = Some(fd);
                     }
-                    (
-                        source.clone(),
-                        handle,
-                        storage.bytes() as u64,
-                        offset,
-                    )
+                    (source.clone(), handle, storage.bytes() as u64, offset)
                 }
                 None => {
                     let pool = self.pool(device)?;

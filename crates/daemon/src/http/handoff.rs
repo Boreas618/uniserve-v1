@@ -312,7 +312,6 @@ pub(crate) struct Registration {
 }
 
 impl Registration {
-
     /// Whether a pause was asked for.
     pub(crate) fn paused(&self) -> bool {
         *self.requested.borrow()
@@ -478,12 +477,10 @@ mod tests {
         // A connection that froze it anyway — a request admitted just before
         // the pause, whose handler registered just after — is answered at
         // once, because no round holds its report.
-        let decision = tokio::time::timeout(
-            Duration::from_secs(10),
-            late.report(Some(frozen("late"))),
-        )
-        .await
-        .expect("the response is not left waiting for a decision");
+        let decision =
+            tokio::time::timeout(Duration::from_secs(10), late.report(Some(frozen("late"))))
+                .await
+                .expect("the response is not left waiting for a decision");
         assert_eq!(decision, Decision::Resume, "the response goes on here");
     }
 

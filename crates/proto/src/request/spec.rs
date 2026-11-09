@@ -59,8 +59,7 @@ pub enum FlashInferBackend {
     Fa3,
 }
 
-impl FlashInferBackend {
-}
+impl FlashInferBackend {}
 
 impl std::str::FromStr for FlashInferBackend {
     type Err = FlashInferBackendParseError;

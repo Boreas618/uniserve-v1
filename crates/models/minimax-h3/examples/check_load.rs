@@ -26,9 +26,9 @@
 
 use std::path::PathBuf;
 
-use nn::weights::{HostStore, WeightLoader};
-use nn::{DType};
 use minimax_h3::VideoTask;
+use nn::DType;
+use nn::weights::{HostStore, WeightLoader};
 
 use minimax_h3::checkpoint::{Layout, Sidecars};
 use minimax_h3::config::Config;

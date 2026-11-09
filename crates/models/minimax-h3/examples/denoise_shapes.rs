@@ -21,12 +21,12 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use minimax_h3::VideoTask;
 use minimax_h3::config::Config;
 use minimax_h3::denoiser::{self, Layouts};
 use minimax_h3::partition::{Partition, Ulysses};
+use nn::DType;
 use nn::capability::{ConditionRole, ConditionShape, VideoRequest};
-use nn::{DType};
-use minimax_h3::VideoTask;
 
 fn main() -> ExitCode {
     match run() {

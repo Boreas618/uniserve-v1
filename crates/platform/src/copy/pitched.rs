@@ -94,7 +94,6 @@ impl PitchedBatch {
         self.copies.is_empty()
     }
 
-
     pub fn copies(&self) -> &[Pitched] {
         &self.copies
     }

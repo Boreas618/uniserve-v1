@@ -64,8 +64,6 @@ impl Embedding {
         })
     }
 
-
-
     /// Whether the table is sharded across ranks.
     pub const fn is_sharded(&self) -> bool {
         self.rows != self.vocabulary

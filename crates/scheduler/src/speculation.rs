@@ -126,7 +126,6 @@ impl SpeculationMeter {
             }
         }
     }
-
 }
 
 /// A running request's draft cache, in a deployment that speculates.

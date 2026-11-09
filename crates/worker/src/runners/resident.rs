@@ -174,7 +174,6 @@ impl ResidentCache {
         })
     }
 
-
     /// The paired forward's view: its group's table and the layer planes over the scratch pages.
     /// Copies what `group`'s rows have cached into their scratch pages.
     ///

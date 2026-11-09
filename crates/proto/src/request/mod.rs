@@ -33,8 +33,8 @@ pub use generation::{
 pub use image::{CfgRenorm, CfgRenormParseError, ImageParams, ImageParamsError};
 pub use sampling::{SamplingParams, SamplingParamsError};
 pub use spec::{
-    ExpertExchange, FlashInferBackend, FlashInferBackendParseError, LoadFormat,
-    PrefixCacheDtype, PrefixCacheDtypeParseError, SchedulingPolicy, StandbyStorage,
+    ExpertExchange, FlashInferBackend, FlashInferBackendParseError, LoadFormat, PrefixCacheDtype,
+    PrefixCacheDtypeParseError, SchedulingPolicy, StandbyStorage,
 };
 pub use values::{CanvasSampling, DiffusionSamplingParams, ImageEncoder, RequestId, TokenLogprob};
 

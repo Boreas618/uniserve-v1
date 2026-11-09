@@ -533,7 +533,6 @@ impl Stack {
             .copied()
             .ok_or_else(|| Error::config("the video encoder's stack has no level".to_owned()))
     }
-
 }
 
 /// The tile grid of one raster, in input pixels, with the latent positions each seam shares.
@@ -1572,7 +1571,6 @@ impl EncoderScratch {
                 ))
             })
     }
-
 }
 
 /// One tile extent's buffers: the input pad, the input convolution's output and a set per level.
@@ -3603,11 +3601,14 @@ mod tests {
         let config = crate::audio_vae::tests::audio_config();
         let mut ours = AudioEncoder::keys(&config).expect("the encoder's keys");
         ours.sort_unstable();
-        let fixture: Vec<&str> = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/audio-encoder-names.txt"))
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .collect();
+        let fixture: Vec<&str> = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/audio-encoder-names.txt"
+        ))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
         assert_eq!(fixture.len(), 171, "the recorded export's encoder half");
         let missing: Vec<&str> = fixture
             .iter()

@@ -10,7 +10,6 @@
 //! This module is the comparison both a slice run and a runner-level harness use, so that the
 //! expected values have one reader rather than one per harness.
 
-
 use serde::Deserialize;
 
 /// One reference generation: the ids it produced, and the margin of each choice.
@@ -40,7 +39,6 @@ pub struct Difference {
 }
 
 impl Reference {
-
     /// Reads a reference from its JSON text.
     pub fn parse(text: &str) -> Result<Self, String> {
         serde_json::from_str(text).map_err(|error| format!("a reference file: {error}"))

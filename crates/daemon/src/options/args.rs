@@ -83,10 +83,7 @@ impl ServerArgs {
     /// option that is not a table, or the merged tree names an unknown
     /// option or a value its option does not take; the message names the
     /// option's path.
-    pub fn resolve(
-        &self,
-        matches: &clap::ArgMatches,
-    ) -> anyhow::Result<(ServerArgs, Stated)> {
+    pub fn resolve(&self, matches: &clap::ArgMatches) -> anyhow::Result<(ServerArgs, Stated)> {
         let mut tree = match &self.config_file {
             Some(path) => std::fs::read_to_string(path)
                 .with_context(|| format!("reading --config {}", path.display()))?
@@ -107,7 +104,11 @@ impl ServerArgs {
         }
         let path = |table: &str, key: &str| vec![table.to_owned(), key.to_owned()];
         if let Some(value) = &self.host {
-            set(&mut tree, &path("admin_config", "host"), Value::String(value.clone()))?;
+            set(
+                &mut tree,
+                &path("admin_config", "host"),
+                Value::String(value.clone()),
+            )?;
         }
         if let Some(value) = self.port {
             set(
@@ -330,9 +331,7 @@ mod tests {
         let command = <Command as clap::CommandFactory>::command();
         let matches =
             command.try_get_matches_from(std::iter::once("serve").chain(args.iter().copied()))?;
-        Command::from_arg_matches(&matches)?
-            .serve
-            .resolve(&matches)
+        Command::from_arg_matches(&matches)?.serve.resolve(&matches)
     }
 
     fn written(name: &str, body: &str) -> PathBuf {
@@ -424,7 +423,10 @@ mod tests {
     #[test]
     fn malformed_options_are_refused_by_path() {
         for (args, named) in [
-            (vec!["--set", "cuda_graph_config.decode_batch_szes=[1]"], "decode_batch_szes"),
+            (
+                vec!["--set", "cuda_graph_config.decode_batch_szes=[1]"],
+                "decode_batch_szes",
+            ),
             (
                 vec!["--set", "max_running_requests=0"],
                 "max_running_requests",

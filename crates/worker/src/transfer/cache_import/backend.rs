@@ -96,10 +96,7 @@ pub(crate) struct ImportEntry {
     retirement: Arc<Retirement>,
 }
 
-impl ImportEntry {
-
-
-}
+impl ImportEntry {}
 
 impl Deref for ImportEntry {
     type Target = CacheImport;
@@ -475,9 +472,7 @@ impl GroupCopy<'_> {
             }
             self.consume(&reads)?;
 
-            let request = ConversionRequest {
-                group: self.index,
-            };
+            let request = ConversionRequest { group: self.index };
             // The conversion enqueues on the workspace stream. The next
             // span's reads record their handoff after it, so no transport
             // overwrites the scratch before the conversion consumed it.

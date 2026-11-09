@@ -1278,7 +1278,6 @@ impl Transformer {
         })
     }
 
-
     /// The FP32 view an FP32 projection reads when `source` is not FP32 already.
     ///
     /// The reference builds all four of the transformer's end projections as FP32 parameters

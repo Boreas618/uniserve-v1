@@ -27,8 +27,7 @@ pub enum RequestKind {
     Hook,
 }
 
-impl RequestKind {
-}
+impl RequestKind {}
 
 /// Engine-to-worker request envelope.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -83,7 +82,6 @@ impl MainProcessRequest {
         }
     }
 
-
     /// Replaces the request-response correlation identity (`message_id`).
     pub fn set_message_id(&mut self, value: Option<u64>) {
         match self {
@@ -120,8 +118,6 @@ impl MainProcessRequest {
     pub fn close() -> Self {
         Self::Close { message_id: None }
     }
-
-
 }
 
 /// Kind discriminator carried by each worker response frame.
@@ -251,7 +247,6 @@ impl MainProcessResponse {
             Self::Hooked { .. } => ResponseKind::Hooked,
         }
     }
-
 
     /// Replaces the request-response correlation identity (`message_id`) of
     /// a response; a stall report has none to replace.

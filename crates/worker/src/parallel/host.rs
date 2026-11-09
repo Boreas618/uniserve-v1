@@ -66,7 +66,6 @@ impl Rendezvous {
             listener: Some(listener),
         }
     }
-
 }
 
 /// One member's connections to every other member of a group.
@@ -80,7 +79,6 @@ pub struct HostGroup {
 }
 
 impl HostGroup {
-
     /// A group of one member, which needs no connections.
     /// A group of one member, which needs no connections: a rank that serves
     /// alone still agrees its block size and slot count over a group, so the

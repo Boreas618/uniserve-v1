@@ -15,8 +15,8 @@
 
 use std::sync::Arc;
 
-use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::model::ModelConfig;
+use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
 use processing::{Catalogue, ReasoningFormat, Serving, ToolCallFormat, VideoFamily};
 use proto::request::{

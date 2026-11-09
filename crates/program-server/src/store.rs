@@ -160,7 +160,6 @@ impl Store {
         Ok(Store { roots })
     }
 
-
     /// The directory a module is published to: the writable root's.
     pub fn directory(&self, path: &ModulePath) -> PathBuf {
         self.roots[0].path.join(path.relative())

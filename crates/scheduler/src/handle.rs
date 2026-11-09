@@ -294,8 +294,6 @@ struct EventCancellation {
 }
 
 impl EventRx {
-
-
     /// Receives the next event and advances the received token count.
     ///
     /// Returns `None` once the channel is closed and empty and every handed
@@ -316,7 +314,6 @@ impl EventRx {
         }
         event
     }
-
 
     /// Attempts to receive an event without waiting.
     ///
@@ -379,7 +376,6 @@ impl EventRx {
             self.acknowledged_token_count = self.text_tokens_received;
         }
     }
-
 
     /// Closes generation after the tokens the consumer has received.
     ///
@@ -1250,7 +1246,6 @@ impl CommandSender {
         Ok(())
     }
 
-
     /// The step and cost counters, polled rather than waited for: the caller is
     /// the engine's control thread, which no scheduler may hold.
     pub fn progress(&self) -> crossbeam_channel::Receiver<crate::Progress> {
@@ -1467,7 +1462,6 @@ impl PolicySlotHandle {
             .recv_timeout(POLICY_SLOT_TIMEOUT)
             .unwrap_or_default()
     }
-
 
     /// The program a precopy prepared for the next switchover, `None` when none
     /// waits.

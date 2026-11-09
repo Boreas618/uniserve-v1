@@ -147,4 +147,3 @@ pub(crate) fn submit(
 pub fn start(reads: &[Arc<Read>]) -> Result<()> {
     reads.iter().try_for_each(|read| read.start())
 }
-

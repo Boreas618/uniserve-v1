@@ -56,7 +56,7 @@ use minimax_h3::transformer::{Transformer, rotated_axes};
 // The block's capability methods: `draw_noise`, `layout`, `state_tables` and the rest are the
 // trait's, and the stage that drives the whole block calls them the way the worker does.
 use nn::capability::Denoiser as _;
-use nn::capability::{VideoRequest};
+use nn::capability::VideoRequest;
 use nn::{
     Arena, Backing, Checkpoint, DType, DevicePtr, Forward, RetainedWeights, Shape, TensorView,
     WeightKey, WeightLoader,

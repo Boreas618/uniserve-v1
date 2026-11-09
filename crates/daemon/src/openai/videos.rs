@@ -587,7 +587,8 @@ mod tests {
 
     #[tokio::test]
     async fn json_and_multipart_normalize_to_the_same_request() {
-        let references = r#"[{"type": "image", "url": "data:image/png;base64,AA==", "frame_index": 0}]"#;
+        let references =
+            r#"[{"type": "image", "url": "data:image/png;base64,AA==", "frame_index": 0}]"#;
         let json = json_request(&serde_json::json!({
             "model": "FastH3",
             "prompt": "A river",
@@ -671,7 +672,10 @@ mod tests {
         let (status, _, body) = send(&router, request).await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["video"]["model"]["sizes"], serde_json::json!(["64x64"]));
+        assert_eq!(
+            body["video"]["model"]["sizes"],
+            serde_json::json!(["64x64"])
+        );
         assert_eq!(
             body["video"]["request_fields"],
             serde_json::json!(crate::input::video::REQUEST_FIELDS)

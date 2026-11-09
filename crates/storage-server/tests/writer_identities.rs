@@ -39,9 +39,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use storage::{
-    Access, Claim, Client, Error, Key, Mode, Role, Scope, StorageRecord, TensorRecord,
-};
+use storage::{Access, Claim, Client, Error, Key, Mode, Role, Scope, StorageRecord, TensorRecord};
 use storage_server::Server;
 
 /// A Storage Server on its own socket, stopped when dropped.

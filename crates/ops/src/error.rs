@@ -77,7 +77,6 @@ pub enum Error {
 }
 
 impl Error {
-
     /// An argument mismatch of `operator`.
     pub(crate) fn argument(operator: &'static str, problem: impl Into<String>) -> Self {
         Self::Argument {

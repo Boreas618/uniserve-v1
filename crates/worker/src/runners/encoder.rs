@@ -362,8 +362,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
         buckets
     }
 
-
-
     fn stream_id(&self) -> StreamId {
         StreamId(self.stream.raw())
     }

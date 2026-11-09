@@ -147,7 +147,6 @@ impl Partition {
         let first = self.expert_rank * per_rank;
         first..first + per_rank
     }
-
 }
 
 #[cfg(test)]

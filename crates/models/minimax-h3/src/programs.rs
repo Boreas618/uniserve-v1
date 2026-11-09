@@ -48,7 +48,6 @@ impl Programs {
         self.rows.dedup();
         self.rows
     }
-
 }
 
 /// The element type of each component a deployment runs.
@@ -157,7 +156,6 @@ impl Deployment {
             rungs,
         })
     }
-
 
     /// The tasks the checkpoint at `root` states it serves.
     ///

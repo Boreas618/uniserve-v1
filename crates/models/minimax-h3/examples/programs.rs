@@ -26,10 +26,10 @@ use minimax_h3::encoding::{AudioEncoder, VideoEncoder};
 use minimax_h3::modulation::Groups;
 use minimax_h3::output::VideoPostprocessor;
 use minimax_h3::partition::{Partition, Ulysses};
-use nn::family::Projection;
 use minimax_h3::programs::{Deployment, Types};
 use minimax_h3::tiled_encode::ClipEncoder;
 use minimax_h3::video_vae::VideoDecoder;
+use nn::family::Projection;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut arguments = std::env::args().skip(1);

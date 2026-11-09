@@ -57,7 +57,6 @@ impl CrossFade {
         })
     }
 
-
     /// Blend `previous` and `current` into `out`, all `[channels, frames, rows, columns]`.
     ///
     /// The leading `extent` positions of `axis` blend; every later position is `current`'s, copied.

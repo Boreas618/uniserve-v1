@@ -153,7 +153,6 @@ impl Staged {
         buffer.resize(length, 0);
         Ok(())
     }
-
 }
 
 /// The columns a denoiser stages a batch into, sized for the largest bucket it was bound with.
@@ -688,7 +687,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         self.model.schedule(&plan.warm.view()).map_err(Error::from)
     }
 
-
     /// Claims the arena the largest bucket's evaluation plans.
     fn claim(&mut self) -> Result<()> {
         let plans = self.buckets.clone();
@@ -709,7 +707,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         }
         Ok(())
     }
-
 
     fn stream_id(&self) -> StreamId {
         StreamId(self.stream.raw())
@@ -2013,11 +2010,11 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
                     .graphs
                     .captured_for(*bucket, *generation)
                     .ok_or_else(|| {
-                    Error::Invariant(format!(
-                        "no graph of bucket {bucket} in generation {generation} or in a \
+                        Error::Invariant(format!(
+                            "no graph of bucket {bucket} in generation {generation} or in a \
                                  generation it replaces"
-                    ))
-                })?;
+                        ))
+                    })?;
                 if served != *generation {
                     tracing::debug!(
                         bucket = %bucket,

@@ -973,7 +973,6 @@ impl Qwen3Moe {
         Ok((input, residual, buffers))
     }
 
-
     /// The number of tokens one page of the prefix cache holds.
     /// The tokens one prefix-cache page holds, which the deployment's cache chose.
     pub const fn cache_page_tokens(&self) -> u32 {

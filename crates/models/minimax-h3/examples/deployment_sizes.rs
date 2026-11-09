@@ -478,10 +478,7 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
         let partition = minimax_h3::partition::Partition::serving(
             &config,
             task,
-            minimax_h3::partition::Ulysses::of(
-                ulysses,
-                nn::family::Projection::Exchange,
-            ),
+            minimax_h3::partition::Ulysses::of(ulysses, nn::family::Projection::Exchange),
             tensor,
             0,
             0,

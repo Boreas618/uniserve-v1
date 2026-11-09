@@ -284,7 +284,6 @@ impl Graphs {
         buckets
     }
 
-
     /// Whether the runner holds no graph.
     pub fn is_empty(&self) -> bool {
         self.captured.is_empty()

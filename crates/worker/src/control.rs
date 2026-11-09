@@ -432,7 +432,6 @@ impl Control {
         self.engine
     }
 
-
     /// Closes every connection, letting each peer observe the close.
     pub fn close(&mut self) {
         for channel in self.peers.values_mut() {

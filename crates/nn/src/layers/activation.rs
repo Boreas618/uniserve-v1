@@ -56,7 +56,6 @@ impl GatedActivation {
         self
     }
 
-
     /// The descriptor one gated activation of `width` channels launches, stated without a device.
     ///
     /// The two row strides are launch values a walk reads from the scratch layout, and `elements` is
@@ -206,7 +205,6 @@ impl SwiGlu {
         Ok(self)
     }
 
-
     /// Channels of one output row.
     pub const fn width(&self) -> u32 {
         self.width
@@ -231,7 +229,6 @@ impl SwiGlu {
     ) -> Result<()> {
         self.run(f, gate, value, out, None)
     }
-
 
     fn run(
         &self,
@@ -334,7 +331,6 @@ impl PackedSwiGlu {
         })
     }
 
-
     /// The activation of a packed `[..., 2 · width]` projection into `[..., width]`.
     ///
     /// `out` may overlap the leading half of `projection` (the value half), element for element; it
@@ -403,7 +399,6 @@ impl Gelu {
             approximation: ops::gelu::Approximation::Exact,
         }
     }
-
 
     /// The descriptor one GELU over rows of `columns` channels launches, stated without a device.
     ///

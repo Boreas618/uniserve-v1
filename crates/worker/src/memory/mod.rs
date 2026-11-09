@@ -15,12 +15,12 @@ pub mod reload;
 pub mod retained;
 pub mod weights;
 
+pub use prefix_cache::PrefixCache;
 pub use prefix_cache::block_tables::{
     BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
 };
 pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, Checkpoint, GroupAxis};
 pub use prefix_cache::planes::{CachePlanes, LaidSegment, PlaneLayout, UnitColumn};
-pub use prefix_cache::PrefixCache;
 
 use std::sync::Mutex;
 
@@ -197,9 +197,6 @@ impl Memory {
         Ok(())
     }
 
-
-
-
     /// The bytes one token of this rank's pages takes in the host KV cache; zero on a rank that
     /// keeps no paged cache.
     pub fn host_token_bytes(&self) -> u64 {
@@ -214,7 +211,6 @@ impl Memory {
             .as_ref()
             .map_or(0, |cache| lock(cache).plan().groups.len())
     }
-
 
     /// The device's pools, so a paired forward can take its scratch page set
     /// from the same allowance as every other pool.
