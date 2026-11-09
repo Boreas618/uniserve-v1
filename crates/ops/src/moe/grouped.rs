@@ -257,18 +257,12 @@ impl Op for GatherGemm {
     type Descriptor = GatherGemmDescriptor;
     type Args<'a> = GatherGemmArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let hidden = u64::from(descriptor.hidden);
         let intermediate = u64::from(descriptor.intermediate);
         let experts = u64::from(descriptor.experts);
         let top = u64::from(descriptor.top);
         let tokens = args.hidden.rows();
-        let permuted_rows = args.out.rows();
 
         args.hidden
             .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
@@ -333,6 +327,21 @@ impl Op for GatherGemm {
             .require_shape(Self::NAME, Shape::new(&[permuted, intermediate]))?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, intermediate)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let hidden = u64::from(descriptor.hidden);
+        let intermediate = u64::from(descriptor.intermediate);
+        let experts = u64::from(descriptor.experts);
+        let top = u64::from(descriptor.top);
+        let tokens = args.hidden.rows();
+        let permuted_rows = args.out.rows();
 
         let mut call = GatherCall {
             hidden: address(args.hidden.ptr) as usize as *const c_void,
@@ -394,12 +403,7 @@ impl Op for RouteGemm {
     type Descriptor = RouteGemmDescriptor;
     type Args<'a> = RouteGemmArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let hidden = u64::from(descriptor.hidden);
         let intermediate = u64::from(descriptor.intermediate);
         let experts = u64::from(descriptor.experts);
@@ -461,6 +465,19 @@ impl Op for RouteGemm {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let hidden = u64::from(descriptor.hidden);
+        let intermediate = u64::from(descriptor.intermediate);
+        let experts = u64::from(descriptor.experts);
+        let rows = args.rows.rows();
 
         let mut call = RouteCall {
             rows: address(args.rows.ptr) as usize as *const c_void,
@@ -913,15 +930,14 @@ impl NativeCall for RouteNvfp4Call {
 /// The routed first matrix over a packed, block-scaled expert stack.
 pub struct GatherGemmNvfp4;
 
-impl GatherGemmNvfp4 {
-    /// The launch's shape and geometry rules, separated from the launch itself so a host test can
-    /// state them without a device.
-    ///
-    /// Answers the contraction, the expert width and the permuted row count the launch needs.
-    pub(crate) fn validate(
-        descriptor: &GatherGemmNvfp4Descriptor,
-        args: &GatherGemmNvfp4Args,
-    ) -> Result<(u64, u64, u64)> {
+impl Op for GatherGemmNvfp4 {
+    const NAME: &'static str = "gather_gemm_nvfp4";
+
+    type Descriptor = GatherGemmNvfp4Descriptor;
+    type Args<'a> = GatherGemmNvfp4Args;
+
+    /// The launch's shape and geometry rules, and the workspace both encoded products carry.
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let hidden = u64::from(descriptor.hidden);
         let intermediate = u64::from(descriptor.intermediate);
         let experts = u64::from(descriptor.experts);
@@ -1096,15 +1112,8 @@ impl GatherGemmNvfp4 {
                 "a launch with no routes per token packs no rows".to_owned(),
             ));
         }
-        Ok((hidden, intermediate, routes))
+        check_workspace(Self::NAME, args.workspace)
     }
-}
-
-impl Op for GatherGemmNvfp4 {
-    const NAME: &'static str = "gather_gemm_nvfp4";
-
-    type Descriptor = GatherGemmNvfp4Descriptor;
-    type Args<'a> = GatherGemmNvfp4Args;
 
     fn launch(
         kernel: &Kernel,
@@ -1112,9 +1121,11 @@ impl Op for GatherGemmNvfp4 {
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let (hidden, intermediate, routes) = Self::validate(descriptor, &args)?;
-        check_workspace(Self::NAME, args.workspace)?;
+        let hidden = u64::from(descriptor.hidden);
+        let intermediate = u64::from(descriptor.intermediate);
+        let routes = args.out.rows();
         let tokens = args.hidden.rows();
+
         let mut call = GatherNvfp4Call {
             hidden: address(args.hidden.ptr) as usize as *const c_void,
             hidden_scale: address(args.hidden_scale.ptr) as usize as *const c_void,
@@ -1392,12 +1403,7 @@ impl Op for RouteGemmNvfp4 {
     type Descriptor = RouteGemmNvfp4Descriptor;
     type Args<'a> = RouteGemmNvfp4Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let hidden = u64::from(descriptor.hidden);
         let intermediate = u64::from(descriptor.intermediate);
         let experts = u64::from(descriptor.experts);
@@ -1532,8 +1538,21 @@ impl Op for RouteGemmNvfp4 {
                 ),
             ));
         }
-
         check_workspace(Self::NAME, args.workspace)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let hidden = u64::from(descriptor.hidden);
+        let intermediate = u64::from(descriptor.intermediate);
+        let experts = u64::from(descriptor.experts);
+        let routes = args.out.rows();
+
         let mut call = RouteNvfp4Call {
             hidden: address(args.hidden.ptr) as usize as *const c_void,
             hidden_scale: address(args.hidden_scale.ptr) as usize as *const c_void,
@@ -1658,7 +1677,7 @@ mod nvfp4_launch_tests {
         // width and the operand it is refused for agree; otherwise the shape check fires first and
         // the test would be green about the wrong rule.
         odd_args.hidden = table(DType::U8, &[3, 1023]);
-        let error = GatherGemmNvfp4::validate(&odd, &odd_args).unwrap_err();
+        let error = <GatherGemmNvfp4 as Op>::check(&odd, &odd_args).unwrap_err();
         assert!(format!("{error}").contains("odd"), "{error}");
 
         let mut partial = fc1();
@@ -1669,7 +1688,7 @@ mod nvfp4_launch_tests {
         // stale width here would be refused by the shape check instead of by the block rule, and the
         // test would be green about the wrong refusal.
         partial_args.hidden = table(DType::U8, &[3, 1020]);
-        let error = GatherGemmNvfp4::validate(&partial, &partial_args).unwrap_err();
+        let error = <GatherGemmNvfp4 as Op>::check(&partial, &partial_args).unwrap_err();
         assert!(format!("{error}").contains("scale blocks"), "{error}");
     }
 
@@ -1677,7 +1696,7 @@ mod nvfp4_launch_tests {
     fn a_scale_cover_short_by_one_block_is_refused() {
         let mut args = fc1_args();
         args.scales = table(DType::F8E4M3, &[127, 1536, 128]);
-        let error = GatherGemmNvfp4::validate(&fc1(), &args).unwrap_err();
+        let error = <GatherGemmNvfp4 as Op>::check(&fc1(), &args).unwrap_err();
         assert!(format!("{error}").contains("do not cover"));
     }
 }

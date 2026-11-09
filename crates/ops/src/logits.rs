@@ -60,12 +60,7 @@ impl Op for LogitsGather {
     type Descriptor = GatherDescriptor;
     type Args<'a> = GatherArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         args.hidden
             .require_row(Self::NAME, descriptor.dtype, columns)?;
@@ -81,6 +76,17 @@ impl Op for LogitsGather {
             .require_shape(Self::NAME, Shape::new(&[count, columns]))?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, columns)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let columns = u64::from(descriptor.columns);
+        let count = args.rows.shape.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
@@ -166,12 +172,7 @@ impl Op for VocabUnpad {
     type Descriptor = UnpadDescriptor;
     type Args<'a> = UnpadArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let vocabulary = u64::from(descriptor.vocabulary);
         let padded = u64::from(descriptor.padded);
         if padded < vocabulary {
@@ -204,6 +205,17 @@ impl Op for VocabUnpad {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let vocabulary = u64::from(descriptor.vocabulary);
+        let rows = args.gathered.rows();
 
         let mut arguments = Arguments::new();
         arguments

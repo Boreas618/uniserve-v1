@@ -219,14 +219,21 @@ impl Op for Unpatchify {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        args.validate(descriptor)?;
+        row_writable(&args.out, Self::NAME)?;
+        Ok(())
+    }
+
     fn launch(
         kernel: &Kernel,
         descriptor: &Self::Descriptor,
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        args.validate(descriptor)?;
-        let strides = row_writable(&args.out, Self::NAME)?;
+        // The outer strides of the layout `check` accepted.
+        let strides = crate::tensor::outer_strides(&args.out);
+
         let mut arguments = Arguments::new();
         arguments.view(args.tokens);
         if let (Some(scale), Some(bias)) = (args.scale, args.bias) {

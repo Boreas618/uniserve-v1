@@ -141,12 +141,7 @@ impl Op for CacheBlockSnapshot {
     type Descriptor = SnapshotDescriptor;
     type Args<'a> = SnapshotArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let count = descriptor.check(Self::NAME, &args.field, &args.blocks)?;
         args.snapshot.require_rank(Self::NAME, 2)?;
         args.snapshot
@@ -166,6 +161,17 @@ impl Op for CacheBlockSnapshot {
                 "the snapshot is not contiguous".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        // One block per selected index: `check` holds the index vector to one axis.
+        let count = args.blocks.shape.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
@@ -220,12 +226,7 @@ impl Op for CacheBlockScatter {
     type Descriptor = ScatterDescriptor;
     type Args<'a> = ScatterArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let count = descriptor.check(Self::NAME, &args.field, &args.blocks)?;
         args.snapshot.require_rank(Self::NAME, 2)?;
         args.snapshot
@@ -245,6 +246,17 @@ impl Op for CacheBlockScatter {
                 "the snapshot is not contiguous".to_owned(),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        // One block per selected index: `check` holds the index vector to one axis.
+        let count = args.blocks.shape.dim(0);
 
         let mut arguments = Arguments::new();
         arguments

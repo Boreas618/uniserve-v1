@@ -244,12 +244,7 @@ impl Op for MoeSort {
     type Descriptor = Descriptor;
     type Args<'a> = SortArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let top = u64::from(descriptor.top);
         let experts = u64::from(descriptor.experts);
         let local = u64::from(descriptor.local_experts);
@@ -325,6 +320,20 @@ impl Op for MoeSort {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let top = u64::from(descriptor.top);
+        let experts = u64::from(descriptor.experts);
+        let local = u64::from(descriptor.local_experts);
+        let tile = u64::from(descriptor.tile_tokens);
+        let tokens = args.ids.rows();
 
         let mut call = Call {
             ids: address(args.ids.ptr) as usize as *const i32,

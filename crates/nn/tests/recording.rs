@@ -68,14 +68,19 @@ fn a_split_recording_answers_the_gathered_width_of_its_rank() {
         "{launches:?}"
     );
 
-    // A gather buffer of one shard is what an unsplit head reads, and a split of two refuses it.
+    // A gather buffer of one shard does not hold two ranks' columns.
     let one_shard = arena.tensor(DType::BF16, Shape::new(&[3, 16])).unwrap();
     assert!(
         head.forward(&f, hidden, projected, Some(one_shard), out)
             .is_err()
     );
+    // Unsplit, the shard's 16 columns are the whole gathered width and cannot hold a vocabulary
+    // of 30: the unpad refuses the call, as the device would.
     let unsplit = Forward::recording(&arena);
-    assert!(head.forward(&unsplit, hidden, projected, None, out).is_ok());
+    assert!(
+        head.forward(&unsplit, hidden, projected, None, out)
+            .is_err()
+    );
 }
 
 /// A sequence-parallel exchange over two ranks moves two equal blocks: a recording forward split
@@ -151,4 +156,28 @@ fn a_collective_needs_a_split() {
     assert!(f.all_reduce(rows).is_err());
     assert!(Forward::recording(&arena).with_split(2, 2).is_err());
     assert!(Forward::recording(&arena).with_split(0, 0).is_err());
+}
+
+/// A recording forward checks every call as the device would before it reports the program: a
+/// call a launch would refuse is refused here with the same error, and no key is recorded for it.
+#[test]
+fn a_recording_forward_refuses_a_call_the_device_would_refuse() {
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let descriptor = nn::layers::Silu::descriptor_of(DType::BF16, 1024);
+    let x = arena.tensor(DType::BF16, Shape::new(&[4, 1024])).unwrap();
+    let short = arena.tensor(DType::BF16, Shape::new(&[3, 1024])).unwrap();
+
+    let (answer, launches) = recorded(|| {
+        f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out: short })
+    });
+    let refused = answer.unwrap_err().to_string();
+    assert!(refused.contains("silu"), "{refused}");
+    assert!(launches.is_empty(), "{launches:?}");
+
+    let (answer, launches) = recorded(|| {
+        f.operate::<ops::activation::Silu>(&descriptor, ops::activation::SiluArgs { x, out: x })
+    });
+    answer.unwrap();
+    assert_eq!(launches.len(), 1);
 }

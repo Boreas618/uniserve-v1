@@ -82,12 +82,7 @@ impl Op for AdaptivePool {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.heads == 0 || descriptor.width == 0 || descriptor.output == 0 {
             return Err(Error::argument(
                 Self::NAME,
@@ -127,6 +122,16 @@ impl Op for AdaptivePool {
         )?;
         args.out
             .require_row(Self::NAME, descriptor.dtype, u64::from(descriptor.output))?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let shape = args.x.shape;
 
         let outputs = shape.dim(0) * u64::from(descriptor.output);
         let mut arguments = Arguments::new();

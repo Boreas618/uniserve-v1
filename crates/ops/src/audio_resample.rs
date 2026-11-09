@@ -120,12 +120,7 @@ impl Op for AudioResample {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let channels = u64::from(descriptor.channels);
         let kernel_size = u64::from(descriptor.kernel);
         let ratio = u64::from(descriptor.ratio);
@@ -233,6 +228,19 @@ impl Op for AudioResample {
                 ),
             ));
         }
+        u32_of(Self::NAME, width, "the width")?;
+        u32_of(Self::NAME, out_width, "the output width")?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (rows, width) = (args.x.shape.dim(0), args.x.shape.dim(2));
+        let out_width = args.out.shape.dim(2);
 
         let mut arguments = Arguments::new();
         arguments
@@ -241,8 +249,9 @@ impl Op for AudioResample {
             .view(args.out)
             .u64(rows)
             .u32(descriptor.channels)
-            .u32(u32_of(Self::NAME, width, "the width")?)
-            .u32(u32_of(Self::NAME, out_width, "the output width")?)
+            // `check` holds both widths within kernel parameters.
+            .u32(width as u32)
+            .u32(out_width as u32)
             .u32(args.pad)
             .u32(args.pad_left)
             .u32(args.pad_right)

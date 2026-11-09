@@ -401,7 +401,6 @@ pub fn row_readable(source: &TensorView, op: &'static str) -> Result<[u64; MAX_R
 fn row_layout(view: &TensorView, op: &'static str, role: &str) -> Result<[u64; MAX_RANK]> {
     let out = view;
     let strides = out.strides.as_slice();
-    let mut outer = [0_u64; MAX_RANK];
     if strides.last() != Some(&1) {
         return Err(Error::argument(
             op,
@@ -425,8 +424,19 @@ fn row_layout(view: &TensorView, op: &'static str, role: &str) -> Result<[u64; M
             ));
         }
     }
-    outer[..strides.len() - 1].copy_from_slice(&strides[..strides.len() - 1]);
-    Ok(outer)
+    Ok(outer_strides(view))
+}
+
+/// The outer strides of a view [`row_writable`] or [`row_readable`] accepted, in axis order.
+///
+/// An operator's `check` states the row rule and its `launch` reads the strides here, so the rule
+/// is checked once per call.
+pub fn outer_strides(view: &TensorView) -> [u64; MAX_RANK] {
+    let strides = view.strides.as_slice();
+    let mut outer = [0_u64; MAX_RANK];
+    let axes = strides.len().saturating_sub(1);
+    outer[..axes].copy_from_slice(&strides[..axes]);
+    outer
 }
 
 /// A borrowed view of device memory: an address, an element type, extents and element strides.

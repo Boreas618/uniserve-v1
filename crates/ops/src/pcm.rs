@@ -80,12 +80,7 @@ impl Op for PcmInterleave {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let samples = u64::from(args.samples);
         if samples == 0 {
             return Err(Error::argument(
@@ -119,6 +114,16 @@ impl Op for PcmInterleave {
                 format!("expected i16 output, found {}", args.out.dtype),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let samples = u64::from(args.samples);
 
         let mut arguments = Arguments::new();
         arguments

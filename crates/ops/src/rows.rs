@@ -110,12 +110,7 @@ impl Op for Rows {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         let count = args.indices.numel();
 
@@ -154,6 +149,23 @@ impl Op for Rows {
                 ),
             ));
         }
+        u32::try_from(count).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{count} rows do not fit a kernel parameter"),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let columns = u64::from(descriptor.columns);
+        let count = args.indices.numel();
 
         let block = u64::from(descriptor.block);
         let mut arguments = Arguments::new();
@@ -161,12 +173,8 @@ impl Op for Rows {
             .view(args.source)
             .view(args.destination)
             .view(args.indices)
-            .u32(u32::try_from(count).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("{count} rows do not fit a kernel parameter"),
-                )
-            })?)
+            // `check` keeps the row count within a kernel parameter.
+            .u32(count as u32)
             .u32(descriptor.columns)
             .u32(descriptor.block)
             .flag(descriptor.pdl);

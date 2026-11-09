@@ -157,186 +157,182 @@ pub struct CommitArgs {
 /// Apply a sampling step's commit rows to the slots' state.
 pub struct SlotCommit;
 
-/// Check one launch's views and descriptor against the operator's contract.
-///
-/// Extracted from [`SlotCommit::launch`] so that the refusals — which are the whole reason a wrong
-/// call fails loudly instead of corrupting a slot's state — are testable without a device.
-fn validate(descriptor: &CommitDescriptor, args: &CommitArgs) -> Result<()> {
-    if args.count == 0 {
-        return Err(Error::argument(
-            SlotCommit::NAME,
-            "a step of zero rows commits nothing".to_owned(),
-        ));
-    }
-    if descriptor.block == 0 || !descriptor.block.is_power_of_two() {
-        return Err(Error::argument(
-            SlotCommit::NAME,
-            format!("the {} lane block is not a power of two", descriptor.block),
-        ));
-    }
-    if u64::from(descriptor.block) < args.count {
-        return Err(Error::argument(
-            SlotCommit::NAME,
-            format!(
-                "a block of {} lanes cannot cover {} rows",
-                descriptor.block, args.count
-            ),
-        ));
-    }
-    args.columns.require_rank(SlotCommit::NAME, 2)?;
-    if args.columns.shape.dim(0) < COMMIT_FIELDS as u64 {
-        return Err(Error::argument(
-            SlotCommit::NAME,
-            format!(
-                "the commit table has {} columns, a row is {COMMIT_FIELDS}",
-                args.columns.shape.dim(0)
-            ),
-        ));
-    }
-    check_type(
-        SlotCommit::NAME,
-        "the commit table",
-        &args.columns,
-        descriptor.index,
-    )?;
-    if args.columns.strides.get(1) != 1 || args.columns.strides.get(0) != descriptor.stride {
-        return Err(Error::argument(
-            SlotCommit::NAME,
-            format!(
-                "the commit columns are {} elements apart and {} apart within a column, the \
-                 descriptor says {}",
-                args.columns.strides.get(0),
-                args.columns.strides.get(1),
-                descriptor.stride
-            ),
-        ));
-    }
-    if args.columns.shape.dim(1) < args.count {
-        return Err(Error::argument(
-            SlotCommit::NAME,
-            format!(
-                "the commit table holds {} rows, the step commits {}",
-                args.columns.shape.dim(1),
-                args.count
-            ),
-        ));
-    }
-    for view in [
-        &args.tokens,
-        &args.valid,
-        &args.active,
-        &args.continuation,
-        &args.points,
-    ] {
-        view.require_rank(SlotCommit::NAME, 1)?;
-    }
-    // `valid` and `active` are flags whose product is the penalty weight; the kernel casts that
-    // product to `i32`, so the views must be integer — a float flag would silently truncate. The
-    // runner's own convention is `i32`, and `u8` costs nothing to accept.
-    for (name, view) in [
-        ("the valid flags", &args.valid),
-        ("the active flags", &args.active),
-    ] {
-        if !matches!(view.dtype, DType::I32 | DType::I64 | DType::U8) {
-            return Err(Error::argument(
-                SlotCommit::NAME,
-                format!(
-                    "{name} are {}, an integer flag is i32, i64 or u8",
-                    view.dtype
-                ),
-            ));
-        }
-    }
-    for (name, view) in [
-        ("the tokens", &args.tokens),
-        ("the points", &args.points),
-        ("the logical positions", &args.logical),
-        ("the sampling positions", &args.sampling),
-    ] {
-        check_type(SlotCommit::NAME, name, view, descriptor.index)?;
-    }
-    for (name, view) in [
-        ("the continuation", &args.continuation),
-        ("the predicates", &args.predicates),
-    ] {
-        check_type(SlotCommit::NAME, name, view, DType::U8)?;
-    }
-    check_type(
-        SlotCommit::NAME,
-        "the verified lengths",
-        &args.verified,
-        descriptor.verified,
-    )?;
-    check_type(
-        SlotCommit::NAME,
-        "the penalty counts",
-        &args.penalties,
-        descriptor.penalties,
-    )?;
-    args.predicates.require_rank(SlotCommit::NAME, 1)?;
-    args.logical.require_rank(SlotCommit::NAME, 1)?;
-    args.sampling.require_rank(SlotCommit::NAME, 1)?;
-    args.verified.require_rank(SlotCommit::NAME, 1)?;
-    args.future.require_rank(SlotCommit::NAME, 2)?;
-    check_type(
-        SlotCommit::NAME,
-        "the next-input tokens",
-        &args.future,
-        descriptor.index,
-    )?;
-    if args.future.strides.get(0) != descriptor.future_stride {
-        return Err(Error::argument(
-            SlotCommit::NAME,
-            format!(
-                "the next-input rows are {} elements apart, the descriptor says {}",
-                args.future.strides.get(0),
-                descriptor.future_stride
-            ),
-        ));
-    }
-    let slots = args.future.shape.dim(0);
-    for (name, view) in [
-        ("the predicates", &args.predicates),
-        ("the logical positions", &args.logical),
-        ("the sampling positions", &args.sampling),
-        ("the verified lengths", &args.verified),
-    ] {
-        if view.shape.dim(0) < slots {
-            return Err(Error::argument(
-                SlotCommit::NAME,
-                format!(
-                    "the {name} hold {} slots, the next-input matrix {slots}",
-                    view.shape.dim(0)
-                ),
-            ));
-        }
-    }
-    args.penalties.require_rank(SlotCommit::NAME, 2)?;
-    if args.penalties.shape.dim(0) < slots
-        || args.penalties.shape.dim(1) != u64::from(descriptor.vocab)
-    {
-        return Err(Error::argument(
-            SlotCommit::NAME,
-            format!("the penalty counts are not [{slots}, {}]", descriptor.vocab),
-        ));
-    }
-    Ok(())
-}
-
 impl Op for SlotCommit {
     const NAME: &'static str = "slot_commit";
 
     type Descriptor = CommitDescriptor;
     type Args<'a> = CommitArgs;
 
+    /// The refusals here are the whole reason a wrong call fails loudly instead of corrupting a
+    /// slot's state, and they need no device.
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        if args.count == 0 {
+            return Err(Error::argument(
+                SlotCommit::NAME,
+                "a step of zero rows commits nothing".to_owned(),
+            ));
+        }
+        if descriptor.block == 0 || !descriptor.block.is_power_of_two() {
+            return Err(Error::argument(
+                SlotCommit::NAME,
+                format!("the {} lane block is not a power of two", descriptor.block),
+            ));
+        }
+        if u64::from(descriptor.block) < args.count {
+            return Err(Error::argument(
+                SlotCommit::NAME,
+                format!(
+                    "a block of {} lanes cannot cover {} rows",
+                    descriptor.block, args.count
+                ),
+            ));
+        }
+        args.columns.require_rank(SlotCommit::NAME, 2)?;
+        if args.columns.shape.dim(0) < COMMIT_FIELDS as u64 {
+            return Err(Error::argument(
+                SlotCommit::NAME,
+                format!(
+                    "the commit table has {} columns, a row is {COMMIT_FIELDS}",
+                    args.columns.shape.dim(0)
+                ),
+            ));
+        }
+        check_type(
+            SlotCommit::NAME,
+            "the commit table",
+            &args.columns,
+            descriptor.index,
+        )?;
+        if args.columns.strides.get(1) != 1 || args.columns.strides.get(0) != descriptor.stride {
+            return Err(Error::argument(
+                SlotCommit::NAME,
+                format!(
+                    "the commit columns are {} elements apart and {} apart within a column, the \
+                     descriptor says {}",
+                    args.columns.strides.get(0),
+                    args.columns.strides.get(1),
+                    descriptor.stride
+                ),
+            ));
+        }
+        if args.columns.shape.dim(1) < args.count {
+            return Err(Error::argument(
+                SlotCommit::NAME,
+                format!(
+                    "the commit table holds {} rows, the step commits {}",
+                    args.columns.shape.dim(1),
+                    args.count
+                ),
+            ));
+        }
+        for view in [
+            &args.tokens,
+            &args.valid,
+            &args.active,
+            &args.continuation,
+            &args.points,
+        ] {
+            view.require_rank(SlotCommit::NAME, 1)?;
+        }
+        // `valid` and `active` are flags whose product is the penalty weight; the kernel casts that
+        // product to `i32`, so the views must be integer — a float flag would silently truncate. The
+        // runner's own convention is `i32`, and `u8` costs nothing to accept.
+        for (name, view) in [
+            ("the valid flags", &args.valid),
+            ("the active flags", &args.active),
+        ] {
+            if !matches!(view.dtype, DType::I32 | DType::I64 | DType::U8) {
+                return Err(Error::argument(
+                    SlotCommit::NAME,
+                    format!(
+                        "{name} are {}, an integer flag is i32, i64 or u8",
+                        view.dtype
+                    ),
+                ));
+            }
+        }
+        for (name, view) in [
+            ("the tokens", &args.tokens),
+            ("the points", &args.points),
+            ("the logical positions", &args.logical),
+            ("the sampling positions", &args.sampling),
+        ] {
+            check_type(SlotCommit::NAME, name, view, descriptor.index)?;
+        }
+        for (name, view) in [
+            ("the continuation", &args.continuation),
+            ("the predicates", &args.predicates),
+        ] {
+            check_type(SlotCommit::NAME, name, view, DType::U8)?;
+        }
+        check_type(
+            SlotCommit::NAME,
+            "the verified lengths",
+            &args.verified,
+            descriptor.verified,
+        )?;
+        check_type(
+            SlotCommit::NAME,
+            "the penalty counts",
+            &args.penalties,
+            descriptor.penalties,
+        )?;
+        args.predicates.require_rank(SlotCommit::NAME, 1)?;
+        args.logical.require_rank(SlotCommit::NAME, 1)?;
+        args.sampling.require_rank(SlotCommit::NAME, 1)?;
+        args.verified.require_rank(SlotCommit::NAME, 1)?;
+        args.future.require_rank(SlotCommit::NAME, 2)?;
+        check_type(
+            SlotCommit::NAME,
+            "the next-input tokens",
+            &args.future,
+            descriptor.index,
+        )?;
+        if args.future.strides.get(0) != descriptor.future_stride {
+            return Err(Error::argument(
+                SlotCommit::NAME,
+                format!(
+                    "the next-input rows are {} elements apart, the descriptor says {}",
+                    args.future.strides.get(0),
+                    descriptor.future_stride
+                ),
+            ));
+        }
+        let slots = args.future.shape.dim(0);
+        for (name, view) in [
+            ("the predicates", &args.predicates),
+            ("the logical positions", &args.logical),
+            ("the sampling positions", &args.sampling),
+            ("the verified lengths", &args.verified),
+        ] {
+            if view.shape.dim(0) < slots {
+                return Err(Error::argument(
+                    SlotCommit::NAME,
+                    format!(
+                        "the {name} hold {} slots, the next-input matrix {slots}",
+                        view.shape.dim(0)
+                    ),
+                ));
+            }
+        }
+        args.penalties.require_rank(SlotCommit::NAME, 2)?;
+        if args.penalties.shape.dim(0) < slots
+            || args.penalties.shape.dim(1) != u64::from(descriptor.vocab)
+        {
+            return Err(Error::argument(
+                SlotCommit::NAME,
+                format!("the penalty counts are not [{slots}, {}]", descriptor.vocab),
+            ));
+        }
+        Ok(())
+    }
+
     fn launch(
         kernel: &Kernel,
-        descriptor: &Self::Descriptor,
+        _descriptor: &Self::Descriptor,
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        validate(descriptor, &args)?;
-
         let mut arguments = Arguments::new();
         arguments
             .view(args.columns)
@@ -442,13 +438,13 @@ mod tests {
     fn refusal(descriptor: &CommitDescriptor, args: &CommitArgs) -> String {
         format!(
             "{}",
-            validate(descriptor, args).expect_err("the launch should have been refused")
+            SlotCommit::check(descriptor, args).expect_err("the launch should have been refused")
         )
     }
 
     #[test]
     fn a_step_of_decoded_rows_passes_every_check() {
-        validate(&descriptor(), &args()).expect("a plain step is valid");
+        SlotCommit::check(&descriptor(), &args()).expect("a plain step is valid");
     }
 
     #[test]
@@ -498,7 +494,7 @@ mod tests {
         }
         let mut wide = args();
         wide.active = view(DType::U8, &[4], &[1]);
-        validate(&descriptor(), &wide).expect("a u8 flag is an integer");
+        SlotCommit::check(&descriptor(), &wide).expect("a u8 flag is an integer");
     }
 
     #[test]

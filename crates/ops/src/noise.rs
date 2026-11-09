@@ -153,12 +153,7 @@ impl Op for PhiloxNoise {
     type Descriptor = NoiseDescriptor;
     type Args<'a> = NoiseArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if !matches!(descriptor.dtype, DType::F16 | DType::BF16 | DType::F32) {
             return Err(Error::argument(
                 Self::NAME,
@@ -190,6 +185,16 @@ impl Op for PhiloxNoise {
                 "the noise buffer is not contiguous".to_owned(),
             ));
         }
+        keyed(descriptor, args)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let plan = plan(descriptor, args)?;
 
         let mut arguments = Arguments::new();
@@ -249,13 +254,12 @@ struct Plan {
     grid: LaunchGrid,
 }
 
-/// The addressing of one draw, checked against the form its descriptor names.
-fn plan(descriptor: &NoiseDescriptor, args: NoiseArgs) -> Result<Plan> {
+/// Refuses a draw whose key form is not the one its descriptor names.
+///
+/// The two key forms address the draw differently, so the view and the grid follow the descriptor
+/// and a call that hands the wrong one is refused rather than read.
+fn keyed(descriptor: &NoiseDescriptor, args: &NoiseArgs) -> Result<()> {
     let rows = args.out.shape.dim(0);
-    let row_elements = args.out.shape.dim(1);
-
-    // The two key forms address the draw differently, so the view and the grid follow the
-    // descriptor and a call that hands the wrong one is refused rather than read.
     match (descriptor.source, args.keys) {
         (KeySource::Rows, Some(keys)) => {
             keys.require_shape(PhiloxNoise::NAME, Shape::new(&[rows]))?;
@@ -270,18 +274,34 @@ fn plan(descriptor: &NoiseDescriptor, args: NoiseArgs) -> Result<Plan> {
                     ),
                 ));
             }
-            Ok(Plan {
-                keys: platform::address(keys.ptr),
-                elements: row_elements,
-                // One row per program column, the whole row in the other.
-                grid: LaunchGrid::new([
-                    rows,
-                    row_elements.div_ceil(u64::from(descriptor.block)),
-                    1,
-                ])?,
-            })
+            Ok(())
         }
-        (KeySource::Scalar, None) => {
+        (KeySource::Scalar, None) => Ok(()),
+        (KeySource::Rows, None) => Err(Error::argument(
+            PhiloxNoise::NAME,
+            "the per-row form needs its keys view".to_owned(),
+        )),
+        (KeySource::Scalar, Some(_)) => Err(Error::argument(
+            PhiloxNoise::NAME,
+            "the scalar form draws from one key and takes no keys view".to_owned(),
+        )),
+    }
+}
+
+/// The addressing of one draw whose key form [`keyed`] accepted: a keys view is present exactly
+/// under [`KeySource::Rows`].
+fn plan(descriptor: &NoiseDescriptor, args: NoiseArgs) -> Result<Plan> {
+    let rows = args.out.shape.dim(0);
+    let row_elements = args.out.shape.dim(1);
+
+    match args.keys {
+        Some(keys) => Ok(Plan {
+            keys: platform::address(keys.ptr),
+            elements: row_elements,
+            // One row per program column, the whole row in the other.
+            grid: LaunchGrid::new([rows, row_elements.div_ceil(u64::from(descriptor.block)), 1])?,
+        }),
+        None => {
             // One grid over the flattened buffer: the element index is the flat index, so a value
             // depends on the key and its own position and on nothing about the launch.
             let elements = rows * row_elements;
@@ -291,14 +311,6 @@ fn plan(descriptor: &NoiseDescriptor, args: NoiseArgs) -> Result<Plan> {
                 grid: LaunchGrid::new([elements.div_ceil(u64::from(descriptor.block)), 1, 1])?,
             })
         }
-        (KeySource::Rows, None) => Err(Error::argument(
-            PhiloxNoise::NAME,
-            "the per-row form needs its keys view".to_owned(),
-        )),
-        (KeySource::Scalar, Some(_)) => Err(Error::argument(
-            PhiloxNoise::NAME,
-            "the scalar form draws from one key and takes no keys view".to_owned(),
-        )),
     }
 }
 
@@ -417,21 +429,21 @@ mod tests {
     fn a_call_that_hands_the_wrong_key_form_is_refused_both_ways() {
         let view = keys(4);
         assert!(
-            plan(&descriptor(KeySource::Rows), args(out(4, 16), None, 0)).is_err(),
+            keyed(&descriptor(KeySource::Rows), &args(out(4, 16), None, 0)).is_err(),
             "the per-row form read a draw with no keys"
         );
         assert!(
-            plan(
+            keyed(
                 &descriptor(KeySource::Scalar),
-                args(out(4, 16), Some(view), 7)
+                &args(out(4, 16), Some(view), 7)
             )
             .is_err(),
             "the scalar form read a keys view it does not address"
         );
         assert!(
-            plan(
+            keyed(
                 &descriptor(KeySource::Rows),
-                args(out(4, 16), Some(view), 7)
+                &args(out(4, 16), Some(view), 7)
             )
             .is_err(),
             "the per-row form read a key it does not use"

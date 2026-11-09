@@ -1,5 +1,5 @@
-//! What an operator is: a name, a descriptor, an argument struct, and three functions — launch it,
-//! shadow it, and say how far two implementations of it may differ.
+//! What an operator is: a name, a descriptor, an argument struct, and four functions — check a
+//! call, launch it, shadow it, and say how far two implementations of it may differ.
 //!
 //! An operator is a Rust type, not a trait object and not a name in a table. Its Rust signature is
 //! the interface a kernel program fills: the package implements what [`Op::launch`] launches, and a
@@ -33,11 +33,25 @@ pub trait Op {
     /// The borrowed views and scalars of one call.
     type Args<'a>;
 
+    /// Refuse arguments a program compiled for `descriptor` cannot be launched with.
+    ///
+    /// Every rule a call's views and scalars must meet against the descriptor is stated here and
+    /// only here: extents, element types, strides, optional operands the descriptor requires or
+    /// excludes, and index widths. It reads no device memory and needs no kernel, so a recording
+    /// forward checks a call exactly as a launching one does, and a recorded descriptor key always
+    /// comes from a call the device would accept.
+    ///
+    /// # Errors
+    ///
+    /// The first rule the arguments break, naming the operator and the operand.
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()>;
+
     /// Pack the arguments, compute the grid and launch `kernel`.
     ///
-    /// The kernel must be the one the caller resolved for this descriptor; `launch` reads the
-    /// descriptor for what the module was compiled with and the arguments for what this call is.
-    /// It is capture-safe: no allocation, no synchronization, no host read of device memory.
+    /// The kernel must be the one the caller resolved for this descriptor, and the caller has
+    /// passed these arguments through [`Op::check`]; `launch` does not check them again. It reads
+    /// the descriptor for what the module was compiled with and the arguments for what this call
+    /// is. It is capture-safe: no allocation, no synchronization, no host read of device memory.
     fn launch(
         kernel: &Kernel,
         descriptor: &Self::Descriptor,

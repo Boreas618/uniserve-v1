@@ -96,12 +96,7 @@ impl Op for PositionInterpolate {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let channels = u64::from(descriptor.channels);
         // The output's point count is the args' own extent: the grid geometry is the caller's, and
         // the program never divides by a side.
@@ -157,6 +152,25 @@ impl Op for PositionInterpolate {
                 ),
             ));
         }
+        u32::try_from(points).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{points} output points do not fit a kernel parameter"),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let channels = u64::from(descriptor.channels);
+        // The output's point count is the args' own extent: the grid geometry is the caller's, and
+        // the program never divides by a side.
+        let points = args.out.rows();
 
         let mut arguments = Arguments::new();
         arguments
@@ -164,12 +178,8 @@ impl Op for PositionInterpolate {
             .view(args.indices)
             .view(args.weights)
             .view(args.out)
-            .u32(u32::try_from(points).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("{points} output points do not fit a kernel parameter"),
-                )
-            })?)
+            // `check` keeps the point count within a kernel parameter.
+            .u32(points as u32)
             .u32(descriptor.channels)
             .u32(descriptor.block)
             .flag(descriptor.pdl);

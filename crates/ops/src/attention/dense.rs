@@ -338,12 +338,7 @@ impl Op for DenseAttention {
     type Descriptor = DenseDescriptor;
     type Args<'a> = DenseArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let operator = Self::NAME;
         let head_dim = u64::from(descriptor.head_dim);
         let q_heads = u64::from(descriptor.q_heads);
@@ -409,7 +404,7 @@ impl Op for DenseAttention {
         // The scheduler writes the offsets; the module pads its schedule to the longest row, which
         // the descriptor bounds. Two absent tables are the one-sequence form: every query row
         // attends the whole key range, which is exactly `[0, q_tokens)` and `[0, kv_tokens)`.
-        let batch = sequence_layout(operator, descriptor, args.cu_seq_lens_q, args.cu_seq_lens_k)?;
+        sequence_layout(operator, descriptor, args.cu_seq_lens_q, args.cu_seq_lens_k)?;
         if kv_tokens > u64::from(descriptor.max_kv_len) {
             return Err(Error::argument(
                 operator,
@@ -443,6 +438,27 @@ impl Op for DenseAttention {
                 format!("expected a finite nonzero scale, found {}", args.scale),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let operator = Self::NAME;
+        let head_dim = u64::from(descriptor.head_dim);
+        let q_heads = u64::from(descriptor.q_heads);
+        let kv_heads = u64::from(descriptor.kv_heads);
+        let q_tokens = args.query.shape.dim(0);
+        let kv_tokens = args.key.shape.dim(0);
+        // The query offsets hold `batch + 1` entries; without offsets the packing is one sequence.
+        let batch = args
+            .cu_seq_lens_q
+            .map_or(1, |offsets| offsets.shape.dim(0) - 1);
+        // The descriptor's mask and the call's flag agree.
+        let causal = args.causal;
 
         let mut call = DenseCall {
             out: address(args.out.ptr) as usize as *mut c_void,

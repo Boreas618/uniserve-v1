@@ -156,12 +156,7 @@ impl Op for Nvfp4Quantize {
     type Descriptor = QuantizeDescriptor;
     type Args<'a> = QuantizeArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.input != DType::BF16 && descriptor.input != DType::F16 {
             return Err(Error::argument(
                 Self::NAME,
@@ -213,6 +208,16 @@ impl Op for Nvfp4Quantize {
         args.token_scale
             .require_shape(Self::NAME, Shape::new(&[rows]))?;
         args.token_scale.require_row(Self::NAME, DType::F32, rows)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        _descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.input.rows();
 
         // One program per row: the row's amax is a reduction over the whole row and every block of
         // the row is scaled against it, so a program that owned a fragment of a row could not
@@ -388,9 +393,9 @@ pub fn require_byte_scale(op: &'static str, view: TensorView, columns: u64) -> R
 /// The operand pair an NVFP4 product requires, checked where a descriptor can be built.
 ///
 /// The truth here is the descriptor's alone — the packed weight is E2M1 pairs carried as bytes and
-/// its block scale is E4M3, two element types by construction. A check that compared one type
-/// against both refused every real product, and because it sat in `launch` only a run could say so.
-/// Called from `launch` as a backstop and from the layer that builds the descriptor, which is where
+/// its block scale is E4M3, two element types by construction; a rule that compared one type
+/// against both would refuse every real product.
+/// Called from `check` as a backstop and from the layer that builds the descriptor, which is where
 /// a test can reach it.
 pub fn check_gemm(descriptor: &GemmDescriptor) -> Result<()> {
     if descriptor.packed != DType::U8 || descriptor.scale != DType::F8E4M3 {
@@ -414,12 +419,7 @@ impl Op for Nvfp4Gemm {
     type Descriptor = GemmDescriptor;
     type Args<'a> = GemmArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         // The descriptor's own truth, refused here as a backstop for a caller that built one by
         // hand; the layer that builds it calls the same check (`fp4::check_gemm`).
         check_gemm(descriptor)?;
@@ -476,10 +476,9 @@ impl Op for Nvfp4Gemm {
             ));
         }
         args.out.require_shape(Self::NAME, Shape::new(&[m, n]))?;
-        let bias = match (descriptor.epilogue, args.bias) {
+        match (descriptor.epilogue, args.bias) {
             (Epilogue::Bias, Some(bias)) => {
                 bias.require_shape(Self::NAME, Shape::new(&[n]))?;
-                bias
             }
             (Epilogue::Bias, None) => {
                 return Err(Error::argument(
@@ -493,8 +492,21 @@ impl Op for Nvfp4Gemm {
                     "the call passed a bias the descriptor's epilogue does not add",
                 ));
             }
-            (Epilogue::None, None) => args.alpha,
-        };
+            (Epilogue::None, None) => {}
+        }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let m = args.input.rows();
+        let n = args.weight.rows();
+        // Without a bias epilogue the slot is never read; the call still takes an address.
+        let bias = args.bias.unwrap_or(args.alpha);
 
         let mut call = Call {
             input: platform::address(args.input.ptr) as usize as *const c_void,

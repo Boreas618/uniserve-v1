@@ -428,12 +428,7 @@ impl Op for PagedAttention {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let head_dim = u64::from(descriptor.head_dim);
         let q_heads = u64::from(descriptor.q_heads);
         let kv_heads = u64::from(descriptor.kv_heads);
@@ -537,7 +532,7 @@ impl Op for PagedAttention {
             ));
         }
 
-        let cum_seq_lens_q = match descriptor.phase {
+        match descriptor.phase {
             Phase::Prefill => {
                 if args.cum_seq_lens_q.shape.rank() != 1 || args.cum_seq_lens_q.dtype != DType::I32
                 {
@@ -556,7 +551,6 @@ impl Op for PagedAttention {
                         ),
                     ));
                 }
-                address(args.cum_seq_lens_q.ptr) as usize as *const i32
             }
             Phase::Decode => {
                 // A decode has one query per row, and the kernel indexes the page table and the
@@ -575,24 +569,17 @@ impl Op for PagedAttention {
                         ));
                     }
                 }
-                // The offsets are the row ends and the package derives nothing from them; an empty
-                // view is passed as null.
-                if args.cum_seq_lens_q.numel() == 0 {
-                    std::ptr::null()
-                } else {
-                    address(args.cum_seq_lens_q.ptr) as usize as *const i32
-                }
             }
-        };
+        }
 
         // A quantized cache holds each page divided by its own scale; the option is the cache's, so
         // the descriptor's dtype decides whether the call carries them.
-        let (key_scale, value_scale) = match (
+        match (
             quantized(descriptor.key_value),
             args.key_scale,
             args.value_scale,
         ) {
-            (false, None, None) => (std::ptr::null(), std::ptr::null()),
+            (false, None, None) => {}
             (true, Some(key), Some(value)) => {
                 for (name, view) in [("key_scale", key), ("value_scale", value)] {
                     view.require_shape(Self::NAME, Shape::new(&[args.key.shape.dim(0), 1, 1, 1]))?;
@@ -603,10 +590,6 @@ impl Op for PagedAttention {
                         ));
                     }
                 }
-                (
-                    address(key.ptr) as usize as *const c_void,
-                    address(value.ptr) as usize as *const c_void,
-                )
             }
             (true, _, _) => {
                 return Err(Error::argument(
@@ -623,11 +606,10 @@ impl Op for PagedAttention {
                     "the call passes page scales for an unquantized cache",
                 ));
             }
-        };
+        }
 
-        let causal = match (descriptor.mask, args.causal) {
-            (Mask::Causal, true) => 1_i64,
-            (Mask::Dense, false) => 0_i64,
+        match (descriptor.mask, args.causal) {
+            (Mask::Causal, true) | (Mask::Dense, false) => {}
             (Mask::Causal, false) => {
                 return Err(Error::argument(
                     Self::NAME,
@@ -640,7 +622,7 @@ impl Op for PagedAttention {
                     "the module was compiled for the dense mask and the call is causal",
                 ));
             }
-        };
+        }
 
         if args.window_left >= 0 && !descriptor.windowed {
             return Err(Error::argument(
@@ -664,15 +646,6 @@ impl Op for PagedAttention {
                 "the call passes its program's workspace as a non-empty u8 view",
             ));
         }
-
-        let max_q_len = match descriptor.phase {
-            Phase::Prefill => {
-                // The longest row is only known from the offsets on the device; the module pads to
-                // the packed token count, which bounds every row.
-                tokens
-            }
-            Phase::Decode => 1,
-        };
 
         // The compiled programs load their operands in 16-byte units and assert it: the cute
         // kernel's `tensorptr<bf16, gmem, align16>` and trtllm-gen's vectorized loads both refuse a
@@ -722,6 +695,59 @@ impl Op for PagedAttention {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let head_dim = u64::from(descriptor.head_dim);
+        let q_heads = u64::from(descriptor.q_heads);
+        let kv_heads = u64::from(descriptor.kv_heads);
+        let page_size = u64::from(descriptor.page_size);
+        // The first extent of the `[tokens, heads, head_dim]` query.
+        let tokens = args.query.shape.dim(0);
+        let batch = args.page_table.shape.dim(0);
+        let max_pages = args.page_table.shape.dim(1);
+        let max_kv_len = max_pages * page_size;
+
+        // `check` holds the offsets to the phase. A decode's are the row ends and the package
+        // derives nothing from them; an empty view is passed as null.
+        let cum_seq_lens_q = match descriptor.phase {
+            Phase::Prefill => address(args.cum_seq_lens_q.ptr) as usize as *const i32,
+            Phase::Decode => {
+                if args.cum_seq_lens_q.numel() == 0 {
+                    std::ptr::null()
+                } else {
+                    address(args.cum_seq_lens_q.ptr) as usize as *const i32
+                }
+            }
+        };
+
+        // `check` holds the page scales to the cache: a quantized cache passes both and any other
+        // passes none.
+        let (key_scale, value_scale) = match (args.key_scale, args.value_scale) {
+            (Some(key), Some(value)) => (
+                address(key.ptr) as usize as *const c_void,
+                address(value.ptr) as usize as *const c_void,
+            ),
+            _ => (std::ptr::null(), std::ptr::null()),
+        };
+
+        // `check` holds the call's mask to the module's.
+        let causal = i64::from(args.causal);
+
+        let max_q_len = match descriptor.phase {
+            Phase::Prefill => {
+                // The longest row is only known from the offsets on the device; the module pads to
+                // the packed token count, which bounds every row.
+                tokens
+            }
+            Phase::Decode => 1,
+        };
 
         // A Triton program is this crate's own kernel and takes the arguments its package declares;
         // a native module keeps the `Call` structure above. It is one operator served by two kinds

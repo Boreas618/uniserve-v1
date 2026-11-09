@@ -134,12 +134,7 @@ impl Op for Patch {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         geometry(args.channels, args.height, args.width)?;
         let channels = u64::from(args.channels);
         let height = u64::from(args.height);
@@ -166,18 +161,32 @@ impl Op for Patch {
                 ));
             }
         }
+        u32::try_from(rows).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{rows} packed rows do not fit a kernel parameter"),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let frames = u64::from(args.frames);
+        let rows = frames * args.rows_per_frame();
+        let row_width = args.row_width();
 
         let mut arguments = Arguments::new();
         arguments
             .view(args.x)
             .view(args.out)
             .u32(args.frames)
-            .u32(u32::try_from(rows).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("{rows} packed rows do not fit a kernel parameter"),
-                )
-            })?)
+            // `check` keeps the row count within a kernel parameter.
+            .u32(rows as u32)
             .u32(args.channels)
             .u32(args.height)
             .u32(args.width)

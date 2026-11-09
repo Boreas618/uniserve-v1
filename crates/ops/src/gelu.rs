@@ -97,12 +97,7 @@ impl Op for Gelu {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         args.x.require_rank(Self::NAME, 2)?;
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
@@ -127,7 +122,15 @@ impl Op for Gelu {
                 ),
             ));
         }
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let elements = args.x.shape.numel();
         let mut arguments = Arguments::new();
         arguments

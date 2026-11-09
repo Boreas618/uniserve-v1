@@ -120,12 +120,7 @@ impl Op for ActAndMul {
     type Descriptor = ActAndMulDescriptor;
     type Args<'a> = ActAndMulArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let width = u64::from(descriptor.width);
         if width == 0 {
             return Err(Error::argument(
@@ -222,6 +217,16 @@ impl Op for ActAndMul {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let elements = args.out.rows() * u64::from(descriptor.width);
 
         let mut arguments = Arguments::new();
         arguments.view(args.gate).view(args.value).view(args.out);
@@ -316,12 +321,7 @@ impl Op for ValueFirstSwiglu {
     type Descriptor = ValueFirstSwigluDescriptor;
     type Args<'a> = ValueFirstSwigluArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let width = u64::from(descriptor.width);
         if width == 0 || descriptor.block == 0 {
             return Err(Error::argument(
@@ -405,6 +405,17 @@ impl Op for ValueFirstSwiglu {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let elements = args.out.rows() * u64::from(descriptor.width);
+        let programs = elements.div_ceil(u64::from(descriptor.block));
 
         // A flag is off, so its slot is never dereferenced; the kernel still takes the argument.
         let bias = args.bias.unwrap_or(args.out);
@@ -498,12 +509,7 @@ impl Op for Swiglu {
     type Descriptor = SwigluDescriptor;
     type Args<'a> = SwigluArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let width = u64::from(descriptor.width);
         if width == 0 || descriptor.block == 0 {
             return Err(Error::argument(
@@ -589,6 +595,17 @@ impl Op for Swiglu {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let elements = args.out.rows() * u64::from(descriptor.width);
+        let programs = elements.div_ceil(u64::from(descriptor.block));
 
         // A flag is off, so its slot is never dereferenced; the kernel still takes the argument.
         let value_bias = args.value_bias.unwrap_or(args.out);
@@ -671,12 +688,7 @@ impl Op for Silu {
     type Descriptor = SiluDescriptor;
     type Args<'a> = SiluArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         args.x.require_rank(Self::NAME, 2)?;
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
@@ -701,7 +713,15 @@ impl Op for Silu {
                 ),
             ));
         }
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let elements = args.x.shape.numel();
         let mut arguments = Arguments::new();
         arguments

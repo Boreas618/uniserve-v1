@@ -107,6 +107,11 @@ impl Op for Probe {
     type Descriptor = ProbeDescriptor;
     type Args<'a> = ProbeArgs;
 
+    fn check(_descriptor: &Self::Descriptor, _args: &Self::Args<'_>) -> ops::Result<()> {
+        // The probe adds to whatever words it is handed: no call is refused.
+        Ok(())
+    }
+
     fn launch(
         kernel: &Kernel,
         descriptor: &Self::Descriptor,

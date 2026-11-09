@@ -136,15 +136,9 @@ impl Op for KvWrite {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let heads = u64::from(descriptor.heads);
         let head_dim = u64::from(descriptor.head_dim);
-        let row = heads * head_dim;
         // The token count is the first extent of a `[tokens, heads, head_dim]` view; `rows()` is the
         // product of every extent but the last and would count tokens times heads.
         let tokens = args.key.shape.dim(0);
@@ -221,6 +215,18 @@ impl Op for KvWrite {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let row = u64::from(descriptor.heads) * u64::from(descriptor.head_dim);
+        // The token count is the first extent of the `[tokens, heads, head_dim]` key view.
+        let tokens = args.key.shape.dim(0);
 
         trace(descriptor, &args);
         let mut arguments = Arguments::new();
@@ -351,12 +357,7 @@ impl Op for KvWriteScaled {
     type Descriptor = ScaledWriteDescriptor;
     type Args<'a> = ScaledWriteArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let heads = u64::from(descriptor.heads);
         let head_dim = u64::from(descriptor.head_dim);
         let row = heads * head_dim;
@@ -449,6 +450,18 @@ impl Op for KvWriteScaled {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let row = u64::from(descriptor.heads) * u64::from(descriptor.head_dim);
+        let tokens = args.source.rows();
+        let pages = args.cache.shape.dim(0);
 
         let mut arguments = Arguments::new();
         arguments

@@ -201,12 +201,7 @@ impl Op for MoeUnpermute {
     type Descriptor = Descriptor;
     type Args<'a> = UnpermuteArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let hidden = u64::from(descriptor.hidden);
         let top = u64::from(descriptor.top);
         let tokens = args.out.rows();
@@ -248,6 +243,19 @@ impl Op for MoeUnpermute {
                 format!("{routes} route rows cannot hold {} routes", tokens * top),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let hidden = u64::from(descriptor.hidden);
+        let top = u64::from(descriptor.top);
+        let tokens = args.out.rows();
+        let routes = args.routes.rows();
 
         let mut call = Call {
             routes: address(args.routes.ptr) as usize as *const c_void,

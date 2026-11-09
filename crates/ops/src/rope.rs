@@ -187,12 +187,7 @@ impl Op for RotaryFactors {
     type Descriptor = FactorsDescriptor;
     type Args<'a> = FactorsArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if args.positions.dtype != descriptor.positions {
             return Err(Error::argument(
                 Self::NAME,
@@ -259,7 +254,17 @@ impl Op for RotaryFactors {
                 ),
             ));
         }
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let columns = u64::from(descriptor.columns);
+        let tokens = args.positions.numel() / u64::from(descriptor.axes.max(1));
         let total = tokens * columns;
         let mut arguments = Arguments::new();
         arguments
@@ -399,13 +404,12 @@ impl fmt::Display for QkNormRopeDescriptor {
     }
 }
 
-/// The launch of the strided form: one program per block of tokens of one head.
-fn launch_strided(
-    kernel: &Kernel,
+/// The rules the strided form adds: no learned scale, a repeating factor table, heads one head
+/// apart in two views of one stride, and outputs that are the inputs.
+fn check_strided(
     descriptor: &QkNormRopeDescriptor,
-    args: QkNormRopeArgs,
+    args: &QkNormRopeArgs,
     tokens: u64,
-    stream: &Stream,
 ) -> Result<()> {
     let name = QkNormRope::NAME;
     if descriptor.affine || descriptor.q_heads != descriptor.k_heads {
@@ -424,7 +428,7 @@ fn launch_strided(
             ),
         ));
     }
-    let [query_row, query_head, ..] = *args.query.strides.as_slice() else {
+    let [_, query_head, ..] = *args.query.strides.as_slice() else {
         return Err(Error::argument(name, "a query has three axes".to_owned()));
     };
     let head_dim = u64::from(descriptor.head_dim);
@@ -444,6 +448,20 @@ fn launch_strided(
             "the strided form turns its heads in place: each output is its input".to_owned(),
         ));
     }
+    Ok(())
+}
+
+/// The launch of the strided form: one program per block of tokens of one head.
+fn launch_strided(
+    kernel: &Kernel,
+    descriptor: &QkNormRopeDescriptor,
+    args: QkNormRopeArgs,
+    tokens: u64,
+    stream: &Stream,
+) -> Result<()> {
+    let table = args.cosine.rows();
+    let query_row = args.query.strides.get(0);
+
     let blocks = tokens.div_ceil(u64::from(descriptor.rows));
     let mut arguments = Arguments::new();
     arguments
@@ -493,12 +511,7 @@ impl Op for QkNormRope {
     type Descriptor = QkNormRopeDescriptor;
     type Args<'a> = QkNormRopeArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let head_dim = u64::from(descriptor.head_dim);
         if descriptor.rotated == 0
             || u64::from(descriptor.rotated) > head_dim
@@ -554,7 +567,7 @@ impl Op for QkNormRope {
         // The weights exist exactly when the descriptor says the normalization has them: a program
         // compiled unweighted has no weight ports, and one compiled weighted cannot normalize
         // without them.
-        let weights = if descriptor.affine {
+        if descriptor.affine {
             let q_weight = args.q_weight.ok_or_else(|| {
                 Error::argument(
                     Self::NAME,
@@ -569,24 +582,20 @@ impl Op for QkNormRope {
             })?;
             q_weight.require_shape(Self::NAME, Shape::new(&[head_dim]))?;
             k_weight.require_shape(Self::NAME, Shape::new(&[head_dim]))?;
-            Some((q_weight, k_weight))
-        } else {
-            if args.q_weight.is_some() || args.k_weight.is_some() {
-                return Err(Error::argument(
-                    Self::NAME,
-                    "an unweighted normalization was launched with a weight; the descriptor and \
-                     the arguments disagree"
-                        .to_owned(),
-                ));
-            }
-            None
-        };
+        } else if args.q_weight.is_some() || args.k_weight.is_some() {
+            return Err(Error::argument(
+                Self::NAME,
+                "an unweighted normalization was launched with a weight; the descriptor and the \
+                 arguments disagree"
+                    .to_owned(),
+            ));
+        }
         args.cosine
             .require_row(Self::NAME, descriptor.factors, pairs)?;
         args.sine
             .require_row(Self::NAME, descriptor.factors, pairs)?;
         if descriptor.strided {
-            return launch_strided(kernel, descriptor, args, tokens, stream);
+            return check_strided(descriptor, args, tokens);
         }
         if args.cosine.rows() != tokens || args.sine.rows() != tokens {
             return Err(Error::argument(
@@ -598,6 +607,22 @@ impl Op for QkNormRope {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        // The token count is the first extent of the `[tokens, heads, head_dim]` views.
+        let tokens = args.query.shape.dim(0);
+        if descriptor.strided {
+            return launch_strided(kernel, descriptor, args, tokens, stream);
+        }
+        // `check` holds both weights exactly when the normalization is weighted.
+        let weights = args.q_weight.zip(args.k_weight);
 
         // The query rows' programs come first, then the key rows': each side rounds up alone.
         let rows = u64::from(descriptor.rows);
@@ -720,12 +745,7 @@ impl Op for RopeApply {
     type Descriptor = RopeApplyDescriptor;
     type Args<'a> = RopeApplyArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let head_dim = u64::from(descriptor.head_dim);
         if descriptor.rotated == 0
             || descriptor.rotated > descriptor.head_dim
@@ -766,7 +786,16 @@ impl Op for RopeApply {
                 ));
             }
         }
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let tokens = args.x.shape.dim(0);
         let programs = tokens.div_ceil(u64::from(descriptor.rows));
         let mut arguments = Arguments::new();
         arguments

@@ -68,12 +68,7 @@ impl Op for RmsNorm {
     type Descriptor = RmsNormDescriptor;
     type Args<'a> = RmsNormArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
         args.out
@@ -90,7 +85,15 @@ impl Op for RmsNorm {
         }
         args.weight
             .require_shape(Self::NAME, Shape::new(&[columns]))?;
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
             .view(args.x)
@@ -167,12 +170,7 @@ impl Op for AddRmsNorm {
     type Descriptor = AddRmsNormDescriptor;
     type Args<'a> = AddRmsNormArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
         args.residual
@@ -194,7 +192,15 @@ impl Op for AddRmsNorm {
         }
         args.weight
             .require_shape(Self::NAME, Shape::new(&[columns]))?;
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
             .view(args.x)
@@ -277,12 +283,7 @@ impl Op for LayerNorm {
     type Descriptor = LayerNormDescriptor;
     type Args<'a> = LayerNormArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
         args.out
@@ -299,10 +300,9 @@ impl Op for LayerNorm {
         }
         args.weight
             .require_shape(Self::NAME, Shape::new(&[columns]))?;
-        let bias = match (descriptor.bias, args.bias) {
+        match (descriptor.bias, args.bias) {
             (true, Some(bias)) => {
                 bias.require_shape(Self::NAME, Shape::new(&[columns]))?;
-                bias
             }
             (true, None) => {
                 return Err(Error::argument(
@@ -316,8 +316,20 @@ impl Op for LayerNorm {
                     "the call passed a bias the descriptor does not declare",
                 ));
             }
-            (false, None) => args.weight,
-        };
+            (false, None) => {}
+        }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        // `check` pairs the bias with the descriptor that declares it. Without one the bias slot
+        // holds the weight's address, which the program never reads under a false bias flag.
+        let bias = args.bias.unwrap_or(args.weight);
 
         let mut arguments = Arguments::new();
         arguments
@@ -393,12 +405,7 @@ impl Op for Softmax {
     type Descriptor = SoftmaxDescriptor;
     type Args<'a> = SoftmaxArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
         args.out
@@ -413,7 +420,15 @@ impl Op for Softmax {
                 ),
             ));
         }
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
             .view(args.x)

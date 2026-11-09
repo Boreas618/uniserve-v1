@@ -129,12 +129,7 @@ impl Op for TopkSoftmax {
     type Descriptor = TopkDescriptor;
     type Args<'a> = TopkArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let experts = u64::from(descriptor.experts);
         let top = u64::from(descriptor.top);
         let tokens = args.scores.rows();
@@ -182,7 +177,7 @@ impl Op for TopkSoftmax {
             ));
         }
 
-        let (scale, scale_kind) = match (descriptor.scale, args.scale) {
+        match (descriptor.scale, args.scale) {
             (Some(dtype), Some(scale)) => {
                 scale.require_shape(Self::NAME, Shape::new(&[experts]))?;
                 if scale.dtype != dtype {
@@ -191,9 +186,8 @@ impl Op for TopkSoftmax {
                         format!("expected {dtype} scales, found {}", scale.dtype),
                     ));
                 }
-                (Some(scale.ptr), Self::score_kind(dtype))
             }
-            (None, None) => (None, -1),
+            (None, None) => {}
             (Some(_), None) => {
                 return Err(Error::argument(
                     Self::NAME,
@@ -206,7 +200,7 @@ impl Op for TopkSoftmax {
                     "the call passed a per-expert scale the descriptor does not declare",
                 ));
             }
-        };
+        }
 
         if let Some(map) = args.map {
             map.require_shape(Self::NAME, Shape::new(&[experts]))?;
@@ -217,6 +211,23 @@ impl Op for TopkSoftmax {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let experts = u64::from(descriptor.experts);
+        let top = u64::from(descriptor.top);
+        let tokens = args.scores.rows();
+        // `check` holds the scale to the descriptor, so a declared scale is always passed.
+        let (scale, scale_kind) = match (descriptor.scale, args.scale) {
+            (Some(dtype), Some(scale)) => (Some(scale.ptr), Self::score_kind(dtype)),
+            _ => (None, -1),
+        };
 
         cubin_metadata(kernel, Self::NAME, WARPS_PER_BLOCK)?;
         let grid = LaunchGrid::covering(tokens, TOKENS_PER_BLOCK)?;
@@ -309,12 +320,7 @@ impl Op for ExpertGather {
 
     type Args<'a> = GatherArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let experts = u64::from(descriptor.experts);
         let top = u64::from(descriptor.top);
         let tokens = args.ids.rows();
@@ -332,7 +338,16 @@ impl Op for ExpertGather {
                 ));
             }
         }
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let _ = descriptor;
         let threads = u64::from(cubin_metadata(kernel, Self::NAME, 1)?.threads());
         let grid = LaunchGrid::covering(args.ids.numel(), threads)?;
         let mut arguments = Arguments::new();

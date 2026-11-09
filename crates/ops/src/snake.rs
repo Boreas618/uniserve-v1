@@ -82,17 +82,11 @@ impl Op for Snake {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let channels = u64::from(descriptor.channels);
         args.x.require_rank(Self::NAME, 3)?;
         let shape = args.x.shape;
         let width = shape.dim(2);
-        let rows = shape.dim(0);
         if shape.dim(1) != channels {
             return Err(Error::argument(
                 Self::NAME,
@@ -118,6 +112,24 @@ impl Op for Snake {
             .require_shape(Self::NAME, Shape::new(&[channels]))?;
         args.alpha
             .require_row(Self::NAME, descriptor.dtype, channels)?;
+        u32::try_from(width).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("a width of {width} elements does not fit a kernel parameter"),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let shape = args.x.shape;
+        let width = shape.dim(2);
+        let rows = shape.dim(0);
 
         // One thread per element; the plane stride is the row-major one the check above pins.
         let elements = shape.numel();
@@ -128,12 +140,8 @@ impl Op for Snake {
             .view(args.out)
             .u64(rows)
             .u32(descriptor.channels)
-            .u32(u32::try_from(width).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("a width of {width} elements does not fit a kernel parameter"),
-                )
-            })?)
+            // `check` keeps the width within a kernel parameter.
+            .u32(width as u32)
             .flag(descriptor.pdl);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

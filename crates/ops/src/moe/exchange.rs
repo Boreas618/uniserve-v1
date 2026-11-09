@@ -602,17 +602,10 @@ impl Op for ExpertExchange {
     type Descriptor = Descriptor;
     type Args<'a> = ExchangeArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let hidden = u64::from(descriptor.hidden);
         let top = u64::from(descriptor.top);
-        let experts = u64::from(descriptor.experts);
         let max_tokens = u64::from(descriptor.max_tokens);
-        let ranks = u64::from(args.ranks);
         let tokens = u64::from(args.tokens);
 
         // The transport a module drives is built for one group size; a launch over another group
@@ -681,6 +674,23 @@ impl Op for ExpertExchange {
                 "a fused launch states its layer's operands, and no other launch does",
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let hidden = u64::from(descriptor.hidden);
+        let top = u64::from(descriptor.top);
+        let experts = u64::from(descriptor.experts);
+        let max_tokens = u64::from(descriptor.max_tokens);
+        let ranks = u64::from(args.ranks);
+        let tokens = u64::from(args.tokens);
+        let fused = args.fused;
+
         let mut call = Call {
             transport: args.transport.handle(),
             states: address(args.state.ptr) as usize as *const c_void,

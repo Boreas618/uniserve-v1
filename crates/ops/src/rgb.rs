@@ -84,21 +84,21 @@ pub fn quantize_scaled(scaled: f32) -> u8 {
     scaled.clamp(0.0, BYTE_SCALE).round_ties_even() as u8
 }
 
-/// The outer strides of a raster view, refusing a broadcast or an overlapping one.
+/// Refuses a raster view that is a broadcast or that overlaps itself.
 ///
 /// A rank-4 raster's axes are `[channels, frames, rows, columns]` on the read side and
 /// `[frames, rows, columns, channels]` on the write side; the innermost is unit-strided by the
-/// crate's row rule (`require_row`), so what the program needs is the three that carry it between
-/// planes, rows and columns. Two views are refused here: one with a **zero** stride on an axis (every
-/// element of that axis would be the same byte — a broadcast, not a raster), and one whose axes
-/// **overlap** (`stride[i]` below `extent[i+1] · stride[i+1]`, so two elements would share a byte).
+/// crate's row rule (`require_row`), so what the program needs is the three outer strides that carry
+/// it between planes, rows and columns ([`outer_strides`]). Two views are refused here: one with a
+/// **zero** stride on an axis (every element of that axis would be the same byte — a broadcast, not a
+/// raster), and one whose axes **overlap** (`stride[i]` below `extent[i+1] · stride[i+1]`, so two
+/// elements would share a byte).
 ///
 /// A sub-region of a larger raster passes unchanged: it is only a bigger outer stride, which is what
 /// the decoder's tile-in-a-canvas write needs.
-fn strides_of(operator: &'static str, name: &str, view: &TensorView) -> Result<[u64; 3]> {
+fn raster(operator: &'static str, name: &str, view: &TensorView) -> Result<()> {
     let rank = view.shape.rank();
     let strides = view.strides.as_slice();
-    let mut outer = [0_u64; 3];
     for axis in 0..rank {
         if strides[axis] == 0 {
             return Err(Error::argument(
@@ -118,11 +118,14 @@ fn strides_of(operator: &'static str, name: &str, view: &TensorView) -> Result<[
                 ));
             }
         }
-        if axis < 3 {
-            outer[axis] = strides[axis];
-        }
     }
-    Ok(outer)
+    Ok(())
+}
+
+/// The three outer strides of a rank-4 raster view that [`raster`] accepted.
+fn outer_strides(view: &TensorView) -> [u64; 3] {
+    let strides = view.strides.as_slice();
+    [strides[0], strides[1], strides[2]]
 }
 
 /// One compilation of `rgb_bytes`.
@@ -171,12 +174,7 @@ impl Op for RgbBytes {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.channels != CHANNELS {
             return Err(Error::argument(
                 Self::NAME,
@@ -246,11 +244,27 @@ impl Op for RgbBytes {
         // The packed image is contiguous, and the program writes it as a flat run of pixels.
         args.out.require_row(Self::NAME, DType::U8, channels)?;
 
+        // The program walks `out` as a block of a larger raster and `input` as a slice of the
+        // latent through their outer strides, so neither may broadcast or overlap.
+        raster(Self::NAME, "input", &args.input)?;
+        raster(Self::NAME, "out", &args.out)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let frames = args.input.shape.dim(1);
+        let rows = args.input.shape.dim(2);
+        let columns = args.input.shape.dim(3);
         // A view carries its base address into the launch, not its strides, so a strided operand has
         // to hand them over: the program walks `out` as a block of a larger raster and `input` as a
         // slice of the latent, and both are only correct if it is told how far apart the axes are.
-        let input = strides_of(Self::NAME, "input", &args.input)?;
-        let out = strides_of(Self::NAME, "out", &args.out)?;
+        let input = outer_strides(&args.input);
+        let out = outer_strides(&args.out);
 
         let mut arguments = Arguments::new();
         arguments
@@ -393,22 +407,22 @@ mod tests {
             shape: Shape::new(&[2, 4, 32, 3]),
             strides: Strides::new(&[4 * 1000, 1000, 3, 1]),
         };
-        let outer = strides_of("test", "out", &tile).expect("a sub-region is a valid raster");
-        assert_eq!(outer, [4000, 1000, 3]);
+        raster("test", "out", &tile).expect("a sub-region is a valid raster");
+        assert_eq!(outer_strides(&tile), [4000, 1000, 3]);
 
         // The same view squeezed against its neighbour: the rows would share bytes.
         let overlapping = TensorView {
             strides: Strides::new(&[4 * 90, 90, 3, 1]),
             ..tile
         };
-        assert!(strides_of("test", "out", &overlapping).is_err());
+        assert!(raster("test", "out", &overlapping).is_err());
 
         // A broadcast axis is not a raster.
         let broadcast = TensorView {
             strides: Strides::new(&[0, 1000, 3, 1]),
             ..tile
         };
-        assert!(strides_of("test", "out", &broadcast).is_err());
+        assert!(raster("test", "out", &broadcast).is_err());
     }
 
     #[test]

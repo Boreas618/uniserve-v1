@@ -86,12 +86,7 @@ impl Op for BiasAdd {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let channels = u64::from(descriptor.channels);
         args.values.require_rank(Self::NAME, 3)?;
         let shape = args.values.shape;
@@ -138,6 +133,21 @@ impl Op for BiasAdd {
                 ),
             ));
         }
+        for view in [&args.values, &args.residual] {
+            for axis in [0, 1] {
+                stride(view, axis)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let shape = args.values.shape;
 
         let elements = shape.numel();
         let mut arguments = Arguments::new();
@@ -150,10 +160,11 @@ impl Op for BiasAdd {
             .u32(descriptor.channels)
             .u64(shape.dim(0))
             .u64(shape.dim(2))
-            .i64(stride(&args.values, 0)?)
-            .i64(stride(&args.values, 1)?)
-            .i64(stride(&args.residual, 0)?)
-            .i64(stride(&args.residual, 1)?)
+            // `check` keeps every stride within a kernel parameter.
+            .i64(args.values.strides.get(0) as i64)
+            .i64(args.values.strides.get(1) as i64)
+            .i64(args.residual.strides.get(0) as i64)
+            .i64(args.residual.strides.get(1) as i64)
             .flag(descriptor.pdl);
         kernel.launch(
             LaunchGrid::covering(elements, u64::from(descriptor.block))?,

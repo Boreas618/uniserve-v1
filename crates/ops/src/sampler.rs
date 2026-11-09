@@ -114,12 +114,7 @@ impl Op for LogitsShape {
     type Descriptor = ShapeDescriptor;
     type Args<'a> = ShapeArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let vocabulary = u64::from(descriptor.vocabulary);
         let rows = args.logits.rows();
         args.logits
@@ -138,11 +133,10 @@ impl Op for LogitsShape {
         )?;
         args.counts
             .require_row(Self::NAME, DType::I32, vocabulary)?;
-        let extras = match (descriptor.extras, args.extras) {
-            (0, None) => args.slots,
+        match (descriptor.extras, args.extras) {
+            (0, None) => {}
             (extras, Some(extra)) => {
                 extra.require_shape(Self::NAME, Shape::new(&[rows, u64::from(extras)]))?;
-                extra
             }
             (extras, None) => {
                 return Err(Error::argument(
@@ -152,7 +146,20 @@ impl Op for LogitsShape {
                     ),
                 ));
             }
-        };
+        }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let vocabulary = u64::from(descriptor.vocabulary);
+        let rows = args.logits.rows();
+        // A descriptor without extra tokens reads the slots in their place.
+        let extras = args.extras.unwrap_or(args.slots);
 
         let mut arguments = Arguments::new();
         arguments
@@ -268,12 +275,7 @@ impl Op for TopK {
     type Descriptor = TopKDescriptor;
     type Args<'a> = TopKArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let vocabulary = u64::from(descriptor.vocabulary);
         let width = u64::from(descriptor.width);
         if width > vocabulary {
@@ -325,6 +327,16 @@ impl Op for TopK {
                 format!("expected {} ids, found {}", descriptor.ids, args.ids.dtype),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.logits.rows();
 
         let mut arguments = Arguments::new();
         arguments
@@ -403,12 +415,7 @@ impl Op for FilterCandidates {
     type Descriptor = FilterDescriptor;
     type Args<'a> = FilterArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let width = u64::from(descriptor.width);
         let rows = args.values.rows();
         args.values.require_row(Self::NAME, DType::F32, width)?;
@@ -431,6 +438,17 @@ impl Op for FilterCandidates {
                 format!("expected i32 validity flags, found {}", args.valid.dtype),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let width = u64::from(descriptor.width);
+        let rows = args.values.rows();
 
         let mut arguments = Arguments::new();
         arguments
@@ -510,12 +528,7 @@ impl Op for InverseCdf {
     type Descriptor = InverseCdfDescriptor;
     type Args<'a> = InverseCdfArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let width = u64::from(descriptor.width);
         let rows = args.probabilities.rows();
         args.probabilities
@@ -545,6 +558,16 @@ impl Op for InverseCdf {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.probabilities.rows();
 
         let mut arguments = Arguments::new();
         // The row count and the width are both runtime values: the program walks the row in tiles
@@ -625,12 +648,7 @@ impl Op for ArgMax {
     type Descriptor = ArgMaxDescriptor;
     type Args<'a> = ArgMaxArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let width = u64::from(descriptor.width);
         let rows = args.values.rows();
         args.values
@@ -642,6 +660,16 @@ impl Op for ArgMax {
                 format!("expected {} ids, found {}", descriptor.ids, args.out.dtype),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        _descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.values.rows();
 
         let mut arguments = Arguments::new();
         arguments.view(args.values).view(args.out).u64(rows);
@@ -708,12 +736,7 @@ impl Op for LogSoftmax {
     type Descriptor = LogSoftmaxDescriptor;
     type Args<'a> = LogSoftmaxArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         args.x.require_row(Self::NAME, descriptor.dtype, columns)?;
         args.out.require_row(Self::NAME, DType::F32, columns)?;
@@ -727,7 +750,15 @@ impl Op for LogSoftmax {
                 ),
             ));
         }
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
             .view(args.x)
@@ -793,12 +824,7 @@ impl Op for LogprobGather {
     type Descriptor = LogprobDescriptor;
     type Args<'a> = LogprobArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let columns = u64::from(descriptor.columns);
         let rows = args.logprobabilities.rows();
         args.logprobabilities
@@ -820,6 +846,16 @@ impl Op for LogprobGather {
                 format!("expected f32 log-probabilities, found {}", args.out.dtype),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.logprobabilities.rows();
 
         let mut arguments = Arguments::new();
         arguments
@@ -923,12 +959,7 @@ impl Op for CandidateOrder {
     type Descriptor = OrderDescriptor;
     type Args<'a> = OrderArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let rows = args.values.rows();
         let width = args.values.last();
         if width == 0 {
@@ -993,6 +1024,33 @@ impl Op for CandidateOrder {
                 ),
             ));
         }
+        // The kernel takes the candidate count and the id space as 32-bit parameters.
+        u32::try_from(width).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{width} candidates do not fit a kernel parameter"),
+            )
+        })?;
+        u32::try_from(args.vocabulary).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!(
+                    "a vocabulary of {} does not fit a kernel parameter",
+                    args.vocabulary
+                ),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        _descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.values.rows();
+        let width = args.values.last();
 
         let mut arguments = Arguments::new();
         // The scratch is the program's own: neither twin rule applies to it, and a shadow run gets
@@ -1004,21 +1062,8 @@ impl Op for CandidateOrder {
             .view(args.ordered_ids)
             .view(args.counts)
             .u64(rows)
-            .u32(u32::try_from(width).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("{width} candidates do not fit a kernel parameter"),
-                )
-            })?)
-            .u32(u32::try_from(args.vocabulary).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!(
-                        "a vocabulary of {} does not fit a kernel parameter",
-                        args.vocabulary
-                    ),
-                )
-            })?);
+            .u32(width as u32)
+            .u32(args.vocabulary as u32);
         kernel.launch(LaunchGrid::linear(rows)?, &mut arguments, stream)
     }
 

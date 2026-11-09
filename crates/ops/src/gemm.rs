@@ -235,12 +235,7 @@ impl Op for Gemm {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let m = args.input.rows();
         let k = args.input.last();
         if k != u64::from(descriptor.k) {
@@ -285,10 +280,9 @@ impl Op for Gemm {
             },
         )?;
 
-        let bias = match (descriptor.epilogue, args.bias) {
+        match (descriptor.epilogue, args.bias) {
             (Epilogue::Bias, Some(bias)) => {
                 bias.require_shape(Self::NAME, Shape::new(&[n]))?;
-                address(bias.ptr) as usize as *const c_void
             }
             (Epilogue::Bias, None) => {
                 return Err(Error::argument(
@@ -302,20 +296,53 @@ impl Op for Gemm {
                     "the call passed a bias the descriptor's epilogue does not add",
                 ));
             }
-            (Epilogue::None, None) => std::ptr::null(),
+            (Epilogue::None, None) => {}
+        }
+
+        // The package's call structure carries every extent and stride as an `i64`.
+        for value in [
+            m,
+            n,
+            k,
+            row_stride(&args.input.strides),
+            weight_row_stride,
+            row_stride(&args.out.strides),
+        ] {
+            to_i64(value)?;
+        }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let m = args.input.rows();
+        let k = args.input.last();
+        let (n, weight_row_stride) = match descriptor.order {
+            WeightOrder::KxN => (args.weight.last(), row_stride(&args.weight.strides)),
+            WeightOrder::NxK => (args.weight.rows(), row_stride(&args.weight.strides)),
+        };
+        // `check` pairs the bias with the epilogue that adds it.
+        let bias = match args.bias {
+            Some(bias) => address(bias.ptr) as usize as *const c_void,
+            None => std::ptr::null(),
         };
 
+        // `check` holds every extent and stride within an `i64`.
         let mut call = Call {
             out: address(args.out.ptr) as usize as *mut c_void,
             input: address(args.input.ptr) as usize as *const c_void,
             weight: address(args.weight.ptr) as usize as *const c_void,
             bias,
-            m: to_i64(m)?,
-            n: to_i64(n)?,
-            k: to_i64(k)?,
-            input_row_stride: to_i64(row_stride(&args.input.strides))?,
-            weight_row_stride: to_i64(weight_row_stride)?,
-            out_row_stride: to_i64(row_stride(&args.out.strides))?,
+            m: m as i64,
+            n: n as i64,
+            k: k as i64,
+            input_row_stride: row_stride(&args.input.strides) as i64,
+            weight_row_stride: weight_row_stride as i64,
+            out_row_stride: row_stride(&args.out.strides) as i64,
             alpha: args.alpha,
             error: [0; 512],
         };

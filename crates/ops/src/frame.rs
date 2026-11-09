@@ -116,12 +116,7 @@ impl Op for FramePad {
     type Descriptor = FramePadDescriptor;
     type Args<'a> = FramePadArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         args.values.require_rank(Self::NAME, 5)?;
         args.out.require_rank(Self::NAME, 5)?;
         if args.values.dtype != descriptor.dtype || args.out.dtype != descriptor.dtype {
@@ -198,6 +193,18 @@ impl Op for FramePad {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (batch, channels) = (args.values.shape.dim(0), args.values.shape.dim(1));
+        let (height, width) = (args.values.shape.dim(3), args.values.shape.dim(4));
+        let (out_width, out_height) = (args.out.shape.dim(4), args.out.shape.dim(3));
 
         let mut arguments = Arguments::new();
         arguments.view(args.values).view(args.out);
@@ -425,12 +432,7 @@ impl Op for FrameMoments {
     type Descriptor = FrameMomentsDescriptor;
     type Args<'a> = FrameMomentsArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         args.values.require_rank(Self::NAME, 5)?;
         if args.values.dtype != DType::F32 {
             return Err(Error::argument(
@@ -438,7 +440,7 @@ impl Op for FrameMoments {
                 "the reference kernel normalizes FP32 values".to_owned(),
             ));
         }
-        let pixel = pixel_stride(&args.values)?;
+        pixel_stride(&args.values)?;
         let (batch, channels, frames) = (
             args.values.shape.dim(0),
             args.values.shape.dim(1),
@@ -478,6 +480,19 @@ impl Op for FrameMoments {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let pixel = pixel_stride(&args.values)?;
+        let (channels, frames) = (args.values.shape.dim(1), args.values.shape.dim(2));
+        let pixels = args.values.shape.dim(3) * args.values.shape.dim(4);
+
         let mut call = FrameMomentsCall {
             values: args.values.ptr.address(),
             values_batch: args.values.strides.get(0) as i64,
@@ -673,12 +688,7 @@ impl Op for FrameNormPad {
     type Descriptor = FrameNormPadDescriptor;
     type Args<'a> = FrameNormPadArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         args.values.require_rank(Self::NAME, 5)?;
         args.out.require_rank(Self::NAME, 5)?;
         if args.values.dtype != DType::F32 || args.out.dtype != DType::F32 {
@@ -824,7 +834,6 @@ impl Op for FrameNormPad {
             ));
         }
 
-        // The kernel's branch: one pixel per frame, the centered reduction, or the fused affine one.
         let channels_per_group = channels / args.groups;
         let reduction = channels_per_group.saturating_mul(height * width);
         if reduction > u64::from(descriptor.reduction) {
@@ -838,6 +847,19 @@ impl Op for FrameNormPad {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (channels, frames) = (args.values.shape.dim(1), args.values.shape.dim(2));
+        let (height, width) = (args.values.shape.dim(3), args.values.shape.dim(4));
+
+        // The kernel's branch: one pixel per frame, the centered reduction, or the fused affine one.
         let normalization = if descriptor.single_pixel {
             2
         } else if descriptor.centered {

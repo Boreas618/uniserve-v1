@@ -95,12 +95,7 @@ impl Op for TileStitch {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         args.out.require_rank(Self::NAME, 4)?;
         let dims = args.out.shape.dims();
         let (channels, frames, height, width) = (dims[0], dims[1], dims[2], dims[3]);
@@ -132,7 +127,7 @@ impl Op for TileStitch {
                 ));
             }
         }
-        let strides = row_writable(&args.out, Self::NAME)?;
+        row_writable(&args.out, Self::NAME)?;
         let word = |name: &str, value: u64| -> Result<u32> {
             u32::try_from(value).map_err(|_| {
                 Error::argument(
@@ -141,14 +136,31 @@ impl Op for TileStitch {
                 )
             })
         };
+        word("frame count", frames)?;
+        word("width", width)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let dims = args.out.shape.dims();
+        let (channels, frames, height, width) = (dims[0], dims[1], dims[2], dims[3]);
+        // The outer strides of the layout `check` accepted.
+        let strides = crate::tensor::outer_strides(&args.out);
+
+        // `check` keeps the frame count and the width within kernel parameters.
         let mut arguments = Arguments::new();
         arguments
             .view(args.tokens)
             .view(args.rows)
             .view(args.columns)
             .view(args.out)
-            .u32(word("frame count", frames)?)
-            .u32(word("width", width)?)
+            .u32(frames as u32)
+            .u32(width as u32)
             .u64(strides[0])
             .u64(strides[1])
             .u64(strides[2])

@@ -168,12 +168,7 @@ impl Op for AudioActivation {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let channels = u64::from(descriptor.channels);
         let taps = u64::from(descriptor.kernel);
         let length = u64::from(args.length);
@@ -231,7 +226,27 @@ impl Op for AudioActivation {
                 ));
             }
         }
+        u32::try_from(out_length).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{out_length} output samples do not fit a kernel parameter"),
+            )
+        })?;
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let channels = u64::from(descriptor.channels);
+        let length = u64::from(args.length);
+        // The output length `check` derived from the same descriptor and length.
+        let out_length = descriptor.output(length)?;
+
+        // Every narrowing below is of a value `check` holds within its kernel parameter.
         let mut arguments = Arguments::new();
         arguments
             .view(args.values)
@@ -244,12 +259,7 @@ impl Op for AudioActivation {
             .u32(descriptor.kernel)
             .u32(descriptor.ratio)
             .u32(args.length)
-            .u32(u32::try_from(out_length).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("{out_length} output samples do not fit a kernel parameter"),
-                )
-            })?)
+            .u32(out_length as u32)
             .u32(descriptor.block)
             .flag(descriptor.pdl);
         // One block owns a channel's whole length: the upsampled signal between stages never leaves

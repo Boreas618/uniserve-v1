@@ -67,12 +67,7 @@ impl Op for Embedding {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if args.ids.dtype != descriptor.ids {
             return Err(Error::argument(
                 Self::NAME,
@@ -91,6 +86,16 @@ impl Op for Embedding {
         args.out
             .require_shape(Self::NAME, Shape::new(&[tokens, hidden]))?;
         args.out.require_row(Self::NAME, descriptor.dtype, hidden)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let tokens = args.ids.shape.dim(0);
 
         let mut arguments = Arguments::new();
         arguments

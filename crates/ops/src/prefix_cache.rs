@@ -146,12 +146,7 @@ impl Op for PageConversion {
     type Descriptor = ConversionDescriptor;
     type Args<'a> = ConversionArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.head_dim == 0 || descriptor.heads == 0 || descriptor.layers == 0 {
             return Err(Error::argument(
                 Self::NAME,
@@ -243,7 +238,15 @@ impl Op for PageConversion {
                 "a span covers at least one source page".to_owned(),
             ));
         }
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let mut arguments = Arguments::new();
         arguments
             .view(args.scratch)
@@ -354,12 +357,7 @@ impl Op for CacheCopyRegion {
     type Descriptor = CopyRegionDescriptor;
     type Args<'a> = CopyRegionArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.columns == 0
             || descriptor.units_per_page == 0
             || descriptor.heads == 0
@@ -468,7 +466,24 @@ impl Op for CacheCopyRegion {
                 ),
             ));
         }
+        if u32::try_from(args.values.shape.dim(1)).is_err() {
+            return Err(Error::argument(
+                Self::NAME,
+                format!(
+                    "the field's {} units per column do not fit a kernel parameter",
+                    args.values.shape.dim(1)
+                ),
+            ));
+        }
+        Ok(())
+    }
 
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
         let scale = args.scale.unwrap_or(args.initialized);
         let mut arguments = Arguments::new();
         arguments
@@ -483,15 +498,7 @@ impl Op for CacheCopyRegion {
             // `[column, unit, …]` and the unit ids arrive per page, so a program needs the pool's own
             // shape to turn (column, unit) into an offset; the views do not carry extents into the
             // kernel.
-            .u32(u32::try_from(args.values.shape.dim(1)).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!(
-                        "the field's {} units per column do not fit a kernel parameter",
-                        args.values.shape.dim(1)
-                    ),
-                )
-            })?);
+            .u32(args.values.shape.dim(1) as u32);
         // One program per (column, unit slot): it owns the whole written span of that cell, so the
         // FP8 path's amax is one reduction over the span rather than one per token - the write
         // takes `max(scale, max(abs(span), 1e-12) / 448)` once and rescales the unit's resident

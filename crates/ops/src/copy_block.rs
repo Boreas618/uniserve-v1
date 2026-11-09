@@ -120,12 +120,7 @@ impl Op for CopyBlock {
     type Descriptor = Descriptor;
     type Args<'a> = Args<'a>;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.source != descriptor.out {
             return Err(Error::argument(
                 Self::NAME,
@@ -165,6 +160,7 @@ impl Op for CopyBlock {
                 ));
             }
         }
+        // An empty block is never launched, so its strides bind nothing.
         if extents.contains(&0) {
             return Ok(());
         }
@@ -200,6 +196,33 @@ impl Op for CopyBlock {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let extents = [
+            args.out.shape.dim(0),
+            args.out.shape.dim(1),
+            args.out.shape.dim(2),
+            args.out.shape.dim(3),
+        ];
+        // An empty block moves nothing, so nothing is launched.
+        if extents.contains(&0) {
+            return Ok(());
+        }
+        // `check` holds every source stride within an `i64`.
+        let strides = args.source.strides.as_slice();
+        let source_strides = [
+            strides[0] as i64,
+            strides[1] as i64,
+            strides[2] as i64,
+            strides[3] as i64,
+        ];
 
         let mut arguments = Arguments::new();
         arguments.view(args.source).view(args.out);

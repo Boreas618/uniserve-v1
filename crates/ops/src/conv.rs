@@ -226,14 +226,9 @@ fn check_layouts(operator: &'static str, descriptor: &Descriptor, args: Args) ->
 pub struct Conv;
 
 impl Conv {
-    /// The launch shared by the three operators, which differ only in their descriptor's geometry.
-    fn launch(
-        operator: &'static str,
-        kernel: &Kernel,
-        descriptor: &Descriptor,
-        args: Args,
-        stream: &Stream,
-    ) -> Result<()> {
+    /// The argument rules shared by the three operators, which differ only in their descriptor's
+    /// geometry.
+    fn check(operator: &'static str, descriptor: &Descriptor, args: &Args) -> Result<()> {
         let rank = descriptor.rank;
         if !(1..=3).contains(&rank) {
             return Err(Error::argument(
@@ -250,7 +245,7 @@ impl Conv {
         // refusing it: the library indexes by the layout it was told, not by the bytes it holds.
         // A filter is the operand this bites first, because a checkpoint stores it channel-first
         // and a channels-last span is a layout its *weights* must be permuted into once.
-        check_layouts(operator, descriptor, args)?;
+        check_layouts(operator, descriptor, *args)?;
         if args.input.dtype != descriptor.input || args.out.dtype != descriptor.output {
             return Err(Error::argument(
                 operator,
@@ -282,10 +277,9 @@ impl Conv {
         args.weight
             .require_shape(operator, Shape::new(&filter[..rank + 2]))?;
 
-        let bias = match (descriptor.bias, args.bias) {
+        match (descriptor.bias, args.bias) {
             (true, Some(bias)) => {
                 bias.require_shape(operator, Shape::new(&[args.out.shape.dim(1)]))?;
-                platform::address(bias.ptr) as usize as *const c_void
             }
             (true, None) => {
                 return Err(Error::argument(
@@ -299,8 +293,18 @@ impl Conv {
                     "the call passed a bias the descriptor does not declare",
                 ));
             }
-            (false, None) => std::ptr::null(),
-        };
+            (false, None) => {}
+        }
+        Ok(())
+    }
+
+    /// The launch shared by the three operators, of arguments [`Conv::check`] accepted.
+    fn launch(kernel: &Kernel, descriptor: &Descriptor, args: Args, stream: &Stream) -> Result<()> {
+        let rank = descriptor.rank as usize;
+        // The descriptor declares a bias exactly when the call passes one.
+        let bias = args.bias.map_or(std::ptr::null(), |bias| {
+            platform::address(bias.ptr) as usize as *const c_void
+        });
 
         let mut input_shape = [1_i64; 5];
         let mut weight_shape = [1_i64; 5];
@@ -383,19 +387,23 @@ impl Op for Conv3d {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.rank != 3 || descriptor.transposed {
             return Err(Error::argument(
                 Self::NAME,
                 "the descriptor is not a 3-d convolution",
             ));
         }
-        Conv::launch(Self::NAME, kernel, descriptor, args, stream)
+        Conv::check(Self::NAME, descriptor, args)
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        Conv::launch(kernel, descriptor, args, stream)
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
@@ -429,19 +437,23 @@ impl Op for Conv1d {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.rank != 1 || descriptor.transposed {
             return Err(Error::argument(
                 Self::NAME,
                 "the descriptor is not a 1-d convolution",
             ));
         }
-        Conv::launch(Self::NAME, kernel, descriptor, args, stream)
+        Conv::check(Self::NAME, descriptor, args)
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        Conv::launch(kernel, descriptor, args, stream)
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {
@@ -472,19 +484,23 @@ impl Op for ConvTranspose1d {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.rank != 1 || !descriptor.transposed {
             return Err(Error::argument(
                 Self::NAME,
                 "the descriptor is not a transposed 1-d convolution",
             ));
         }
-        Conv::launch(Self::NAME, kernel, descriptor, args, stream)
+        Conv::check(Self::NAME, descriptor, args)
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        Conv::launch(kernel, descriptor, args, stream)
     }
 
     fn shadow<'a>(args: Self::Args<'a>, twins: &mut Twins, stream: &Stream) -> Self::Args<'a> {

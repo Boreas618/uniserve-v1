@@ -119,12 +119,7 @@ impl Op for Transpose {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         // A layout operator moves the bits it was given: no arithmetic, so no narrower type, and no
         // integer or narrow-float type either, because nothing that would want one transposes.
         if !matches!(descriptor.dtype, DType::F32 | DType::BF16 | DType::F16) {
@@ -156,6 +151,17 @@ impl Op for Transpose {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        // `check` holds the input to a nonempty contiguous matrix.
+        let (rows, columns) = (args.input.shape.dim(0), args.input.shape.dim(1));
 
         let mut arguments = Arguments::new();
         arguments

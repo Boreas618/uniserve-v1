@@ -81,12 +81,7 @@ impl Op for VsaZeroPadding {
     type Descriptor = ZeroPaddingDescriptor;
     type Args<'a> = ZeroPaddingArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         check_rows(
             Self::NAME,
             descriptor.dtype,
@@ -108,6 +103,16 @@ impl Op for VsaZeroPadding {
         let tiles = rows / u64::from(descriptor.tile_rows);
         args.sizes.require_shape(Self::NAME, Shape::new(&[tiles]))?;
         args.sizes.require_row(Self::NAME, DType::I32, tiles)?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let tiles = args.values.shape.dim(0) / u64::from(descriptor.tile_rows);
 
         let mut arguments = Arguments::new();
         arguments
@@ -183,13 +188,8 @@ impl Op for VsaAddGatedTiles {
     type Descriptor = AddGatedTilesDescriptor;
     type Args<'a> = AddGatedTilesArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
-        let (rows, heads) = (args.output.shape.dim(0), descriptor.heads_hint(&args)?);
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        let (rows, heads) = (args.output.shape.dim(0), descriptor.heads_hint(args)?);
         let width = u64::from(descriptor.width);
         let tiles = rows / u64::from(descriptor.tile_rows);
         args.compressed
@@ -213,6 +213,16 @@ impl Op for VsaAddGatedTiles {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (rows, heads) = (args.output.shape.dim(0), args.output.shape.dim(1));
 
         let mut arguments = Arguments::new();
         arguments
@@ -328,12 +338,7 @@ impl Op for VsaComposeGatedRows {
     type Descriptor = ComposeGatedRowsDescriptor;
     type Args<'a> = ComposeGatedRowsArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let members = u64::from(descriptor.members);
         if members == 0 || members > MAX_MEMBERS as u64 {
             return Err(Error::argument(
@@ -434,6 +439,17 @@ impl Op for VsaComposeGatedRows {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let members = u64::from(descriptor.members);
+        let heads = args.output.shape.dim(2);
 
         let mut arguments = Arguments::new();
         arguments
@@ -516,12 +532,7 @@ impl Op for VsaSelectTiles {
     type Descriptor = SelectTilesDescriptor;
     type Args<'a> = SelectTilesArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         args.scores.require_rank(Self::NAME, 3)?;
         if args.scores.dtype != DType::F32 {
             return Err(Error::argument(
@@ -587,6 +598,20 @@ impl Op for VsaSelectTiles {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        _descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let (heads, query_tiles, tiles) = (
+            args.scores.shape.dim(0),
+            args.scores.shape.dim(1),
+            args.scores.shape.dim(2),
+        );
 
         let mut arguments = Arguments::new();
         arguments
@@ -715,12 +740,7 @@ impl Op for VsaPrepareTiles {
     type Descriptor = PrepareTilesDescriptor;
     type Args<'a> = PrepareTilesArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let heads = args.query.shape.dim(1);
         let width = args.query.shape.dim(2);
         if u64::from(descriptor.heads) != heads || u64::from(descriptor.width) != width {
@@ -855,6 +875,17 @@ impl Op for VsaPrepareTiles {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let heads = args.query.shape.dim(1);
+        let tiles = args.query.shape.dim(0) / u64::from(descriptor.tile_rows);
 
         // The stepwise recipe's operands stand in with the rows they would have touched.
         let query_weight = args.query_weight.unwrap_or(args.query);
@@ -1036,12 +1067,7 @@ impl Op for VsaScores {
     type Descriptor = ScoresDescriptor;
     type Args<'a> = ScoresArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let width = u64::from(descriptor.width);
         let heads = u64::from(descriptor.heads);
         if width == 0 || heads == 0 {
@@ -1113,6 +1139,18 @@ impl Op for VsaScores {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let heads = u64::from(descriptor.heads);
+        let query_tiles = args.pooled_query.shape.dim(0);
+        let key_tiles = args.pooled_key.shape.dim(0);
 
         let mut arguments = Arguments::new();
         arguments
@@ -1270,12 +1308,7 @@ impl Op for VsaCompressPooled {
     type Descriptor = CompressPooledDescriptor;
     type Args<'a> = CompressPooledArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let heads = u64::from(descriptor.heads);
         let width = u64::from(descriptor.width);
         if heads == 0 || width == 0 {
@@ -1375,6 +1408,18 @@ impl Op for VsaCompressPooled {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let heads = u64::from(descriptor.heads);
+        let query_tiles = args.scores.shape.dim(1);
+        let tiles = args.scores.shape.dim(2);
 
         let mut arguments = Arguments::new();
         arguments

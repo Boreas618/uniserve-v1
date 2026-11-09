@@ -130,12 +130,7 @@ impl Op for ModulatedRmsNorm {
     type Descriptor = ModulatedRmsNormDescriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let width = u64::from(descriptor.width);
         if !descriptor.dtype.is_float() {
             return Err(Error::argument(
@@ -280,12 +275,6 @@ impl Op for ModulatedRmsNorm {
             }
         }
 
-        // A flag is off, so its slot is never dereferenced; the kernel still takes the argument, and
-        // an address already in the launch keeps the slot valid.
-        let update = args.update.unwrap_or(args.value);
-        let gate = args.gate.unwrap_or(args.shift);
-        let output_scale = args.output_scale.unwrap_or(args.out);
-        let retain = args.retain.unwrap_or(args.out);
         let strides = [
             descriptor.gate_stride,
             descriptor.shift_stride,
@@ -299,6 +288,23 @@ impl Op for ModulatedRmsNorm {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.value.shape.dim(0);
+
+        // A flag is off, so its slot is never dereferenced; the kernel still takes the argument, and
+        // an address already in the launch keeps the slot valid.
+        let update = args.update.unwrap_or(args.value);
+        let gate = args.gate.unwrap_or(args.shift);
+        let output_scale = args.output_scale.unwrap_or(args.out);
+        let retain = args.retain.unwrap_or(args.out);
 
         let mut arguments = Arguments::new();
         arguments
@@ -392,12 +398,7 @@ impl Op for GatedResidual {
     type Descriptor = GatedResidualDescriptor;
     type Args<'a> = GatedResidualArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let width = u64::from(descriptor.width);
         args.hidden.require_rank(Self::NAME, 2)?;
         args.hidden
@@ -433,6 +434,17 @@ impl Op for GatedResidual {
                 ),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let width = u64::from(descriptor.width);
+        let rows = args.hidden.shape.dim(0);
 
         let mut arguments = Arguments::new();
         arguments

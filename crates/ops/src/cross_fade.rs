@@ -90,12 +90,7 @@ impl Op for CrossFade {
     type Descriptor = Descriptor;
     type Args<'a> = Args;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.axis != 2 && descriptor.axis != 3 {
             return Err(Error::argument(
                 Self::NAME,
@@ -184,6 +179,78 @@ impl Op for CrossFade {
                 )
             })
         };
+        u32::try_from(dims[0]).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{} channels do not fit a kernel parameter", dims[0]),
+            )
+        })?;
+        u32::try_from(dims[1]).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{} frames do not fit a kernel parameter", dims[1]),
+            )
+        })?;
+        u32::try_from(dims[2]).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{} rows do not fit a kernel parameter", dims[2]),
+            )
+        })?;
+        u32::try_from(dims[3]).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!("{} columns do not fit a kernel parameter", dims[3]),
+            )
+        })?;
+        for (role, strides) in [("previous", previous_strides), ("current", current_strides)] {
+            for (axis, stride) in strides.iter().take(3).enumerate() {
+                stride_word(role, axis, *stride)?;
+            }
+        }
+        u32::try_from(out_strides[0]).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!(
+                    "the tile's channel stride {} does not fit a kernel parameter",
+                    out_strides[0]
+                ),
+            )
+        })?;
+        u32::try_from(out_strides[1]).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!(
+                    "the tile's frame stride {} does not fit a kernel parameter",
+                    out_strides[1]
+                ),
+            )
+        })?;
+        u32::try_from(out_strides[2]).map_err(|_| {
+            Error::argument(
+                Self::NAME,
+                format!(
+                    "the tile's row stride {} does not fit a kernel parameter",
+                    out_strides[2]
+                ),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let dims = args.current.shape.dims();
+        // The outer strides of the layouts `check` accepted.
+        let out_strides = crate::tensor::outer_strides(&args.out);
+        let previous_strides = crate::tensor::outer_strides(&args.previous);
+        let current_strides = crate::tensor::outer_strides(&args.current);
+
+        // Every narrowing below is of a value `check` holds within its kernel parameter.
         let mut arguments = Arguments::new();
         arguments
             .view(args.previous)
@@ -191,68 +258,24 @@ impl Op for CrossFade {
             .view(args.out)
             .u32(descriptor.extent)
             .u32(descriptor.axis)
-            .u32(u32::try_from(dims[0]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("{} channels do not fit a kernel parameter", dims[0]),
-                )
-            })?)
-            .u32(u32::try_from(dims[1]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("{} frames do not fit a kernel parameter", dims[1]),
-                )
-            })?)
+            .u32(dims[0] as u32)
+            .u32(dims[1] as u32)
             // The two frame-grid extents the blend walks: the C ABI hands a program raw slots, so
             // the rows and columns the kernel loops over travel as scalars rather than as extents a
             // view carries. They are the axis the overlap does not run along, one per position.
-            .u32(u32::try_from(dims[2]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("{} rows do not fit a kernel parameter", dims[2]),
-                )
-            })?)
-            .u32(u32::try_from(dims[3]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!("{} columns do not fit a kernel parameter", dims[3]),
-                )
-            })?)
+            .u32(dims[2] as u32)
+            .u32(dims[3] as u32)
             // The destination's outer strides, then its block and PDL flag. Its base is addressed
             // with these, which is what lets a tile land inside a larger raster.
-            .u32(stride_word("previous", 0, previous_strides[0])?)
-            .u32(stride_word("previous", 1, previous_strides[1])?)
-            .u32(stride_word("previous", 2, previous_strides[2])?)
-            .u32(stride_word("current", 0, current_strides[0])?)
-            .u32(stride_word("current", 1, current_strides[1])?)
-            .u32(stride_word("current", 2, current_strides[2])?)
-            .u32(u32::try_from(out_strides[0]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!(
-                        "the tile's channel stride {} does not fit a kernel parameter",
-                        out_strides[0]
-                    ),
-                )
-            })?)
-            .u32(u32::try_from(out_strides[1]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!(
-                        "the tile's frame stride {} does not fit a kernel parameter",
-                        out_strides[1]
-                    ),
-                )
-            })?)
-            .u32(u32::try_from(out_strides[2]).map_err(|_| {
-                Error::argument(
-                    Self::NAME,
-                    format!(
-                        "the tile's row stride {} does not fit a kernel parameter",
-                        out_strides[2]
-                    ),
-                )
-            })?)
+            .u32(previous_strides[0] as u32)
+            .u32(previous_strides[1] as u32)
+            .u32(previous_strides[2] as u32)
+            .u32(current_strides[0] as u32)
+            .u32(current_strides[1] as u32)
+            .u32(current_strides[2] as u32)
+            .u32(out_strides[0] as u32)
+            .u32(out_strides[1] as u32)
+            .u32(out_strides[2] as u32)
             .u32(descriptor.block)
             .flag(descriptor.pdl);
         // One thread per output voxel: the leading band blends and everything after it copies, and

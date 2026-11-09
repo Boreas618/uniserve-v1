@@ -298,12 +298,7 @@ impl Op for SparseAttention {
     type Descriptor = SparseDescriptor;
     type Args<'a> = SparseArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         let block = u64::from(descriptor.block);
         let head_dim = u64::from(descriptor.head_dim);
         let operator = Self::NAME;
@@ -472,6 +467,20 @@ impl Op for SparseAttention {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let head_dim = u64::from(descriptor.head_dim);
+        let operator = Self::NAME;
+        let heads = args.query.shape.dim(1);
+        let query_rows = args.query.shape.dim(0);
+        let key_rows = args.key.shape.dim(0);
 
         let mut call = SparseCall {
             query: address(args.query.ptr) as usize as *const c_void,

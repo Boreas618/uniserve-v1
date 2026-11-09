@@ -100,12 +100,7 @@ impl Op for WeightedRmsNorm {
     type Descriptor = WeightedRmsNormDescriptor;
     type Args<'a> = WeightedRmsNormArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         check_descriptor(Self::NAME, descriptor.columns, descriptor.tile)?;
         let columns = u64::from(descriptor.columns);
         args.x.require_rank(Self::NAME, 2)?;
@@ -119,13 +114,26 @@ impl Op for WeightedRmsNorm {
         args.out
             .require_row(Self::NAME, descriptor.activation, columns)?;
 
-        let partials = matches(
+        matches(
             &args.partials,
             descriptor.absmax,
             Self::NAME,
             "magnitude",
             rows,
         )?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        _descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.x.shape.dim(0);
+        // The descriptor's flag and this operand agree, as `check` states.
+        let partials = args.partials;
+
         let mut arguments = Arguments::new();
         arguments.view(args.x).view(args.weight).view(args.out);
         if let Some(partials) = partials {
@@ -214,12 +222,7 @@ impl Op for ScaledResidualRmsNorm {
     type Descriptor = ScaledResidualRmsNormDescriptor;
     type Args<'a> = ScaledResidualRmsNormArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         check_descriptor(Self::NAME, descriptor.columns, descriptor.tile)?;
         let columns = u64::from(descriptor.columns);
         for (name, view, dtype) in [
@@ -236,13 +239,12 @@ impl Op for ScaledResidualRmsNorm {
             }
         }
         let rows = args.hidden.shape.dim(0);
-        let bias = match (&args.update_bias, descriptor.update_bias) {
+        match (&args.update_bias, descriptor.update_bias) {
             (Some(bias), true) => {
                 bias.require_shape(Self::NAME, Shape::new(&[columns]))?;
                 bias.require_row(Self::NAME, descriptor.dtype, columns)?;
-                Some(*bias)
             }
-            (None, false) => None,
+            (None, false) => {}
             (None, true) => {
                 return Err(Error::argument(
                     Self::NAME,
@@ -255,8 +257,8 @@ impl Op for ScaledResidualRmsNorm {
                     "an update bias was given but the descriptor adds none".to_owned(),
                 ));
             }
-        };
-        let width = scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
+        }
+        scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
         args.weight
             .require_shape(Self::NAME, Shape::new(&[columns]))?;
         args.weight
@@ -264,13 +266,28 @@ impl Op for ScaledResidualRmsNorm {
         args.out.require_shape(Self::NAME, args.hidden.shape)?;
         args.out
             .require_row(Self::NAME, descriptor.activation, columns)?;
-        let partials = matches(
+        matches(
             &args.partials,
             descriptor.absmax,
             Self::NAME,
             "magnitude",
             rows,
         )?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        _descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.hidden.shape.dim(0);
+        // The descriptor's flags and these operands agree, as `check` states.
+        let bias = args.update_bias;
+        let partials = args.partials;
+        // A scale of one element broadcasts; the kernel reads its width as a launch argument.
+        let width = args.scale.shape.numel() as u32;
 
         let mut arguments = Arguments::new();
         arguments
@@ -372,12 +389,7 @@ impl Op for ScaledResidualLayerNorm {
     type Descriptor = ScaledResidualLayerNormDescriptor;
     type Args<'a> = ScaledResidualLayerNormArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         check_descriptor(Self::NAME, descriptor.columns, descriptor.tile)?;
         let columns = u64::from(descriptor.columns);
         for (name, view, dtype) in [
@@ -394,13 +406,12 @@ impl Op for ScaledResidualLayerNorm {
             }
         }
         let rows = args.hidden.shape.dim(0);
-        let update_bias = match (&args.update_bias, descriptor.update_bias) {
+        match (&args.update_bias, descriptor.update_bias) {
             (Some(bias), true) => {
                 bias.require_shape(Self::NAME, Shape::new(&[columns]))?;
                 bias.require_row(Self::NAME, descriptor.dtype, columns)?;
-                Some(*bias)
             }
-            (None, false) => None,
+            (None, false) => {}
             (None, true) => {
                 return Err(Error::argument(
                     Self::NAME,
@@ -413,8 +424,8 @@ impl Op for ScaledResidualLayerNorm {
                     "an update bias was given but the descriptor adds none".to_owned(),
                 ));
             }
-        };
-        let width = scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
+        }
+        scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
         for view in [&args.weight, &args.bias] {
             view.require_shape(Self::NAME, Shape::new(&[columns]))?;
             view.require_row(Self::NAME, descriptor.dtype, columns)?;
@@ -422,13 +433,28 @@ impl Op for ScaledResidualLayerNorm {
         args.out.require_shape(Self::NAME, args.hidden.shape)?;
         args.out
             .require_row(Self::NAME, descriptor.activation, columns)?;
-        let partials = matches(
+        matches(
             &args.partials,
             descriptor.absmax,
             Self::NAME,
             "magnitude",
             rows,
         )?;
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        _descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows = args.hidden.shape.dim(0);
+        // The descriptor's flags and these operands agree, as `check` states.
+        let update_bias = args.update_bias;
+        let partials = args.partials;
+        // A scale of one element broadcasts; the kernel reads its width as a launch argument.
+        let width = args.scale.shape.numel() as u32;
 
         let mut arguments = Arguments::new();
         arguments
@@ -516,12 +542,7 @@ impl Op for ScaledResidual {
     type Descriptor = ScaledResidualDescriptor;
     type Args<'a> = ScaledResidualArgs;
 
-    fn launch(
-        kernel: &Kernel,
-        descriptor: &Self::Descriptor,
-        args: Self::Args<'_>,
-        stream: &Stream,
-    ) -> Result<()> {
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
         if descriptor.columns == 0 || descriptor.block == 0 {
             return Err(Error::argument(
                 Self::NAME,
@@ -539,13 +560,12 @@ impl Op for ScaledResidual {
                 ));
             }
         }
-        let bias = match (&args.update_bias, descriptor.update_bias) {
+        match (&args.update_bias, descriptor.update_bias) {
             (Some(bias), true) => {
                 bias.require_shape(Self::NAME, Shape::new(&[columns]))?;
                 bias.require_row(Self::NAME, descriptor.dtype, columns)?;
-                Some(*bias)
             }
-            (None, false) => None,
+            (None, false) => {}
             (None, true) => {
                 return Err(Error::argument(
                     Self::NAME,
@@ -558,7 +578,7 @@ impl Op for ScaledResidual {
                     "an update bias was given but the descriptor adds none".to_owned(),
                 ));
             }
-        };
+        }
         // The channel count is compiled into the program (the package's `WIDTH`), so this only checks
         // that the scale is as wide as a row; the value is not a launch parameter.
         scale_width(Self::NAME, &args.scale, descriptor.dtype, columns)?;
@@ -569,6 +589,18 @@ impl Op for ScaledResidual {
                 format!("{elements} elements do not fit the kernel's int32 count"),
             ));
         }
+        Ok(())
+    }
+
+    fn launch(
+        kernel: &Kernel,
+        descriptor: &Self::Descriptor,
+        args: Self::Args<'_>,
+        stream: &Stream,
+    ) -> Result<()> {
+        // The descriptor's flag and this operand agree, as `check` states.
+        let bias = args.update_bias;
+        let elements = args.hidden.shape.numel();
 
         let mut arguments = Arguments::new();
         arguments
@@ -653,14 +685,13 @@ fn matches(
     operator: &'static str,
     what: &str,
     rows: u64,
-) -> Result<Option<TensorView>> {
+) -> Result<()> {
     match (partials, expected) {
         (Some(partials), true) => {
             partials.require_shape(operator, Shape::new(&[rows]))?;
-            partials.require_row(operator, DType::F32, rows)?;
-            Ok(Some(*partials))
+            partials.require_row(operator, DType::F32, rows)
         }
-        (None, false) => Ok(None),
+        (None, false) => Ok(()),
         (None, true) => Err(Error::argument(
             operator,
             format!("the descriptor records {what} but no buffer was given"),
@@ -735,13 +766,73 @@ impl Op for ScaledAdd {
     type Descriptor = ScaledAddDescriptor;
     type Args<'a> = ScaledAddArgs;
 
+    fn check(descriptor: &Self::Descriptor, args: &Self::Args<'_>) -> Result<()> {
+        if descriptor.block == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a block of zero elements adds nothing".to_owned(),
+            ));
+        }
+        // The width is the operand's, read from the view: a descriptor field would be a second statement
+        // of it, and a keyed one states a row set per request duration.
+        args.target.require_rank(Self::NAME, 2)?;
+        args.source.require_rank(Self::NAME, 2)?;
+        // The two element types are the descriptor's, and the operands must be the types it names: the
+        // key states them because a call may mix them on purpose, and a kernel compiled for one pair
+        // reads another pair's bytes at the wrong width. Losing this check is what a `columns` field
+        // took with it when it left the descriptor.
+        for (operand, named, role) in [
+            (args.target, descriptor.target, "target"),
+            (args.source, descriptor.source, "source"),
+        ] {
+            if operand.dtype != named {
+                return Err(Error::argument(
+                    Self::NAME,
+                    format!(
+                        "the {role} is {} and the descriptor names {named}",
+                        operand.dtype
+                    ),
+                ));
+            }
+        }
+        if args.source.shape != args.target.shape {
+            return Err(Error::argument(
+                Self::NAME,
+                "the source does not have the target's shape".to_owned(),
+            ));
+        }
+        let elements = args.target.shape.numel();
+        // A call over no elements has nothing to add, and the grid would refuse it as `[0, 1, 1] has no
+        // block` — a message about the launch rather than about the blend. The width is the operand's
+        // now that it is not a descriptor field, so the empty case has to be read from the view too.
+        if elements == 0 {
+            return Err(Error::argument(
+                Self::NAME,
+                "a blend of no elements adds nothing".to_owned(),
+            ));
+        }
+        // The kernel takes the extent as an `i64` and computes its offsets in `i64`, so the count's
+        // type is the arithmetic's type. No launch today reaches `i32::MAX` — a call holds a tile, not
+        // a whole canvas — but a 32-bit count on a 64-bit offset space is an operator limit that no
+        // device imposes, and it costs nothing to not have one.
+        if elements > i64::MAX as u64 {
+            return Err(Error::argument(
+                Self::NAME,
+                format!("{elements} elements do not fit the kernel's int64 count"),
+            ));
+        }
+        Ok(())
+    }
+
     fn launch(
         kernel: &Kernel,
         descriptor: &Self::Descriptor,
         args: Self::Args<'_>,
         stream: &Stream,
     ) -> Result<()> {
-        let elements = check(descriptor, args)?;
+        // `check` keeps the count within the kernel's `int64`.
+        let elements = args.target.shape.numel() as i64;
+
         let mut arguments = Arguments::new();
         arguments
             .view(args.target)
@@ -780,65 +871,6 @@ impl Op for ScaledAdd {
                 + descriptor.source.unit_roundoff() as f32,
         )
     }
-}
-
-/// Validate a call and answer its flattened element count.
-fn check(descriptor: &ScaledAddDescriptor, args: ScaledAddArgs) -> Result<i64> {
-    if descriptor.block == 0 {
-        return Err(Error::argument(
-            ScaledAdd::NAME,
-            "a block of zero elements adds nothing".to_owned(),
-        ));
-    }
-    // The width is the operand's, read from the view: a descriptor field would be a second statement
-    // of it, and a keyed one states a row set per request duration.
-    args.target.require_rank(ScaledAdd::NAME, 2)?;
-    args.source.require_rank(ScaledAdd::NAME, 2)?;
-    // The two element types are the descriptor's, and the operands must be the types it names: the
-    // key states them because a call may mix them on purpose, and a kernel compiled for one pair
-    // reads another pair's bytes at the wrong width. Losing this check is what a `columns` field
-    // took with it when it left the descriptor.
-    for (operand, named, role) in [
-        (args.target, descriptor.target, "target"),
-        (args.source, descriptor.source, "source"),
-    ] {
-        if operand.dtype != named {
-            return Err(Error::argument(
-                ScaledAdd::NAME,
-                format!(
-                    "the {role} is {} and the descriptor names {named}",
-                    operand.dtype
-                ),
-            ));
-        }
-    }
-    if args.source.shape != args.target.shape {
-        return Err(Error::argument(
-            ScaledAdd::NAME,
-            "the source does not have the target's shape".to_owned(),
-        ));
-    }
-    let elements = args.target.shape.numel();
-    // A call over no elements has nothing to add, and the grid would refuse it as `[0, 1, 1] has no
-    // block` — a message about the launch rather than about the blend. The width is the operand's
-    // now that it is not a descriptor field, so the empty case has to be read from the view too.
-    if elements == 0 {
-        return Err(Error::argument(
-            ScaledAdd::NAME,
-            "a blend of no elements adds nothing".to_owned(),
-        ));
-    }
-    // The kernel takes the extent as an `i64` and computes its offsets in `i64`, so the count's
-    // type is the arithmetic's type. No launch today reaches `i32::MAX` — a call holds a tile, not
-    // a whole canvas — but a 32-bit count on a 64-bit offset space is an operator limit that no
-    // device imposes, and it costs nothing to not have one.
-    if elements > i64::MAX as u64 {
-        return Err(Error::argument(
-            ScaledAdd::NAME,
-            format!("{elements} elements do not fit the kernel's int64 count"),
-        ));
-    }
-    Ok(elements as i64)
 }
 
 #[cfg(test)]
@@ -894,29 +926,25 @@ mod scaled_add_tests {
             block: SCALED_ADD_BLOCK,
         };
 
-        let elements = check(&descriptor, args(target, source))
+        ScaledAdd::check(&descriptor, &args(target, source))
             .expect("a count past i32::MAX is a launch of this operator");
-        assert_eq!(elements, WIDEST_ENCODER_ROW as i64);
-        assert!(elements > i64::from(i32::MAX));
+        assert!(WIDEST_ENCODER_ROW > i32::MAX as u64);
     }
 
     #[test]
     fn the_two_operands_must_be_the_shape_the_descriptor_names() {
         let fine = args(view(DType::BF16, 2, 64), view(DType::F32, 2, 64));
-        assert_eq!(
-            check(&descriptor(DType::BF16, DType::F32), fine).unwrap(),
-            128
-        );
+        assert!(ScaledAdd::check(&descriptor(DType::BF16, DType::F32), &fine).is_ok());
 
         let wrong_source = args(view(DType::BF16, 2, 64), view(DType::BF16, 2, 64));
         assert!(
-            check(&descriptor(DType::BF16, DType::F32), wrong_source).is_err(),
+            ScaledAdd::check(&descriptor(DType::BF16, DType::F32), &wrong_source).is_err(),
             "a source of another type than the descriptor names"
         );
 
         let wrong_shape = args(view(DType::BF16, 2, 64), view(DType::F32, 1, 64));
         assert!(
-            check(&descriptor(DType::BF16, DType::F32), wrong_shape).is_err(),
+            ScaledAdd::check(&descriptor(DType::BF16, DType::F32), &wrong_shape).is_err(),
             "a source row count the target does not have"
         );
     }
@@ -924,7 +952,7 @@ mod scaled_add_tests {
     #[test]
     fn a_blend_of_no_elements_is_refused_by_name_and_not_by_the_grid() {
         let empty = args(view(DType::BF16, 2, 0), view(DType::F32, 2, 0));
-        let error = check(&descriptor(DType::BF16, DType::F32), empty)
+        let error = ScaledAdd::check(&descriptor(DType::BF16, DType::F32), &empty)
             .expect_err("a row of no elements has nothing to add");
 
         // The refusal must name the operator: `LaunchGrid` would answer `grid [0, 1, 1] has no

@@ -651,7 +651,11 @@ impl<'a> Forward<'a> {
         self
     }
 
-    /// Resolve `O`'s kernel for this descriptor and launch it.
+    /// Check the call against `O`'s rules ([`Op::check`]), then resolve `O`'s kernel for this
+    /// descriptor and launch it.
+    ///
+    /// A recording forward checks the call the same way and then only reports the descriptor key
+    /// to the capture sink, so a recorded key always comes from a call the device would accept.
     ///
     /// When this forward shadows `O` at this descriptor key, the launch is
     /// paired: the new kernel writes the twins and the previous generation's kernel writes the real
@@ -661,6 +665,8 @@ impl<'a> Forward<'a> {
     where
         O::Args<'t>: Copy,
     {
+        let refused = |error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error);
+        O::check(descriptor, &args).map_err(refused)?;
         // A recording forward states the program and stops: no kernel to resolve, no launch to make,
         // and the descriptor key formatted only when a sink will read it.
         let (Some(stream), Some(kernels)) = (self.stream, self.kernels) else {
@@ -677,8 +683,7 @@ impl<'a> Forward<'a> {
             .filter(|shadow| shadow.operator == O::NAME);
         let Some(shadow) = shadow else {
             let kernel = kernels.op::<O>(descriptor)?;
-            O::launch(kernel, descriptor, args, stream)
-                .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
+            O::launch(kernel, descriptor, args, stream).map_err(refused)?;
             Self::record::<O>(descriptor);
             return Ok(());
         };
@@ -698,13 +703,13 @@ impl<'a> Forward<'a> {
         };
         // Redirect the call's outputs into the twins and let the new program write them; the
         // previous program then writes the real outputs, which the forward continues on.
+        // The twins are other views than the call's, so the redirected call is checked on its own.
         let redirected = O::shadow(args, &mut twins, stream);
-        O::launch(current, descriptor, redirected, stream)
-            .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
+        O::check(descriptor, &redirected).map_err(refused)?;
+        O::launch(current, descriptor, redirected, stream).map_err(refused)?;
         Self::record::<O>(descriptor);
         drop(twins);
-        O::launch(previous, descriptor, args, stream)
-            .map_err(|error| Error::launch(O::NAME, ops::descriptor::key(descriptor), error))?;
+        O::launch(previous, descriptor, args, stream).map_err(refused)?;
         Self::record::<O>(descriptor);
         shadow.twins.borrow_mut().freeze(stream);
         Ok(())
