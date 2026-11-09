@@ -183,22 +183,20 @@ impl Arena {
 
 /// The borrowed execution resources of one forward.
 pub struct Forward<'a> {
-    /// The stream this forward's work is issued on and the generation of loaded kernels the
-    /// operators resolve their programs from, or `None` for a **recording** forward: one that states
-    /// the programs a graph launches instead of launching them.
+    /// The stream this forward's work is issued on, or `None` for a **recording** forward: one that
+    /// states the programs a graph launches instead of launching them.
     ///
     /// A recording forward exists so that the enumeration of a model's programs can be the model's own
     /// `forward` rather than a second traversal written beside it. It needs no device: the arena is a
     /// null-backed region, `operate` formats the descriptor and hands it to the capture sink, and no
     /// kernel is resolved. That is the difference between "the walk runs the model" (which would need
     /// a GPU and the checkpoint's shards) and this: the walk runs the model's *shape arithmetic*.
-    /// The stream this forward's work is issued on, or `None` for a recording forward.
     stream: Option<&'a Stream>,
     /// The generation of loaded kernels the operators resolve their programs from, or `None` for a
     /// recording forward.
-    pub kernels: Option<&'a Generation>,
+    kernels: Option<&'a Generation>,
     /// The activation region of this captured bucket.
-    pub arena: &'a Arena,
+    arena: &'a Arena,
     /// The communicator of this rank's parallel group, when a launching forward's block is
     /// partitioned. Layers reach it only through this forward's collectives.
     group: Option<&'a Group>,
@@ -206,7 +204,7 @@ pub struct Forward<'a> {
     /// walk follows, and the member count.
     split: Option<Split>,
     /// The expert-parallel dispatch's received views, when the block's experts are split across ranks.
-    pub dispatch: Option<&'a DispatchViews>,
+    dispatch: Option<&'a DispatchViews>,
     /// Where this forward's launches go when the runtime routes them itself ([`Route`]), or `None`
     /// to launch every call once with the current generation's program.
     route: Option<&'a dyn Route>,
@@ -216,12 +214,12 @@ pub struct Forward<'a> {
     /// token row needs to know which rows are real, and it cannot derive that from any shape: the
     /// arena is the bucket's. The value is device-resident because it changes per replay of one
     /// captured graph, and the buffer must outlive the bucket - a layer reads it on every replay.
-    pub live_tokens: Option<TensorView>,
+    live_tokens: Option<TensorView>,
     /// Times the model's components on the device, or `None`.
     ///
     /// A forward captured into a graph captures its probes, and every replay then runs them. Nothing
     /// a forward computes depends on a fence being present.
-    pub fence: Option<&'a dyn Fence>,
+    fence: Option<&'a dyn Fence>,
 }
 
 /// How a partitioned block is split across a group: this rank's index and the member count.
@@ -248,7 +246,7 @@ enum Collective<'a> {
 /// Times a model's components on the device (`docs/profiling.md`, fence probes).
 ///
 /// A model states each of its modules with [`Forward::fenced`]: the module's component, which names
-/// its class across the deployment (`models.qwen3_moe.Transformer`), and its path in the model
+/// its class across the deployment (`models.<family>.<module>.<Class>`), and its path in the model
 /// (`layers.3`), which names this instance. Which components carry probes is the deployment's
 /// choice, so an implementation answers `None` for a component no pattern names and the module then
 /// runs as if unobserved.
@@ -580,9 +578,16 @@ impl<'a> Forward<'a> {
         Ok(answer)
     }
 
-    /// The token rows of this batch that are live, when the caller stated them.
-    pub fn live_of(&self) -> Option<TensorView> {
+    /// The token rows of this batch that are live, `[1]` i32 on the device, when the caller stated
+    /// them ([`Self::with_live_tokens`]).
+    pub fn live_tokens(&self) -> Option<TensorView> {
         self.live_tokens
+    }
+
+    /// The expert-parallel dispatch's received views, when the caller stated them
+    /// ([`Self::with_dispatch`]).
+    pub fn dispatch(&self) -> Option<&'a DispatchViews> {
+        self.dispatch
     }
 
     /// Check the call against `O`'s rules ([`Op::check`]), then resolve `O`'s kernel for this

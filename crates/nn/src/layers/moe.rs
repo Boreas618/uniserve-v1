@@ -1090,7 +1090,7 @@ impl Moe {
             permuted_to_token,
             total_padded_tokens,
             num_non_exiting_tiles,
-            live_tokens: f.live_of(),
+            live_tokens: f.live_tokens(),
             local_offset: 0,
         };
 
@@ -1140,7 +1140,7 @@ impl Moe {
 
     /// `out = Σ_routes weight · expert(hidden)` over this rank's experts and block.
     fn combine(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
-        if self.local != self.experts || f.dispatch.is_some() {
+        if self.local != self.experts || f.dispatch().is_some() {
             return self.forward_expert_parallel(f, hidden, out);
         }
         let hidden_width = u64::from(self.hidden);
@@ -1535,7 +1535,7 @@ impl Moe {
         hidden: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        let exchange = f.dispatch.ok_or_else(|| {
+        let exchange = f.dispatch().ok_or_else(|| {
             Error::shape(
                 "Moe",
                 "an expert-parallel block reads the group's exchange views, and the forward \
@@ -1639,7 +1639,7 @@ impl Moe {
     /// same dispatch on every rank. A rank with no batch of its own calls this: its experts serve the
     /// tokens routed to them and it sends none.
     pub fn join_expert_step(&self, f: &Forward) -> Result<()> {
-        let exchange = f.dispatch.ok_or_else(|| {
+        let exchange = f.dispatch().ok_or_else(|| {
             Error::shape(
                 "Moe",
                 "a join reads the group's exchange views, and the forward borrows none".to_owned(),
@@ -1709,7 +1709,7 @@ impl Moe {
             state: hidden,
             ids: sent,
             weights,
-            live: f.live_of(),
+            live: f.live_tokens(),
             out: empty,
             fused: None,
             ranks: exchange.ranks,
@@ -1915,7 +1915,7 @@ impl Moe {
             state: empty,
             ids: sent,
             weights,
-            live: f.live_of(),
+            live: f.live_tokens(),
             out,
             fused: Some(layer),
             ranks: exchange.ranks,
@@ -1951,7 +1951,7 @@ impl Moe {
             state: empty,
             ids: empty,
             weights: empty,
-            live: f.live_of(),
+            live: f.live_tokens(),
             out,
             fused: None,
             ranks: exchange.ranks,
