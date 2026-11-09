@@ -320,11 +320,6 @@ pub struct EncoderInputs<'a> {
     pub layout: &'a EncoderLayout,
     /// The encoder's tables for this layout, in [`Encoder::state_tables`]' order.
     pub state: &'a [TensorView],
-    /// The rows an encoder reports back for its caller's inspection, in the model's order.
-    ///
-    /// Diagnostics are outputs of the encode and never an input of the model's mathematics: a
-    /// model that reports nothing passes an empty slice.
-    pub diagnostics: &'a [TensorView],
 }
 
 /// One image a multimodal tower reads: its pixels.

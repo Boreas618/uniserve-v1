@@ -2,10 +2,7 @@
 //!
 //! The protocol: both implementations write the named tensors they
 //! computed into their own tree at `<block>/<name>.npy`, and `tools/diagnosis/compare.py` pairs the
-//! two trees by that relative path. The reference half exists - `crates/models/minimax-h3/tools/`
-//! holds a dumper per block - and the served half did not: no crate read `UNISERVE_DIAG_DIR`, so a
-//! served run wrote no dump and a report read every name as `missing_in_got`. This module is that
-//! half.
+//! two trees by that relative path. This module writes the served run's tree.
 //!
 //! **Nothing here runs unless `UNISERVE_DIAG_DIR` names a directory.** The variable is read once,
 //! when a runner binds; an unset variable costs no allocation, no copy and no branch inside a step,

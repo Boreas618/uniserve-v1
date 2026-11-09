@@ -719,7 +719,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
                     images: &images,
                     layout: &layout,
                     state: &state,
-                    diagnostics: &[],
                 },
                 EncoderOutputs { hidden },
             )
@@ -802,7 +801,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             images: &[],
             layout: &layout,
             state: &state,
-            diagnostics: &[],
         };
         self.model
             .encode(
