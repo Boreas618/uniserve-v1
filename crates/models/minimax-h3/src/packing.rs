@@ -21,9 +21,11 @@
 
 use std::ops::Range;
 
+#[cfg(test)]
+use crate::config::AttentionKind;
 use crate::config::{
-    AUDIO_CHANNELS, AUDIO_HOP, AttentionKind, CANVAS_MULTIPLE, CLIP_FRAMES, CLIP_LATENTS, Canvas,
-    FPS, SPARSE_TILE_ROWS,
+    AUDIO_CHANNELS, AUDIO_HOP, CANVAS_MULTIPLE, CLIP_FRAMES, CLIP_LATENTS, Canvas, FPS,
+    SPARSE_TILE_ROWS,
 };
 use crate::{Error, Result};
 
@@ -136,6 +138,7 @@ pub fn video_latent_frames(num_frames: u32) -> Result<u32> {
 /// back: a count that is off by a clip is an empty table or one that stops short of the last window,
 /// and neither shows as an error at the call site. Refuses a timeline no clip sequence produces,
 /// including the zero-clip one (two latent frames), rather than returning the truncated division.
+#[cfg(test)]
 pub fn clip_count(latent_frames: u32) -> Result<u32> {
     let extra = CLIP_LATENT_WINDOW - CLIP_LATENTS;
     let aligned = latent_frames.checked_sub(extra).ok_or_else(|| {
@@ -159,6 +162,7 @@ pub fn clip_count(latent_frames: u32) -> Result<u32> {
 /// frames those latents were encoded from, so the decoder's tables can be derived from a layout's
 /// latent extents without knowing the request's frame rule. Refuses a latent count no clip timeline
 /// produces.
+#[cfg(test)]
 pub fn video_output_frames(latent_frames: u32) -> Result<u32> {
     let clips = clip_count(latent_frames)?;
     let frames = clips
@@ -367,6 +371,7 @@ pub fn tile_order(grid: (u32, u32, u32), shape: (u32, u32, u32)) -> TileOrder {
 ///
 /// `tiles` is clamped to the grid's tile count. The whole tile slabs of frames count first, then
 /// the whole tile rows of the next slab, then the leading tiles of its next tile row.
+#[cfg(test)]
 pub fn tiled_rows(grid: (u32, u32, u32), shape: (u32, u32, u32), tiles: u32) -> u32 {
     let (frames, height, width) = grid;
     let (tile_t, tile_h, tile_w) = shape;
@@ -393,6 +398,7 @@ pub fn tiled_rows(grid: (u32, u32, u32), shape: (u32, u32, u32), tiles: u32) -> 
 /// exactly at the last latent frame. Under dense attention the raster and packed orders agree; a
 /// sparse layout orders the rows tile-major, so each clip's rows are the packed position of every
 /// raster row it reads (the inverse of [`video_order`]).
+#[cfg(test)]
 pub fn clip_rows(attention: AttentionKind, num_frames: u32, canvas: &Canvas) -> Result<Vec<u32>> {
     let raster = latent_raster(canvas)?;
     let order = video_order(attention, num_frames, canvas)?;
@@ -415,6 +421,7 @@ pub fn clip_rows(attention: AttentionKind, num_frames: u32, canvas: &Canvas) -> 
 ///
 /// Dense packing keeps the raster order; a sparse layout orders the rows tile-major, which depends
 /// on neither the prompt nor the conditions.
+#[cfg(test)]
 pub fn video_order(attention: AttentionKind, num_frames: u32, canvas: &Canvas) -> Result<Vec<u32>> {
     video_order_of(
         attention,
@@ -424,6 +431,7 @@ pub fn video_order(attention: AttentionKind, num_frames: u32, canvas: &Canvas) -
 }
 
 /// The same order, from the latent extents a layout states rather than a pixel canvas.
+#[cfg(test)]
 pub fn video_order_of(
     attention: AttentionKind,
     frames: u32,
@@ -448,6 +456,7 @@ const ROPE_SPATIAL_SCALE: f64 = 32.0;
 
 /// Latent frames one clip's decoder input covers: its five advancing frames and the two the next
 /// clip also reads (`uniserve/models/minimax_h3/decoding.py::VideoDecoder.clip_input`).
+#[cfg(test)]
 const CLIP_DECODE_LATENTS: u32 = 7;
 
 /// The rotary coordinates of the patches along one spatial axis.
@@ -969,11 +978,13 @@ impl SegmentExtent {
     }
 
     /// Generated audio rows packed before packed row `row`.
+    #[cfg(test)]
     pub fn audio_rows_below(&self, row: u32) -> u32 {
         row.saturating_sub(self.audio_start()).min(self.audio_rows)
     }
 
     /// Generated video rows packed before `row`, which must be a tile boundary of the video tiles.
+    #[cfg(test)]
     pub fn video_rows_below(&self, row: u32) -> Result<u32> {
         let shape = tile_shape(self.tile)?;
         let offset = i64::from(row) - i64::from(self.video_start());
@@ -988,6 +999,7 @@ impl SegmentExtent {
 
     /// Leading tiles that every request keeps dense or empty: the text tiles, and without
     /// conditions the audio tiles after them.
+    #[cfg(test)]
     pub fn dense_prefix_tiles(&self) -> u32 {
         let stop = if self.condition_rows == 0 {
             self.video_start()
@@ -1002,6 +1014,7 @@ impl SegmentExtent {
     /// Dense tiles attend every tile, and so may any tile before the generated video, which can be
     /// a reference segment. A generated video query attends the live dense tiles, which all precede
     /// it, and [`kept_tiles`] of its own tiles. Tiles after the video are empty.
+    #[cfg(test)]
     pub fn key_bounds(&self, sparsity: f64) -> Vec<u32> {
         let tiles = self.padded_tokens / self.tile;
         let start = self.video_start() / self.tile;

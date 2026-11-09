@@ -344,11 +344,13 @@ impl TextEncoderConfig {
     }
 
     /// The width of the key and value projection of one rank.
+    #[cfg(test)]
     pub const fn key_value_width(&self) -> u32 {
         self.num_key_value_heads * self.head_dim
     }
 
     /// The width of one M-RoPE axis's rotation: `2 * sections[axis]` channels of each head.
+    #[cfg(test)]
     pub fn mrope_axis_width(&self, axis: usize) -> u32 {
         self.mrope_sections[axis] * 2
     }

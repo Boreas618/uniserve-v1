@@ -14,14 +14,13 @@
 //!    returns its events ([`RequestEvents`]), across the engines that serve
 //!    it when it migrates;
 //! 3. the events are assembled into public [`RequestOutput`] events
-//!    ([`output::generation_output`], [`output::media_output`]) and wrapped
+//!    (`output::run::GenerationRun`, [`output::media_output`]) and wrapped
 //!    in [`RequestStats`], which records the request's metrics once.
 //!
 //! Dropping the returned stream drops its `RequestEvents`, which cancels the
 //! request in the engine that serves it; that is the only cancellation path.
 //!
 //! [`RequestOutput`]: crate::output::RequestOutput
-//! [`output::generation_output`]: crate::output::generation_output
 //! [`output::media_output`]: crate::output::media_output
 
 use std::collections::BTreeMap;
@@ -1176,6 +1175,7 @@ impl Leader {
     ///
     /// Fails when an image cannot be fetched, preprocessing refuses the
     /// request, or no scheduler accepts it.
+    #[cfg(test)]
     pub async fn generate(
         &self,
         request: GenerateRequest,

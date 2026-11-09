@@ -207,11 +207,6 @@ impl Condition {
         }
     }
 
-    /// Denoiser video rows of the condition.
-    pub fn video_rows(&self) -> u64 {
-        self.latent_units.iter().map(|rows| u64::from(*rows)).sum()
-    }
-
     /// Bytes of the RGB24 pixels the video encoder encodes.
     pub fn pixel_bytes(&self) -> u64 {
         self.media.pixels().map_or(0, |(frames, canvas)| {
@@ -513,7 +508,6 @@ mod tests {
     fn an_image_condition_is_consistent() {
         let condition = image(ConditionRole::FirstFrame);
         assert_eq!(condition.validate(), Ok(()));
-        assert_eq!(condition.video_rows(), 2);
         assert_eq!(condition.pixel_bytes(), 64 * 32 * 3);
     }
 

@@ -93,32 +93,6 @@ impl DataType {
             Self::I16 => -1,    // no counterpart
         }
     }
-
-    /// The unit round-off `u`, half the gap between 1 and the next
-    /// representable number of this type: the `u` of design §7.3's error
-    /// bound `γₙ = n·u/(1 − n·u)`, which an operator's tolerance is derived
-    /// from.
-    ///
-    /// It is 0 for integer types, which have no rounding.
-    pub fn unit_round_off(self) -> f64 {
-        match self {
-            // 53, 24, 11, 8 and 3 explicit bits of significand, plus the
-            // implicit one.
-            Self::F64 => libm_half_ulp(53),
-            Self::F32 => libm_half_ulp(24),
-            Self::F16 => libm_half_ulp(11),
-            Self::Bf16 => libm_half_ulp(8),
-            Self::F8E4M3 => libm_half_ulp(4),
-            Self::F8E5M2 => libm_half_ulp(3),
-            Self::I64 | Self::I32 | Self::I16 | Self::I8 | Self::U64 | Self::U32 | Self::U8 => 0.0,
-        }
-    }
-}
-
-/// `2^-bits`: half a unit in the last place for a significand of `bits` bits,
-/// where the leading bit is implicit.
-fn libm_half_ulp(bits: u32) -> f64 {
-    2f64.powi(-(bits as i32))
 }
 
 #[cfg(test)]
@@ -155,23 +129,5 @@ mod tests {
         assert_eq!(DataType::Bf16.nccl(), 9);
         assert_eq!(DataType::I8.nccl(), 0);
         assert_eq!(DataType::I16.nccl(), -1);
-    }
-
-    /// The bound of design §7.3 is `γₙ = n·u/(1 − n·u)` with this `u`; its
-    /// smallest value for FP32, `u = 2^-24`, is the one the standard bound
-    /// uses.
-    #[test]
-    fn a_type_reports_its_unit_round_off() {
-        assert_eq!(DataType::F32.unit_round_off(), 2f64.powi(-24));
-        assert_eq!(DataType::F64.unit_round_off(), 2f64.powi(-53));
-        assert_eq!(DataType::Bf16.unit_round_off(), 2f64.powi(-8));
-        assert_eq!(DataType::F16.unit_round_off(), 2f64.powi(-11));
-        assert_eq!(DataType::I32.unit_round_off(), 0.0);
-
-        // γₙ stays below one for a reduction of a hundred million terms in
-        // FP32, which is why the bound is usable at the lengths a kernel sums.
-        let n = 100_000_000.0;
-        let u = DataType::F32.unit_round_off();
-        assert!(n * u / (1.0 - n * u) < 6.0);
     }
 }

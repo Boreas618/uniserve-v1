@@ -235,8 +235,6 @@ pub struct Arguments {
     words: Vec<Box<u64>>,
     /// For each word, whether the driver reads a device address out of it.
     kinds: Vec<Word>,
-    /// The global scratch address, for a kernel whose metadata asks for one.
-    scratch: Option<DevicePtr>,
     /// The word the scratch address is read from at launch.
     scratch_slot: Box<u64>,
     /// The word the profile scratch address is read from at launch.
@@ -299,31 +297,14 @@ impl Arguments {
         self.i32(i32::from(value))
     }
 
-    /// The global scratch the kernel's metadata asks for.
-    ///
-    /// A kernel whose metadata declares global scratch takes its address as the last parameter; a
-    /// caller that omits it, or supplies one to a kernel that declares none, is launching with the
-    /// wrong parameter list and fails here rather than in the driver.
-    pub fn scratch(&mut self, buffer: Option<DevicePtr>) -> &mut Self {
-        self.scratch = buffer;
-        self
-    }
-
     /// The parameter array, for a launch.
     pub fn parameters(&mut self, metadata: Option<&CubinMetadata>) -> Result<&mut [*mut c_void]> {
-        let needs_scratch = metadata.is_some_and(CubinMetadata::needs_scratch);
-        match (needs_scratch, self.scratch) {
-            (true, None) => {
-                return Err(Error::Metadata(
-                    "the kernel declares global scratch and the operator passed none".to_owned(),
-                ));
-            }
-            (false, Some(_)) => {
-                return Err(Error::Metadata(
-                    "the operator passed global scratch to a kernel that declares none".to_owned(),
-                ));
-            }
-            _ => {}
+        // No operator supplies global scratch, so a kernel whose metadata declares it is launching
+        // with a parameter list it cannot be given, and fails here rather than in the driver.
+        if metadata.is_some_and(CubinMetadata::needs_scratch) {
+            return Err(Error::Metadata(
+                "the kernel declares global scratch, which no operator supplies".to_owned(),
+            ));
         }
 
         self.check(metadata)?;
@@ -339,7 +320,7 @@ impl Arguments {
             // address and the profile scratch address. They are values the driver reads at launch,
             // exactly like the packed words above, so they are passed through slots of their own that
             // outlive this call.
-            *self.scratch_slot = self.scratch.map(platform::address).unwrap_or(0);
+            *self.scratch_slot = 0;
             *self.profile_slot = 0;
             self.parameters
                 .push(self.scratch_slot.as_mut() as *mut u64 as *mut c_void);
@@ -926,15 +907,9 @@ mod tests {
     }
 
     #[test]
-    fn global_scratch_is_a_value_the_caller_supplies_and_its_absence_is_refused() {
+    fn a_kernel_that_declares_global_scratch_is_refused() {
         let module =
             metadata(r#"{"name":"_kernel","signature":{"x":"*bf16"},"global_scratch_size":4096}"#);
-        let mut arguments = Arguments::new();
-        arguments.pointer(DevicePtr::new(0x1000));
-        arguments.scratch(Some(DevicePtr::new(0x2000)));
-        // One declared parameter and the two scratch addresses.
-        assert_eq!(arguments.parameters(Some(&module)).unwrap().len(), 3);
-
         let mut without = Arguments::new();
         without.pointer(DevicePtr::new(0x1000));
         let error = without.parameters(Some(&module)).unwrap_err().to_string();

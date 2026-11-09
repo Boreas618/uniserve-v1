@@ -37,17 +37,6 @@ pub enum GenerationConstraint {
     GenOnly,
 }
 
-impl GenerationConstraint {
-    /// Returns the stable snake-case wire name.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Default => "default",
-            Self::UndOnly => "und_only",
-            Self::GenOnly => "gen_only",
-        }
-    }
-}
-
 impl FromStr for GenerationConstraint {
     type Err = GenerationConstraintParseError;
 
@@ -1567,7 +1556,6 @@ mod tests {
             ("und_only", GenerationConstraint::UndOnly),
             ("gen_only", GenerationConstraint::GenOnly),
         ] {
-            assert_eq!(constraint.as_str(), name);
             assert_eq!(name.parse::<GenerationConstraint>().unwrap(), constraint);
         }
         assert!("text".parse::<GenerationConstraint>().is_err());

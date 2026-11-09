@@ -131,6 +131,7 @@ impl Resample {
     /// The reference states the three paddings once, for the upsampling direction; the downsampling
     /// direction pads its own convolution's input, which is why [`Resample::upsample_length`] and
     /// [`Resample::downsample_padding`] are separate.
+    #[cfg(test)]
     pub fn new(ratio: u32, kernel: u32) -> Result<Self> {
         if ratio == 0 || kernel == 0 {
             return Err(Error::config(
@@ -156,16 +157,19 @@ impl Resample {
     /// The transposed convolution of a `length + 2·pad` input, stride `ratio` and kernel `kernel`
     /// emits `(length + 2·pad − 1)·ratio + kernel`, and the crop removes `pad_left + pad_right`; the
     /// two cancel to `length · ratio` for the kernel this constructor admits.
+    #[cfg(test)]
     pub fn upsample_length(&self, length: u32) -> u32 {
         (u64::from(length) * u64::from(self.ratio)) as u32
     }
 
     /// The samples the upsampling direction's transposed convolution emits before the crop.
+    #[cfg(test)]
     pub fn transposed_length(&self, length: u32) -> u32 {
         (u64::from(length) + 2 * u64::from(self.pad) - 1) as u32 * self.ratio + self.kernel
     }
 
     /// The padding of the downsampling direction's convolution: `[pad_left, pad_right]`.
+    #[cfg(test)]
     pub fn downsample_padding(&self) -> (u32, u32) {
         let even = self.kernel.is_multiple_of(2);
         let left = self.kernel / 2 - u32::from(even);
@@ -173,6 +177,7 @@ impl Resample {
     }
 
     /// The output length of the downsampling direction for `length` input samples.
+    #[cfg(test)]
     pub fn downsample_length(&self, length: u32) -> u32 {
         let (left, right) = self.downsample_padding();
         let padded = u64::from(length) + u64::from(left) + u64::from(right);
@@ -209,12 +214,14 @@ pub struct Activation {
 
 impl Activation {
     /// The activation of `ratio` and `kernel`.
+    #[cfg(test)]
     pub fn new(ratio: u32, kernel: u32) -> Result<Self> {
         Resample::new(ratio, kernel)?;
         Ok(Self { ratio, kernel })
     }
 
     /// The activation of the checkpoint's decoder: ratio 2, kernel 12.
+    #[cfg(test)]
     pub fn bigvgan() -> Self {
         Self {
             ratio: 2,
@@ -225,6 +232,7 @@ impl Activation {
     /// The output length for `length` input samples, which is `length` itself.
     ///
     /// Stated as the two passes so that [`Resample`]'s arithmetic is the only place the formulas live.
+    #[cfg(test)]
     pub fn length(&self, length: u32) -> Result<u32> {
         let up = Resample::new(self.ratio, self.kernel)?;
         Ok(up.downsample_length(up.upsample_length(length)))
@@ -237,6 +245,7 @@ pub fn samples_per_latent(config: &AudioVaeConfig) -> u32 {
 }
 
 /// The latent frames a sample count needs: `ceil(samples / samples_per_latent)`.
+#[cfg(test)]
 pub fn latent_frames(config: &AudioVaeConfig, samples: u32) -> Result<u32> {
     let hop = samples_per_latent(config);
     if samples == 0 {
@@ -259,6 +268,7 @@ pub fn track_samples(config: &AudioVaeConfig, latent_frames: u32) -> u64 {
 /// (so a stage contributes its widest branch, not their sum) and each alias-free activation spreading
 /// its own upsample, filter and low-pass. The result rounds up and may exceed the exact field, which
 /// costs context and never correctness — it is the halo the runner carries around a media window.
+#[cfg(test)]
 pub fn receptive_field(config: &AudioVaeConfig) -> Result<u32> {
     let stages = stages(config)?;
     if config.resblock_kernel_sizes.len() != config.resblock_dilation_sizes.len() {
@@ -326,6 +336,7 @@ impl Pcm {
     ///
     /// `x` is clamped to [-1, 1] first, so the result never leaves `[-32767, 32767]` and the cast is
     /// total.
+    #[cfg(test)]
     pub fn quantize(x: f32) -> i16 {
         let clamped = x.clamp(-1.0, 1.0) * Self::FULL_SCALE;
         // `f32::round_ties_even` is `torch.round`'s rule; a value that is not finite cannot leave the
@@ -680,6 +691,7 @@ impl Workspace {}
 ///
 /// The reference decodes a track's whole latent timeline at once, so the runner sizes these from the
 /// request; a window shorter than the track carries the halo [`receptive_field`] states on each side.
+#[cfg(test)]
 pub fn workspace(config: &AudioVaeConfig, latent_frames: u32) -> Result<Vec<Workspace>> {
     if latent_frames == 0 {
         return Err(Error::config(
@@ -757,6 +769,7 @@ impl Statistics {
     ///
     /// The reference of the affine the decoder's input stage applies; a kernel that folds it into the
     /// input projection's epilogue must agree with it.
+    #[cfg(test)]
     pub fn denormalize(&self, channel: usize, value: f32) -> Result<f32> {
         let mean = *self.mean.get(channel).ok_or_else(|| {
             Error::config(format!(

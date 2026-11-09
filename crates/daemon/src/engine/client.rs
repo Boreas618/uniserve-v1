@@ -469,6 +469,7 @@ impl EngineClient {
     ///
     /// Fails when the daemon connection fails or the process does not exit
     /// in time.
+    #[cfg(test)]
     pub fn await_exit(&self, timeout: Duration) -> anyhow::Result<Option<String>> {
         use proto::process::{Downstream, Event as ProcessEvent, downstream, event};
 
@@ -1170,6 +1171,7 @@ impl EventStream {
     }
 
     /// Receives the next event; the same as [`Self::recv`].
+    #[cfg(test)]
     pub async fn next(&mut self) -> Option<Event> {
         self.recv().await
     }

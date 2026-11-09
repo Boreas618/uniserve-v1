@@ -527,6 +527,7 @@ impl Stack {
     }
 
     /// The extent of the posterior moments: `2 * latent_channels` channels over the latent raster.
+    #[cfg(test)]
     pub fn moments(&self, raster: Extent) -> Result<Extent> {
         self.extents(raster)
             .last()
@@ -573,6 +574,7 @@ impl Grid {
     /// The band's first tile row is the last one starting at or before `start`; it is preceded by one
     /// more row when `start` falls inside the cross-fade that row shares, because those latent rows
     /// read the row above. The last row is the last one starting before `stop`.
+    #[cfg(test)]
     pub fn band(&self, latent_height: u32, start: u32, stop: u32) -> Result<(usize, usize)> {
         if start >= stop || stop > latent_height {
             return Err(Error::config(format!(
@@ -792,6 +794,7 @@ impl AudioStack {
     /// A strided stage is a convolution of `2 * rate` taps with `ceil(rate / 2)` samples of padding
     /// each side, so it maps `L` to `(L + 2 * ceil(rate / 2) - 2 * rate) / rate + 1`: 800 samples
     /// become 400, 100, 25, 5 and 1.
+    #[cfg(test)]
     pub fn lengths(&self, samples: u32) -> Vec<u32> {
         let mut lengths = vec![samples];
         let mut current = samples;
@@ -809,6 +812,7 @@ impl AudioStack {
     }
 
     /// The latent frames a track of `samples` encodes to, and the length the stack must be given.
+    #[cfg(test)]
     pub fn latent_frames(&self, samples: u32) -> Result<u32> {
         let frames = audio_latent_frames(u64::from(samples), u64::from(self.samples_per_latent))?;
         u32::try_from(frames)

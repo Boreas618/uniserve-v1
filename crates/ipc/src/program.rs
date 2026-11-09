@@ -90,6 +90,7 @@ pub enum ProgramCommand {
 
 impl ProgramCommand {
     /// The generation this command is about.
+    #[cfg(test)]
     pub const fn generation(&self) -> u64 {
         match self {
             Self::Precopy { generation, .. }
@@ -101,6 +102,7 @@ impl ProgramCommand {
     }
 
     /// The stage's name, for tracing and for the status the command answers with.
+    #[cfg(test)]
     pub const fn stage(&self) -> &'static str {
         match self {
             Self::Precopy { .. } => "precopy",
@@ -123,6 +125,7 @@ impl ProgramCommand {
     /// The switchover's `step` is not part of the daemon's form: the boundary
     /// is the main process's own decision (§7.3 step 3), and the daemon learns
     /// it from `Report::Switched`.
+    #[cfg(test)]
     pub fn to_command(&self) -> proto::process::Command {
         use proto::process::command::Kind;
 
@@ -218,6 +221,7 @@ impl ProgramCommand {
 
 /// A program as the daemon's Protobuf carries it: its backend, its revision and
 /// its arguments, never the module's bytes (§6.3).
+#[cfg(test)]
 fn program_to_wire(program: &program_server::Program) -> proto::process::Program {
     proto::process::Program {
         backend: program.backend.clone(),
@@ -252,6 +256,7 @@ fn program_from_wire(
 }
 
 /// `ops::PhaseKind` as the wire's enum.
+#[cfg(test)]
 fn phase_to_wire(phase: program_server::PhaseKind) -> proto::process::PhaseKind {
     use program_server::PhaseKind;
     match phase {

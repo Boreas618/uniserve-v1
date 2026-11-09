@@ -784,6 +784,7 @@ impl Buckets {
     /// This is the set an epoch captures; the bound it implies - the largest decode rows and the
     /// largest prefill tokens - is what the capacity plan and the scheduler admit, so the buckets
     /// come first and the batch bound follows them rather than the other way round.
+    #[cfg(test)]
     pub fn default_causal_lm(
         decode: Option<&[u32]>,
         prefill: Option<&[u32]>,
@@ -831,6 +832,7 @@ impl Buckets {
     }
 
     /// How many buckets the set holds.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.ascending.len()
     }
@@ -913,12 +915,14 @@ impl Buckets {
     }
 
     /// Whether the set holds `bucket`.
+    #[cfg(test)]
     pub fn contains(&self, bucket: &Bucket) -> bool {
         self.ascending.binary_search(bucket).is_ok()
     }
 
     /// The bytes the largest bucket of each variant can need, given `bytes` as the footprint of
     /// one full bucket: what an arena must be able to map before it captures the set.
+    #[cfg(test)]
     pub fn largest_footprint(&self) -> Option<Bucket> {
         self.ascending.last().copied()
     }

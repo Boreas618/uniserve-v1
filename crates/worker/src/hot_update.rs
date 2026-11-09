@@ -146,21 +146,25 @@ impl HotUpdate {
     }
 
     /// The generation a revert returns to, while an update is on probation.
+    #[cfg(test)]
     pub fn previous(&self) -> Option<u64> {
         self.previous
     }
 
     /// The generations released and not yet purged, in release order.
+    #[cfg(test)]
     pub fn awaiting_purge(&self) -> &[u64] {
         &self.purgeable
     }
 
     /// The first error that failed the last update, if one did.
+    #[cfg(test)]
     pub fn failure(&self) -> Option<&UpdateFailure> {
         self.failure.as_ref()
     }
 
     /// The generation whose update failed last, for the report that names it.
+    #[cfg(test)]
     pub fn failed_generation(&self) -> Option<u64> {
         self.failed_generation
     }
@@ -362,6 +366,7 @@ impl HotUpdate {
     /// The generation whose purge runs now: the daemon asked for it, and the device performs the
     /// release behind every batch its queue already holds (§7.3 step 6). The caller releases its
     /// graphs and kernels and reports [`Self::purged`].
+    #[cfg(test)]
     pub fn purge_due(&self) -> Option<u64> {
         self.purging
     }

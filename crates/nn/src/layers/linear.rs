@@ -369,16 +369,19 @@ impl Nvfp4Linear {
     }
 
     /// The contraction length, in elements.
+    #[cfg(test)]
     pub const fn k(&self) -> u32 {
         self.k
     }
 
     /// The number of output channels.
+    #[cfg(test)]
     pub const fn n(&self) -> u32 {
         self.n
     }
 
     /// The packed weight view, `[n, k/2]` bytes.
+    #[cfg(test)]
     pub fn weight(&self) -> TensorView {
         self.packed.view()
     }

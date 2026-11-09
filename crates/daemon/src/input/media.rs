@@ -236,16 +236,19 @@ impl ImageInput {
     }
 
     /// Encoded image file bytes.
+    #[cfg(test)]
     pub fn bytes(&self) -> &Bytes {
         &self.bytes
     }
 
     /// Width in pixels, from the file header.
+    #[cfg(test)]
     pub fn width(&self) -> u32 {
         self.width
     }
 
     /// Height in pixels, from the file header.
+    #[cfg(test)]
     pub fn height(&self) -> u32 {
         self.height
     }
@@ -255,6 +258,7 @@ impl ImageInput {
     /// Equal bytes always give equal digests, whether the image arrived
     /// inline or from a URL, so the value starts the identity of the
     /// image's encoder outputs (`proto::request::ImageInput::digest`).
+    #[cfg(test)]
     pub fn digest(&self) -> [u8; 32] {
         self.digest
     }

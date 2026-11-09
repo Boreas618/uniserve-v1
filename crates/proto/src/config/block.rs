@@ -246,48 +246,11 @@ impl BlockConfig {
         }
         Ok(())
     }
-
-    /// Reports whether every member rank publishes its own copy of the
-    /// block's products.
-    ///
-    /// A distributed block's ranks each publish the units dealt to them, and
-    /// sequence-parallel ranks each publish their own shard. A tensor replica
-    /// publishes once, from tensor-parallel coordinate zero, and only the
-    /// final pipeline stage publishes, so a block with either degree above one
-    /// leaves some member ranks without a copy.
-    pub fn publishes_on_every_rank(&self) -> bool {
-        self.distribution.is_some()
-            || (self.tensor_parallel_size == 1 && self.pipeline_parallel_size == 1)
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn only_replicated_or_pipelined_blocks_leave_ranks_without_a_copy() {
-        let block = |tensor_parallel_size, pipeline_parallel_size, sequence_parallel| BlockConfig {
-            tensor_parallel_size,
-            pipeline_parallel_size,
-            sequence_parallel,
-            ..BlockConfig::parallel(vec![0, 1, 2, 3])
-        };
-        let ulysses = |ulysses_degree| SequenceParallel::Ulysses {
-            ulysses_degree,
-            projection: HeadProjection::Gather,
-            projection_rows: None,
-        };
-
-        assert!(block(1, 1, ulysses(4)).publishes_on_every_rank());
-        assert!(!block(4, 1, SequenceParallel::Local).publishes_on_every_rank());
-        assert!(!block(2, 1, ulysses(2)).publishes_on_every_rank());
-        assert!(!block(1, 4, SequenceParallel::Local).publishes_on_every_rank());
-
-        let mut distributed = BlockConfig::parallel(vec![0, 1, 2, 3]);
-        distributed.distribution = Some(BlockDistribution::TemporalUnits);
-        assert!(distributed.publishes_on_every_rank());
-    }
 
     #[test]
     fn a_deployment_names_where_a_block_keeps_its_weights() {

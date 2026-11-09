@@ -10,11 +10,10 @@
 //! Each kind therefore gets its own lane: a bounded pool ([`HostPool`]) with
 //! its own queue, its own worker threads and its own admission bound. A lane is
 //! created by the owner of its work, which names its action type; the
-//! [`ThreadPool`] keeps the lanes so that the process can abort and close all
-//! of them together, and owns nothing of any lane's action.
+//! [`ThreadPool`] keeps the lanes so that the process can close all of them
+//! together, and owns nothing of any lane's action.
 //!
-//! Aborting stops admission without joining work that may wait on a failed
-//! device or peer; closing lets the process exit once the lanes' threads ended.
+//! Closing lets the process exit once the lanes' threads ended.
 //! A lane's inputs are retired by its pool, by the rules of
 //! [`HostAction::input_outcome`]: a failed or cancelled physical producer keeps
 //! its action until process exit, because a device work whose completion is
@@ -91,15 +90,10 @@ impl Limits {
 
 /// What the pool keeps of a lane, with its action type erased.
 trait LaneHandle: Send + Sync {
-    fn abort(&self);
     fn close(&self) -> Vec<Error>;
 }
 
 impl<A: HostAction> LaneHandle for HostPool<A> {
-    fn abort(&self) {
-        HostPool::abort(self);
-    }
-
     fn close(&self) -> Vec<Error> {
         HostPool::close(self)
     }
@@ -148,16 +142,9 @@ impl ThreadPool {
     }
 
     /// The kinds whose lane exists.
+    #[cfg(test)]
     pub fn kinds(&self) -> Vec<BlockingKind> {
         lock(&self.lanes).iter().map(|(kind, _)| *kind).collect()
-    }
-
-    /// Stops admission on every lane without joining work that may wait on a
-    /// failed device or peer.
-    pub fn abort(&self) {
-        for (_, lane) in lock(&self.lanes).iter() {
-            lane.abort();
-        }
     }
 
     /// Closes every lane and returns the errors of those whose workers did not
@@ -258,22 +245,6 @@ mod tests {
             threads.kinds(),
             vec![BlockingKind::ModuleLoad, BlockingKind::Media]
         );
-        Ok(())
-    }
-
-    #[test]
-    fn an_aborted_lane_admits_nothing_new() -> Result<()> {
-        let threads = ThreadPool::new(limits());
-        let lane = threads.lane::<Probe>(BlockingKind::Reclaim)?;
-        threads.abort();
-        assert!(
-            lane.admit(Probe {
-                runs: Arc::new(AtomicUsize::new(0)),
-                input: Arc::new(()),
-            })
-            .is_err()
-        );
-        assert!(threads.close().is_empty());
         Ok(())
     }
 

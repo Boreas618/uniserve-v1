@@ -24,7 +24,9 @@
 //! `Finished` as the control thread sees them, so a policy that tracks
 //! per-tenant usage routes on what each rank actually served.
 
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -134,6 +136,7 @@ impl PolicyProgram {
     /// revision and the arguments as TOML text — so nothing about a program is
     /// decided here: a name the interface does not have is refused, as it is by
     /// [`Self::from_arguments`].
+    #[cfg(test)]
     pub fn from_program(program: &proto::process::Program) -> Result<Self, PolicyError> {
         let arguments: std::collections::BTreeMap<String, String> = program
             .arguments
@@ -289,11 +292,13 @@ impl ProgramSource {
     }
 
     /// The socket the source asks.
+    #[cfg(test)]
     pub fn socket(&self) -> &Path {
         &self.socket
     }
 
     /// The store key every resolve of this source asks for.
+    #[cfg(test)]
     pub fn target(&self) -> &program_server::Target {
         &self.target
     }
@@ -795,6 +800,7 @@ impl PolicySlot {
     /// The policy's limits are read once here and checked against `ceilings`; a
     /// limit outside them is a policy failure and the epoch does not serve under
     /// it.
+    #[cfg(feature = "testing")]
     pub fn install(
         engine: &Engine,
         source: &dyn PolicySource,
@@ -1021,6 +1027,7 @@ impl PolicySlot {
     }
 
     /// Whether a precopy prepared an instance for the switchover.
+    #[cfg(test)]
     pub fn has_candidate(&self) -> bool {
         self.candidate.is_some()
     }
@@ -1209,6 +1216,7 @@ impl Validators for RouteTrial {
 /// It is the same program as the scheduler threads' instances and changes with
 /// them: a precopy prepares it on the same state, a switchover puts it in, and a
 /// revert instantiates the previous program again.
+#[cfg(feature = "testing")]
 pub struct RoutePolicy {
     engine: Engine,
     ceilings: Limits,
@@ -1224,6 +1232,7 @@ pub struct RoutePolicy {
     cost: Cost,
 }
 
+#[cfg(feature = "testing")]
 impl RoutePolicy {
     /// Instantiates `program` on `state`, which is the state routing is decided
     /// on: every rank, and every request the epoch already holds.

@@ -15,20 +15,17 @@
 //! frame larger than the kernel's send buffer finishes sending across later
 //! calls. Its owner blocks in [`Channel::wait`] on the socket together with
 //! one local [`Wake`], which the owner's other threads fire for work that did
-//! not arrive on the socket. An owner that closes a connection on purpose
-//! calls [`Channel::flush`] first, since dropping a channel discards the
-//! frames still queued.
+//! not arrive on the socket. Dropping a channel discards the frames still
+//! queued.
 //!
 //! A closed connection is terminal. Frames that arrived whole before the
 //! close are still delivered; every call after them fails. A TCP connection
 //! probes its peer (see [`DEAD_PEER_SECS`]), so a peer whose host has died
-//! closes the connection like one that exited. [`Hangup`] observes
-//! the peer's close without reading the connection, for an owner whose
-//! thread is not in a position to call the channel.
+//! closes the connection like one that exited.
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -466,33 +463,6 @@ impl Channel {
         })
     }
 
-    /// Returns this end's address on a TCP connection, and `None` on a Unix
-    /// socket.
-    ///
-    /// It is the address the peer reached this end at, which is how a process
-    /// that binds every interface learns an address its peers route to.
-    pub fn local_addr(&self) -> IpcResult<Option<SocketAddr>> {
-        match &self.stream {
-            Stream::Unix(_) => Ok(None),
-            Stream::Tcp(stream) => stream
-                .local_addr()
-                .map(Some)
-                .map_err(|error| transport("reading a channel's local address", error)),
-        }
-    }
-
-    /// Returns the peer's address on a TCP connection, and `None` on a Unix
-    /// socket.
-    pub fn peer_addr(&self) -> IpcResult<Option<SocketAddr>> {
-        match &self.stream {
-            Stream::Unix(_) => Ok(None),
-            Stream::Tcp(stream) => stream
-                .peer_addr()
-                .map(Some)
-                .map_err(|error| transport("reading a channel's peer address", error)),
-        }
-    }
-
     /// Closes the connection in both directions, as dropping it would, while
     /// the channel value lives on: the peer observes the close at once, and
     /// every later call fails.
@@ -606,6 +576,7 @@ impl Channel {
     /// reading, is lost and the engine reports a truncated frame instead of
     /// the response. Fails when the connection fails, which also ends the
     /// wait on a peer that is gone.
+    #[cfg(test)]
     pub fn flush(&mut self) -> IpcResult<()> {
         loop {
             if let Some(error) = &self.failure {
@@ -623,22 +594,6 @@ impl Channel {
             }];
             wait_ready(&mut writable, None)?;
         }
-    }
-
-    /// Returns an observer of the peer's close that does not read the
-    /// connection, and that another thread may hold while this channel is in
-    /// use.
-    pub fn hangup(&self) -> IpcResult<Hangup> {
-        let duplicate = |descriptor: std::os::fd::BorrowedFd<'_>| {
-            descriptor
-                .try_clone_to_owned()
-                .map_err(|error| transport("duplicating a channel's descriptor", error))
-        };
-        let stream = match &self.stream {
-            Stream::Unix(stream) => duplicate(std::os::fd::AsFd::as_fd(stream))?,
-            Stream::Tcp(stream) => duplicate(std::os::fd::AsFd::as_fd(stream))?,
-        };
-        Ok(Hangup { stream })
     }
 
     /// Returns the descriptors whose readiness means this channel can make
@@ -677,49 +632,6 @@ impl Channel {
     }
 }
 
-/// Observes whether a connection's peer has closed it, without reading it.
-///
-/// A channel notices its peer's close only when its owner calls it. An owner
-/// whose thread is occupied elsewhere, for example while it loads a model,
-/// gives a `Hangup` to a thread that can wait. The observer holds its own
-/// descriptor of the connection, so it stays valid whatever happens to the
-/// channel it came from.
-pub struct Hangup {
-    stream: std::os::fd::OwnedFd,
-}
-
-impl Hangup {
-    /// Blocks until the peer has closed the connection or the connection has
-    /// failed, and returns `true`; or until `cancel` becomes readable or is
-    /// closed, and returns `false`.
-    ///
-    /// Data the peer sent and the channel has not read yet does not hide the
-    /// close: the peer's hangup is reported by `poll` separately from
-    /// readability (`POLLRDHUP`).
-    pub fn wait(&self, cancel: &impl AsRawFd) -> IpcResult<bool> {
-        #[cfg(target_os = "linux")]
-        let closing = libc::POLLRDHUP;
-        #[cfg(not(target_os = "linux"))]
-        let closing = 0;
-
-        let mut descriptors = [
-            libc::pollfd {
-                fd: self.stream.as_raw_fd(),
-                events: closing,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: cancel.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        wait_ready(&mut descriptors, None)?;
-        let closed = closing | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL;
-        Ok(descriptors[1].revents == 0 && descriptors[0].revents & closed != 0)
-    }
-}
-
 /// One bound, listening socket of a [`Listener`].
 enum Socket {
     /// A Unix socket and the path it is bound at, removed when it closes.
@@ -745,12 +657,13 @@ impl Socket {
     }
 
     /// Returns the address this socket is bound at, as peers write it.
+    #[cfg(test)]
     fn address(&self) -> IpcResult<String> {
         match self {
             Self::Unix(_, path) => Ok(format!("{UNIX_PREFIX}{}", path.display())),
             Self::Tcp(listener) => listener
                 .local_addr()
-                .map(|address: SocketAddr| address.to_string())
+                .map(|address| address.to_string())
                 .map_err(|error| transport("reading a listening address", error)),
         }
     }
@@ -809,6 +722,7 @@ impl Drop for Socket {
 pub struct Listener {
     sockets: Vec<Socket>,
     /// The bound addresses, in the order they were given.
+    #[cfg(test)]
     addresses: Vec<String>,
 }
 
@@ -823,15 +737,21 @@ impl Listener {
             .iter()
             .map(|address| Socket::bind(address))
             .collect::<IpcResult<Vec<_>>>()?;
+        #[cfg(test)]
         let addresses = sockets
             .iter()
             .map(Socket::address)
             .collect::<IpcResult<_>>()?;
-        Ok(Self { sockets, addresses })
+        Ok(Self {
+            sockets,
+            #[cfg(test)]
+            addresses,
+        })
     }
 
     /// Returns the bound addresses, in the order they were given to
     /// [`Self::bind`].
+    #[cfg(test)]
     pub fn addresses(&self) -> &[String] {
         &self.addresses
     }
@@ -950,13 +870,6 @@ mod tests {
         for address in listener.addresses() {
             let mut near = Channel::connect(address).unwrap();
             let mut far = accept(&listener);
-
-            // Only a TCP connection has addresses, and each end's local
-            // address is the other's peer address.
-            let tcp = !address.starts_with(UNIX_PREFIX);
-            assert_eq!(near.local_addr().unwrap().is_some(), tcp);
-            assert_eq!(near.local_addr().unwrap(), far.peer_addr().unwrap());
-            assert_eq!(near.peer_addr().unwrap(), far.local_addr().unwrap());
 
             let mut request = MainProcessRequest::info();
             request.set_message_id(Some(77));
@@ -1209,36 +1122,5 @@ mod tests {
             "the frame arrived resized"
         );
         assert!(received == large, "the message arrived changed");
-    }
-
-    /// A hangup observer sees the peer's close without the channel being
-    /// called; unread data from the peer does not hide or fake it, and its
-    /// owner can cancel the wait.
-    #[test]
-    fn a_hangup_reports_the_peers_close_and_nothing_else() {
-        let directory = tempfile::tempdir().unwrap();
-        let unix = format!("unix:{}", directory.path().join("channel.sock").display());
-        let listener = Listener::bind(&[&unix, "127.0.0.1:0"]).unwrap();
-        for address in listener.addresses() {
-            let channel = Channel::connect(address).unwrap();
-            let mut peer = accept(&listener);
-            let hangup = channel.hangup().unwrap();
-            let (cancel, canceller) = UnixStream::pair().unwrap();
-
-            peer.send(&MainProcessRequest::info()).unwrap();
-            let cancelling = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(100));
-                drop(canceller);
-            });
-            assert!(
-                !hangup.wait(&cancel).unwrap(),
-                "unread data read as a close"
-            );
-            cancelling.join().unwrap();
-
-            let (cancel, _canceller) = UnixStream::pair().unwrap();
-            drop(peer);
-            assert!(hangup.wait(&cancel).unwrap());
-        }
     }
 }

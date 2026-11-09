@@ -1,6 +1,8 @@
 //! Assembly of engine events into public serving events.
 //!
-//! [`generation_output`] serves every generation request. It pulls decoded
+//! [`generation_output`], which the tests drive, assembles a generation
+//! request's events in one stream; a serving response runs the same pipeline
+//! through `run::GenerationRun`. It pulls decoded
 //! text from `decoded_text_event_stream`, runs it through the request's
 //! `ChatOutputProcessor`, frames the parsed output as content blocks and tool
 //! calls (`StructuredEventState`), and forwards each update's tokens and the
@@ -18,15 +20,19 @@ use std::time::Instant;
 
 use crate::migration::RequestEvents;
 use asynk_strim_attr::{TryYielder, try_stream};
+#[cfg(test)]
 use futures::{StreamExt as _, pin_mut};
 use proto::request::Event;
 
+#[cfg(test)]
+use crate::output::OutputParams;
+#[cfg(test)]
 use crate::output::chat::structured::StructuredEventState;
+#[cfg(test)]
 use crate::output::text::decoded_text_event_stream;
+#[cfg(test)]
 use crate::output::text::{DecodedTextEvent, ImageEvent};
-use crate::output::{
-    FinishReason, OutputError, OutputParams, RequestOutput, RequestUsage, RuntimeTimings,
-};
+use crate::output::{FinishReason, OutputError, RequestOutput, RequestUsage, RuntimeTimings};
 
 /// Result of a stream that ends in an output-processing failure.
 type Result<T> = std::result::Result<T, OutputError>;
@@ -117,6 +123,7 @@ impl StreamClock {
 
 /// Whether `output` is visible output: text, reasoning, a tool call, or
 /// generated media.
+#[cfg(test)]
 fn is_visible(output: &RequestOutput) -> bool {
     match output {
         RequestOutput::TextDelta { text } | RequestOutput::ReasoningDelta { text } => {
@@ -145,6 +152,7 @@ fn malformed(request_id: &str, message: &str) -> OutputError {
 /// metadata, then each decoded update's content-block, tool-call and image
 /// events followed by its `TokenDelta`, then the terminal event.
 #[try_stream]
+#[cfg(test)]
 pub(super) async fn generation_output(
     request_id: String,
     started: Instant,

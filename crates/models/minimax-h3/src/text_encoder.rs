@@ -36,6 +36,8 @@
 //! *replicated* on every rank: it is small, every rank needs its features, and its row-parallel
 //! projections would otherwise need a bias added once after the reduction.
 
+#[cfg(test)]
+use nn::DevicePtr;
 use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape, StateTable,
 };
@@ -43,7 +45,7 @@ use nn::layers::{
     Attention, Embedding, GatedActivation, Linear, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
 use nn::weights::{WeightLoader, WeightRequest};
-use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
+use nn::{Arena, Forward, Shape, TensorView, Weight};
 use ops::activation::Activation;
 use ops::gemm::WeightOrder;
 
@@ -142,6 +144,7 @@ impl Plan {
     }
 
     /// The plan of a text-only prompt of `tokens` rows.
+    #[cfg(test)]
     pub fn of_text(config: &TextEncoderConfig, partition: &Partition, tokens: u32) -> Result<Self> {
         Self::new(config, partition, tokens, &[])
     }
@@ -171,6 +174,7 @@ impl Plan {
     }
 
     /// The bytes one encode call of this plan reserves in the arena.
+    #[cfg(test)]
     pub fn bytes(&self, config: &TextEncoderConfig, dtype: nn::DType) -> Result<u64> {
         let bytes = Buffers::bytes(self, dtype)?;
         let Some(&patches) = self.images.iter().max() else {
@@ -364,6 +368,7 @@ impl Buffers {
     }
 
     /// The bytes [`Buffers::new`] reserves.
+    #[cfg(test)]
     fn bytes(plan: &Plan, dtype: nn::DType) -> Result<u64> {
         let arena = Arena::new(DevicePtr::new(0), u64::MAX);
         Self::new(&arena, plan, dtype)?;
@@ -371,6 +376,7 @@ impl Buffers {
     }
 
     /// The bytes one image's tower reservations take.
+    #[cfg(test)]
     fn tower_bytes(
         config: &crate::config::VisionConfig,
         patches: u32,

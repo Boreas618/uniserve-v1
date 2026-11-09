@@ -69,24 +69,6 @@ pub struct Descriptor {
 }
 
 impl Descriptor {
-    /// The replicate pad of stage 1: `kernel/ratio - 1` samples on each side.
-    pub fn upsample_pad(&self) -> u64 {
-        u64::from(self.kernel / self.ratio) - 1
-    }
-
-    /// The crop of stage 3: `3·(kernel - ratio)/2` samples on each side, which leaves `length·ratio`.
-    ///
-    /// Derived from the transposed convolution's own length, `(length + 2p - 1)·ratio + kernel` with
-    /// `p` the pad of stage 1, so a changed rate changes it with no second constant.
-    pub fn crop(&self) -> u64 {
-        (3 * (u64::from(self.kernel) - u64::from(self.ratio))) / 2
-    }
-
-    /// The low-pass's pads of stage 5: `kernel/2 - 1` on the left and `kernel/2` on the right.
-    pub fn lowpass_pads(&self) -> (u64, u64) {
-        (u64::from(self.kernel) / 2 - 1, u64::from(self.kernel) / 2)
-    }
-
     /// Samples after stage 3, for a launch of `length` samples: `length · ratio`.
     pub fn upsampled(&self, length: u64) -> u64 {
         length * u64::from(self.ratio)
@@ -295,15 +277,6 @@ mod tests {
             block: 8,
             pdl: false,
         }
-    }
-
-    #[test]
-    fn the_constants_are_the_envelopes_read_back() {
-        // ratio 2, kernel 12: replicate pad 5, crop 15 a side, low-pass pads (5, 6) — h3's numbers,
-        // derived rather than written.
-        assert_eq!(descriptor().upsample_pad(), 5);
-        assert_eq!(descriptor().crop(), 15);
-        assert_eq!(descriptor().lowpass_pads(), (5, 6));
     }
 
     #[test]

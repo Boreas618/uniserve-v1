@@ -250,6 +250,7 @@ impl MainProcessResponse {
 
     /// Replaces the request-response correlation identity (`message_id`) of
     /// a response; a stall report has none to replace.
+    #[cfg(test)]
     pub fn set_message_id(&mut self, value: Option<u64>) {
         match self {
             Self::Info { message_id, .. }
@@ -291,6 +292,7 @@ impl MainProcessResponse {
     }
 
     /// Constructs a structured worker-error response.
+    #[cfg(test)]
     pub fn error(error: MainProcessResponseError) -> Self {
         Self::Error {
             message_id: None,

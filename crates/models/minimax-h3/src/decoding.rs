@@ -69,6 +69,7 @@ impl Clip {
     /// predecessor's and the fifth entirely this clip's. The weights are computed in the decoded
     /// element type there; this is the same table stated exactly, which a quantized implementation
     /// compares against.
+    #[cfg(test)]
     pub fn overlap_weights(&self) -> [f32; OVERLAP_FRAMES as usize] {
         let mut weights = [0.0; OVERLAP_FRAMES as usize];
         for (index, weight) in weights.iter_mut().enumerate() {
@@ -115,6 +116,7 @@ pub struct Track {
 
 impl Track {
     /// The track of a video's `frames` at the checkpoint's 40 Hz latent rate.
+    #[cfg(test)]
     pub fn of(frames: u32, audio: &crate::AudioVaeConfig) -> Result<Self> {
         let samples = crate::packing::audio_samples(frames);
         Ok(Self {
@@ -126,6 +128,7 @@ impl Track {
 
     /// The latent frames a decoded window `[start, stop)` needs, halo included and clipped to the
     /// track.
+    #[cfg(test)]
     pub fn window(&self, start: u32, stop: u32) -> (u32, u32) {
         (
             start.saturating_sub(self.halo),
@@ -209,6 +212,7 @@ impl Buffer {
 ///
 /// **The tiles overlap at their seams**, so the entries are not a permutation of the clip's voxels: a
 /// seam's positions are decoded by both neighbours, which is what the blend is for.
+#[cfg(test)]
 pub fn tile_rows(canvas: &Canvas, tiles: &[Tile]) -> (Vec<i32>, Vec<u32>) {
     let height = u64::from(canvas.height);
     let width = u64::from(canvas.width);

@@ -101,16 +101,19 @@ impl SegmentAttention {
     }
 
     /// The tile's row count.
+    #[cfg(test)]
     pub const fn block(&self) -> u32 {
         self.block
     }
 
     /// The heads one row carries.
+    #[cfg(test)]
     pub const fn heads(&self) -> u32 {
         self.heads
     }
 
     /// The elements of one head.
+    #[cfg(test)]
     pub const fn head_dim(&self) -> u32 {
         self.head_dim
     }

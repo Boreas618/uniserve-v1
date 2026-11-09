@@ -11,10 +11,9 @@
 //!
 //! CUPTI invokes the callback on the calling thread as the call is entered.
 //! A thread inside a [`Watched`] scope counts the call in its own counters
-//! by call, which the scope reads ([`Watched::blocking_calls`],
-//! [`Watched::calls`]) and a thread can snapshot at any time
-//! ([`Calls::current`]); a thread outside any scope is not counted. The
-//! callback only increments thread-local counters.
+//! by call, which the thread can snapshot at any time ([`Calls::current`])
+//! and difference ([`Calls::since`]); a thread outside any scope is not
+//! counted. The callback only increments thread-local counters.
 //!
 //! Dropping the watch releases its callbacks; a later
 //! [`BlockingWatch::start`] enables them again.
@@ -162,8 +161,6 @@ impl Calls {
 /// A scope in which the calling thread's watched driver calls are counted.
 /// It stays on the thread that entered it.
 pub struct Watched {
-    /// The thread's counters when the scope was entered.
-    entered: Calls,
     _thread: PhantomData<*const ()>,
 }
 
@@ -172,20 +169,8 @@ impl Watched {
     pub fn enter() -> Self {
         DEPTH.set(DEPTH.get() + 1);
         Self {
-            entered: Calls::current(),
             _thread: PhantomData,
         }
-    }
-
-    /// Watched calls this thread made since the scope was entered.
-    pub fn blocking_calls(&self) -> u64 {
-        self.calls().iter().map(|&(_, count)| count).sum()
-    }
-
-    /// The watched calls this thread made since the scope was entered, by
-    /// call name; calls it did not make are left out.
-    pub fn calls(&self) -> Vec<(&'static str, u64)> {
-        Calls::current().since(&self.entered)
     }
 }
 
@@ -214,9 +199,12 @@ mod tests {
         assert_eq!(Calls::current(), before);
 
         let scope = Watched::enter();
+        let entered = Calls::current();
         stream.synchronize()?;
-        assert_eq!(scope.blocking_calls(), 1);
-        assert_eq!(scope.calls(), vec![("cuStreamSynchronize", 1)]);
+        assert_eq!(
+            Calls::current().since(&entered),
+            vec![("cuStreamSynchronize", 1)]
+        );
         drop(scope);
         drop(watch);
         Ok(())
@@ -227,12 +215,13 @@ mod tests {
     fn a_stopped_watch_counts_nothing_until_a_new_one_starts() -> Result<()> {
         let _serial = lock(&crate::cupti::tests::SERIAL);
         let stream = Stream::new(DeviceId(0))?;
-        let scope = Watched::enter();
+        let _scope = Watched::enter();
+        let entered = Calls::current();
         let watch = BlockingWatch::start()?;
         drop(StreamActivity::start([("device", &stream)], false)?);
         drop(watch);
         stream.synchronize()?;
-        assert_eq!(scope.blocking_calls(), 0);
+        assert_eq!(Calls::current(), entered);
 
         let watch = BlockingWatch::start()?;
         let recording = StreamActivity::start([("device", &stream)], false)?;
@@ -242,7 +231,10 @@ mod tests {
         // the synchronization waits for.
         unsafe { memset_d8(storage.address(), 0, bytes, &stream)? };
         stream.synchronize()?;
-        assert_eq!(scope.calls(), vec![("cuStreamSynchronize", 1)]);
+        assert_eq!(
+            Calls::current().since(&entered),
+            vec![("cuStreamSynchronize", 1)]
+        );
         let taken = crate::cupti::activity::tests::taken_until("device", |taken| taken.busy_us > 0);
         assert!(taken.busy_us > 0, "{taken:?}");
         drop(recording);

@@ -41,8 +41,7 @@
 //! workers consume that concrete plan. [`BoundManifest::spans`]
 //! turns the copies into the spans of a transfer between the chunks the
 //! Storage Server retains ([`crate::protocol::Request::Transfer`]), which
-//! its Transfer Server executes. The source epoch of weights is what the
-//! manifests an epoch retains name ([`weights::sources`]).
+//! its Transfer Server executes.
 
 pub mod cache;
 pub mod layout;
@@ -138,6 +137,7 @@ impl Storage {
     /// A storage of `layout` in the chunks [`StorageLayout::chunks`] cuts
     /// for `degrees` at `granularity`, keyed with `fingerprint`
     /// ([`StorageLayout::chunk_key`]).
+    #[cfg(test)]
     pub fn chunked(
         layout: StorageLayout,
         granularity: u64,
@@ -217,110 +217,6 @@ pub struct Epoch {
     pub ranks: Vec<Rank>,
 }
 
-impl Storage {
-    /// Whether this storage of a rank on `gpu` and `other` of a rank on
-    /// `other_gpu` are one numerical storage in one physical storage. A
-    /// GPU's local and remote bindings are views of one allocation, while
-    /// host endpoints remain distinct.
-    fn same_as(&self, gpu: Option<Gpu>, other: &Self, other_gpu: Option<Gpu>) -> bool {
-        self.layout == other.layout
-            && self.chunks.len() == other.chunks.len()
-            && self.chunks.iter().zip(&other.chunks).all(|(x, y)| {
-                x.offset == y.offset
-                    && x.length == y.length
-                    && x.key == y.key
-                    && x.storage_offset == y.storage_offset
-                    && x.binding.end(gpu).ok() == y.binding.end(other_gpu).ok()
-            })
-    }
-}
-
-impl Epoch {
-    /// Whether the same ordered ranks retain the same numerical storage
-    /// in the same physical storage ([`Storage::same_as`]).
-    pub fn same_storage(&self, other: &Self) -> bool {
-        self.ranks.len() == other.ranks.len()
-            && self.ranks.iter().zip(&other.ranks).all(|(one, two)| {
-                one.gpu == two.gpu
-                    && one.storages.len() == two.storages.len()
-                    && one
-                        .storages
-                        .iter()
-                        .zip(&two.storages)
-                        .all(|(a, b)| a.same_as(one.gpu, b, two.gpu))
-            })
-    }
-
-    /// Whether a rank on `gpu` of this epoch holds `storage` of a rank on
-    /// that GPU of another reading.
-    fn holds(&self, gpu: Option<Gpu>, storage: &Storage) -> bool {
-        self.ranks
-            .iter()
-            .filter(|rank| rank.gpu == gpu)
-            .flat_map(|rank| &rank.storages)
-            .any(|own| own.same_as(gpu, storage, gpu))
-    }
-
-    /// The storages of this epoch that every one of `others` holds too, in
-    /// this epoch's order and with its bindings; a rank left without
-    /// storages is dropped. Readings of retained sources taken at other
-    /// times or from other hosts list other storages and bind them from
-    /// their own host; the ranks that plan one manifest together plan it
-    /// from this one epoch, which each of them binds ([`Epoch::reading_of`]).
-    pub fn common<'a>(&self, others: impl IntoIterator<Item = &'a Epoch> + Clone) -> Epoch {
-        let ranks = self
-            .ranks
-            .iter()
-            .map(|rank| Rank {
-                gpu: rank.gpu,
-                storages: rank
-                    .storages
-                    .iter()
-                    .filter(|storage| {
-                        others
-                            .clone()
-                            .into_iter()
-                            .all(|other| other.holds(rank.gpu, storage))
-                    })
-                    .cloned()
-                    .collect(),
-            })
-            .filter(|rank| !rank.storages.is_empty())
-            .collect();
-        Epoch { ranks }
-    }
-
-    /// This reading's storages that `plan` names, in `plan`'s order and
-    /// with this reading's bindings: the source epoch a plan made from
-    /// `plan` binds on this reader's host ([`Manifest::bind`]). `None` when
-    /// this reading lacks one of them.
-    pub fn reading_of(&self, plan: &Epoch) -> Option<Epoch> {
-        let ranks = plan
-            .ranks
-            .iter()
-            .map(|rank| {
-                let storages = rank
-                    .storages
-                    .iter()
-                    .map(|storage| {
-                        self.ranks
-                            .iter()
-                            .filter(|own| own.gpu == rank.gpu)
-                            .flat_map(|own| &own.storages)
-                            .find(|own| own.same_as(rank.gpu, storage, rank.gpu))
-                            .cloned()
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                Some(Rank {
-                    gpu: rank.gpu,
-                    storages,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        Some(Epoch { ranks })
-    }
-}
-
 /// What a manifest is computed from.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Request {
@@ -394,6 +290,7 @@ pub struct Copy {
 
 impl Copy {
     /// The bytes the copy moves.
+    #[cfg(test)]
     pub fn bytes(&self) -> u64 {
         self.length * self.rows
     }
@@ -508,43 +405,9 @@ impl Manifest {
     }
 
     /// The bytes the copies move.
+    #[cfg(test)]
     pub fn copied_bytes(&self) -> u64 {
         self.copies.iter().map(Copy::bytes).sum()
-    }
-
-    /// Peak conversion scratch on a receiver. Groups execute serially:
-    /// one destination canonical form, one source's gathered fields and
-    /// canonical form. Numerical conversion writes these borrowed buffers
-    /// directly, without additional device allocations.
-    pub fn conversion_bytes(&self, request: &Request, rank: u32, granularity: u64) -> u64 {
-        let mut peak = 0;
-        for copy in self.copies.iter().filter(|copy| copy.target.rank == rank) {
-            let mut bytes = 0;
-            for (side, endpoint) in [(Side::Source, copy.source), (Side::Target, copy.target)] {
-                let Space::Staging { staging } = endpoint.space else {
-                    continue;
-                };
-                let staging = &self.stagings[staging as usize];
-                let epoch = match side {
-                    Side::Source => &request.source,
-                    Side::Target => &request.target,
-                };
-                bytes += staging.bytes.div_ceil(granularity) * granularity;
-                if side == Side::Source {
-                    let mut stored = 0u64;
-                    for field in epoch.ranks[staging.rank as usize].storages.iter()
-                        .flat_map(|storage| &storage.layout.fields)
-                        .filter(|field| matches!(&field.encoding, Encoding::Encoded { group, .. } if group == &staging.group))
-                    {
-                        let extent = field.bytes();
-                        stored = stored.div_ceil(256) * 256 + extent.end - extent.start;
-                    }
-                    bytes += stored.div_ceil(granularity) * granularity;
-                }
-            }
-            peak = peak.max(bytes);
-        }
-        peak
     }
 }
 

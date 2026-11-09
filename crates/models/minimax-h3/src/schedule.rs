@@ -197,6 +197,7 @@ impl Schedule {
     /// block's weights, normalized by their sum, combine the heads into the block's one prediction.
     /// The sum is the block's node-sigma increment, so an ordinary Euler step between the two node
     /// sigmas applies that prediction. The other grids have one head, so a block of them is refused.
+    #[cfg(test)]
     pub fn block_weights(&self, modality: Modality, block: u32) -> Result<Vec<f64>> {
         Ok(self.block_span(modality, block)?.1)
     }

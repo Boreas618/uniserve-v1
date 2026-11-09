@@ -80,6 +80,7 @@ impl Groups {
 ///
 /// This is the value the worker writes into the per-request `modulation_indices` table, and the
 /// only request-dependent input of the conditioning.
+#[cfg(test)]
 pub const fn row(group: u32, tag: u32) -> u32 {
     TAGS * group + tag
 }

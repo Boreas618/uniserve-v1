@@ -10,13 +10,11 @@
 //! while a request's channel is full hands the events it could not send to
 //! the receiver, which yields them after the channel's buffered events.
 //!
-//! [`EventRx`] also carries the frontend decoder's stop-string decisions. The
-//! scheduler holds a token request with stop strings at a bounded number of
-//! resolved calls whose tokens await a decision; the decoder calls
-//! [`EventRx::acknowledge_consumed_prefix`] after checking that the tokens
-//! received so far complete no stop string, which reports them as
-//! [`Command::Acknowledge`], or [`EventRx::cancel_at_consumed_prefix`] on a
-//! match. Dropping an [`EventRx`] before a terminal event cancels the request.
+//! The scheduler holds a token request with stop strings at a bounded number
+//! of resolved calls whose tokens await the frontend decoder's decision; the
+//! decision arrives as [`Command::Acknowledge`] for tokens that complete no
+//! stop string, or as [`Command::Stop`] on a match. Dropping an [`EventRx`]
+//! before a terminal event cancels the request.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -194,16 +192,6 @@ pub enum EventSendError {
     Closed(Box<Event>),
 }
 
-/// Cause recorded when an event receiver closes before terminal completion.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum StreamCancelCause {
-    #[default]
-    /// The consumer dropped or explicitly closed the event stream.
-    DroppedStream,
-    /// Incremental decoding matched a configured stop string.
-    StopStringMatched,
-}
-
 /// Request-submission failures visible to engine clients.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum SubmitError {
@@ -273,10 +261,6 @@ pub struct EventRx {
     handoff: Handoff,
     waker: CommandWaker,
     cancellation: Option<EventCancellation>,
-    /// Text tokens of the received `TextToken` and `TextTokens` events.
-    text_tokens_received: usize,
-    /// Text-token count of the last `Command::Acknowledge` sent.
-    acknowledged_token_count: usize,
     on_finish: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
@@ -288,9 +272,6 @@ pub struct EventRx {
 struct EventCancellation {
     handle: CommandSender,
     request_id: RequestId,
-    /// Whether the request's tokens await the frontend decoder's stop-string
-    /// decisions: set by `submit` for token requests with stop strings.
-    awaits_decoder: bool,
 }
 
 impl EventRx {
@@ -338,60 +319,11 @@ impl EventRx {
         lock(&self.handoff).pop_front()
     }
 
-    /// Updates the received token count and completion state for a received
-    /// event.
+    /// Updates the completion state for a received event.
     fn observe(&mut self, event: &Event) {
-        match event {
-            Event::TextToken { .. } => {
-                self.text_tokens_received = self.text_tokens_received.saturating_add(1);
-            }
-            Event::TextTokens { ids } => {
-                self.text_tokens_received = self.text_tokens_received.saturating_add(ids.len());
-            }
-            event if event.is_terminal() => self.finish(),
-            _ => {}
+        if event.is_terminal() {
+            self.finish();
         }
-    }
-
-    /// Accepts every text token observed through this receiver as completing
-    /// no stop string, so the scheduler resolves the decisions they await.
-    ///
-    /// Sends nothing for a request without stop strings, whose tokens await
-    /// no decision, when no token arrived since the last acknowledgement, or
-    /// when the receiver has no armed cancellation (finished, or already
-    /// cancelled).
-    pub fn acknowledge_consumed_prefix(&mut self) {
-        if self.text_tokens_received <= self.acknowledged_token_count {
-            return;
-        }
-        if let Some(cancellation) = self
-            .cancellation
-            .as_ref()
-            .filter(|cancellation| cancellation.awaits_decoder)
-        {
-            let _ = cancellation.handle.send(Command::Acknowledge {
-                request_id: cancellation.request_id,
-                output_token_count: self.text_tokens_received,
-            });
-            self.acknowledged_token_count = self.text_tokens_received;
-        }
-    }
-
-    /// Closes generation after the tokens the consumer has received.
-    ///
-    /// `DroppedStream` cancels the request; `StopStringMatched` finishes it
-    /// successfully with `Stop`. Only the first cancellation of an armed
-    /// receiver sends a command; see `acknowledge_consumed_prefix` for when
-    /// it is disarmed.
-    pub fn cancel_at_consumed_prefix(&mut self, cause: StreamCancelCause) {
-        let Some(cancellation) = self.cancellation.take() else {
-            return;
-        };
-        let command = match cause {
-            StreamCancelCause::DroppedStream => Command::Cancel(cancellation.request_id),
-            StreamCancelCause::StopStringMatched => Command::Stop(cancellation.request_id),
-        };
-        let _ = cancellation.handle.send(command);
     }
 
     /// Disarms cancellation and invokes the completion callback exactly once.
@@ -435,8 +367,6 @@ fn event_channel_with_waker(
             handoff,
             waker,
             cancellation,
-            text_tokens_received: 0,
-            acknowledged_token_count: 0,
             on_finish: None,
         },
     )
@@ -889,18 +819,11 @@ impl CommandSender {
     /// request when dropped before its terminal event.
     fn bind(&self, request: Request) -> (Submission, EventRx) {
         let request_id = request.request_id();
-        // Stop-string matching happens in the frontend decoder, which
-        // acknowledges each token it has checked.
-        let awaits_decoder = match &request {
-            Request::Generation(request) => !request.stop_strings.is_empty(),
-            Request::Diffusion(_) => false,
-        };
         let (event_tx, event_rx) = event_channel_with_waker(
             self.waker.clone(),
             Some(EventCancellation {
                 handle: self.clone(),
                 request_id,
-                awaits_decoder,
             }),
         );
         let submission = Submission {
@@ -976,6 +899,7 @@ impl CommandSender {
     }
 
     /// Publishes the committed epoch's immutable pages on every claimed node.
+    #[cfg(feature = "testing")]
     pub fn publish_epoch(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, published) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::PublishEpoch(answer));
@@ -984,6 +908,7 @@ impl CommandSender {
 
     /// Ends the storage of `epochs` on the nodes of the scheduler's workers
     /// (`Command::Retire`); the receiver gets whether it did.
+    #[cfg(feature = "testing")]
     pub fn retire(&self, epochs: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
         let (answer, retired) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::Retire { epochs, answer });
@@ -993,6 +918,7 @@ impl CommandSender {
     /// Keeps the weights alone of `epochs` on the nodes of the scheduler's
     /// workers, in host storage when `to_host` (`Command::KeepWeights`); the
     /// receiver gets each node's report.
+    #[cfg(feature = "testing")]
     pub fn keep_weights(
         &self,
         epochs: Vec<u64>,
@@ -1011,6 +937,7 @@ impl CommandSender {
 
     /// Reads the storage ledgers of the nodes of the scheduler's workers
     /// (`Command::Ledgers`); the receiver gets each node's.
+    #[cfg(feature = "testing")]
     pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         let (answer, read) = crossbeam_channel::bounded(1);
         let _ = self.send(Command::Ledgers(answer));
@@ -1020,6 +947,7 @@ impl CommandSender {
     /// Halves, or restores when not `halve`, the byte budgets of the links
     /// the deployment's transfers use (`Command::Throttle`); the receiver
     /// gets the hosts it throttled.
+    #[cfg(feature = "testing")]
     pub fn throttle(
         &self,
         halve: bool,
@@ -1290,6 +1218,7 @@ impl CommandSender {
     ///
     /// The control thread's route instance is instantiated and, after a
     /// `route` failure, reverted on this state (§7.3).
+    #[cfg(feature = "testing")]
     pub fn policy_state(
         &self,
         ranks: Vec<scheduling::guest::view::RankView>,
@@ -1300,6 +1229,7 @@ impl CommandSender {
     }
 
     /// Read accepted cache lengths of requests that can move to a successor.
+    #[cfg(feature = "testing")]
     pub fn describe_requests(
         &self,
     ) -> crossbeam_channel::Receiver<Vec<proto::request::wire::RequestPrefix>> {
@@ -1339,6 +1269,7 @@ impl CommandSender {
     /// Runs the worker hook `name` (`Command::Hook`) together with the
     /// other schedulers of `together`; the receiver gets each worker's
     /// result, or why the hook failed.
+    #[cfg(feature = "testing")]
     pub fn hook(
         &self,
         name: String,
@@ -1561,9 +1492,7 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// Tokens of a request without stop strings await no decoder decision,
-    /// so receiving and accepting them sends nothing; dropping the receiver
-    /// before the terminal event cancels the request.
+    /// Dropping the receiver before the terminal event cancels the request.
     #[test]
     fn dropping_event_receiver_cancels_the_request() {
         let (tx, rx) = crossbeam_channel::unbounded();
@@ -1581,51 +1510,12 @@ mod tests {
             events.try_recv(),
             Ok(Event::TextToken { id: 7, .. })
         ));
-        events.acknowledge_consumed_prefix();
         drop(events);
 
         match rx.recv().unwrap() {
             Command::Cancel(request_id) => assert_eq!(request_id, RequestId(12)),
             _ => panic!("expected Cancel command"),
         }
-        assert!(rx.try_recv().is_err());
-    }
-
-    /// The decoder of a request with stop strings reports each newly accepted
-    /// token prefix once, and a matched stop string finishes the request with
-    /// `Stop`.
-    #[test]
-    fn stop_string_request_reports_decoder_decisions() {
-        let (tx, rx) = crossbeam_channel::unbounded();
-        let handle = CommandSender::new(tx);
-        let mut request = test_request(14);
-        request.stop_strings = vec!["end".to_string()];
-        let mut events = handle.submit(request).unwrap();
-        let event_tx = submitted_events(rx.recv().unwrap());
-
-        event_tx
-            .send(Event::TextTokens { ids: vec![7, 8] })
-            .unwrap();
-        assert!(events.try_recv().is_ok());
-        events.acknowledge_consumed_prefix();
-        events.acknowledge_consumed_prefix();
-        match rx.recv().unwrap() {
-            Command::Acknowledge {
-                request_id,
-                output_token_count,
-            } => {
-                assert_eq!(request_id, RequestId(14));
-                assert_eq!(output_token_count, 2);
-            }
-            _ => panic!("expected Acknowledge command"),
-        }
-
-        events.cancel_at_consumed_prefix(StreamCancelCause::StopStringMatched);
-        match rx.recv().unwrap() {
-            Command::Stop(request_id) => assert_eq!(request_id, RequestId(14)),
-            _ => panic!("expected Stop command"),
-        }
-        drop(events);
         assert!(rx.try_recv().is_err());
     }
 

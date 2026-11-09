@@ -10,7 +10,9 @@
 //! table indexed by id.
 
 use crate::ids::PhaseId;
-use crate::view::{PhaseClass, PhaseKind, PhaseView};
+#[cfg(test)]
+use crate::view::PhaseClass;
+use crate::view::{PhaseKind, PhaseView};
 
 /// The epoch's phases, so a policy can classify a request's next phase
 /// without asking the mechanism again.
@@ -50,6 +52,7 @@ impl Phases {
 
     /// The assembly class of a phase (design §4.4, today's
     /// `assembly_priority`).
+    #[cfg(test)]
     pub fn class(&self, phase: PhaseId) -> PhaseClass {
         self.kind(phase).class()
     }

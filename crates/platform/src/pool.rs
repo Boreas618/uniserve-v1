@@ -89,6 +89,7 @@ impl VirtualPool {
     /// # Errors
     ///
     /// Fails when the driver cannot reserve the range.
+    #[cfg(test)]
     pub fn reserve(device: DeviceId, bytes: usize) -> Result<Self> {
         let handle_type = HandleType::probe(device)?;
         Self::with_handle_type(device, bytes, handle_type, None)

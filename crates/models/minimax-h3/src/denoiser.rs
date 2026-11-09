@@ -1051,6 +1051,7 @@ impl Layouts {
     /// The conditions are the request's, in request order; a layout's `condition_rows` is their
     /// packed row capacity and cannot replace them, because rows and elements differ by modality
     /// (`video_channels` against `audio_channels`).
+    #[cfg(test)]
     pub fn noise_offsets(
         &self,
         layout: &Layout,

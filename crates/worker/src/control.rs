@@ -423,6 +423,7 @@ impl Control {
     }
 
     /// The ranks whose peer channel is connected.
+    #[cfg(test)]
     pub fn ranks(&self) -> impl Iterator<Item = u32> + '_ {
         self.peers.keys().copied()
     }

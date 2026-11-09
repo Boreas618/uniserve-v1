@@ -371,14 +371,6 @@ impl Client {
         }
     }
 
-    /// See [`Request::Promote`].
-    pub fn promote(&mut self, keys: Vec<Key>) -> Result<()> {
-        match Self::expect(self.call(&Request::Promote { keys }, &[])?)?.reply {
-            Reply::Promoted => Ok(()),
-            other => Err(unexpected("promote", &other)),
-        }
-    }
-
     /// See [`Request::Release`].
     pub fn release(&mut self, keys: Vec<Key>) -> Result<()> {
         match Self::expect(self.call(&Request::Release { keys }, &[])?)?.reply {

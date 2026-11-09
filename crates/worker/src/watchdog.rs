@@ -164,16 +164,6 @@ impl Watchdog {
     pub fn probed(&mut self, now: Instant) {
         self.probed_at = Some(now);
     }
-
-    /// Forgets the reports of ranks that no longer run a job, so that the map
-    /// does not grow with every job a long-serving process performs.
-    pub fn settled(&mut self, running: &[Running]) {
-        self.reported.retain(|rank, since| {
-            running
-                .iter()
-                .any(|job| job.rank == *rank && job.since == *since)
-        });
-    }
 }
 
 #[cfg(test)]
@@ -308,15 +298,5 @@ mod tests {
         watchdog.probed(now);
         assert!(!watchdog.probe_due(now + Duration::from_millis(999), Some(job)));
         assert!(watchdog.probe_due(now + Duration::from_secs(1), Some(job)));
-    }
-
-    #[test]
-    fn settling_drops_the_reports_of_jobs_that_ended() {
-        let mut watchdog = watchdog();
-        let now = Instant::now();
-        let job = never_shadowed(0, 1, now - Duration::from_secs(16));
-        assert_eq!(watchdog.stalls(now, &[job]).len(), 1);
-        watchdog.settled(&[]);
-        assert_eq!(watchdog.stalls(now, &[job]).len(), 1);
     }
 }

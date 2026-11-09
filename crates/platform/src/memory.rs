@@ -44,10 +44,9 @@ enum Kind {
         /// Whether the allocation also exports a POSIX descriptor, which a
         /// Storage Server retains.
         retainable: bool,
-        /// The devices granted access, which a change of protection names
-        /// again.
-        access: Vec<DeviceId>,
-        range: VirtualRange,
+        /// The virtual range the allocation is mapped at, held for the
+        /// allocation's lifetime: dropping it unmaps the storage.
+        _range: VirtualRange,
     },
 }
 
@@ -160,8 +159,7 @@ impl DeviceAllocation {
                 handle,
                 handle_type,
                 retainable,
-                access: devices,
-                range,
+                _range: range,
             },
         })
     }
@@ -226,22 +224,6 @@ impl DeviceAllocation {
                 )),
             },
             _ => Ok(None),
-        }
-    }
-
-    /// Change the allocation's access in place, at an unchanged address. The
-    /// caller has drained every access the new protection forbids. Fails
-    /// for linear storage, whose access is fixed.
-    pub fn protect(&self, protection: Protection) -> Result<()> {
-        match &self.kind {
-            Kind::Linear { .. } => {
-                Err(Error::invalid("the access of linear storage cannot change"))
-            }
-            Kind::Exportable { access, range, .. } => {
-                let context = PrimaryContext::retain(self.device)?;
-                let _guard = context.enter()?;
-                range.grant(access, protection)
-            }
         }
     }
 }

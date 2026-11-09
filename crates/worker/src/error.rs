@@ -194,6 +194,7 @@ impl Failure {
         Self::new(code, message)
     }
 
+    #[cfg(test)]
     pub fn message(&self) -> &str {
         &self.message
     }

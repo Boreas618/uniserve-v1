@@ -81,26 +81,5 @@ pub fn bicubic_antialias_u8(
     bicubic::bicubic_antialias_u8(src, channels, height, width, out_height, out_width)
 }
 
-/// Resizes a planar float32 image with torch's antialiased bicubic filter.
-///
-/// The layout is the one of [`bicubic_antialias_u8`]; reproduces
-/// `torch.nn.functional.interpolate(..., mode = "bicubic", align_corners =
-/// false, antialias = true)` on a float32 tensor.
-///
-/// # Errors
-///
-/// [`crate::Error::Plan`] when the dimensions are zero or `src` does not hold
-/// `channels * height * width` samples.
-pub fn bicubic_antialias_f32(
-    src: &[f32],
-    channels: usize,
-    height: u32,
-    width: u32,
-    out_height: u32,
-    out_width: u32,
-) -> Result<Vec<f32>> {
-    bicubic::bicubic_antialias_f32(src, channels, height, width, out_height, out_width)
-}
-
 #[cfg(test)]
 mod tests;

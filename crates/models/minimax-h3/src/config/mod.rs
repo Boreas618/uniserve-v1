@@ -208,6 +208,7 @@ impl Config {
     ///
     /// A base release holds both partitions and a deployment places one, which the deployment
     /// names; an export holds exactly one.
+    #[cfg(test)]
     pub fn only_denoiser(&self) -> Option<(Dit, &DenoiserConfig)> {
         let mut dits = self.denoisers.iter();
         match (dits.next(), dits.next()) {
@@ -246,6 +247,7 @@ impl Config {
     }
 
     /// The DiT that serves `task`, when the checkpoint holds one.
+    #[cfg(test)]
     pub fn denoiser_for(&self, task: VideoTask) -> Option<(Dit, &DenoiserConfig)> {
         self.denoisers
             .iter()

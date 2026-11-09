@@ -994,6 +994,7 @@ impl<'a> WeightLoader<'a> {
         self.checkpoint
     }
 
+    #[cfg(test)]
     pub fn shapes(dtype: DType) -> Self {
         Self::stated(dtype, None)
     }

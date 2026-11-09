@@ -63,6 +63,8 @@ const CANDIDATE_TILE: u32 = 8192;
 /// holds two planes and a nibble's ranks at once.
 const TOP_TILE: u32 = 2048;
 
+#[cfg(test)]
+use ops::Op;
 use ops::norm::{Softmax, SoftmaxArgs, SoftmaxDescriptor};
 use ops::sampler::{
     ArgMax, ArgMaxArgs, ArgMaxDescriptor, CandidateOrder, FilterArgs, FilterCandidates,
@@ -70,7 +72,7 @@ use ops::sampler::{
     LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather, OrderArgs,
     OrderDescriptor, PARAMETER_COLUMNS, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor,
 };
-use ops::{DType, Op, Shape, TensorView};
+use ops::{DType, Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::{Arena, Forward};
@@ -218,16 +220,19 @@ impl Sampler {
     }
 
     /// The vocabulary width of a logit row.
+    #[cfg(test)]
     pub const fn vocabulary(&self) -> u32 {
         self.vocabulary
     }
 
     /// How many candidates a row keeps.
+    #[cfg(test)]
     pub const fn width(&self) -> u32 {
         self.width
     }
 
     /// The element type of a sampled token.
+    #[cfg(test)]
     pub const fn tokens(&self) -> DType {
         self.tokens
     }
@@ -658,6 +663,7 @@ impl Sampler {
 
     /// The bound the sampled tokens' distributions are compared with: the shaping and filtering
     /// steps round FP32 values a few times, while a chosen token is exact.
+    #[cfg(test)]
     pub fn tolerance(&self) -> ops::Tolerance {
         LogitsShape::tolerance(&ShapeDescriptor {
             dtype: DType::F32,

@@ -155,6 +155,7 @@ fn base_info(report: Report, request: &MemoryRequest, slots: usize) -> Result<Ma
 /// every variant, so adding one here without adding it to `Booked` is a compile
 /// error rather than a shortfall in a sum.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg(test)]
 pub enum Region {
     /// The checkpoint's tensors, mapped before the plan runs and booked by the
     /// Storage Server's device ledger.
@@ -174,6 +175,7 @@ pub enum Region {
     Fixed,
 }
 
+#[cfg(test)]
 impl Region {
     /// Every region a plan books, in the order a report reads them.
     pub const ALL: [Region; Region::COUNT] = [
@@ -222,8 +224,10 @@ impl Region {
 ///   the first capture, so the figure a budget carries is the whole range and
 ///   never the widest bucket inside it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(test)]
 pub struct Booked([u64; Region::COUNT]);
 
+#[cfg(test)]
 impl Booked {
     /// The bytes booked for `region`.
     pub fn get(&self, region: Region) -> u64 {
@@ -249,6 +253,7 @@ impl MemoryConfig {
     /// `weights` is the checkpoint's mapped bytes, which the plan cannot know:
     /// the store maps them before the plan measures the device, and its figure is
     /// what the fit's grant already excludes.
+    #[cfg(test)]
     pub fn booked(&self, device: Device, weights: u64) -> Booked {
         let cache = self
             .cache

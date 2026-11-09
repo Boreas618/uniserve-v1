@@ -54,6 +54,7 @@ impl Descriptor {
     ///
     /// The geometry is not a compilation choice — the program reads it as words — so it is checked
     /// where it is consumed, by [`geometry`], and a canvas never selects a module.
+    #[cfg(test)]
     pub const fn new(dtype: DType, block: u32, pdl: bool) -> Self {
         Self { dtype, block, pdl }
     }

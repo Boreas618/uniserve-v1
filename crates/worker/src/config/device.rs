@@ -7,6 +7,7 @@
 
 use platform::DeviceId;
 
+#[cfg(test)]
 use super::DescriptorError;
 
 /// A device a rank computes on, parsed once from the launch descriptor.
@@ -19,6 +20,7 @@ pub enum Device {
 
 impl Device {
     /// Parse a torch device name. `option` names the launch setting in errors.
+    #[cfg(test)]
     pub fn parse(value: &str, option: &str) -> Result<Self, DescriptorError> {
         let invalid =
             || DescriptorError::new(format!("{option} must name a torch device, got {value:?}"));

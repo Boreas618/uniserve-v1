@@ -646,6 +646,7 @@ pub struct Span {
 
 impl Span {
     /// The bytes the span copies: its rows' bytes.
+    #[cfg(test)]
     pub fn copied(&self) -> u64 {
         self.bytes.saturating_mul(self.rows)
     }

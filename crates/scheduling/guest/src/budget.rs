@@ -39,6 +39,7 @@ pub struct Shares {
 
 impl Shares {
     /// The shares of one step.
+    #[cfg(test)]
     pub fn new(tokens: u32, calls: usize, prefill: Option<u32>) -> Self {
         Self {
             tokens,
@@ -63,6 +64,7 @@ impl Shares {
     }
 
     /// Calls the step may still add.
+    #[cfg(test)]
     pub fn calls(&self) -> usize {
         self.calls
     }

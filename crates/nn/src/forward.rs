@@ -69,11 +69,13 @@ impl Arena {
     }
 
     /// The region's first address, aligned to [`ALIGNMENT`].
+    #[cfg(test)]
     pub const fn base(&self) -> DevicePtr {
         self.base
     }
 
     /// The region's usable size in bytes, after the base was aligned.
+    #[cfg(test)]
     pub const fn bytes(&self) -> u64 {
         self.bytes
     }
@@ -313,6 +315,7 @@ impl<'a> Forward<'a> {
     }
 
     /// Whether this forward launches, rather than only recording what it would launch.
+    #[cfg(test)]
     pub const fn is_recording(&self) -> bool {
         self.stream.is_none()
     }

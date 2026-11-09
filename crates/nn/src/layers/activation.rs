@@ -97,6 +97,7 @@ impl GatedActivation {
     /// `descriptor_of(.., width, .., 2 · width, 2 · width, ..)` is what `forward` derives from those
     /// views; this is that arithmetic, stated once, next to the contract and proved against a packed
     /// view in the tests below.
+    #[cfg(test)]
     pub fn packed_descriptor_of(
         dtype: DType,
         width: u64,

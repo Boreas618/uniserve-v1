@@ -272,6 +272,7 @@ impl Config {
     }
 
     /// Query heads per key/value head.
+    #[cfg(test)]
     pub const fn group_size(&self) -> usize {
         self.num_attention_heads / self.num_key_value_heads
     }

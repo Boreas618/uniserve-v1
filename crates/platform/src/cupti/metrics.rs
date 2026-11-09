@@ -373,6 +373,7 @@ impl Counters {
     }
 
     /// How many passes the hardware needs to collect every metric.
+    #[cfg(test)]
     pub fn passes(&self) -> usize {
         self.passes
     }
