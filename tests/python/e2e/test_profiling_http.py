@@ -35,14 +35,14 @@ from pathlib import Path
 import httpx
 import pytest
 
-from tests.python.e2e.program_server import (
-    program_server as running_program_server,
-)
 from tests.python.e2e.profiling_helpers import NAME, RANGE_PASS_STORAGE, serve
 from tests.python.e2e.profiling_helpers import Load as _Load
 from tests.python.e2e.profiling_helpers import ended as _ended
 from tests.python.e2e.profiling_helpers import profile as _profile
 from tests.python.e2e.profiling_helpers import start as _start
+from tests.python.e2e.program_server import (
+    program_server as running_program_server,
+)
 from uniserve_eval.profile import ProfileFile, convert
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]
