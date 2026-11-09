@@ -26,12 +26,12 @@ use nn::capability::{DecodedMedia, Decoder, LatentShape, Layout};
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
-use crate::arena::{Pools, StreamId};
+use crate::arena::Pools;
 use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
 use crate::plan::{Bucket, Buckets, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
-use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
+use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
 use crate::runners::output::interleave_pcm;
 use crate::runners::products::{Product, Products};
 use crate::runners::recording::Footprint;
@@ -64,7 +64,6 @@ pub struct AudioDecoderRunner<M: Decoder + Send + Sync + ?Sized> {
     buckets: Buckets,
     device: DeviceId,
     stream: platform::Stream,
-    pools: Option<Arc<Mutex<Pools>>>,
     counters: Option<Arc<crate::device::SharedCounters>>,
     /// The layout of each audio bucket, which is the bucket's own extent: a track's decode is keyed
     /// by the layout the denoiser produced, not by a raster a caller computed from one.
@@ -144,7 +143,6 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
             buckets,
             device: binding.device,
             stream: binding.stream,
-            pools: None,
             counters: None,
             layouts,
             dtype,
@@ -215,21 +213,6 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
                 "bucket {bucket} states no audio track and this runner is asked for its shape"
             ))
         })
-    }
-
-    fn stream_id(&self) -> StreamId {
-        StreamId(self.stream.raw())
-    }
-
-    fn pool(&self) -> Result<std::sync::MutexGuard<'_, Pools>> {
-        let pools = self.pools.as_ref().ok_or_else(|| {
-            Error::Resource(
-                "the audio decoder runner has no graph pools; the device attaches them at start",
-            )
-        })?;
-        Ok(pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// The track's latents, `[frames, channels]`, as the model reads them.
@@ -331,31 +314,11 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
             request,
             Product::Track,
             self.device,
-            self.stream_id(),
+            self.lifecycle.stream_id(),
             Some(written),
             &pcm,
         )?;
         self.published_for = Some(request);
-        Ok(())
-    }
-
-    /// Walks the decode once for `bucket`, recording every operator launch into the generation.
-    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
-        let stream = self.stream.clone();
-        if self.staged != Some(bucket) {
-            self.stage_warm(bucket)?;
-        }
-        let first = self.pool()?.begin(self.stream_id(), bucket)?;
-        self.upload()?;
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let forward = nn::Forward::new(&stream, generation, &arena);
-        self.decode(&forward, bucket)?;
-        if first {
-            self.pool()?
-                .record(self.stream_id(), bucket, arena.peak())?;
-        }
         Ok(())
     }
 }
@@ -496,8 +459,7 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for AudioDecoderRunner<M> {
     }
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
-        self.lifecycle.attach_pools(Arc::clone(&pools));
-        self.pools = Some(pools);
+        self.lifecycle.attach_pools(pools);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
@@ -577,20 +539,30 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for AudioDecoderRunner<M> {
     }
 }
 
-impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
-    /// Captures one bucket of `generation`: the walk here, the graph kept by the lifecycle.
-    fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.capture(bucket, generation, walked, &kernels)
+impl<M: Decoder + Send + Sync + ?Sized> RunnerLifecycle for AudioDecoderRunner<M> {
+    fn lifecycle(&mut self) -> &mut Lifecycle {
+        &mut self.lifecycle
     }
 
-    /// Prepares one bucket of the next generation from a walk of the same bucket.
-    fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
+    /// Walks the decode once for `bucket`, recording every operator launch into the generation.
+    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.capture(bucket, generation, walked, &kernels)
+        if self.staged != Some(bucket) {
+            self.stage_warm(bucket)?;
+        }
+        let first = self
+            .lifecycle
+            .pool()?
+            .begin(self.lifecycle.stream_id(), bucket)?;
+        self.upload()?;
+        let arena = self.lifecycle.arena()?;
+        let forward = nn::Forward::new(&stream, generation, &arena);
+        self.decode(&forward, bucket)?;
+        if first {
+            self.lifecycle
+                .pool()?
+                .record(self.lifecycle.stream_id(), bucket, arena.peak())?;
+        }
+        Ok(())
     }
 }

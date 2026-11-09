@@ -90,6 +90,20 @@ impl Lifecycle {
         StreamId(self.stream.raw())
     }
 
+    /// The arena of this runner's stream region: its first address and the bytes the region holds
+    /// for the stream, which every walk, replay preparation and eager forward of the runner starts
+    /// from, as a captured graph's addresses do.
+    pub(crate) fn arena(&self) -> Result<nn::Arena> {
+        let mut pool = self.pool()?;
+        let stream = self.stream_id();
+        let base = pool.base(stream)?;
+        let reserved = pool.reserved_on(stream);
+        Ok(nn::Arena::new(
+            ops::DevicePtr::new(base.address()),
+            reserved,
+        ))
+    }
+
     /// The generation numbered `number`, from any this runner holds.
     pub(crate) fn generation_named(&self, number: u64) -> Result<Arc<ops::Generation>> {
         for candidate in [
@@ -274,6 +288,28 @@ impl Lifecycle {
         Ok(())
     }
 
+    /// The serving graph of `bucket` a rebind for `generation` prepares from, or the refusal of a
+    /// rebind that has none.
+    ///
+    /// Preparing a bucket for the generation it already serves from would replace a live graph
+    /// under a batch that is running on it, and a bucket with no serving graph has no structure to
+    /// rebind. `precopy` names the generation it prepares and the buckets its serving graphs
+    /// launch, so either is a disagreement, refused before a walk is spent on it.
+    pub(crate) fn served_for_rebind(&self, bucket: Bucket, generation: u64) -> Result<&Captured> {
+        let current = self.generation.number();
+        if generation == current {
+            return Err(Error::Invariant(format!(
+                "a rebind names bucket {bucket}'s serving generation {current} as the one it \
+                 prepares"
+            )));
+        }
+        self.graphs.captured(bucket, current).ok_or_else(|| {
+            Error::Invariant(format!(
+                "no graph of bucket {bucket} in generation {current} to prepare the next one from"
+            ))
+        })
+    }
+
     pub(crate) fn rebind(
         &mut self,
         bucket: Bucket,
@@ -281,21 +317,7 @@ impl Lifecycle {
         walked: Walked,
         kernels: &Arc<ops::Generation>,
     ) -> Result<()> {
-        let current = self.generation.number();
-        // Preparing a bucket for the generation it already serves from would replace a live graph
-        // under a batch that is running on it. `precopy` names the generation it prepares, and an
-        // update that changes nothing prepares no bucket at all, so this is a disagreement.
-        if generation == current {
-            return Err(Error::Invariant(format!(
-                "a rebind names bucket {bucket}'s serving generation {current} as the one it \
-                 prepares"
-            )));
-        }
-        let served = self.graphs.captured(bucket, current).ok_or_else(|| {
-            Error::Invariant(format!(
-                "no graph of bucket {bucket} in generation {current} to prepare the next one from"
-            ))
-        })?;
+        let served = self.served_for_rebind(bucket, generation)?;
         // A walk with no node table means the operator launches were not annotated, so there is no
         // node to set the prepared generation's parameters on and the bucket must be recaptured
         // rather than prepared from a structure nobody can address.
@@ -514,6 +536,42 @@ impl Lifecycle {
         }
         self.next = Some(Arc::clone(next));
         Ok(Jobs::new(jobs))
+    }
+}
+
+/// A runner whose buckets are graphs captured from walks of its own forward, held by its
+/// [`Lifecycle`].
+///
+/// A runner states its lifecycle and its walk - the one forward of a bucket it captures - and the
+/// two ways a bucket becomes a graph are this trait's, once for every runner: a capture walks the
+/// bucket warm and keeps the recorded graph, and a rebind prepares the next generation's bucket
+/// from a walk under [`Lifecycle::rebind`]'s rule (the serving template rebound when the launch
+/// structure is unchanged, a recapture otherwise, and a refusal of the serving generation).
+pub(crate) trait RunnerLifecycle {
+    /// The lifecycle that holds this runner's graphs, generations and pools.
+    fn lifecycle(&mut self) -> &mut Lifecycle;
+
+    /// Walks `bucket`'s forward once with `kernels`, on the lifecycle's stream: the launches a
+    /// capture records.
+    fn walk(&mut self, bucket: Bucket, kernels: &Arc<ops::Generation>) -> Result<()>;
+
+    /// Captures one bucket of `generation`: the walk, warm, and the graph kept by the lifecycle.
+    fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
+        let kernels = self.lifecycle().generation_named(generation)?;
+        let stream = self.lifecycle().stream.clone();
+        let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
+        self.lifecycle()
+            .capture(bucket, generation, walked, &kernels)
+    }
+
+    /// Prepares one bucket of the next generation from a walk of the same bucket (4.5).
+    fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
+        self.lifecycle().served_for_rebind(bucket, generation)?;
+        let kernels = self.lifecycle().generation_named(generation)?;
+        let stream = self.lifecycle().stream.clone();
+        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
+        self.lifecycle()
+            .rebind(bucket, generation, walked, &kernels)
     }
 }
 

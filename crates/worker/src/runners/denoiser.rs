@@ -50,14 +50,14 @@ use platform::DeviceId;
 
 use ::storage::manifest::{Encoding, Field, Logical, Segment, Span, StorageLayout};
 
-use crate::arena::{Pools, StreamId};
+use crate::arena::Pools;
 use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
 use crate::memory::latent::host::LatentHostPool;
 use crate::memory::latent::restore;
 use crate::plan::{Bucket, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
-use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
+use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
 use crate::runners::products::{self, Product, Products};
 use crate::runners::recording::{Footprint, Walk};
 use crate::runners::tables::Tables;
@@ -528,7 +528,6 @@ pub struct DenoiserRunner<M: Denoiser + Send + Sync + ?Sized> {
     device: DeviceId,
     stream: platform::Stream,
     shape: DenoiserShape,
-    pools: Option<Arc<Mutex<Pools>>>,
     counters: Option<Arc<crate::device::SharedCounters>>,
     tables: Tables,
     columns: DenoiseColumns,
@@ -642,7 +641,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             device: binding.device,
             stream: binding.stream,
             shape,
-            pools: None,
             counters: None,
             tables: Tables::new(),
             columns,
@@ -729,21 +727,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
     pub fn schedule(&self, bucket: Bucket) -> Result<Vec<Step>> {
         let plan = self.plan_of(bucket)?;
         self.model.schedule(&plan.warm.view()).map_err(Error::from)
-    }
-
-    fn stream_id(&self) -> StreamId {
-        StreamId(self.stream.raw())
-    }
-
-    fn pool(&self) -> Result<std::sync::MutexGuard<'_, Pools>> {
-        let pools = self.pools.as_ref().ok_or_else(|| {
-            Error::Resource(
-                "the denoiser runner has no graph pools; the device attaches them at start",
-            )
-        })?;
-        Ok(pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// The key a bucket's tables are held under.
@@ -1056,9 +1039,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         let stream = self.stream.clone();
         self.fill(bucket)?;
         self.state_of_request(bucket)?;
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let arena = self.lifecycle.arena()?;
         let group = self.group.clone();
         let forward = grouped(
             nn::Forward::new(&stream, &kernels, &arena),
@@ -1572,7 +1553,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
                 request,
                 Product::VideoLatents,
                 self.device,
-                self.stream_id(),
+                self.lifecycle.stream_id(),
                 Some(written),
                 &latents.video,
             )?;
@@ -1582,7 +1563,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
                     request,
                     Product::AudioLatents,
                     self.device,
-                    self.stream_id(),
+                    self.lifecycle.stream_id(),
                     Some(written),
                     &audio,
                 )?;
@@ -1715,9 +1696,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             return Ok(());
         }
         let stream = self.stream.clone();
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let arena = self.lifecycle.arena()?;
         self.constants(&nn::Forward::new(&stream, kernels, &arena))?;
         self.constants_filled = true;
         Ok(())
@@ -1782,47 +1761,6 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         self.model
             .denoise(forward, step, latents, cond)
             .map_err(Error::from)
-    }
-
-    /// Walks one step of `bucket`'s first request, recording every operator launch into the
-    /// generation's capture (4.5).
-    ///
-    /// One request, because the model's step is one request's: `Bucket::denoise` carries the layout
-    /// and this runner walks request zero of it, the rest of the bucket being the same graph over
-    /// another block of the columns.
-    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
-        let stream = self.stream.clone();
-        self.stage_warm(bucket)?;
-        self.fill(bucket)?;
-        let first = self.pool()?.begin(self.stream_id(), bucket)?;
-        self.upload()?;
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let group = self.group.clone();
-        let probes = crate::profiling::fences::capturing(&stream);
-        let forward = grouped(
-            nn::Forward::new(&stream, generation, &arena)
-                .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
-            group.as_deref(),
-        );
-        let layout = layout_of(bucket)?;
-        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
-        let key = Self::key(bucket);
-        let state = self
-            .tables
-            .views(self.lifecycle.generation.number(), &key, &tables)?;
-        let step = self
-            .schedule(bucket)?
-            .first()
-            .copied()
-            .ok_or_else(|| self.no_step(bucket))?;
-        self.step(&forward, bucket, step, &state)?;
-        if first {
-            self.pool()?
-                .record(self.stream_id(), bucket, arena.peak())?;
-        }
-        Ok(())
     }
 }
 
@@ -2028,8 +1966,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> Runner for DenoiserRunner<M> {
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
-        self.lifecycle.attach_pools(Arc::clone(&pools));
-        self.pools = Some(pools);
+        self.lifecycle.attach_pools(pools);
     }
 
     /// The model's constants once, then for every bucket the opening of its warm request and the
@@ -2306,22 +2243,55 @@ fn pieces(regions: &[(u64, u64)], start: u64, bytes: u64) -> Result<Vec<(u64, u6
     Ok(pieces)
 }
 
-impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
-    /// Captures one bucket of `generation`: the walk here, the graph kept by the lifecycle.
-    fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        self.fill_constants(&kernels)?;
-        let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.capture(bucket, generation, walked, &kernels)
+impl<M: Denoiser + Send + Sync + ?Sized> RunnerLifecycle for DenoiserRunner<M> {
+    fn lifecycle(&mut self) -> &mut Lifecycle {
+        &mut self.lifecycle
     }
 
-    /// Prepares one bucket of the next generation from a walk of the same bucket (4.5).
-    fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
+    /// Walks one step of `bucket`'s first request, recording every operator launch into the
+    /// generation's capture (4.5).
+    ///
+    /// One request, because the model's step is one request's: `Bucket::denoise` carries the layout
+    /// and this runner walks request zero of it, the rest of the bucket being the same graph over
+    /// another block of the columns.
+    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
+        // The model's constants are filled once per load, ahead of the first walk that reads them;
+        // a later walk finds them filled and launches nothing for them.
+        self.fill_constants(generation)?;
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.rebind(bucket, generation, walked, &kernels)
+        self.stage_warm(bucket)?;
+        self.fill(bucket)?;
+        let first = self
+            .lifecycle
+            .pool()?
+            .begin(self.lifecycle.stream_id(), bucket)?;
+        self.upload()?;
+        let arena = self.lifecycle.arena()?;
+        let group = self.group.clone();
+        let probes = crate::profiling::fences::capturing(&stream);
+        let forward = grouped(
+            nn::Forward::new(&stream, generation, &arena)
+                .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
+            group.as_deref(),
+        );
+        let layout = layout_of(bucket)?;
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
+        let key = Self::key(bucket);
+        let state = self
+            .tables
+            .views(self.lifecycle.generation.number(), &key, &tables)?;
+        let step = self
+            .schedule(bucket)?
+            .first()
+            .copied()
+            .ok_or_else(|| self.no_step(bucket))?;
+        self.step(&forward, bucket, step, &state)?;
+        if first {
+            self.lifecycle
+                .pool()?
+                .record(self.lifecycle.stream_id(), bucket, arena.peak())?;
+        }
+        Ok(())
     }
 }
 
@@ -2624,6 +2594,7 @@ mod tests {
 #[cfg(test)]
 mod product_tests {
     use super::*;
+    use crate::arena::StreamId;
 
     /// A product store that answers for exactly the kinds it was given.
     ///

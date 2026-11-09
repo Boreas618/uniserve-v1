@@ -36,13 +36,13 @@ use nn::capability::{
 use ops::{DType, PhaseKind, TensorView};
 use platform::DeviceId;
 
-use crate::arena::{Pools, StreamId};
+use crate::arena::Pools;
 use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
 use crate::memory::encoders::EncoderHostPool;
 use crate::plan::{Bucket, Buckets, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, Region, encode_i32};
-use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
+use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
 use crate::runners::products::{self, Product, Products};
 use crate::runners::recording::Footprint;
 use crate::runners::tables::Tables;
@@ -146,7 +146,6 @@ pub struct EncoderRunner<M: Encoder + Send + Sync + ?Sized> {
     device: DeviceId,
     stream: platform::Stream,
     shape: EncoderShape,
-    pools: Option<Arc<Mutex<Pools>>>,
     counters: Option<Arc<crate::device::SharedCounters>>,
     tables: Tables,
     columns: EncoderColumns,
@@ -253,7 +252,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             device: binding.device,
             stream: binding.stream,
             shape,
-            pools: None,
             counters: None,
             tables: Tables::new(),
             columns,
@@ -379,21 +377,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             .collect();
         buckets.sort_by_key(|bucket| std::cmp::Reverse(bucket.tokens));
         buckets
-    }
-
-    fn stream_id(&self) -> StreamId {
-        StreamId(self.stream.raw())
-    }
-
-    fn pool(&self) -> Result<std::sync::MutexGuard<'_, Pools>> {
-        let pools = self.pools.as_ref().ok_or_else(|| {
-            Error::Resource(
-                "the encoder runner has no graph pools; the device attaches them at start",
-            )
-        })?;
-        Ok(pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// The layout of `bucket`'s encode, as the model states it.
@@ -612,7 +595,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
                 *request,
                 Product::Text,
                 self.device,
-                self.stream_id(),
+                self.lifecycle.stream_id(),
                 Some(written),
                 &view,
             )?;
@@ -641,9 +624,7 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
             .ordered(prompt.request, Product::VisionPixels, &stream)?
             .ok_or_else(|| products::absent(prompt.request, Product::VisionPixels))?;
 
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let arena = self.lifecycle.arena()?;
         let group = self.group.clone();
         let forward = crate::runners::denoiser::grouped(
             nn::Forward::new(&stream, &kernels, &arena),
@@ -777,42 +758,6 @@ impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
                 EncoderOutputs { hidden },
             )
             .map_err(Error::from)
-    }
-
-    /// Walks the encode once for `bucket`, recording every operator launch's nodes into the
-    /// generation's capture (4.5).
-    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
-        let stream = self.stream.clone();
-        if self.staged != Some(bucket) {
-            self.stage_warm(bucket)?;
-        }
-        let first = self.pool()?.begin(self.stream_id(), bucket)?;
-        self.upload()?;
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let group = self.group.clone();
-        let probes = crate::profiling::fences::capturing(&stream);
-        let forward = crate::runners::denoiser::grouped(
-            nn::Forward::new(&stream, generation, &arena)
-                .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
-            group.as_deref(),
-        );
-        let layout = self.layout(bucket);
-        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
-        let key = Self::key(bucket);
-        if !tables.is_empty() {
-            self.fill(bucket)?;
-        }
-        let state = self
-            .tables
-            .views(self.lifecycle.generation.number(), &key, &tables)?;
-        self.encode(&forward, bucket, &state)?;
-        if first {
-            self.pool()?
-                .record(self.stream_id(), bucket, arena.peak())?;
-        }
-        Ok(())
     }
 }
 
@@ -958,8 +903,7 @@ impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
-        self.lifecycle.attach_pools(Arc::clone(&pools));
-        self.pools = Some(pools);
+        self.lifecycle.attach_pools(pools);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
@@ -1131,21 +1075,47 @@ impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
     }
 }
 
-impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
-    /// Captures one bucket of `generation`: the walk here, the graph kept by the lifecycle.
-    fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.capture(bucket, generation, walked, &kernels)
+impl<M: Encoder + Send + Sync + ?Sized> RunnerLifecycle for EncoderRunner<M> {
+    fn lifecycle(&mut self) -> &mut Lifecycle {
+        &mut self.lifecycle
     }
 
-    /// Prepares one bucket of the next generation from a walk of the same bucket (4.5).
-    fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
+    /// Walks the encode once for `bucket`, recording every operator launch's nodes into the
+    /// generation's capture (4.5).
+    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.rebind(bucket, generation, walked, &kernels)
+        if self.staged != Some(bucket) {
+            self.stage_warm(bucket)?;
+        }
+        let first = self
+            .lifecycle
+            .pool()?
+            .begin(self.lifecycle.stream_id(), bucket)?;
+        self.upload()?;
+        let arena = self.lifecycle.arena()?;
+        let group = self.group.clone();
+        let probes = crate::profiling::fences::capturing(&stream);
+        let forward = crate::runners::denoiser::grouped(
+            nn::Forward::new(&stream, generation, &arena)
+                .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence)),
+            group.as_deref(),
+        );
+        let layout = self.layout(bucket);
+        let tables = self.model.state_tables(&layout).map_err(Error::from)?;
+        let key = Self::key(bucket);
+        if !tables.is_empty() {
+            self.fill(bucket)?;
+        }
+        let state = self
+            .tables
+            .views(self.lifecycle.generation.number(), &key, &tables)?;
+        self.encode(&forward, bucket, &state)?;
+        if first {
+            self.lifecycle
+                .pool()?
+                .record(self.lifecycle.stream_id(), bucket, arena.peak())?;
+        }
+        Ok(())
     }
 }
 

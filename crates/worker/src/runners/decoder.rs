@@ -38,12 +38,12 @@ use nn::capability::{Clip, DecodedMedia, Decoder, Layout};
 use ops::{DType, Shape, TensorView};
 use platform::DeviceId;
 
-use crate::arena::{Pools, StreamId};
+use crate::arena::Pools;
 use crate::batch::{Batch, BatchOutput, CallId, Job, Jobs, answered};
 use crate::plan::{Bucket, Buckets, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
-use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
+use crate::runners::lifecycle::{Lifecycle, RunnerLifecycle};
 use crate::runners::output::RgbBytes;
 use crate::runners::products::{Product, Products};
 use crate::runners::recording::{Footprint, Walk};
@@ -128,7 +128,6 @@ pub struct DecoderRunner<M: Decoder + Send + Sync + ?Sized> {
     buckets: Buckets,
     device: DeviceId,
     stream: platform::Stream,
-    pools: Option<Arc<Mutex<Pools>>>,
     counters: Option<Arc<crate::device::SharedCounters>>,
     tables: Tables,
     /// The model's own map from each bucket's raster to the latents its graph is keyed by, asked once
@@ -290,7 +289,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             buckets,
             device: binding.device,
             stream: binding.stream,
-            pools: None,
             counters: None,
             tables: Tables::new(),
             layouts,
@@ -389,21 +387,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         let layout = Self::layout_of(model, bucket)?;
         let tables = model.layout_tables(&layout).map_err(Error::from)?;
         Tables::plan_bytes(&tables)
-    }
-
-    fn stream_id(&self) -> StreamId {
-        StreamId(self.stream.raw())
-    }
-
-    fn pool(&self) -> Result<std::sync::MutexGuard<'_, Pools>> {
-        let pools = self.pools.as_ref().ok_or_else(|| {
-            Error::Resource(
-                "the decoder runner has no graph pools; the device attaches them at start",
-            )
-        })?;
-        Ok(pools
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// Allocates and fills `bucket`'s layout tables, on the device thread, outside any step.
@@ -676,9 +659,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     fn gather_replayed(&mut self, bucket: Bucket, generation: u64, first: u32) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved();
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let arena = self.lifecycle.arena()?;
         let forward = nn::Forward::new(&stream, &kernels, &arena);
         let column = self
             .trajectory
@@ -796,7 +777,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             request,
             Product::Video(self.staged_unit),
             self.device,
-            self.stream_id(),
+            self.lifecycle.stream_id(),
             Some(written),
             &published,
         )?;
@@ -807,37 +788,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         }
         self.published_units = self.published_units.max(self.staged_unit + 1);
         self.published_for = Some(request);
-        Ok(())
-    }
-
-    /// Walks the decode once for `bucket`, recording every operator launch's nodes into the
-    /// generation's capture (4.5).
-    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
-        let stream = self.stream.clone();
-        if self.staged != Some(bucket) {
-            self.stage_warm(bucket)?;
-        }
-        let first = self.pool()?.begin(self.stream_id(), bucket)?;
-        self.upload()?;
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        let forward = nn::Forward::new(&stream, generation, &arena);
-        let layout = self.layout(bucket)?;
-        let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
-        let key = Self::key(bucket);
-        if !tables.is_empty() {
-            self.fill(bucket)?;
-        }
-        let state = self
-            .tables
-            .views(self.lifecycle.generation.number(), &key, &tables)?;
-        let raster = self.raster(bucket)?;
-        self.decode(&forward, &layout, &state, raster)?;
-        if first {
-            self.pool()?
-                .record(self.stream_id(), bucket, arena.peak())?;
-        }
         Ok(())
     }
 
@@ -953,9 +903,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         }
         let kernels = self.lifecycle.generation_named(generation)?;
         let stream = self.stream.clone();
-        let base = self.pool()?.base(self.stream_id())?;
-        let reserved = self.pool()?.reserved_on(self.stream_id());
-        let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
+        let arena = self.lifecycle.arena()?;
         let forward = nn::Forward::new(&stream, &kernels, &arena);
         self.layout(bucket)?;
         self.splice_clip(&forward, bucket)
@@ -1224,7 +1172,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             request,
             Product::Tail(index),
             self.device,
-            self.stream_id(),
+            self.lifecycle.stream_id(),
             Some(crate::runners::products::written_on(&self.stream)?),
             &tail,
         )
@@ -1434,8 +1382,7 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
 
     fn attach_pools(&mut self, pools: Arc<Mutex<Pools>>) {
         self.tables.attach(Arc::clone(&pools));
-        self.lifecycle.attach_pools(Arc::clone(&pools));
-        self.pools = Some(pools);
+        self.lifecycle.attach_pools(pools);
     }
 
     fn attach_counters(&mut self, counters: Arc<crate::device::SharedCounters>) {
@@ -1522,21 +1469,42 @@ impl<M: Decoder + Send + Sync + ?Sized> Runner for DecoderRunner<M> {
     }
 }
 
-impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
-    /// Captures one bucket of `generation`: the walk here, the graph kept by the lifecycle.
-    fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
-        let stream = self.stream.clone();
-        let walked = warmed_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.capture(bucket, generation, walked, &kernels)
+impl<M: Decoder + Send + Sync + ?Sized> RunnerLifecycle for DecoderRunner<M> {
+    fn lifecycle(&mut self) -> &mut Lifecycle {
+        &mut self.lifecycle
     }
 
-    /// Prepares one bucket of the next generation from a walk of the same bucket (4.5).
-    fn rebind(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
-        let kernels = self.lifecycle.generation_named(generation)?;
+    /// Walks the decode once for `bucket`, recording every operator launch's nodes into the
+    /// generation's capture (4.5).
+    fn walk(&mut self, bucket: Bucket, generation: &Arc<ops::Generation>) -> Result<()> {
         let stream = self.stream.clone();
-        let walked = walk_capture(&stream, || self.walk(bucket, &kernels))?;
-        self.lifecycle.rebind(bucket, generation, walked, &kernels)
+        if self.staged != Some(bucket) {
+            self.stage_warm(bucket)?;
+        }
+        let first = self
+            .lifecycle
+            .pool()?
+            .begin(self.lifecycle.stream_id(), bucket)?;
+        self.upload()?;
+        let arena = self.lifecycle.arena()?;
+        let forward = nn::Forward::new(&stream, generation, &arena);
+        let layout = self.layout(bucket)?;
+        let tables = self.model.layout_tables(&layout).map_err(Error::from)?;
+        let key = Self::key(bucket);
+        if !tables.is_empty() {
+            self.fill(bucket)?;
+        }
+        let state = self
+            .tables
+            .views(self.lifecycle.generation.number(), &key, &tables)?;
+        let raster = self.raster(bucket)?;
+        self.decode(&forward, &layout, &state, raster)?;
+        if first {
+            self.lifecycle
+                .pool()?
+                .record(self.lifecycle.stream_id(), bucket, arena.peak())?;
+        }
+        Ok(())
     }
 }
 
