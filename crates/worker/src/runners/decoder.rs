@@ -44,6 +44,7 @@ use crate::plan::{Bucket, Buckets, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
+use crate::runners::output::RgbBytes;
 use crate::runners::products::{Product, Products};
 use crate::runners::recording::{Footprint, Walk};
 use crate::runners::tables::Tables;
@@ -170,6 +171,9 @@ pub struct DecoderRunner<M: Decoder + Send + Sync + ?Sized> {
     /// postprocessor that writes a clip's frames into the request's timeline with the seam fade and
     /// the checkpoint's de-normalization. Without one the runner publishes the clip's own raster.
     postprocessor: Option<Arc<dyn Decoder + Send + Sync>>,
+    /// The byte packing of what the postprocessor places, de-normalized by its pixel normalization;
+    /// present exactly when the postprocessor is.
+    bytes: Option<RgbBytes>,
     /// `[frames, rows, columns, 3]` bytes: the frames a splice wrote for the clip staged last.
     ///
     /// Sized at bind for the bucket's own clip raster, which no splice exceeds - a splice keeps at
@@ -271,6 +275,13 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         let rows = block_rows(model.as_ref(), layout)?;
         let columns = DecoderColumns::new(binding.device, layout, latent, dtype, rows)?;
         let lifecycle = Lifecycle::new(binding.id, generation, binding.stream.clone());
+        let bytes = postprocessor
+            .as_deref()
+            .map(|postprocessor| -> Result<RgbBytes> {
+                let norm = postprocessor.pixel_norm().map_err(Error::from)?;
+                RgbBytes::new(binding.device, postprocessor.element_type(), norm)
+            })
+            .transpose()?;
         Ok(Self {
             id: binding.id,
             phases: binding.phases,
@@ -296,6 +307,7 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
             trajectory_elements: 0,
             published_for: None,
             postprocessor,
+            bytes,
             frames: None,
             tail: None,
             staged_frames: None,
@@ -1045,17 +1057,22 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
     }
 
     /// Writes one clip into its timeline's frames and keeps the frames its successor fades
-    /// against: the model calls a replay's splice makes and the recorded walk records.
+    /// against: the calls a replay's splice makes and the recorded walk records.
     ///
-    /// Answers the tail kept for the successor, `[channels, overlap, rows, columns]`, or `None` when
-    /// the clip owes no successor a tail.
+    /// The postprocessor places the clip's kept frames as normalized runs, and each run is packed
+    /// into its frames' bytes here, in the order it was placed. Answers the tail kept for the
+    /// successor, `[channels, overlap, rows, columns]`, or `None` when the clip owes no successor a
+    /// tail.
     fn splice(
         &self,
         forward: &nn::Forward<'_>,
         postprocessor: &(dyn Decoder + Send + Sync),
         splicing: Splicing,
     ) -> Result<Option<TensorView>> {
-        postprocessor
+        let bytes = self.bytes.as_ref().ok_or_else(|| {
+            Error::Invariant("a postprocessor is bound and its byte packing is not".into())
+        })?;
+        let placed = postprocessor
             .splice(
                 forward,
                 splicing.previous,
@@ -1064,12 +1081,24 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
                     first: 0,
                     ..splicing.splice
                 },
-                DecodedMedia {
-                    video: Some(splicing.video),
-                    audio: None,
-                },
             )
             .map_err(Error::from)?;
+        for run in placed {
+            let frames = run.raster.shape.dim(1);
+            let first = u64::from(run.frame);
+            if run.raster.shape.rank() != 4 || first + frames > splicing.video.shape.dim(0) {
+                return Err(Error::Invalid(format!(
+                    "the postprocessor placed {:?} at frame {first} of a clip that keeps {}",
+                    run.raster.shape.dims(),
+                    splicing.video.shape.dim(0)
+                )));
+            }
+            bytes.forward(
+                forward,
+                run.raster,
+                splicing.video.narrow(0, first, frames)?,
+            )?;
+        }
         self.keep_tail(forward, &splicing)
     }
 

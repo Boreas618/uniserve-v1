@@ -1,12 +1,12 @@
 //! H3's audio VAE decoder: the latent restore and input projection around a BigVGAN generator, and
-//! the stereo PCM it ends in.
+//! the stereo waveform it ends in.
 //!
 //! Diffusers' `autoencoders/autoencoder_kl_minimax_h3_audio.py` is the reference. The decoder
 //! restores the latent's channel statistics, projects it to `latent_dim` with a 1×1 convolution
 //! (`dec_in_proj`), and runs the checkpoint's BigVGAN (`decoder`, [`nn::vocoder::BigVgan`]): a
 //! kernel-7 pre-convolution, transposed-convolution upsampling stages of anti-aliased
 //! multi-periodicity blocks, one alias-free activation and a kernel-7 post-convolution to mono
-//! without a bias, whose output is clamped to [-1, 1] as the PCM step quantizes it.
+//! without a bias, whose output the runtime clamps to [-1, 1] as it quantizes the PCM.
 //!
 //! ## Precision
 //!
@@ -15,7 +15,7 @@
 //! direction pair, and its convolutions run through cuDNN without TF32.
 
 use crate::{AudioVaeConfig, Error, Result};
-use nn::layers::{Bias, ChannelAffine, Conv1d, ConvSpec, PcmInterleave};
+use nn::layers::{Bias, ChannelAffine, Conv1d, ConvSpec};
 use nn::vocoder::{BigVgan, BigVganSpec};
 use nn::{DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, WeightLoader};
 
@@ -23,11 +23,11 @@ use nn::{DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, W
 /// state.
 const ACTIVATION_RATIO: u32 = 2;
 
-/// The rows of the PCM window a decode writes: one per stereo channel, interleaved.
+/// The channels of the waveform a decode writes: a stereo pair.
 ///
-/// Public because a caller sizes `DecodedMedia.audio` before a graph exists - the window is
-/// `[track_samples(config, frames), PCM_CHANNELS]` - and a row count restated outside this crate would
-/// be a second statement of the wire format.
+/// Public because a caller sizes `DecodedMedia.audio` before a graph exists - the waveform is
+/// `[PCM_CHANNELS, track_samples(config, frames)]` - and a channel count restated outside this crate
+/// would be a second statement of the checkpoint's.
 pub const PCM_CHANNELS: u32 = 2;
 
 /// The samples a latent frame count decodes to.
@@ -106,7 +106,6 @@ pub struct AudioDecoder {
     denormalize: ChannelAffine,
     input: Conv1d,
     generator: BigVgan,
-    pcm: PcmInterleave,
     /// Moves the track from the denoiser's rows into the decoder's channel-major layout.
     track: nn::layers::Copy,
 }
@@ -148,7 +147,6 @@ impl AudioDecoder {
             denormalize,
             input,
             generator,
-            pcm: PcmInterleave::new(DType::F32)?,
             track: nn::layers::Copy::new(DType::F32, nn::layers::Access::Element)?,
         })
     }
@@ -192,12 +190,11 @@ impl AudioDecoder {
         Ok(major)
     }
 
-    /// Decode `latents [2, latent_channels, frames]` into interleaved PCM `[samples, 2]`.
+    /// Decode `latents [2, latent_channels, frames]` into the waveform `out [2, samples]` FP32.
     ///
     /// The two rows of the latent are the stereo pair the reference decodes; both hold the same
-    /// latent, so the network's two output rows are equal and [`PcmInterleave`] clamps and writes
-    /// them interleaved. Every intermediate is FP32, and the length grows only through the
-    /// generator's transposed convolutions.
+    /// latent, so the network's two output rows are equal. Every intermediate is FP32, and the
+    /// length grows only through the generator's transposed convolutions.
     pub fn forward(&self, f: &Forward, latents: TensorView, out: TensorView) -> Result<()> {
         let shape = latents.shape;
         if shape.rank() != 3
@@ -217,13 +214,17 @@ impl AudioDecoder {
         let projected = self.buffer(f, self.config.latent_dim, length)?;
         self.input.forward(f, restored, projected)?;
         let samples = self.generator.samples(length);
-        let mono = f.arena().tensor(
-            DType::F32,
-            Shape::new(&[u64::from(PCM_CHANNELS), 1, samples]),
-        )?;
-        self.generator.forward(f, projected, mono)?;
-        let planes = mono.reshape(Shape::new(&[u64::from(PCM_CHANNELS), samples]));
-        Ok(self.pcm.forward(f, planes, out)?)
+        let planes = [u64::from(PCM_CHANNELS), samples];
+        if out.dtype != DType::F32 || out.shape.dims() != planes || !out.is_row_major() {
+            return Err(Error::config(format!(
+                "the waveform is a contiguous f32 {planes:?}, not {} {:?}",
+                out.dtype,
+                out.shape.dims()
+            )));
+        }
+        // The generator's batch axis is the stereo pair and its channel axis one.
+        let mono = out.reshape(Shape::new(&[u64::from(PCM_CHANNELS), 1, samples]));
+        Ok(self.generator.forward(f, projected, mono)?)
     }
 
     /// A FP32 buffer of the audio network's layout.
@@ -239,8 +240,7 @@ impl Decoder for AudioDecoder {
     /// The element type this decoder computes in.
     ///
     /// `F32`: the audio decoder's arithmetic is single precision throughout, so the latents column
-    /// and the PCM raster it writes are `f32` and `i16` respectively, and the PCM half states its own
-    /// type at the write (`DecodedMedia::audio`).
+    /// and the waveform it writes are `f32` (`DecodedMedia::audio`).
     fn element_type(&self) -> nn::DType {
         nn::DType::F32
     }
@@ -266,16 +266,16 @@ impl Decoder for AudioDecoder {
         .into())
     }
 
-    /// The interleaved PCM window one decode of `audio` writes: the track's latent frames times the
-    /// decoder's hop, in [`PCM_CHANNELS`] channels.
+    /// The waveform one decode of `audio` writes: the track's latent frames times the decoder's hop,
+    /// in [`PCM_CHANNELS`] channels.
     fn pcm_window(&self, audio: &nn::capability::LatentShape) -> nn::Result<(u64, u32)> {
         Ok((track_samples(&self.config, audio.frames), PCM_CHANNELS))
     }
 
-    /// Decode one run of latent frames into interleaved PCM.
+    /// Decode one run of latent frames into its waveform.
     ///
-    /// `state` must be empty, `out.audio` is the request's `[samples, 2]` i16 window and `out.video`
-    /// must be absent: this path decodes sound only.
+    /// `state` must be empty, `out.audio` is the request's `[2, samples]` f32 waveform and
+    /// `out.video` must be absent: this path decodes sound only.
     fn decode(
         &self,
         f: &Forward,
@@ -291,7 +291,7 @@ impl Decoder for AudioDecoder {
             .into());
         }
         let audio = out.audio.ok_or_else(|| {
-            Error::config("an audio decode writes the request's PCM window".to_owned())
+            Error::config("an audio decode writes the request's waveform".to_owned())
         })?;
         if out.video.is_some() {
             return Err(

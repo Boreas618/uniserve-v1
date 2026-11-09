@@ -313,18 +313,12 @@ pub fn load(
                 }
             }
             Component::VideoPostprocessor => {
-                // Weightless: the splice's only constants are the reference's ImageNet means and standard
-                // deviations, uploaded once as the two `[3]` weights the byte step reads. It reads and
-                // writes the video decoder's rasters, so it holds their element type, which the
-                // decoder declares.
+                // Weightless: it reads and writes the video decoder's rasters, so it holds their
+                // element type, which the decoder declares; the runtime de-normalizes what it
+                // places by its pixel normalization.
                 let dtype = crate::video_vae::ACTIVATION;
-                let mut splice = loader.scope("video_postprocessor");
-                let mean = splice.constant_f32("pixel_mean", &[3], &crate::output::PIXEL_MEAN)?;
-                let std = splice.constant_f32("pixel_std", &[3], &crate::output::PIXEL_STD)?;
                 let postprocessor = Arc::new(crate::output::VideoPostprocessor::new(
                     dtype,
-                    mean,
-                    std,
                     crate::video_vae::clips(&config.video_vae),
                 )?);
                 video_postprocessor = Some(postprocessor);

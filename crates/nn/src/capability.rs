@@ -838,13 +838,36 @@ pub struct DecodedMedia {
     /// a planar raster. A decoder writes this layout and does not transpose; the caller that needs
     /// `[frames, height, width, channels]` for a file converts once, where it writes.
     pub video: Option<TensorView>,
-    /// `[samples, 2]` interleaved stereo PCM, `i16`, at the decoder's own sample rate.
+    /// `[channels, samples]` FP32 waveform, one row per channel, at the decoder's own sample rate.
     ///
-    /// Two channels, interleaved: one row per sample frame, the left channel's value before the
-    /// right's. The wire format and the file format both want that order, so the decoder writes it and
-    /// no caller transposes. The channel count is fixed - `output::Pcm::CHANNELS` is two - because this
-    /// checkpoint's soundtrack is stereo.
+    /// Planar, as the vocoder computes it; the runtime interleaves and quantizes it into the PCM a
+    /// container carries, so no decoder holds a media byte format.
     pub audio: Option<TensorView>,
+}
+
+/// How an RGB raster's values relate to pixel intensities in `[0, 1]`: per channel, red, green,
+/// blue, `value = (intensity - mean) / std`.
+///
+/// One declaration per model serves both directions: an encoder reads condition pixels normalized
+/// by it, and a decoder's raster is de-normalized by it into the bytes a caller receives. The
+/// runtime performs both conversions.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PixelNorm {
+    /// The per-channel means.
+    pub mean: [f32; 3],
+    /// The per-channel standard deviations.
+    pub std: [f32; 3],
+}
+
+/// One run of a timeline's frames a splice placed: a normalized raster and where it lands.
+#[derive(Clone, Copy)]
+pub struct Placed {
+    /// `[3, frames, rows, columns]` normalized frames, in the decoder's element type: a view of the
+    /// clip's own decode or of a fade the splice reserved from the forward's arena.
+    pub raster: TensorView,
+    /// The frame of the splice's destination, counted from [`Splice::first`], that the raster's first
+    /// frame becomes.
+    pub frame: u32,
 }
 
 /// A tower that turns inputs into conditioning (a text encoder, a vision tower, a video encoder).
@@ -1170,7 +1193,7 @@ pub trait Decoder {
         ))
     }
 
-    /// The interleaved PCM window one decode of `audio` writes: sample frames and channels.
+    /// The waveform one decode of `audio` writes: samples per channel and channels.
     ///
     /// **A track's window is the model's to state, and the runner sizes a column from it.** The
     /// window is the vocoder's latent steps multiplied by the product of its upsampling rates,
@@ -1183,7 +1206,7 @@ pub trait Decoder {
     fn pcm_window(&self, audio: &LatentShape) -> Result<(u64, u32)> {
         let _ = audio;
         Err(Error::Unsupported(
-            "this decoder writes no interleaved PCM".to_owned(),
+            "this decoder writes no waveform".to_owned(),
         ))
     }
 
@@ -1199,22 +1222,32 @@ pub trait Decoder {
     /// Place one decoded clip on the timeline, fading it against its predecessor.
     ///
     /// `clip` is the clip's decoded raster; `previous` is the predecessor's own decode of the frames the
-    /// two share, absent for the timeline's first clip; `out.video` is the whole timeline's raster, which
-    /// the splice writes at `splice.first`. A decoder that decodes one clip and knows nothing of timelines
-    /// leaves this default, which refuses by the block kind's name so a runner that splices with the wrong
-    /// block hears which kind it called.
+    /// two share, absent for the timeline's first clip. Answers the normalized runs of the splice's kept
+    /// frames, in order, which the runtime de-normalizes into the timeline's bytes by
+    /// [`Self::pixel_norm`]; a fade's output is reserved from `f`'s arena and read before the arena is
+    /// reset. A decoder that decodes one clip and knows nothing of timelines leaves this default, which
+    /// refuses by the block kind's name so a runner that splices with the wrong block hears which kind
+    /// it called.
     fn splice(
         &self,
         f: &Forward,
         previous: Option<TensorView>,
         clip: TensorView,
         splice: Splice,
-        out: DecodedMedia,
-    ) -> Result<()> {
-        let _ = (f, previous, clip, splice, out);
+    ) -> Result<Vec<Placed>> {
+        let _ = (f, previous, clip, splice);
         Err(Error::shape(
             "Decoder",
             "this decoder splices no clips".to_owned(),
+        ))
+    }
+
+    /// How the rasters [`Self::splice`] places are normalized, which the runtime undoes as it writes
+    /// a timeline's bytes.
+    fn pixel_norm(&self) -> Result<PixelNorm> {
+        Err(Error::shape(
+            "Decoder",
+            "this decoder places no raster on a timeline".to_owned(),
         ))
     }
 

@@ -25,7 +25,7 @@
 //! [`Conv3d`], [`Conv1d`],
 //! [`ConvTranspose1d`], [`UlyssesAttention`](layers::UlyssesAttention),
 //! and [`ParallelLMHead`]; the diffusion and
-//! video models add [`Patchify`](layers::Patchify), [`Copy`](layers::Copy), [`RgbBytes`],
+//! video models add [`Patchify`](layers::Patchify), [`Copy`](layers::Copy),
 //! [`Transpose`](layers::Transpose) and [`VsaAttention`](layers::VsaAttention), and the
 //! audio path adds
 //! [`Snake`], [`AdaptiveAvgPool2d`] and
@@ -71,8 +71,8 @@ pub mod weights;
 pub use capability::{
     CausalLm, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
     Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput,
-    ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, MediaFormat, Seed, StateTable, Step,
-    TableValues, TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
+    ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, MediaFormat, PixelNorm, Placed, Seed,
+    StateTable, Step, TableValues, TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};
@@ -81,8 +81,8 @@ pub use group::{Group, Transfer};
 pub use layers::{
     Activation, AdaptiveAvgPool2d, Axpby, Cast, CausalPad, Conv1d, Conv3d, ConvSpec,
     ConvTranspose1d, Epilogue, GateBias, GatedActivation, Gelu, GroupNorm, Halves, IndexRows,
-    LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead, PcmInterleave,
-    Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding, Scale, Silu, Snake,
+    LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead, Residual,
+    ResidualStream, RmsNorm, Rotary, Rounding, Scale, Silu, Snake,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

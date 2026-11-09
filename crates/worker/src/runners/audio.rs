@@ -32,6 +32,7 @@ use crate::plan::{Bucket, Buckets, Extent, Variant};
 use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::Column;
 use crate::runners::lifecycle::{Lifecycle, walk_capture, warmed_capture};
+use crate::runners::output::interleave_pcm;
 use crate::runners::products::{Product, Products};
 use crate::runners::recording::Footprint;
 use crate::{Error, Result};
@@ -40,8 +41,8 @@ use crate::{Error, Result};
 struct AudioColumns {
     /// The track's latents, `[frames, channels]`, in the decoder's own element type.
     latents: Column,
-    /// The PCM window the decode writes, `[samples, channels]`, `i16` interleaved - the type
-    /// `DecodedMedia::audio` states, which the model writes and no runner converts.
+    /// The PCM window a decode ends in, `[samples, channels]`, `i16` interleaved: the waveform the
+    /// model writes, converted by this runner ([`interleave_pcm`]).
     pcm: Column,
 }
 
@@ -178,8 +179,8 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
     ///
     /// The window's length is the model's to state: it is the product of the vocoder's upsampling
     /// rates, which this crate cannot derive and would be a second statement of the checkpoint's if
-    /// it tried. The dtype is `i16` because `DecodedMedia::audio` states interleaved `i16` PCM, and
-    /// a column of another width is a waveform the muxer cannot read.
+    /// it tried. The dtype is `i16` because the column holds the interleaved `i16` PCM the muxer
+    /// reads.
     fn pcm_elements(model: &M, audio: LatentShape) -> Result<(nn::DType, u64)> {
         let (samples, channels) = model.pcm_window(&audio).map_err(Error::from)?;
         let elements = samples
@@ -360,12 +361,19 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
 }
 
 impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
-    /// Decodes `bucket`'s staged track on `forward`: the model call a capture walk records and the
-    /// recorded walk records.
+    /// Decodes `bucket`'s staged track on `forward` and interleaves its waveform into the PCM
+    /// column: the calls a capture walk records and the recorded walk records.
+    ///
+    /// The waveform is the forward's scratch, reserved from its arena before the model's own: only
+    /// the PCM outlives the replay.
     fn decode(&self, forward: &nn::Forward<'_>, bucket: Bucket) -> Result<()> {
         let audio = self.audio(bucket)?;
         let latents = self.latents(audio);
         let pcm = self.pcm(audio)?;
+        let (samples, channels) = self.model.pcm_window(&audio).map_err(Error::from)?;
+        let waveform = forward
+            .arena()
+            .tensor(DType::F32, Shape::new(&[u64::from(channels), samples]))?;
         self.model
             .decode(
                 forward,
@@ -375,10 +383,11 @@ impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
                 &[],
                 DecodedMedia {
                     video: None,
-                    audio: Some(pcm),
+                    audio: Some(waveform),
                 },
             )
-            .map_err(Error::from)
+            .map_err(Error::from)?;
+        interleave_pcm(forward, waveform, pcm)
     }
 }
 

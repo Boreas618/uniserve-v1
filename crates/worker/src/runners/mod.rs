@@ -18,6 +18,7 @@ pub mod encoder;
 pub mod experts;
 pub mod lifecycle;
 pub mod media;
+pub(crate) mod output;
 pub mod recording;
 pub(crate) mod tables;
 

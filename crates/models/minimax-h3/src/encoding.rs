@@ -446,9 +446,8 @@ impl Stack {
 pub fn normalize(pixel: [u8; 3]) -> [f32; 3] {
     let mut values = [0.0f32; 3];
     for (channel, byte) in pixel.iter().enumerate() {
-        values[channel] = (f32::from(*byte) / crate::output::BYTE_MAX
-            - crate::output::PIXEL_MEAN[channel])
-            / crate::output::PIXEL_STD[channel];
+        values[channel] = (f32::from(*byte) / 255.0 - crate::output::PIXEL_NORM.mean[channel])
+            / crate::output::PIXEL_NORM.std[channel];
     }
     values
 }
@@ -1857,10 +1856,9 @@ mod tests {
         let quantize = |normalized: [f32; 3]| -> [u8; 3] {
             let mut bytes = [0u8; 3];
             for (channel, value) in normalized.iter().enumerate() {
-                let restored =
-                    value * crate::output::PIXEL_STD[channel] + crate::output::PIXEL_MEAN[channel];
-                bytes[channel] =
-                    (restored.clamp(0.0, 1.0) * crate::output::BYTE_MAX).round_ties_even() as u8;
+                let restored = value * crate::output::PIXEL_NORM.std[channel]
+                    + crate::output::PIXEL_NORM.mean[channel];
+                bytes[channel] = (restored.clamp(0.0, 1.0) * 255.0).round_ties_even() as u8;
             }
             bytes
         };

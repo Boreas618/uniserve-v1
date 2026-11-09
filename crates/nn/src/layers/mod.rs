@@ -30,11 +30,9 @@ mod linear;
 mod moe;
 mod noise;
 mod norm;
-mod pcm;
 mod pool;
 mod posterior;
 mod residual;
-mod rgb;
 mod rope;
 mod rows;
 mod transpose;
@@ -61,11 +59,9 @@ pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{Epilogue, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNorm};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
-pub use pcm::PcmInterleave;
 pub use pool::AdaptiveAvgPool2d;
 pub use posterior::Posterior;
 pub use residual::{Axpby, Cast, Residual, Scale};
-pub use rgb::RgbBytes;
 pub use rope::{
     Gains, Normalization, Precision, QkNorm, Rotary, RotarySpec, Sections, Spectrum, Yarn,
     grid_positions,
