@@ -140,7 +140,7 @@ impl Solver {
         // The coefficient is read on the device from the worker's `step` table, so the launch that
         // follows addresses one buffer whose contents change per evaluation rather than one buffer
         // per evaluation: one capture serves them all.
-        nn::layers::gather_rows(f, track.coefficients.view(), index, gathered)?;
+        nn::layers::IndexRows.gather(f, track.coefficients.view(), index, gathered)?;
         let scale = Weight {
             backing: nn::Backing::new(gathered.ptr, 4),
             view: gathered.reshape(Shape::new(&[1])),

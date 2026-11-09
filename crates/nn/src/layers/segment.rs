@@ -20,7 +20,7 @@
 //!   output).
 //!
 //! The compressed-tile branch is deliberately not here: it is one elementwise gate the model folds
-//! in with [`Rows::add`](crate::layers::Rows), where its arithmetic stays visible.
+//! in with [`IndexRows::scatter_add`](crate::layers::IndexRows), where its arithmetic stays visible.
 
 use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::segments::{self, VsaZeroPadding};

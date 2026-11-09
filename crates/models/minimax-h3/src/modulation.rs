@@ -31,7 +31,7 @@
 //! layers of [`crate::transformer`] index with it.
 
 use nn::Shape;
-use nn::layers::{Bias, Linear, Parallel, gather_rows};
+use nn::layers::{Bias, IndexRows, Linear, Parallel};
 use nn::weights::{Weight, WeightLoader};
 use nn::{DType, Forward, TensorView};
 
@@ -163,7 +163,7 @@ impl AdaLnCache {
     /// `step` is `[1]` i32 - the step index, which the worker writes - and `out` a `[1, groups]`
     /// i32 scratch view it overwrites with the entries.
     pub fn entries_of(&self, f: &Forward, step: TensorView, out: TensorView) -> Result<()> {
-        Ok(gather_rows(f, self.entries.view(), step, out)?)
+        Ok(IndexRows.gather(f, self.entries.view(), step, out)?)
     }
 
     /// The modulation rows of layer `layer` at these entries: `[groups, 18 · hidden_size]`.
@@ -183,12 +183,12 @@ impl AdaLnCache {
                 self.layers.len()
             ))
         })?;
-        Ok(gather_rows(f, table.view(), flat_rows(entries), out)?)
+        Ok(IndexRows.gather(f, table.view(), flat_rows(entries), out)?)
     }
 
     /// The final normalization's modulation rows at these entries: `[groups, 2 · hidden_size]`.
     pub fn output(&self, f: &Forward, entries: TensorView, out: TensorView) -> Result<()> {
-        Ok(gather_rows(f, self.output.view(), flat_rows(entries), out)?)
+        Ok(IndexRows.gather(f, self.output.view(), flat_rows(entries), out)?)
     }
 
     /// The columns one entry's modulation table holds: the three interval tags of six vectors.

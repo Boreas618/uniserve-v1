@@ -410,8 +410,8 @@ pub const MINIMUM_OVERLAP: u32 = 64;
 
 use nn::Forward;
 use nn::layers::{
-    Attention, Bias, Cast, Epilogue, GateBias, GatedActivation, Halves, LayerNorm, Linear,
-    MergedColumnLinear, Parallel, ResidualStream, RmsNorm, Rotary, Rounding, Rows, Sections,
+    Attention, Bias, Cast, Epilogue, GateBias, GatedActivation, Halves, IndexRows, LayerNorm,
+    Linear, MergedColumnLinear, Parallel, ResidualStream, RmsNorm, Rotary, Rounding, Sections,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
@@ -478,7 +478,6 @@ pub struct VideoDecoder {
     last: LayerNorm,
     output: Linear,
     rotary: Rotary,
-    place: Rows,
     /// The offsets of the clip's sequences: `[0, rows, 2 · rows, ...]`, one per tile of the largest
     /// canvas this decoder serves. A tile's rows are one sequence; a clip of fewer tiles reads the
     /// table's prefix.
@@ -872,7 +871,6 @@ impl VideoDecoder {
             last,
             output,
             rotary,
-            place: Rows::new(STREAM, u64::from(width))?,
             offsets,
             // One block for the whole set: its bound is the largest served clip's rows, and a clip of
             // a smaller canvas reads fewer.
@@ -1089,14 +1087,13 @@ impl VideoDecoder {
                 Shape::new(&[tile_voxels, width]),
             );
             Cast.forward(f, projected, voxel_rows)?;
-            self.place.replace(
+            IndexRows.scatter(
                 f,
-                tile_stream,
                 self.registers.view(),
                 self.register_rows.view(),
+                tile_stream,
             )?;
-            self.place
-                .replace(f, tile_stream, self.zero_row.view(), self.zero_rows.view())?;
+            IndexRows.scatter(f, self.zero_row.view(), self.zero_rows.view(), tile_stream)?;
         }
 
         let (cosine, sine) = (scratch.cosine, scratch.sine);

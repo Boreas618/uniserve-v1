@@ -1,124 +1,191 @@
-//! Placing the rows a tower contributes into the sequence that reserved them.
+//! Row indexing: rows picked out of a `[rows, columns]` sequence by index, and rows written into one.
 //!
-//! Two modalities of the H3 text encoder funnel rows into a packed sequence (`ops::rows`):
+//! ```text
+//! IndexRows::gather        out[j] = source[indices[j]]
+//! IndexRows::scatter       destination[indices[j]] = source[j]
+//! IndexRows::scatter_add   destination[indices[j]] += source[j]      one rounding into destination's type
+//! ```
 //!
-//! - a tower's vision rows *replace* the placeholder rows the prompt reserved for its images, so the
-//!   text encoder attends them in the position the prompt put them;
-//! - a deep-stack tap *adds* a tower layer's rows into rows that already hold a residual, which is
-//!   how the encoder folds an intermediate feature into its input stream.
-//!
-//! The layer carries no weights: the destination, the source and the index view are the caller's,
-//! because the sequence and its placeholders belong to the encoder's composition. It owns only the
-//! compiled form — one operator variant per mode, width and element block — so a block that places
-//! rows twice pays for one program.
+//! A gather and a scatter move whole rows and are exact. `indices` is a flat `[count]` int32 view
+//! and may repeat: a scatter writes a repeated index more than once in the order it appears, so the
+//! caller controls a sum's order and repeated launches agree bit for bit. The layer holds nothing:
+//! the views are the caller's, and the element type and the row width are read from them.
 //!
 //! # The caller's obligation
 //!
-//! The index view holds **destination** indices, and every value in it must be less than the
-//! destination's row count: the operator writes `destination[indices[j]]`, so a table computed for
-//! another canvas — a clip's row table launched against a tile's rows, which is the mismatch that
-//! scatters a tiled decode past its buffer — writes into whatever the arena put next rather than
-//! refusing. The table is a **bound**, not a permutation: an entry names the packed row of the patch
-//! its voxel lies in, so entries repeat and rows go unnamed, and the only invariant the scatter needs
-//! is that every entry is under the destination's row count. [`Rows::check`] holds the three views' shapes against the descriptor and cannot see a
-//! value, so the table's provenance is the caller's to guarantee: it must be computed for the same
-//! canvas as the destination it is launched against, and a caller that cannot state which canvas a
-//! table came from must not launch it.
+//! Every index must be less than the indexed view's row count. The kernels take an index as an
+//! address and mask only the columns, so an index computed for another canvas — a clip's row table
+//! launched against a tile's rows — reads or writes whatever the arena put next instead of
+//! refusing. A device value cannot be checked on the host, so the table's provenance is the
+//! caller's to guarantee: it must be computed for the same canvas as the view it is launched
+//! against.
 
-use ops::DType;
 use ops::TensorView;
-use ops::rows::{self, Mode, Rows as RowsOp};
+use ops::logits::{self, LogitsGather};
+use ops::rows::{self, Mode, Rows};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
+use crate::layers::launch::PDL;
 
-/// Elements one thread block places.
+/// Elements one thread block moves.
 const BLOCK: u32 = 1024;
 
-/// Row writes over a `[rows, columns]` sequence.
-#[derive(Clone, Copy)]
-pub struct Rows {
-    datatype: DType,
-    columns: u32,
+/// The width of `view`'s rows as a descriptor field.
+fn columns(owner: &'static str, view: &TensorView) -> Result<u32> {
+    u32::try_from(view.last()).map_err(|_| {
+        Error::shape(
+            owner,
+            format!(
+                "a row of {} elements is wider than a descriptor holds",
+                view.last()
+            ),
+        )
+    })
 }
 
-impl Rows {
-    /// A layer that places rows of a sequence `columns` wide, both of `dtype`.
-    pub fn new(dtype: DType, columns: u64) -> Result<Self> {
-        let columns = u32::try_from(columns).map_err(|_| {
-            Error::shape(
-                "Rows",
-                format!("a row of {columns} elements is wider than a descriptor holds"),
-            )
-        })?;
-        Ok(Self {
-            datatype: dtype,
-            columns,
-        })
+/// A flat `[count]` index view: the operators derive the row count from it and refuse more axes.
+fn flat(owner: &'static str, indices: &TensorView) -> Result<u64> {
+    if indices.shape.rank() != 1 {
+        return Err(Error::shape(
+            owner,
+            format!(
+                "the indices are {:?}, and the operator takes a flat [count] index view",
+                indices.shape.dims()
+            ),
+        ));
     }
+    Ok(indices.numel())
+}
 
-    /// `destination[indices[j]] = source[j]`: the vision rows take their placeholders' place.
-    pub fn replace(
-        &self,
-        f: &Forward,
-        destination: TensorView,
-        source: TensorView,
-        indices: TensorView,
-    ) -> Result<()> {
-        self.forward(f, Mode::Replace, destination, source, indices)
-    }
+/// Rows of a sequence read and written by index.
+#[derive(Clone, Copy, Debug)]
+pub struct IndexRows;
 
-    /// The descriptor one gather or scatter of `columns`-wide rows launches.
+impl IndexRows {
+    /// `out[j] = source[indices[j]]`: `out` is `[count, columns]` for `count` indices.
     ///
-    /// The mode is part of the key: a replace and a tap are two programs over the same table.
-    fn descriptor(dtype: DType, mode: Mode, columns: u32) -> rows::Descriptor {
-        rows::Descriptor {
-            dtype,
-            mode,
-            columns,
-            block: BLOCK,
-            pdl: false,
-        }
-    }
-
-    /// `destination[indices[j]] += source[j]`: a tap adds into the rows already there.
-    pub fn add(
+    /// # Errors
+    ///
+    /// Indices of another rank, an `out` of another shape, or the operator's refusal.
+    pub fn gather(
         &self,
         f: &Forward,
-        destination: TensorView,
         source: TensorView,
         indices: TensorView,
+        out: TensorView,
     ) -> Result<()> {
-        self.forward(f, Mode::Add, destination, source, indices)
+        const OWNER: &str = "IndexRows::gather";
+        let count = flat(OWNER, &indices)?;
+        let width = source.last();
+        if out.shape.rank() != 2 || out.shape.dim(0) != count || out.shape.dim(1) != width {
+            return Err(Error::shape(
+                OWNER,
+                format!("out is {:?}, [{count}, {width}] expected", out.shape.dims()),
+            ));
+        }
+        let descriptor = logits::GatherDescriptor {
+            dtype: source.dtype,
+            columns: columns(OWNER, &source)?,
+            block: BLOCK,
+            pdl: PDL,
+        };
+        let args = logits::GatherArgs {
+            hidden: source,
+            rows: indices,
+            out,
+        };
+        f.operate::<LogitsGather>(&descriptor, args)
     }
 
-    fn forward(
+    /// `destination[indices[j]] = source[j]`, in place on `destination`.
+    ///
+    /// # Errors
+    ///
+    /// The operator's refusal of the three views' shapes.
+    pub fn scatter(
         &self,
+        f: &Forward,
+        source: TensorView,
+        indices: TensorView,
+        destination: TensorView,
+    ) -> Result<()> {
+        Self::rows(f, Mode::Replace, source, indices, destination)
+    }
+
+    /// `destination[indices[j]] += source[j]`, in place on `destination`.
+    ///
+    /// # Errors
+    ///
+    /// The operator's refusal of the three views' shapes.
+    pub fn scatter_add(
+        &self,
+        f: &Forward,
+        source: TensorView,
+        indices: TensorView,
+        destination: TensorView,
+    ) -> Result<()> {
+        Self::rows(f, Mode::Add, source, indices, destination)
+    }
+
+    /// The `rows` launch of `mode`: a replace and an add are two programs over the same table.
+    fn rows(
         f: &Forward,
         mode: Mode,
-        destination: TensorView,
         source: TensorView,
         indices: TensorView,
+        destination: TensorView,
     ) -> Result<()> {
-        let descriptor = Self::descriptor(self.datatype, mode, self.columns);
-        f.operate::<RowsOp>(
-            &descriptor,
-            rows::Args {
-                source,
-                destination,
-                indices,
-            },
-        )
+        let descriptor = rows::Descriptor {
+            dtype: destination.dtype,
+            mode,
+            columns: columns("IndexRows", &destination)?,
+            block: BLOCK,
+            pdl: false,
+        };
+        let args = rows::Args {
+            source,
+            destination,
+            indices,
+        };
+        f.operate::<Rows>(&descriptor, args)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Arena;
+    use ops::{DType, Shape};
 
+    /// A gather reads a flat index view and writes one row per index of the source's width.
     #[test]
-    fn a_width_wider_than_a_descriptor_holds_is_refused() {
-        assert!(Rows::new(DType::BF16, 5120).is_ok());
-        assert!(Rows::new(DType::BF16, u64::from(u32::MAX) + 1).is_err());
+    fn a_gather_writes_one_source_row_per_index() {
+        let arena = Arena::counting();
+        let f = Forward::recording(&arena);
+        let view = |dtype, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
+        let source = view(DType::BF16, &[8, 32]);
+        let indices = view(DType::I32, &[3]);
+        assert!(
+            IndexRows
+                .gather(&f, source, indices, view(DType::BF16, &[3, 32]))
+                .is_ok()
+        );
+        assert!(
+            IndexRows
+                .gather(&f, source, indices, view(DType::BF16, &[4, 32]))
+                .is_err()
+        );
+        assert!(
+            IndexRows
+                .gather(&f, source, indices, view(DType::BF16, &[3, 16]))
+                .is_err()
+        );
+        let nested = view(DType::I32, &[1, 3]);
+        assert!(
+            IndexRows
+                .gather(&f, source, nested, view(DType::BF16, &[3, 32]))
+                .is_err()
+        );
     }
 }

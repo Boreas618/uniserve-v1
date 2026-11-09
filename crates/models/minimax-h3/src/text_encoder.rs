@@ -40,8 +40,8 @@ use nn::capability::{
 };
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, GateBias, GatedActivation, Halves, Linear, Parallel, QkvBias, QkvLinear,
-    QkvNames, QkvSpec, Residual, ResidualStream, RmsNorm, Rotary, Rounding, Rows, Sections,
+    Attention, Bias, GateBias, GatedActivation, Halves, IndexRows, Linear, Parallel, QkvBias,
+    QkvLinear, QkvNames, QkvSpec, Residual, ResidualStream, RmsNorm, Rotary, Rounding, Sections,
     VocabParallelEmbedding,
 };
 use nn::weights::{Scope, WeightLoader};
@@ -570,8 +570,6 @@ pub struct TextEncoder {
     rotary: Rotary,
     layers: Vec<Layer>,
     tower: VisionTower,
-    /// The row operator that splices the vision rows into the prompt and adds the DeepStack taps.
-    rows: Rows,
     activation: GatedActivation,
     /// The add of every sub-layer's update into the residual stream.
     residual: Residual,
@@ -591,7 +589,6 @@ impl TextEncoder {
         dtype: nn::DType,
     ) -> Result<Self> {
         let rank = Rank::new(config, partition)?;
-        let hidden = u64::from(config.hidden_size);
         let retained = config.num_retained_layers;
         if retained == 0 || retained > config.num_checkpoint_layers {
             return Err(Error::config(format!(
@@ -651,7 +648,6 @@ impl TextEncoder {
             .map_err(Error::from)?,
             layers,
             tower: VisionTower::load(loader, &config.vision, dtype)?,
-            rows: Rows::new(dtype, hidden).map_err(Error::from)?,
             activation: GatedActivation::new(ACTIVATION, Rounding::Fused, GateBias::None)
                 .map_err(Error::from)?,
             // Every sub-layer's output joins the stream unscaled.
@@ -842,8 +838,7 @@ impl TextEncoder {
             .forward(f, inputs.ids, hidden)
             .map_err(Error::from)?;
         if !inputs.images.is_empty() {
-            self.rows
-                .replace(f, hidden, buffers.features, prepared.destinations)?;
+            IndexRows.scatter(f, buffers.features, prepared.destinations, hidden)?;
         }
 
         // 3. The prompt's M-RoPE factors, once for the whole stack, and the attention descriptor
@@ -900,7 +895,7 @@ impl TextEncoder {
                 if merged > 0 {
                     let features =
                         Buffers::rows_of(buffers.deepstack, next as u64 * merged, merged);
-                    self.rows.add(f, hidden, features, prepared.destinations)?;
+                    IndexRows.scatter_add(f, features, prepared.destinations, hidden)?;
                 }
                 carried = None;
                 next += 1;

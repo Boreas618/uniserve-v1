@@ -332,7 +332,7 @@ fn row_interval(view: TensorView, first: u64, count: u64) -> TensorView {
 /// one row.
 ///
 /// The table is laid out `[blocks, out * hidden]` so that one evaluation's head is **one table
-/// row**: `gather_rows` indexed by the worker's `step` view (`[1]` int32) gives `[1, out *
+/// row**: `IndexRows::gather` indexed by the worker's `step` view (`[1]` int32) gives `[1, out *
 /// hidden]`, and a projection over that view's element type is the ordinary output projection. The
 /// gathered buffers sit at fixed arena addresses with contents that change per evaluation, so the
 /// graph does not change: one capture serves every step of a layout.
@@ -386,9 +386,9 @@ impl FusedHeads {
             dtype,
             Shape::new(&[1, u64::from(self.out) * u64::from(self.hidden)]),
         )?;
-        nn::layers::gather_rows(f, self.weight.view(), step, wide)?;
+        nn::layers::IndexRows.gather(f, self.weight.view(), step, wide)?;
         let narrow = arena.tensor(dtype, Shape::new(&[1, u64::from(self.out)]))?;
-        nn::layers::gather_rows(f, self.bias.view(), step, narrow)?;
+        nn::layers::IndexRows.gather(f, self.bias.view(), step, narrow)?;
         Ok(Selected {
             weight: staged(
                 wide.reshape(Shape::new(&[u64::from(self.out), u64::from(self.hidden)])),
@@ -941,7 +941,7 @@ impl Transformer {
         let entries = arena.tensor(nn::DType::I32, Shape::new(&[1, u64::from(groups.count())]))?;
         adaln.entries_of(f, step, entries)?;
         // **The gather's own arrangement: one row per entry, the whole 18-vector table across the
-        // columns** (`gather_rows` derives its output from the table's columns and the index count,
+        // columns** (`IndexRows::gather` derives its output from the table's columns and the index count,
         // so a buffer of the same bytes in another shape is refused by name:
         // `out is [12, 32256], [4, 96768] expected`). The block cuts three intervals per group out
         // of it, and that is a view of the same flat order - group `g`'s row holds its three

@@ -5169,16 +5169,17 @@ impl<M: CausalLm> CausalLmRunner<M> {
             self.geometry.hidden_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
         )?;
-        // The indices are the same defect one operator earlier: `gather_rows` takes a flat `[count]`
+        // The indices are the same defect one operator earlier: `IndexRows::gather` takes a flat `[count]`
         // view and derives `count` from the gathered rows, so the column's own extent - the largest
         // bucket's - is refused for every bucket narrower than it, before the sampler is reached.
-        nn::gather_rows(
-            forward,
-            hidden,
-            self.columns.indices.shaped(&[rows]),
-            gathered,
-        )
-        .map_err(Error::from)?;
+        nn::IndexRows
+            .gather(
+                forward,
+                hidden,
+                self.columns.indices.shaped(&[rows]),
+                gathered,
+            )
+            .map_err(Error::from)?;
         let logits = arena.tensor(
             self.geometry.logits_dtype,
             ops::Shape::new(&[rows, u64::from(self.geometry.vocabulary)]),
@@ -6597,7 +6598,7 @@ mod sampled_output_tests {
         let draws =
             Column::new(platform::DeviceId(0), DType::F32, largest).expect("the draws column");
         assert_eq!(draws.shaped(&[narrow]).shape.dims(), &[narrow]);
-        // The gather column is the same shape one operator earlier: `gather_rows` takes a flat
+        // The gather column is the same shape one operator earlier: `IndexRows::gather` takes a flat
         // `[count]` view and derives `count` from the rows it gathers, so a flat column states the
         // largest bucket's row count and every narrower bucket is refused before the sampler.
         let indices =

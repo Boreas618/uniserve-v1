@@ -8,7 +8,7 @@
 //! logits the batch asks for before calling the head, so the head reads a `[rows, hidden]` view and a
 //! graph replays over a fixed row count.
 
-use ops::logits::{self, GatherDescriptor, LogitsGather, UnpadDescriptor, VocabUnpad};
+use ops::logits::{self, UnpadDescriptor, VocabUnpad};
 use ops::{DType, Shape, TensorView};
 
 use crate::error::{Error, Result};
@@ -174,50 +174,4 @@ impl ParallelLMHead {
             pdl: crate::layers::launch::PDL,
         }
     }
-}
-
-/// Gather `rows` of `hidden` into a `[rows, hidden]` view, for the head.
-///
-/// The worker calls this when it assembles a batch's logits requests: the operator moves whole
-/// rows, so two implementations agree bit for bit.
-pub fn gather_rows(
-    f: &Forward,
-    hidden: TensorView,
-    rows: TensorView,
-    out: TensorView,
-) -> Result<()> {
-    let columns = hidden.last();
-    let count = rows.numel();
-    // The operator's indices are one axis and its output two, because it derives the row count from
-    // `out`. A caller holding `[1, count]` - the shape an output of one row needs - must flatten it
-    // itself: the same bytes as a two-axis view reach the kernel as two axes and are refused there
-    // (`expected 1 axes, found 2`), which names neither the caller nor the fix.
-    if rows.shape.rank() != 1 {
-        return Err(Error::shape(
-            "gather_rows",
-            format!(
-                "rows is {:?}, and the operator takes a flat [count] index view",
-                rows.shape.dims()
-            ),
-        ));
-    }
-    if out.shape.rank() != 2 || out.shape.dim(0) != count || out.shape.dim(1) != columns {
-        return Err(Error::shape(
-            "gather_rows",
-            format!(
-                "out is {:?}, [{count}, {columns}] expected",
-                out.shape.dims()
-            ),
-        ));
-    }
-    let descriptor = GatherDescriptor {
-        dtype: hidden.dtype,
-        columns: u32::try_from(columns)
-            .map_err(|_| Error::shape("gather_rows", "a hidden width above u32::MAX".to_owned()))?,
-        block: BLOCK,
-        pdl: crate::layers::launch::PDL,
-    };
-    let args = logits::GatherArgs { hidden, rows, out };
-
-    f.operate::<LogitsGather>(&descriptor, args)
 }

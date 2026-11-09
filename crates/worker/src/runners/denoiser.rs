@@ -2551,7 +2551,7 @@ mod tests {
     /// width the model states - and a model that keeps the encoder's width gets one width.
     ///
     /// The stop this closes was `out is [19904, 5376], [19904, 5120] expected`. A gather cannot
-    /// change a row's width (`head::gather_rows` requires `[count, table width]`), so a runner that
+    /// change a row's width (`IndexRows::gather` requires `[count, table width]`), so a runner that
     /// sized both conditioning columns from the encoder's width handed the conditioner a buffer too
     /// narrow for its own output, and the refusal arrived one operator later than the mistake. Both
     /// models are asserted, so an implementation that always used one of the two numbers - either one

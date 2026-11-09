@@ -1764,7 +1764,7 @@ const SEGMENT_TABLES: [&str; 18] = [
 /// A rank-one row table as the rows of width one a row gather moves.
 ///
 /// The per-row tables (`groups`, `prefix_index`, `modulation_indices`, `step`) are declared
-/// one-dimensional, because a layer reads one integer per row. `nn::layers::gather_rows` states its
+/// one-dimensional, because a layer reads one integer per row. `nn::layers::IndexRows::gather` states its
 /// source and its output as `[rows, columns]`, so a table enters it as rows of width one: the same
 /// buffer with row-major strides for the new shape, no copy and no change of value.
 fn one_column(view: TensorView) -> TensorView {
@@ -2303,7 +2303,7 @@ impl Denoiser {
         // The packed rows: every row gathers its prefix source, so a generated row reads the zero
         // row and a text row reads itself.
         let hidden = arena.tensor(dtype, Shape::new(&[local, hidden_size]))?;
-        nn::layers::gather_rows(f, cond.text, own(tables.get("prefix_index")?), hidden)?;
+        nn::layers::IndexRows.gather(f, cond.text, own(tables.get("prefix_index")?), hidden)?;
 
         // The video rows: patchify, project, scatter.
         let video_indices = tables.get("video_indices")?;
@@ -2336,12 +2336,12 @@ impl Denoiser {
         // and its output are FP32, and the one rounding into the packed rows is the narrowing.
         if own_video > 0 {
             let owned = arena.tensor(sample_dtype, Shape::new(&[own_video, channels * 4]))?;
-            nn::layers::gather_rows(f, patched, video_sources, owned)?;
+            nn::layers::IndexRows.gather(f, patched, video_sources, owned)?;
             let projected = arena.tensor(DType::F32, Shape::new(&[own_video, hidden_size]))?;
             self.transformer.project(f, owned, projected)?;
             let narrowed = arena.tensor(dtype, Shape::new(&[own_video, hidden_size]))?;
             nn::layers::Cast.forward(f, projected, narrowed)?;
-            nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, narrowed, video_slots)?;
+            nn::layers::IndexRows.scatter(f, narrowed, video_slots, hidden)?;
         }
 
         // One audio stream or none. A layout with audio rows and no audio latents would otherwise
@@ -2384,19 +2384,14 @@ impl Denoiser {
             let own_audio = audio_sources.shape.dim(0);
             if own_audio > 0 {
                 let owned = arena.tensor(sample_dtype, Shape::new(&[own_audio, features]))?;
-                nn::layers::gather_rows(f, flat, audio_sources, owned)?;
+                nn::layers::IndexRows.gather(f, flat, audio_sources, owned)?;
                 // The audio's own two crossings, for the reason the video's: the latent is the
                 // sample's type and the projection's FP32 output is narrowed into the packed rows.
                 let projected = arena.tensor(DType::F32, Shape::new(&[own_audio, hidden_size]))?;
                 self.transformer.project_audio(f, owned, projected)?;
                 let narrowed = arena.tensor(dtype, Shape::new(&[own_audio, hidden_size]))?;
                 nn::layers::Cast.forward(f, projected, narrowed)?;
-                nn::layers::Rows::new(dtype, hidden_size)?.replace(
-                    f,
-                    hidden,
-                    narrowed,
-                    tables.get("audio_slots")?,
-                )?;
+                nn::layers::IndexRows.scatter(f, narrowed, tables.get("audio_slots")?, hidden)?;
             }
         }
 
@@ -2472,9 +2467,9 @@ impl Denoiser {
         let groups_table = own(tables.get("groups")?);
         let predicted = if own_video > 0 {
             let video_hidden = arena.tensor(dtype, Shape::new(&[own_video, hidden_size]))?;
-            nn::layers::gather_rows(f, hidden, video_slots, video_hidden)?;
+            nn::layers::IndexRows.gather(f, hidden, video_slots, video_hidden)?;
             let video_groups = arena.tensor(DType::I32, Shape::new(&[own_video]))?;
-            nn::layers::gather_rows(
+            nn::layers::IndexRows.gather(
                 f,
                 one_column(groups_table),
                 video_slots,
@@ -2529,9 +2524,9 @@ impl Denoiser {
             let own_audio = audio_slots.shape.dim(0);
             let predicted = if own_audio > 0 {
                 let audio_hidden = arena.tensor(dtype, Shape::new(&[own_audio, hidden_size]))?;
-                nn::layers::gather_rows(f, hidden, audio_slots, audio_hidden)?;
+                nn::layers::IndexRows.gather(f, hidden, audio_slots, audio_hidden)?;
                 let audio_groups = arena.tensor(DType::I32, Shape::new(&[own_audio]))?;
-                nn::layers::gather_rows(
+                nn::layers::IndexRows.gather(
                     f,
                     one_column(groups_table),
                     audio_slots,
@@ -2606,7 +2601,7 @@ impl Denoiser {
         }
         let interval = arena.tensor(SAMPLE_DTYPE, Shape::new(&[local, width]))?;
         if let Some(predicted) = predicted {
-            nn::layers::Rows::new(SAMPLE_DTYPE, width)?.replace(f, interval, predicted, slots)?;
+            nn::layers::IndexRows.scatter(f, predicted, slots, interval)?;
         }
         let sequence = arena.tensor(SAMPLE_DTYPE, Shape::new(&[tokens, width]))?;
         if f.split().is_none() {
@@ -2618,7 +2613,7 @@ impl Denoiser {
         }
         f.all_gather(interval, sequence)?;
         let rows = arena.tensor(SAMPLE_DTYPE, Shape::new(&[indices.shape.dim(0), width]))?;
-        nn::layers::gather_rows(f, sequence, indices, rows)?;
+        nn::layers::IndexRows.gather(f, sequence, indices, rows)?;
         Ok(rows)
     }
 

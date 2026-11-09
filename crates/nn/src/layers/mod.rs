@@ -56,7 +56,7 @@ pub use cross_fade::CrossFade;
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
 pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
-pub use head::{ParallelLMHead, gather_rows};
+pub use head::ParallelLMHead;
 pub use layout::{Access, Copy, Patchify};
 pub use linear::{
     Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, PACKED_M_CLASSES, Parallel, QkvBias, QkvLinear,
@@ -76,7 +76,7 @@ pub use residual::{Axpby, Cast, Residual, Scale};
 pub use rgb::RgbBytes;
 pub use rope::{Rotary, Sections};
 pub use rotate::Rotate;
-pub use rows::Rows;
+pub use rows::IndexRows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use segment::{SegmentAttention, SegmentTables};
 pub use segments::{SELECT_FLOOR, VsaTiles};
