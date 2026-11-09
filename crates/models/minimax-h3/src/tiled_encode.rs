@@ -118,7 +118,7 @@ pub struct Scene<'a> {
     /// Tile `i`'s pixels, in plan order.
     ///
     /// Without [`Self::packed`] each view is `[1, in_channels, frames, tile_height, tile_width]` and
-    /// **packed**: `nn::layers::FramePad` pads a frame's rows in place of the source's own, so it
+    /// **packed**: `nn::layers::CausalPad` pads a frame's rows in place of the source's own, so it
     /// requires a frame's rows to be contiguous in the view it reads. A caller that uploads tiles as
     /// separate buffers passes them as they are. With it, each view is the tile's block of a wider
     /// raster, `[in_channels, frames, tile_height, tile_width]` at the raster's strides.

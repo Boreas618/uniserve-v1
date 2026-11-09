@@ -7,21 +7,11 @@
 //! share one configuration, which the checkpoint's `vae/config.json` states.
 
 use nn::config::Fields;
+use nn::layers::Padding;
 use serde_json::Value;
 
 use super::statistics;
 use crate::{Error, Result};
-
-/// How a convolution pads the spatial axes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SpatialPadding {
-    /// Mirror the raster about its edge.
-    Reflect,
-    /// Repeat the edge value.
-    Replicate,
-    /// Pad with zeros.
-    Constant,
-}
 
 /// The video VAE's network and reconstruction geometry.
 #[derive(Clone, PartialEq, Debug)]
@@ -44,8 +34,8 @@ pub struct VideoVaeConfig {
     pub norm_num_groups: u32,
     /// Group-normalization epsilon.
     pub norm_eps: f32,
-    /// How the spatial convolutions pad.
-    pub spatial_padding_mode: SpatialPadding,
+    /// How the causal convolutions fill the rows and columns beyond a frame's edge.
+    pub spatial_padding_mode: Padding,
     /// Transformer layers of the decoder's latent stage.
     pub decoder_num_layers: u32,
     /// Attention heads of those layers.
@@ -78,9 +68,10 @@ impl VideoVaeConfig {
         let values = Fields::of("vae/config.json", values)?;
         let latent_channels = values.count("latent_channels")?;
         let spatial_padding_mode = match values.text("spatial_padding_mode")? {
-            "reflect" => SpatialPadding::Reflect,
-            "replicate" => SpatialPadding::Replicate,
-            "constant" => SpatialPadding::Constant,
+            "reflect" => Padding::Reflect,
+            "replicate" => Padding::Replicate,
+            // A constant border is the convolution's own zero padding, which the causal pad's
+            // kernel does not fill: it mirrors or repeats the edge.
             other => {
                 return Err(Error::config(format!(
                     "unsupported H3 video spatial padding mode {other:?}"
@@ -222,7 +213,7 @@ mod tests {
         assert_eq!(config.temporal_compression(), 4);
         assert_eq!(config.clip_latents(), 5);
         assert_eq!(config.final_clip_latents(), 2);
-        assert_eq!(config.spatial_padding_mode, SpatialPadding::Reflect);
+        assert_eq!(config.spatial_padding_mode, Padding::Reflect);
         // The parsing keeps every statistic the sidecar declares, one per entry of its array.
         assert_eq!(config.latents_mean.len(), 4);
     }

@@ -7,7 +7,7 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    Activation, AdaptivePool, Arena, CausalPad, Conv3d, ConvGeometry, DType, DevicePtr, Epilogue,
+    Activation, AdaptivePool, Arena, CausalPad, Conv3d, ConvSpec, DType, DevicePtr, Epilogue,
     Forward, GateBias, GatedActivation, GroupNorm, Halves, KvGroup, KvPlanes, KvView, LayerNorm,
     Linear, Modulation, Residual, ResidualStream, RmsNorm, Rounding, Scale, Shape, Snake,
     TensorView, Weight,
@@ -297,7 +297,7 @@ fn a_group_normalization_states_its_groups_and_its_affine_pair() {
         top: 1,
         left: 1,
         front: 2,
-        reflect: false,
+        padding: nn::Padding::Replicate,
     };
     assert!(
         GroupNorm::new(32, 1e-6, Some(weight(&[64])), None, pad).is_err(),
@@ -319,7 +319,7 @@ fn a_group_normalization_writes_a_frame_no_smaller_than_its_source() {
         top: 1,
         left: 1,
         front: 2,
-        reflect: true,
+        padding: nn::Padding::Reflect,
     };
     let norm = GroupNorm::new(4, 1e-6, None, None, pad).unwrap();
     let values = view(&[1, 8, 3, 6, 6]);
@@ -494,7 +494,6 @@ impl ops::capture::Sink for Launches {
 /// call. An order in the key would compile the same convolution twice.
 #[test]
 fn a_channels_last_convolution_launches_the_channels_first_program() {
-    let spatial = ConvGeometry::new(3, [2, 2, 2], [1, 1, 1], [0, 0, 0], [1, 1, 1], 1).unwrap();
     let spatial_weight = weight(&[8, 4, 2, 2, 2]);
     let input = Shape::new(&[1, 4, 3, 3, 3]);
     let output = Shape::new(&[1, 8, 2, 2, 2]);
@@ -516,7 +515,12 @@ fn a_channels_last_convolution_launches_the_channels_first_program() {
             }
         };
         let (x, out) = (view(input), view(output));
-        let conv = Conv3d::new(spatial_weight, None, spatial, false, channels_last).unwrap();
+        let spec = ConvSpec {
+            bias: nn::layers::Bias::Absent,
+            channels_last,
+            ..ConvSpec::new(4, 8, [2; 3])
+        };
+        let conv = Conv3d::new(spatial_weight, None, spec).unwrap();
         let mut launches = Launches(Vec::new());
         ops::capture::set_sink(Some(&mut launches));
         let walked = conv.forward(&f, x, out);

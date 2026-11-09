@@ -1,104 +1,307 @@
-//! Convolutions through cuDNN: the video VAE's `conv3d` and the audio decoder's one-dimensional
-//! pair.
+//! Convolutions through cuDNN with torch's arguments, and the causal padding of a video
+//! convolution's input.
 //!
-//! A convolution's geometry is part of its descriptor, because the program is compiled per shape
-//! family and selects a cuDNN engine for it from its tuning data. The
-//! layer holds the geometry the model states and calls the matching operator; the descriptor's
-//! `tf32` flag is the model's numerical declaration for an FP32 convolution (the video VAE keeps it
-//! on, as the `quality` preset does).
+//! [`Conv1d`], [`ConvTranspose1d`] and [`Conv3d`] take the arguments their torch modules take —
+//! channels, kernel, stride, zero padding, dilation, groups, bias — as one [`ConvSpec`], and load
+//! the module's `weight` (or its weight-normalized `weight_v`/`weight_g` pair, folded once) and
+//! `bias` from a [`Scope`]. The spec's `tf32` flag is the model's numerical declaration for an FP32
+//! convolution, and `channels_last` the storage of a 3-d convolution's operands.
+//!
+//! A causal video convolution reads an input padded beyond what a zero padding states: the spatial
+//! border mirrored or replicated ([`Padding`]) and zero frames in front, so no output frame reads a
+//! later input frame. [`CausalPad`] is that padding, launched on its own (`frame_pad`) or fused
+//! into the [`GroupNorm`](crate::layers::GroupNorm) that writes a normalized input.
 
 use ops::conv::{
     Args, Conv1d as Conv1dOp, Conv3d as Conv3dOp, ConvTranspose1d as ConvTranspose1dOp, Descriptor,
     Geometry,
 };
-use ops::{DType, Shape, Strides, TensorView};
+use ops::frame;
+use ops::{Shape, Strides, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::weights::Weight;
+use crate::layers::Bias;
+use crate::weights::{Scope, Weight};
 
-/// One convolution's geometry, as the model states it.
+/// How a causal pad fills the rows and columns beyond a frame's edge: torch's `padding_mode`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct ConvGeometry {
-    /// The filter's extent along each spatial axis.
-    pub kernel: [u32; 3],
-    /// The step between output positions along each spatial axis.
-    pub stride: [u32; 3],
-    /// The padding before the first input position along each spatial axis.
-    pub padding: [u32; 3],
-    /// The spacing between filter taps along each spatial axis.
-    pub dilation: [u32; 3],
-    /// How many input channels each output channel's filter reads.
-    pub groups: u32,
+pub enum Padding {
+    /// Mirror the rows and columns inside the edge (`reflect`).
+    Reflect,
+    /// Repeat the edge row and column (`replicate`).
+    Replicate,
 }
 
-impl ConvGeometry {
-    /// The geometry of a `rank`-dimensional convolution: the leading axes of the three-axis form, as
-    /// the operator orders them. A 1-d convolution's length is the first spatial axis, and its other
-    /// two axes are a filter of one with no padding.
-    pub fn new(
-        rank: usize,
-        kernel: [u32; 3],
-        stride: [u32; 3],
-        padding: [u32; 3],
-        dilation: [u32; 3],
-        groups: u32,
-    ) -> Result<Self> {
-        if rank != 1 && rank != 3 {
-            return Err(Error::shape(
-                "ConvGeometry",
-                format!("rank {rank} is not a 1-d or 3-d convolution"),
-            ));
-        }
-        if groups == 0 {
-            return Err(Error::shape(
-                "ConvGeometry",
-                "a convolution has at least one group".to_owned(),
-            ));
-        }
-        Ok(Self {
-            kernel,
-            stride,
-            padding,
-            dilation,
-            groups,
-        })
+/// The causal padding of a video convolution's input: `top` rows, `left` columns and `front` zero
+/// frames before the source, the border filled as `padding` states.
+///
+/// The output view's own extents give the padding after the source. The frames in front are zeros,
+/// so no output frame of the convolution that reads the padded input depends on a later input
+/// frame.
+#[derive(Clone, Copy, Debug)]
+pub struct CausalPad {
+    /// Rows before the source.
+    pub top: u32,
+    /// Columns before the source.
+    pub left: u32,
+    /// Zero frames before the source.
+    pub front: u32,
+    /// How the rows and columns beyond the edge are filled.
+    pub padding: Padding,
+}
+
+impl CausalPad {
+    /// Whether the border mirrors rather than replicates: the operators' flag.
+    pub(crate) fn reflect(&self) -> bool {
+        self.padding == Padding::Reflect
     }
 
-    /// The geometry as the operator's descriptor states it.
-    fn descriptor(self) -> Geometry {
+    /// Pad `values` `[batch, channels, frames, height, width]` into `out`, whose extra frames are
+    /// zeros and whose extra rows and columns follow [`Self::padding`].
+    ///
+    /// Both operands may be stored channel-first or channels-last: the logical axes keep their
+    /// meaning and the strides state the order (`ops::conv`'s rule).
+    ///
+    /// # Errors
+    ///
+    /// The operator's refusal: operands of another rank or channel count, or an output smaller than
+    /// the source and its leading padding.
+    pub fn forward(&self, f: &Forward, values: TensorView, out: TensorView) -> Result<()> {
+        // The block tiles are the operator's own split of the values' and the output's extents.
+        let (block_pixels, block_channels) = frame::FramePadDescriptor::tiles(&values, &out);
+        let descriptor = frame::FramePadDescriptor {
+            dtype: values.dtype,
+            reflect: self.reflect(),
+            block_pixels,
+            block_channels,
+        };
+        f.operate::<frame::FramePad>(
+            &descriptor,
+            frame::FramePadArgs {
+                values,
+                out,
+                top: u64::from(self.top),
+                left: u64::from(self.left),
+                front: u64::from(self.front),
+            },
+        )
+    }
+}
+
+/// A convolution's torch arguments over `N` spatial axes.
+///
+/// [`ConvSpec::new`] states torch's defaults — stride one, no padding, no dilation, one group, a
+/// bias — and a caller overrides the fields its module states with struct update syntax.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ConvSpec<const N: usize> {
+    /// Input channels.
+    pub in_channels: u32,
+    /// Output channels.
+    pub out_channels: u32,
+    /// The filter's extent along each spatial axis.
+    pub kernel: [u32; N],
+    /// The step between output positions along each spatial axis.
+    pub stride: [u32; N],
+    /// The zero padding before (and after) the input along each spatial axis.
+    pub padding: [u32; N],
+    /// The spacing between filter taps along each spatial axis.
+    pub dilation: [u32; N],
+    /// How many channel groups the filter is split into.
+    pub groups: u32,
+    /// Whether the module states a `bias`.
+    pub bias: Bias,
+    /// Whether the checkpoint stores the weight as torch's weight-norm pair, folded at load.
+    pub weight_norm: bool,
+    /// Whether cuDNN may use TF32 for an FP32 convolution.
+    pub tf32: bool,
+    /// Whether the operands are stored channels-last (3-d only).
+    pub channels_last: bool,
+}
+
+impl<const N: usize> ConvSpec<N> {
+    /// `in_channels` to `out_channels` with a `kernel` filter and torch's other defaults.
+    pub const fn new(in_channels: u32, out_channels: u32, kernel: [u32; N]) -> Self {
+        Self {
+            in_channels,
+            out_channels,
+            kernel,
+            stride: [1; N],
+            padding: [0; N],
+            dilation: [1; N],
+            groups: 1,
+            bias: Bias::Present,
+            weight_norm: false,
+            tf32: false,
+            channels_last: false,
+        }
+    }
+
+    /// The operator's three-axis statement of the spec: a 1-d convolution's length is the first
+    /// spatial axis, and its other two axes are a filter of one with no padding.
+    fn geometry(&self) -> Geometry {
+        let lift = |values: &[u32; N], fill: u32| {
+            let mut axes = [fill; 3];
+            axes[..N].copy_from_slice(values);
+            axes
+        };
         Geometry {
-            kernel: self.kernel,
-            stride: self.stride,
-            padding: self.padding,
-            dilation: self.dilation,
+            kernel: lift(&self.kernel, 1),
+            stride: lift(&self.stride, 1),
+            padding: lift(&self.padding, 0),
+            dilation: lift(&self.dilation, 1),
             groups: self.groups,
         }
     }
+
+    /// Refuse a spec no convolution has.
+    fn check(&self, owner: &'static str) -> Result<()> {
+        let positive = |values: &[u32; N]| values.iter().all(|value| *value > 0);
+        if self.groups == 0
+            || self.in_channels == 0
+            || self.out_channels == 0
+            || !self.in_channels.is_multiple_of(self.groups)
+            || !self.out_channels.is_multiple_of(self.groups)
+            || !positive(&self.kernel)
+            || !positive(&self.stride)
+            || !positive(&self.dilation)
+        {
+            return Err(Error::shape(
+                owner,
+                format!("{self:?} is not a convolution"),
+            ));
+        }
+        if self.channels_last && N != 3 {
+            return Err(Error::shape(
+                owner,
+                "only a 3-d convolution stores its operands channels-last".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
-/// A three-dimensional convolution.
-pub struct Conv3d {
+/// The convolution state the three layers share: the weights, the spec and the operator's rank.
+struct Convolution<const N: usize> {
     weight: Weight,
     bias: Option<Weight>,
-    geometry: ConvGeometry,
-    tf32: bool,
-    /// Whether this convolution reads and writes channels-last (NDHWC) tensors.
-    ///
-    /// **The filter is not part of the order.** A checkpoint stores a convolution's weight
-    /// `[out, in, kd, kh, kw]` packed, which is the KCRS form cuDNN's filter descriptor wants, and
-    /// PyTorch's `channels_last_3d` is a memory format of *activations* - module weights stay dense.
-    /// So a channels-last convolution reorders its input and output only.
-    /// `crates/ops/kernels/conv3d/cudnn/src/conv.cu:383-386` currently derives NDHWC strides for the
-    /// filter as well, which reads a packed KCRS weight in the wrong order; no site passes `true`
-    /// today, so the flag is refused by the guard below before that line can run.
-    ///
-    /// The reference's stride-1 padded convolutions read channels-last and its strided ones
-    /// channels-first, because the two orders can select different algorithms and, for a strided
-    /// convolution, different rounding. **Stated per layer, never inferred from the stride**: a 1x1
-    /// stride-1 convolution is channels-first in the reference (`conv_shortcut`, `quant_conv`), and
-    /// deriving the order from the stride gets exactly those wrong.
-    channels_last: bool,
+    spec: ConvSpec<N>,
+}
+
+impl<const N: usize> Convolution<N> {
+    /// The module at `scope` of `filter` extents (torch's weight shape for the layer).
+    fn load(
+        owner: &'static str,
+        scope: &mut Scope<'_, '_>,
+        spec: ConvSpec<N>,
+        filter: Vec<u64>,
+    ) -> Result<Self> {
+        spec.check(owner)?;
+        let weight = match spec.weight_norm {
+            true => scope.weight_norm("weight")?,
+            false => scope.tensor("weight", &filter)?,
+        };
+        let bias = match spec.bias {
+            Bias::Present => Some(scope.tensor("bias", &[u64::from(spec.out_channels)])?),
+            Bias::Absent => None,
+        };
+        Self::new(owner, weight, bias, spec, filter)
+    }
+
+    /// The convolution over already bound weights of `filter` extents.
+    fn new(
+        owner: &'static str,
+        weight: Weight,
+        bias: Option<Weight>,
+        spec: ConvSpec<N>,
+        filter: Vec<u64>,
+    ) -> Result<Self> {
+        spec.check(owner)?;
+        if weight.shape().dims() != filter.as_slice() {
+            return Err(Error::shape(
+                owner,
+                format!(
+                    "a filter of {:?} for a spec whose filter is {filter:?}",
+                    weight.shape().dims()
+                ),
+            ));
+        }
+        if (spec.bias == Bias::Present) != bias.is_some()
+            || bias
+                .as_ref()
+                .is_some_and(|bias| bias.shape().dims() != [u64::from(spec.out_channels)])
+        {
+            return Err(Error::shape(
+                owner,
+                format!("the bias does not match a spec of {:?}", spec.bias),
+            ));
+        }
+        Ok(Self { weight, bias, spec })
+    }
+
+    /// One launch of `Op` over `input` into `out`.
+    fn launch(
+        &self,
+        f: &Forward,
+        owner: &'static str,
+        input: TensorView,
+        out: TensorView,
+        rank: u32,
+        transposed: bool,
+    ) -> Result<()> {
+        if self
+            .bias
+            .as_ref()
+            .is_some_and(|bias| bias.dtype() != out.dtype)
+        {
+            return Err(Error::shape(
+                owner,
+                "the bias and the output have different element types".to_owned(),
+            ));
+        }
+        let descriptor = Descriptor {
+            input: input.dtype,
+            weight: self.weight.dtype(),
+            output: out.dtype,
+            geometry: self.spec.geometry(),
+            bias: self.bias.is_some(),
+            tf32: self.spec.tf32,
+            channels_last: self.spec.channels_last,
+            rank,
+            transposed,
+        };
+        let args = Args {
+            input,
+            weight: self.weight.view(),
+            bias: self.bias.as_ref().map(Weight::view),
+            out,
+        };
+        match (rank, transposed) {
+            (3, false) => f.operate::<Conv3dOp>(&descriptor, args),
+            (1, false) => f.operate::<Conv1dOp>(&descriptor, args),
+            (1, true) => f.operate::<ConvTranspose1dOp>(&descriptor, args),
+            (rank, transposed) => Err(Error::Unsupported(format!(
+                "{owner}: rank {rank} transposed={transposed} is not a convolution this layer builds"
+            ))),
+        }
+    }
+}
+
+/// The filter of a plain convolution: `[out, in / groups, kernel...]`.
+fn filter<const N: usize>(spec: &ConvSpec<N>, transposed: bool) -> Vec<u64> {
+    let (first, second) = match transposed {
+        // torch stores a transposed filter `[in, out / groups, kernel...]`.
+        true => (spec.in_channels, spec.out_channels / spec.groups.max(1)),
+        false => (spec.out_channels, spec.in_channels / spec.groups.max(1)),
+    };
+    let mut extents = vec![u64::from(first), u64::from(second)];
+    extents.extend(spec.kernel.iter().map(|tap| u64::from(*tap)));
+    extents
+}
+
+/// A three-dimensional convolution: torch's `Conv3d`.
+pub struct Conv3d {
+    inner: Convolution<3>,
 }
 
 /// The strides of a channels-last (`NDHWC`) buffer read as its logical `[n, c, d, h, w]` shape.
@@ -117,9 +320,11 @@ fn channels_last_strides(shape: Shape) -> Strides {
 ///
 /// The kernel derives every operand's strides from the descriptor's `channels_last` flag alone, so
 /// the flag **is** the layout: a convolution declared channels-last over a channels-first buffer
-/// reads the same bytes in another order and produces wrong numbers with no error anywhere. A model
-/// that wants the order but not the storage needs a permute in front of the convolution, and this is
-/// where that gap is named rather than measured.
+/// reads the same bytes in another order and produces wrong numbers with no error anywhere.
+///
+/// **The filter is not part of the order.** A checkpoint stores a convolution's weight
+/// `[out, in, kd, kh, kw]` packed, the KCRS form cuDNN's filter descriptor wants, and PyTorch's
+/// `channels_last_3d` is a memory format of *activations*.
 fn channels_last_storage(
     owner: &'static str,
     operand: &'static str,
@@ -140,9 +345,7 @@ fn channels_last_storage(
             owner,
             format!(
                 "the {operand} of a channels-last convolution must be stored NDHWC: its strides are \
-                 {:?} over {:?}, and the packed channels-last layout is {:?}. The kernel derives the \
-                 strides from the descriptor, so a channels-first buffer would be read in the wrong \
-                 order",
+                 {:?} over {:?}, and the packed channels-last layout is {:?}",
                 view.strides.as_slice(),
                 view.shape.dims(),
                 expected.as_slice()
@@ -153,233 +356,105 @@ fn channels_last_storage(
 }
 
 impl Conv3d {
-    /// The convolution of `weight` (`[out, in, kd, kh, kw]` or its group form).
-    pub fn new(
-        weight: Weight,
-        bias: Option<Weight>,
-        geometry: ConvGeometry,
-        tf32: bool,
-        channels_last: bool,
-    ) -> Result<Self> {
-        if weight.shape().rank() != 5 {
-            return Err(Error::shape(
-                "Conv3d",
-                format!("a filter is 5-d, not {:?}", weight.shape().dims()),
-            ));
-        }
-        Ok(Self {
-            weight,
-            bias,
-            geometry,
-            tf32,
-            channels_last,
-        })
+    /// The module at `scope`: `weight` `[out, in / groups, kd, kh, kw]` and, when the spec states
+    /// one, `bias` `[out]`.
+    ///
+    /// # Errors
+    ///
+    /// A spec no convolution has, or a tensor the checkpoint lacks or holds at another extent.
+    pub fn load(scope: &mut Scope<'_, '_>, spec: ConvSpec<3>) -> Result<Self> {
+        let inner = Convolution::load("Conv3d", scope, spec, filter(&spec, false))?;
+        Ok(Self { inner })
     }
 
-    /// `out = conv3d(input)`.
+    /// The convolution over weights a model computes rather than reads.
     ///
-    /// `input` is `[n, c, d, h, w]` and `out` `[n, k, d', h', w']`.
+    /// # Errors
+    ///
+    /// As [`Self::load`], for the weights given.
+    pub fn new(weight: Weight, bias: Option<Weight>, spec: ConvSpec<3>) -> Result<Self> {
+        let inner = Convolution::new("Conv3d", weight, bias, spec, filter(&spec, false))?;
+        Ok(Self { inner })
+    }
+
+    /// `out = conv3d(input)`: `input` `[n, c, d, h, w]` into `out` `[n, k, d', h', w']`.
     ///
     /// A convolution built channels-last takes both operands **stored** channels-last, which a
-    /// caller states by viewing an `NDHWC` buffer as its logical shape; the check is here because
-    /// the kernel reads the order from the descriptor and would otherwise misread the bytes.
+    /// caller states by viewing an `NDHWC` buffer as its logical shape.
+    ///
+    /// # Errors
+    ///
+    /// An operand not stored as the spec states, or the operator's refusal.
     pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        if self.channels_last {
+        if self.inner.spec.channels_last {
             channels_last_storage("Conv3d", "input", input)?;
             channels_last_storage("Conv3d", "out", out)?;
         }
-        launch(
-            f,
-            "conv3d",
-            input,
-            &self.weight,
-            self.bias.as_ref(),
-            out,
-            self.geometry,
-            3,
-            false,
-            self.tf32,
-            self.channels_last,
-        )
+        self.inner.launch(f, "Conv3d", input, out, 3, false)
     }
 }
 
-/// A one-dimensional convolution (the audio decoder's convolutions).
+/// A one-dimensional convolution: torch's `Conv1d`.
 pub struct Conv1d {
-    weight: Weight,
-    bias: Option<Weight>,
-    geometry: ConvGeometry,
-    tf32: bool,
+    inner: Convolution<1>,
 }
 
 impl Conv1d {
-    /// The convolution of `weight` (`[out, in, k]` or its group form).
-    pub fn new(
-        weight: Weight,
-        bias: Option<Weight>,
-        geometry: ConvGeometry,
-        tf32: bool,
-    ) -> Result<Self> {
-        if weight.shape().rank() != 3 {
-            return Err(Error::shape(
-                "Conv1d",
-                format!("a filter is 3-d, not {:?}", weight.shape().dims()),
-            ));
-        }
-        Ok(Self {
-            weight,
-            bias,
-            geometry,
-            tf32,
-        })
+    /// The module at `scope`: `weight` `[out, in / groups, k]` (or its weight-norm pair) and, when
+    /// the spec states one, `bias` `[out]`.
+    ///
+    /// # Errors
+    ///
+    /// A spec no convolution has, or a tensor the checkpoint lacks or holds at another extent.
+    pub fn load(scope: &mut Scope<'_, '_>, spec: ConvSpec<1>) -> Result<Self> {
+        let inner = Convolution::load("Conv1d", scope, spec, filter(&spec, false))?;
+        Ok(Self { inner })
+    }
+
+    /// The convolution over weights a model computes rather than reads.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`], for the weights given.
+    pub fn new(weight: Weight, bias: Option<Weight>, spec: ConvSpec<1>) -> Result<Self> {
+        let inner = Convolution::new("Conv1d", weight, bias, spec, filter(&spec, false))?;
+        Ok(Self { inner })
     }
 
     /// `out = conv1d(input)` on `[n, c, l]` sequences.
+    ///
+    /// # Errors
+    ///
+    /// The operator's refusal.
     pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        launch(
-            f,
-            "conv1d",
-            input,
-            &self.weight,
-            self.bias.as_ref(),
-            out,
-            self.geometry,
-            1,
-            false,
-            self.tf32,
-            false,
-        )
+        self.inner.launch(f, "Conv1d", input, out, 1, false)
     }
 }
 
-/// A one-dimensional transposed convolution (the audio decoder's upsampling).
+/// A one-dimensional transposed convolution: torch's `ConvTranspose1d`.
 pub struct ConvTranspose1d {
-    weight: Weight,
-    bias: Option<Weight>,
-    geometry: ConvGeometry,
-    tf32: bool,
+    inner: Convolution<1>,
 }
 
 impl ConvTranspose1d {
-    /// The transposed convolution of `weight` (`[in, out, k]` or its group form).
-    pub fn new(
-        weight: Weight,
-        bias: Option<Weight>,
-        geometry: ConvGeometry,
-        tf32: bool,
-    ) -> Result<Self> {
-        if weight.shape().rank() != 3 {
-            return Err(Error::shape(
-                "ConvTranspose1d",
-                format!("a filter is 3-d, not {:?}", weight.shape().dims()),
-            ));
-        }
-        Ok(Self {
-            weight,
-            bias,
-            geometry,
-            tf32,
-        })
+    /// The module at `scope`: `weight` `[in, out / groups, k]` (or its weight-norm pair) and, when
+    /// the spec states one, `bias` `[out]`.
+    ///
+    /// # Errors
+    ///
+    /// A spec no convolution has, or a tensor the checkpoint lacks or holds at another extent.
+    pub fn load(scope: &mut Scope<'_, '_>, spec: ConvSpec<1>) -> Result<Self> {
+        let inner = Convolution::load("ConvTranspose1d", scope, spec, filter(&spec, true))?;
+        Ok(Self { inner })
     }
 
     /// `out = conv_transpose1d(input)` on `[n, c, l]` sequences.
+    ///
+    /// # Errors
+    ///
+    /// The operator's refusal.
     pub fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        launch(
-            f,
-            "conv_transpose1d",
-            input,
-            &self.weight,
-            self.bias.as_ref(),
-            out,
-            self.geometry,
-            1,
-            true,
-            self.tf32,
-            false,
-        )
-    }
-}
-
-/// The descriptor one convolution launch takes.
-///
-/// The three layers share one launch, so they share the construction of its descriptor.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "every argument is a geometry or an element type the descriptor states separately"
-)]
-fn descriptor(
-    input: DType,
-    weight: &Weight,
-    bias: Option<&Weight>,
-    output: DType,
-    geometry: ConvGeometry,
-    rank: u32,
-    transposed: bool,
-    tf32: bool,
-    channels_last: bool,
-) -> Descriptor {
-    Descriptor {
-        input,
-        weight: weight.dtype(),
-        output,
-        geometry: geometry.descriptor(),
-        bias: bias.is_some(),
-        tf32,
-        channels_last,
-        rank,
-        transposed,
-    }
-}
-
-/// The launch the three convolutions share.
-#[allow(
-    clippy::too_many_arguments,
-    reason = "the descriptor's own arguments plus the launch's views; one helper keeps the three \
-              layers' launches identical"
-)]
-fn launch(
-    f: &Forward,
-    owner: &'static str,
-    input: TensorView,
-    weight: &Weight,
-    bias: Option<&Weight>,
-    out: TensorView,
-    geometry: ConvGeometry,
-    rank: u32,
-    transposed: bool,
-    tf32: bool,
-    channels_last: bool,
-) -> Result<()> {
-    if bias.is_some_and(|bias| bias.dtype() != out.dtype) {
-        return Err(Error::shape(
-            owner,
-            "the bias and the output have different element types".to_owned(),
-        ));
-    }
-    let descriptor = descriptor(
-        input.dtype,
-        weight,
-        bias,
-        out.dtype,
-        geometry,
-        rank,
-        transposed,
-        tf32,
-        channels_last,
-    );
-    let args = Args {
-        input,
-        weight: weight.view(),
-        bias: bias.map(Weight::view),
-        out,
-    };
-    match (rank, transposed) {
-        (3, false) => f.operate::<Conv3dOp>(&descriptor, args),
-        (1, false) => f.operate::<Conv1dOp>(&descriptor, args),
-        (1, true) => f.operate::<ConvTranspose1dOp>(&descriptor, args),
-        (rank, transposed) => Err(Error::Unsupported(format!(
-            "Conv: rank {rank} transposed={transposed} is not a convolution this layer builds"
-        ))),
+        self.inner.launch(f, "ConvTranspose1d", input, out, 1, true)
     }
 }
 
@@ -411,13 +486,9 @@ mod tests {
     #[test]
     fn a_channels_first_buffer_is_refused_by_a_channels_last_convolution() {
         let shape = Shape::new(&[1, 3, 19, 258, 258]);
-        // Packed channels-first: the layout every other layer of the model builds.
         let error = channels_last_storage("Conv3d", "input", operand(Strides::row_major(shape)))
             .expect_err("a channels-first buffer read channels-last is wrong numbers, not a plan");
-        let text = format!("{error}");
-        assert!(text.contains("must be stored NDHWC"), "{text}");
-
-        // The same bytes viewed channels-last are accepted, which is what the encoder must build.
+        assert!(format!("{error}").contains("must be stored NDHWC"));
         channels_last_storage("Conv3d", "input", operand(channels_last_strides(shape)))
             .expect("the packed channels-last layout is what the descriptor promises");
     }

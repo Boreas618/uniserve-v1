@@ -11,6 +11,7 @@
 use std::path::Path;
 
 use nn::diffusion::{Euler, Grid};
+use nn::layers::{CausalPad, Conv1d, ConvSpec, ConvTranspose1d, Padding};
 use nn::{Arena, Checkpoint, DType, Forward, Shape, TensorView, WeightLoader};
 
 /// The programs a walk reported, as `(operator, key)` pairs.
@@ -71,6 +72,94 @@ fn checkpoint(directory: &Path, tensors: &[(&str, &str, &[u64])]) -> Checkpoint 
 /// A checkpoint whose only tensor is a placeholder: for layers that publish constants alone.
 fn empty_checkpoint(directory: &Path) -> Checkpoint {
     checkpoint(directory, &[("placeholder", "F32", &[1])])
+}
+
+/// A convolution loads torch's weight shape for its arguments, folds a weight-norm pair, and refuses
+/// a filter its arguments do not state; the transposed form reads torch's `[in, out, k]` filter.
+#[test]
+fn a_convolution_loads_the_filter_its_torch_arguments_state() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(
+        directory.path(),
+        &[
+            ("conv.weight_v", "F32", &[8, 4, 3]),
+            ("conv.weight_g", "F32", &[8, 1, 1]),
+            ("conv.bias", "F32", &[8]),
+            ("up.weight", "F32", &[8, 4, 4]),
+            ("up.bias", "F32", &[4]),
+        ],
+    );
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let spec = ConvSpec {
+        padding: [1],
+        weight_norm: true,
+        ..ConvSpec::new(4, 8, [3])
+    };
+    let conv = Conv1d::load(&mut loader.scope("conv"), spec).unwrap();
+    assert!(
+        Conv1d::load(
+            &mut loader.scope("conv"),
+            ConvSpec {
+                out_channels: 16,
+                ..spec
+            }
+        )
+        .is_err(),
+        "a filter of another width than the spec states"
+    );
+    assert!(
+        Conv1d::load(&mut loader.scope("conv"), ConvSpec { groups: 0, ..spec }).is_err(),
+        "no groups is no convolution"
+    );
+    assert!(
+        Conv1d::load(
+            &mut loader.scope("conv"),
+            ConvSpec {
+                channels_last: true,
+                ..spec
+            }
+        )
+        .is_err(),
+        "a 1-d convolution has no channels-last storage"
+    );
+    let up = ConvTranspose1d::load(
+        &mut loader.scope("up"),
+        ConvSpec {
+            stride: [2],
+            padding: [1],
+            ..ConvSpec::new(8, 4, [4])
+        },
+    )
+    .unwrap();
+
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
+    let (input, out) = (view(&[2, 4, 16]), view(&[2, 8, 16]));
+    let ((), launches) = recorded(|| conv.forward(&f, input, out).unwrap());
+    assert_eq!(operators(&launches), ["conv1d"]);
+    let ((), launches) = recorded(|| up.forward(&f, out, view(&[2, 4, 32])).unwrap());
+    assert_eq!(operators(&launches), ["conv_transpose1d"]);
+}
+
+/// A causal pad is one `frame_pad` launch, mirroring or repeating the border as its mode states.
+#[test]
+fn a_causal_pad_is_one_frame_pad_launch() {
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dims: &[u64]| arena.tensor(DType::F32, Shape::new(dims)).unwrap();
+    let (values, padded) = (view(&[1, 3, 5, 16, 16]), view(&[1, 3, 7, 18, 18]));
+    let launches = [Padding::Reflect, Padding::Replicate].map(|padding| {
+        let pad = CausalPad {
+            top: 1,
+            left: 1,
+            front: 2,
+            padding,
+        };
+        recorded(|| pad.forward(&f, values, padded).unwrap()).1
+    });
+    assert_eq!(operators(&launches[0]), ["frame_pad"]);
+    assert_ne!(launches[0], launches[1], "the border mode is compiled in");
 }
 
 /// The Euler step gathers its coefficient by the step index and adds the scaled velocity in place;

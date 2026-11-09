@@ -77,8 +77,8 @@ pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{
     Activation, AdaptivePool, AudioActivation, Axpby, Candidates, Cast, CausalPad, Conv1d, Conv3d,
-    ConvGeometry, ConvTranspose1d, CrossFade, Epilogue, FramePad, GateBias, GatedActivation, Gelu,
-    GroupNorm, Halves, IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey,
+    ConvSpec, ConvTranspose1d, CrossFade, Epilogue, GateBias, GatedActivation, Gelu, GroupNorm,
+    Halves, IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding,
     ParallelLMHead, PcmInterleave, Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding,
     Sampler, SamplerState, Samples, Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES,
 };

@@ -56,7 +56,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use nn::layers::{
-    Axpby, Conv1d, Conv3d, ConvGeometry, CrossFade, Linear, Residual, Scale, TileGrid, TileStitch,
+    Axpby, Conv1d, Conv3d, ConvSpec, CrossFade, Linear, Residual, Scale, TileGrid, TileStitch,
     WeightOrder,
 };
 use nn::{Arena, Backing, DType, DevicePtr, Forward, Shape, Strides, TensorView, Weight};
@@ -861,8 +861,7 @@ mod device {
         let denormalize = Conv1d::new(
             bench.weight(DType::F32, &[channels, channels, 1], &diagonal(std))?,
             Some(bench.weight(DType::F32, &[channels], mean)?),
-            one_by_one(1)?,
-            false,
+            one_by_one(channels, false),
         )?;
         let input = bench.values(DType::F32, &[2, channels, frames], &latents)?;
         let out = bench.tensor(DType::F32, &[2, channels, frames])?;
@@ -887,9 +886,7 @@ mod device {
         let normalize = Conv3d::new(
             bench.weight(DType::F32, &[channels, channels, 1, 1, 1], &scale)?,
             Some(bench.weight(DType::F32, &[channels], &shift)?),
-            one_by_one(3)?,
-            true,
-            false,
+            one_by_one(channels, true),
         )?;
         let input = bench.values(DType::F32, &[1, channels, 7, 45, 80], &samples)?;
         let out = bench.tensor(DType::F32, &[1, channels, 7, 45, 80])?;
@@ -910,8 +907,7 @@ mod device {
         let normalize = Conv1d::new(
             bench.weight(DType::F32, &[channels, channels, 1], &scale)?,
             Some(bench.weight(DType::F32, &[channels], &shift)?),
-            one_by_one(1)?,
-            false,
+            one_by_one(channels, false),
         )?;
         let input = bench.values(DType::F32, &[1, channels, frames], &samples)?;
         let out = bench.tensor(DType::F32, &[1, channels, frames])?;
@@ -949,13 +945,12 @@ mod device {
         (diagonal(&reciprocals), shift)
     }
 
-    /// A one-by-one convolution of rank `rank`, as the H3 encoders and decoders build theirs.
-    fn one_by_one(rank: usize) -> Outcome<ConvGeometry> {
-        Ok(if rank == 1 {
-            ConvGeometry::new(1, [1, 1, 1], [1, 1, 1], [0, 0, 0], [1, 1, 1], 1)?
-        } else {
-            ConvGeometry::new(3, [1; 3], [1; 3], [0; 3], [1; 3], 1)?
-        })
+    /// A one-by-one convolution of `channels`, as the H3 encoders and decoders build theirs.
+    fn one_by_one<const N: usize>(channels: u64, tf32: bool) -> ConvSpec<N> {
+        ConvSpec {
+            tf32,
+            ..ConvSpec::new(channels as u32, channels as u32, [1; N])
+        }
     }
 
     /// A channel-major sample of `positions` values per channel, each channel `N(mean, std²)`.

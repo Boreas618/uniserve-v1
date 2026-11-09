@@ -66,8 +66,7 @@ pub use config::{
     AudioVaeConfig, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, CLIP_FRAMES, CLIP_LATENTS, Canvas, Config,
     DROPPED_LATENTS, DenoiserConfig, FPS, NAMED_ASPECT_RATIOS, NAMED_CANVASES, NUM_TRAIN_TIMESTEPS,
     PixelConfig, RETAINED_LAYERS, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
-    SpatialPadding, TextEncoderConfig, TransformerConfig, UNIFORM_GRID_POINTS, VideoVaeConfig,
-    VisionConfig,
+    TextEncoderConfig, TransformerConfig, UNIFORM_GRID_POINTS, VideoVaeConfig, VisionConfig,
 };
 
 pub use load::load;

@@ -1983,7 +1983,7 @@ impl Denoiser {
         );
         let clip = crate::tiled_encode::ClipEncoder::new(taller, wider)?;
         let plan = clip.plan();
-        // One packed copy per tile, taken from the piece's own raster. `FramePad` - which pads a
+        // One packed copy per tile, taken from the piece's own raster. `CausalPad` - which pads a
         // tile's edges - reads each frame's rows in place, so it wants the *tile's* row stride and a
         // tile cut from a wider raster has the raster's: the kernel refuses it by name ("a frame's
         // pixels of one channel are not contiguous"). `Copy` is the strided-to-packed copy, and

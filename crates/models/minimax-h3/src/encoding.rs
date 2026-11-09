@@ -730,14 +730,14 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
 
 use nn::Forward;
 use nn::layers::{
-    AdaptivePool, CausalPad, Conv1d, Conv3d, ConvGeometry, DenseAttention, DenseSpec, FramePad,
-    GateBias, GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Posterior, Residual, Rounding,
+    AdaptivePool, Bias, CausalPad, Conv1d, Conv3d, ConvSpec, DenseAttention, DenseSpec, GateBias,
+    GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Padding, Posterior, Residual, Rounding,
     Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Scope, Weight, WeightLoader};
 use nn::{DType, Shape, Strides, TensorView};
 
-use crate::audio_vae::folded;
+use crate::audio_vae::normalized;
 
 /// One causal convolution of the encoder and the normalization that feeds it.
 ///
@@ -788,22 +788,8 @@ pub struct VideoEncoder {
     normalize: Conv3d,
     /// The posterior's epilogue: the sample a condition reads, from the projected moments.
     sampler: Posterior,
-    /// Whether the spatial padding mirrors the edge rows and columns (the checkpoint's mode) or
-    /// replicates them.
-    reflect: bool,
-}
-
-/// The geometry every causal convolution of the encoder is built for: three taps, no padding of its
-/// own (the frame pad supplies it) and unit dilation.
-fn geometry(kernel: u32, stride: [u32; 3]) -> Result<ConvGeometry> {
-    Ok(ConvGeometry::new(
-        3,
-        [kernel; 3],
-        stride,
-        [0; 3],
-        [1; 3],
-        1,
-    )?)
+    /// How the causal pads fill the rows and columns beyond a frame's edge (the checkpoint's mode).
+    padding: Padding,
 }
 
 /// The per-channel affine of the latent space, in the encoder's direction: `(sample − mean) / std`.
@@ -949,28 +935,17 @@ fn convolution(
     stride: [u32; 3],
     channels_last: bool,
 ) -> Result<Conv3d> {
-    let weight = scope.tensor(
-        "weight",
-        &[
-            u64::from(to),
-            u64::from(from),
-            u64::from(kernel),
-            u64::from(kernel),
-            u64::from(kernel),
-        ],
-    )?;
-    let bias = scope.tensor("bias", &[u64::from(to)])?;
-    Ok(Conv3d::new(
-        weight,
-        Some(bias),
-        geometry(kernel, stride)?,
-        // `tf32`: the encoder's convolutions are FP32 and the reference keeps cuDNN's TF32 for
-        // them (design section 9). Stated with its name because a bare `true` beside another bool
-        // reads as neither, and a review of this crate took it for absent while it was here.
-        /* tf32 */
-        true,
-        /* channels_last */
-        channels_last,
+    // No zero padding of its own: a causal pad (`CausalPad`, alone or fused into the
+    // normalization) supplies the padded input. `tf32`: the encoder's convolutions are FP32 and the
+    // reference keeps cuDNN's TF32 for them.
+    Ok(Conv3d::load(
+        scope,
+        ConvSpec {
+            stride,
+            tf32: true,
+            channels_last,
+            ..ConvSpec::new(from, to, [kernel; 3])
+        },
     )?)
 }
 
@@ -985,10 +960,7 @@ impl VideoEncoder {
                 "the video encoder's normalization epsilon is {epsilon}"
             )));
         }
-        let reflect = matches!(
-            config.spatial_padding_mode,
-            crate::config::SpatialPadding::Reflect
-        );
+        let padding = config.spatial_padding_mode;
         // A normalized convolution reads its affine parameters from `norm` and its filter from `conv`.
         let normalized = |loader: &mut WeightLoader,
                           norm_name: &str,
@@ -1011,7 +983,7 @@ impl VideoEncoder {
                         top: 1,
                         left: 1,
                         front: 2,
-                        reflect,
+                        padding,
                     },
                 )?,
                 conv: convolution(
@@ -1120,9 +1092,10 @@ impl VideoEncoder {
         let normalize = Conv3d::new(
             constants.constant_f32("weight", &[latent, latent, 1, 1, 1], &scale)?,
             Some(constants.constant_f32("bias", &[latent], &shift)?),
-            geometry(1, [1; 3])?,
-            true,
-            false,
+            ConvSpec {
+                tf32: true,
+                ..ConvSpec::new(stack.latent_channels, stack.latent_channels, [1; 3])
+            },
         )?;
         Ok(Self {
             stack,
@@ -1132,7 +1105,7 @@ impl VideoEncoder {
             moments,
             normalize,
             sampler: Posterior::new(),
-            reflect,
+            padding,
         })
     }
 }
@@ -1493,7 +1466,13 @@ impl VideoEncoder {
         let set = scratch.of(raster)?;
 
         // The input convolution reads padded pixels; it has no normalization of its own.
-        FramePad::new(self.reflect).forward(f, pixels, set.padded, 1, 1, 2)?;
+        CausalPad {
+            top: 1,
+            left: 1,
+            front: 2,
+            padding: self.padding,
+        }
+        .forward(f, pixels, set.padded)?;
         self.input.forward(f, set.padded, set.stream)?;
 
         // A level's blocks alternate between its own pair of buffers, and the level's input is a third
@@ -1516,7 +1495,15 @@ impl VideoEncoder {
                         "level {index} downsamples without the buffers for it"
                     )));
                 };
-                FramePad::new(self.reflect).forward(f, source, pad, 0, 0, 2)?;
+                // The strided downsampler pads only after the source (its view is one row and
+                // one column larger), and two zero frames in front.
+                CausalPad {
+                    top: 0,
+                    left: 0,
+                    front: 2,
+                    padding: self.padding,
+                }
+                .forward(f, source, pad)?;
                 downsample.forward(f, pad, strided)?;
                 source = strided;
             }
@@ -1874,8 +1861,10 @@ impl AudioEncoder {
         let mut root = root.pinned(DType::F32);
         let mut network = root.scope("encoder.block");
         let mut width = config.encoder_dim;
-        let (weight, bias) = folded(&mut network.scope("0"), Some(u64::from(width)))?;
-        let input = Conv1d::new(weight, bias, crate::audio_vae::geometry(7, 1, 3)?, false)?;
+        let input = Conv1d::load(
+            &mut network.scope("0"),
+            normalized(1, width, 7, 3, 1, Bias::Present),
+        )?;
 
         let mut stages = Vec::with_capacity(config.encoder_rates.len());
         for (index, rate) in config.encoder_rates.iter().enumerate() {
@@ -1894,16 +1883,14 @@ impl AudioEncoder {
                 // A residual unit's `block` is its Snake (0), the dilated convolution (1), a second
                 // Snake (2) and the pointwise convolution (3).
                 let mut module = stage.scope(format!("{unit}.block"));
-                let (weight, bias) = folded(&mut module.scope("1"), Some(u64::from(inner)))?;
-                let first = Conv1d::new(
-                    weight,
-                    bias,
-                    crate::audio_vae::dilated_geometry(7, 1, 3 * dilation, dilation)?,
-                    false,
+                let first = Conv1d::load(
+                    &mut module.scope("1"),
+                    normalized(inner, inner, 7, 3 * dilation, dilation, Bias::Present),
                 )?;
-                let (weight, bias) = folded(&mut module.scope("3"), Some(u64::from(inner)))?;
-                let second =
-                    Conv1d::new(weight, bias, crate::audio_vae::geometry(1, 1, 0)?, false)?;
+                let second = Conv1d::load(
+                    &mut module.scope("3"),
+                    normalized(inner, inner, 1, 0, 1, Bias::Present),
+                )?;
                 units.push(EncoderUnit {
                     convs: [first, second],
                     snakes: [Snake::new(u64::from(inner))?, Snake::new(u64::from(inner))?],
@@ -1915,12 +1902,12 @@ impl AudioEncoder {
             }
             let snake = Snake::new(u64::from(inner))?;
             let alpha = stage.scope("3").tensor("alpha", &[u64::from(inner)])?;
-            let (weight, bias) = folded(&mut stage.scope("4"), Some(u64::from(width)))?;
-            let widen = Conv1d::new(
-                weight,
-                bias,
-                crate::audio_vae::geometry(2 * rate, *rate, rate.div_ceil(2))?,
-                false,
+            let widen = Conv1d::load(
+                &mut stage.scope("4"),
+                ConvSpec {
+                    stride: [*rate],
+                    ..normalized(inner, width, 2 * rate, rate.div_ceil(2), 1, Bias::Present)
+                },
             )?;
             stages.push(EncoderStage {
                 inner,
@@ -1940,11 +1927,10 @@ impl AudioEncoder {
             .tensor("alpha", &[u64::from(width)])?;
         // The network's last convolution is three wide, not seven: the reference's `Conv1d(width,
         // latent_dim, 3, padding=1)`.
-        let (weight, bias) = folded(
+        let output = Conv1d::load(
             &mut network.scope(stages_end + 2),
-            Some(u64::from(config.latent_dim)),
+            normalized(width, config.latent_dim, 3, 1, 1, Bias::Present),
         )?;
-        let output = Conv1d::new(weight, bias, crate::audio_vae::geometry(3, 1, 1)?, false)?;
 
         let projection = Projection::load(config, &mut root.scope("pre_block"), frames)?;
         let channels = u64::from(config.latent_channels);
@@ -1952,12 +1938,9 @@ impl AudioEncoder {
         // checkpoint stores a three-dimensional filter `[out, in, kernel]` and not a matrix: a kernel
         // of one makes the two the same arithmetic but not the same rank, and `Conv1d::new` refuses a
         // filter that is not 3-d.
-        let mut mean = root.scope("mean_proj");
-        let mean = Conv1d::new(
-            mean.tensor("weight", &[channels, channels, 1])?,
-            Some(mean.tensor("bias", &[channels])?),
-            crate::audio_vae::geometry(1, 1, 0)?,
-            false,
+        let mean = Conv1d::load(
+            &mut root.scope("mean_proj"),
+            ConvSpec::new(config.latent_channels, config.latent_channels, [1]),
         )?;
         // The latent space's affine: the config states its statistics, not a tensor for them.
         let (scale, shift) = normalize_tables(&config.latents_mean, &config.latents_std)?;
@@ -1965,8 +1948,7 @@ impl AudioEncoder {
         let normalize = Conv1d::new(
             constants.constant_f32("weight", &[channels, channels, 1], &scale)?,
             Some(constants.constant_f32("bias", &[channels], &shift)?),
-            crate::audio_vae::geometry(1, 1, 0)?,
-            false,
+            ConvSpec::new(config.latent_channels, config.latent_channels, [1]),
         )?;
         Ok(Self {
             config: config.clone(),

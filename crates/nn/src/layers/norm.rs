@@ -33,6 +33,7 @@ use ops::residual::{self, ScaledResidualLayerNorm, ScaledResidualRmsNorm, Weight
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
+use crate::layers::CausalPad;
 use crate::layers::launch::{PDL, row_tile};
 use crate::weights::{Scope, Weight};
 
@@ -581,23 +582,6 @@ impl LayerNorm {
     }
 }
 
-/// The causal frame a [`GroupNorm`] writes its activated rows into: the padding before the source
-/// on each axis, and whether the spatial border mirrors (`reflect`) or replicates the edge.
-///
-/// The output view's own extents give the padding after the source; the frames in front are zeros,
-/// so no output frame of the convolution that reads the frame depends on a later input frame.
-#[derive(Clone, Copy, Debug)]
-pub struct CausalPad {
-    /// Rows before the source.
-    pub top: u64,
-    /// Columns before the source.
-    pub left: u64,
-    /// Zero frames before the source.
-    pub front: u64,
-    /// Mirror the edge rows and columns rather than replicate them.
-    pub reflect: bool,
-}
-
 /// Group normalization of a video frame's channel groups, with the frame's SiLU activation and its
 /// causal pad fused into the store.
 ///
@@ -737,10 +721,10 @@ impl GroupNorm {
                 bias: self.bias.as_ref().map(Weight::view),
                 out,
                 groups: u64::from(self.groups),
-                top: self.pad.top,
-                left: self.pad.left,
-                front: self.pad.front,
-                reflect: self.pad.reflect,
+                top: u64::from(self.pad.top),
+                left: u64::from(self.pad.left),
+                front: u64::from(self.pad.front),
+                reflect: self.pad.reflect(),
             },
         )
     }

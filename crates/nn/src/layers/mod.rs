@@ -24,7 +24,6 @@ mod audio;
 mod conv;
 mod cross_fade;
 mod embedding;
-mod frame;
 mod head;
 mod indexed;
 mod layout;
@@ -52,10 +51,9 @@ pub use attention::{
     DenseAttention, DenseSpec, PagedAttention, PagedSpec, TRTLLM_WORKSPACE_BYTES, Varlen,
 };
 pub use audio::AudioActivation;
-pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
+pub use conv::{CausalPad, Conv1d, Conv3d, ConvSpec, ConvTranspose1d, Padding};
 pub use cross_fade::CrossFade;
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
-pub use frame::FramePad;
 pub use head::ParallelLMHead;
 pub use indexed::StepIndexed;
 pub use layout::{Access, Copy, Patchify};
@@ -65,7 +63,7 @@ pub use linear::{
 };
 pub use moe::{ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
 pub use noise::{Key as NoiseKey, Noise};
-pub use norm::{CausalPad, Epilogue, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNorm};
+pub use norm::{Epilogue, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNorm};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use pcm::PcmInterleave;

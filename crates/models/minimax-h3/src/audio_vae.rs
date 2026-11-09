@@ -23,13 +23,11 @@
 
 use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{
-    AudioActivation, Axpby, Cast, ChannelAffine, Conv1d, ConvGeometry, ConvTranspose1d,
+    AudioActivation, Axpby, Bias, Cast, ChannelAffine, Conv1d, ConvSpec, ConvTranspose1d,
     PcmInterleave, Residual,
 };
 use nn::weights::Scope;
-use nn::{
-    DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, Weight, WeightLoader,
-};
+use nn::{DType, DecodedMedia, Decoder, Forward, Shape, StateTable, TensorView, WeightLoader};
 
 /// One upsampling stage of the decoder.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -367,43 +365,42 @@ impl BigVgan {
         // The decoder's input is a plain 1x1 convolution in the reference - `nn.Conv1d(
         // latent_channels, latent_dim, 1)` outside `_normalized` - and the export holds its weight
         // as a **3-d filter** `[latent_dim, latent_channels, 1]`, the rank `Conv1d::new` requires.
-        let input = {
-            let mut input = root.scope("dec_in_proj");
-            Conv1d::new(
-                input.tensor(
-                    "weight",
-                    &[
-                        u64::from(config.latent_dim),
-                        u64::from(config.latent_channels),
-                        1,
-                    ],
-                )?,
-                Some(input.tensor("bias", &[u64::from(config.latent_dim)])?),
-                geometry(1, 1, 0)?,
-                false,
-            )?
-        };
-        let mut decoder = root.scope("decoder");
-        let (weight, bias) = folded(
-            &mut decoder.scope("conv_pre"),
-            Some(u64::from(config.decoder_dim)),
+        let input = Conv1d::load(
+            &mut root.scope("dec_in_proj"),
+            ConvSpec::new(config.latent_channels, config.latent_dim, [1]),
         )?;
-        let pre = Conv1d::new(weight, bias, geometry(7, 1, 3)?, false)?;
+        let mut decoder = root.scope("decoder");
+        let pre = Conv1d::load(
+            &mut decoder.scope("conv_pre"),
+            normalized(
+                config.latent_dim,
+                config.decoder_dim,
+                7,
+                3,
+                1,
+                Bias::Present,
+            ),
+        )?;
         let stages = stages(config)?;
         let blocks = blocks(config)?;
         let mut built = Vec::with_capacity(stages.len());
         for (index, stage) in stages.iter().enumerate() {
-            let (weight, bias) = folded(
+            let upsample = ConvTranspose1d::load(
                 &mut decoder.scope(format!("ups.{index}.0")),
-                Some(u64::from(stage.channels_out)),
+                ConvSpec {
+                    stride: [stage.rate],
+                    ..normalized(
+                        stage.channels_in,
+                        stage.channels_out,
+                        stage.kernel,
+                        stage.padding,
+                        1,
+                        Bias::Present,
+                    )
+                },
             )?;
-            let upsample = ConvTranspose1d::new(
-                weight,
-                bias,
-                geometry(stage.kernel, stage.rate, stage.padding)?,
-                false,
-            )?;
-            let width = u64::from(stage.channels_out);
+            let channels = stage.channels_out;
+            let width = u64::from(channels);
             let mut stage_blocks = Vec::with_capacity(BLOCKS_PER_STAGE);
             for block in blocks.iter().filter(|block| block.stage == index) {
                 let mut module = decoder.scope(format!(
@@ -412,25 +409,31 @@ impl BigVgan {
                 ));
                 let mut steps = Vec::with_capacity(block.steps.len());
                 for (step, dilation) in block.steps.iter().enumerate() {
-                    let (weight, bias) =
-                        folded(&mut module.scope(format!("convs1.{step}")), Some(width))?;
-                    let first = Conv1d::new(
-                        weight,
-                        bias,
-                        dilated_geometry(block.kernel, 1, dilation.padding, dilation.dilation)?,
-                        false,
+                    let first = Conv1d::load(
+                        &mut module.scope(format!("convs1.{step}")),
+                        normalized(
+                            channels,
+                            channels,
+                            block.kernel,
+                            dilation.padding,
+                            dilation.dilation,
+                            Bias::Present,
+                        ),
                     )?;
                     let first_activation = activation(
                         &mut module.scope(format!("activations.{}", 2 * step)),
                         width,
                     )?;
-                    let (weight, bias) =
-                        folded(&mut module.scope(format!("convs2.{step}")), Some(width))?;
-                    let second = Conv1d::new(
-                        weight,
-                        bias,
-                        geometry(block.kernel, 1, Step::padding_plain(block.kernel))?,
-                        false,
+                    let second = Conv1d::load(
+                        &mut module.scope(format!("convs2.{step}")),
+                        normalized(
+                            channels,
+                            channels,
+                            block.kernel,
+                            Step::padding_plain(block.kernel),
+                            1,
+                            Bias::Present,
+                        ),
                     )?;
                     let second_activation = activation(
                         &mut module.scope(format!("activations.{}", 2 * step + 1)),
@@ -461,8 +464,10 @@ impl BigVgan {
             &mut decoder.scope("activation_post"),
             u64::from(last.channels_out),
         )?;
-        let (weight, _) = folded(&mut decoder.scope("conv_post"), None)?;
-        let output = Conv1d::new(weight, None, geometry(7, 1, 3)?, false)?;
+        let output = Conv1d::load(
+            &mut decoder.scope("conv_post"),
+            normalized(last.channels_out, 1, 7, 3, 1, Bias::Absent),
+        )?;
         Ok(Self {
             config: config.clone(),
             denormalize,
@@ -753,31 +758,6 @@ impl Decoder for BigVgan {
     }
 }
 
-/// The 1-d convolution geometry: `kernel` taps, `stride`, `padding`, no dilation of its own, one group.
-pub(crate) fn geometry(kernel: u32, stride: u32, padding: u32) -> Result<ConvGeometry> {
-    dilated_geometry(kernel, stride, padding, 1)
-}
-
-/// A one-dimensional convolution's geometry with a dilation, which the encoder's residual units use at
-/// `1`, `3` and `9`.
-pub(crate) fn dilated_geometry(
-    kernel: u32,
-    stride: u32,
-    padding: u32,
-    dilation: u32,
-) -> Result<ConvGeometry> {
-    // The operator states a 1-d convolution's length as the first spatial axis, `[length, 1, 1]`, so
-    // the geometry's other two axes are the identity: a filter of one, no padding.
-    Ok(ConvGeometry::new(
-        1,
-        [kernel, 1, 1],
-        [stride, 1, 1],
-        [padding, 0, 0],
-        [dilation, 1, 1],
-        1,
-    )?)
-}
-
 /// A view of `[channels, rows, columns]` as `[rows · channels, columns]`, the form the in-place
 /// accumulation takes.
 fn rows(view: TensorView) -> Result<TensorView> {
@@ -788,21 +768,23 @@ fn rows(view: TensorView) -> Result<TensorView> {
     Ok(view.reshape(Shape::new(&[view.shape.numel() / columns, columns])))
 }
 
-/// The weight-normalized convolution module at `scope`: its `weight`, folded from the stored
-/// `weight_v`/`weight_g` pair, and its `[bias]` of `bias` channels when it has one.
-///
-/// # Errors
-///
-/// When the checkpoint lacks a tensor or holds another extent.
-pub(crate) fn folded(
-    scope: &mut Scope<'_, '_>,
-    bias: Option<u64>,
-) -> Result<(Weight, Option<Weight>)> {
-    let weight = scope.weight_norm("weight")?;
-    let bias = bias
-        .map(|channels| scope.tensor("bias", &[channels]))
-        .transpose()?;
-    Ok((weight, bias))
+/// A weight-normalized 1-d convolution of `from` to `to` channels with `kernel` taps, `padding`
+/// zeros each side and `dilation`, its bias as `bias` states: the BigVGAN body's convolution form.
+pub(crate) fn normalized(
+    from: u32,
+    to: u32,
+    kernel: u32,
+    padding: u32,
+    dilation: u32,
+    bias: Bias,
+) -> ConvSpec<1> {
+    ConvSpec {
+        padding: [padding],
+        dilation: [dilation],
+        bias,
+        weight_norm: true,
+        ..ConvSpec::new(from, to, [kernel])
+    }
 }
 
 /// The alias-free activation module at `scope`: its two log-space frequencies (`act.alpha`,

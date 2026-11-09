@@ -44,7 +44,7 @@ pub use denoiser::{
     TransformerConfig,
 };
 pub use text::{PixelConfig, RETAINED_LAYERS, TextEncoderConfig, VisionConfig};
-pub use video_vae::{SpatialPadding, VideoVaeConfig};
+pub use video_vae::VideoVaeConfig;
 
 use crate::checkpoint::{ContractSchedule, Dit, Layout, Sidecars};
 use crate::encoding::Clip;
