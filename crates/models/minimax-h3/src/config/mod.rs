@@ -99,7 +99,7 @@ pub struct Config {
     /// The Qwen3-VL text encoder that conditions a request.
     pub text_encoder: qwen3::VlConfig,
     /// The pixel normalization the text encoder's processor applies.
-    pub pixels: qwen3::processor::PixelConfig,
+    pub pixels: nn::capability::PixelNorm,
     /// Each DiT partition the checkpoint holds, by network.
     pub denoisers: BTreeMap<Dit, DenoiserConfig>,
     /// The video VAE: the decoder every task uses and the encoder `ref2va` uses.
@@ -132,7 +132,7 @@ impl Config {
     /// below sees a value it cannot use.
     pub fn normalize(layout: &Layout, sidecars: &Sidecars) -> Result<Self> {
         let text_encoder = text::text_encoder(&sidecars.text_encoder)?;
-        let pixels = qwen3::processor::PixelConfig::parse(&Fields::of(
+        let pixels = qwen3::processor::pixel_norm(&Fields::of(
             "processor/preprocessor_config.json",
             &sidecars.processor,
         )?)?;

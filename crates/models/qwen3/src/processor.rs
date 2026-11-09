@@ -14,6 +14,7 @@
 //! lands on the same side.
 
 use nn::DType;
+use nn::capability::PixelNorm;
 use nn::config::Fields;
 use proto::video::VisionGrid;
 use serde::{Deserialize, Serialize};
@@ -310,36 +311,24 @@ pub fn sample_frames(
     Ok((indices, blocks))
 }
 
-/// How a processor normalizes a pixel before the vision tower patches it.
+/// The pixel normalization a processor's `image_mean` and `image_std` state: each RGB channel maps
+/// `x` in `[0, 255]` to `(x / 255 - mean) / std` ([`nn::capability::PixelNorm`]).
 ///
-/// Each RGB channel maps `x` in `[0, 255]` to `(x / 255 - mean) / std`.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct PixelConfig {
-    /// Per-channel means.
-    pub mean: [f32; 3],
-    /// Per-channel standard deviations.
-    pub std: [f32; 3],
-}
-
-impl PixelConfig {
-    /// Read a processor's `image_mean` and `image_std`.
-    ///
-    /// # Errors
-    ///
-    /// Fields of the wrong type or length, or a deviation that is not positive.
-    pub fn parse(values: &Fields<'_>) -> Result<Self> {
-        let owner = values.owner();
-        let mean = values.fixed_numbers("image_mean", 3)?;
-        let std = values.fixed_numbers("image_std", 3)?;
-        let mean: [f32; 3] = [mean[0] as f32, mean[1] as f32, mean[2] as f32];
-        let std: [f32; 3] = [std[0] as f32, std[1] as f32, std[2] as f32];
-        if std.iter().any(|value| *value <= 0.0) {
-            return Err(Error::Config(format!(
-                "{owner}.image_std must be positive, got {std:?}"
-            )));
-        }
-        Ok(Self { mean, std })
+/// # Errors
+///
+/// Fields of the wrong type or length, or a deviation that is not positive.
+pub fn pixel_norm(values: &Fields<'_>) -> Result<PixelNorm> {
+    let owner = values.owner();
+    let mean = values.fixed_numbers("image_mean", 3)?;
+    let std = values.fixed_numbers("image_std", 3)?;
+    let mean: [f32; 3] = [mean[0] as f32, mean[1] as f32, mean[2] as f32];
+    let std: [f32; 3] = [std[0] as f32, std[1] as f32, std[2] as f32];
+    if std.iter().any(|value| *value <= 0.0) {
+        return Err(Error::Config(format!(
+            "{owner}.image_std must be positive, got {std:?}"
+        )));
     }
+    Ok(PixelNorm { mean, std })
 }
 
 /// How the processor lays a clip's pixels out as the vision tower's patch rows, which the runtime
@@ -352,7 +341,7 @@ impl PixelConfig {
 /// clip's last frame: an image is one frame repeated.
 pub fn patch_format(
     vision: &VisionConfig,
-    pixels: PixelConfig,
+    norm: PixelNorm,
     dtype: DType,
 ) -> nn::capability::PatchFormat {
     nn::capability::PatchFormat {
@@ -360,10 +349,7 @@ pub fn patch_format(
         temporal: vision.temporal_patch_size,
         merge: vision.spatial_merge_size,
         channels: vision.in_channels,
-        norm: nn::capability::PixelNorm {
-            mean: pixels.mean,
-            std: pixels.std,
-        },
+        norm,
         dtype,
     }
 }
@@ -454,10 +440,9 @@ mod tests {
     fn a_processor_states_three_positive_deviations() {
         let fields =
             serde_json::json!({"image_mean": [0.5, 0.5, 0.5], "image_std": [0.5, 0.0, 0.5]});
-        let error = PixelConfig::parse(
-            &Fields::of("preprocessor_config.json", &fields).expect("an object"),
-        )
-        .expect_err("a zero deviation is refused");
+        let error =
+            pixel_norm(&Fields::of("preprocessor_config.json", &fields).expect("an object"))
+                .expect_err("a zero deviation is refused");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("image_std")),
             "{error}"
