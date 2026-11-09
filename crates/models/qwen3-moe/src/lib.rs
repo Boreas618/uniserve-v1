@@ -29,6 +29,10 @@ pub mod reference;
 pub mod representation;
 pub mod weights;
 
+/// The Hugging Face repository this crate's examples and tests read when none is named, as vLLM's
+/// model registry names one example checkpoint per architecture.
+pub const REPO_ID: &str = "Qwen/Qwen3-30B-A3B";
+
 pub use config::{Activation, Config, RopeScaling, YaRn};
 pub use load::load;
 pub use model::{LoadOptions, Plan, Qwen3Moe, Run, Substage};

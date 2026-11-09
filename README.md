@@ -40,10 +40,9 @@ For RDMA transfers between hosts, install the pinned UCX and NIXL builds describ
 Download the checkpoint and serve it on four GPUs:
 
 ```bash
-export H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
-hf download FastVideo/FastVideo-FastH3-8-Step-V2 --local-dir "$H3_MODEL"
+hf download FastVideo/FastVideo-FastH3-8-Step-V2
 
-uniserve serve "$H3_MODEL" \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 \
   --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 \
   --host 0.0.0.0 \
@@ -106,7 +105,7 @@ The metrics endpoint publishes scheduler, worker, request and HTTP metrics in on
 UniServe's options form one tree, following TensorRT-LLM's serving configuration: the options most deployments state sit at its top level, and the rest in `*_config` tables, one per part of the system. `uniserve serve` reads the tree from a `--config` TOML file, from flags for the most common options, and from repeatable `--set PATH=VALUE` assignments that reach any option by its path, each overriding the last:
 
 ```bash
-uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 --max-running-requests 2 \
   --set quantization.mode=balanced
 ```
@@ -142,7 +141,6 @@ The serving evaluator runs HTTP workloads against a server, validates every resp
 
 ```bash
 uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
-export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml plan gb200-4-bf16
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
 ```
@@ -168,10 +166,10 @@ just test-python-fast
 just test-python-gpu
 ```
 
-`test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start a real server on a GPU, and `test-python-gpu` runs them with `UNISERVE_RUN_GPU_E2E=1`. The FastH3 GPU test loads a complete checkpoint on four GPUs:
+`test-python-fast` runs without a CUDA device. The HTTP tests under `tests/python/e2e` start a real server on a GPU, and `test-python-gpu` runs them with `UNISERVE_RUN_GPU_E2E=1`. They name every model by its Hugging Face repository and read it from the local Hub cache that `HF_HOME` locates, as the profiles do; `UNISERVE_BINARY` names the binary they serve with. The FastH3 GPU test loads a complete checkpoint on four GPUs:
 
 ```bash
-UNISERVE_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2 \
+UNISERVE_BINARY=$PWD/target/debug/uniserve \
   .venv/bin/python -m pytest tests/python/e2e/test_h3_parallel_http.py
 ```
 

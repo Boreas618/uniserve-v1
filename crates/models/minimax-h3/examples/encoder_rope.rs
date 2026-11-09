@@ -14,11 +14,11 @@
 //! own band - so its coordinates agreeing does not make its factors agree.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example encoder_rope -- --root $UNISERVE_H3_MODEL \
+//! cargo run -q -p minimax-h3 --example encoder_rope -- --root MiniMaxAI/MiniMax-H3 \
 //!     --prompt-ids 32,2518,38835,8473,3941,264,89773,2070,518,38393,11,8413,3100,11,6884 \
 //!     --out artifacts/h3-stage4/rope
 //! python crates/models/minimax-h3/tools/compare_rope_factors.py \
-//!     --case artifacts/h3-stage4/rope --checkpoint $UNISERVE_H3_MODEL
+//!     --case artifacts/h3-stage4/rope --checkpoint MiniMaxAI/MiniMax-H3
 //! ```
 //!
 //! The first writes `positions.h3t` (`[3, tokens]` int32), `cosine.h3t` and `sine.h3t`
@@ -49,7 +49,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
-            "--root" => root = Some(PathBuf::from(value()?)),
+            "--root" => root = Some(nn::hub::model_dir(&value()?)?),
             "--out" => out = PathBuf::from(value()?),
             // A prompt with one image block states its grid here; the ids must carry that block's
             // placeholders, and `rope_index` refuses a run whose counts disagree. Without a grid the

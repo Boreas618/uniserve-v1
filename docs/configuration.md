@@ -13,7 +13,7 @@ A UniServe server is configured by one tree of serving options and, for a parall
 Options none of them states keep their defaults. `GET /admin/config` returns the resolved non-default options as reloadable TOML. Reading it restores defaults without treating options belonging to other model families or rank-assignment modes as explicitly configured.
 
 ```bash
-uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
+uniserve serve FastVideo/FastVideo-FastH3-8-Step-V2 --worker-groups configs/minimax_h3/ulysses4.toml \
   --max-running-requests 2 \
   --set video_config.text_capacities=1024,10240
 

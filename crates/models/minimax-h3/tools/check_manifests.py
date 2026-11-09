@@ -4,8 +4,8 @@
     .venv/bin/python crates/models/minimax-h3/tools/check_manifests.py \
         [--root <checkpoint>] [--kernels <package root>]
 
-`--root` defaults to the checkpoint `UNISERVE_H3_MODEL` names, and `--kernels` to this repository's
-`crates/ops/kernels`.
+`--root` is a directory or a repository id, read from the local Hub cache; it defaults to
+`MiniMaxAI/MiniMax-H3`, and `--kernels` to this repository's `crates/ops/kernels`.
 
 A descriptor outside a package's `dimensions` is a key with no compiled program: `_compile.py`
 accepts exactly the range the manifest declares, and `Generation::kernel` answers
@@ -36,13 +36,26 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import pathlib
 import re
 import sys
 
 #: This repository, found from this file's own place in it.
 REPOSITORY = pathlib.Path(__file__).resolve().parents[4]
+
+
+def model_dir(model: str) -> pathlib.Path:
+    """A directory, or the local Hub cache's snapshot of the repository `model` names.
+
+    A repository id may carry a revision after an `@`. Nothing is downloaded.
+    """
+    path = pathlib.Path(model)
+    if path.is_dir():
+        return path
+    from huggingface_hub import snapshot_download
+
+    repo_id, _, revision = model.partition("@")
+    return pathlib.Path(snapshot_download(repo_id, revision=revision or None, local_files_only=True))
 
 # One `dimensions = { field = ["value", ...], ... }` line of a package manifest.
 DIMENSIONS = re.compile(r"^dimensions\s*=\s*\{(.*)\}\s*$")
@@ -171,7 +184,7 @@ def expectations(config: dict, degrees: list[int]) -> list[tuple[str, str, str, 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default=os.environ.get("UNISERVE_H3_MODEL"))
+    parser.add_argument("--root", default="MiniMaxAI/MiniMax-H3")
     parser.add_argument("--kernels", default=REPOSITORY / "crates/ops/kernels")
     parser.add_argument(
         "--ulysses",
@@ -181,9 +194,7 @@ def main() -> int:
     arguments = parser.parse_args()
     degrees = [int(value) for value in arguments.ulysses.split(",") if value.strip()]
 
-    if arguments.root is None:
-        parser.error("name the checkpoint with --root or UNISERVE_H3_MODEL")
-    root = pathlib.Path(arguments.root)
+    root = model_dir(arguments.root)
     kernels = pathlib.Path(arguments.kernels)
     configs = sorted(root.glob("transformer*/config.json"))
     if not configs:

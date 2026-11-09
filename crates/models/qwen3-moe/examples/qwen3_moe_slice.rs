@@ -485,13 +485,12 @@ impl Args {
             }
         }
         if checkpoint.as_os_str().is_empty() {
-            checkpoint = std::env::var_os("UNISERVE_QWEN3_MODEL")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    eprintln!("name the checkpoint with --checkpoint or UNISERVE_QWEN3_MODEL");
-                    std::process::exit(2)
-                });
+            checkpoint = PathBuf::from(qwen3_moe::REPO_ID);
         }
+        checkpoint = nn::hub::model_dir(&checkpoint.to_string_lossy()).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(2)
+        });
         if substage.is_some() && stage != Stage::Block {
             return Err(Failure::message(
                 "--substage cuts inside one layer, so it belongs to --stage block",

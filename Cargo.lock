@@ -2591,6 +2591,7 @@ dependencies = [
 name = "nn"
 version = "2.0.0"
 dependencies = [
+ "hf-hub 0.5.0",
  "memmap2",
  "ops",
  "safetensors",

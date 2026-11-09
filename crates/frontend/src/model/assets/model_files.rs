@@ -55,6 +55,64 @@ impl ResolvedModelFiles {
     }
 }
 
+/// The local directory of the checkpoint `model_id` names, which the engine
+/// loads in place.
+///
+/// A directory is itself. A repository is the snapshot the Hub cache holds
+/// once every file the engine reads is cached: each file the repository
+/// publishes is downloaded when the cache lacks it, except weights in a
+/// serialization the loader does not read. With `HF_HUB_OFFLINE` set, it is the
+/// snapshot the cache already holds, and nothing reaches the Hub.
+///
+/// # Errors
+///
+/// Returns [`Error::Remote`] when a Hub request fails, and
+/// [`Error::Invalid`] when the cache holds no snapshot offline or the
+/// repository publishes no file.
+pub async fn checkpoint_dir(model_id: &str) -> Result<PathBuf> {
+    match ModelSource::from_model_id(model_id)? {
+        ModelSource::Local(directory) => Ok(directory),
+        ModelSource::Hub { api, repo_id } => {
+            let repo = api.model(repo_id.clone());
+            let info = repo.info().await.map_err(|error| Error::Remote {
+                model: repo_id.clone(),
+                message: format!("failed to list the repository: {}", error.as_report()),
+            })?;
+            let mut snapshot = None;
+            for name in info
+                .siblings
+                .iter()
+                .map(|sibling| sibling.rfilename.as_str())
+                .filter(|name| !unread_weights(name))
+            {
+                let path = fetch_file(&repo, &repo_id, name).await?;
+                // A file sits as many levels below the snapshot as its name has components.
+                snapshot = snapshot.or_else(|| {
+                    path.ancestors()
+                        .nth(Path::new(name).components().count())
+                        .map(Path::to_path_buf)
+                });
+            }
+            snapshot.ok_or_else(|| {
+                Error::invalid(format!("the Hub repository {repo_id} publishes no files"))
+            })
+        }
+    }
+}
+
+/// Whether `name` holds weights in a serialization the loader does not read:
+/// it reads safetensors alone, and a repository may publish the same weights
+/// again for other frameworks.
+fn unread_weights(name: &str) -> bool {
+    Path::new(name).extension().is_some_and(|extension| {
+        [
+            "bin", "pt", "pth", "ckpt", "h5", "msgpack", "onnx", "gguf", "pb", "ot",
+        ]
+        .iter()
+        .any(|unread| extension == *unread)
+    })
+}
+
 /// Where a configured model id's files are read from.
 pub(crate) enum ModelSource {
     /// An existing local checkpoint directory, read in place.
@@ -74,11 +132,29 @@ impl ModelSource {
     ///
     /// An existing directory is local; any other id names a Hub repository,
     /// reached with a client and cache configured from the environment
-    /// (`HF_HOME`, `HF_ENDPOINT` and `HF_TOKEN`).
+    /// (`HF_HOME`, `HF_ENDPOINT` and `HF_TOKEN`). With `HF_HUB_OFFLINE` set, a
+    /// repository is the snapshot the cache holds at `main`, read in place, and
+    /// nothing reaches the Hub.
     pub(crate) fn from_model_id(model_id: &str) -> Result<Self> {
         let local = Path::new(model_id);
         if local.is_dir() {
             return Ok(Self::Local(local.to_path_buf()));
+        }
+        if hub_offline() {
+            let cache = Cache::from_env();
+            let repo = cache.model(model_id.to_owned());
+            return ["config.json", "model_index.json"]
+                .iter()
+                .find_map(|marker| repo.get(marker))
+                .and_then(|file| file.parent().map(Path::to_path_buf))
+                .map(Self::Local)
+                .ok_or_else(|| {
+                    Error::invalid(format!(
+                        "HF_HUB_OFFLINE is set and the Hub cache at {} holds no snapshot of \
+                         {model_id}",
+                        cache.path().display()
+                    ))
+                });
         }
         Ok(Self::Hub {
             api: build_api(model_id)?,
@@ -262,6 +338,17 @@ fn build_api(model_id: &str) -> Result<Api> {
     builder.build().map_err(|error| Error::Remote {
         model: model_id.to_owned(),
         message: error.to_report_string(),
+    })
+}
+
+/// Whether `HF_HUB_OFFLINE` asks for the cache alone, read as `huggingface_hub`
+/// reads it.
+fn hub_offline() -> bool {
+    std::env::var("HF_HUB_OFFLINE").is_ok_and(|value| {
+        matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
     })
 }
 

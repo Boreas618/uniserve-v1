@@ -18,11 +18,12 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import httpx
-import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_MOE,
     find_free_port,
     gpu_device,
+    model_dir,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -41,10 +42,8 @@ PROMPT = (
 
 
 def checkpoint() -> str:
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
-    return checkpoint
+    """The Qwen3-MoE checkpoint, from the local Hub cache."""
+    return str(model_dir(QWEN3_MOE))
 
 
 def stop_storage_server(socket: Path) -> None:

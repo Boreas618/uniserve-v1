@@ -15,7 +15,7 @@ case; this reads the candidate's case and writes the reference's rows for it, so
 about arithmetic rather than about which side built the prompt.
 
     python crates/models/minimax-h3/tools/dump_encoder.py --probe prompt_hidden \
-        --stack artifacts/h3-stage4/text_encoder --checkpoint $UNISERVE_H3_MODEL \
+        --stack artifacts/h3-stage4/text_encoder --checkpoint <checkpoint directory> \
         --out artifacts/h3-stage4-ref --device cuda
 
 One file per invocation, so a failure costs one tensor:

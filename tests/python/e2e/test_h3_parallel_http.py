@@ -17,7 +17,9 @@ import torch
 from transformers import AutoTokenizer
 
 from tests.python.e2e.http_helpers import (
+    FAST_H3,
     find_free_port,
+    model_dir,
     require_uniserve_binary,
     second_host,
     server_process,
@@ -190,12 +192,7 @@ def test_component_bindings_release_cancelled_requests(
     grouping: str,
     max_running_requests: int,
 ) -> None:
-    model_value = os.environ.get("UNISERVE_H3_MODEL")
-    if not model_value or not Path(model_value).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/minimax_h3/minimax_h3.md lists them"
-        )
+    model_value = str(model_dir(FAST_H3))
     # A layout that holds the whole denoiser on one device cannot also hold a
     # 15-second activation working set: the single-device warmup exhausts a
     # 184 GiB device with 178 GB allocated. That layout is qualified at a
@@ -518,12 +515,7 @@ def test_video_jobs_retain_content_and_cancel_active_work(
     """
     import time
 
-    model = os.environ.get("UNISERVE_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/minimax_h3/minimax_h3.md lists them"
-        )
+    model = str(model_dir(FAST_H3))
     inference = json.loads(
         (Path(model) / "fastvideo_inference.json").read_text()
     )

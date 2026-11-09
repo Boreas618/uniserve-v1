@@ -1,6 +1,6 @@
 //! The programs this Qwen3-MoE deployment compiles, printed as fixture lines.
 //!
-//!     cargo run -p qwen3-moe --example keys -- [--checkpoint $UNISERVE_QWEN3_MODEL] \
+//!     cargo run -p qwen3-moe --example keys -- [--checkpoint Qwen/Qwen3-30B-A3B] \
 //!         [--cache bf16]
 //!
 //! Each line is `<operator>\t<key>`, the form `tools/build_store.py` consumes, so a key file is
@@ -147,13 +147,12 @@ fn main() -> ExitCode {
         }
     }
     if checkpoint.as_os_str().is_empty() {
-        checkpoint = std::env::var_os("UNISERVE_QWEN3_MODEL")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                eprintln!("name the checkpoint with --checkpoint or UNISERVE_QWEN3_MODEL");
-                std::process::exit(2)
-            });
+        checkpoint = PathBuf::from(qwen3_moe::REPO_ID);
     }
+    checkpoint = nn::hub::model_dir(&checkpoint.to_string_lossy()).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2)
+    });
 
     match run(&checkpoint, &deployment) {
         Ok(()) => ExitCode::SUCCESS,

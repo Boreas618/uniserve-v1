@@ -1,7 +1,7 @@
 """Generation and cancellation through an independently launched AFD server.
 
-Set UNISERVE_AFD_URL and UNISERVE_AFD_MODEL for the running deployment. The
-deployment fixes its role layout, precision and graph policy before these
+Set UNISERVE_AFD_URL to the running deployment; it states the model it serves.
+The deployment fixes its role layout, precision and graph policy before these
 client-side checks; tests never change them or start another measurement.
 """
 
@@ -18,10 +18,13 @@ pytestmark = [pytest.mark.e2e, pytest.mark.gpu]
 @pytest.fixture(scope="module")
 def served():
     url = os.environ.get("UNISERVE_AFD_URL")
-    model = os.environ.get("UNISERVE_AFD_MODEL")
-    if not url or not model:
-        pytest.fail("UNISERVE_AFD_URL and UNISERVE_AFD_MODEL are required")
-    return url.rstrip("/"), model
+    if not url:
+        pytest.fail("UNISERVE_AFD_URL must name the running deployment")
+    url = url.rstrip("/")
+    # The deployment states the model it serves; the test asks rather than
+    # being told.
+    models = httpx.get(f"{url}/v1/models", timeout=30).json()["data"]
+    return url, models[0]["id"]
 
 
 def _request(model, prompt, limit=24):

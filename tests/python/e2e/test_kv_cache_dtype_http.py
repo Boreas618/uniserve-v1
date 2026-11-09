@@ -13,15 +13,16 @@ until their first difference, where each output's token is among the other's
 from __future__ import annotations
 
 import json
-import os
 from pathlib import Path
 
 import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_MOE,
     find_free_port,
     gpu_device,
+    model_dir,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -126,9 +127,7 @@ def _generate(
 
 
 def test_an_fp16_cache_serves_a_bf16_model_like_a_bf16_cache(tmp_path: Path):
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
+    checkpoint = str(model_dir(QWEN3_MOE))
 
     reference = _generate(tmp_path, checkpoint, "bfloat16-cache", [])
     converted = _generate(

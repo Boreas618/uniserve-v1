@@ -19,7 +19,8 @@ asserted on the daemon's events, never on sleeps.
 Inputs, all optional except the model, so the file skips where the fixtures do
 not exist:
 
-- ``UNISERVE_QWEN3_MOE_MODEL``: the Qwen3-MoE BF16 checkpoint.
+- The Qwen3-MoE BF16 checkpoint is the local Hub cache's snapshot of
+  ``Qwen/Qwen3-30B-A3B``.
 - ``UNISERVE_PROGRAM_REBIND_PACKAGE``: a package of an operator the slice
   launches every step, with the serving descriptor key and the same launch
   structure (a rebind swap).
@@ -57,7 +58,9 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_MOE,
     find_free_port,
+    model_dir,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -125,17 +128,8 @@ def _required(name: str) -> Path:
 
 @pytest.fixture(scope="module")
 def model() -> Path:
-    value = os.environ.get("UNISERVE_QWEN3_MOE_MODEL")
-    if not value:
-        pytest.skip(
-            "UNISERVE_QWEN3_MOE_MODEL must name the Qwen3-MoE checkpoint"
-        )
-    path = Path(value)
-    if not path.exists():
-        pytest.fail(
-            f"UNISERVE_QWEN3_MOE_MODEL names {path}, which does not exist"
-        )
-    return path
+    """The Qwen3-MoE BF16 checkpoint, from the local Hub cache."""
+    return model_dir(QWEN3_MOE)
 
 
 @pytest.fixture(scope="module")
