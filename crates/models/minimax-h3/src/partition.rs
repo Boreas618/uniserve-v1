@@ -661,19 +661,6 @@ impl Partition {
     pub const fn text_key_value_heads(&self, config: &Config) -> u32 {
         config.text_encoder.num_key_value_heads / self.tensor_parallel as u32
     }
-
-    /// The vocabulary rows one tensor-parallel rank of the text encoder holds, as the half-open
-    /// range `[first, stop)`.
-    ///
-    /// The rows are split into `tensor_parallel` contiguous shards, the last taking the remainder;
-    /// the head pads its shard to a multiple of the descriptor's row alignment, and the gathered
-    /// logits drop the padding.
-    pub fn vocabulary_shard(&self, vocab_size: u32) -> (u32, u32) {
-        let degree = self.tensor_parallel as u32;
-        let rows = vocab_size.div_ceil(degree);
-        let first = rows * self.tensor_rank as u32;
-        (first, (first + rows).min(vocab_size))
-    }
 }
 
 #[cfg(test)]
@@ -765,7 +752,6 @@ mod tests {
         assert_eq!(partition.denoiser_heads(56), 56);
         assert_eq!(partition.text_query_heads(&config), 64);
         assert_eq!(partition.text_key_value_heads(&config), 8);
-        assert_eq!(partition.vocabulary_shard(151_936), (0, 151_936));
         // One rank holds every component of a base deployment, and one denoiser: the task's. A
         // `ref2va` deployment places `TransformerRef` instead.
         assert!(partition.blocks.contains(Component::Transformer));
@@ -831,32 +817,6 @@ mod tests {
             matches!(error, Error::Config(ref problem) if problem.contains("outside")),
             "{error}"
         );
-    }
-
-    #[test]
-    fn the_vocabulary_shard_gives_the_last_rank_the_remainder() {
-        let partition = Partition {
-            ulysses_degree: 1,
-            tensor_parallel: 3,
-            tensor_rank: 2,
-            ..Partition::single()
-        };
-        assert_eq!(partition.vocabulary_shard(151_936), (101_292, 151_936));
-        let partition = Partition {
-            ulysses_degree: 1,
-            tensor_parallel: 2,
-            tensor_rank: 0,
-            ..Partition::single()
-        };
-        assert_eq!(partition.vocabulary_shard(151_936), (0, 75_968));
-        // A vocabulary the degree does not divide leaves the last shard short.
-        let partition = Partition {
-            ulysses_degree: 1,
-            tensor_parallel: 4,
-            tensor_rank: 3,
-            ..Partition::single()
-        };
-        assert_eq!(partition.vocabulary_shard(10), (9, 10));
     }
 
     #[test]

@@ -1,18 +1,22 @@
 //! The vocabulary head: project selected hidden rows onto the vocabulary.
 //!
-//! The head is a column-parallel projection across the tensor-parallel ranks: each rank holds a
-//! contiguous slice of the vocabulary rows, projects into its slice, the ranks all-gather the
-//! slices, and the padded tail the sharding added is removed. The row selection itself is the
-//! worker's: it gathers the rows whose logits the batch asks for before calling the head, so the
-//! head reads a `[rows, hidden]` view and a graph replays over a fixed row count.
+//! The head is a column-parallel projection across the tensor-parallel ranks: each rank holds its
+//! [`vocabulary_shard`] of the vocabulary rows, projects into its slice padded to a whole number
+//! of eight-row tiles, the ranks all-gather the slices, and the padding is removed. The head owns
+//! the shard rule, the padding and the buffers its projection and gather write, which it reserves
+//! from the forward's arena. The row selection itself is the worker's: it gathers the rows whose
+//! logits the batch asks for before calling the head, so the head reads a `[rows, hidden]` view and a
+//! graph replays over a fixed row count.
 
 use ops::logits::{self, GatherDescriptor, LogitsGather, UnpadDescriptor, VocabUnpad};
-use ops::{DType, TensorView};
+use ops::{DType, Shape, TensorView};
 
 use crate::error::{Error, Result};
+use crate::family::Split;
 use crate::forward::Forward;
 use crate::layers::Linear;
-use crate::weights::Weight;
+use crate::layers::embedding::{VocabParallelEmbedding, vocabulary_shard};
+use crate::weights::{Scope, Weight};
 
 /// A vocabulary-parallel output projection.
 pub struct ParallelLMHead {
@@ -24,39 +28,51 @@ pub struct ParallelLMHead {
 /// Elements one `logits_gather` / `logits_unpad` program handles.
 const BLOCK: u32 = 1024;
 
+/// The rows a shard's projection is padded to: whole eight-row tiles of the product.
+const PADDING: u32 = 8;
+
 impl ParallelLMHead {
-    /// The head whose rank holds `local` vocabulary rows starting at id `first`, padded to `padded`.
+    /// The head module at `scope`: its `weight` `[vocabulary, hidden]`, of which `split`'s rank
+    /// reads its [`vocabulary_shard`].
     ///
-    /// `padded` is the shard's width after the projection: the local vocabulary rounded up to the
-    /// matmul's alignment, so a rank computes a whole number of tiles. The gathered width is
-    /// `padded × ranks`.
-    pub fn new(
-        weight: Weight,
-        first: u32,
-        local: u32,
+    /// # Errors
+    ///
+    /// When the checkpoint lacks the table, or the rank's shard is not a whole number of tiles: the
+    /// checkpoint's rows are contiguous, so a shard's padded rows would be another rank's.
+    pub fn load(
+        scope: &mut Scope<'_, '_>,
         vocabulary: u32,
-        padded: u32,
+        hidden: u32,
+        split: Split,
     ) -> Result<Self> {
-        if weight.shape().rank() != 2 || weight.shape().dim(0) != u64::from(padded) {
-            return Err(Error::shape(
-                "ParallelLMHead",
-                format!(
-                    "the weight is {:?}, [{padded}, hidden] expected for the padded shard",
-                    weight.shape().dims()
-                ),
-            ));
-        }
-        if padded < local {
-            return Err(Error::shape(
-                "ParallelLMHead",
-                format!("a shard padded to {padded} is narrower than its {local} rows"),
-            ));
-        }
-        if first.checked_add(local).is_none_or(|end| end > vocabulary) {
-            return Err(Error::shape(
-                "ParallelLMHead",
-                format!("a shard at {first} of {local} rows is past the vocabulary {vocabulary}"),
-            ));
+        let (first, rows) = vocabulary_shard(vocabulary, split);
+        let weight = scope.rows(
+            "weight",
+            u64::from(first),
+            &[u64::from(rows), u64::from(hidden)],
+        )?;
+        Self::over(weight, rows, vocabulary)
+    }
+
+    /// The head that shares `embedding`'s table: a checkpoint that ties its word embeddings.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`], for the embedding's shard.
+    pub fn tied(embedding: &VocabParallelEmbedding) -> Result<Self> {
+        let (_, rows) = embedding.shard();
+        Self::over(embedding.weight(), rows, embedding.vocabulary())
+    }
+
+    /// The head over `weight`, a shard of `rows` vocabulary rows.
+    fn over(weight: Weight, rows: u32, vocabulary: u32) -> Result<Self> {
+        let padded = rows.next_multiple_of(PADDING);
+        if padded != rows {
+            return Err(Error::Unsupported(format!(
+                "ParallelLMHead: a vocabulary shard of {rows} rows needs {padded} padded rows; the \
+                 checkpoint's rows are contiguous, so a rank whose shard is not its padded width is \
+                 not loadable"
+            )));
         }
         Ok(Self {
             weight,
@@ -72,17 +88,15 @@ impl ParallelLMHead {
 
     /// Project `hidden` into `out`, gathering the ranks' shards.
     ///
-    /// `hidden` is `[rows, hidden]` (the rows the batch asks logits for), `projected` is this rank's
-    /// `[rows, padded]` output, `gathered` is the all-gather's `[rows, padded × ranks]` buffer (only
-    /// when the group has more than one rank), and `out` is `[rows, vocabulary]`.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        projected: TensorView,
-        gathered: Option<TensorView>,
-        out: TensorView,
-    ) -> Result<()> {
+    /// `hidden` is `[rows, hidden]` (the rows the batch asks logits for) and `out` is
+    /// `[rows, vocabulary]`. The head reserves this rank's `[rows, padded]` projection and, when
+    /// the forward's group has more than one rank, the `[rows, padded × ranks]` gather from the
+    /// forward's arena, in that order.
+    ///
+    /// # Errors
+    ///
+    /// When a view does not fit the head or an operator refuses.
+    pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
         let rows = hidden.rows();
         if out.shape.rank() != 2
             || out.shape.dim(0) != rows
@@ -97,45 +111,19 @@ impl ParallelLMHead {
                 ),
             ));
         }
-        if projected.shape.rank() != 2 || projected.shape.dim(0) != rows {
-            return Err(Error::shape(
-                "ParallelLMHead",
-                format!(
-                    "the shard output is {:?}, [{rows}, {padded}] expected",
-                    projected.shape.dims(),
-                    padded = self.padded
-                ),
-            ));
-        }
+        let ranks = f.split().map_or(1, |split| split.ranks);
+        let arena = f.arena();
+        let projected = arena.tensor(hidden.dtype, Shape::new(&[rows, u64::from(self.padded)]))?;
         // The projection itself: the same dense operator as any other linear layer, with the
         // vocabulary shard as its output width.
         let linear = Linear::new(self.weight, None, ops::gemm::WeightOrder::NxK)?;
         linear.forward(f, hidden, projected)?;
 
-        let ranks = f.split().map_or(1, |split| split.ranks);
         let gathered = if ranks > 1 {
-            let gathered = gathered.ok_or_else(|| {
-                Error::shape(
-                    "ParallelLMHead",
-                    format!(
-                        "a gather over {ranks} ranks needs a {rows} × {width} buffer",
-                        width = u64::from(self.padded) * ranks
-                    ),
-                )
-            })?;
-            let expected = u64::from(self.padded) * ranks;
-            if gathered.shape.rank() != 2
-                || gathered.shape.dim(0) != rows
-                || gathered.shape.dim(1) != expected
-            {
-                return Err(Error::shape(
-                    "ParallelLMHead",
-                    format!(
-                        "the gather buffer is {:?}, [{rows}, {expected}] expected",
-                        gathered.shape.dims()
-                    ),
-                ));
-            }
+            let gathered = arena.tensor(
+                hidden.dtype,
+                Shape::new(&[rows, u64::from(self.padded) * ranks]),
+            )?;
             f.all_gather(projected, gathered)?;
             gathered
         } else {
@@ -162,7 +150,6 @@ impl ParallelLMHead {
 
         f.operate::<VocabUnpad>(&descriptor, args)
     }
-
     /// The descriptor the vocabulary unpad launches with, for a gathered matrix of `gathered_width`
     /// columns: the gathered logits' element type, the type the sampler's candidate buffer carries,
     /// the vocabulary, the gathered width, the block and PDL.

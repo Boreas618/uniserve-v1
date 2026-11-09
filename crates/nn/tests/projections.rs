@@ -10,7 +10,8 @@ use std::path::Path;
 
 use nn::family::Split;
 use nn::layers::{
-    Bias, Linear, MergedColumnLinear, Parallel, QkvBias, QkvLinear, QkvNames, QkvSpec,
+    Bias, Linear, MergedColumnLinear, Parallel, ParallelLMHead, QkvBias, QkvLinear, QkvNames,
+    QkvSpec, VocabParallelEmbedding,
 };
 use nn::quantization::{Declaration, KvCache, Scheme};
 use nn::weights::RetainedWeights;
@@ -461,4 +462,35 @@ fn a_declaration_this_library_does_not_serve_is_refused_by_name() {
     let declaration = Declaration::read(&checkpoint(dense.path(), "{}")).unwrap();
     assert!(!declaration.is_encoded());
     assert_eq!(declaration.scheme("w"), Scheme::Dense);
+}
+
+/// The embedding and the head shard the vocabulary by one rule: a rank's rows of each table are
+/// the same ids, and a tied head reads the embedding's own rows.
+#[test]
+fn the_embedding_and_the_head_hold_the_same_vocabulary_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    shard(
+        directory.path(),
+        &[
+            ("embed.weight", DType::F32, vec![32, 3], matrix(32, 3)),
+            ("head.weight", DType::F32, vec![32, 3], matrix(32, 3)),
+        ],
+    );
+    let checkpoint = checkpoint(directory.path(), "{}");
+    let mut store = Store::default();
+    let rank = Split { size: 2, rank: 1 };
+    let (embedding, head) = {
+        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
+        let embedding =
+            VocabParallelEmbedding::load(&mut loader.scope("embed"), 32, 3, rank).unwrap();
+        let head = ParallelLMHead::load(&mut loader.scope("head"), 32, 3, rank).unwrap();
+        (embedding, head)
+    };
+    assert_eq!(embedding.shard(), (16, 16));
+    assert_eq!(
+        store.values(embedding.weight().view()),
+        expected(16..32, 0..3)
+    );
+    assert_eq!(head.padded(), 16);
+    assert_eq!(ParallelLMHead::tied(&embedding).unwrap().padded(), 16);
 }

@@ -15,8 +15,8 @@ use std::f64::consts::PI;
 
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, Embedding, Linear, Moe, Parallel, ParallelLMHead, QkvBias, QkvLinear,
-    QkvNames, QkvSpec, RmsNorm, Rotary, SwiGlu,
+    Attention, Bias, Linear, Moe, Parallel, ParallelLMHead, QkvBias, QkvLinear, QkvNames, QkvSpec,
+    RmsNorm, Rotary, SwiGlu, VocabParallelEmbedding,
 };
 use nn::quantization::Declaration;
 use nn::weights::{
@@ -87,37 +87,28 @@ pub fn load(
     let q_heads = partition.local_attention_heads(&config);
     let kv_heads = partition.local_key_value_heads(&config);
 
-    // The vocabulary shard: rows are contiguous in a `[vocabulary, hidden]` table.
-    let (first, rows) = partition.vocabulary_shard(config.vocab_size);
-    let padded = partition.padded_vocabulary_shard(config.vocab_size);
-    if padded != rows {
-        return Err(Error::Unsupported(format!(
-            "a vocabulary shard of {rows} rows needs {padded} padded rows; the checkpoint's rows \
-             are contiguous, so a rank whose shard is not its padded width is not loadable yet"
-        )));
-    }
-    let mut root = loader.scope("");
-    let embedding_weight = root.scope("model.embed_tokens").rows(
-        "weight",
-        u64::from(first),
-        &[u64::from(rows), hidden],
+    // The embedding and the head are vocabulary parallel over the tensor group; a tied head reads
+    // the embedding's own matrix.
+    let embedding = VocabParallelEmbedding::load(
+        &mut loader.scope("model.embed_tokens"),
+        config.vocab_size,
+        config.hidden_size,
+        tensor,
     )?;
-    let embedding = Embedding::new(embedding_weight, first, rows, config.vocab_size)?;
-    let dtype = embedding_weight.view().dtype;
-
-    // A tied head reads the embedding's own matrix.
-    let head_module = if config.tie_word_embeddings {
-        "model.embed_tokens"
+    let dtype = embedding.weight().dtype();
+    let head = if config.tie_word_embeddings {
+        ParallelLMHead::tied(&embedding)?
     } else {
-        "lm_head"
+        ParallelLMHead::load(
+            &mut loader.scope("lm_head"),
+            config.vocab_size,
+            config.hidden_size,
+            tensor,
+        )?
     };
-    let lm_head_weight =
-        root.scope(head_module)
-            .rows("weight", u64::from(first), &[u64::from(rows), hidden])?;
-    let head = ParallelLMHead::new(lm_head_weight, first, rows, config.vocab_size, padded)?;
 
     let norm = RmsNorm::new(
-        root.scope("model.norm").tensor("weight", &[hidden])?,
+        loader.scope("model.norm").tensor("weight", &[hidden])?,
         config.rms_norm_eps,
     )?;
 

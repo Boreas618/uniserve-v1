@@ -108,27 +108,6 @@ impl Partition {
         config.num_key_value_heads / self.tensor_parallel
     }
 
-    /// The vocabulary shard this rank's embedding and head own, as `(first id, rows)`.
-    ///
-    /// The shard is `ceil(vocab / degree)` rows except the last, which is short when the
-    /// vocabulary does not divide evenly.
-    pub fn vocabulary_shard(&self, vocab_size: u32) -> (u32, u32) {
-        let rows = vocab_size.div_ceil(self.tensor_parallel);
-        let first = self.tensor_rank * rows;
-        let rows = rows.min(vocab_size.saturating_sub(first));
-        (first, rows)
-    }
-
-    /// The width of this rank's vocabulary shard as the head stores and computes it.
-    ///
-    /// The head multiplies a whole number of eight-row tiles per rank, so a shard shorter than its
-    /// tile is stored padded; the vocabulary's own last rank can be short, and then the padding is
-    /// what the shard's rows are rounded up to. The same width is the head's output width and the
-    /// width of one rank's block in the gathered logits matrix.
-    pub fn padded_vocabulary_shard(&self, vocab_size: u32) -> u32 {
-        self.vocabulary_shard(vocab_size).1.next_multiple_of(8)
-    }
-
     /// The intermediate width of one routed expert on this rank: the tensor group splits every
     /// expert's `moe_intermediate_size` over its ranks and sums the partial outputs once after the
     /// experts.
@@ -152,32 +131,6 @@ impl Partition {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_single_rank_owns_everything() {
-        let partition = Partition::single();
-        assert_eq!(partition.vocabulary_shard(151936), (0, 151936));
-    }
-
-    #[test]
-    fn the_last_vocabulary_shard_is_short() {
-        let partition = Partition {
-            tensor_parallel: 4,
-            tensor_rank: 3,
-            expert_parallel: 1,
-            expert_rank: 0,
-        };
-        // 151936 / 4 = 37984 exactly.
-        assert_eq!(partition.vocabulary_shard(151936), (113952, 37984));
-        // A shard is `ceil(vocabulary / degree)` rows: an uneven vocabulary rounds the width up,
-        // and the last rank keeps the remainder. (Such a checkpoint is refused at load, because
-        // the head's rows must be its padded width; the rule still has one meaning here.)
-        let partition = Partition {
-            tensor_rank: 3,
-            ..partition
-        };
-        assert_eq!(partition.vocabulary_shard(151937), (113955, 37982));
-    }
 
     #[test]
     fn expert_ranges_partition_the_experts() {

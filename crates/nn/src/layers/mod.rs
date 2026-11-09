@@ -57,7 +57,7 @@ pub use bias::BiasAdd;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use copy_block::CopyBlock;
 pub use cross_fade::CrossFade;
-pub use embedding::Embedding;
+pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
 pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
 pub use head::{ParallelLMHead, gather_rows};

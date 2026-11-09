@@ -38,8 +38,8 @@
 
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::layers::{
-    Attention, Embedding, Linear, Moe, ParallelLMHead, QkvLinear, RmsNorm, Rotary, SwiGlu,
-    TRTLLM_WORKSPACE_BYTES,
+    Attention, Linear, Moe, ParallelLMHead, QkvLinear, RmsNorm, Rotary, SwiGlu,
+    TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
 };
 use nn::weights::Weight;
 use nn::{Arena, DType, Forward, Shape, Strides, TensorView};
@@ -86,7 +86,7 @@ pub struct Qwen3Moe {
     config: Config,
     partition: Partition,
     dtype: DType,
-    embedding: Embedding,
+    embedding: VocabParallelEmbedding,
     layers: Vec<DecoderLayer>,
     norm: RmsNorm,
     head: ParallelLMHead,
@@ -161,11 +161,6 @@ struct Extents {
     factors: u64,
     /// Elements per dense feed-forward row; zero when every layer routes to experts.
     feed_forward: u64,
-    /// Elements per row of this rank's vocabulary shard: the head's output width.
-    vocabulary: u64,
-    /// Elements per row of the gathered logits matrix, `vocabulary × tensor parallel`; zero when
-    /// one rank projects the whole vocabulary and no gather happens.
-    gathered: u64,
     /// Bytes of the attention program's workspace.
     workspace: u64,
 }
@@ -202,19 +197,6 @@ impl Extents {
             factors: element(config.head_dim / 2, "head_dim / 2")?,
             feed_forward: if config.has_dense_layers() {
                 element(partition.local_intermediate(config), "intermediate_size")?
-            } else {
-                0
-            },
-            vocabulary: element(
-                partition.padded_vocabulary_shard(config.vocab_size),
-                "the vocabulary shard",
-            )?,
-            gathered: if partition.tensor_parallel > 1 {
-                element(
-                    partition.padded_vocabulary_shard(config.vocab_size)
-                        * partition.tensor_parallel,
-                    "the gathered vocabulary",
-                )?
             } else {
                 0
             },
@@ -318,7 +300,7 @@ impl Qwen3Moe {
         config: Config,
         partition: Partition,
         dtype: DType,
-        embedding: Embedding,
+        embedding: VocabParallelEmbedding,
         layers: Vec<DecoderLayer>,
         norm: RmsNorm,
         head: ParallelLMHead,
@@ -706,30 +688,8 @@ impl CausalLm for Qwen3Moe {
     }
 
     fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> nn::Result<()> {
-        let rows = hidden.rows();
-        let extents = self.extents(rows).map_err(nn::Error::from)?;
-        // The extents' two widths are the model's, not the launch's: a loaded head whose shard width
-        // disagrees with the partition would otherwise be given a buffer of the wrong width and
-        // write past it.
-        if extents.vocabulary != u64::from(self.head.padded()) {
-            return Err(nn::Error::from(Error::Config(format!(
-                "the forward reserves {} columns for the vocabulary shard, the head projects {}",
-                extents.vocabulary,
-                self.head.padded()
-            ))));
-        }
-        let projected = f
-            .arena
-            .tensor(self.dtype, Shape::new(&[rows, extents.vocabulary]))?;
-        let gathered = if extents.gathered == 0 {
-            None
-        } else {
-            Some(
-                f.arena
-                    .tensor(self.dtype, Shape::new(&[rows, extents.gathered]))?,
-            )
-        };
-        self.head.forward(f, hidden, projected, gathered, out)
+        // The head reserves its shard's projection and the group's gather itself.
+        self.head.forward(f, hidden, out)
     }
 }
 

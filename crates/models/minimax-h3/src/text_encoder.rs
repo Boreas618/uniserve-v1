@@ -30,7 +30,7 @@
 //! and it is decided once at the loading boundary: no layer converts. The text stack is
 //! tensor-parallel: query, key and value heads are split over the ranks, the MLP's intermediate
 //! width is split, the output and down projections reduce over the group, and the embedding's
-//! vocabulary is split (`nn::layers::Embedding` reduces its own lookups). The vision tower is
+//! vocabulary is split (`nn::layers::VocabParallelEmbedding` reduces its own lookups). The vision tower is
 //! *replicated* on every rank: it is small, every rank needs its features, and its row-parallel
 //! projections would otherwise need a bias added once after the reduction.
 
@@ -40,8 +40,8 @@ use nn::capability::{
 };
 use nn::family::Split;
 use nn::layers::{
-    Attention, Bias, Embedding, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames,
-    QkvSpec, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
+    Attention, Bias, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames, QkvSpec,
+    RmsNorm, Rotary, Rows, ScaledResidual, Sections, VocabParallelEmbedding,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -195,8 +195,6 @@ struct Rank {
     key_value: u32,
     /// Width of this rank's intermediate projection.
     intermediate: u32,
-    /// The `[first, stop)` vocabulary rows this rank's embedding holds.
-    vocabulary: (u32, u32),
 }
 
 impl Rank {
@@ -229,7 +227,6 @@ impl Rank {
         }
         let query_heads = config.num_attention_heads / degree;
         let key_value_heads = config.num_key_value_heads / degree;
-        let (first, stop) = partition.vocabulary_shard(config.vocab_size);
         Ok(Self {
             index,
             degree,
@@ -238,7 +235,6 @@ impl Rank {
             query: query_heads * config.head_dim,
             key_value: key_value_heads * config.head_dim,
             intermediate: config.intermediate_size / degree,
-            vocabulary: (first, stop),
         })
     }
 }
@@ -548,7 +544,7 @@ pub struct TextEncoder {
     partition: Partition,
     dtype: nn::DType,
     rank: Rank,
-    embedding: Embedding,
+    embedding: VocabParallelEmbedding,
     /// The prompt's M-RoPE factor tables; the layers apply the same factors.
     rotary: Rotary,
     layers: Vec<Layer>,
@@ -582,28 +578,18 @@ impl TextEncoder {
                 config.num_checkpoint_layers
             )));
         }
-        let (first, stop) = rank.vocabulary;
-        let rows = stop - first;
-        let embedding = Embedding::new(
-            // A rank's vocabulary rows start at its first id: read from the table's start, every
-            // rank past the first would hold the first shard's rows under its own ids.
-            loader
-                .scope(format!("{PREFIX}.embed_tokens"))
-                .rows("weight", u64::from(first), &[u64::from(rows), hidden])
-                .map_err(|error| {
-                    Error::config(format!("the embedding shard {first}..{stop}: {error}"))
-                })?,
-            first,
-            rows,
-            config.vocab_size,
-        )
-        .map_err(Error::from)?;
-        // One frequency table rotates the prompt's factors and every layer's.
-        let frequencies = frequencies(loader, config)?;
         let split = Split {
             size: rank.degree,
             rank: rank.index,
         };
+        let embedding = VocabParallelEmbedding::load(
+            &mut loader.scope(format!("{PREFIX}.embed_tokens")),
+            config.vocab_size,
+            config.hidden_size,
+            split,
+        )?;
+        // One frequency table rotates the prompt's factors and every layer's.
+        let frequencies = frequencies(loader, config)?;
         let layers = (0..retained)
             .map(|index| {
                 Layer::load(
@@ -1347,11 +1333,10 @@ mod tests {
         assert_eq!(rank.query, 64 * 128);
         assert_eq!(rank.key_value, 8 * 128);
         assert_eq!(rank.intermediate, 25_600);
-        assert_eq!(rank.vocabulary, (0, config.vocab_size));
     }
 
     #[test]
-    fn four_ranks_split_the_heads_the_intermediate_width_and_the_vocabulary() {
+    fn four_ranks_split_the_heads_and_the_intermediate_width() {
         let config = config();
         let partition = Partition {
             tensor_parallel: 4,
@@ -1364,9 +1349,6 @@ mod tests {
         assert_eq!(rank.query, 16 * 128);
         assert_eq!(rank.key_value, 2 * 128);
         assert_eq!(rank.intermediate, 6_400);
-        let (first, stop) = rank.vocabulary;
-        assert_eq!(first, 2 * config.vocab_size.div_ceil(4));
-        assert!(stop <= config.vocab_size);
     }
 
     #[test]

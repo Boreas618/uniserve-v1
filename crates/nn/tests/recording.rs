@@ -4,8 +4,11 @@
 //! A recording forward has no device, so every view here addresses a counting arena that no memory
 //! backs; nothing reads it.
 
+// The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
+#![cfg(test)]
+
 use nn::layers::{ParallelLMHead, UlyssesExchange};
-use nn::{Arena, DType, DevicePtr, Forward, Shape, Split, TensorView, Weight};
+use nn::{Arena, Checkpoint, DType, Forward, Shape, Split, WeightLoader};
 use ops::Op;
 use ops::logits::VocabUnpad;
 
@@ -28,61 +31,75 @@ fn recorded<T>(walk: impl FnOnce() -> T) -> (T, Vec<(String, String)>) {
     (answer, launches.0)
 }
 
-/// A BF16 weight of `dims` elements over a region that is never read.
-fn weight(dims: &[u64]) -> Weight {
-    let shape = Shape::new(dims);
-    let backing = nn::Backing::new(DevicePtr::new(0x1_0000), shape.numel() * 2);
-    Weight {
-        backing,
-        view: TensorView::new(DevicePtr::new(0x1_0000), DType::BF16, shape),
-    }
+/// A checkpoint whose `lm_head.weight` is `[vocabulary, 8]` BF16, in `directory`.
+fn checkpoint(directory: &std::path::Path, vocabulary: u64) -> Checkpoint {
+    let header = format!(
+        r#"{{"lm_head.weight":{{"dtype":"BF16","shape":[{vocabulary},8],"data_offsets":[0,{}]}}}}"#,
+        vocabulary * 16
+    );
+    let mut file = (header.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(header.as_bytes());
+    file.resize(file.len() + (vocabulary * 16) as usize, 0);
+    std::fs::write(directory.join("model.safetensors"), file).unwrap();
+    Checkpoint::open(directory).unwrap()
 }
 
-/// Rank 1 of 2 of a vocabulary of 30, sharded into rows 15..30 and padded to 16.
-fn head() -> nn::Result<ParallelLMHead> {
-    ParallelLMHead::new(weight(&[16, 8]), 15, 15, 30, 16)
+/// Rank `rank` of 2 of a head over `vocabulary` rows, read by a meta loader.
+fn head(checkpoint: &Checkpoint, vocabulary: u32, rank: u32) -> nn::Result<ParallelLMHead> {
+    let mut loader = WeightLoader::meta(checkpoint, None, None);
+    ParallelLMHead::load(
+        &mut loader.scope("lm_head"),
+        vocabulary,
+        8,
+        nn::family::Split { size: 2, rank },
+    )
 }
 
 /// A vocabulary-parallel head over two ranks gathers both shards and unpads the gathered width:
-/// a recording forward split as rank 1 of 2 asks for the same gather buffer and states the same
-/// unpad program as that rank's launching forward.
+/// a recording forward split as rank 1 of 2 reserves the same gather and states the same unpad
+/// program as that rank's launching forward.
 #[test]
 fn a_split_recording_answers_the_gathered_width_of_its_rank() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(directory.path(), 32);
     let arena = Arena::counting();
     let f = Forward::recording(&arena).with_split(1, 2).unwrap();
     assert_eq!(f.split(), Some(Split { rank: 1, ranks: 2 }));
 
-    let head = head().unwrap();
+    // Rank 1 holds rows 16..32, a whole number of the head's eight-row tiles.
+    let head = head(&checkpoint, 32, 1).unwrap();
+    assert_eq!(head.padded(), 16);
     let hidden = arena.tensor(DType::BF16, Shape::new(&[3, 8])).unwrap();
-    let projected = arena.tensor(DType::BF16, Shape::new(&[3, 16])).unwrap();
-    let gathered = arena.tensor(DType::BF16, Shape::new(&[3, 32])).unwrap();
-    let out = arena.tensor(DType::F32, Shape::new(&[3, 30])).unwrap();
+    let out = arena.tensor(DType::F32, Shape::new(&[3, 32])).unwrap();
 
-    let (answer, launches) = recorded(|| head.forward(&f, hidden, projected, Some(gathered), out));
+    let before = arena.used();
+    let (answer, launches) = recorded(|| head.forward(&f, hidden, out));
     answer.expect("two shards of 16 gather into 32 columns");
-    // The unpad reads the gathered BF16 logits two shards wide and writes the 30-entry vocabulary
-    // in FP32.
+    // The head reserved its shard's projection and the two shards' gather, BF16 each.
+    assert!(arena.used() - before >= 3 * 16 * 2 + 3 * 32 * 2);
+    // The unpad reads the gathered BF16 logits two shards wide and writes the vocabulary in FP32.
     assert!(
         launches
             .iter()
             .any(|(operator, key)| operator == <VocabUnpad as Op>::NAME
-                && key.starts_with("dtype_bf16_output_f32_vocabulary_30_padded_32_")),
+                && key.starts_with("dtype_bf16_output_f32_vocabulary_32_padded_32_")),
         "{launches:?}"
     );
 
-    // A gather buffer of one shard does not hold two ranks' columns.
-    let one_shard = arena.tensor(DType::BF16, Shape::new(&[3, 16])).unwrap();
-    assert!(
-        head.forward(&f, hidden, projected, Some(one_shard), out)
-            .is_err()
-    );
     // Unsplit, the shard's 16 columns are the whole gathered width and cannot hold a vocabulary
-    // of 30: the unpad refuses the call, as the device would.
+    // of 32: the unpad refuses the call, as the device would.
     let unsplit = Forward::recording(&arena);
-    assert!(
-        head.forward(&unsplit, hidden, projected, None, out)
-            .is_err()
-    );
+    assert!(head.forward(&unsplit, hidden, out).is_err());
+}
+
+/// A shard that is not a whole number of tiles has no padded rows in the checkpoint to read: the
+/// next rank's rows follow it, so the head is refused at load rather than projected over them.
+#[test]
+fn a_shard_of_a_partial_tile_is_refused_at_load() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(directory.path(), 30);
+    let refused = head(&checkpoint, 30, 1).err().expect("fifteen rows");
+    assert!(refused.to_string().contains("15"), "{refused}");
 }
 
 /// A sequence-parallel exchange over two ranks moves two equal blocks: a recording forward split

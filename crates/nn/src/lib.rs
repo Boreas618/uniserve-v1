@@ -20,7 +20,7 @@
 //!
 //! [`layers`] holds what a model composes: [`Linear`],
 //! [`RmsNorm`], [`LayerNorm`], [`Rotary`],
-//! [`Embedding`], [`Attention`], [`Moe`],
+//! [`VocabParallelEmbedding`](layers::VocabParallelEmbedding), [`Attention`], [`Moe`],
 //! [`Conv3d`], [`Conv1d`],
 //! [`ConvTranspose1d`], [`UlyssesExchange`],
 //! [`Sampler`] and [`ParallelLMHead`]; the diffusion and
@@ -73,9 +73,9 @@ pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{
     Activation, AdaptivePool, Attention, AttentionBackend, AudioActivation, Candidates, Conv1d,
-    Conv3d, ConvGeometry, ConvTranspose1d, CrossFade, Embedding, FrameMoments, FrameNormPad,
-    FramePad, GatedActivation, GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe,
-    Noise, NoiseKey, PackedSwiGlu, ParallelLMHead, Patch, PcmInterleave, RgbBytes, RmsNorm, Rotary,
+    Conv3d, ConvGeometry, ConvTranspose1d, CrossFade, FrameMoments, FrameNormPad, FramePad,
+    GatedActivation, GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise,
+    NoiseKey, PackedSwiGlu, ParallelLMHead, Patch, PcmInterleave, RgbBytes, RmsNorm, Rotary,
     Rotate, Rotation, Sampler, SamplerState, Samples, ScaledAdd, ScaledResidual,
     ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections, SegmentAttention, SegmentTables,
     Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm,
