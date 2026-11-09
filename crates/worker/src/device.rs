@@ -1055,13 +1055,26 @@ impl Device {
                 // milliseconds of idle, and the next step's launch fits behind this step's work.
                 let named = self.runner_mut(runner)?;
                 // A session's window is made of whole steps, so its rank runs them one at a time.
-                let overlapping = named.runner.overlaps_staged();
+                let deferred = named.runner.overlaps_staged();
                 let stream = named.runner.stream().cloned();
-                let overlapping = overlapping && self.session.is_none();
+                let overlapping = deferred && self.session.is_none();
                 self.begin_step(batch, stream.as_ref())?;
                 self.waits = !overlapping;
                 let output = self.perform(&label, jobs_of(runner, jobs));
                 self.waits = true;
+                // A runner whose replays overlap answers this step's replay when it lands
+                // (`overlaps_staged`), with an empty stand-in now. It cannot know that a session
+                // runs the step alone: then the wait above covered the landing, and the answer is
+                // taken here, or the stand-in completes the batch with none of its calls reported.
+                // Only then: a step the runner answered at once may be served beside an earlier
+                // replay still in flight, whose deferred answer is first in the runner's queue and
+                // belongs to that replay's own landing. A session lands every replay before its
+                // first step, so its steps find the queue holding their own answer alone.
+                let output = if deferred && !overlapping {
+                    output.and_then(|output| self.runner_mut(runner)?.runner.landed(output))
+                } else {
+                    output
+                };
                 let output = output
                     .and_then(|mut output| {
                         output.forward_stats = self.end_step(batch.id.0)?;
