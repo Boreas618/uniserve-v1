@@ -1062,6 +1062,16 @@ impl Device {
                 self.waits = !overlapping;
                 let output = self.perform(&label, jobs_of(runner, jobs));
                 self.waits = true;
+                // A replay this step does not leave in flight has landed: the wait above covered
+                // it. Its runner chose on its own whether the answer waits for the landing
+                // (`overlaps_staged`), and it cannot know that a session runs the step alone, so a
+                // runner that deferred its answer gives it here. Without this the deferred answer's
+                // empty stand-in completed the batch, with none of its calls reported.
+                let output = if overlapping {
+                    output
+                } else {
+                    output.and_then(|output| self.runner_mut(runner)?.runner.landed(output))
+                };
                 let output = output
                     .and_then(|mut output| {
                         output.forward_stats = self.end_step(batch.id.0)?;
