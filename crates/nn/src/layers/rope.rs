@@ -11,9 +11,9 @@
 //! ## Spectra
 //!
 //! ```text
-//! Default    θ^(−2i/d), i < d/2                                   (Llama, Qwen3)
+//! Default    θ^(−2i/d), i < d/2
 //! Yarn       Default interpolated by the extension, ramped over the correction range
-//! Sectioned  Default over d, its frequencies cycled over the M-RoPE axes  (Qwen3-VL)
+//! Sectioned  Default over d, its frequencies cycled over the M-RoPE axes  (interleaved M-RoPE)
 //! Repeated   one spectrum of p pairs, repeated once per coordinate axis   (N-d RoPE)
 //! ```
 //!
@@ -35,7 +35,7 @@
 //! per-head RMS norm followed by the rotation (the separate form rounds in between), so a consumer
 //! whose baseline fuses keeps the fused form. A stack without the norm ([`QkNorm::None`]) rotates
 //! through `rope_apply` alone. The rotation is always the half-split pairing (`x[i]` against
-//! `x[i + d/2]`, GPT-NeoX and Qwen), and a head may rotate only its leading channels: the factor
+//! `x[i + d/2]`, GPT-NeoX), and a head may rotate only its leading channels: the factor
 //! tables are as wide as the spectrum, and a head wider than the rotated width passes its trailing
 //! channels through.
 
@@ -96,7 +96,7 @@ pub struct Yarn {
 
 /// The M-RoPE cut of a spectrum: how many frequencies each position axis owns.
 ///
-/// The axes cycle over the whole spectrum (Qwen3-VL's interleaved M-RoPE): frequency `j` reads axis
+/// The axes cycle over the whole spectrum (interleaved M-RoPE): frequency `j` reads axis
 /// `j % axes` while `j < widths[j % axes] · axes`, and axis 0 otherwise
 /// (`ops::rope::interleaved_axes`), so every axis keeps frequencies from the whole range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

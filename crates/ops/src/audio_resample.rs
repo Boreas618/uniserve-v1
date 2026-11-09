@@ -1,9 +1,9 @@
-//! The audio decoder's anti-aliased up- and downsampler, pad and crop included.
+//! An anti-aliased up- and downsampler of a waveform, pad and crop included.
 //!
 //! Both directions are one depthwise convolution with a Kaiser-windowed sinc filter whose taps sum
 //! to one (`kaiser_sinc_filter1d`), and both reproduce the reference module's replicate pad
 //! exactly, because the pad is what keeps the resampler from ringing at the ends of a waveform
-//! (`autoencoder_kl_minimax_h3_audio.py:151-193`):
+//! (the BigVGAN-style `UpSample1d`/`DownSample1d`):
 //!
 //! * [`Mode::Downsample`] pads `pad_left = kernel/2 - (kernel even)` on the left and `pad_right =
 //!   kernel/2` on the right, replicates, and convolves with stride `ratio`, one filter per channel.
@@ -111,7 +111,7 @@ pub struct Args {
     pub pad_right: u32,
 }
 
-/// The anti-aliased resampler of the audio decoder.
+/// The anti-aliased resampler of a waveform.
 pub struct AudioResample;
 
 impl Op for AudioResample {

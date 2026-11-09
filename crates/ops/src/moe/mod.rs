@@ -12,7 +12,7 @@
 //! exchange routes with other expert ranks  → expert_exchange   (expert parallel only)
 //! ```
 //!
-//! The shapes are the ones a checkpoint states (Qwen3-30B-A3B: 128 experts, top-k 8, hidden 2048,
+//! The shapes are the ones a checkpoint states (e.g. 128 experts, top-k 8, hidden 2048,
 //! expert width 768); every operator takes its compiled shapes from its descriptor and every runtime
 //! extent — the token count, the offsets — from its arguments. The metadata operators are exact;
 //! the two grouped GEMMs and the combine carry the rounding bound of their own reduction.

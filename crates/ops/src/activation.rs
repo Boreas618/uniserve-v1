@@ -17,8 +17,8 @@
 //! The activation runs in FP32 and the product rounds to the output type, which is what the eager
 //! expression does.
 //!
-//! A plain, ungated `silu` is here too, because a model applies it on its own as well: H3's timestep
-//! embedding is `Linear → SiLU → Linear` over one buffer, which is not a gated pair and must not be
+//! A plain, ungated `silu` is here too, because a model applies it on its own as well: a timestep
+//! embedding of `Linear → SiLU → Linear` over one buffer is not a gated pair and must not be
 //! expressed as one.
 
 use std::fmt;

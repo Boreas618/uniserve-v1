@@ -17,7 +17,7 @@
 //!
 //! **Which resampling rule this is, the program does not know.** Corner alignment or half-pixel
 //! alignment, edge clamping or edge extension — those are the caller's convention, and each tower has
-//! its own: H3's vision tower resamples with corner alignment and a clamped last sample
+//! its own: one tower may resample with corner alignment and a clamped last sample
 //! (`torch.linspace(0, extent - 1, size)` with
 //! `upper = (lower + 1).clamp(max = extent - 1)`), which is *not* the `align_corners = false` rule
 //! any one framework defaults to. So the caller computes the four tap indices and four f32 weights

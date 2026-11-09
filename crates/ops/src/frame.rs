@@ -1001,8 +1001,7 @@ mod tests {
         assert_eq!(frame_reduction_class(1, 1), 1);
         assert_eq!(frame_reduction_class(4, 1), 4);
         assert_eq!(frame_reduction_class(3, 3), 16);
-        // The two H3 frames this operator serves: a latent raster inside 65 536 and the encoder's
-        // pixel raster, which is not.
+        // A 168×96 latent raster fits inside 65 536 and a 1344×768 pixel raster does not.
         assert_eq!(frame_reduction_class(4, 168 * 96), 65_536);
         assert_eq!(frame_reduction_class(4, 1344 * 768), 4_194_304);
     }

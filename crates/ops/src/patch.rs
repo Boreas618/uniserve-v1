@@ -1,6 +1,6 @@
 //! `patch`: the diffusion transformer's latent, packed into its rows.
 //!
-//! The DiT reads packed rows — `[video | audio | prefix | padding]` — and one video row is one
+//! A diffusion transformer reads packed rows, of which a latent's are one run, and one row is one
 //! `1×2×2` patch of the latent's `channels` channels, so a row is `channels · 4` values wide. The
 //! capability boundary hands the diffuser a latent `[channels, frames, height, width]`, so every
 //! evaluation converts rows to latent and back:

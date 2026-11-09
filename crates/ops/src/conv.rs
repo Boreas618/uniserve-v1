@@ -4,8 +4,8 @@
 //! for one geometry and the package's tuning data names that engine, so the same descriptor always
 //! selects the same engine and the same workspace. The grid is the library's.
 //!
-//! The video VAE's FP32 convolutions keep TF32 allowed; that is a descriptor value, because it
-//! changes the numerical contract of the module and therefore its key.
+//! An FP32 convolution may allow TF32; that is a descriptor value, because it changes the numerical
+//! contract of the module and therefore its key.
 //!
 //! ```text
 //! conv3d            input [n, c, d, h, w]  weight [k, c/groups, t, h, w]   out [n, k, od, oh, ow]
@@ -341,7 +341,7 @@ fn to_i64(value: u64) -> Result<i64> {
     i64::try_from(value).map_err(|_| Error::argument("conv", "an extent above i64::MAX"))
 }
 
-/// A 3-d convolution: the video VAE's spatial convolutions.
+/// A 3-d convolution over `[n, c, d, h, w]`.
 pub struct Conv3d;
 
 impl Op for Conv3d {
@@ -390,7 +390,7 @@ impl Op for Conv3d {
     }
 }
 
-/// A 1-d convolution: the audio decoder's and the VAE's temporal convolutions.
+/// A 1-d convolution over `[n, c, l]`.
 pub struct Conv1d;
 
 impl Op for Conv1d {
@@ -437,7 +437,7 @@ impl Op for Conv1d {
     }
 }
 
-/// A transposed 1-d convolution: the audio decoder's upsampling.
+/// A transposed 1-d convolution over `[n, c, l]`: an upsampling stage.
 pub struct ConvTranspose1d;
 
 impl Op for ConvTranspose1d {

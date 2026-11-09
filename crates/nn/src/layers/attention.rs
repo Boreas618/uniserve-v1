@@ -783,7 +783,7 @@ mod tests {
         assert!(page_scale(plane(DType::BF16), None).is_ok());
     }
 
-    /// The paged geometry of a Qwen3-MoE layer at one rank.
+    /// The paged geometry of a layer of 32 query heads of 128 at one rank.
     fn paged(kv_heads: u32, max_kv_len: u32) -> Result<PagedAttention> {
         PagedAttention::new(PagedSpec {
             head_dim: 128,

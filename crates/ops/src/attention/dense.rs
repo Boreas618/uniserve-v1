@@ -1,9 +1,8 @@
 //! Dense attention over packed sequences: no cache, no page table.
 //!
-//! The attention of everything H3 does without a prefix cache: the language encoder over packed
-//! text and vision rows, the video transformer's cross-attention onto the encoded conditions, and
-//! the audio encoder, which runs in FP32. Each batch's rows are a contiguous run
-//! of the packed tensors, named by the offsets the scheduler writes:
+//! The attention of everything that runs without a prefix cache: an encoder over packed rows, a
+//! transformer's cross-attention onto encoded conditions, and attention in FP32. Each batch's rows
+//! are a contiguous run of the packed tensors, named by the offsets the scheduler writes:
 //!
 //! ```text
 //! query       [q_tokens, q_heads, head_dim]
@@ -43,7 +42,7 @@
 //! implementations differ by twice that. The `V` term enters as an absolute term over the declared
 //! envelope [`VALUE_ENVELOPE`]; the reduction length is the descriptor's
 //! [`DenseDescriptor::max_kv_len`], the longest key extent a launch may declare. It is a bound and
-//! not a compiled value, so it is absent from the key: H3's dense attention is bidirectional over a
+//! not a compiled value, so it is absent from the key: a bidirectional attention may run over a
 //! `padded_tokens` bucket that varies per layout, and naming it would compile a program per bucket.
 //!
 //! # The package
@@ -95,11 +94,11 @@ pub struct DenseDescriptor {
     /// The longest key extent a launch may declare: a bound the caller supplies per layout, **not**
     /// a compiled value.
     ///
-    /// It is deliberately absent from the key. H3's dense attention is full bidirectional over
-    /// `padded_tokens`, a bucket value that varies per layout and reaches 174,598, so naming it in
-    /// the key would compile a program per bucket. The program reads the extent from the key view;
-    /// this bound only refuses a launch beyond what the caller declared and gives the tolerance its
-    /// reduction length.
+    /// It is deliberately absent from the key. A full bidirectional attention may run over
+    /// `padded_tokens`, a bucket value that varies per layout and may reach 174,598, so naming it
+    /// in the key would compile a program per bucket. The program reads the extent from the key
+    /// view; this bound only refuses a launch beyond what the caller declared and gives the
+    /// tolerance its reduction length.
     pub max_kv_len: u32,
     /// Whether a launch carries `[batch + 1]` sequence offsets.
     ///
@@ -645,8 +644,9 @@ mod tests {
 
     #[test]
     fn a_cross_attention_with_no_offsets_accepts_more_queries_than_keys() {
-        // H3's whole visibility rule: every query sees keys `[0, used)`. Eight queries against five
-        // keys, one sequence each, no offsets — the descriptor does not change and no mask is added.
+        // An unmasked cross-attention's whole visibility rule: every query sees keys `[0, used)`.
+        // Eight queries against five keys, one sequence each, no offsets — the descriptor does not
+        // change and no mask is added.
         let unweighted = DenseDescriptor {
             cu_seq_lens: false,
             ..cross()

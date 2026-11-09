@@ -17,9 +17,10 @@
 //! ## Expert parallelism
 //!
 //! One rank holding every expert is the colocated case this layer serves; an expert-parallel group
-//! routes over `expert_exchange` and is built with the H3 step, whose `moe_config.exchange`
-//! program selects the transport. A `Moe` layer built for a layout that does not hold every
-//! expert refuses the forward rather than computing a routing the weights do not have.
+//! routes over `expert_exchange` and is built with the expert-parallel step, whose
+//! `moe_config.exchange` program selects the transport. A `Moe` layer built for a layout that does
+//! not hold every expert refuses the forward rather than computing a routing the weights do not
+//! have.
 
 mod dispatch;
 
@@ -104,7 +105,8 @@ const fn pad_1k(bytes: u64) -> u64 {
 /// The tile geometry the grouped products' packages are compiled for.
 ///
 /// Like the row tile of a normalization this is program content; the
-/// values here are the packages' default tactic for the Qwen3-MoE shapes, declared once in
+/// values here are the packages' default tactic for the shapes a checkpoint states (e.g. 128
+/// experts, top-k 8, hidden 2048, expert width 768), declared once in
 /// [`crate::layers::launch`] rather than at every call.
 const MMA_TILE: (u32, u32) = (128, 128);
 /// The cluster shape the grouped products' packages are compiled for.
@@ -2019,7 +2021,7 @@ pub(super) mod tests {
         )
     }
 
-    /// A quantized block's stacks are packed: the same Qwen3-MoE geometry, two codes a byte along
+    /// A quantized block's stacks are packed: the same 128-expert geometry, two codes a byte along
     /// the contraction, one block scale per sixteen elements and one reciprocal per expert.
     fn quantized_block(hidden: u64, intermediate: u64) -> Result<Moe> {
         let experts = 128;
@@ -2053,7 +2055,7 @@ pub(super) mod tests {
     /// The encoded products' scratch is computed from the artifact's arithmetic and each entry's
     /// preamble: a bucket of 8 routes costs the row-max planes and tile bars of the wider product,
     /// and a bucket twice as wide costs more. What it must not be is a floor: the size the largest
-    /// Qwen3-MoE case needs is far below sixteen mebibytes.
+    /// 128-expert case needs is far below sixteen mebibytes.
     ///
     /// The number is the one an entry compares its own request against, so it is stated for the
     /// geometry a deployment runs (2048 hidden, 768 intermediate): the second product's entry asks

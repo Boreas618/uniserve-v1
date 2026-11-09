@@ -11,7 +11,7 @@
 //!
 //! The rotation this operator expresses is the one the checkpoint's model uses: a rotation of
 //! `rotated` dimensions of each head, in either the half-split pairing (`x[i]` against
-//! `x[i + d/2]`, GPT-NeoX and Qwen) or the interleaved pairing (`x[2i]` against `x[2i+1]`).
+//! `x[i + d/2]`, GPT-NeoX) or the interleaved pairing (`x[2i]` against `x[2i+1]`).
 //! A model that rotates several axes with different factors (multimodal position embeddings) is a
 //! further descriptor value and another kernel program, added with the model that needs it.
 
@@ -67,8 +67,8 @@ pub struct FactorsDescriptor {
     pub sections: [u32; MAX_AXES],
     /// Whether the axes interleave over the frequencies instead of cutting them in order.
     ///
-    /// The default, a contiguous cut, gives axis `a` the next `sections[a]` frequencies. Qwen3-VL's
-    /// interleaved M-RoPE instead cycles the axes over the whole spectrum: frequency `j` reads axis
+    /// The default, a contiguous cut, gives axis `a` the next `sections[a]` frequencies.
+    /// Interleaved M-RoPE instead cycles the axes over the whole spectrum: frequency `j` reads axis
     /// `j % axes` while `j < sections[axis] · axes` and axis 0 otherwise, so every axis keeps
     /// frequencies from the whole range (see [`interleaved_axes`]). The two compile different
     /// programs, and the field appears in the key only for the interleaved one, so every sectioned
@@ -113,7 +113,7 @@ pub fn section_axes(widths: &[u32]) -> Vec<u32> {
     axes
 }
 
-/// The axis each compact frequency reads under interleaved M-RoPE (Qwen3-VL).
+/// The axis each compact frequency reads under interleaved M-RoPE.
 ///
 /// Frequency `j` reads axis `j % n` while `j < widths[axis] · n`, and axis 0 otherwise, where `n` is
 /// the number of axes: every axis keeps frequencies from the whole spectrum, each receives exactly
@@ -327,7 +327,7 @@ pub struct QkNormRopeDescriptor {
     /// Channels of each head the rotation turns; `head_dim` for a full-width rotation.
     ///
     /// A multimodal transformer rotates the leading channels of a head and leaves the rest as they
-    /// are — H3 rotates 96 of 128 — so the tables carry `rotated / 2` pair columns rather than
+    /// are — e.g. 96 of 128 — so the tables carry `rotated / 2` pair columns rather than
     /// `head_dim / 2`, and the program copies the trailing channels through. The key names this
     /// only when it is narrower than the head, so every full-width key is unchanged.
     pub rotated: u32,
@@ -339,27 +339,28 @@ pub struct QkNormRopeDescriptor {
     ///
     /// `true` is the trained transformer's form: each head's RMS is scaled by a `[head_dim]` weight
     /// per query and key head, which the program reads. `false` is a per-head normalization with no
-    /// learned weight — the video VAE's decoder normalizes this way — so the program has no weight
+    /// learned weight — an attention block may normalize this way — so the program has no weight
     /// ports at all and the arguments carry none.
     pub affine: bool,
     /// Launch with programmatic dependent launch.
     pub pdl: bool,
     /// Element type of the factor tables.
     ///
-    /// FP32 is the trained transformers' form. The video VAE's decoder rotates with factors rounded
-    /// to its activation type, as the reference's `.to(compute_dtype)` does, so a table of another
+    /// FP32 is the trained transformers' form. A block may rotate with factors rounded to its
+    /// activation type, as a reference's `.to(compute_dtype)` does, so a table of another
     /// type is its own variant; a key names it only then.
     pub factors: DType,
     /// Whether the queries and keys are views into wider rows, and the factor table repeats.
     ///
-    /// `false` is the packed form: `[tokens, heads, head_dim]` contiguous, one factor row per token.
-    /// `true` is the video VAE's form. Its queries and keys are column ranges of one merged
+    /// `false` is the packed form: `[tokens, heads, head_dim]` contiguous, one factor row per
+    /// token. `true` is the strided form. Its queries and keys are column ranges of one merged
     /// projection, turned where they lie: a token's row advances by the view's own stride, and the
-    /// attention reads the same ranges, whose keys and values share that stride. It decodes many
-    /// tiles in one launch that share a position table, so token `t` reads factor row
-    /// `t % table rows`. Each program then owns `rows` tokens of one head rather than every head of
-    /// its tokens, because the rows are wide enough that the loop over heads is the launch's cost.
-    /// The form has no learned scale, its outputs are its inputs, and a key names it only when set.
+    /// attention reads the same ranges, whose keys and values share that stride. One launch may
+    /// cover many tiles that share a position table, so token `t` reads factor row
+    /// `t % table rows`. Each program then owns `rows` tokens of one head rather than every head
+    /// of its tokens, because the rows are wide enough that the loop over heads is the launch's
+    /// cost. The form has no learned scale, its outputs are its inputs, and a key names it only
+    /// when set.
     pub strided: bool,
 }
 
@@ -383,8 +384,7 @@ impl fmt::Display for QkNormRopeDescriptor {
             key.field("rotated", self.rotated)
         };
         // Named only for the unweighted form, so every key a trained transformer compiles stays
-        // exactly the key it was: the video VAE's weightless per-head norm is a new variant, not a
-        // renamed old one.
+        // unchanged: the weightless per-head norm is its own variant.
         let key = if self.affine {
             key
         } else {
@@ -852,8 +852,8 @@ mod tests {
 
     #[test]
     fn a_weighted_normalization_keeps_the_key_it_already_had() {
-        // The Qwen3 slice's key, exactly: the learned-scale variant does not name the flag, so no
-        // package has to repackage the transformer for the video VAE's weightless norm.
+        // A full-rotation slice's key, exactly: the learned-scale variant does not name the flag,
+        // so no package has to repackage the transformer for the weightless norm.
         assert_eq!(
             descriptor(true).to_string(),
             "dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false"
@@ -866,7 +866,7 @@ mod tests {
             descriptor(true).to_string(),
             "dtype_bf16_output_bf16_head_dim_128_q_heads_32_k_heads_4_rotation_half_epsilon_0x358637bd_rows_1_block_128_pdl_false"
         );
-        // H3's 96-of-128 rotary: the same descriptor with a narrower rotation is another module.
+        // A 96-of-128 rotary: the same descriptor with a narrower rotation is another module.
         let partial = QkNormRopeDescriptor {
             rotated: 96,
             ..descriptor(true)

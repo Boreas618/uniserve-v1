@@ -1,8 +1,8 @@
 //! `unpatchify_video`: packed latent tokens into a planar raster, and back out again.
 //!
-//! The video VAE's decoder does not read the DiT's packed rows: it reads a `[channels, frames,
-//! height, width]` raster, and the decoder's own output is the same kind of raster with a wider
-//! patch. One operator covers both directions the model needs, because they are one index arithmetic
+//! A latent decoder does not read a diffusion transformer's packed rows: it reads a
+//! `[channels, frames, height, width]` raster, and the decoder's own output is the same kind of
+//! raster with a wider patch. One operator covers both directions the model needs, because they are one index arithmetic
 //! with different patch shapes:
 //!
 //! ```text

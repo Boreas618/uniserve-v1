@@ -19,8 +19,8 @@
 //! rounded one, as the reference does. A launch may also record each program's largest normalized
 //! magnitude, an FP32 vector the caller reduces.
 //!
-//! The residual and the rows a projection reads may be two element types: the video VAE's decoder
-//! holds its stream in FP32 while its projections read and write FP16, which is what the reference's
+//! The residual and the rows a projection reads may be two element types: a block may hold
+//! its stream in FP32 while its projections read and write FP16, which is what a reference's
 //! autocast does to these same kernels. Each descriptor's `dtype` is the residual's and the learned
 //! vectors', and `activation` is the type of the update and of the normalized rows; a key names it
 //! only when the two differ, so every single-type key is the key it always was.

@@ -11,8 +11,8 @@
 //! quantize(scaled) = round_half_to_even(clamp(scaled, 0, 255))        as u8
 //! ```
 //!
-//! **The arithmetic is FP32 throughout**, whatever the input's element type — the decoders emit f16
-//! (the video VAE's raster is `float16`, its own state buffer type), so f16 is the element type
+//! **The arithmetic is FP32 throughout**, whatever the input's element type — a decoder emits f16
+//! (its raster is `float16`, its own state buffer type), so f16 is the element type
 //! this operator is declared for, with bf16 and f32 accepted because the arithmetic is the same
 //! either way: the normalized pixels convert to `float32` before the de-normalization and the
 //! clamp, and the same order matters here — a BF16 multiply then a BF16 add would round twice

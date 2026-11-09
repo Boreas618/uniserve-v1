@@ -1420,7 +1420,7 @@ mod tests {
         }
     }
 
-    /// A BF16 causal decode module of Qwen3-30B-A3B at TP=8, page size 64.
+    /// A BF16 causal decode module of 32 query and 4 KV heads of 128 at TP=8, page size 64.
     fn decode() -> Descriptor {
         Descriptor {
             phase: Phase::Decode,

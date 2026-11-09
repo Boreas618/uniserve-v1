@@ -597,12 +597,12 @@ impl Checkpoint {
 
     /// What a load has asked this checkpoint for, and what it has left alone.
     ///
-    /// A component of a multi-component export legitimately reads a subset of what its shards hold —
-    /// a video VAE's per-layer `scale1`/`scale2`, a tied head, the calibration fields of a layer the
-    /// model runs dense — so a non-empty [`Reading::unread`] is a **report and never a refusal**. It
-    /// answers the one question a half-read export leaves open: when the numbers are wrong, which
-    /// tensors did nobody ask for. It is device-free: it needs the claims the index states, not the
-    /// tensors' values.
+    /// A component of a multi-component export legitimately reads a subset of what its shards hold
+    /// — a second calibration scheme's per-layer `scale1`/`scale2`, a tied head, the calibration
+    /// fields of a layer the model runs dense — so a non-empty [`Reading::unread`] is a **report
+    /// and never a refusal**. It answers the one question a half-read export leaves open: when the
+    /// numbers are wrong, which tensors did nobody ask for. It is device-free: it needs the claims
+    /// the index states, not the tensors' values.
     ///
     /// A pipeline root holds no tensors of its own, so its answer is its components', each name
     /// qualified `component/name` — two components may hold one name each.

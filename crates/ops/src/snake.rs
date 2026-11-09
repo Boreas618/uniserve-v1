@@ -1,19 +1,20 @@
-//! `Snake`: the periodic activation of the H3 audio VAE, elementwise over `[rows, channels, width]`.
+//! `Snake`: a periodic activation with one linear parameter per channel, elementwise over
+//! `[rows, channels, width]`.
 //!
 //! ```text
 //! out = x + sin²(α · x) / (α + 1e-9)
 //! ```
 //!
 //! `α` is `[channels]`, stored as it is used (not in log space), one frequency and reciprocal gain per
-//! channel: the audio VAE decoder's activation holds a single
+//! channel: the reference activation holds a single
 //! `nn.Parameter(torch.ones(1, channels, 1))` and evaluates exactly the formula above. The
 //! epsilon keeps the reciprocal finite for a zero frequency; it is part of the formula and not a
 //! guard a kernel may drop.
 //!
-//! This is the H3 decoder's activation and is **not** SnakeBeta: BigVGAN-style blocks store a
+//! This activation is **not** SnakeBeta: BigVGAN-style blocks store a
 //! frequency and a gain separately, in log space (`x + sin²(exp(α)·x)/(exp(β) + 1e-9)`, which
 //! `audio_activation` applies inside its resample),
-//! while H3's audio VAE stores one linear parameter that serves as both. The two have different
+//! while this one stores one linear parameter that serves as both. The two have different
 //! parameters, so folding them behind a flag would make one operator read a weight the other's
 //! checkpoint does not have.
 //!
@@ -24,7 +25,7 @@
 //!
 //! The result is elementwise, so its tolerance is the output's own rounding plus one envelope: the
 //! two implementations evaluate the same formula with their own `sin` and their own reciprocal, each
-//! accurate to about one ulp of its result, and over the decoder's envelope `|α·x| ≤ 8` and
+//! accurate to about one ulp of its result, and over the envelope `|α·x| ≤ 8` and
 //! `α + 1e-9 ≥ 1` an ulp of `sin²` is bounded by an ulp of the value 1.
 
 use std::fmt;
@@ -74,7 +75,7 @@ pub struct Args {
     pub out: TensorView,
 }
 
-/// The periodic activation of the H3 audio decoder.
+/// The periodic activation `x + sin²(α·x)/(α + 1e-9)`, one linear `α` per channel.
 pub struct Snake;
 
 impl Op for Snake {

@@ -80,7 +80,7 @@ pub struct Nvfp4Names {
 impl Nvfp4Names {
     /// The vLLM/ModelOpt spelling: `weight`, `weight_scale`, `weight_scale_2`, `input_scale`.
     ///
-    /// This is what a Qwen3-MoE calibrated checkpoint states.
+    /// This is what a ModelOpt export for vLLM states.
     pub const fn vllm() -> Self {
         Self {
             export: "vLLM ModelOpt",
@@ -94,9 +94,9 @@ impl Nvfp4Names {
     /// The diffusers/ModelOpt spelling: `weight_packed`, `weight_scale`, `weight_tensor_scale`,
     /// `input_scale`.
     ///
-    /// This is what the FastH3 export states, in every component that is quantized (its
-    /// `transformer` and `vae` state 100 and 216 packed projections respectively), and its VAE adds
-    /// `scale1`/`scale2` beside them for the layers ModelOpt calibrated in a second scheme.
+    /// This is what a multi-component diffusers NVFP4 export states, in every component it
+    /// quantizes (e.g. a `transformer` and a `vae`), and a component may add `scale1`/`scale2`
+    /// beside them for the layers ModelOpt calibrated in a second scheme.
     pub const fn diffusers() -> Self {
         Self {
             export: "diffusers ModelOpt",

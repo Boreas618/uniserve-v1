@@ -15,9 +15,9 @@
 //! are the reference's constants; `-30` is why an encoder variance of `1e-40` still conditions.
 //!
 //! The **per-channel affine is not here**. Normalising by `latents_std` and `latents_mean` is a
-//! diagonal `1×1` convolution — the same layer the audio decoder already composes for exactly this
-//! arithmetic — and an operator that fused it would make this kernel's arithmetic depend on a weight
-//! layout. This operator ends at the round trip; the caller applies the affine.
+//! diagonal `1×1` convolution — the same layer a decoder composes for exactly this arithmetic — and
+//! an operator that fused it would make this kernel's arithmetic depend on a weight layout. This
+//! operator ends at the round trip; the caller applies the affine.
 //!
 //! `tolerance` is exact, on `cross_fade`'s precedent: the arithmetic above *is* the specification, so
 //! two implementations of it agree bit for bit or one of them is wrong.

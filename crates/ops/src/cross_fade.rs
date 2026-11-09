@@ -1,6 +1,6 @@
 //! `cross_fade`: the seam between two decoded tiles, blended over their overlap.
 //!
-//! The video decoder decodes overlapping tiles and blends their shared band so the seam does not
+//! A tiled decoder decodes overlapping tiles and blends their shared band so the seam does not
 //! show. The reference's weights are not floats derived at run time but the integer ratio of the
 //! position, `i/extent`, evaluated in the decoded dtype — which is what the reference's own arithmetic
 //! does, and reproducing it exactly is the difference between a fade and a slightly different fade

@@ -98,7 +98,7 @@ pub enum DType {
     F8E4M3 = 6,
     /// NVFP4 E2M1, two values in one byte.
     F4E2M1 = 7,
-    /// Signed 16-bit integer: the audio decoders' PCM output element.
+    /// Signed 16-bit integer: the 16-bit PCM sample element.
     I16 = 8,
 }
 

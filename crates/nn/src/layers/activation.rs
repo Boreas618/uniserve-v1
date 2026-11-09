@@ -11,8 +11,8 @@
 //! Rounding::ValueProduct  out = round((value · gate) / (1 + exp(−gate)))    swiglu, value_first_swiglu
 //! ```
 //!
-//! The three orders round differently, so a model keeps the one its reference computes: the H3 DiT,
-//! refiner and VAE evaluate the activation and the product as separate rounded steps; the
+//! The three orders round differently, so a model keeps the one its reference computes: a reference
+//! that evaluates the activation and the product as separate rounded steps keeps `Stepwise`; the
 //! SwiGLU kernels multiply value and gate before dividing by the sigmoid's denominator. A packed
 //! projection under `ValueProduct` is read in one pass with its packed bias; under `Fused` or
 //! `Stepwise` its halves are read as two strided views of the packed rows.
@@ -362,8 +362,8 @@ impl GatedActivation {
 
 /// GELU over a row-major `[rows, columns]` activation.
 ///
-/// H3's audio VAE and its diffusion transformer take PyTorch's tanh form
-/// (`gelu_pytorch_tanh`); a checkpoint whose config says plain `gelu` takes the exact one. They are
+/// A checkpoint whose reference takes PyTorch's tanh form takes `gelu_pytorch_tanh`;
+/// a checkpoint whose config says plain `gelu` takes the exact one. They are
 /// separate compilations, so the layer states which it is (`ops::gelu`).
 pub struct Gelu {
     approximation: ops::gelu::Approximation,
@@ -417,9 +417,9 @@ impl Gelu {
     }
 }
 
-/// The audio VAE's periodic activation, `x + sin²(α·x)/(α + 1e-9)`, one frequency per channel.
+/// A periodic activation, `x + sin²(α·x)/(α + 1e-9)`, one frequency per channel.
 ///
-/// The encoder's blocks apply it and the decoder's alias-free activation composes it; `α` is the
+/// A block may apply it directly or compose it inside an alias-free activation; `α` is the
 /// checkpoint's raw per-channel parameter, not a log-space pair (`ops::snake`).
 pub struct Snake {
     channels: u64,

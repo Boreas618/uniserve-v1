@@ -1,6 +1,6 @@
 //! Video Sparse Attention: complete block-sparse attention over selected key blocks.
 //!
-//! H3's video backbone does not attend densely: every query tile keeps a small set of `tile`-row
+//! A video transformer need not attend densely: every query tile keeps a small set of `tile`-row
 //! key blocks, chosen per head and per query tile by a score the caller computes. This operator
 //! evaluates exactly the selected blocks and nothing else, so its cost follows the selection rather
 //! than the sequence length.
@@ -551,7 +551,7 @@ impl Op for SparseAttention {
 mod tests {
     use super::*;
 
-    /// The SM100 64-row build H3's video backbone runs, BF16 out, with the normalizer.
+    /// The SM100 64-row build of 128-wide heads, BF16 out, with the normalizer.
     fn block64() -> SparseDescriptor {
         SparseDescriptor {
             block: 64,

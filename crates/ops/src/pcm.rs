@@ -1,6 +1,6 @@
-//! `pcm_interleave`: the audio decoder's last step, from two float channels to interleaved i16.
+//! `pcm_interleave`: a waveform's last step, from two float channels to interleaved i16.
 //!
-//! The decoder ends with one `[samples]` float channel per side, and the artifact is 16-bit PCM with
+//! A waveform ends with one `[samples]` float channel per side, and the artifact is 16-bit PCM with
 //! the sides interleaved — left, right, left, right. Writing it is one arithmetic per sample, but it
 //! is the step whose rounding is audible if it is wrong, so it is a device program with the
 //! quantization written out rather than host code beside the graph:

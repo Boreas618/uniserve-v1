@@ -16,8 +16,8 @@
 //! host conversion.
 //!
 //! The paged cache is [`KvView`]: one entry per attention group, each with its block table, its
-//! page geometry and its per-layer key/value planes. A model with one attention type (Qwen3-MoE) has
-//! one group; a model whose blocks attend differently has one per group.
+//! page geometry and its per-layer key/value planes. A model with one attention type has one group;
+//! a model whose blocks attend differently has one per group.
 
 use ops::PhaseKind;
 
@@ -535,8 +535,8 @@ pub struct LatentShape {
 ///   hold values that never change for a model — an AdaLN cache folded once from the weights — so
 ///   they are filled once per load and read by every capture. The forward is capture-safe: it reads
 ///   nothing back and synchronizes nothing.
-/// - **layout** ([`Denoiser::layout_tables`]) is per *layout* and needs no request: the video VAE's
-///   rotary positions of its raster, the packed row of each clip's latent voxel. These are the
+/// - **layout** ([`Denoiser::layout_tables`]) is per *layout* and needs no request: the rotary
+///   positions of a raster, the packed row of each clip's latent voxel. These are the
 ///   model's mathematical layout, which the worker cannot compute, and they are the same for
 ///   every request of one shape — so they are filled once per layout
 ///   ([`Denoiser::prepare_layout`], host values only) and shared.
@@ -991,11 +991,11 @@ pub trait Denoiser {
     /// The width of [`Conditioning::text`]'s rows, when it is not the encoder's.
     ///
     /// `text` is what the denoiser reads and `source` is what the text encoder wrote, and a model
-    /// whose conditioner **widens** its input has two widths: H3's refiner projects the encoder's
-    /// 5120 columns into the stack's 5376, so a runner that sized both buffers from the encoder's
-    /// width hands the conditioner one too narrow for its own output - which no launch refuses until
-    /// the packed rows are gathered, one operator later, as `out is [rows, 5376], [rows, 5120]
-    /// expected`.
+    /// whose conditioner **widens** its input has two widths: a conditioner may project the
+    /// encoder's 5120 columns into the stack's 5376, so a runner that sized both buffers from the
+    /// encoder's width hands the conditioner one too narrow for its own output - which no launch
+    /// refuses until the packed rows are gathered, one operator later, as `out is [rows, 5376],
+    /// [rows, 5120] expected`.
     ///
     /// `None` means one width: no conditioner, or a conditioner that keeps the encoder's.
     fn text_width(&self) -> Option<u32> {
@@ -1089,7 +1089,7 @@ pub trait Denoiser {
 
     /// The constants a layout needs, in the order [`Self::prepare_layout`] fills them.
     ///
-    /// These are the layout's alone: the video VAE's per-voxel rotary positions, the packed row of
+    /// These are the layout's alone: the per-voxel rotary positions of a raster, the packed row of
     /// each clip's voxel. They are filled once per layout, not once per request, so the worker
     /// keys its storage by `(layout, name)` beside the request's state and shares one set between
     /// every request of that shape.
