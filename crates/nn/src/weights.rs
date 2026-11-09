@@ -24,16 +24,25 @@
 //! through [`RetainedWeights`], which the worker implements over the Storage Server and its
 //! device mappings. `nn` owns no device memory: a [`Weight`] is a [`Backing`] plus the view the
 //! operator reads.
+//!
+//! ## Meta loading
+//!
+//! [`WeightLoader::meta`] runs the same loading code over the same shard headers and stops where
+//! bytes would be read: it answers every weight's element type and extents at a synthetic address
+//! and publishes nothing, so a recording walk of a model's load needs no payload and no device.
 
-use std::collections::BTreeMap;
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ops::fp4::ScaleLayout;
 use ops::{DType, Shape, TensorView};
 use sha2::{Digest, Sha256};
 
-use crate::checkpoint::{Checkpoint, FileIdentity};
+use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
 use crate::error::{Error, Result};
+use crate::forward::ALIGNMENT;
 use crate::tensor::{Backing, DevicePtr};
 
 /// The suffix one export spells each field of a calibrated NVFP4 projection with.
@@ -531,101 +540,6 @@ pub trait RetainedWeights {
     }
 }
 
-/// A retained store in host memory: a model loaded, and asked for what it would launch, with no
-/// device.
-///
-/// A loading audit — which programs a model's request space needs, which keys its layers build, what
-/// a checkpoint's mapping produces — is a question about shapes, dtypes and layouts. None of it needs
-/// a device: the checkpoint is host-mapped, `WeightLoader` converts on the host, and a store that
-/// keeps the bytes in host memory is enough to build every layer and ask each for its descriptor.
-///
-/// The addresses it answers are **host** addresses, which is why the type is named for the host and
-/// not for storage in general: a view carved from one is a shape and an element type, and a call that
-/// launches it would hand a host pointer to a device. A model built over this store is for
-/// enumeration, never for execution.
-pub struct HostStore {
-    /// One buffer per published region, eight-byte aligned so any element type can be read from it.
-    buffers: Vec<Vec<u64>>,
-    /// The regions, in publication order, with the key each was published under.
-    published: Vec<(WeightKey, Backing)>,
-}
-
-impl HostStore {
-    /// An empty store.
-    pub fn new() -> Self {
-        Self {
-            buffers: Vec::new(),
-            published: Vec::new(),
-        }
-    }
-
-    /// How many regions the store holds.
-    pub fn len(&self) -> usize {
-        self.published.len()
-    }
-
-    /// Whether the store holds nothing.
-    pub fn is_empty(&self) -> bool {
-        self.published.is_empty()
-    }
-
-    /// The keys of every published region, in publication order.
-    pub fn keys(&self) -> impl Iterator<Item = &WeightKey> {
-        self.published.iter().map(|(key, _)| key)
-    }
-}
-
-impl Default for HostStore {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl RetainedWeights for HostStore {
-    fn retained(&mut self, key: &WeightKey) -> Result<Option<Backing>> {
-        Ok(self
-            .published
-            .iter()
-            .find(|(published, _)| published == key)
-            .map(|(_, backing)| *backing))
-    }
-
-    fn publish(
-        &mut self,
-        key: &WeightKey,
-        _dtype: DType,
-        _shape: Shape,
-        bytes: &[u8],
-    ) -> Result<Backing> {
-        // Publishing the same key twice answers the first region: a store that replaced it would
-        // hand two layers two buffers for one weight, and the second load would silently win.
-        if let Some((_, backing)) = self
-            .published
-            .iter()
-            .find(|(published, _)| published == key)
-        {
-            return Ok(*backing);
-        }
-        let words = bytes.len().div_ceil(8);
-        let mut buffer = vec![0_u64; words];
-        // SAFETY: the buffer has been sized to hold `bytes.len()` bytes rounded up to whole words,
-        // and both pointers are valid for that many bytes with no overlap: the source is the
-        // caller's slice and the destination is a buffer this function owns.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                buffer.as_mut_ptr().cast::<u8>(),
-                bytes.len(),
-            );
-        }
-        let address = DevicePtr::new(buffer.as_ptr() as u64);
-        let backing = Backing::new(address, bytes.len() as u64);
-        self.buffers.push(buffer);
-        self.published.push((key.clone(), backing));
-        Ok(backing)
-    }
-}
-
 /// The arrangement of a calibrated matrix's packed E2M1 values.
 ///
 /// The values are two codes a byte along the contraction whichever arrangement they are in; what
@@ -942,17 +856,118 @@ impl Weight {
     }
 }
 
+/// The first address a meta loader hands out.
+///
+/// Far above the counting arena's base (`1 << 40`, `forward.rs`), so a weight view and an
+/// activation view of one recorded walk never share an address, and far from zero, so no weight
+/// view reads as a null pointer to an argument check.
+const META_BASE: u64 = 1 << 48;
+
+/// The next address a meta loader hands out.
+///
+/// Every meta loader of the process draws from this one cursor, so two loaders of one walk (one per
+/// pipeline component, say) never answer one address for two different weights.
+static META_CURSOR: AtomicU64 = AtomicU64::new(META_BASE);
+
+/// The tensor scale a meta loader answers for every calibrated scale it is asked for.
+///
+/// A meta loader reads no payload, so it has no scale to answer; one is a positive, finite number,
+/// so every check a caller makes on a scale passes, and a value derived from it is a valid one. A
+/// scale only ever reaches a kernel as data (a launch scalar or a published table), so a recorded
+/// walk over this placeholder states the same programs as a device load over the real scales.
+const META_TENSOR_SCALE: f32 = 1.0;
+
+/// The synthetic regions a meta loader answered, by the key a device load would publish them under.
+///
+/// A key answered once is answered again with the same region, as a retained store answers a key it
+/// already holds, so two layers that share a weight on the device share its view here too.
+#[derive(Default)]
+struct MetaRegions {
+    regions: HashMap<WeightKey, Backing>,
+}
+
+impl MetaRegions {
+    /// The region answered for `key`, when one was.
+    fn retained(&self, key: &WeightKey) -> Option<Backing> {
+        self.regions.get(key).copied()
+    }
+
+    /// A fresh region of `bytes` bytes at an [`ALIGNMENT`]-aligned synthetic address.
+    ///
+    /// `retain` files it under `key` for a later [`Self::retained`]; a writable table is this
+    /// load's own and is never answered twice, as on the device.
+    fn reserve(&mut self, key: &WeightKey, bytes: u64, retain: bool) -> Result<Backing> {
+        // Every region takes at least one granule, so even an empty weight has an address no other
+        // weight shares.
+        let span = bytes
+            .max(1)
+            .checked_next_multiple_of(ALIGNMENT)
+            .ok_or_else(|| Error::weight(&key.region.to_string(), "the weight's bytes overflow"))?;
+        let address = META_CURSOR.fetch_add(span, Ordering::Relaxed);
+        if address.checked_add(span).is_none() {
+            return Err(Error::weight(
+                &key.region.to_string(),
+                "the meta loader's synthetic address range is exhausted",
+            ));
+        }
+        let backing = Backing::new(DevicePtr::new(address), bytes);
+        if retain {
+            self.regions.insert(key.clone(), backing);
+        }
+        Ok(backing)
+    }
+}
+
+/// Where a loader's weights go.
+enum Retention<'a> {
+    /// Retained storage, which converted bytes are published to: a device load.
+    Store(&'a mut dyn RetainedWeights),
+    /// Synthetic regions, owned by a loader [`WeightLoader::meta`] built.
+    Meta(MetaRegions),
+    /// The synthetic regions of the meta loader this one was reborrowed from.
+    MetaBorrowed(&'a mut MetaRegions),
+}
+
+/// One contiguous byte range of a checkpoint tensor that a weight's bytes are gathered from.
+///
+/// A load plans its spans from the shard headers alone, so every bound a device load checks is
+/// checked by a meta load too, without a payload byte read; a device load then copies the spans in
+/// order.
+struct Span<'c> {
+    location: &'c TensorLocation,
+    /// The first byte, within the tensor's own bytes.
+    from: usize,
+    /// One past the last byte, within the tensor's own bytes.
+    to: usize,
+}
+
+/// How many bytes the shard's header states `location` holds.
+///
+/// `Checkpoint::open` has checked the range against the tensor's extents and element width and
+/// against the shard's length, so this is the length of the slice [`Checkpoint::bytes`] answers.
+fn stored_bytes(location: &TensorLocation) -> u64 {
+    location.bytes.1 - location.bytes.0
+}
+
 /// The boundary between a checkpoint and retained storage: converts a weight once and publishes it.
+///
+/// A loader is one of two kinds, and both run the same decisions over the same shard headers:
+///
+/// - a **device** loader ([`WeightLoader::new`]) reads each tensor's payload, converts it and
+///   publishes it to a [`RetainedWeights`] store;
+/// - a **meta** loader ([`WeightLoader::meta`]) reads no payload and publishes nothing: every weight
+///   it answers has the element type and extents the device load answers, at a synthetic address.
+///
+/// Every refusal a device load decides from a tensor's name, element type or extents is a meta
+/// load's refusal too. Only a refusal that depends on a tensor's values (an all-zero matrix asked
+/// to hold a value, a zero or non-finite tensor scale) is a device load's alone.
 pub struct WeightLoader<'a> {
-    /// The checkpoint the weights come from, or `None` for a loader that states shapes only.
-    checkpoint: Option<&'a Checkpoint>,
-    store: Option<&'a mut dyn RetainedWeights>,
+    /// The checkpoint the weights come from.
+    checkpoint: &'a Checkpoint,
+    /// Where the weights go: retained storage, or synthetic regions.
+    retention: Retention<'a>,
     dtype: Option<DType>,
     quantization: Option<Quantization>,
-    /// The checkpoint tensors' extents, when a shapes-only loader states them from a table instead of
-    /// from a checkpoint's headers. A computed weight — the folded form of a weight-normalized
-    /// convolution — has no request to take its extents from, so it is answered from here.
-    extents: Option<&'a BTreeMap<String, (DType, Shape)>>,
 }
 
 impl<'a> WeightLoader<'a> {
@@ -967,98 +982,117 @@ impl<'a> WeightLoader<'a> {
         quantization: Option<Quantization>,
     ) -> Self {
         Self {
-            checkpoint: Some(checkpoint),
-            store: Some(store),
+            checkpoint,
+            retention: Retention::Store(store),
             dtype,
             quantization,
-            extents: None,
         }
     }
 
-    /// A loader that states every weight's extents and reads nothing.
+    /// A loader over `checkpoint` that reads no tensor payload and publishes nothing.
     ///
-    /// `load` answers each request with a view of the requested element type and shape at address
-    /// zero, `constant` with the shape it was given, and every path that would need bytes — a
-    /// checkpoint read, a retained-store round trip, a block scale — refuses by name. The caller is a
-    /// model's `load` driven by a **recording** forward (`Forward::recording`): the shapes a load
-    /// derives are what decide the programs a model launches, and the values never reach a kernel. So
-    /// a walk of a model's programs needs no shards and no device.
-    /// The checkpoint this loader reads, when it reads one.
+    /// Each weight's element type and extents come from the shard headers [`Checkpoint::open`]
+    /// already parsed, and `dtype` and `quantization` are the same precision choices
+    /// [`WeightLoader::new`] takes. Every method answers what the device load of the same request
+    /// answers — the same element type, the same extents, the same representation (dense or NVFP4
+    /// fields, the block-scale type the checkpoint stores, the published layout) and the same
+    /// refusals — because it runs the device load's own code up to the point where bytes would be
+    /// read. The views it answers sit at distinct, [`ALIGNMENT`]-aligned, non-null synthetic
+    /// addresses that no memory backs; a weight's key answers the same view twice, as a retained
+    /// store answers a key it holds.
     ///
-    /// A shapes-only loader has none: it states extents and reads nothing, so a caller that needs a
-    /// fact only a shard holds must say what it does without it.
-    pub fn checkpoint(&self) -> Option<&Checkpoint> {
-        self.checkpoint
-    }
-
-    pub fn shapes(dtype: DType) -> Self {
-        Self::stated(dtype, None)
-    }
-
-    /// A shapes-only loader that also states the checkpoint tensors' extents from `extents`.
-    ///
-    /// A weight a module merely reads takes its extents from the request, so a shapes-only loader needs
-    /// no table for it. A weight **computed at load** does: the folded form of a weight-normalized
-    /// convolution reduces `v · g / ‖v‖`, and `v`'s extents are a fact of the checkpoint's header. The
-    /// table is that header's content — produced where the weights are, used where they are not — so a
-    /// walk needs no shard while still stating the shapes the checkpoint really holds.
-    pub fn stated(dtype: DType, extents: Option<&'a BTreeMap<String, (DType, Shape)>>) -> Self {
+    /// What a meta load cannot answer is a tensor's **value**: [`Self::tensor_scale`] answers a
+    /// placeholder of one, a value-dependent refusal does not run, and the bytes of a computed
+    /// constant derived from a placeholder are not the device's. The caller is a model's load driven
+    /// by a recording forward, which launches nothing and reads no weight: the shapes and element
+    /// types decide the programs a model launches, and the values never enter a program key.
+    pub fn meta(
+        checkpoint: &'a Checkpoint,
+        dtype: Option<DType>,
+        quantization: Option<Quantization>,
+    ) -> Self {
         Self {
-            checkpoint: None,
-            store: None,
-            dtype: Some(dtype),
-            quantization: None,
-            extents,
+            checkpoint,
+            retention: Retention::Meta(MetaRegions::default()),
+            dtype,
+            quantization,
         }
-    }
-
-    /// Whether this loader reads a checkpoint, or only states shapes.
-    pub const fn is_shapes(&self) -> bool {
-        self.checkpoint.is_none()
     }
 
     /// The checkpoint this loader reads.
-    fn shards(&self) -> Result<&'a Checkpoint> {
-        self.checkpoint.ok_or_else(|| {
-            Error::Unsupported(format!(
-                "this loader states weights' shapes and reads no checkpoint: {}",
-                "a weight's bytes were asked for"
-            ))
-        })
+    pub fn checkpoint(&self) -> &'a Checkpoint {
+        self.checkpoint
     }
 
-    /// The retained store this loader publishes into.
-    fn retention(&mut self) -> Result<&mut (dyn RetainedWeights + 'a)> {
-        match self.store.as_deref_mut() {
-            Some(store) => Ok(store),
-            None => Err(Error::Unsupported(
-                "this loader states weights' shapes and retains nothing".to_owned(),
-            )),
-        }
+    /// Whether this loader answers synthetic regions instead of reading and publishing.
+    fn is_meta(&self) -> bool {
+        !matches!(self.retention, Retention::Store(_))
+    }
+
+    /// The weight already held under `key`, viewed as `shape` elements of its type.
+    fn retained(&mut self, key: &WeightKey, shape: Shape) -> Result<Option<Weight>> {
+        let backing = match &mut self.retention {
+            Retention::Store(store) => store.retained(key)?,
+            Retention::Meta(regions) => regions.retained(key),
+            Retention::MetaBorrowed(regions) => regions.retained(key),
+        };
+        backing
+            .map(|backing| {
+                Ok(Weight {
+                    view: backing.view(key.dtype, shape)?,
+                    backing,
+                })
+            })
+            .transpose()
+    }
+
+    /// Publish the weight of `key`, `shape` elements of `key.dtype`, and answer its view.
+    ///
+    /// `bytes` produces the converted bytes from the checkpoint's payload; only a device loader
+    /// calls it, so everything a meta load must decide happens before this call. A `writable` table
+    /// goes to the store's writable regions and is never answered for a later key.
+    fn publish_with<'c>(
+        &mut self,
+        key: &WeightKey,
+        shape: Shape,
+        writable: bool,
+        bytes: impl FnOnce(&Self) -> Result<Cow<'c, [u8]>>,
+    ) -> Result<Weight> {
+        let backing = if self.is_meta() {
+            let element = key.dtype.bytes().ok_or_else(|| {
+                Error::weight(
+                    &key.region.to_string(),
+                    format!("{} has no whole-byte element size", key.dtype),
+                )
+            })?;
+            let length = shape.numel().checked_mul(element).ok_or_else(|| {
+                Error::weight(&key.region.to_string(), "the weight's bytes overflow")
+            })?;
+            match &mut self.retention {
+                Retention::Meta(regions) => regions.reserve(key, length, !writable)?,
+                Retention::MetaBorrowed(regions) => regions.reserve(key, length, !writable)?,
+                Retention::Store(_) => unreachable!("a store-backed loader is not a meta loader"),
+            }
+        } else {
+            let produced = bytes(self)?;
+            match &mut self.retention {
+                Retention::Store(store) if writable => {
+                    store.writable(key, key.dtype, shape, &produced)?
+                }
+                Retention::Store(store) => store.publish(key, key.dtype, shape, &produced)?,
+                Retention::Meta(_) | Retention::MetaBorrowed(_) => {
+                    unreachable!("a meta loader publishes nothing")
+                }
+            }
+        };
+        Ok(Weight {
+            view: backing.view(key.dtype, shape)?,
+            backing,
+        })
     }
 
     /// Load `request`, converting and publishing it the first time and reusing it afterwards.
     pub fn load(&mut self, request: &WeightRequest) -> Result<Weight> {
-        // A shapes-only loader states the extents a launch reads and reads no bytes at all.
-        if self.is_shapes() {
-            let dtype = request.pinned.or(self.dtype).ok_or_else(|| {
-                Error::weight(
-                    &request.tensor,
-                    "a shapes-only loader has no checkpoint to read the element type from"
-                        .to_owned(),
-                )
-            })?;
-            let bytes = request
-                .shape
-                .numel()
-                .checked_mul(dtype.bytes().unwrap_or(0))
-                .ok_or_else(|| Error::weight(&request.tensor, "the weight's bytes overflow"))?;
-            let backing = Backing::new(DevicePtr::new(0), bytes);
-            return Ok(Weight {
-                view: backing.view(dtype, request.shape)?,
-                backing,
-            });
-        }
         if self.quantization.is_some() {
             return Err(Error::Unsupported(format!(
                 "quantization `{}` is converted at load only for the FP8 and NVFP4 step; the BF16 \
@@ -1124,59 +1158,71 @@ impl<'a> WeightLoader<'a> {
             provenance: None,
         };
 
-        if let Some(backing) = self.retention()?.retained(&key)? {
-            return Ok(Weight {
-                view: backing.view(dtype, request.shape)?,
-                backing,
-            });
+        if let Some(weight) = self.retained(&key, request.shape)? {
+            return Ok(weight);
         }
 
-        let bytes = self.source_bytes(&request.source, &key)?;
-        // The region's own bytes, before any conversion: one read, which this load was doing
-        // anyway, so the sentence costs no second pass over the shard.
-        if request.nonzero && bytes.iter().all(|byte| *byte == 0) {
-            return Err(Error::weight(
-                &request.tensor,
-                "every stored byte of the region is zero: the product would answer zeros for every \
-                 activation, so this tensor is missing its export"
-                    .to_owned(),
-            ));
+        // The bytes the request names, planned from the headers: every bound below is checked on
+        // a meta load as on a device load, and only the copy waits for the publish.
+        let spans = self.spans(&request.source, &key)?;
+        if source_dtype != dtype {
+            conversion(source_dtype, dtype, &request.tensor)?;
         }
-        // The key carries the retained element type; the bytes still hold the checkpoint's, so the
-        // conversion is decided by the source, not by the key.
-        let bytes = if source_dtype != dtype {
-            convert(source_dtype, dtype, &bytes, &request.tensor)?
-        } else {
-            bytes
-        };
+        let source_element = source_dtype.bytes().ok_or_else(|| {
+            Error::weight(
+                &request.tensor,
+                format!("{source_dtype} has no whole-byte size"),
+            )
+        })?;
+        let element = dtype.bytes().ok_or_else(|| {
+            Error::weight(
+                &request.tensor,
+                format!("{dtype} has no whole-byte element size"),
+            )
+        })?;
         let expected = request
             .shape
             .numel()
-            .checked_mul(dtype.bytes().ok_or_else(|| {
-                Error::weight(
-                    &request.tensor,
-                    format!("{dtype} has no whole-byte element size"),
-                )
-            })?)
+            .checked_mul(element)
             .ok_or_else(|| Error::weight(&request.tensor, "the weight's bytes overflow"))?;
-        if bytes.len() as u64 != expected {
+        let read = spans
+            .iter()
+            .map(|span| (span.to - span.from) as u64)
+            .sum::<u64>();
+        // A conversion keeps the element count and changes its width.
+        let converted = read / source_element * element;
+        if converted != expected {
             return Err(Error::weight(
                 &request.tensor,
                 format!(
-                    "{} bytes were read, {expected} expected for {:?} of {dtype}",
-                    bytes.len(),
+                    "{converted} bytes were read, {expected} expected for {:?} of {dtype}",
                     request.shape.dims()
                 ),
             ));
         }
-
         check_layout(&request.tensor, &request.source, request.layout)?;
-        let backing = self
-            .retention()?
-            .publish(&key, dtype, request.shape, &bytes)?;
-        Ok(Weight {
-            view: backing.view(dtype, request.shape)?,
-            backing,
+
+        let tensor = &request.tensor;
+        let nonzero = request.nonzero;
+        self.publish_with(&key, request.shape, false, |loader| {
+            let bytes = loader.gather(&spans)?;
+            // The region's own bytes, before any conversion: one read, which this load was doing
+            // anyway, so the sentence costs no second pass over the shard.
+            if nonzero && bytes.iter().all(|byte| *byte == 0) {
+                return Err(Error::weight(
+                    tensor,
+                    "every stored byte of the region is zero: the product would answer zeros for \
+                     every activation, so this tensor is missing its export"
+                        .to_owned(),
+                ));
+            }
+            // The key carries the retained element type; the bytes still hold the checkpoint's, so
+            // the conversion is decided by the source, not by the key.
+            if source_dtype != dtype {
+                Ok(Cow::Owned(convert(source_dtype, dtype, &bytes, tensor)?))
+            } else {
+                Ok(Cow::Owned(bytes))
+            }
         })
     }
 
@@ -1187,53 +1233,13 @@ impl<'a> WeightLoader<'a> {
     /// 1]`). The weight the convolution reads is `v · g / ‖v‖`, where the norm reduces every axis
     /// but the first per channel; spec 9 computes it once at loading, so a loaded model never
     /// carries the pair. The computation is FP32 and the result keeps the checkpoint's element type
-    /// unless the loader was given another.
+    /// unless the loader was given another. Its extents are `v`'s, as the header states them.
     ///
     /// `name` is the logical tensor the key records; the key also names both sources, so it cannot
     /// be confused with a plain region of either.
     pub fn weight_norm(&mut self, name: &str, v: &str, g: &str) -> Result<Weight> {
-        if self.is_shapes() {
-            // The folded weight keeps `v`'s extents and one gain per output channel; both are facts of
-            // the checkpoint's header, which the table states.
-            let extents = self.extents.ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "{name}: this loader states shapes but holds no table of the checkpoint's \
-                     extents, and a weight-normalized weight's extents are not in any request"
-                ))
-            })?;
-            let (value_dtype, shape) = extents.get(v).copied().ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "{name}: the extents table does not name `{v}`, which the folded weight is read from"
-                ))
-            })?;
-            let (_, gain) = extents.get(g).copied().ok_or_else(|| {
-                Error::Unsupported(format!(
-                    "{name}: the extents table does not name `{g}`, which carries the gain"
-                ))
-            })?;
-            if gain.numel() != shape.dim(0) {
-                return Err(Error::weight(
-                    name,
-                    format!(
-                        "a gain of {} elements for {} output channels",
-                        gain.numel(),
-                        shape.dim(0)
-                    ),
-                ));
-            }
-            let dtype = self.dtype.unwrap_or(value_dtype);
-            let bytes = shape
-                .numel()
-                .checked_mul(dtype.bytes().unwrap_or(0))
-                .ok_or_else(|| Error::weight(name, "the weight's bytes overflow".to_owned()))?;
-            let backing = Backing::new(DevicePtr::new(0), bytes);
-            return Ok(Weight {
-                view: backing.view(dtype, shape)?,
-                backing,
-            });
-        }
-        let value = self.shards()?.read(v)?;
-        let gain = self.shards()?.read(g)?;
+        let value = self.checkpoint.locate(v)?;
+        let gain = self.checkpoint.locate(g)?;
         if value.shape.rank() == 0 {
             return Err(Error::weight(
                 name,
@@ -1260,6 +1266,12 @@ impl<'a> WeightLoader<'a> {
                 ),
             ));
         }
+        // The fold reads both tensors as FP32 and writes the result back: each of the three is one
+        // conversion this loader must have.
+        conversion(value.dtype, DType::F32, v)?;
+        conversion(gain.dtype, DType::F32, g)?;
+        conversion(DType::F32, dtype, name)?;
+
         let names = vec![v.to_owned(), g.to_owned()];
         let key = WeightKey {
             files: self.identities(&names)?,
@@ -1276,31 +1288,25 @@ impl<'a> WeightLoader<'a> {
 
             provenance: None,
         };
-        if let Some(backing) = self.retention()?.retained(&key)? {
-            return Ok(Weight {
-                view: backing.view(dtype, value.shape)?,
-                backing,
-            });
+        if let Some(weight) = self.retained(&key, value.shape)? {
+            return Ok(weight);
         }
 
-        let values = to_f32(value.dtype, &value.bytes, v)?;
-        let gains = to_f32(gain.dtype, &gain.bytes, g)?;
-        let per_channel = usize::try_from(value.shape.numel() / channels.max(1))
-            .map_err(|_| Error::weight(name, "more elements than a usize".to_owned()))?;
-        let mut normalized = Vec::with_capacity(values.len());
-        for (channel, gain) in gains.iter().enumerate() {
-            let rows = &values[channel * per_channel..][..per_channel];
-            let sum = rows.iter().map(|value| value * value).sum::<f32>();
-            let scale = gain / sum.sqrt();
-            normalized.extend(rows.iter().map(|value| value * scale));
-        }
-        let bytes = from_f32(dtype, &normalized, name)?;
-        let backing = self
-            .retention()?
-            .publish(&key, dtype, value.shape, &bytes)?;
-        Ok(Weight {
-            view: backing.view(dtype, value.shape)?,
-            backing,
+        self.publish_with(&key, value.shape, false, |loader| {
+            let value = loader.checkpoint.read(v)?;
+            let gain = loader.checkpoint.read(g)?;
+            let values = to_f32(value.dtype, &value.bytes, v)?;
+            let gains = to_f32(gain.dtype, &gain.bytes, g)?;
+            let per_channel = usize::try_from(value.shape.numel() / channels.max(1))
+                .map_err(|_| Error::weight(name, "more elements than a usize".to_owned()))?;
+            let mut normalized = Vec::with_capacity(values.len());
+            for (channel, gain) in gains.iter().enumerate() {
+                let rows = &values[channel * per_channel..][..per_channel];
+                let sum = rows.iter().map(|value| value * value).sum::<f32>();
+                let scale = gain / sum.sqrt();
+                normalized.extend(rows.iter().map(|value| value * scale));
+            }
+            Ok(Cow::Owned(from_f32(dtype, &normalized, name)?))
         })
     }
 
@@ -1310,7 +1316,8 @@ impl<'a> WeightLoader<'a> {
     /// A pipeline root holds one component per subdirectory (`transformer/`, `vae/`,
     /// `text_encoder/`, …), each with its own index and its own file identities, so a model crate
     /// opens the root once and reads every component through one store: a weight converted once for
-    /// one component is reused for another and never converted twice.
+    /// one component is reused for another and never converted twice. A meta loader's reborrow is a
+    /// meta loader over the same synthetic regions.
     ///
     /// The policy is the loader's, not the component's, so a component that its policy does not
     /// describe is refused here: an FP8-policy loader over a BF16 component, or a float policy over
@@ -1319,14 +1326,16 @@ impl<'a> WeightLoader<'a> {
     /// builds two loaders over the same store.
     pub fn reborrow<'b>(&'b mut self, checkpoint: &'b Checkpoint) -> Result<WeightLoader<'b>> {
         self.check_policy(checkpoint)?;
-        let dtype = self.dtype;
-        let quantization = self.quantization;
+        let retention = match &mut self.retention {
+            Retention::Store(store) => Retention::Store(&mut **store),
+            Retention::Meta(regions) => Retention::MetaBorrowed(regions),
+            Retention::MetaBorrowed(regions) => Retention::MetaBorrowed(regions),
+        };
         Ok(WeightLoader {
-            checkpoint: Some(checkpoint),
-            store: Some(self.retention()?),
-            dtype,
-            quantization,
-            extents: None,
+            checkpoint,
+            retention,
+            dtype: self.dtype,
+            quantization: self.quantization,
         })
     }
 
@@ -1359,6 +1368,17 @@ impl<'a> WeightLoader<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Run `check` over the checkpoint's payload, on a loader that reads one.
+    ///
+    /// A refusal that depends on a tensor's values rather than its element type or extents can only
+    /// be made with the payload in hand, so it is a device load's alone; a meta load skips it.
+    fn check_values(&self, check: impl FnOnce(&Checkpoint) -> Result<()>) -> Result<()> {
+        if self.is_meta() {
+            return Ok(());
+        }
+        check(self.checkpoint)
     }
 
     /// Load a calibrated NVFP4 matrix: its packed E2M1 values, its block scales and its tensor
@@ -1450,8 +1470,8 @@ impl<'a> WeightLoader<'a> {
         // product would answer zeros for every activation, and a cache filled from it would read as
         // "this projection is broken" long after the loading boundary could have said so. One host
         // read of a few megabytes per projection, at load only, buys that sentence.
-        if !self.is_shapes() {
-            let bytes = self.shards()?.read(&values_request.tensor)?;
+        self.check_values(|checkpoint| {
+            let bytes = checkpoint.read(&values_request.tensor)?;
             if bytes.bytes.iter().all(|byte| *byte == 0) {
                 return Err(Error::weight(
                     &values_request.tensor,
@@ -1464,7 +1484,7 @@ impl<'a> WeightLoader<'a> {
             // an E4M3 scale of zero multiplies its whole block to zero whatever the codes are. One
             // zero scale is legitimate (a block whose values are all zero); every scale zero is a
             // calibration that did not run, and it is invisible in the values themselves.
-            let file_scales = self.shards()?.read(&scales.tensor)?;
+            let file_scales = checkpoint.read(&scales.tensor)?;
             if file_scales.bytes.iter().all(|byte| *byte == 0) {
                 return Err(Error::weight(
                     &scales.tensor,
@@ -1473,7 +1493,8 @@ impl<'a> WeightLoader<'a> {
                         .to_owned(),
                 ));
             }
-        }
+            Ok(())
+        })?;
         // The file's arrangement and the product's are two statements, and the permutation between
         // them happens here once: a kernel must never read a table under a claim it does not meet.
         let scales = if file == product {
@@ -1483,8 +1504,8 @@ impl<'a> WeightLoader<'a> {
             block_scale_dtype(&request.tensor, loaded.dtype())?;
             loaded
         } else {
-            let bytes = self.shards()?.read(&scales.tensor)?;
-            let dtype = block_scale_dtype(&scales.tensor, bytes.dtype)?;
+            let location = self.checkpoint.locate(&scales.tensor)?;
+            let dtype = block_scale_dtype(&scales.tensor, location.dtype)?;
             let blocks = file.columns(columns);
             // The request may name a column block of a row-parallel matrix, so the rows are gathered
             // at its stride before the permutation: permuting the file's first `rows · blocks`
@@ -1502,23 +1523,28 @@ impl<'a> WeightLoader<'a> {
                     ));
                 }
             };
-            let mut linear = Vec::with_capacity((rows * blocks) as usize);
+            // Each row's byte range, checked against the header's length of the tensor: the scales
+            // are one byte each, so elements and bytes are the same offsets.
+            let length = usize::try_from(stored_bytes(location)).unwrap_or(usize::MAX);
+            let mut ranges = Vec::with_capacity(rows as usize);
             for row in 0..rows {
                 let first = start + row * stride;
                 let end = first + blocks;
                 let end = usize::try_from(end).unwrap_or(usize::MAX);
                 let first = usize::try_from(first).unwrap_or(usize::MAX);
-                let row_bytes = bytes.bytes.get(first..end).ok_or_else(|| {
-                    Error::weight(
+                if first > end || end > length {
+                    return Err(Error::weight(
                         &scales.tensor,
-                        format!("elements {first}..{end} of a row are past the tensor's {blocks}-block rows"),
-                    )
-                })?;
-                linear.extend_from_slice(row_bytes);
+                        format!(
+                            "elements {first}..{end} of a row are past the tensor's {blocks}-block rows"
+                        ),
+                    ));
+                }
+                ranges.push(first..end);
             }
-            let arranged = swizzled_scales(&linear, rows, blocks);
             let shape = product.shape(rows, columns);
             let files = self.identities(std::slice::from_ref(&scales.tensor))?;
+            let tensor = &scales.tensor;
             self.publish_computed(
                 WeightKey {
                     files,
@@ -1535,7 +1561,14 @@ impl<'a> WeightLoader<'a> {
                     provenance: None,
                 },
                 shape,
-                &arranged,
+                |loader| {
+                    let bytes = loader.checkpoint.read(tensor)?;
+                    let mut linear = Vec::with_capacity((rows * blocks) as usize);
+                    for range in ranges {
+                        linear.extend_from_slice(&bytes.bytes[range]);
+                    }
+                    Ok(Cow::Owned(swizzled_scales(&linear, rows, blocks)))
+                },
             )?
         };
         let input_scale = match input_scale {
@@ -1574,7 +1607,7 @@ impl<'a> WeightLoader<'a> {
                             provenance: None,
                         },
                         shape,
-                        &bytes,
+                        |_| Ok(Cow::Borrowed(&bytes[..])),
                     )?,
                 )
             }
@@ -1602,7 +1635,7 @@ impl<'a> WeightLoader<'a> {
         field: &str,
         suffix: &str,
     ) -> Result<()> {
-        if self.shards()?.tensor(tensor).is_some() {
+        if self.checkpoint.tensor(tensor).is_some() {
             return Ok(());
         }
         Err(Error::weight(
@@ -1648,18 +1681,27 @@ impl<'a> WeightLoader<'a> {
     /// would encode at an invented magnitude. A projection reads its weight's scale to build the
     /// product's `alpha` and its activation's to build the encoder's operand, so the reading is
     /// public and the reciprocals are its callers'.
+    ///
+    /// The tensor must be one floating number by its header on either kind of loader. A meta loader
+    /// reads no value and answers a placeholder of one; only a device loader refuses a scale that is
+    /// zero, negative or not finite.
     pub fn tensor_scale(&self, request: &WeightRequest) -> Result<f32> {
-        let tensor = self.shards()?.read(&request.tensor)?;
-        if tensor.shape.numel() != 1 || !tensor.dtype.is_float() {
+        let location = self.checkpoint.locate(&request.tensor)?;
+        if location.shape.numel() != 1 || !location.dtype.is_float() {
             return Err(Error::weight(
                 &request.tensor,
                 format!(
                     "a tensor scale is one floating number, not {} {:?}",
-                    tensor.dtype,
-                    tensor.shape.dims()
+                    location.dtype,
+                    location.shape.dims()
                 ),
             ));
         }
+        conversion(location.dtype, DType::F32, &request.tensor)?;
+        if self.is_meta() {
+            return Ok(META_TENSOR_SCALE);
+        }
+        let tensor = self.checkpoint.read(&request.tensor)?;
         let scale = to_f32(tensor.dtype, &tensor.bytes, &request.tensor)?[0];
         if !(scale.is_finite() && scale > 0.0) {
             return Err(Error::weight(
@@ -1755,7 +1797,8 @@ impl<'a> WeightLoader<'a> {
     ///
     /// The activation encoder's scale is the whole vocabulary's: a token is encoded once on the rank
     /// that holds it, for experts on any rank, so every rank must encode with the same number. The
-    /// second value is each held expert's tensor scales, expert-major, one per projection.
+    /// second value is each held expert's tensor scales, expert-major, one per projection; a meta
+    /// loader answers [`Self::tensor_scale`]'s placeholder for each.
     #[allow(
         clippy::too_many_arguments,
         reason = "the stack is named by its parts, as `nvfp4_stack` names them"
@@ -1784,13 +1827,14 @@ impl<'a> WeightLoader<'a> {
         let count = u64::from(experts);
         let per = projections.len() as u64;
 
-        // Every field of every expert, by the export's own suffix set.
+        // Every field of every expert, by the export's own suffix set. The stack's geometry and
+        // types come from the headers; the payload is read only when a field is published.
         let spelling = names;
         let mut fields = Vec::new();
+        let mut values_names = Vec::with_capacity(slots.len() * projections.len());
+        let mut scales_names = Vec::with_capacity(slots.len() * projections.len());
         let mut rows = None;
         let mut columns = None;
-        let mut values_bytes = Vec::new();
-        let mut scales_bytes = Vec::new();
         let mut tensor_scales = Vec::with_capacity(experts as usize);
         let mut activation_reciprocals = Vec::with_capacity(experts as usize * projections.len());
         let mut scale_shape = None;
@@ -1817,7 +1861,7 @@ impl<'a> WeightLoader<'a> {
                     "packed E2M1 values",
                     spelling.values,
                 )?;
-                let values = self.shards()?.read(&values_name)?;
+                let values = self.checkpoint.locate(&values_name)?;
                 if values.dtype != DType::U8 {
                     return Err(Error::weight(
                         &values_name,
@@ -1851,7 +1895,7 @@ impl<'a> WeightLoader<'a> {
                 agreed(&mut rows, rows_here, "rows")?;
                 agreed(&mut columns, columns_here, "columns")?;
 
-                let scales = self.shards()?.read(&scales_name)?;
+                let scales = self.checkpoint.locate(&scales_name)?;
                 let here = block_scale_dtype(&scales_name, scales.dtype)?;
                 match scale_dtype {
                     None => scale_dtype = Some(here),
@@ -1884,32 +1928,15 @@ impl<'a> WeightLoader<'a> {
                     ));
                 }
 
-                let tensor = self.shards()?.read(&tensor_name)?;
-                if tensor.shape.numel() != 1 || !tensor.dtype.is_float() {
-                    return Err(Error::weight(
-                        &tensor_name,
-                        format!(
-                            "a tensor scale is one floating number, not {} {:?}",
-                            tensor.dtype,
-                            tensor.shape.dims()
-                        ),
-                    ));
-                }
-                let scale = to_f32(tensor.dtype, &tensor.bytes, &tensor_name)?[0];
-                if !(scale.is_finite() && scale > 0.0) {
-                    return Err(Error::weight(
-                        &tensor_name,
-                        format!("a tensor scale of {scale} is not a positive number"),
-                    ));
-                }
-                tensor_scales.push(scale);
+                let tensor = WeightRequest::region(&tensor_name, 0, Shape::new(&[1]));
+                tensor_scales.push(self.tensor_scale(&tensor)?);
                 if input_scale {
                     let request = WeightRequest::region(&activation_name, 0, Shape::new(&[1]));
                     activation_reciprocals.push(self.activation_reciprocal(&request)?);
                 }
 
-                values_bytes.extend_from_slice(&values.bytes);
-                scales_bytes.extend_from_slice(&scales.bytes);
+                values_names.push(values_name);
+                scales_names.push(scales_name);
                 scale_shape = Some(expected);
             }
         }
@@ -1943,7 +1970,6 @@ impl<'a> WeightLoader<'a> {
                 ),
             ));
         }
-        let values_bytes = values_layout.arrange(&values_bytes, count, rows, (columns / 2).max(1));
 
         let values_shape = Shape::new(&[count, rows, columns / 2]);
         let scales_shape = Shape::new(&[
@@ -1985,28 +2011,22 @@ impl<'a> WeightLoader<'a> {
                 provenance: None,
             },
             values_shape,
-            &values_bytes,
+            |loader| {
+                let mut bytes = Vec::with_capacity(values_shape.numel() as usize);
+                for values_name in &values_names {
+                    bytes.extend_from_slice(&loader.checkpoint.read(values_name)?.bytes);
+                }
+                Ok(Cow::Owned(values_layout.arrange(
+                    &bytes,
+                    count,
+                    rows,
+                    (columns / 2).max(1),
+                )))
+            },
         )?;
         // The stack's scale type is the checkpoint's own: an E4M3 field stays E4M3, and the model
         // puts it in the descriptor unchanged.
         let scale_dtype = scale_dtype.unwrap_or(DType::U8);
-        // One expert's linear table becomes the published arrangement: rows permuted the way the
-        // values' rows were when the values are shuffled (the scales are read beside the row), then
-        // padded and interleaved when the deployment's kernels read the swizzled 128x4 table.
-        let mut arranged_scales = Vec::with_capacity(scales_shape.numel() as usize);
-        let blocks = ScaleLayout::Linear.columns(columns);
-        for expert in 0..usize::try_from(count).unwrap_or(0) {
-            let entry = &scales_bytes
-                [expert * (rows * blocks) as usize..(expert + 1) * (rows * blocks) as usize];
-            let entry = values_layout.arrange(entry, 1, rows, blocks);
-            match layout {
-                ScaleLayout::Linear => arranged_scales.extend_from_slice(&entry),
-                ScaleLayout::Swizzled128X4 => {
-                    arranged_scales.extend_from_slice(&swizzled_scales(&entry, rows, blocks));
-                }
-            }
-        }
-        let scales_bytes = arranged_scales;
         let scales = self.publish_computed(
             WeightKey {
                 files: files.clone(),
@@ -2027,7 +2047,30 @@ impl<'a> WeightLoader<'a> {
                 provenance: None,
             },
             scales_shape,
-            &scales_bytes,
+            |loader| {
+                let blocks = ScaleLayout::Linear.columns(columns);
+                let mut scales_bytes = Vec::with_capacity((count * rows * blocks) as usize);
+                for scales_name in &scales_names {
+                    scales_bytes.extend_from_slice(&loader.checkpoint.read(scales_name)?.bytes);
+                }
+                // One expert's linear table becomes the published arrangement: rows permuted the
+                // way the values' rows were when the values are shuffled (the scales are read
+                // beside the row), then padded and interleaved when the deployment's kernels read
+                // the swizzled 128x4 table.
+                let mut arranged = Vec::with_capacity(scales_shape.numel() as usize);
+                for expert in 0..usize::try_from(count).unwrap_or(0) {
+                    let entry = &scales_bytes[expert * (rows * blocks) as usize
+                        ..(expert + 1) * (rows * blocks) as usize];
+                    let entry = values_layout.arrange(entry, 1, rows, blocks);
+                    match layout {
+                        ScaleLayout::Linear => arranged.extend_from_slice(&entry),
+                        ScaleLayout::Swizzled128X4 => {
+                            arranged.extend_from_slice(&swizzled_scales(&entry, rows, blocks));
+                        }
+                    }
+                }
+                Ok(Cow::Owned(arranged))
+            },
         )?;
         let global_scale = self.publish_computed(
             WeightKey {
@@ -2046,7 +2089,7 @@ impl<'a> WeightLoader<'a> {
                 provenance: None,
             },
             projections_shape,
-            &scale_bytes,
+            |_| Ok(Cow::Borrowed(&scale_bytes[..])),
         )?;
         let input_scale = if input_scale {
             let bytes = strides.bytes(&activation_reciprocals);
@@ -2073,7 +2116,7 @@ impl<'a> WeightLoader<'a> {
                     provenance: None,
                 },
                 shape,
-                &bytes,
+                |_| Ok(Cow::Borrowed(&bytes[..])),
             )?)
         } else {
             None
@@ -2116,19 +2159,19 @@ impl<'a> WeightLoader<'a> {
         ))
     }
 
-    /// Publish bytes this loader computed, under a key it built, and answer the weight.
-    fn publish_computed(&mut self, key: WeightKey, shape: Shape, bytes: &[u8]) -> Result<Weight> {
-        if let Some(backing) = self.retention()?.retained(&key)? {
-            return Ok(Weight {
-                view: backing.view(key.dtype, shape)?,
-                backing,
-            });
+    /// Publish bytes this loader computes, under a key it built, and answer the weight.
+    ///
+    /// A key already held is answered without calling `bytes`, and a meta loader never calls it.
+    fn publish_computed<'c>(
+        &mut self,
+        key: WeightKey,
+        shape: Shape,
+        bytes: impl FnOnce(&Self) -> Result<Cow<'c, [u8]>>,
+    ) -> Result<Weight> {
+        if let Some(weight) = self.retained(&key, shape)? {
+            return Ok(weight);
         }
-        let backing = self.retention()?.publish(&key, key.dtype, shape, bytes)?;
-        Ok(Weight {
-            view: backing.view(key.dtype, shape)?,
-            backing,
-        })
+        self.publish_with(&key, shape, false, bytes)
     }
 
     /// Publish host-computed bytes as a weight, without a checkpoint tensor behind them.
@@ -2193,14 +2236,6 @@ impl<'a> WeightLoader<'a> {
                 ),
             ));
         }
-        // A shapes-only loader states the constant's extents and keeps the bytes nowhere.
-        if self.is_shapes() {
-            let backing = Backing::new(DevicePtr::new(0), expected);
-            return Ok(Weight {
-                view: backing.view(dtype, shape)?,
-                backing,
-            });
-        }
         let key = WeightKey {
             files: Vec::new(),
             dtype,
@@ -2213,18 +2248,11 @@ impl<'a> WeightLoader<'a> {
             },
             provenance: Some(Provenance::computed(producer, bytes)),
         };
-        let backing = if writable {
-            self.retention()?.writable(&key, dtype, shape, bytes)?
+        if writable {
+            self.publish_with(&key, shape, true, |_| Ok(Cow::Borrowed(bytes)))
         } else {
-            match self.retention()?.retained(&key)? {
-                Some(backing) => backing,
-                None => self.retention()?.publish(&key, dtype, shape, bytes)?,
-            }
-        };
-        Ok(Weight {
-            view: backing.view(dtype, shape)?,
-            backing,
-        })
+            self.publish_computed(key, shape, |_| Ok(Cow::Borrowed(bytes)))
+        }
     }
 
     /// The identity of each of `names`' files, in order.
@@ -2232,7 +2260,7 @@ impl<'a> WeightLoader<'a> {
         names
             .iter()
             .map(|name| {
-                self.shards()?
+                self.checkpoint
                     .identity(name)
                     .cloned()
                     .ok_or_else(|| Error::MissingTensor(name.clone()))
@@ -2245,7 +2273,7 @@ impl<'a> WeightLoader<'a> {
         let mut dtype = None;
         for name in names {
             let location = self
-                .shards()?
+                .checkpoint
                 .tensor(name)
                 .ok_or_else(|| Error::MissingTensor(name.clone()))?;
             match dtype {
@@ -2286,19 +2314,22 @@ impl<'a> WeightLoader<'a> {
         Ok(dtype)
     }
 
-    /// The bytes a source names, in the source's logical order.
-    fn source_bytes(&self, source: &WeightSource, key: &WeightKey) -> Result<Vec<u8>> {
+    /// The byte ranges a source names, in the source's logical order, planned from the headers.
+    ///
+    /// Every bound is checked against the length the header states for each tensor, which is the
+    /// length of the payload slice a device load copies from.
+    fn spans(&self, source: &WeightSource, key: &WeightKey) -> Result<Vec<Span<'a>>> {
+        let checkpoint = self.checkpoint;
         match source {
             WeightSource::Region {
                 tensor,
                 start,
                 shape,
             } => {
-                let location = self
-                    .shards()?
+                let location = checkpoint
                     .tensor(tensor)
                     .ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
-                let bytes = self.shards()?.bytes(location)?.to_vec();
+                let length = stored_bytes(location);
                 let element = location.dtype.bytes().ok_or_else(|| {
                     Error::weight(tensor, format!("{} has no whole-byte size", location.dtype))
                 })?;
@@ -2308,18 +2339,21 @@ impl<'a> WeightLoader<'a> {
                 let end = usize::try_from((start + shape.numel()) * element).map_err(|_| {
                     Error::weight(tensor, "the region's last element is past usize::MAX")
                 })?;
-                if end > bytes.len() {
+                if end as u64 > length {
                     return Err(Error::weight(
                         tensor,
                         format!(
-                            "elements {start}..{} of {:?} reach past the tensor's {}",
+                            "elements {start}..{} of {:?} reach past the tensor's {length}",
                             start + shape.numel(),
                             location.shape.dims(),
-                            bytes.len()
                         ),
                     ));
                 }
-                Ok(bytes[begin..end].to_vec())
+                Ok(vec![Span {
+                    location,
+                    from: begin,
+                    to: end,
+                }])
             }
             WeightSource::Strided {
                 tensor,
@@ -2327,8 +2361,7 @@ impl<'a> WeightLoader<'a> {
                 shape,
                 row_stride,
             } => {
-                let location = self
-                    .shards()?
+                let location = checkpoint
                     .tensor(tensor)
                     .ok_or_else(|| Error::MissingTensor(tensor.clone()))?;
                 let element = location.dtype.bytes().ok_or_else(|| {
@@ -2348,9 +2381,8 @@ impl<'a> WeightLoader<'a> {
                     ));
                 }
                 let rows = shape.numel() / row.max(1);
-                let bytes = self.shards()?.bytes(location)?;
-                let mut gathered =
-                    Vec::with_capacity(usize::try_from(shape.numel() * element).unwrap_or(0));
+                let length = stored_bytes(location);
+                let mut spans = Vec::with_capacity(usize::try_from(rows).unwrap_or(0));
                 for index in 0..rows {
                     let begin = start + index * row_stride;
                     let from = usize::try_from(begin * element).map_err(|_| {
@@ -2359,29 +2391,27 @@ impl<'a> WeightLoader<'a> {
                     let to = usize::try_from((begin + row) * element).map_err(|_| {
                         Error::weight(tensor, "a gathered row ends past usize::MAX")
                     })?;
-                    if to > bytes.len() {
+                    if to as u64 > length {
                         return Err(Error::weight(
                             tensor,
                             format!(
-                                "row {index} (elements {begin}..{}) reaches past the tensor's {} bytes",
+                                "row {index} (elements {begin}..{}) reaches past the tensor's {length} bytes",
                                 begin + row,
-                                bytes.len()
                             ),
                         ));
                     }
-                    gathered.extend_from_slice(&bytes[from..to]);
+                    spans.push(Span { location, from, to });
                 }
-                Ok(gathered)
+                Ok(spans)
             }
             WeightSource::Parts {
                 parts,
                 block: Some(block),
                 ..
             } => {
-                let mut fused = Vec::new();
+                let mut spans = Vec::new();
                 for name in parts {
-                    let location = self
-                        .shards()?
+                    let location = checkpoint
                         .tensor(name)
                         .ok_or_else(|| Error::MissingTensor(name.clone()))?;
                     let element = location.dtype.bytes().ok_or_else(|| {
@@ -2396,7 +2426,7 @@ impl<'a> WeightLoader<'a> {
                             ),
                         ));
                     }
-                    let bytes = self.shards()?.bytes(location)?;
+                    let length = stored_bytes(location);
                     for row in 0..block.rows {
                         let first = (block.start + row * block.row_stride) * element;
                         let last = first + block.columns * element;
@@ -2404,33 +2434,31 @@ impl<'a> WeightLoader<'a> {
                         else {
                             return Err(Error::weight(name, "a block row is past usize::MAX"));
                         };
-                        if to > bytes.len() {
+                        if to as u64 > length {
                             return Err(Error::weight(
                                 name,
                                 format!(
                                     "row {row} of the block (bytes {from}..{to}) reaches past the \
-                                     part's {} bytes",
-                                    bytes.len()
+                                     part's {length} bytes"
                                 ),
                             ));
                         }
-                        fused.extend_from_slice(&bytes[from..to]);
+                        spans.push(Span { location, from, to });
                     }
                 }
-                if fused.is_empty() {
+                if spans.iter().all(|span| span.from == span.to) {
                     return Err(Error::weight(
                         &key.region.tensors.join("+"),
                         "a fused weight has no part",
                     ));
                 }
-                Ok(fused)
+                Ok(spans)
             }
             WeightSource::Parts { parts, .. } => {
-                let mut fused = Vec::new();
+                let mut spans = Vec::with_capacity(parts.len());
                 let mut part_shape: Option<Shape> = None;
                 for name in parts {
-                    let location = self
-                        .shards()?
+                    let location = checkpoint
                         .tensor(name)
                         .ok_or_else(|| Error::MissingTensor(name.clone()))?;
                     if location.shape.rank() == 0 {
@@ -2456,17 +2484,45 @@ impl<'a> WeightLoader<'a> {
                             }
                         }
                     }
-                    fused.extend_from_slice(self.shards()?.bytes(location)?);
+                    let to = usize::try_from(stored_bytes(location))
+                        .map_err(|_| Error::weight(name, "a part is past usize::MAX"))?;
+                    spans.push(Span {
+                        location,
+                        from: 0,
+                        to,
+                    });
                 }
-                if fused.is_empty() {
+                if spans.iter().all(|span| span.from == span.to) {
                     return Err(Error::weight(
                         &key.region.tensors.join("+"),
                         "a fused weight has no part",
                     ));
                 }
-                Ok(fused)
+                Ok(spans)
             }
         }
+    }
+
+    /// The payload bytes of `spans`, concatenated in order.
+    fn gather(&self, spans: &[Span<'_>]) -> Result<Vec<u8>> {
+        let total = spans.iter().map(|span| span.to - span.from).sum();
+        let mut gathered = Vec::with_capacity(total);
+        for span in spans {
+            let bytes = self.checkpoint.bytes(span.location)?;
+            let range = bytes.get(span.from..span.to).ok_or_else(|| {
+                Error::weight(
+                    &span.location.tensor,
+                    format!(
+                        "bytes {}..{} reach past the tensor's {} bytes",
+                        span.from,
+                        span.to,
+                        bytes.len()
+                    ),
+                )
+            })?;
+            gathered.extend_from_slice(range);
+        }
+        Ok(gathered)
     }
 }
 
@@ -2507,23 +2563,10 @@ fn check_layout(tensor: &str, source: &WeightSource, layout: WeightLayout) -> Re
 /// converts on a path a launch did not state is widening the rule above, so the conversion belongs
 /// where the boundary itself is stated.
 pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec<u8>> {
-    match (from, to) {
-        (DType::BF16, DType::F32)
-        | (DType::BF16, DType::F16)
-        | (DType::F16, DType::F32)
-        | (DType::F16, DType::BF16)
-        | (DType::F32, DType::BF16)
-        | (DType::F32, DType::F16)
-        | (DType::F32, DType::I16)
-        | (DType::I16, DType::F32) => {}
-        (same, target) if same == target => return Ok(bytes.to_vec()),
-        (source, target) => {
-            return Err(Error::weight(
-                tensor,
-                format!("converting {source} to {target} is not implemented"),
-            ));
-        }
-    };
+    conversion(from, to, tensor)?;
+    if from == to {
+        return Ok(bytes.to_vec());
+    }
     let source_bytes = usize::try_from(from.bytes().unwrap_or(4)).unwrap_or(4);
     let target_bytes = usize::try_from(to.bytes().unwrap_or(4)).unwrap_or(4);
     if !bytes.len().is_multiple_of(source_bytes) {
@@ -2567,6 +2610,28 @@ pub fn convert(from: DType, to: DType, bytes: &[u8], tensor: &str) -> Result<Vec
         }
     }
     Ok(converted)
+}
+
+/// Whether [`convert`] converts `from` to `to`: one of its pairs, or the same type.
+///
+/// A load decides this from the element types alone, before any byte is read, so a meta load
+/// refuses the pairs a device load refuses.
+fn conversion(from: DType, to: DType, tensor: &str) -> Result<()> {
+    match (from, to) {
+        (DType::BF16, DType::F32)
+        | (DType::BF16, DType::F16)
+        | (DType::F16, DType::F32)
+        | (DType::F16, DType::BF16)
+        | (DType::F32, DType::BF16)
+        | (DType::F32, DType::F16)
+        | (DType::F32, DType::I16)
+        | (DType::I16, DType::F32) => Ok(()),
+        (same, target) if same == target => Ok(()),
+        (source, target) => Err(Error::weight(
+            tensor,
+            format!("converting {source} to {target} is not implemented"),
+        )),
+    }
 }
 
 /// The `i16` a sample becomes: nearest, ties to even, saturating at both ends.
@@ -2780,7 +2845,7 @@ mod tests {
         );
 
         let checkpoint = Checkpoint::open(root.path()).expect("the shard opens");
-        let mut store = HostStore::new();
+        let mut store = HostBuffers::default();
         let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
 
         let zero =
@@ -2814,43 +2879,45 @@ mod tests {
             .load(&live_request)
             .expect("a tensor that holds a value passes");
 
-        // A shapes-only loader reads no bytes at all, so the walk of a model's programs states
-        // extents without a shard and has nothing to refuse.
-        WeightLoader::shapes(DType::BF16)
+        // A meta loader reads no payload, so the zeros are not there for it to refuse: the check
+        // is a value's, and only a device load holds the value.
+        drop(loader);
+        WeightLoader::meta(&checkpoint, None, None)
             .load(&zero)
-            .expect("a shapes-only loader reads nothing");
+            .expect("a meta loader reads no payload");
     }
 
-    /// A shapes-only loader answers a weight request with the extents the caller asked for, at
-    /// address zero, and reads nothing: no checkpoint, no shard, no device.
-    ///
-    /// It exists for the walk — a model's own `load` driven by a recording forward — so what it owes is
-    /// the shapes a `load` derives, and what it must not do is pretend to have bytes: a path that needs
-    /// them refuses by name rather than answering a zero.
-    #[test]
-    fn a_shapes_only_loader_states_extents_and_reads_no_bytes() {
-        let mut loader = WeightLoader::shapes(DType::BF16);
-        assert!(loader.is_shapes());
+    /// A store that keeps every published region in host memory, at the address of its buffer.
+    #[derive(Default)]
+    struct HostBuffers {
+        published: Vec<(WeightKey, Vec<u8>)>,
+    }
 
-        let request = WeightRequest::region("block.proj.weight", 0, Shape::new(&[64, 128]));
-        let weight = loader.load(&request).expect("the stated weight");
-        assert_eq!(weight.shape().dims(), &[64, 128]);
-        assert_eq!(weight.dtype(), DType::BF16);
-        assert_eq!(weight.view().ptr.address(), 0);
+    impl RetainedWeights for HostBuffers {
+        fn retained(&mut self, key: &WeightKey) -> Result<Option<Backing>> {
+            Ok(self
+                .published
+                .iter()
+                .find(|(published, _)| published == key)
+                .map(|(_, bytes)| {
+                    Backing::new(DevicePtr::new(bytes.as_ptr() as u64), bytes.len() as u64)
+                }))
+        }
 
-        // A computed weight states its extents too: the H3 loader publishes tables this way.
-        let bytes = [0u8, 0, 0, 0, 1, 0, 0, 0];
-        let constant = loader
-            .constant(
-                "video_vae.voxel_rows",
-                DType::I32,
-                Shape::new(&[2]),
-                &bytes,
-                "test",
-            )
-            .expect("the stated constant");
-        assert_eq!(constant.shape().dims(), &[2]);
-        assert_eq!(constant.view().ptr.address(), 0);
+        fn publish(
+            &mut self,
+            key: &WeightKey,
+            _dtype: DType,
+            _shape: Shape,
+            bytes: &[u8],
+        ) -> Result<Backing> {
+            self.published.push((key.clone(), bytes.to_vec()));
+            let held = &self.published[self.published.len() - 1].1;
+            Ok(Backing::new(
+                DevicePtr::new(held.as_ptr() as u64),
+                held.len() as u64,
+            ))
+        }
     }
 
     /// The block-scale arrangement is the launcher's `computeSFIndex`: a permutation of the

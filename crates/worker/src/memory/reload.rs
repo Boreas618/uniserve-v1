@@ -26,7 +26,7 @@ use crate::{Error, Result};
 /// The region a [`Walk`] answers: wide enough for any view, and read by nothing.
 ///
 /// A model's load builds its layers from views and launches nothing, so a walk's model is a
-/// structure of addresses nobody dereferences, as a shapes-only loader's is.
+/// structure of addresses nobody dereferences, as a meta loader's is.
 fn placeholder() -> Backing {
     Backing::new(DevicePtr::new(0), u64::MAX / 2)
 }

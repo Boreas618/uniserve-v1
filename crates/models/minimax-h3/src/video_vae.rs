@@ -2056,10 +2056,104 @@ pub(crate) mod tests {
         );
     }
 
-    /// A decoder of one canvas, built from stated weights: the geometry is the subject, so neither a
-    /// checkpoint nor a device is needed.
+    /// Write one shard into `directory` whose header states `tensors` — name, element type, extents
+    /// — and whose payload is never written, and open it.
+    ///
+    /// The payload is a hole the file's length covers (`set_len`), so a checkpoint of a full-size
+    /// decoder costs a header's bytes on disk. Only a meta loader may load from it: the header is
+    /// the real format's, and the payload is zeros nobody wrote.
+    pub(crate) fn header_checkpoint(
+        directory: &std::path::Path,
+        tensors: &[(String, DType, Vec<u64>)],
+    ) -> nn::Checkpoint {
+        let mut header = String::from("{");
+        let mut offset = 0_u64;
+        for (index, (name, dtype, shape)) in tensors.iter().enumerate() {
+            if index > 0 {
+                header.push(',');
+            }
+            let bytes = shape.iter().product::<u64>() * dtype.bytes().expect("a whole-byte type");
+            let extents = shape
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",");
+            let format = match dtype {
+                DType::BF16 => "BF16",
+                DType::F16 => "F16",
+                DType::F32 => "F32",
+                other => panic!("the fixture writes float tensors, not {other}"),
+            };
+            header.push_str(&format!(
+                r#""{name}":{{"dtype":"{format}","shape":[{extents}],"data_offsets":[{offset},{}]}}"#,
+                offset + bytes
+            ));
+            offset += bytes;
+        }
+        header.push('}');
+        // The payload starts eight-byte aligned, as every exporter writes it.
+        let padded = header.len().div_ceil(8) * 8;
+        header.push_str(&" ".repeat(padded - header.len()));
+
+        let path = directory.join("model.safetensors");
+        let mut file = std::fs::File::create(&path).expect("a shard");
+        std::io::Write::write_all(&mut file, &(header.len() as u64).to_le_bytes())
+            .expect("the header length");
+        std::io::Write::write_all(&mut file, header.as_bytes()).expect("the header");
+        file.set_len(8 + header.len() as u64 + offset)
+            .expect("the payload's extent");
+        nn::Checkpoint::open(directory).expect("the shard opens")
+    }
+
+    /// A decoder of one canvas, loaded by a meta loader over a checkpoint that states the decoder's
+    /// tensors in BF16: the geometry is the subject, so no payload and no device are needed.
     fn stated_decoder(config: &VideoVaeConfig, canvas: Canvas) -> VideoDecoder {
-        let mut loader = WeightLoader::stated(DType::F32, None);
+        let channels = u64::from(config.latent_channels);
+        let width =
+            u64::from(config.decoder_num_attention_heads * config.decoder_attention_head_dim);
+        let ffn = width * u64::from(config.decoder_ffn_mult);
+        let out = u64::from(
+            config.out_channels
+                * config.temporal_compression()
+                * config.spatial_compression()
+                * config.spatial_compression(),
+        );
+        let shape = |parameter: &str| -> Vec<u64> {
+            // A layer's parameter is `layers.<index>.<field>`; the head's are named bare.
+            let layer = parameter.starts_with("layers.");
+            let field = if layer {
+                parameter.splitn(3, '.').nth(2).unwrap_or(parameter)
+            } else {
+                parameter
+            };
+            match field {
+                "post_quant.weight" => vec![channels, channels],
+                "post_quant.bias" => vec![channels],
+                "input.weight" => vec![width, channels],
+                "registers" => vec![u64::from(canvas.registers), width],
+                "query.weight" | "key.weight" | "value.weight" => vec![width, width],
+                "gate_up.weight" => vec![2 * ffn, width],
+                "gate_up.bias" => vec![2 * ffn],
+                "down.weight" => vec![width, ffn],
+                "output.weight" if layer => vec![width, width],
+                "output.weight" => vec![out, width],
+                "output.bias" if !layer => vec![out],
+                _ => vec![width],
+            }
+        };
+        let tensors: Vec<(String, DType, Vec<u64>)> = sources(config)
+            .expect("the decoder's sources")
+            .into_iter()
+            .map(|source| match source.tensor {
+                crate::audio_vae::Tensor::Region(tensor) => {
+                    (tensor, DType::BF16, shape(&source.parameter))
+                }
+                other => panic!("the decoder reads regions, not {other:?}"),
+            })
+            .collect();
+        let directory = tempfile::tempdir().expect("a temp directory");
+        let checkpoint = header_checkpoint(directory.path(), &tensors);
+        let mut loader = WeightLoader::meta(&checkpoint, None, None);
         let spatial = config.spatial_compression();
         let raster = (canvas.width * spatial, canvas.height * spatial);
         VideoDecoder::load(config, &[raster], &mut loader).expect("the decoder")

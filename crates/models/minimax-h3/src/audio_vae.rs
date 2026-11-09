@@ -1526,12 +1526,34 @@ pub(crate) mod tests {
     /// loading boundary is the whole of what stops it: without this, the mismatch appears at the
     /// kernel that reads one type and is handed another, if the kernel checks at all.
     ///
-    /// A shapes-only loader answers each request in its own shape and at the stated type
-    /// (`WeightLoader::load`), so the first weight the load reads is enough to reach the refusal.
+    /// A meta loader answers each request at the type the checkpoint's header states, so a
+    /// checkpoint holding the first weight the load reads, stored as F16, is enough to reach the
+    /// refusal.
     #[test]
     fn a_weight_the_audio_vae_cannot_compute_in_is_refused_by_name() {
         let config = audio_config();
-        let mut loader = WeightLoader::stated(DType::F16, None);
+        let input = sources(&config)
+            .expect("the decoder's sources")
+            .into_iter()
+            .find(|source| source.parameter == "input.weight")
+            .expect("the input projection");
+        let Tensor::Region(tensor) = input.tensor else {
+            panic!("the input projection is one region");
+        };
+        let directory = tempfile::tempdir().expect("a temp directory");
+        let checkpoint = crate::video_vae::tests::header_checkpoint(
+            directory.path(),
+            &[(
+                tensor,
+                DType::F16,
+                vec![
+                    u64::from(config.latent_dim),
+                    u64::from(config.latent_channels),
+                    1,
+                ],
+            )],
+        );
+        let mut loader = WeightLoader::meta(&checkpoint, None, None);
         // `BigVgan` is not `Debug`, so the outcome is matched rather than unwrapped.
         let error = match BigVgan::load(&config, &mut loader) {
             Ok(_) => panic!("an F16 audio weight was accepted"),

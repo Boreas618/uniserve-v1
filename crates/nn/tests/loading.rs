@@ -1279,48 +1279,6 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
     assert!(text.contains("vLLM ModelOpt"), "{text}");
 }
 
-/// A host store answers the weights a model needs with no device, so a loading audit — which
-/// programs a request space names, which keys the layers build — costs no GPU time.
-#[test]
-fn a_host_store_retains_weights_and_answers_the_first_region() {
-    let mut store = nn::HostStore::new();
-    assert!(store.is_empty());
-    let key = |tensor: &str| WeightKey {
-        files: Vec::new(),
-        dtype: DType::BF16,
-        layout: WeightLayout::ROW_MAJOR,
-        region: nn::weights::WeightRegion {
-            tensors: vec![tensor.to_owned()],
-            start: 0,
-            shape: Shape::new(&[4, 32]),
-            stride: None,
-        },
-        provenance: None,
-    };
-    let bytes: Vec<u8> = (0..256).map(|byte| byte as u8).collect();
-    let first = store
-        .publish(&key("w"), DType::BF16, Shape::new(&[4, 32]), &bytes)
-        .expect("a host store publishes");
-    assert_eq!(first.bytes(), 256);
-    // A view carved from it names the bytes the store kept.
-    let view = nn::TensorView::new(first.address(), DType::BF16, Shape::new(&[4, 32]));
-    assert_eq!(view.rows(), 4);
-    // The same key again answers the first region rather than a second buffer.
-    let again = store
-        .publish(&key("w"), DType::BF16, Shape::new(&[4, 32]), &bytes)
-        .expect("a repeated publish answers the first region");
-    assert_eq!(again.address(), first.address());
-    assert_eq!(store.len(), 1);
-    assert_eq!(
-        store
-            .retained(&key("w"))
-            .unwrap()
-            .map(|held| held.address()),
-        Some(first.address())
-    );
-    assert!(store.retained(&key("other")).unwrap().is_none());
-}
-
 /// A load that reads part of a checkpoint reports the rest by name, so a wrong number can be traced
 /// to the tensors nobody asked for rather than to the ones that loaded. A pipeline qualifies its
 /// components, because two components may hold one name each.
@@ -1600,4 +1558,351 @@ fn a_swizzled_scale_table_is_built_from_the_shards_linear_one() {
             assert_eq!(*value, 0, "a padding column is a zero scale at {at}");
         }
     }
+}
+
+/// One weight's element type and extents: what a meta load owes a caller.
+type Answer = (DType, Vec<u64>);
+
+/// The answer of `weight`.
+fn answer(weight: &nn::Weight) -> Answer {
+    (weight.dtype(), weight.shape().dims().to_vec())
+}
+
+/// A dense checkpoint: a projection, a row-parallel matrix, two fusable parts and a
+/// weight-normalized pair, all BF16 with values in every byte.
+fn dense_checkpoint(directory: &Path) -> Checkpoint {
+    let values = |count: usize| bf16(&(1..=count).map(|value| value as f32).collect::<Vec<_>>());
+    shard(
+        directory,
+        "model.safetensors",
+        &[
+            ("proj.weight", vec![4, 8], values(32)),
+            ("rows.weight", vec![4, 8], values(32)),
+            ("experts.0.up", vec![2, 8], values(16)),
+            ("experts.0.gate", vec![2, 8], values(16)),
+            ("conv.weight_v", vec![2, 3, 1], values(6)),
+            ("conv.weight_g", vec![2, 1, 1], values(2)),
+        ],
+    );
+    Checkpoint::open(directory).unwrap()
+}
+
+/// Every kind of dense load, in one order: a pinned region, a strided column block, fused parts, a
+/// tensor-parallel block of each part, a weight-normalized fold and a computed constant.
+fn dense_loads(loader: &mut WeightLoader<'_>) -> Vec<nn::Weight> {
+    let parts = vec!["experts.0.up".to_owned(), "experts.0.gate".to_owned()];
+    vec![
+        loader
+            .load(&WeightRequest::region("proj.weight", 0, Shape::new(&[4, 8])).pinned(DType::F32))
+            .unwrap(),
+        loader
+            .load(&WeightRequest::strided(
+                "rows.weight",
+                4,
+                Shape::new(&[4, 4]),
+                8,
+            ))
+            .unwrap(),
+        loader
+            .load(&WeightRequest::parts(
+                "experts.0.up_gate",
+                parts.clone(),
+                Shape::new(&[4, 8]),
+                WeightLayout::UP_GATE,
+            ))
+            .unwrap(),
+        loader
+            .load(&WeightRequest::part_blocks(
+                "experts.0.up_gate.rank1",
+                parts,
+                Shape::new(&[4, 4]),
+                WeightLayout::UP_GATE,
+                nn::weights::PartBlock {
+                    start: 4,
+                    rows: 2,
+                    columns: 4,
+                    row_stride: 8,
+                },
+            ))
+            .unwrap(),
+        loader
+            .weight_norm("conv.weight", "conv.weight_v", "conv.weight_g")
+            .unwrap(),
+        loader
+            .constant(
+                "table",
+                DType::I32,
+                Shape::new(&[2]),
+                &[1, 0, 0, 0, 2, 0, 0, 0],
+                "test",
+            )
+            .unwrap(),
+    ]
+}
+
+/// A meta load of a dense checkpoint answers the element type and extents a device load answers for
+/// every kind of request, at aligned, non-null addresses that are distinct per weight and the same
+/// for a weight asked for twice — and it reads no tensor of the checkpoint.
+#[test]
+fn a_meta_load_answers_what_a_device_load_answers_for_a_dense_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(directory.path());
+
+    let mut store = Recording::default();
+    let device = dense_loads(&mut WeightLoader::new(&checkpoint, &mut store, None, None));
+    let reading = checkpoint.reading();
+
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let meta = dense_loads(&mut loader);
+    assert_eq!(
+        meta.iter().map(answer).collect::<Vec<_>>(),
+        device.iter().map(answer).collect::<Vec<_>>(),
+        "every view has the device load's element type and extents"
+    );
+    assert_eq!(
+        checkpoint.reading(),
+        reading,
+        "the meta load asked the checkpoint for no tensor"
+    );
+
+    let addresses: Vec<u64> = meta
+        .iter()
+        .map(|weight| weight.view().ptr.address())
+        .collect();
+    for address in &addresses {
+        assert!(*address != 0 && address % 256 == 0, "{address:#x}");
+    }
+    let mut distinct = addresses.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(distinct.len(), addresses.len(), "one address per weight");
+
+    let again = loader
+        .load(&WeightRequest::region("proj.weight", 0, Shape::new(&[4, 8])).pinned(DType::F32))
+        .unwrap();
+    assert_eq!(
+        again.view().ptr.address(),
+        addresses[0],
+        "a key answered once is answered again with the same region"
+    );
+}
+
+/// A calibrated NVFP4 checkpoint in the vLLM spelling: one projection and a two-expert up/gate
+/// stack, E4M3 block scales, FP32 tensor and activation scales. `zero` writes every value as zero,
+/// which a device load refuses and a meta load never sees.
+fn nvfp4_checkpoint(directory: &Path, zero: bool) -> Checkpoint {
+    let byte = |value: u8| if zero { 0 } else { value };
+    let scale = |value: f32| (if zero { 0.0 } else { value }).to_le_bytes().to_vec();
+    let mut tensors: Vec<(String, DType, Vec<u64>, Vec<u8>)> = Vec::new();
+    let mut projection = |stem: String, rows: u64| {
+        tensors.push((
+            format!("{stem}.weight"),
+            DType::U8,
+            vec![rows, 32],
+            vec![byte(0x21); rows as usize * 32],
+        ));
+        tensors.push((
+            format!("{stem}.weight_scale"),
+            DType::F8E4M3,
+            vec![rows, 4],
+            vec![byte(0x38); rows as usize * 4],
+        ));
+        tensors.push((
+            format!("{stem}.weight_scale_2"),
+            DType::F32,
+            vec![1],
+            scale(0.5),
+        ));
+        tensors.push((
+            format!("{stem}.input_scale"),
+            DType::F32,
+            vec![1],
+            scale(0.25),
+        ));
+    };
+    projection("layer.q_proj".to_owned(), 4);
+    for expert in 0..2 {
+        for name in ["up", "gate"] {
+            projection(format!("experts.{expert}.{name}_proj"), 2);
+        }
+    }
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+        .collect();
+    shard_typed(directory, "model.safetensors", &views);
+    Checkpoint::open(directory).unwrap()
+}
+
+/// What an NVFP4 projection and stack load answers, field by field, in a fixed order.
+fn nvfp4_loads(loader: &mut WeightLoader<'_>) -> nn::Result<Vec<Option<Answer>>> {
+    let global_scale = loader.tensor_scale(&WeightRequest::region(
+        "layer.q_proj.weight_scale_2",
+        0,
+        Shape::new(&[1]),
+    ))?;
+    // The file's linear table is permuted into the product's swizzled one, which is the path a
+    // device load reads the block scales' payload on.
+    let quantized = loader.nvfp4(
+        &WeightRequest::region("layer.q_proj.weight", 0, Shape::new(&[4, 32])),
+        &WeightRequest::region("layer.q_proj.weight_scale", 0, Shape::new(&[4, 4])),
+        Some(&WeightRequest::region(
+            "layer.q_proj.input_scale",
+            0,
+            Shape::new(&[1]),
+        )),
+        Nvfp4Names::vllm(),
+        ops::fp4::ScaleLayout::Linear,
+        ops::fp4::ScaleLayout::Swizzled128X4,
+        global_scale,
+    )?;
+    let stack = loader.nvfp4_stack(
+        "experts.up_gate",
+        "experts",
+        &["up", "gate"],
+        2,
+        Nvfp4Names::vllm(),
+        nn::ValueLayout::Plain,
+        ops::fp4::ScaleLayout::Swizzled128X4,
+        true,
+    )?;
+    Ok(vec![
+        Some(answer(&quantized.packed)),
+        Some(answer(&quantized.scales)),
+        quantized.input_scale.as_ref().map(answer),
+        Some(answer(&stack.values)),
+        Some(answer(&stack.scales)),
+        Some(answer(&stack.global_scale)),
+        Some(answer(&stack.encode_scale)),
+        stack.input_scale.as_ref().map(answer),
+    ])
+}
+
+/// A meta load of a calibrated NVFP4 checkpoint decides the representation a device load decides:
+/// the packed values as U8, the checkpoint's own E4M3 block scales in the product's layout, the
+/// activation scales present, and the stack's tables in their published extents.
+#[test]
+fn a_meta_load_answers_what_a_device_load_answers_for_an_nvfp4_checkpoint() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = nvfp4_checkpoint(directory.path(), false);
+
+    let mut store = Recording::default();
+    let device = nvfp4_loads(&mut WeightLoader::new(&checkpoint, &mut store, None, None)).unwrap();
+    let meta = nvfp4_loads(&mut WeightLoader::meta(&checkpoint, None, None)).unwrap();
+    assert_eq!(meta, device);
+    assert_eq!(
+        meta[1],
+        Some((DType::F8E4M3, vec![128, 4])),
+        "the checkpoint's own scale type, padded to the swizzled table"
+    );
+}
+
+/// A meta load reads no payload: a checkpoint whose values a device load refuses — all-zero packed
+/// values and block scales, zero tensor scales, an all-zero matrix asked to hold a value — loads,
+/// and no tensor is read.
+#[test]
+fn a_meta_load_reads_no_payload() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = nvfp4_checkpoint(directory.path(), true);
+
+    let mut store = Recording::default();
+    let refused = nvfp4_loads(&mut WeightLoader::new(&checkpoint, &mut store, None, None))
+        .expect_err("a device load reads the zeros and refuses them");
+    assert!(
+        refused.to_string().contains("not a positive number"),
+        "{refused}"
+    );
+    let before = checkpoint.reading();
+
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    nvfp4_loads(&mut loader).expect("a meta load never sees the values");
+    loader
+        .load(&WeightRequest::region("layer.q_proj.weight", 0, Shape::new(&[4, 32])).nonzero())
+        .expect("nor the zeros of a matrix asked to hold a value");
+    assert_eq!(checkpoint.reading(), before, "no tensor was read");
+}
+
+/// A request the header contradicts is refused by a meta load with the device load's own refusal:
+/// a region past its tensor, parts of different tails, a gain of the wrong length and an expert
+/// stack whose block scales are not the linear table of its values.
+#[test]
+fn a_meta_load_refuses_what_the_header_contradicts() {
+    let dense = tempfile::tempdir().unwrap();
+    let checkpoint = dense_checkpoint(dense.path());
+    let mut store = Recording::default();
+    let mut device = WeightLoader::new(&checkpoint, &mut store, None, None);
+    let mut meta = WeightLoader::meta(&checkpoint, None, None);
+
+    let past = WeightRequest::region("proj.weight", 0, Shape::new(&[8, 8]));
+    let tails = WeightRequest::parts(
+        "mixed",
+        vec!["experts.0.up".to_owned(), "conv.weight_v".to_owned()],
+        Shape::new(&[4, 8]),
+        WeightLayout::UP_GATE,
+    );
+    for request in [&past, &tails] {
+        let expected = device.load(request).expect_err("a device load refuses");
+        let refused = meta.load(request).expect_err("a meta load refuses");
+        assert_eq!(refused.to_string(), expected.to_string());
+    }
+    let expected = device
+        .weight_norm("conv.weight", "conv.weight_v", "proj.weight")
+        .expect_err("a gain of 32 for 2 channels");
+    let refused = meta
+        .weight_norm("conv.weight", "conv.weight_v", "proj.weight")
+        .expect_err("a meta load reads the gain's extents from the header");
+    assert_eq!(refused.to_string(), expected.to_string());
+
+    // A stack whose block scales are stated as wide as the packed values: the swizzled table is
+    // the loader's to build, so the header alone refuses it.
+    let encoded = tempfile::tempdir().unwrap();
+    let mut tensors = Vec::new();
+    for projection in ["up", "gate"] {
+        let stem = format!("experts.0.{projection}_proj");
+        tensors.push((
+            format!("{stem}.weight"),
+            DType::U8,
+            vec![2, 32],
+            vec![1; 64],
+        ));
+        tensors.push((
+            format!("{stem}.weight_scale"),
+            DType::U8,
+            vec![2, 32],
+            vec![1; 64],
+        ));
+        tensors.push((
+            format!("{stem}.weight_scale_2"),
+            DType::F32,
+            vec![1],
+            1.0_f32.to_le_bytes().to_vec(),
+        ));
+    }
+    let views: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, dtype, shape, bytes)| (name.as_str(), *dtype, shape.clone(), bytes.clone()))
+        .collect();
+    shard_typed(encoded.path(), "model.safetensors", &views);
+    let checkpoint = Checkpoint::open(encoded.path()).unwrap();
+    let stack = |loader: &mut WeightLoader<'_>| {
+        loader
+            .nvfp4_stack(
+                "experts.up_gate",
+                "experts",
+                &["up", "gate"],
+                1,
+                Nvfp4Names::vllm(),
+                nn::ValueLayout::Plain,
+                ops::fp4::ScaleLayout::Linear,
+                false,
+            )
+            .map(|_| ())
+    };
+    let mut store = Recording::default();
+    let expected = stack(&mut WeightLoader::new(&checkpoint, &mut store, None, None))
+        .expect_err("a device load refuses");
+    let refused =
+        stack(&mut WeightLoader::meta(&checkpoint, None, None)).expect_err("a meta load refuses");
+    assert_eq!(refused.to_string(), expected.to_string());
+    assert!(refused.to_string().contains("linear"), "{refused}");
 }

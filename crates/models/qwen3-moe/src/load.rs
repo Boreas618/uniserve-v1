@@ -106,12 +106,9 @@ pub fn load_placed(
 ) -> Result<Qwen3Moe> {
     let representation = Representation::read(root)?;
     // The shards are the fact and the declaration is a claim about them, so a load resolves each
-    // parameter's representation from what the checkpoint stores. A shapes walk has no shard to ask
-    // and keeps the declaration's answer.
-    let representation = match loader.checkpoint() {
-        Some(checkpoint) => representation.resolved(checkpoint),
-        None => representation,
-    };
+    // parameter's representation from what the checkpoint stores: its tensor names, which a meta
+    // loader's checkpoint holds as a device loader's does.
+    let representation = representation.resolved(loader.checkpoint());
     refuse_dense_parameters(root, &representation)?;
     match representation {
         Representation::Dense => load_with(
