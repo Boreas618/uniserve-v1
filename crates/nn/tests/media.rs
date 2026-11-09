@@ -12,7 +12,7 @@ use std::path::Path;
 
 use nn::codec::{DacEncoder, DacSpec};
 use nn::diffusion::{Euler, Grid};
-use nn::layers::{CausalPad, Conv1d, ConvSpec, ConvTranspose1d, Padding};
+use nn::layers::{CausalPad, Conv1d, ConvSpec, ConvTranspose1d, Padding, Posterior};
 use nn::vocoder::{BigVgan, BigVganSpec};
 use nn::{Arena, Checkpoint, DType, Forward, Shape, TensorView, WeightLoader};
 
@@ -351,4 +351,44 @@ fn a_dac_encoder_widens_and_strides_through_its_stages() {
             .forward(&f, view(&[2, 1, 15]), view(&[2, 8, 7]))
             .is_err()
     );
+}
+
+/// A posterior sample reads the mean and log-variance as the halves of one channel-major moments
+/// raster and draws a sample of half its channels, in one launch; rasters of another width, type,
+/// extent or storage are refused.
+#[test]
+fn a_posterior_sample_reads_the_two_halves_of_its_moments() {
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let raster = |channels: u64, frames: u64, dtype| {
+        arena
+            .tensor(dtype, Shape::new(&[channels, frames, 6, 10]))
+            .unwrap()
+    };
+    let moments = raster(8, 3, DType::F32);
+    let (noise, out) = (raster(4, 3, DType::F32), raster(4, 3, DType::F32));
+    let ((), launches) = recorded(|| Posterior.sample(&f, moments, noise, out).unwrap());
+    assert_eq!(operators(&launches), ["posterior"]);
+
+    // Moments of the sample's own width have no log-variance; a draw of their width is two draws.
+    assert!(Posterior.sample(&f, noise, noise, out).is_err());
+    assert!(Posterior.sample(&f, moments, moments, out).is_err());
+    // A half-precision draw, another clip's draw, and planes that overlap.
+    assert!(
+        Posterior
+            .sample(&f, moments, raster(4, 3, DType::F16), out)
+            .is_err()
+    );
+    assert!(
+        Posterior
+            .sample(&f, moments, raster(4, 2, DType::F32), out)
+            .is_err()
+    );
+    let overlapping = TensorView::with_strides(
+        noise.ptr,
+        DType::F32,
+        noise.shape,
+        nn::Strides::new(&[60, 60, 10, 1]),
+    );
+    assert!(Posterior.sample(&f, moments, overlapping, out).is_err());
 }

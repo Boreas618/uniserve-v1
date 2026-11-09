@@ -735,7 +735,7 @@ use nn::layers::{
     Transpose, WeightOrder,
 };
 use nn::weights::{Scope, WeightLoader};
-use nn::{DType, Shape, Strides, TensorView};
+use nn::{DType, Shape, TensorView};
 
 use nn::codec::{DacEncoder, DacSpec};
 
@@ -824,93 +824,6 @@ pub fn normalize_tables(mean: &[f32], std: &[f32]) -> Result<(Vec<f32>, Vec<f32>
         shift[channel] = -mean[channel] / deviation;
     }
     Ok((scale, shift))
-}
-
-/// The geometry of one posterior sample: the positions it reads and the channels it writes.
-///
-/// The sample is `[latent_channels, frames, rows, columns]` like every other raster here, and
-/// `ops::posterior` reads `[positions, channels]` - so the call states the positions
-/// (`frames · rows · columns`) once, here, and both the strides and the operator's channel count come
-/// from it. Every refusal is on this type rather than inside a forward, because a raster of the wrong
-/// channel count is a configuration mistake and not a runtime condition.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Sample {
-    /// Positions the sample has: `frames · rows · columns`.
-    pub positions: u64,
-    /// Latent channels of one position.
-    pub channels: u64,
-}
-
-impl Sample {
-    /// The sample of `latent_channels` channels over the raster `moments`, `noise` and `out` share.
-    ///
-    /// `moments` holds both fields of the posterior, so it has twice the sample's channels; `noise` and
-    /// `out` hold the sample's own. All three are FP32 rasters of one geometry, packed as the encoder
-    /// writes them: the call addresses them through two strides, and a plane that is not packed has no
-    /// single pair of them.
-    pub fn of(
-        latent_channels: u32,
-        moments: TensorView,
-        noise: TensorView,
-        out: TensorView,
-    ) -> Result<Self> {
-        let channels = u64::from(latent_channels);
-        if channels == 0 {
-            return Err(Error::config(
-                "a latent raster with no channels has no sample".to_owned(),
-            ));
-        }
-        let wide = 2 * channels;
-        for (name, view, expected) in [
-            ("moments", moments, wide),
-            ("noise", noise, channels),
-            ("out", out, channels),
-        ] {
-            if view.dtype != DType::F32 {
-                return Err(Error::config(format!(
-                    "the {name} raster is {}, and a condition's posterior is FP32 throughout: the \
-                     reference draws and samples in f32",
-                    view.dtype
-                )));
-            }
-            if view.shape.rank() != 4 {
-                return Err(Error::config(format!(
-                    "the {name} raster is {:?}, a [channels, frames, rows, columns] raster expected",
-                    view.shape.dims()
-                )));
-            }
-            if view.shape.dim(0) != expected {
-                return Err(Error::config(format!(
-                    "the {name} raster has {} channels, {expected} expected for a {latent_channels}-\
-                     channel latent",
-                    view.shape.dim(0)
-                )));
-            }
-            let packed = Strides::row_major(view.shape);
-            if view.strides != packed {
-                return Err(Error::config(format!(
-                    "the {name} raster's strides are {:?} over {:?}: a channel-major sample \
-                     addresses a packed raster through two strides, and a view is refused rather than \
-                     copied",
-                    view.strides.as_slice(),
-                    view.shape.dims()
-                )));
-            }
-        }
-        if noise.shape != out.shape || moments.shape.dims()[1..] != out.shape.dims()[1..] {
-            return Err(Error::config(format!(
-                "the posterior's rasters disagree: moments {:?}, noise {:?}, out {:?}",
-                moments.shape.dims(),
-                noise.shape.dims(),
-                out.shape.dims()
-            )));
-        }
-        let positions = moments.shape.dims()[1..].iter().product::<u64>();
-        Ok(Self {
-            positions,
-            channels,
-        })
-    }
 }
 
 /// Read one convolution of the checkpoint: `from` input channels, `to` output, `kernel` taps.
@@ -1104,7 +1017,7 @@ impl VideoEncoder {
             output,
             moments,
             normalize,
-            sampler: Posterior::new(),
+            sampler: Posterior,
             padding,
         })
     }
@@ -1584,23 +1497,17 @@ impl VideoEncoder {
         noise: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        let sample = Sample::of(self.stack.latent_channels, moments, noise, out)?;
-        let positions = sample.positions;
-        let channels = sample.channels;
-        // A channel-major raster: neighbouring positions are neighbouring elements, and one channel is
-        // one whole plane away. The two halves of the moments differ by exactly `channels` planes.
-        let strides = Strides::new(&[1, positions]);
-        let view = |ptr| {
-            TensorView::with_strides(ptr, DType::F32, Shape::new(&[positions, channels]), strides)
-        };
+        if out.shape.rank() != 4 || out.shape.dim(0) != u64::from(self.stack.latent_channels) {
+            return Err(Error::config(format!(
+                "the condition's latent is [{}, frames, rows, columns], not {:?}",
+                self.stack.latent_channels,
+                out.shape.dims()
+            )));
+        }
+        // The sample is written into one scratch raster, because the affine cannot read and write
+        // `out` at once.
         let drawn = f.arena().tensor(DType::F32, out.shape)?;
-        self.sampler.forward(
-            f,
-            view(moments.ptr),
-            view(moments.offset_elements(channels * positions)),
-            view(noise.ptr),
-            view(drawn.ptr),
-        )?;
+        self.sampler.sample(f, moments, noise, drawn)?;
         self.normalize
             .forward(f, batched(drawn), batched(out))
             .map_err(Error::from)
@@ -2419,51 +2326,6 @@ mod tests {
             assert!(low < -1.0, "channel {channel}: {low} from zero");
             assert!(high > 1.0, "channel {channel}: {high} from 255");
         }
-    }
-
-    /// A raster view of `channels` over one frame's `rows × columns`, for the shape tests: nothing
-    /// reads it, so the pointer is the null one.
-    fn raster(channels: u64, frames: u64, rows: u64, columns: u64, dtype: DType) -> TensorView {
-        TensorView::new(
-            nn::DevicePtr::new(0),
-            dtype,
-            Shape::new(&[channels, frames, rows, columns]),
-        )
-    }
-
-    #[test]
-    fn the_posterior_sample_is_the_rasters_own_geometry() {
-        let config = video_config();
-        let channels = u64::from(config.latent_channels);
-        let moments = raster(2 * channels, 7, 30, 52, DType::F32);
-        let noise = raster(channels, 7, 30, 52, DType::F32);
-        let out = raster(channels, 7, 30, 52, DType::F32);
-        let sample = Sample::of(config.latent_channels, moments, noise, out).expect("a sample");
-        assert_eq!(sample.channels, channels);
-        assert_eq!(sample.positions, 7 * 30 * 52);
-        // The moments' rows are twice the sample's, which is what makes the two fields one tensor.
-        assert_eq!(moments.shape.dim(0), 2 * sample.channels);
-
-        // A moments raster of the sample's own width has no log-variance to read.
-        let narrow = raster(channels, 7, 30, 52, DType::F32);
-        assert!(Sample::of(config.latent_channels, narrow, noise, out).is_err());
-        // A noise raster of the moments' width is two draws where the sample wants one.
-        let wide_noise = raster(2 * channels, 7, 30, 52, DType::F32);
-        assert!(Sample::of(config.latent_channels, moments, wide_noise, out).is_err());
-        // An FP16 raster is the decoder's precision, not the encoder's posterior.
-        let half = raster(channels, 7, 30, 52, DType::F16);
-        assert!(Sample::of(config.latent_channels, moments, half, out).is_err());
-        // A view whose planes overlap has no single channel stride.
-        let strided = TensorView::with_strides(
-            nn::DevicePtr::new(0),
-            DType::F32,
-            Shape::new(&[channels, 7, 30, 52]),
-            Strides::new(&[30 * 52, 30 * 52, 52, 1]),
-        );
-        assert!(Sample::of(config.latent_channels, moments, strided, out).is_err());
-        // A noise raster of another clip is a different sample.
-        let other = raster(channels, 5, 30, 52, DType::F32);
-        assert!(Sample::of(config.latent_channels, moments, other, out).is_err());
     }
 
     #[test]

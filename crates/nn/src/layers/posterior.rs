@@ -1,74 +1,116 @@
-//! Drawing the sample a condition reads from the encoder's moments (`ops::posterior`).
+//! The diagonal Gaussian posterior of a VAE encoder and the sample drawn from it
+//! (`ops::posterior`).
 //!
-//! The layer is the operator without arithmetic of its own: the two moments arrive as the halves of
-//! the encoder's channel axis, the draw is the caller's, and each of the four views is addressed
-//! through its own two strides -- so a channel-major caller (the VAE's rasters are
-//! `[channels, frames, rows, columns]`) hands the halves of one buffer through without a transpose,
-//! and a channels-last caller does the same with the other stride pair. What the layer does add is the statement of the shape the four views must share — the
-//! operator compares them, and this is where a caller reads that they are compared.
+//! An encoder's moments hold the posterior's mean and log-variance as the two halves of their
+//! channel axis. The sample is
 //!
-//! The per-channel affine is deliberately not here: normalising by `latents_std` and `latents_mean` is
-//! a diagonal `1×1` convolution, which is the audio decoder's own layer, and it takes the sample this
-//! layer produces.
+//! ```text
+//! sample = round_to_f16(mean + exp(0.5 · clamp(log_variance, -30, 20)) · noise)
+//! ```
+//!
+//! in FP32 with the FP16 rounding as a step of its own, the reference's `DiagonalGaussian.sample()`
+//! under its autocast. The moments, the draw and the sample are channel-major rasters
+//! `[channels, ...]`, packed; the operator reads each through two strides, so the two halves of the
+//! moments are one buffer cut by an offset and nothing is copied or transposed.
 
-use ops::TensorView;
 use ops::posterior::{self, Posterior as PosteriorOp};
+use ops::{DType, Shape, Strides, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 
-/// The posterior sample of `[positions, channels]` moments.
+/// The posterior sample of a VAE encoder's moments.
 #[derive(Clone, Copy, Default)]
-pub struct Posterior {
-    /// Whether the program was compiled for programmatic dependent launch.
-    pdl: bool,
-}
+pub struct Posterior;
 
 impl Posterior {
-    /// A sample drawn with the operator's own tiling.
-    pub fn new() -> Self {
-        Self { pdl: false }
-    }
-
-    /// `out[p, c] = round_to_f16(mean[p, c] + exp(0.5 · clamp(log_variance[p, c])) · noise[p, c])`.
+    /// Draw `out` from `moments` and the caller's standard-normal `noise`.
     ///
-    /// All four views are `[positions, channels]` f32 and each is read through its own two strides, so
-    /// `mean` and `log_variance` may be the two halves of one moments buffer cut by an offset -- in
-    /// either physical layout, channels-last `(row = channels, channel = 1)` or channel-major
-    /// `(row = 1, channel = positions)`. `out` may not alias any of them.
-    /// The descriptor this layer's launch takes.
-    fn descriptor(&self) -> posterior::Descriptor {
-        posterior::Descriptor {
-            block: posterior::BLOCK,
-            pdl: self.pdl,
-        }
-    }
-
-    pub fn forward(
+    /// `moments` is `[2 · channels, ...]`, the mean's channels then the log-variance's; `noise` and
+    /// `out` are `[channels, ...]` of the same trailing extents. All three are packed FP32, and
+    /// `out` may not alias the others.
+    ///
+    /// # Errors
+    ///
+    /// Rasters of another element type, rank, channel count or trailing extent, a strided raster,
+    /// or the operator's refusal.
+    pub fn sample(
         &self,
         f: &Forward,
-        mean: TensorView,
-        log_variance: TensorView,
+        moments: TensorView,
         noise: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        if mean.shape != out.shape {
+        const OWNER: &str = "Posterior";
+        let channels = out.shape.dims().first().copied().unwrap_or(0);
+        if channels == 0 {
             return Err(Error::shape(
-                "Posterior",
-                format!(
-                    "the sample is {:?} but the moments are {:?}: a sample has one value per moment",
-                    out.shape.dims(),
-                    mean.shape.dims()
-                ),
+                OWNER,
+                format!("a sample of {:?} has no channels", out.shape.dims()),
             ));
         }
+        for (name, view, expected) in [
+            ("moments", moments, 2 * channels),
+            ("noise", noise, channels),
+            ("out", out, channels),
+        ] {
+            if view.dtype != DType::F32 {
+                return Err(Error::shape(
+                    OWNER,
+                    format!(
+                        "the {name} raster is {}, and a posterior is FP32",
+                        view.dtype
+                    ),
+                ));
+            }
+            if view.shape.rank() < 2
+                || view.shape.dim(0) != expected
+                || view.shape.dims()[1..] != out.shape.dims()[1..]
+            {
+                return Err(Error::shape(
+                    OWNER,
+                    format!(
+                        "the {name} raster is {:?}, not [{expected}, {:?}]",
+                        view.shape.dims(),
+                        &out.shape.dims()[1..]
+                    ),
+                ));
+            }
+            if view.strides != Strides::row_major(view.shape) {
+                return Err(Error::shape(
+                    OWNER,
+                    format!(
+                        "the {name} raster's strides are {:?} over {:?}: a channel-major raster is \
+                         read packed through two strides",
+                        view.strides.as_slice(),
+                        view.shape.dims()
+                    ),
+                ));
+            }
+        }
+        // Each raster as the operator's `[positions, channels]`: neighbouring positions are
+        // neighbouring elements and one channel is one whole plane away, and the moments' two halves
+        // are exactly `channels` planes apart.
+        let positions = out.shape.dims()[1..].iter().product::<u64>();
+        let view = |ptr| {
+            TensorView::with_strides(
+                ptr,
+                DType::F32,
+                Shape::new(&[positions, channels]),
+                Strides::new(&[1, positions]),
+            )
+        };
+        let descriptor = posterior::Descriptor {
+            block: posterior::BLOCK,
+            pdl: false,
+        };
         f.operate::<PosteriorOp>(
-            &self.descriptor(),
+            &descriptor,
             posterior::Args {
-                mean,
-                log_variance,
-                noise,
-                out,
+                mean: view(moments.ptr),
+                log_variance: view(moments.offset_elements(channels * positions)),
+                noise: view(noise.ptr),
+                out: view(out.ptr),
             },
         )
     }
