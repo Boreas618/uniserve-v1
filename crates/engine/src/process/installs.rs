@@ -2,7 +2,7 @@
 //! Program Server store, one install per device admitted on the module-load lane, and the walk to an
 //! operator's next candidate program when the store refuses one for a shape of the generation.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use ipc::UpdateFailure;
@@ -237,15 +237,15 @@ impl MainProcess {
     ///
     /// An update changes implementations and never the set of descriptors, so the keys each
     /// operator must cover are the ones the serving generation holds. The epoch's *first*
-    /// generation has no serving generation to take them from, and nothing else can state them: a
-    /// descriptor is what the model's forward computes for a bucket, and only a walk of that
-    /// forward says which ones it launches. So the first generation starts with the keys already
-    /// learned and finds the rest by walking - each attempt that finds a kernel missing names the
-    /// operator and key it needed, and the install is admitted again with that key added.
+    /// generation has no serving generation to take them from: a descriptor is what the model's
+    /// forward computes for a bucket, and only a walk of that forward says which ones it launches.
+    /// So `required` carries the keys the devices' recorded walks reported, and every one of them is
+    /// asked of the Program Server in this one admission; a key a device's walk still finds missing
+    /// joins them and the installs are admitted again.
     pub(super) fn admit_installs(
         &mut self,
         programs: &Programs,
-        learned: &BTreeMap<String, Vec<String>>,
+        required: &BTreeMap<String, BTreeSet<String>>,
     ) -> std::result::Result<Admitted, UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
         // The Program Server's listing, read at most once and only when a program's keys cannot be
@@ -275,16 +275,15 @@ impl MainProcess {
                 .into_iter()
                 .filter(|key| key_fits_phase(key, slot.phase))
                 .collect();
-            // A generation that launched this operator states the keys it runs; a key the walk has
-            // taught since is added to them, never substituted for them. The first generation has
-            // nothing serving, so its keys come from the package - once, not one capture at a time -
-            // and a taught key joins them for the packages the store does not describe.
-            let mut known: Vec<String> = learned
+            // A generation that launched this operator states the keys it runs; a required key is
+            // added to them, never substituted for them. The first generation has nothing serving,
+            // so its keys are the recorded ones beside what the package's built modules cover.
+            let mut known: Vec<String> = required
                 .get(operator)
-                .cloned()
-                .unwrap_or_default()
                 .into_iter()
+                .flatten()
                 .filter(|key| key_fits_phase(key, slot.phase))
+                .cloned()
                 .collect();
             if keys.is_empty() {
                 if listing.is_none() {
@@ -305,14 +304,14 @@ impl MainProcess {
                 if declared.is_empty() {
                     // The listing names the modules this host has *built*, not what the package
                     // declares, so an empty answer is a host that built none yet - not a program
-                    // that covers nothing. The walk is the authority on which descriptors the
-                    // model needs, and it teaches them one capture at a time; the listing only
-                    // makes the first capture enough when the store already holds them.
+                    // that covers nothing. The recorded walk is the authority on which descriptors
+                    // the model needs, and its keys are asked for below.
                     tracing::debug!(
                         op = %slot.op,
                         backend = %program.backend,
                         revision = program.revision,
-                        "no module of this package is built yet: the walk will name its descriptors"
+                        "no module of this package is built yet: the recorded keys name its \
+                         descriptors"
                     );
                 }
                 keys = declared;
@@ -380,7 +379,7 @@ impl MainProcess {
     /// Moves the generation on to the next program its operator may be filled by.
     ///
     /// Each candidate this host built for the operator is tried once, in a stated order: the
-    /// candidate whose built modules cover the most of the keys learned so far first, then the
+    /// candidate whose built modules cover the most of the generation's required keys first, then the
     /// highest revision, then the backend's name - so two runs choose alike and a store with two
     /// backends costs one extra install rather than a failed generation. When every candidate has
     /// been tried the refusal names the operator, the descriptor it could not serve, and every
@@ -422,7 +421,7 @@ impl MainProcess {
             Ok(listing) => listing,
             Err(reason) => return Advance::Failed(reason),
         };
-        let learned = precopy.learned.get(&op).cloned().unwrap_or_default();
+        let required = precopy.required.get(&op).cloned().unwrap_or_default();
         let mut remaining: Vec<(usize, (String, u32))> = ordered
             .into_iter()
             .filter(|candidate| !precopy.tried.contains(candidate))
@@ -434,12 +433,12 @@ impl MainProcess {
                 };
                 let covers = built_keys(&listing, &op, &program, &self.targets)
                     .iter()
-                    .filter(|key| learned.contains(key))
+                    .filter(|key| required.contains(*key))
                     .count();
                 (covers, candidate)
             })
             .collect();
-        // The stated order: coverage of the keys learned so far, then the highest revision, then the
+        // The stated order: coverage of the required keys, then the highest revision, then the
         // backend name. Coverage only orders; it never excludes a candidate.
         remaining.sort_by(|left, right| {
             right
@@ -466,7 +465,7 @@ impl MainProcess {
             to = %next.0,
             revision = next.1,
             covers,
-            learned = learned.len(),
+            required = required.len(),
             "a program cannot serve this generation's shape: trying the operator's next candidate"
         );
         precopy.programs.insert(
@@ -477,7 +476,7 @@ impl MainProcess {
                 arguments: Default::default(),
             },
         );
-        match self.admit_installs(&precopy.programs, &precopy.learned) {
+        match self.admit_installs(&precopy.programs, &precopy.required) {
             Ok((tasks, unavailable)) => {
                 precopy.unavailable = unavailable;
                 Advance::Retry(tasks)
