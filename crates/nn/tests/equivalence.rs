@@ -17,11 +17,11 @@
 //! | Case | Forms | Kernels |
 //! | --- | --- | --- |
 //! | `device::qk_norm_fused_into_rope` | `Rotary::apply` with per-head gains vs `RmsNorm` per head then the rotation | `rotary_factors`, `qk_norm_rope`, `rms_norm`, `rope_apply` |
-//! | `device::ones_scaled_residual` | `ScaledResidual` over an all-ones scale vs `ScaledAdd(1, 1)` and vs one rounding of the sum | `scaled_residual`, `scaled_add` |
+//! | `device::ones_scaled_residual` | a channel-scaled `Residual` over an all-ones scale vs `Axpby(1, 1)` and vs one rounding of the sum | `scaled_residual`, `scaled_add` |
 //! | `host::spectra_at_the_shipped_bases` | the f32 power and the f64 reciprocal against the f64 power `θ^-e` | none |
 //! | `device::rotary_factors_of_each_spectrum` | the factor tables each spectrum produces | `rotary_factors` |
 //! | `device::channel_affine` | the diagonal-matrix products vs `x·s+m` and `(x-m)/s` on the host | `gemm`, `conv1d`, `conv3d` |
-//! | `device::frame_blend` | the `ScaledAdd` frame loop vs `CrossFade` | `scaled_add`, `cross_fade` |
+//! | `device::frame_blend` | the `Axpby` frame loop vs `CrossFade` | `scaled_add`, `cross_fade` |
 //! | `device::tile_stitch_corners` | `TileStitch` vs `CrossFade` vertical then horizontal, neighbours blended in place | `tile_stitch`, `cross_fade` |
 //! | `device::bias_after_identity_gemm` | the identity-matrix product with a bias vs `bias_add` | `gemm`, `bias_add` |
 //! | `host::refiner_final_norm_eps` | `final_norm_eps` vs `norm_eps` in each shipped H3 transformer config | none |
@@ -59,8 +59,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use nn::layers::{
-    Conv1d, Conv3d, ConvGeometry, CrossFade, Linear, RmsNorm, Rotary, Rotation, ScaledAdd,
-    ScaledResidual, Sections, TileGrid, TileStitch, WeightOrder,
+    Axpby, Conv1d, Conv3d, ConvGeometry, CrossFade, Linear, Residual, RmsNorm, Rotary, Rotation,
+    Scale, Sections, TileGrid, TileStitch, WeightOrder,
 };
 use nn::{Arena, Backing, DType, DevicePtr, Forward, Shape, Strides, TensorView, Weight};
 use ops::values::{f16_to_f32, f32_to_bf16, f32_to_f16};
@@ -1110,8 +1110,8 @@ mod device {
 
     // ---- Case 2 -------------------------------------------------------------------------------
 
-    /// Case 2: `ScaledResidual` over the all-ones scale the H3 refiner, text encoder and vision
-    /// tower publish, against a plain add: `ScaledAdd` with both coefficients one, and the sum of
+    /// Case 2: a channel-scaled `Residual` over the all-ones scale the H3 refiner, text encoder and vision
+    /// tower publish, against a plain add: `Axpby` with both coefficients one, and the sum of
     /// the two BF16 operands rounded once (what a `Residual` with no scale computes).
     #[test]
     #[ignore = "requires a CUDA device and a Program Server (UNISERVE_PROGRAM_SERVER_SOCKET)"]
@@ -1147,11 +1147,11 @@ mod device {
             let added = bench.upload(dtype, &[rows, width], &hidden)?;
             let update_view = bench.upload(dtype, &[rows, width], &update)?;
             let ones = bench.weight(dtype, &[width], &vec![1.0; width as usize])?;
-            let residual = ScaledResidual::new(ones, None)?;
+            let residual = Residual::new(Scale::Channel(ones), None)?;
 
             bench.run(&|f| {
-                residual.forward(f, scaled, update_view)?;
-                ScaledAdd.forward(f, added, update_view, 1.0, 1.0)
+                residual.forward(f, scaled, update_view, None, scaled)?;
+                Axpby.forward(f, added, update_view, 1.0, 1.0)
             })?;
 
             let scaled = bench.download(scaled)?;
@@ -1574,7 +1574,7 @@ mod device {
     // ---- Case 5 -------------------------------------------------------------------------------
 
     /// Case 5, clips: the video postprocessor's fade of a clip's first five frames against its
-    /// predecessor's tail (`minimax-h3` `output::VideoPostprocessor::blend`: three `ScaledAdd`
+    /// predecessor's tail (`minimax-h3` `output::VideoPostprocessor::blend`: three `Axpby`
     /// launches a frame, the ramp `i/5` and its complement rounded to FP16 on the host) against
     /// `CrossFade` over the same frames, read as a band of five rows of one row per frame.
     #[test]
@@ -1625,9 +1625,9 @@ mod device {
                             Shape::new(&[1, pixels]),
                         )
                     };
-                    ScaledAdd.forward(f, row(looped), row(previous), complement, 0.0)?;
-                    ScaledAdd.forward(f, term, row(clip), weight, 0.0)?;
-                    ScaledAdd.forward(f, row(looped), term, 1.0, 1.0)?;
+                    Axpby.forward(f, row(looped), row(previous), complement, 0.0)?;
+                    Axpby.forward(f, term, row(clip), weight, 0.0)?;
+                    Axpby.forward(f, row(looped), term, 1.0, 1.0)?;
                 }
             }
             fade.forward(

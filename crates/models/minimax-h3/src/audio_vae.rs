@@ -23,7 +23,7 @@
 
 use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{
-    AudioActivation, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, ScaledAdd,
+    AudioActivation, Axpby, Cast, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, Residual,
 };
 use nn::weights::Scope;
 use nn::{
@@ -573,7 +573,7 @@ impl BigVgan {
         let accumulated = self.buffer(f, stage.channels, length)?;
         // The four buffers a block needs are the stage's shape, not the block's, so they are reserved
         // once here and reused by every block: a block overwrites all four before it reads them (its
-        // first `ScaledAdd` writes `running` from the stage's input with `beta = 0`), while the running
+        // first `Cast` writes `running` from the stage's input), while the running
         // sum is a buffer of its own because it must survive the loop. Reserving them per block instead
         // multiplied the decoder's arena by the block count, and the arena never rewinds.
         let scratch = BlockBuffers {
@@ -586,11 +586,11 @@ impl BigVgan {
             let block_out = self.block(f, block, input, scratch)?;
             // The first block initialises the sum; the rest add to it.
             let beta = if index == 0 { 0.0 } else { 1.0 };
-            ScaledAdd.forward(f, rows(accumulated)?, rows(block_out)?, 1.0, beta)?;
+            Axpby.forward(f, rows(accumulated)?, rows(block_out)?, 1.0, beta)?;
         }
         // The reference divides the sum by the number of kernels; multiplying by the reciprocal differs
         // only in the last bit of a FP32 value, three orders below one PCM step.
-        ScaledAdd.forward(
+        Axpby.forward(
             f,
             rows(accumulated)?,
             rows(accumulated)?,
@@ -617,15 +617,16 @@ impl BigVgan {
             convolved,
             residual,
         } = scratch;
-        // `beta = 0` initialises the running value from the stage's input without touching it. Every
+        // The running value starts as a copy of the stage's input, which stays untouched. Every
         // block does this first, which is what makes one set of buffers reusable across the stage.
-        ScaledAdd.forward(f, rows(running)?, rows(input)?, 1.0, 0.0)?;
+        Cast.forward(f, rows(input)?, rows(running)?)?;
         for step in &block.steps {
             step.first_activation.forward(f, running, activated)?;
             step.first.forward(f, activated, convolved)?;
             step.second_activation.forward(f, convolved, activated)?;
             step.second.forward(f, activated, residual)?;
-            ScaledAdd.forward(f, rows(running)?, rows(residual)?, 1.0, 1.0)?;
+            let running_rows = rows(running)?;
+            Residual::default().forward(f, running_rows, rows(residual)?, None, running_rows)?;
         }
         Ok(running)
     }

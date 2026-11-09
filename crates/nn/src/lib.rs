@@ -72,14 +72,13 @@ pub use exchange::ExchangeViews;
 pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{
-    Activation, AdaptivePool, Attention, AttentionBackend, AudioActivation, Candidates, Conv1d,
-    Conv3d, ConvGeometry, ConvTranspose1d, CrossFade, FrameMoments, FrameNormPad, FramePad,
-    GatedActivation, GatedResidual, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise,
-    NoiseKey, PackedSwiGlu, ParallelLMHead, Patch, PcmInterleave, RgbBytes, RmsNorm, Rotary,
-    Rotate, Rotation, Sampler, SamplerState, Samples, ScaledAdd, ScaledResidual,
-    ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections, SegmentAttention, SegmentTables,
-    Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm,
-    gather_rows,
+    Activation, AdaptivePool, Attention, AttentionBackend, AudioActivation, Axpby, Candidates,
+    Cast, Conv1d, Conv3d, ConvGeometry, ConvTranspose1d, CrossFade, FrameMoments, FrameNormPad,
+    FramePad, GatedActivation, Gelu, LayerNorm, Linear, ModulatedRmsNorm, Moe, Noise, NoiseKey,
+    PackedSwiGlu, ParallelLMHead, Patch, PcmInterleave, Residual, RgbBytes, RmsNorm, Rotary,
+    Rotate, Rotation, Sampler, SamplerState, Samples, Scale, ScaledResidualLayerNorm,
+    ScaledResidualRmsNorm, Sections, SegmentAttention, SegmentTables, Silu, Snake, SwiGlu,
+    TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm, gather_rows,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

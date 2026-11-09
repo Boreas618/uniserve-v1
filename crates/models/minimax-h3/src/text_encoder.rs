@@ -41,7 +41,7 @@ use nn::capability::{
 use nn::family::Split;
 use nn::layers::{
     Attention, Bias, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames, QkvSpec,
-    RmsNorm, Rotary, Rows, ScaledResidual, Sections, VocabParallelEmbedding,
+    Residual, RmsNorm, Rotary, Rows, Sections, VocabParallelEmbedding,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -560,8 +560,8 @@ pub struct TextEncoder {
     /// The row operator that splices the vision rows into the prompt and adds the DeepStack taps.
     rows: Rows,
     activation: GatedActivation,
-    /// The coefficient of the residual stream: one, read as a weight by the fused operator.
-    residual: ScaledResidual,
+    /// The add of every sub-layer's update into the residual stream.
+    residual: Residual,
     /// The layers whose hidden state a DeepStack table is added after.
     deepstack_layers: Vec<usize>,
 }
@@ -640,18 +640,8 @@ impl TextEncoder {
             tower: VisionTower::load(loader, &config.vision, dtype)?,
             rows: Rows::new(dtype, hidden).map_err(Error::from)?,
             activation: GatedActivation::new(ACTIVATION),
-            // The fused residual operator reads its coefficient as a weight; every layer adds its
-            // sub-layers' outputs with coefficient one.
-            residual: ScaledResidual::new(
-                loader.scope(PREFIX).constant(
-                    "residual_scale",
-                    dtype,
-                    &[u64::from(config.hidden_size)],
-                    &vec![1.0; config.hidden_size as usize],
-                )?,
-                None,
-            )
-            .map_err(Error::from)?,
+            // Every sub-layer's output joins the stream unscaled.
+            residual: Residual::default(),
             deepstack_layers,
             rank,
         })
@@ -891,7 +881,7 @@ impl TextEncoder {
                 // The reference's cut: the layer's own output joins the stream, then its features,
                 // and the next layer normalizes the stream alone.
                 self.residual
-                    .forward(f, hidden, buffers.down)
+                    .forward(f, hidden, buffers.down, None, hidden)
                     .map_err(Error::from)?;
                 if merged > 0 {
                     let features =
@@ -904,7 +894,7 @@ impl TextEncoder {
         }
         if let Some(carried) = carried {
             self.residual
-                .forward(f, hidden, carried)
+                .forward(f, hidden, carried, None, hidden)
                 .map_err(Error::from)?;
         }
         Ok(())

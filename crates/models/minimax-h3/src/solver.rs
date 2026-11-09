@@ -44,7 +44,7 @@
 //! is one rounding per step of the velocity; it is inside the operator's tolerance and is the
 //! `quality` preset's own representation.
 
-use nn::layers::ScaledResidual;
+use nn::layers::{Residual, Scale};
 use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
 
@@ -89,7 +89,7 @@ struct Track {
     ///
     /// A parallel-decoding student's first node is not unit noise; the released and distilled
     /// grids start at `sigma_0 = 1`, where the layer is omitted because the draw is already right.
-    start: Option<ScaledResidual>,
+    start: Option<Residual>,
 }
 
 impl Solver {
@@ -145,8 +145,9 @@ impl Solver {
             backing: nn::Backing::new(gathered.ptr, 4),
             view: gathered.reshape(Shape::new(&[1])),
         };
-        ScaledResidual::new(scale, None)
-            .and_then(|scaled| scaled.forward(f, sample, velocity))
+        // A one-channel scale: every element of the sample's single column reads it.
+        Residual::new(Scale::Channel(scale), None)
+            .and_then(|scaled| scaled.forward(f, sample, velocity, None, sample))
             .map_err(Error::from)
     }
 
@@ -159,7 +160,9 @@ impl Solver {
             return Ok(());
         };
         let sample = elements(sample)?;
-        start.forward(f, sample, sample).map_err(Error::from)
+        start
+            .forward(f, sample, sample, None, sample)
+            .map_err(Error::from)
     }
 
     /// The coefficients of one step, as the published table holds them: `sigma - sigma_next`.
@@ -239,7 +242,7 @@ impl Track {
             None => None,
             Some(sigma) => {
                 let table = track.constant_f32("start_coefficient", &[1], &[sigma - 1.0])?;
-                Some(ScaledResidual::new(table, None).map_err(Error::from)?)
+                Some(Residual::new(Scale::Channel(table), None).map_err(Error::from)?)
             }
         };
         Ok(Self {

@@ -1908,8 +1908,8 @@ impl Denoiser {
                 let hidden = u64::from(self.config.transformer.hidden_size);
                 let projected = f.arena().tensor(DType::F32, Shape::new(&[rows, hidden]))?;
                 self.transformer.project_audio(f, encoded, projected)?;
-                nn::layers::ScaledAdd
-                    .forward(f, row_range(text, start, rows)?, projected, 1.0, 0.0)
+                nn::layers::Cast
+                    .forward(f, projected, row_range(text, start, rows)?)
                     .map_err(Error::from)?;
             }
             if piece.rows > 0 {
@@ -2115,7 +2115,7 @@ impl Denoiser {
 
         // The latent becomes rows, the draw becomes rows - the draw is drawn at latent resolution,
         // so it takes the same mapping - and the anchor mixes them in place over the latent's rows.
-        // `ScaledAdd` is `target ← β · target + α · source`, so the reference's `t · clean + (1 - t) ·
+        // `Axpby` is `y ← β · y + α · x`, so the reference's `t · clean + (1 - t) ·
         // draw` is β = t on the latent's rows and α = 1 - t on the draw's.
         let patch = nn::layers::Patch::new(video_channels, run_rows, run_columns)?;
         let rows = u64::from(piece.rows);
@@ -2124,9 +2124,9 @@ impl Denoiser {
         patch.forward(f, latent, clean, latent_frames)?;
         let anchored = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
         patch.forward(f, draw, anchored, latent_frames)?;
-        // `target ← β · target + α · source` with the target the latent's rows and the source the
+        // `y ← β · y + α · x` with `y` the latent's rows and `x` the
         // draw's: α weights the draw, β the latent, so the result is `t · clean + (1 - t) · draw`.
-        nn::layers::ScaledAdd
+        nn::layers::Axpby
             .forward(
                 f,
                 clean,
@@ -2140,8 +2140,8 @@ impl Denoiser {
         let hidden = u64::from(self.config.transformer.hidden_size);
         let projected = f.arena().tensor(DType::F32, Shape::new(&[rows, hidden]))?;
         self.transformer.project(f, clean, projected)?;
-        nn::layers::ScaledAdd
-            .forward(f, row_range(text, start, rows)?, projected, 1.0, 0.0)
+        nn::layers::Cast
+            .forward(f, projected, row_range(text, start, rows)?)
             .map_err(Error::from)?;
         Ok(())
     }
@@ -2338,7 +2338,7 @@ impl Denoiser {
             let projected = arena.tensor(DType::F32, Shape::new(&[own_video, hidden_size]))?;
             self.transformer.project(f, owned, projected)?;
             let narrowed = arena.tensor(dtype, Shape::new(&[own_video, hidden_size]))?;
-            nn::layers::ScaledAdd.forward(f, narrowed, projected, 1.0, 0.0)?;
+            nn::layers::Cast.forward(f, projected, narrowed)?;
             nn::layers::Rows::new(dtype, hidden_size)?.replace(f, hidden, narrowed, video_slots)?;
         }
 
@@ -2388,7 +2388,7 @@ impl Denoiser {
                 let projected = arena.tensor(DType::F32, Shape::new(&[own_audio, hidden_size]))?;
                 self.transformer.project_audio(f, owned, projected)?;
                 let narrowed = arena.tensor(dtype, Shape::new(&[own_audio, hidden_size]))?;
-                nn::layers::ScaledAdd.forward(f, narrowed, projected, 1.0, 0.0)?;
+                nn::layers::Cast.forward(f, projected, narrowed)?;
                 nn::layers::Rows::new(dtype, hidden_size)?.replace(
                     f,
                     hidden,

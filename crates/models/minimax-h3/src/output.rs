@@ -30,7 +30,7 @@
 
 use nn::Shape;
 use nn::capability::StateTable;
-use nn::layers::{RgbBytes, ScaledAdd};
+use nn::layers::{Axpby, RgbBytes};
 use nn::{DType, Forward, TensorView, Weight};
 
 use crate::config::CLIP_FRAMES;
@@ -275,14 +275,14 @@ impl VideoPostprocessor {
                     Shape::new(&[1, pixels]),
                 );
                 // A zero `beta` does not read the target, so neither buffer needs clearing.
-                ScaledAdd.forward(f, target, source, complement, 0.0)?;
+                Axpby.forward(f, target, source, complement, 0.0)?;
                 let current = TensorView::new(
                     clip.element(&[channel, u64::from(first + frame), 0, 0]),
                     clip.dtype,
                     Shape::new(&[1, pixels]),
                 );
-                ScaledAdd.forward(f, term, current, weight, 0.0)?;
-                ScaledAdd.forward(f, target, term, 1.0, 1.0)?;
+                Axpby.forward(f, term, current, weight, 0.0)?;
+                Axpby.forward(f, target, term, 1.0, 1.0)?;
             }
         }
         Ok(())

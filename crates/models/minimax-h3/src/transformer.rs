@@ -27,7 +27,7 @@ use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
 use nn::layers::{
-    Bias, GatedActivation, GatedResidual, Linear, ModulatedRmsNorm, Parallel, RmsNorm,
+    Bias, GatedActivation, Linear, ModulatedRmsNorm, Parallel, Residual, RmsNorm, Scale,
 };
 use nn::tensor::Backing;
 use nn::weights::{Weight, WeightLoader};
@@ -177,7 +177,7 @@ impl Layer {
             self.eps,
         )?
         .with_retain();
-        let residual = GatedResidual::new(gate_mlp)?;
+        let residual = Residual::new(Scale::Row(gate_mlp), None)?;
         // Under Ulysses the attended rows return interval by interval, and what follows attention
         // reads a row alone, so an interval's output projection and feed-forward run while the
         // later intervals travel.
@@ -287,7 +287,7 @@ impl Layer {
         &self,
         f: &Forward,
         mlp_norm: &ModulatedRmsNorm,
-        residual: &GatedResidual,
+        residual: &Residual,
         hidden: TensorView,
         update: TensorView,
         out: TensorView,
@@ -315,7 +315,7 @@ impl Layer {
         // `hidden` is spent by now, so the down projection lands there, and the gated residual
         // writes over its `update` operand: the layer's output is `hidden`, in place.
         self.down.forward(f, mlp, hidden)?;
-        Ok(residual.forward(f, out, hidden, rows)?)
+        Ok(residual.forward(f, out, hidden, Some(rows), hidden)?)
     }
 }
 
@@ -847,11 +847,8 @@ impl Transformer {
         if source.dtype == nn::DType::F32 {
             return Ok(source);
         }
-        let out = f.arena().tensor(nn::DType::F32, source.shape)?;
-        // `target <- 1 * source + 0 * target`: a widening, and the zero beta means the target is
-        // never read, so an uninitialised buffer is the right operand.
-        nn::layers::ScaledAdd.forward(f, out, source, 1.0, 0.0)?;
-        Ok(out)
+        // A widening: every BF16 value is an FP32 value, so the conversion is exact.
+        Ok(nn::layers::Cast.apply(f, source, nn::DType::F32)?)
     }
 
     /// Project one modality's packed rows into the hidden width.

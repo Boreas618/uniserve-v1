@@ -731,7 +731,7 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
 use nn::Forward;
 use nn::layers::{
     AdaptivePool, Attention, Conv1d, Conv3d, ConvGeometry, FrameMoments, FrameNormPad, FramePad,
-    GatedActivation, LayerNorm, Linear, Posterior, ScaledAdd, Snake, Transpose, WeightOrder,
+    GatedActivation, LayerNorm, Linear, Posterior, Residual, Snake, Transpose, WeightOrder,
 };
 use nn::weights::{Scope, Weight, WeightLoader};
 use nn::{DType, Shape, Strides, TensorView};
@@ -1669,7 +1669,8 @@ impl VideoEncoder {
         // The reference groups the sum as `residual + (values + bias)` and adds the convolution's
         // bias in a pass of its own; cuDNN adds that bias in a pass of its own too, and IEEE addition
         // commutes, so `(values + bias) + residual` here is the same rounded value.
-        Ok(ScaledAdd.forward(f, rows(out)?, rows(residual)?, 1.0, 1.0)?)
+        let sum = rows(out)?;
+        Ok(Residual::default().forward(f, sum, rows(residual)?, None, sum)?)
     }
 }
 
@@ -2051,7 +2052,7 @@ impl AudioEncoder {
                 unit.snakes[1].forward(f, second, unit.alphas[1].view(), first)?;
                 unit.convs[1].forward(f, first, second)?;
                 let residual = matrix(hidden)?;
-                ScaledAdd.forward(f, residual, matrix(second)?, 1.0, 1.0)?;
+                Residual::default().forward(f, residual, matrix(second)?, None, residual)?;
             }
             let widened = extent / u64::from(stage.rate);
             let next = f.arena().tensor(
@@ -2266,7 +2267,7 @@ impl Projection {
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, channels]))?;
         self.attention_output.forward(f, pooled, projected)?;
-        ScaledAdd.forward(f, shortcut, projected, 1.0, 1.0)?;
+        Residual::default().forward(f, shortcut, projected, None, shortcut)?;
         // The normalized GeGLU residual.
         let normed = f
             .arena()
@@ -2276,7 +2277,7 @@ impl Projection {
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, channels]))?;
         self.mlp.forward(f, normed, updated)?;
-        ScaledAdd.forward(f, shortcut, updated, 1.0, 1.0)?;
+        Residual::default().forward(f, shortcut, updated, None, shortcut)?;
         Ok(shortcut)
     }
 }

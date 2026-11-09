@@ -410,7 +410,7 @@ pub const MINIMUM_OVERLAP: u32 = 64;
 
 use nn::Forward;
 use nn::layers::{
-    Attention, Bias, Linear, MergedColumnLinear, PackedSwiGlu, Parallel, Rotary, Rows, ScaledAdd,
+    Attention, Bias, Cast, Linear, MergedColumnLinear, PackedSwiGlu, Parallel, Rotary, Rows,
     ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections, WeightedRmsNorm,
 };
 use nn::weights::{Weight, WeightLoader};
@@ -1050,7 +1050,7 @@ impl VideoDecoder {
 
         // The latents restore in FP32 and round once on their way into the FP16 projections.
         self.restore.forward(f, latents, scratch.restored)?;
-        ScaledAdd.forward(f, scratch.rounded, scratch.restored, 1.0, 0.0)?;
+        Cast.forward(f, scratch.restored, scratch.rounded)?;
         self.post_quant
             .forward(f, scratch.rounded, scratch.quantized)?;
         self.post_quant_bias
@@ -1080,7 +1080,7 @@ impl VideoDecoder {
                 scratch.projected.dtype,
                 Shape::new(&[tile_voxels, width]),
             );
-            ScaledAdd.forward(f, voxel_rows, projected, 1.0, 0.0)?;
+            Cast.forward(f, projected, voxel_rows)?;
             self.place.replace(
                 f,
                 tile_stream,

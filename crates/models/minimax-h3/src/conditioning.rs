@@ -25,7 +25,7 @@
 use nn::family::Split;
 use nn::layers::{
     Attention, Bias, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames, QkvSpec,
-    RmsNorm, ScaledResidual,
+    Residual, RmsNorm,
 };
 use nn::weights::WeightLoader;
 use nn::{Forward, Shape, TensorView};
@@ -61,8 +61,8 @@ pub struct RefinerBlock {
     /// `silu(gate)` and the product one step at a time.
     gated: GatedActivation,
     attention: Attention,
-    /// The identity add of the attention and feed-forward residuals.
-    residual: ScaledResidual,
+    /// The plain add of the attention and feed-forward updates into the stream.
+    residual: Residual,
     hidden_size: u32,
     head_dim: u32,
     heads: u32,
@@ -120,7 +120,6 @@ impl RefinerBlock {
             scaling(config.head_dim),
         )?;
 
-        let stream = query_dtype;
         Ok(Self {
             dtype: query_dtype,
             intermediate_size: config.intermediate_size,
@@ -150,7 +149,7 @@ impl RefinerBlock {
             down,
             gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             attention,
-            residual: identity(loader, u64::from(config.hidden_size), stream)?,
+            residual: Residual::default(),
             hidden_size: config.hidden_size,
             head_dim: config.head_dim,
             heads: config.num_attention_heads,
@@ -201,7 +200,8 @@ impl RefinerBlock {
                 .reshape(with_heads(rows.attended, heads, head)),
         )?;
         self.output.forward(f, rows.attended, rows.update)?;
-        self.residual.forward(f, hidden, rows.update)?;
+        self.residual
+            .forward(f, hidden, rows.update, None, hidden)?;
 
         // Feed-forward: normalize, project the packed value and gate halves, gate, project back.
         self.norm2.forward(f, hidden, rows.normed)?;
@@ -209,7 +209,8 @@ impl RefinerBlock {
         let (value, gate) = crate::transformer::projection_halves(rows.packed);
         self.gated.forward(f, gate, value, rows.ffn)?;
         self.down.forward(f, rows.ffn, rows.update)?;
-        self.residual.forward(f, hidden, rows.update)?;
+        self.residual
+            .forward(f, hidden, rows.update, None, hidden)?;
         Ok(())
     }
 }
@@ -366,30 +367,6 @@ fn with_heads(view: TensorView, heads: u32, head_dim: u32) -> Shape {
 /// The attention scale of one head: `1 / sqrt(head_dim)`.
 fn scaling(head_dim: u32) -> f32 {
     1.0 / (head_dim as f32).sqrt()
-}
-
-/// The identity residual: every channel's update added unchanged.
-///
-/// The layer's width is its scale's, so the scale holds one element per channel of the stream.
-///
-/// The operator reads the scale in the stream's element type, so the ones are stated in it.
-fn identity(
-    loader: &mut WeightLoader<'_>,
-    hidden: u64,
-    stream: nn::DType,
-) -> Result<ScaledResidual> {
-    if !matches!(stream, nn::DType::F32 | nn::DType::BF16) {
-        return Err(Error::checkpoint(format!(
-            "a refiner's stream is F32 or BF16, not {stream}"
-        )));
-    }
-    let scale = loader.scope("token_refiner").constant(
-        "identity_scale",
-        stream,
-        &[hidden],
-        &vec![1.0; hidden as usize],
-    )?;
-    Ok(ScaledResidual::new(scale, None)?)
 }
 
 #[cfg(test)]

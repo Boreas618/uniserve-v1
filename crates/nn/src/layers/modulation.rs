@@ -1,4 +1,4 @@
-//! The diffusion transformer's modulation layer: an indexed RMS modulation and the gated residual.
+//! The diffusion transformer's modulation layer: an indexed RMS modulation.
 //!
 //! A diffusion block is conditioned on a timestep embedding: three vectors per conditioning row —
 //! shift, scale and gate — are selected per activation row, the row is normalized, its affine image
@@ -8,9 +8,7 @@
 //! caller's views.
 
 use ops::descriptor::Float;
-use ops::modulation::{
-    self, GatedResidual as GatedResidualOp, ModulatedRmsNorm as ModulatedRmsNormOp,
-};
+use ops::modulation::{self, ModulatedRmsNorm as ModulatedRmsNormOp};
 use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
@@ -201,106 +199,5 @@ impl ModulatedRmsNorm {
         };
 
         f.operate::<ModulatedRmsNormOp>(&descriptor, args)
-    }
-}
-
-/// The gate a diffusion block folds its update through: `hidden += gate[row] · update`.
-///
-/// A diffusion block's second residual is gated not by one channel vector but by the row of a
-/// `[parameters, width]` table that the block's conditioning selects — the same table an indexed
-/// modulation reads, at a different parameter. The layer holds that table; the rows and the update
-/// are the caller's views (`ops::modulation::GatedResidual`).
-pub struct GatedResidual {
-    gate: Weight,
-}
-
-impl GatedResidual {
-    /// The descriptor one gated residual over `width`-wide rows launches.
-    fn descriptor(
-        dtype: ops::DType,
-        indices: ops::DType,
-        width: u64,
-        gate_stride: u64,
-    ) -> Result<modulation::GatedResidualDescriptor> {
-        Ok(modulation::GatedResidualDescriptor {
-            dtype,
-            indices,
-            width: u32::try_from(width).map_err(|_| {
-                Error::shape(
-                    "GatedResidual",
-                    "a row wider than a descriptor holds".to_owned(),
-                )
-            })?,
-            gate_stride,
-        })
-    }
-
-    /// The gates of `gate`'s width: one row per conditioning parameter.
-    pub fn new(gate: Weight) -> Result<Self> {
-        let view = gate.view();
-        if view.shape.rank() != 2 || view.shape.last() == 0 {
-            return Err(Error::shape(
-                "GatedResidual",
-                format!(
-                    "a gate table is [parameters, width], not {:?}",
-                    view.shape.dims()
-                ),
-            ));
-        }
-        Ok(Self { gate })
-    }
-
-    /// The elements per activation row.
-    pub fn width(&self) -> u32 {
-        self.gate.shape().last() as u32
-    }
-
-    /// Fold `update` into `hidden`, both `[rows, width]`; the sum overwrites `update`, as the
-    /// kernel writes it, and `hidden` is left as it was.
-    ///
-    /// `row_indices` is `[rows]` and selects the gate row each activation row multiplies by. The row
-    /// count is the launch's, not the descriptor's: a clip's token count changes with every request,
-    /// so a descriptor carrying it would be a kernel per clip length, and the operator reads it
-    /// from `hidden` and packs it as the launch's last scalar.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        update: TensorView,
-        row_indices: TensorView,
-    ) -> Result<()> {
-        let width = self.gate.shape().last();
-        if hidden.shape.rank() != 2 || hidden.shape.last() != width || update.shape != hidden.shape
-        {
-            return Err(Error::shape(
-                "GatedResidual",
-                format!(
-                    "{:?} and {:?} are not [rows, {width}]",
-                    hidden.shape.dims(),
-                    update.shape.dims()
-                ),
-            ));
-        }
-        let rows = hidden.shape.dim(0);
-        if row_indices.shape.numel() != rows {
-            return Err(Error::shape(
-                "GatedResidual",
-                format!("{} row indices for {rows} rows", row_indices.shape.numel()),
-            ));
-        }
-        let descriptor = Self::descriptor(
-            hidden.dtype,
-            row_indices.dtype,
-            width,
-            self.gate.view().strides.get(0),
-        )?;
-        let args = modulation::GatedResidualArgs {
-            hidden,
-            update,
-            gate: self.gate.view(),
-            row_indices,
-        };
-
-        f.operate::<GatedResidualOp>(&descriptor, args)
     }
 }

@@ -7,10 +7,9 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    AdaptivePool, Arena, Conv3d, ConvGeometry, DType, DevicePtr, Forward, FrameNormPad,
-    GatedResidual, KvGroup, KvPlanes, KvView, Linear, ModulatedRmsNorm, Patch, Rotary, Rotate,
-    Rotation, ScaledResidual, ScaledResidualRmsNorm, Shape, Snake, SwiGlu, TensorView, VsaTiles,
-    Weight, WeightedRmsNorm,
+    AdaptivePool, Arena, Conv3d, ConvGeometry, DType, DevicePtr, Forward, FrameNormPad, KvGroup,
+    KvPlanes, KvView, Linear, ModulatedRmsNorm, Patch, Residual, Rotary, Rotate, Rotation, Scale,
+    ScaledResidualRmsNorm, Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
 };
 use ops::gemm::WeightOrder;
 
@@ -58,9 +57,85 @@ fn the_residual_layers_refuse_parameters_of_different_channel_counts() {
     assert!(
         ScaledResidualRmsNorm::new(weight(&[16]), Some(weight(&[16])), weight(&[16]), 1e-6).is_ok()
     );
+}
 
-    assert!(ScaledResidual::new(weight(&[16]), Some(weight(&[8]))).is_err());
-    assert!(ScaledResidual::new(weight(&[16]), Some(weight(&[16]))).is_ok());
+/// A residual's bias is the update's, added under a channel scale of its width; a row scale is a
+/// table with one row per conditioning parameter.
+#[test]
+fn a_residual_refuses_parameters_its_scale_does_not_read() {
+    let channel = |width| Scale::Channel(weight(&[width]));
+    assert!(Residual::new(channel(16), Some(weight(&[8]))).is_err());
+    assert!(Residual::new(channel(16), Some(weight(&[16]))).is_ok());
+    assert!(Residual::new(Scale::Channel(weight(&[4, 16])), None).is_err());
+    assert!(Residual::new(Scale::None, Some(weight(&[16]))).is_err());
+
+    assert!(Residual::new(Scale::Row(weight(&[4, 32])), None).is_ok());
+    assert!(Residual::new(Scale::Row(weight(&[4, 32])), Some(weight(&[32]))).is_err());
+    assert!(Residual::new(Scale::Row(weight(&[32])), None).is_err());
+    assert!(Residual::new(Scale::Row(weight(&[4, 0])), None).is_err());
+}
+
+/// Each scale writes one operand in place: the unscaled add either input, a channel scale the
+/// residual, a row scale the update. Another output, or row indices the scale does not read, is
+/// refused before anything launches.
+#[test]
+fn a_residual_writes_only_the_operand_its_scale_updates() {
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let rows = |columns| {
+        arena
+            .tensor(DType::BF16, Shape::new(&[3, columns]))
+            .unwrap()
+    };
+    let (residual, update, other) = (rows(16), rows(16), rows(16));
+    let indices = arena.tensor(DType::I32, Shape::new(&[3])).unwrap();
+
+    let plain = Residual::default();
+    assert!(plain.forward(&f, residual, update, None, residual).is_ok());
+    assert!(plain.forward(&f, residual, update, None, update).is_ok());
+    assert!(plain.forward(&f, residual, update, None, other).is_err());
+    assert!(
+        plain
+            .forward(&f, residual, update, Some(indices), residual)
+            .is_err()
+    );
+
+    let gains = arena.tensor(DType::BF16, Shape::new(&[16])).unwrap();
+    let channel = Residual::new(
+        Scale::Channel(Weight {
+            backing: nn::Backing::new(gains.ptr, 32),
+            view: gains,
+        }),
+        None,
+    )
+    .unwrap();
+    assert!(
+        channel
+            .forward(&f, residual, update, None, residual)
+            .is_ok()
+    );
+    assert!(channel.forward(&f, residual, update, None, update).is_err());
+
+    let table = arena.tensor(DType::BF16, Shape::new(&[4, 16])).unwrap();
+    let gated = Residual::new(
+        Scale::Row(Weight {
+            backing: nn::Backing::new(table.ptr, 128),
+            view: table,
+        }),
+        None,
+    )
+    .unwrap();
+    assert!(
+        gated
+            .forward(&f, residual, update, Some(indices), update)
+            .is_ok()
+    );
+    assert!(
+        gated
+            .forward(&f, residual, update, Some(indices), residual)
+            .is_err()
+    );
+    assert!(gated.forward(&f, residual, update, None, update).is_err());
 }
 
 #[test]
@@ -222,17 +297,6 @@ fn the_audio_layers_hold_their_channels() {
     assert!(AdaptivePool::new(8, 256, 0).is_err());
     // Wider than the descriptor's fields hold.
     assert!(AdaptivePool::new(u64::from(u32::MAX) + 1, 256, 32).is_err());
-}
-
-/// The gate table of a diffusion block is one row per conditioning parameter, and a table of no
-/// rows or a vector is a loading error rather than a launch-time surprise.
-#[test]
-fn a_gated_residual_holds_the_gate_table_it_gates_with() {
-    assert!(GatedResidual::new(weight(&[4, 32])).is_ok());
-    let gate = GatedResidual::new(weight(&[4, 32])).unwrap();
-    assert_eq!(gate.width(), 32);
-    assert!(GatedResidual::new(weight(&[32])).is_err());
-    assert!(GatedResidual::new(weight(&[4, 0])).is_err());
 }
 
 /// The patch mapping is built from a layout's latent geometry: channels and the patch grid are

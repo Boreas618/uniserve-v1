@@ -1,29 +1,40 @@
-//! The residual stream's normalization layer: a channel-scaled update folded into the residual,
-//! and the normalization of the rows that follow.
+//! Elementwise updates of a stream: the residual add, the two-coefficient update a solver steps
+//! with, and the element-type conversion.
 //!
-//! Four compositions, each one operator (`ops::residual`):
-//! `scaled_residual`, `scaled_residual_rms_norm`, `scaled_residual_layer_norm`, `weighted_rms_norm`.
-//! A block that uses them reads its residual once instead of running an add, a reduction and a
-//! scale as separate launches.
+//! ```text
+//! Residual   out = residual + (update + bias) · scale     scale: none, per channel or per row
+//! Axpby      y   = β · y + α · x                          two host coefficients
+//! Cast       out = x                                      converted to out's element type
+//! ```
 //!
-//! The layers own the learned parameters and the epsilon; the residual, the block's update and the
-//! output are the caller's views, because the residual stream is shared by every layer of a block.
+//! Each form computes in FP32 and rounds once into the written operand's element type. The three
+//! scales of [`Residual`] are three operators — `scaled_add` (no scale), `scaled_residual` (one
+//! learned scale per channel), `gated_residual` (a table row per activation row) — because each
+//! reads a different operand set; the layer picks the one its scale names, so a consumer states the
+//! mathematics and never the kernel. An all-ones channel scale is not a fourth form: it rounds
+//! exactly as the unscaled add does, so a block whose scale is one has no scale.
 
-use ops::residual::{
-    self, ScaledResidualLayerNorm as LayerNormOp, ScaledResidualRmsNorm as RmsNormOp,
-};
+use ops::modulation::{self, GatedResidual as GatedResidualOp};
+use ops::residual::{self, ScaledAdd, ScaledResidual};
 use ops::{DType, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::layers::launch::row_tile;
 use crate::weights::Weight;
 
-/// The columns of a `[columns]` parameter, checked once.
-fn columns(name: &'static str, weight: &Weight) -> Result<u32> {
+/// The elements one program of `scaled_add` and `scaled_residual` walks.
+const BLOCK: u32 = residual::RESIDUAL_BLOCK;
+
+/// Whether two views name the same elements: one address, element type, shape and strides.
+fn same(a: &TensorView, b: &TensorView) -> bool {
+    a.ptr == b.ptr && a.dtype == b.dtype && a.shape == b.shape && a.strides == b.strides
+}
+
+/// The width of a `[columns]` parameter vector, checked once.
+fn channels(owner: &'static str, weight: &Weight) -> Result<u32> {
     if weight.shape().rank() != 1 {
         return Err(Error::shape(
-            name,
+            owner,
             format!(
                 "a per-channel parameter is one vector, not {:?}",
                 weight.shape().dims()
@@ -31,357 +42,270 @@ fn columns(name: &'static str, weight: &Weight) -> Result<u32> {
         ));
     }
     u32::try_from(weight.shape().numel())
-        .map_err(|_| Error::shape(name, "more channels than a descriptor holds".to_owned()))
+        .map_err(|_| Error::shape(owner, "more channels than a descriptor holds".to_owned()))
 }
 
-/// The elements one statement of a `scaled_residual` launch walks.
-const BLOCK: u32 = residual::RESIDUAL_BLOCK;
-
-/// `out = rms(x) · weight`.
-pub struct WeightedRmsNorm {
-    weight: Weight,
-    eps: f32,
+/// The coefficient a [`Residual`] multiplies its update by.
+#[derive(Clone, Copy, Debug)]
+pub enum Scale {
+    /// No coefficient: `residual + update`.
+    None,
+    /// One learned coefficient per channel, a `[columns]` vector (layer scale).
+    Channel(Weight),
+    /// One coefficient row per activation row, selected from a `[parameters, columns]` table by the
+    /// call's row indices (a diffusion block's gate).
+    Row(Weight),
 }
 
-impl WeightedRmsNorm {
-    /// The weighted normalization of `weight`'s channels.
-    pub fn new(weight: Weight, eps: f32) -> Result<Self> {
-        columns("WeightedRmsNorm", &weight)?;
-        Ok(Self { weight, eps })
-    }
-
-    /// Channels per row.
-    pub fn columns(&self) -> u32 {
-        self.weight.shape().numel() as u32
-    }
-
-    /// The descriptor one launch without a magnitude takes: rows of `dtype`, normalized into
-    /// `activation`.
-    fn descriptor(&self, dtype: DType, activation: DType) -> residual::WeightedRmsNormDescriptor {
-        let columns = self.columns();
-        residual::WeightedRmsNormDescriptor {
-            dtype,
-            columns,
-            tile: row_tile(columns),
-            absmax: false,
-            activation,
-        }
-    }
-
-    /// Normalize `x` into `out`; both are `[rows, columns]` and may alias.
-    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
-        self.run(f, x, out, None)
-    }
-
-    fn run(
-        &self,
-        f: &Forward,
-        x: TensorView,
-        out: TensorView,
-        partials: Option<TensorView>,
-    ) -> Result<()> {
-        let mut descriptor = self.descriptor(x.dtype, out.dtype);
-        descriptor.absmax = partials.is_some();
-        let args = residual::WeightedRmsNormArgs {
-            x,
-            weight: self.weight.view(),
-            out,
-            eps: self.eps,
-            partials,
-        };
-
-        f.operate::<residual::WeightedRmsNorm>(&descriptor, args)
-    }
-}
-
-/// `hidden += (update + bias) · scale`.
-pub struct ScaledResidual {
-    scale: Weight,
+/// The residual add: `out = residual + (update + bias) · scale`.
+///
+/// The sum is formed in FP32 and rounded once into `out`'s element type. Which operand `out` may be
+/// follows the scale, because each operator writes one of its inputs in place:
+///
+/// | scale | `out` |
+/// | --- | --- |
+/// | [`Scale::None`] | `residual` or `update` (the add is symmetric) |
+/// | [`Scale::Channel`] | `residual` |
+/// | [`Scale::Row`] | `update` |
+///
+/// A bias is added to the update before the channel scale and exists only with one.
+#[derive(Clone, Copy, Debug)]
+pub struct Residual {
+    scale: Scale,
     bias: Option<Weight>,
 }
 
-impl ScaledResidual {
-    /// The scaled addition of `scale`'s channels, with the update's bias when the block has one.
-    pub fn new(scale: Weight, bias: Option<Weight>) -> Result<Self> {
-        let channels = columns("ScaledResidual", &scale)?;
-        if let Some(bias) = &bias
-            && columns("ScaledResidual", bias)? != channels
-        {
-            return Err(Error::shape(
-                "ScaledResidual",
-                format!("a scale of {channels} channels and a bias of another count"),
-            ));
+impl Residual {
+    /// The residual add with `scale` and, for a channel scale, the update's `bias`.
+    ///
+    /// # Errors
+    ///
+    /// A bias without a channel scale, a bias of another width than the scale, or a scale of the
+    /// wrong rank.
+    pub fn new(scale: Scale, bias: Option<Weight>) -> Result<Self> {
+        match scale {
+            Scale::None if bias.is_some() => {
+                return Err(Error::shape(
+                    "Residual",
+                    "an update bias is added under a channel scale only".to_owned(),
+                ));
+            }
+            Scale::None => {}
+            Scale::Channel(weight) => {
+                let width = channels("Residual", &weight)?;
+                if let Some(bias) = &bias
+                    && channels("Residual", bias)? != width
+                {
+                    return Err(Error::shape(
+                        "Residual",
+                        format!("a scale of {width} channels and a bias of another count"),
+                    ));
+                }
+            }
+            Scale::Row(table) => {
+                if bias.is_some() {
+                    return Err(Error::shape(
+                        "Residual",
+                        "an update bias is added under a channel scale only".to_owned(),
+                    ));
+                }
+                if table.shape().rank() != 2 || table.shape().last() == 0 {
+                    return Err(Error::shape(
+                        "Residual",
+                        format!(
+                            "a row scale is a [parameters, columns] table, not {:?}",
+                            table.shape().dims()
+                        ),
+                    ));
+                }
+            }
         }
         Ok(Self { scale, bias })
     }
 
-    /// The descriptor one launch takes.
+    /// `out = residual + (update + bias) · scale` over `[rows, columns]`.
     ///
-    /// `dtype` is the caller's: the hidden states' element type is the deployment's, while the
-    /// layer's width and its bias's presence are its own.
-    fn descriptor(&self, dtype: DType) -> Result<residual::ScaledResidualDescriptor> {
-        Ok(residual::ScaledResidualDescriptor {
-            dtype,
-            columns: u32::try_from(self.scale.shape().numel()).map_err(|_| {
-                Error::shape(
-                    "ScaledResidual",
-                    "a row wider than a descriptor holds".to_owned(),
-                )
-            })?,
-            block: BLOCK,
-            update_bias: self.bias.is_some(),
-        })
-    }
-
-    /// Fold `update` into `hidden`, both `[rows, columns]`; `hidden` is written in place.
-    pub fn forward(&self, f: &Forward, hidden: TensorView, update: TensorView) -> Result<()> {
-        let descriptor = self.descriptor(hidden.dtype)?;
-        let args = residual::ScaledResidualArgs {
-            hidden,
-            update,
-            update_bias: self.bias.as_ref().map(Weight::view),
-            scale: self.scale.view(),
-        };
-
-        f.operate::<residual::ScaledResidual>(&descriptor, args)
-    }
-}
-
-/// `hidden += (update + bias) · scale; out = rms(hidden) · weight`.
-pub struct ScaledResidualRmsNorm {
-    scale: Weight,
-    bias: Option<Weight>,
-    weight: Weight,
-    eps: f32,
-    absmax: bool,
-}
-
-impl ScaledResidualRmsNorm {
-    /// The scaled addition and the RMS normalization of `weight`'s channels.
-    pub fn new(scale: Weight, bias: Option<Weight>, weight: Weight, eps: f32) -> Result<Self> {
-        let channels = columns("ScaledResidualRmsNorm", &weight)?;
-        if columns("ScaledResidualRmsNorm", &scale)? != channels {
-            return Err(Error::shape(
-                "ScaledResidualRmsNorm",
-                "the residual's scale and the normalization's weight differ in channels".to_owned(),
-            ));
-        }
-        if let Some(bias) = &bias
-            && columns("ScaledResidualRmsNorm", bias)? != channels
-        {
-            return Err(Error::shape(
-                "ScaledResidualRmsNorm",
-                "the update's bias and the normalization's weight differ in channels".to_owned(),
-            ));
-        }
-        Ok(Self {
-            scale,
-            bias,
-            weight,
-            eps,
-            absmax: false,
-        })
-    }
-
-    /// Channels per row.
-    pub fn columns(&self) -> u32 {
-        self.weight.shape().numel() as u32
-    }
-
-    /// The descriptor one launch takes: a residual of `dtype` folding updates of `activation`.
-    fn descriptor(
-        &self,
-        dtype: DType,
-        activation: DType,
-    ) -> residual::ScaledResidualRmsNormDescriptor {
-        let columns = self.columns();
-        residual::ScaledResidualRmsNormDescriptor {
-            dtype,
-            columns,
-            tile: row_tile(columns),
-            update_bias: self.bias.is_some(),
-            absmax: self.absmax,
-            activation,
-        }
-    }
-
-    /// Fold `update` into `hidden` and normalize it into `out`.
+    /// `rows` is the `[rows]` index of each activation row's scale row, present exactly under
+    /// [`Scale::Row`]. `out` aliases `residual` or `update` as the type documentation states.
     ///
-    /// `hidden`, `update` and `out` are `[rows, columns]` in the activation element type; `partials`
-    /// is `[rows]` FP32 and is required exactly when the layer records the magnitude.
+    /// # Errors
+    ///
+    /// Views whose shapes disagree, a missing or superfluous row index, an `out` the scale's
+    /// operator cannot write, or the operator's refusal.
     pub fn forward(
         &self,
         f: &Forward,
-        hidden: TensorView,
+        residual: TensorView,
         update: TensorView,
+        rows: Option<TensorView>,
         out: TensorView,
-        partials: Option<TensorView>,
     ) -> Result<()> {
-        if self.absmax != partials.is_some() {
+        if rows.is_some() != matches!(self.scale, Scale::Row(_)) {
             return Err(Error::shape(
-                "ScaledResidualRmsNorm",
-                "the magnitude buffer is present exactly when the layer records it".to_owned(),
+                "Residual",
+                "row indices are passed exactly under a row scale".to_owned(),
             ));
         }
-        let descriptor = self.descriptor(hidden.dtype, update.dtype);
-        let args = residual::ScaledResidualRmsNormArgs {
-            hidden,
-            update,
-            update_bias: self.bias.as_ref().map(Weight::view),
-            scale: self.scale.view(),
-            weight: self.weight.view(),
-            out,
-            eps: self.eps,
-            partials,
-        };
-
-        f.operate::<RmsNormOp>(&descriptor, args)
-    }
-}
-
-/// `out = layer_norm(hidden + (update + bias) · scale) · weight + bias`.
-pub struct ScaledResidualLayerNorm {
-    scale: Weight,
-    update_bias: Option<Weight>,
-    weight: Weight,
-    bias: Weight,
-    eps: f32,
-    absmax: bool,
-}
-
-impl ScaledResidualLayerNorm {
-    /// The scaled addition and the layer normalization of `weight`'s channels.
-    pub fn new(
-        scale: Weight,
-        update_bias: Option<Weight>,
-        weight: Weight,
-        bias: Weight,
-        eps: f32,
-    ) -> Result<Self> {
-        let channels = columns("ScaledResidualLayerNorm", &weight)?;
-        for (name, parameter) in [
-            ("scale", Some(&scale)),
-            ("update bias", update_bias.as_ref()),
-            ("bias", Some(&bias)),
-        ] {
-            if let Some(parameter) = parameter
-                && columns("ScaledResidualLayerNorm", parameter)? != channels
-            {
-                return Err(Error::shape(
-                    "ScaledResidualLayerNorm",
-                    format!("the {name} and the normalization's weight differ in channels"),
-                ));
+        match (self.scale, rows) {
+            (Scale::None, _) => {
+                // The add is symmetric, so the written operand is the target and the other the
+                // source; both coefficients are one, so the FP32 sum is the plain one.
+                let (target, source) = if same(&out, &residual) {
+                    (residual, update)
+                } else if same(&out, &update) {
+                    (update, residual)
+                } else {
+                    return Err(Error::shape(
+                        "Residual",
+                        "an unscaled add writes its residual or its update in place".to_owned(),
+                    ));
+                };
+                Axpby.forward(f, target, source, 1.0, 1.0)
             }
+            (Scale::Channel(scale), _) => {
+                if !same(&out, &residual) {
+                    return Err(Error::shape(
+                        "Residual",
+                        "a channel-scaled add writes its residual in place".to_owned(),
+                    ));
+                }
+                let descriptor = residual::ScaledResidualDescriptor {
+                    dtype: residual.dtype,
+                    columns: channels("Residual", &scale)?,
+                    block: BLOCK,
+                    update_bias: self.bias.is_some(),
+                };
+                let args = residual::ScaledResidualArgs {
+                    hidden: residual,
+                    update,
+                    update_bias: self.bias.as_ref().map(Weight::view),
+                    scale: scale.view(),
+                };
+                f.operate::<ScaledResidual>(&descriptor, args)
+            }
+            (Scale::Row(gate), Some(rows)) => {
+                if !same(&out, &update) {
+                    return Err(Error::shape(
+                        "Residual",
+                        "a row-scaled add writes its update in place".to_owned(),
+                    ));
+                }
+                let width = gate.shape().last();
+                if residual.shape.rank() != 2
+                    || residual.shape.last() != width
+                    || update.shape != residual.shape
+                {
+                    return Err(Error::shape(
+                        "Residual",
+                        format!(
+                            "{:?} and {:?} are not [rows, {width}]",
+                            residual.shape.dims(),
+                            update.shape.dims()
+                        ),
+                    ));
+                }
+                // The row count is a launch value, not a descriptor field: a clip's token count
+                // changes with every request, and a descriptor carrying it would be a kernel per
+                // clip length.
+                let descriptor = modulation::GatedResidualDescriptor {
+                    dtype: residual.dtype,
+                    indices: rows.dtype,
+                    width: u32::try_from(width).map_err(|_| {
+                        Error::shape("Residual", "a row wider than a descriptor holds".to_owned())
+                    })?,
+                    gate_stride: gate.view().strides.get(0),
+                };
+                let args = modulation::GatedResidualArgs {
+                    hidden: residual,
+                    update,
+                    gate: gate.view(),
+                    row_indices: rows,
+                };
+                f.operate::<GatedResidualOp>(&descriptor, args)
+            }
+            (Scale::Row(_), None) => unreachable!("the row index presence is checked above"),
         }
-        Ok(Self {
-            scale,
-            update_bias,
-            weight,
-            bias,
-            eps,
-            absmax: false,
-        })
-    }
-
-    /// Channels per row.
-    pub fn columns(&self) -> u32 {
-        self.weight.shape().numel() as u32
-    }
-
-    /// The descriptor one launch takes: a residual of `dtype` folding updates of `activation`.
-    fn descriptor(
-        &self,
-        dtype: DType,
-        activation: DType,
-    ) -> residual::ScaledResidualLayerNormDescriptor {
-        let columns = self.columns();
-        residual::ScaledResidualLayerNormDescriptor {
-            dtype,
-            columns,
-            tile: row_tile(columns),
-            update_bias: self.update_bias.is_some(),
-            absmax: self.absmax,
-            activation,
-        }
-    }
-
-    /// Fold `update` into `hidden` and normalize it into `out`.
-    pub fn forward(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        update: TensorView,
-        out: TensorView,
-        partials: Option<TensorView>,
-    ) -> Result<()> {
-        if self.absmax != partials.is_some() {
-            return Err(Error::shape(
-                "ScaledResidualLayerNorm",
-                "the magnitude buffer is present exactly when the layer records it".to_owned(),
-            ));
-        }
-        let descriptor = self.descriptor(hidden.dtype, update.dtype);
-        let args = residual::ScaledResidualLayerNormArgs {
-            hidden,
-            update,
-            update_bias: self.update_bias.as_ref().map(Weight::view),
-            scale: self.scale.view(),
-            weight: self.weight.view(),
-            bias: self.bias.view(),
-            out,
-            eps: self.eps,
-            partials,
-        };
-
-        f.operate::<LayerNormOp>(&descriptor, args)
     }
 }
 
-/// The diffusion solver's update: `target ← β · target + α · source`, in place.
-///
-/// The Euler step passes `α = σ − σ_next`, `β = 1`; the probability-flow start passes `β = σ₀`,
-/// `α = 0`. Both coefficients are host values, so a captured graph stays valid, and the two
-/// operands' element types differ on purpose — a BF16 trajectory stepped by an FP32 velocity
-/// (`ops::residual::ScaledAdd`).
-pub struct ScaledAdd;
-
-impl ScaledAdd {
-    /// The descriptor one launch takes.
-    ///
-    /// The two operands' element types are the caller's — a BF16 trajectory stepped by an FP32
-    /// velocity is the intended pairing — and the width is the operands', so both are arguments.
-    fn descriptor(&self, target: DType, source: DType) -> residual::ScaledAddDescriptor {
-        residual::ScaledAddDescriptor {
-            target,
-            source,
-            block: BLOCK,
+impl Default for Residual {
+    /// The plain add `out = residual + update`: no scale, no bias.
+    fn default() -> Self {
+        Self {
+            scale: Scale::None,
+            bias: None,
         }
     }
+}
 
-    /// `target ← β · target + α · source` over `[rows, columns]`, writing `target` in place.
+/// The two-coefficient update `y ← β · y + α · x`, in place on `y`.
+///
+/// A diffusion solver's arithmetic: an Euler step is `α = σ_next − σ`, `β = 1`; a rescale is
+/// `α = 0`. Both coefficients are host values, so a captured graph stays valid, and the two
+/// operands' element types may differ on purpose — a BF16 trajectory stepped by an FP32 velocity.
+/// The products and the sum are FP32 and round once into `y`'s element type.
+pub struct Axpby;
+
+impl Axpby {
+    /// `y ← β · y + α · x` over two `[rows, columns]` views of one shape.
+    ///
+    /// # Errors
+    ///
+    /// Views of another rank or of different shapes, or the operator's refusal.
     pub fn forward(
         &self,
         f: &Forward,
-        target: TensorView,
-        source: TensorView,
+        y: TensorView,
+        x: TensorView,
         alpha: f32,
         beta: f32,
     ) -> Result<()> {
-        if target.shape.rank() != 2 || target.shape != source.shape {
+        if y.shape.rank() != 2 || y.shape != x.shape {
             return Err(Error::shape(
-                "ScaledAdd",
-                format!("{:?} with {:?}", target.shape.dims(), source.shape.dims()),
+                "Axpby",
+                format!("{:?} with {:?}", y.shape.dims(), x.shape.dims()),
             ));
         }
-        let descriptor = self.descriptor(target.dtype, source.dtype);
-        f.operate::<residual::ScaledAdd>(
-            &descriptor,
-            residual::ScaledAddArgs {
-                target,
-                source,
-                alpha,
-                beta,
-            },
-        )
+        let descriptor = residual::ScaledAddDescriptor {
+            target: y.dtype,
+            source: x.dtype,
+            block: BLOCK,
+        };
+        let args = residual::ScaledAddArgs {
+            target: y,
+            source: x,
+            alpha,
+            beta,
+        };
+        f.operate::<ScaledAdd>(&descriptor, args)
+    }
+}
+
+/// The element-type conversion `out = x`, rounded once into `out`'s element type.
+///
+/// It is the solver update with `α = 1`, `β = 0` — the target's old value is multiplied by zero and
+/// never contributes — so one conversion is one `scaled_add` launch between any two floating
+/// element types.
+pub struct Cast;
+
+impl Cast {
+    /// Convert `x` into `out`, two `[rows, columns]` views of one shape.
+    ///
+    /// # Errors
+    ///
+    /// Views of another rank or of different shapes, or the operator's refusal.
+    pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
+        Axpby.forward(f, out, x, 1.0, 0.0)
+    }
+
+    /// Convert `x` into a fresh `[rows, columns]` buffer of `dtype` reserved from the arena.
+    ///
+    /// # Errors
+    ///
+    /// An arena too small for the buffer, or [`Self::forward`]'s refusals.
+    pub fn apply(&self, f: &Forward, x: TensorView, dtype: DType) -> Result<TensorView> {
+        let out = f.arena().tensor(dtype, x.shape)?;
+        self.forward(f, x, out)?;
+        Ok(out)
     }
 }

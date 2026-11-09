@@ -65,10 +65,12 @@ pub use linear::{
     Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, PACKED_M_CLASSES, Parallel, QkvBias, QkvLinear,
     QkvNames, QkvSpec, encode_block, packed_rows,
 };
-pub use modulation::{GatedResidual, ModulatedRmsNorm};
+pub use modulation::ModulatedRmsNorm;
 pub use moe::{ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
 pub use noise::{Key as NoiseKey, Noise};
-pub use norm::{LayerNorm, RmsNorm};
+pub use norm::{
+    LayerNorm, RmsNorm, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
+};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use ops::rope::Rotation;
@@ -77,9 +79,7 @@ pub use pcm::PcmInterleave;
 pub use pool::AdaptivePool;
 pub use position::PositionInterpolate;
 pub use posterior::Posterior;
-pub use residual::{
-    ScaledAdd, ScaledResidual, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
-};
+pub use residual::{Axpby, Cast, Residual, Scale};
 pub use rgb::RgbBytes;
 pub use rope::{Rotary, Sections};
 pub use rotate::Rotate;

@@ -437,13 +437,13 @@ impl Projections {
         nn::layers::Silu.forward(f, time, activated_time)?;
         let time = activated_time;
         // The one crossing: the activation the timestep pair built, rounded into the type the
-        // modulation projections read. `target <- 1 * source + 0 * target` is the reference's
-        // `.to(weight.dtype)`, and the zero beta means the target is never read.
+        // modulation projections read: the reference's
+        // `.to(weight.dtype)`.
         let narrow = if dtype == time_type {
             time
         } else {
             let out = arena.tensor(dtype, time.shape)?;
-            nn::layers::ScaledAdd.forward(f, out, time, 1.0, 0.0)?;
+            nn::layers::Cast.forward(f, time, out)?;
             out
         };
         for (layer, out) in self.layers.iter().zip(layers_out) {

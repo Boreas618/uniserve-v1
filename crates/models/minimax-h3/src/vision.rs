@@ -53,7 +53,7 @@ use nn::capability::ImageInput;
 use nn::family::Split;
 use nn::layers::{
     Attention, Bias, Gelu, LayerNorm, Linear, Parallel, PositionInterpolate, QkvBias, QkvLinear,
-    QkvNames, QkvSpec, Rotate, ScaledResidual,
+    QkvNames, QkvSpec, Residual, Rotate,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -529,7 +529,7 @@ impl Block {
             .map_err(Error::from)?;
         tower
             .residual
-            .forward(f, hidden, buffers.projected)
+            .forward(f, hidden, buffers.projected, None, hidden)
             .map_err(Error::from)?;
 
         self.output_norm
@@ -546,7 +546,7 @@ impl Block {
             .map_err(Error::from)?;
         tower
             .residual
-            .forward(f, hidden, buffers.down)
+            .forward(f, hidden, buffers.down, None, hidden)
             .map_err(Error::from)
     }
 }
@@ -691,7 +691,7 @@ pub struct VisionTower {
     deepstack: Vec<Merger>,
     blocks_gelu: Gelu,
     merger_gelu: Gelu,
-    residual: ScaledResidual,
+    residual: Residual,
 }
 
 impl VisionTower {
@@ -761,18 +761,8 @@ impl VisionTower {
             deepstack,
             blocks_gelu,
             merger_gelu: Gelu::exact(),
-            // The fused residual operator reads its coefficient as a weight; these blocks add each
-            // sub-layer's output with coefficient one.
-            residual: ScaledResidual::new(
-                loader.scope(PREFIX).constant(
-                    "residual_scale",
-                    dtype,
-                    &[hidden],
-                    &vec![1.0; hidden as usize],
-                )?,
-                None,
-            )
-            .map_err(Error::from)?,
+            // Every sub-layer's output joins the stream unscaled.
+            residual: Residual::default(),
             config: config.clone(),
             dtype,
         })
@@ -839,7 +829,7 @@ impl VisionTower {
         )
         .map_err(Error::from)?;
         self.residual
-            .forward(f, buffers.hidden, buffers.normalized)
+            .forward(f, buffers.hidden, buffers.normalized, None, buffers.hidden)
             .map_err(Error::from)?;
 
         // One bidirectional launch over the grid's time steps: the descriptor's key bound is the
