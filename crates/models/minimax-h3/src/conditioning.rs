@@ -22,11 +22,12 @@
 //! Sharding two blocks over a thousand rows would save nothing and put two exchanges on the first
 //! step of every request.
 
-use nn::family::Split;
-use nn::layers::{
-    Bias, DenseAttention, DenseSpec, GateBias, GatedActivation, Halves, Linear, Parallel, QkvBias,
-    QkvLinear, QkvNames, QkvSpec, Residual, RmsNorm, Rounding, Varlen,
+use nn::blocks::{
+    AttentionKind, GateUp, GatedMlpSpec, Keys, PreNormBlock, PreNormSpec, QkNormNames,
+    QkvAttention, QkvAttentionSpec, ResidualForm,
 };
+use nn::family::Split;
+use nn::layers::{Bias, Linear, Parallel, QkvBias, QkvNames, QkvSpec, RmsNorm, Rounding, Varlen};
 use nn::weights::WeightLoader;
 use nn::{Forward, Shape, TensorView};
 
@@ -46,28 +47,15 @@ pub struct Documents {
     pub key_rows: u32,
 }
 
-/// One refined document block: pre-normalized attention and a value-first SwiGLU.
+/// One refined document block: a pre-norm block over dense attention with per-head q/k norms and a
+/// value-first SwiGLU.
 pub struct RefinerBlock {
-    norm1: RmsNorm,
-    norm2: RmsNorm,
-    query_norm: RmsNorm,
-    key_norm: RmsNorm,
-    /// The attention's query, key and value projections.
-    qkv: QkvLinear,
-    output: Linear,
-    gate_up: Linear,
-    down: Linear,
-    /// The stepwise gated activation (`Rounding::Stepwise`): the refiner rounds
-    /// `silu(gate)` and the product one step at a time.
-    gated: GatedActivation,
-    attention: DenseAttention,
-    /// The plain add of the attention and feed-forward updates into the stream.
-    residual: Residual,
-    hidden_size: u32,
-    head_dim: u32,
-    heads: u32,
-    intermediate_size: u32,
-    dtype: nn::DType,
+    /// The norms and the stepwise SwiGLU (`Rounding::Stepwise`): the refiner rounds `silu(gate)`
+    /// and the product one step at a time. Each update joins the stream in its own launch.
+    block: PreNormBlock,
+    /// Bidirectional attention over a document's text rows, each head's query and key normalized
+    /// by its own RmsNorm and not rotated.
+    attention: QkvAttention,
 }
 
 impl RefinerBlock {
@@ -78,148 +66,58 @@ impl RefinerBlock {
         rows: u32,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
-        let prefix = format!("token_refiner.refiner_blocks.{index}");
-        let inner = config.num_attention_heads * config.head_dim;
-        let ffn = config.intermediate_size;
-
-        let qkv = QkvLinear::load(
-            &mut loader.scope(format!("{prefix}.attn")),
-            QkvSpec {
-                hidden: config.hidden_size,
-                heads: config.num_attention_heads,
-                kv_heads: config.num_attention_heads,
-                head_dim: config.head_dim,
+        let mut scope = loader.scope(format!("token_refiner.refiner_blocks.{index}"));
+        let attention = QkvAttention::load(
+            &mut scope.scope("attn"),
+            QkvAttentionSpec {
+                qkv: QkvSpec {
+                    hidden: config.hidden_size,
+                    heads: config.num_attention_heads,
+                    kv_heads: config.num_attention_heads,
+                    head_dim: config.head_dim,
+                },
+                names: QkvNames::Separate(["to_q", "to_k", "to_v"]),
+                bias: QkvBias::Absent,
+                output: "to_out.0",
+                output_bias: Bias::Absent,
+                qk_norm: QkNormNames::Separate {
+                    query: "norm_q",
+                    key: "norm_k",
+                    epsilon: config.qk_norm_eps,
+                },
+                kind: AttentionKind::Dense {
+                    max_keys: rows,
+                    causal: false,
+                    window: None,
+                },
+                scale: scaling(config.head_dim),
             },
-            QkvNames::Separate(["to_q", "to_k", "to_v"]),
-            QkvBias::Absent,
             Split::WHOLE,
         )?;
-        let query_dtype = qkv.query().weight().dtype;
-        let projection = |loader: &mut WeightLoader<'_>, module: &str, inputs, outputs| {
-            Linear::load(
-                &mut loader.scope(format!("{prefix}.{module}")),
-                inputs,
-                outputs,
-                Bias::Absent,
-                Parallel::None,
-            )
-        };
-        let output = projection(loader, "attn.to_out.0", inner, config.hidden_size)?;
-        // The checkpoint fuses the feed-forward's value half first and its gate half second.
-        let gate_up = projection(loader, "ff.net.0.proj", config.hidden_size, 2 * ffn)?;
-        let down = projection(loader, "ff.net.2", ffn, config.hidden_size)?;
-
-        let attention = DenseAttention::new(DenseSpec {
-            head_dim: config.head_dim,
-            heads: config.num_attention_heads,
-            kv_heads: config.num_attention_heads,
-            max_keys: rows,
-            causal: false,
-            window: None,
-            scale: scaling(config.head_dim),
-        })?;
-
-        Ok(Self {
-            dtype: query_dtype,
-            intermediate_size: config.intermediate_size,
-            norm1: RmsNorm::load(
-                &mut loader.scope(format!("{prefix}.norm1")),
-                config.hidden_size,
-                config.norm_eps,
-            )?,
-            norm2: RmsNorm::load(
-                &mut loader.scope(format!("{prefix}.norm2")),
-                config.hidden_size,
-                config.norm_eps,
-            )?,
-            query_norm: RmsNorm::load(
-                &mut loader.scope(format!("{prefix}.attn.norm_q")),
-                config.head_dim,
-                config.qk_norm_eps,
-            )?,
-            key_norm: RmsNorm::load(
-                &mut loader.scope(format!("{prefix}.attn.norm_k")),
-                config.head_dim,
-                config.qk_norm_eps,
-            )?,
-            qkv,
-            output,
-            gate_up,
-            down,
-            gated: GatedActivation::new(
-                ops::activation::Activation::Silu,
-                Rounding::Stepwise,
-                GateBias::None,
-            )?,
-            attention,
-            residual: Residual::default(),
-            hidden_size: config.hidden_size,
-            head_dim: config.head_dim,
-            heads: config.num_attention_heads,
-        })
-    }
-
-    /// Refine `hidden`, in place.
-    fn forward(&self, f: &Forward, hidden: TensorView, visible: &Documents) -> Result<()> {
-        let row_count = u32::try_from(hidden.shape.dim(0))
-            .map_err(|_| Error::checkpoint("a refiner row count above u32::MAX".to_owned()))?;
-        let rows = Rows::reserve(self, f, row_count)?;
-
-        // Attention: normalize, project every head, normalize each head's query and key, attend.
-        self.norm1.forward(f, hidden, None, rows.normed)?;
-        self.qkv
-            .forward(f, rows.normed, rows.query, rows.key, rows.value)?;
-        // The query and key norms are **per head**: a projection writes `[rows, heads · head]` and
-        // the normalization is over one head's channels, so it reads the same buffer as
-        // `[rows · heads, head]`. Handing it the flat projection is a width the norm refuses
-        // (`RmsNorm::forward` checks the row's extent) - and it refused the whole refiner, which is
-        // why no forward of it had ever completed.
-        let head = self.head_dim;
-        let heads = self.heads;
-        self.query_norm.forward(
-            f,
-            rows.query.reshape(per_head(rows.query, head)),
-            None,
-            rows.query_normed.reshape(per_head(rows.query, head)),
+        let block = PreNormBlock::load(
+            &mut scope,
+            PreNormSpec {
+                hidden: config.hidden_size,
+                eps: config.norm_eps,
+                norm1: "norm1",
+                norm2: "norm2",
+                layer_scale: None,
+                norm_dtype: None,
+                residual: ResidualForm::Separate,
+                // The checkpoint fuses the feed-forward's value half first and its gate half second.
+                mlp: GatedMlpSpec {
+                    hidden: config.hidden_size,
+                    intermediate: config.intermediate_size,
+                    activation: ops::activation::Activation::Silu,
+                    rounding: Rounding::Stepwise,
+                    gate_up: GateUp::ValueFirst("ff.net.0.proj"),
+                    down: "ff.net.2",
+                    bias: Bias::Absent,
+                },
+            },
+            Split::WHOLE,
         )?;
-        self.key_norm.forward(
-            f,
-            rows.key.reshape(per_head(rows.key, head)),
-            None,
-            rows.key_normed.reshape(per_head(rows.key, head)),
-        )?;
-
-        let (query, key, value) = (rows.query_normed, rows.key_normed, rows.value);
-        // The attention's operands are rank 3 - one axis of tokens, then the heads, then a head's
-        // channels (`ops/src/attention/dense.rs`) - while every buffer here is `[rows, inner]`.
-        self.attention.forward(
-            f,
-            query.reshape(with_heads(query, heads, head)),
-            key.reshape(with_heads(key, heads, head)),
-            value.reshape(with_heads(value, heads, head)),
-            // One document per request over packed rows: every query sees the whole key set.
-            Some(Varlen {
-                cu_q: visible.cu_seq_lens_q,
-                cu_k: visible.cu_seq_lens_k,
-                max_q: None,
-                max_k: visible.key_rows,
-            }),
-            rows.attended
-                .reshape(with_heads(rows.attended, heads, head)),
-        )?;
-        self.output.forward(f, rows.attended, rows.update)?;
-        self.residual
-            .forward(f, hidden, rows.update, None, hidden)?;
-
-        // Feed-forward: normalize, project the packed value and gate halves, gate, project back.
-        self.norm2.forward(f, hidden, None, rows.normed)?;
-        self.gate_up.forward(f, rows.normed, rows.packed)?;
-        self.gated
-            .forward(f, Halves::ValueFirst(rows.packed), rows.ffn)?;
-        self.down.forward(f, rows.ffn, rows.update)?;
-        self.residual
-            .forward(f, hidden, rows.update, None, hidden)?;
-        Ok(())
+        Ok(Self { block, attention })
     }
 }
 
@@ -227,6 +125,8 @@ impl RefinerBlock {
 pub struct TokenRefiner {
     input: Linear,
     blocks: Vec<RefinerBlock>,
+    /// The final norm, whose variance floor is the blocks' (`final_norm_eps` equals `norm_eps` in
+    /// every shipped configuration).
     norm: RmsNorm,
     hidden_size: u32,
     text_dim: u32,
@@ -299,109 +199,40 @@ impl TokenRefiner {
             )));
         }
         // The whole refined document is the chain of blocks over a working buffer; the input
-        // projection is the same dtype as the features it reads.
-        let working = f.arena().tensor(
-            features.dtype,
-            Shape::new(&[rows, u64::from(self.hidden_size)]),
-        )?;
+        // projection is the same dtype as the features it reads, and the blocks' intermediates are
+        // the projections' own.
+        let shape = Shape::new(&[rows, u64::from(self.hidden_size)]);
+        let arena = f.arena();
+        let working = arena.tensor(features.dtype, shape)?;
+        let dtype = self.blocks[0].attention.query().weight().dtype;
+        let normalized = arena.tensor(dtype, shape)?;
+        let update = arena.tensor(dtype, shape)?;
         self.input.forward(f, features, working)?;
-        for block in &self.blocks {
-            block.forward(f, working, visible)?;
+        // One document per request over packed rows: every query sees the document's whole key set.
+        let keys = Keys::Dense(Some(Varlen {
+            cu_q: visible.cu_seq_lens_q,
+            cu_k: visible.cu_seq_lens_k,
+            max_q: None,
+            max_k: visible.key_rows,
+        }));
+        let mut pending = None;
+        for refiner in &self.blocks {
+            let attend =
+                |normalized, update| refiner.attention.forward(f, normalized, None, keys, update);
+            pending = Some(
+                refiner
+                    .block
+                    .forward(f, working, pending, normalized, update, attend)?,
+            );
+        }
+        if let Some(last) = pending {
+            last.join(f, working)?;
         }
         Ok(self.norm.forward(f, working, None, out)?)
     }
 }
 
-/// The scratch one block's forward reads and writes, reserved from the forward's arena.
-///
-/// One block runs at a time and the arena is reused, so every buffer is written before it is read.
-struct Rows {
-    normed: TensorView,
-    query: TensorView,
-    key: TensorView,
-    value: TensorView,
-    query_normed: TensorView,
-    key_normed: TensorView,
-    attended: TensorView,
-    update: TensorView,
-    packed: TensorView,
-    ffn: TensorView,
-}
-
-impl Rows {
-    /// Reserve one refiner block's scratch from the forward's arena, in the order the block uses it.
-    fn reserve(block: &RefinerBlock, f: &Forward, rows: u32) -> Result<Self> {
-        let dtype = block.dtype;
-        let rows = u64::from(rows);
-        let hidden = u64::from(block.hidden_size);
-        let inner = u64::from(block.heads) * u64::from(block.head_dim);
-        // The gate projection's rows hold the checkpoint's two fused halves of one width.
-        let packed = 2 * u64::from(block.intermediate_size);
-        let ffn = u64::from(block.intermediate_size);
-        let arena = f.arena();
-        let reserve = |columns: u64| arena.tensor(dtype, Shape::new(&[rows, columns]));
-        Ok(Self {
-            normed: reserve(hidden)?,
-            query: reserve(inner)?,
-            key: reserve(inner)?,
-            value: reserve(inner)?,
-            query_normed: reserve(inner)?,
-            key_normed: reserve(inner)?,
-            attended: reserve(inner)?,
-            update: reserve(hidden)?,
-            packed: reserve(packed)?,
-            ffn: reserve(ffn)?,
-        })
-    }
-}
-
-/// One flat `[rows, heads · head]` buffer as the shape a per-head norm reads: `[rows · heads, head]`.
-fn per_head(view: TensorView, head_dim: u32) -> Shape {
-    let head = u64::from(head_dim).max(1);
-    Shape::new(&[view.shape.numel() / head, head])
-}
-
-/// One flat `[rows, heads · head]` buffer as the shape the attention takes: `[tokens, heads, head]`.
-fn with_heads(view: TensorView, heads: u32, head_dim: u32) -> Shape {
-    let width = u64::from(heads) * u64::from(head_dim);
-    Shape::new(&[
-        view.shape.numel() / width.max(1),
-        u64::from(heads),
-        u64::from(head_dim),
-    ])
-}
-
 /// The attention scale of one head: `1 / sqrt(head_dim)`.
 fn scaling(head_dim: u32) -> f32 {
     1.0 / (head_dim as f32).sqrt()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ops::tensor::{DevicePtr, Shape};
-
-    /// A view of `shape` at a host address: these tests never launch, so the address is a marker.
-    fn view(shape: &[u64]) -> TensorView {
-        TensorView::new(DevicePtr::new(0x1000), ops::DType::BF16, Shape::new(shape))
-    }
-
-    /// The refiner's two flat buffers are read by two readers that want two different ranks.
-    ///
-    /// A per-head normalization is over one head's channels, so it reads a `[rows, heads · head]`
-    /// projection as `[rows · heads, head]`; the attention takes `[tokens, heads, head]`. Handing
-    /// either of them the flat projection is what stopped the refiner's forward from ever
-    /// completing - and a shape a reader refuses is not a shape a test can leave to a comment.
-    #[test]
-    fn the_refiners_flat_buffers_are_read_as_a_head_axis_or_as_one_norm_row() {
-        let (rows, heads, head) = (5u64, 56u64, 128u64);
-        let flat = view(&[rows, heads * head]);
-        let normed = per_head(flat, head as u32);
-        assert_eq!(normed.dims(), &[rows * heads, head]);
-        let attended = with_heads(flat, heads as u32, head as u32);
-        assert_eq!(attended.dims(), &[rows, heads, head]);
-        // Both views hold the buffer's own elements: a reshape, not a copy or a second allocation.
-        assert_eq!(normed.numel(), flat.shape.numel());
-        assert_eq!(attended.numel(), flat.shape.numel());
-    }
 }

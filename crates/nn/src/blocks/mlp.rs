@@ -39,6 +39,8 @@ pub struct GatedMlpSpec<'n> {
     pub gate_up: GateUp<'n>,
     /// The output projection's module name.
     pub down: &'n str,
+    /// Whether each projection adds its module's bias.
+    pub bias: Bias,
 }
 
 /// The input projections, as the checkpoint stores them.
@@ -79,7 +81,7 @@ impl GatedMlp {
                 &mut scope.scope(name),
                 spec.hidden,
                 outputs,
-                Bias::Absent,
+                spec.bias,
                 column,
             )
         };
@@ -94,7 +96,7 @@ impl GatedMlp {
             &mut scope.scope(spec.down),
             spec.intermediate,
             spec.hidden,
-            Bias::Absent,
+            spec.bias,
             row,
         )?;
         Ok(Self {

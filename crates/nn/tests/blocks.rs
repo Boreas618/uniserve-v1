@@ -66,6 +66,7 @@ fn mlp_spec(rounding: Rounding, gate_up: GateUp<'_>) -> GatedMlpSpec<'_> {
         rounding,
         gate_up,
         down: "down_proj",
+        bias: nn::layers::Bias::Absent,
     }
 }
 
@@ -797,4 +798,110 @@ fn a_patch_embedding_packs_projects_and_unpacks_its_tokens() {
     // A patch of no rows is refused before any tensor is read.
     let empty = PatchEmbedSpec { spatial: 0, ..spec };
     assert!(PatchEmbed::load(&mut loader.scope("proj_in"), empty).is_err());
+}
+
+// ---- Pre-norm block ------------------------------------------------------------------------------
+
+use nn::blocks::{Pending, PreNormBlock, PreNormSpec, ResidualForm};
+
+fn prenorm_spec(residual: ResidualForm, layer_scale: Option<[&str; 2]>) -> PreNormSpec<'_> {
+    PreNormSpec {
+        hidden: HIDDEN as u32,
+        eps: 1e-6,
+        norm1: "norm1",
+        norm2: "norm2",
+        layer_scale,
+        norm_dtype: Some(DType::F32),
+        residual,
+        mlp: GatedMlpSpec {
+            down: "ff.down_proj",
+            ..mlp_spec(Rounding::Stepwise, GateUp::ValueFirst("ff.proj"))
+        },
+    }
+}
+
+/// Two blocks and a final join: a separate block joins each update in its own launch before the
+/// next norm, a fused block folds it into that norm (under the layer scale when it has one), and
+/// the attention reads the first norm's output and writes the update the second norm joins.
+#[test]
+fn a_pre_norm_block_joins_each_update_in_its_residual_form() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(
+        directory.path(),
+        &[
+            ("block.norm1.weight", &[HIDDEN]),
+            ("block.norm2.weight", &[HIDDEN]),
+            ("block.scale1", &[HIDDEN]),
+            ("block.scale2", &[HIDDEN]),
+            ("block.ff.proj.weight", &[2 * INTERMEDIATE, HIDDEN]),
+            ("block.ff.down_proj.weight", &[HIDDEN, INTERMEDIATE]),
+        ],
+    );
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let tokens = 4;
+    let stream = arena
+        .tensor(DType::F32, Shape::new(&[tokens, HIDDEN]))
+        .unwrap();
+    let [normalized, update] = [0; 2].map(|_| view(&arena, &[tokens, HIDDEN]));
+
+    // The stream is FP32 and the norms write the BF16 rows the projections read, so a norm that
+    // reads the stream alone is the narrowing one.
+    let cases: [(_, _, &[&str]); 2] = [
+        (
+            ResidualForm::Separate,
+            None,
+            &["scaled_add", "weighted_rms_norm"],
+        ),
+        (
+            ResidualForm::Fused,
+            Some(["scale1", "scale2"]),
+            &["scaled_residual_rms_norm"],
+        ),
+    ];
+    for (residual, layer_scale, joined) in cases {
+        let block = PreNormBlock::load(
+            &mut loader.scope("block"),
+            prenorm_spec(residual, layer_scale),
+            Split::WHOLE,
+        )
+        .unwrap();
+        let mut attended = Vec::new();
+        let (last, launches) = launched(|| -> nn::Result<Pending> {
+            let mut pending = None;
+            for _ in 0..2 {
+                let attend = |input: TensorView, output: TensorView| {
+                    attended.push((input.ptr, output.ptr));
+                    Ok(())
+                };
+                pending = Some(block.forward(&f, stream, pending, normalized, update, attend)?);
+            }
+            Ok(pending.unwrap())
+        });
+        let last = last.unwrap();
+        assert_eq!(attended, [(normalized.ptr, update.ptr); 2]);
+        assert_eq!(last.update.ptr, update.ptr);
+        assert_eq!(last.scale.is_some(), layer_scale.is_some());
+
+        // The first norm reads the FP32 stream alone and narrows it; every later norm joins the
+        // update before it.
+        let mlp = ["gemm", "act_and_mul", "gemm"];
+        let mut expected = vec!["weighted_rms_norm"];
+        expected.extend(joined);
+        expected.extend(mlp);
+        expected.extend(joined);
+        expected.extend(joined);
+        expected.extend(mlp);
+        assert_eq!(launches, expected, "{residual:?}");
+    }
+
+    // The separate join of a stack's last update is one plain add into the stream.
+    let last = Pending {
+        update,
+        scale: None,
+    };
+    let (result, launches) = launched(|| last.join(&f, stream));
+    result.unwrap();
+    assert_eq!(launches, ["scaled_add"]);
 }

@@ -89,6 +89,7 @@ impl Layer {
                     rounding: Rounding::Stepwise,
                     gate_up: GateUp::ValueFirst("ff.net.0.proj"),
                     down: "ff.net.2",
+                    bias: Bias::Absent,
                 },
             },
             Split::WHOLE,

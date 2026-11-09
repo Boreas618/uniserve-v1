@@ -257,10 +257,12 @@ pub const MINIMUM_OVERLAP: u32 = 64;
 // ---------------------------------------------------------------------------------------------
 
 use nn::Forward;
+use nn::blocks::{GateUp, GatedMlpSpec, PreNormBlock, PreNormSpec, ResidualForm};
+use nn::family::Split;
 use nn::layers::{
-    Bias, Cast, ChannelAffine, DenseAttention, DenseSpec, Epilogue, GateBias, GatedActivation,
-    Halves, IndexRows, LayerNorm, Linear, MergedColumnLinear, Parallel, Precision, QkNorm,
-    ResidualStream, RmsNorm, Rotary, RotarySpec, Rounding, Spectrum, Varlen,
+    Bias, Cast, ChannelAffine, DenseAttention, DenseSpec, Epilogue, IndexRows, LayerNorm, Linear,
+    MergedColumnLinear, Parallel, Precision, QkNorm, ResidualStream, Rotary, RotarySpec, Rounding,
+    Spectrum, Varlen,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
@@ -275,23 +277,21 @@ pub const ACTIVATION: DType = DType::F16;
 /// keeps wider than the rows its projections read.
 pub const STREAM: DType = DType::F32;
 
-/// One transformer layer of the decoder: the attention half and the gated feed-forward half.
+/// One transformer layer of the decoder: a pre-norm block with layer scales over the decoder's
+/// attention.
 ///
 /// The residual updates are folded into the normalization that reads them, as the reference's
-/// `_residual_norm` does: the attention's output joins the stream and normalizes for the feed-forward
-/// in one launch, and the feed-forward's output joins it and normalizes for the next layer.
+/// `_residual_norm` does ([`ResidualForm::Fused`]): the attention's output joins the stream and
+/// normalizes for the feed-forward in one launch, and the feed-forward's output joins it and
+/// normalizes for the next layer, or for the final norm.
 struct Layer {
     /// The query, key and value projections as one `[3 · width, width]` product: one read of the
-    /// normalized rows, and the three outputs are column ranges of one buffer.
+    /// normalized rows, and the three outputs are column ranges of one buffer, which the rotation
+    /// turns in place through its row stride.
     query_key_value: MergedColumnLinear,
     output: Linear,
-    /// `scale1`, then the second normalization.
-    attended: RmsNorm,
-    gate_up: Linear,
-    gated: GatedActivation,
-    down: Linear,
-    /// `scale2`, then the next layer's first normalization; the last layer folds into `last`.
-    fed: Option<RmsNorm>,
+    /// The norms, the layer scales and the value-first SwiGLU.
+    block: PreNormBlock,
 }
 
 /// The video decoder's latent stage: one clip's latent voxels become the clip's pixels.
@@ -319,12 +319,9 @@ pub struct VideoDecoder {
     register_rows: Weight,
     zero_row: Weight,
     zero_rows: Weight,
-    /// The first layer's first normalization, which has no update to fold: it narrows the FP32
-    /// stream into the FP16 rows the projections read.
-    first: RmsNorm,
     layers: Vec<Layer>,
-    /// The last layer's feed-forward update and the final normalization.
-    last: LayerNorm,
+    /// The final normalization's gain and bias, which fold the last layer's scaled update.
+    norm_out: (Weight, Weight),
     output: Linear,
     rotary: Rotary,
     /// The offsets of the clip's sequences: `[0, rows, 2 · rows, ...]`, one per tile of the largest
@@ -332,7 +329,6 @@ pub struct VideoDecoder {
     /// table's prefix.
     offsets: Weight,
     config: VideoVaeConfig,
-    ffn_mult: u32,
     /// Elements per head.
     head: u64,
     /// Query heads per token.
@@ -574,46 +570,42 @@ impl VideoDecoder {
         )?;
 
         // The normalizations' gains and the residual scales stay at the stream's width.
-        let vector = |loader: &mut WeightLoader, module: String, leaf: &str| -> Result<Weight> {
-            Ok(loader
-                .scope(module)
-                .pinned(STREAM)
-                .tensor(leaf, &[u64::from(width)])?)
-        };
-        let first = RmsNorm::new(
-            vector(
-                loader,
-                "decoder.transformer_blocks.0.norm1".to_owned(),
-                "weight",
-            )?,
-            epsilon,
-            Epilogue::None,
-        )?;
-        let weight = vector(loader, "decoder.norm_out".to_owned(), "weight")?;
-        let bias = vector(loader, "decoder.norm_out".to_owned(), "bias")?;
-        // Every residual update is scaled per channel and has no bias of its own.
-        let scaled = |scale: Weight| Epilogue::ScaledResidual { scale, bias: None };
+        let mut norm_out = loader.scope("decoder.norm_out");
+        let mut norm_out = norm_out.pinned(STREAM);
+        let norm_out = (
+            norm_out.tensor("weight", &[u64::from(width)])?,
+            norm_out.tensor("bias", &[u64::from(width)])?,
+        );
         let count = config.decoder_num_layers;
-        let last_scale = vector(
-            loader,
-            format!("decoder.transformer_blocks.{}", count - 1),
-            "scale2",
-        )?;
-        let last = LayerNorm::new(weight, Some(bias), epsilon, scaled(last_scale))?;
-
         let mut layers = Vec::with_capacity(count as usize);
         for index in 0..count {
             let base = format!("decoder.transformer_blocks.{index}");
-            let scale1 = vector(loader, base.clone(), "scale1")?;
-            let norm2 = vector(loader, format!("{base}.norm2"), "weight")?;
-            let fed = if index + 1 < count {
-                let scale2 = vector(loader, base.clone(), "scale2")?;
-                let next = format!("decoder.transformer_blocks.{}.norm1", index + 1);
-                let norm1 = vector(loader, next, "weight")?;
-                Some(RmsNorm::new(norm1, epsilon, scaled(scale2))?)
-            } else {
-                None
-            };
+            // The projections are read at the activation type, the gains and the layer scales at
+            // the stream's, and every update is scaled per channel and folded into the next norm.
+            let block = PreNormBlock::load(
+                &mut loader.scope(&base).pinned(ACTIVATION),
+                PreNormSpec {
+                    hidden: width,
+                    eps: epsilon,
+                    norm1: "norm1",
+                    norm2: "norm2",
+                    layer_scale: Some(["scale1", "scale2"]),
+                    norm_dtype: Some(STREAM),
+                    residual: ResidualForm::Fused,
+                    // The feed-forward's projection is packed: its rows hold the value half and
+                    // then the gate half.
+                    mlp: GatedMlpSpec {
+                        hidden: width,
+                        intermediate: ffn,
+                        activation: ops::activation::Activation::Silu,
+                        rounding: Rounding::ValueProduct,
+                        gate_up: GateUp::ValueFirst("ff.net.0.proj"),
+                        down: "ff.net.2",
+                        bias: Bias::Present,
+                    },
+                },
+                Split::WHOLE,
+            )?;
             // The three projections are one product: their matrices stacked query, key, value.
             let query_key_value = MergedColumnLinear::load(
                 &mut loader.scope(format!("{base}.attn")).pinned(ACTIVATION),
@@ -622,29 +614,19 @@ impl VideoDecoder {
                 &[width, width, width],
                 Bias::Present,
             )?;
-            let mut projection = |module: &str, from: u32, to: u32| {
-                Linear::load(
-                    &mut loader.scope(format!("{base}.{module}")).pinned(ACTIVATION),
-                    from,
-                    to,
-                    Bias::Present,
-                    Parallel::None,
-                )
-            };
+            let output = Linear::load(
+                &mut loader
+                    .scope(format!("{base}.attn.to_out.0"))
+                    .pinned(ACTIVATION),
+                width,
+                width,
+                Bias::Present,
+                Parallel::None,
+            )?;
             layers.push(Layer {
                 query_key_value,
-                output: projection("attn.to_out.0", width, width)?,
-                attended: RmsNorm::new(norm2, epsilon, scaled(scale1))?,
-                // The feed-forward's projection is packed: its rows hold the value half and then the
-                // gate half, so it is twice the feed-forward's width.
-                gate_up: projection("ff.net.0.proj", width, 2 * ffn)?,
-                gated: GatedActivation::new(
-                    ops::activation::Activation::Silu,
-                    Rounding::ValueProduct,
-                    GateBias::None,
-                )?,
-                down: projection("ff.net.2", ffn, width)?,
-                fed,
+                output,
+                block,
             });
         }
 
@@ -691,9 +673,8 @@ impl VideoDecoder {
             register_rows,
             zero_row,
             zero_rows,
-            first,
             layers,
-            last,
+            norm_out,
             output,
             rotary,
             offsets,
@@ -706,7 +687,6 @@ impl VideoDecoder {
                     .map_err(|_| Error::config("too many tokens".to_owned()))?,
             )?,
             config: config.clone(),
-            ffn_mult: config.decoder_ffn_mult,
             head: u64::from(head),
             heads: u64::from(heads),
         })
@@ -779,7 +759,6 @@ impl VideoDecoder {
         let rows = tiles * tile.rows();
         let voxels = tiles * tile.voxels();
         let width = u64::from(self.width);
-        let ffn = width * u64::from(self.ffn_mult);
         let half = u64::from(rotary(&self.config)?.0 / 2);
         let channels = u64::from(self.config.latent_channels);
         let arena = f.arena();
@@ -795,8 +774,6 @@ impl VideoDecoder {
             query_key_value: arena.tensor(ACTIVATION, Shape::new(&[rows, 3 * width]))?,
             attended: arena.tensor(ACTIVATION, Shape::new(&[rows, width]))?,
             update: arena.tensor(ACTIVATION, Shape::new(&[rows, width]))?,
-            gate_up: arena.tensor(ACTIVATION, Shape::new(&[rows, 2 * ffn]))?,
-            gated: arena.tensor(ACTIVATION, Shape::new(&[rows, ffn]))?,
         })
     }
 
@@ -896,7 +873,6 @@ impl VideoDecoder {
         let (head, heads) = (self.head, self.heads);
         let normalized = scratch.normalized;
         let (attended, update) = (scratch.attended, scratch.update);
-        let (gate_up, gated) = (scratch.gate_up, scratch.gated);
         let per_head = |view: TensorView| view.reshape(Shape::new(&[rows, heads, head]));
         // The three column ranges of the merged projection, turned and read in place through its row
         // stride, which is the reference's arrangement: the keys and the values share one stride.
@@ -919,36 +895,54 @@ impl VideoDecoder {
             .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?;
         let bound = u32::try_from(rows).map_err(|_| Error::config("too many tokens".to_owned()))?;
 
-        self.first.forward(f, stream, None, normalized)?;
-        let stream = Some(ResidualStream::in_place(stream));
+        // The first layer's first norm has no update to fold: it narrows the FP32 stream into the
+        // FP16 rows the projections read. Every later norm folds the update before it.
+        let mut pending = None;
         for layer in &self.layers {
-            layer.query_key_value.forward(f, normalized, merged)?;
-            self.rotary
-                .apply_strided(f, projection(0), projection(1), cosine, sine)?;
-            self.attention.forward(
-                f,
-                projection(0),
-                projection(1),
-                projection(2),
-                Some(Varlen {
-                    cu_q: offsets,
-                    cu_k: offsets,
-                    max_q: Some(sequence),
-                    max_k: bound,
-                }),
-                per_head(attended),
-            )?;
-            layer.output.forward(f, attended, update)?;
-            layer.attended.forward(f, update, stream, normalized)?;
-            layer.gate_up.forward(f, normalized, gate_up)?;
-            layer.gated.forward(f, Halves::ValueFirst(gate_up), gated)?;
-            layer.down.forward(f, gated, update)?;
-            if let Some(fed) = &layer.fed {
-                fed.forward(f, update, stream, normalized)?;
-            }
+            let attend = |normalized: TensorView, update: TensorView| -> nn::Result<()> {
+                layer.query_key_value.forward(f, normalized, merged)?;
+                self.rotary
+                    .apply_strided(f, projection(0), projection(1), cosine, sine)?;
+                self.attention.forward(
+                    f,
+                    projection(0),
+                    projection(1),
+                    projection(2),
+                    Some(Varlen {
+                        cu_q: offsets,
+                        cu_k: offsets,
+                        max_q: Some(sequence),
+                        max_k: bound,
+                    }),
+                    per_head(attended),
+                )?;
+                layer.output.forward(f, attended, update)
+            };
+            pending = Some(
+                layer
+                    .block
+                    .forward(f, stream, pending, normalized, update, attend)?,
+            );
         }
 
-        self.last.forward(f, update, stream, normalized)?;
+        // The final norm folds the last layer's scaled update into the stream.
+        let last = pending.ok_or_else(|| Error::config("a decoder of no layer".to_owned()))?;
+        let scale = last
+            .scale
+            .ok_or_else(|| Error::config("the decoder's layers scale their updates".to_owned()))?;
+        let (weight, bias) = self.norm_out;
+        LayerNorm::new(
+            weight,
+            Some(bias),
+            self.config.decoder_norm_eps,
+            Epilogue::ScaledResidual { scale, bias: None },
+        )?
+        .forward(
+            f,
+            last.update,
+            Some(ResidualStream::in_place(stream)),
+            normalized,
+        )?;
         Ok(self.output.forward(f, normalized, out)?)
     }
 }
@@ -967,8 +961,6 @@ pub struct ClipScratch {
     query_key_value: TensorView,
     attended: TensorView,
     update: TensorView,
-    gate_up: TensorView,
-    gated: TensorView,
 }
 
 impl Decoder for VideoDecoder {

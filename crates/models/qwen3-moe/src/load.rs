@@ -234,6 +234,7 @@ pub fn load(
                         up: "up_proj",
                     },
                     down: "down_proj",
+                    bias: Bias::Absent,
                 },
                 tensor,
             )?))
