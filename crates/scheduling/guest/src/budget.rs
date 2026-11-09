@@ -222,8 +222,6 @@ impl Step {
     pub fn into_work(self) -> Vec<Work> {
         self.work
     }
-
-
 }
 
 #[cfg(test)]

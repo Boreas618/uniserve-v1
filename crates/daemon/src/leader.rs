@@ -32,8 +32,8 @@ use std::time::Instant;
 use crate::metrics::{EngineLabels, METRICS};
 use anyhow::Context as _;
 use futures::StreamExt as _;
-use proto::request::wire;
 use proto::request::Request;
+use proto::request::wire;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -390,7 +390,6 @@ impl Leader {
         }
         Ok(results)
     }
-
 
     /// The LoRA adapter named `name` the workers hold, which a request
     /// naming it as its model computes with.
@@ -1124,7 +1123,6 @@ impl Leader {
     pub fn served_model_name(&self) -> &str {
         &self.served_model_name
     }
-
 
     /// The video denoiser this deployment serves; `None` for a model that
     /// generates no video.

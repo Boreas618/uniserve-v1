@@ -36,11 +36,11 @@ use crate::{SchedulerConfig, SchedulerStats};
 use anyhow::Context as _;
 use ipc::MainProcessInfo;
 use ipc::RequestId;
-#[cfg(test)]
-use proto::config::{BlockConfig, BlockDistribution};
 use proto::config::EngineArgs;
 #[cfg(feature = "testing")]
 use proto::config::EngineConfig;
+#[cfg(test)]
+use proto::config::{BlockConfig, BlockDistribution};
 pub use proto::config::{WorkerGroupConfig, WorkerGroupRole, WorkerRank};
 use worker::batch::Batches;
 
@@ -534,8 +534,6 @@ impl SchedulerHandle {
         done
     }
 
-
-
     /// What this scheduler has done and what its policy has cost (§12), answered
     /// by the scheduler thread.
     pub fn counters(&self) -> crossbeam_channel::Receiver<crate::handle::Counters> {
@@ -609,7 +607,6 @@ impl SchedulerHandle {
     pub fn model_name(&self) -> &str {
         &self.model
     }
-
 
     /// Returns whether the scheduler stopped on a terminal worker or
     /// worker failure: from its first fatal error on, before its thread
@@ -743,8 +740,6 @@ impl SchedulerHandle {
     pub fn revert_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.revert_policy()
     }
-
-
 
     /// The step this scheduler reached and §12's cost counters for its policy,
     /// or a timeout when the scheduler does not answer.

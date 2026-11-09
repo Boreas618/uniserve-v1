@@ -280,7 +280,6 @@ impl Shape {
             variant,
         }
     }
-
 }
 
 impl fmt::Display for Shape {
@@ -694,7 +693,6 @@ pub fn prefill_row_buckets(rows: u32) -> Vec<u32> {
     }
     buckets
 }
-
 
 /// The buckets one runner captures, in the order it captures them.
 ///

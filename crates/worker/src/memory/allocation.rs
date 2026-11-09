@@ -211,7 +211,6 @@ pub enum MemoryKind {
 }
 
 impl MemoryKind {
-
     /// The locator spelling of transfer peers (`cuda:<ordinal>`, or `cpu` for
     /// host storage of either kind), which consumers read back with
     /// [`Self::from_locator`].
@@ -365,7 +364,6 @@ impl HostMapping {
         *lock(&self.registration) = Some(registration);
         Ok(())
     }
-
 }
 
 impl Drop for HostMapping {
@@ -375,7 +373,6 @@ impl Drop for HostMapping {
         unsafe { libc::munmap(self.address as *mut _, self.bytes) };
     }
 }
-
 
 /// Exportable allocations by base address. Entries
 /// are weak: the registry never extends an allocation's lifetime, and a
@@ -402,7 +399,6 @@ impl Storage {
     ) -> Result<Arc<Self>> {
         Self::register_exportable(device, bytes, access)
     }
-
 
     fn register_exportable(
         device: DeviceId,
@@ -623,7 +619,6 @@ impl Storage {
             _ => Ok(None),
         }
     }
-
 
     /// The device allocation, `None` for host storage and mappings.
     pub(crate) fn allocation(&self) -> Option<&DeviceAllocation> {
@@ -859,12 +854,10 @@ impl StorageView {
         }
     }
 
-
     /// The allocation this view retains.
     pub fn storage(&self) -> &Arc<dyn Backing> {
         &self.storage
     }
-
 
     pub(crate) fn device(&self) -> MemoryKind {
         self.storage.device()
@@ -886,7 +879,6 @@ impl StorageView {
     pub fn address(&self) -> u64 {
         self.storage.address() + self.offset as u64
     }
-
 
     /// Elements addressed by the view.
     pub fn numel(&self) -> u64 {

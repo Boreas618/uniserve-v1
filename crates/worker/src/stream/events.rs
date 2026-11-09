@@ -245,7 +245,6 @@ impl EventPool {
         recorded
     }
 
-
     /// Transfers one retained reference of each event, and the release work
     /// `owner`, to deferred release, outside the recording of any job: the
     /// events' records were made, or are queued in jobs already submitted.
@@ -359,7 +358,6 @@ impl EventPool {
             failure.and(run(completed))?;
         }
     }
-
 }
 
 impl Drop for EventPool {

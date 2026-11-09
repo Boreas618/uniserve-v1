@@ -230,7 +230,6 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
             .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
-
     /// Claims the arena the largest bucket's decode plans.
     fn claim(&mut self) -> Result<()> {
         let mut needed = 0;

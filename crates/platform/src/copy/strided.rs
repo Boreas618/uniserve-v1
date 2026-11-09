@@ -76,7 +76,6 @@ impl StridedCopy {
         self.linear.is_empty() && self.pitched.is_empty()
     }
 
-
     /// Appends the copies of `source` into `destination`. On error nothing is
     /// appended.
     pub fn plan(&mut self, destination: &Strided<'_>, source: &Strided<'_>) -> Result<()> {

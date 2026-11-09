@@ -334,7 +334,6 @@ impl Output {
         }
     }
 
-
     /// Encodes one clip of `request` into the unit it covers.
     ///
     /// `units` is the request's timeline as the model's schedule states it - the kept frame count

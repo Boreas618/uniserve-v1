@@ -417,8 +417,6 @@ impl Captured {
         }
         Ok(None)
     }
-
-
 }
 
 impl std::fmt::Debug for Captured {

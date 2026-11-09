@@ -55,7 +55,6 @@ impl WeightedRmsNorm {
         self.weight.shape().numel() as u32
     }
 
-
     /// The descriptor one launch without a magnitude takes, for a walk without a device: rows of
     /// `dtype`, normalized into `activation`.
     pub fn descriptor_of(
@@ -76,7 +75,6 @@ impl WeightedRmsNorm {
     pub fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
         self.run(f, x, out, None)
     }
-
 
     fn run(
         &self,
@@ -162,7 +160,6 @@ impl ScaledResidual {
 
         f.operate::<residual::ScaledResidual>(&descriptor, args)
     }
-
 }
 
 /// `hidden += (update + bias) · scale; out = rms(hidden) · weight`.
@@ -201,12 +198,10 @@ impl ScaledResidualRmsNorm {
         })
     }
 
-
     /// Channels per row.
     pub fn columns(&self) -> u32 {
         self.weight.shape().numel() as u32
     }
-
 
     /// Fold `update` into `hidden` and normalize it into `out`.
     ///
@@ -315,7 +310,6 @@ impl ScaledResidualLayerNorm {
             absmax: false,
         })
     }
-
 
     /// Channels per row.
     pub fn columns(&self) -> u32 {

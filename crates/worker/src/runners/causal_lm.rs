@@ -298,7 +298,6 @@ impl Staging {
         self.staged
     }
 
-
     /// The tokens the staged batch holds, before the padding to its bucket.
     pub fn live_tokens(&self) -> u64 {
         u64::try_from(self.live_tokens).unwrap_or(0)
@@ -324,7 +323,6 @@ impl Staging {
     pub fn commit(&self) -> &[i64] {
         &self.commit
     }
-
 
     /// The sampling rows, in batch order (4.4's rows the sampler writes a token for).
     pub fn logits_rows(&self) -> &[i32] {
@@ -1777,7 +1775,6 @@ impl<M> Shared<M> {
     pub fn new(model: Arc<M>) -> Self {
         Self(model)
     }
-
 }
 
 impl<M> Clone for Shared<M> {
@@ -1937,11 +1934,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.tensor = Some(group);
         self
     }
-
-
-
-
-
 
     /// The pools' books, for the caller that reports mapped bytes against the budget.
     fn pool(&self) -> Result<std::sync::MutexGuard<'_, Pools>> {

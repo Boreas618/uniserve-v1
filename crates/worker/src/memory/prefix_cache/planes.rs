@@ -285,7 +285,6 @@ pub struct CachePlanes {
 }
 
 impl CachePlanes {
-
     /// Allocate a pool of `num_units` units (the sentinel included), and
     /// reset the planes whose storage is new: values and flags zero, scales
     /// one. On a device the resets run on `stream`, which is synchronized
@@ -830,7 +829,6 @@ impl CachePlanes {
         Ok(())
     }
 
-
     /// The whole value storage of `field`, cell-major: `columns * units` planes of
     /// `CachePlan::plane_bytes` bytes, the shape the block copy reads.
     #[cfg(test)]
@@ -839,8 +837,6 @@ impl CachePlanes {
             .get(field)
             .ok_or_else(|| Error::Invalid(format!("a cache pool holds no field {field}")))
     }
-
-
 
     pub(crate) fn plan(&self) -> &Arc<CachePlan> {
         &self.plan
@@ -1390,7 +1386,6 @@ impl CachePlanes {
     pub(crate) fn scale_address(&self, field: usize, column: u32, unit: u32) -> Result<u64> {
         Ok(self.scale(field, column, unit)?.address())
     }
-
 }
 
 /// The scattered unit resets of one stream: the units a recycle, an import or
@@ -1443,7 +1438,6 @@ impl UnitColumn {
         }
         Ok(())
     }
-
 
     /// Commit transferred values and scales of whole units: set both fields'
     /// initialization flags in every column, in runs like `recycle`.
@@ -1731,7 +1725,6 @@ mod layer_view_tests {
         );
         Ok(())
     }
-
 
     /// A dense pool holds no scale, and states so instead of inventing one.
     #[test]

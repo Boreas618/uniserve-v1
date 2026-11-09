@@ -276,7 +276,6 @@ impl Shape {
         dims
     }
 
-
     /// Whether this shape and `other` have the same extents.
     pub fn matches(&self, other: &Shape) -> bool {
         self.dims() == other.dims()

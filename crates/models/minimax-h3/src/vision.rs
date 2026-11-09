@@ -913,8 +913,6 @@ impl VisionTower {
         })
     }
 
-
-
     /// How many DeepStack feature tables one block returns.
     pub fn deepstack_features(&self) -> usize {
         self.deepstack.len()
@@ -924,7 +922,6 @@ impl VisionTower {
     pub fn buffers(&self, arena: &Arena, patches: u32) -> Result<Buffers> {
         Buffers::new(arena, &self.config, patches, self.dtype)
     }
-
 
     /// Encode one image block's patches into `out`.
     ///

@@ -21,7 +21,6 @@ pub struct GroupShape {
 }
 
 impl GroupShape {
-
     pub fn new(block_size: u32, units_per_page: u32, window: Option<u32>) -> Result<Self> {
         if block_size == 0 || units_per_page == 0 {
             return Err(Error::Invalid(
@@ -184,8 +183,6 @@ impl BlockTables {
         })
     }
 
-
-
     /// Check a table against the rank's own table storage: its group's
     /// shape, whole pages within the row width, allocated tokens within its
     /// pages, and units inside the pool. The scheduler's allocator owns
@@ -330,8 +327,6 @@ impl BlockTables {
             .ok_or_else(|| Error::Invalid("request slot has no installed block table".into()))
     }
 
-
-
     /// Commit a release after its device clears have been submitted.
     pub fn release(&mut self, slots: &[u32]) {
         for &slot in slots {
@@ -341,9 +336,6 @@ impl BlockTables {
             self.lengths.remove(&slot);
         }
     }
-
-
-
 
     pub(crate) fn clear(&mut self) {
         self.tables.clear();
@@ -355,7 +347,6 @@ impl BlockTables {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
 
     #[test]
     fn batch_assignments_replace_only_supplied_groups_until_commit() -> Result<()> {
@@ -422,5 +413,4 @@ mod tests {
         assert!(table.spans(40, 0)?.is_empty());
         Ok(())
     }
-
 }

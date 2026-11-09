@@ -39,9 +39,7 @@ use super::allocation::StorageView;
 use crate::host::HostPool;
 use crate::memory::retained::ExclusiveStorage;
 use crate::stream::Issue;
-use crate::transfer::{
-    CacheImporter, ImportWorkspace, Retired,
-};
+use crate::transfer::{CacheImporter, ImportWorkspace, Retired};
 use crate::{Error, Result};
 
 /// The most import copy threads (and workspaces) a rank runs.
@@ -309,7 +307,6 @@ impl PrefixCache {
         self.planes.plan()
     }
 
-
     /// How many attention groups the plan holds, which the model's layers index.
     pub fn groups(&self) -> usize {
         self.planes.groups()
@@ -359,12 +356,6 @@ impl PrefixCache {
         &self.tables
     }
 
-
-
-
-
-
-
     /// Every bound tensor of the cache: the planes and the block tables,
     /// keyed as numerical bindings receive them.
     pub fn views(&self) -> crate::Result<Vec<(String, StorageView)>> {
@@ -372,7 +363,6 @@ impl PrefixCache {
         views.extend(self.storage.views());
         Ok(views)
     }
-
 
     /// The units a gather for `slot`'s pages of `group` reads, in page order.
     ///
@@ -393,7 +383,6 @@ impl PrefixCache {
         self.tables.commit(update);
         Ok(())
     }
-
 
     /// Make the given units of every group fresh for a new owner on `stream`: flags zero and scales
     /// one, and the values left as they are.
@@ -424,26 +413,6 @@ impl PrefixCache {
         }
         Ok(())
     }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     /// Cancel every import and join the import copy threads, so no import
     /// reads through the transports any more. Idempotent.
@@ -503,7 +472,6 @@ mod fixed_bytes_tests {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,7 +513,6 @@ mod tests {
             .expect("a dense plan of two layers"),
         )
     }
-
 
     /// The row a batch's gather reads is the units the allocation named - not zeros, and not
     /// another request's pages. This is the assertion whose absence let a graph run clean against

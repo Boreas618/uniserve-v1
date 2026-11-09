@@ -722,7 +722,6 @@ impl StorageLayout {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

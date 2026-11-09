@@ -80,12 +80,11 @@ impl ConversionScratch {
             Some(device) => Storage::device(device, size)?,
             None => Storage::host(size),
         };
-        Ok(Self { storage, })
+        Ok(Self { storage })
     }
 
     /// The scratch's storage.
     pub(crate) fn storage(&self) -> &Arc<Storage> {
         &self.storage
     }
-
 }

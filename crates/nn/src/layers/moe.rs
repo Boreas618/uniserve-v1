@@ -277,8 +277,7 @@ pub enum Launch {
     SecondProduct,
 }
 
-impl Launch {
-}
+impl Launch {}
 
 /// One buffer of the encoded step: its extent, its element type, and the launch that writes it.
 ///
@@ -1149,9 +1148,6 @@ impl Moe {
     pub const fn experts(&self) -> u32 {
         self.experts
     }
-
-
-
 
     /// The router's raw scores for `hidden`: `[tokens, experts]`, the gate's product before the
     /// top-k softens it.

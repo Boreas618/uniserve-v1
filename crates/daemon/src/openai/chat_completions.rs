@@ -1374,11 +1374,6 @@ fn append_delta_text(slot: &mut Option<String>, delta: String) {
     }
 }
 
-
-
-
-
-
 /// Builds the initial assistant-role SSE chunk required by OpenAI streaming.
 fn start_chunk(
     request_id: &str,

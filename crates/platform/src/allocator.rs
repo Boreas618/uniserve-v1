@@ -290,7 +290,6 @@ impl Buffer {
         self.block.bytes()
     }
 
-
     pub fn device(&self) -> DeviceId {
         self.device
     }

@@ -25,6 +25,4 @@
 //! [`ServeOptions::devices`](program_server::command::ServeOptions::devices)
 //! instead.
 
-pub(crate) use program_server::command::{
-    command, options, run,
-};
+pub(crate) use program_server::command::{command, options, run};

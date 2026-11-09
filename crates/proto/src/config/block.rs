@@ -80,7 +80,6 @@ pub enum SequenceParallel {
 }
 
 impl SequenceParallel {
-
     /// Derives sequence degree from the selected strategy's independent dimensions.
     ///
     /// # Errors
@@ -206,7 +205,6 @@ impl BlockConfig {
         }
     }
 
-
     /// The rank count one model-parallel group of this block needs: the product
     /// of the tensor, pipeline, and sequence degrees.
     ///
@@ -248,7 +246,6 @@ impl BlockConfig {
         }
         Ok(())
     }
-
 
     /// Reports whether every member rank publishes its own copy of the
     /// block's products.

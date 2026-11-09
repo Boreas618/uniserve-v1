@@ -593,13 +593,10 @@ impl Jobs {
         }
     }
 
-
     /// Every job, in order.
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
         self.jobs.iter()
     }
-
-
 }
 
 /// One job the device worker issues, in submission order.
@@ -717,8 +714,6 @@ impl Job {
             Self::Prepare { call, .. } => format!("preparing the trajectory of call {}", call.0),
         }
     }
-
-
 
     /// The runner that performs the job, if a runner does.
     pub fn runner(&self) -> Option<crate::runner::RunnerId> {
@@ -966,7 +961,6 @@ pub struct Workers {
 }
 
 impl Workers {
-
     /// The rank's devices, as the handles the rest of the process already holds.
     ///
     /// A main process holds one handle per device from the moment it spawns them: the control
@@ -1070,8 +1064,6 @@ impl Workers {
         }
         Ok(submit(first, batch)?.joined(peers))
     }
-
-
 }
 
 /// The refusal of a batch whose phase no device of this rank serves.
@@ -1284,8 +1276,7 @@ pub enum JobKind {
     After,
 }
 
-impl JobKind {
-}
+impl JobKind {}
 
 /// What the caller of a submission holds until its jobs ended.
 ///
@@ -1352,7 +1343,6 @@ impl Submission {
             state,
         )
     }
-
 
     /// The state the queue completes, and the submission's number.
     pub(crate) fn parts(&self) -> (Arc<SubmissionState>, SubmissionId) {

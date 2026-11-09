@@ -26,8 +26,7 @@ pub enum Activation {
     GeluTanh,
 }
 
-impl Activation {
-}
+impl Activation {}
 
 /// A YaRN rotary recipe, the only scaled recipe a Qwen3 checkpoint may use.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -271,7 +270,6 @@ impl Config {
             && !self.mlp_only_layers.contains(&layer)
             && (layer + 1).is_multiple_of(self.decoder_sparse_step)
     }
-
 
     /// Query heads per key/value head.
     pub const fn group_size(&self) -> usize {

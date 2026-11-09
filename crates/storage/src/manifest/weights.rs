@@ -39,7 +39,6 @@ pub struct RetainedStorage {
     pub storage: Storage,
 }
 
-
 /// What a successor rank must hold on its GPU before it can serve.
 /// Weight bytes are filled from the concrete transfer manifest; the other
 /// quantities come from the target rank's numerical and worker layouts.
@@ -80,8 +79,6 @@ pub struct CachePage {
 }
 
 impl RankBudget {
-
-
     /// Writable cache needed to resume accepted request prefixes at this
     /// target layout. Windowed attention keeps the pages intersecting its
     /// history; recurrent layers keep an input and an output checkpoint.

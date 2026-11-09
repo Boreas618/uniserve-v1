@@ -135,7 +135,6 @@ impl Error {
     pub(crate) fn checkpoint(problem: impl Into<String>) -> Self {
         Self::Checkpoint(problem.into())
     }
-
 }
 
 /// A result of this crate.

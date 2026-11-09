@@ -34,7 +34,6 @@ impl BlockName {
     pub fn new(name: impl AsRef<str>) -> Self {
         Self(Arc::from(name.as_ref()))
     }
-
 }
 
 impl fmt::Display for BlockName {
@@ -100,9 +99,4 @@ impl Model {
     pub fn new(blocks: Vec<(BlockName, Block)>) -> Self {
         Self { _blocks: blocks }
     }
-
-
-
-
-
 }

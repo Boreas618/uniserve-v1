@@ -61,8 +61,6 @@ impl fmt::Display for BlockShape {
 }
 
 impl BlockShape {
-
-
     /// Check the launch against the compiled variant and the index vector.
     fn check(
         &self,

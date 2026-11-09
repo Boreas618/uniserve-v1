@@ -196,7 +196,6 @@ impl Control {
         })
     }
 
-
     /// The state the daemon last commanded.
     pub fn current(&self) -> State {
         self.state.borrow().clone()

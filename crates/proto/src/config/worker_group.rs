@@ -181,7 +181,6 @@ impl WorkerGroupConfig {
         Ok(groups)
     }
 
-
     /// Appends this file group's replicas to `groups`, placed on `engine_host`.
     fn expand(self, engine_host: &str, groups: &mut Vec<Self>) -> anyhow::Result<()> {
         use anyhow::Context as _;

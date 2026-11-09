@@ -360,7 +360,6 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         format!("decode-{:?}-{}", bucket.extent, bucket.rows)
     }
 
-
     /// Claims the arena the largest bucket's decode plans.
     fn claim(&mut self) -> Result<()> {
         let mut needed = 0;

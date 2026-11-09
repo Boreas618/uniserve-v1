@@ -434,7 +434,6 @@ impl EngineControl {
         Ok((control, welcome.nodes))
     }
 
-
     /// The storage ledgers every node's Storage Server keeps for the deployment, one JSON report
     /// per node: `{"host": ..., "ledgers": [...], "host_storage": {...}, "transfers": [...]}`.
     /// Each node's daemon reads them over its claim, so no main process is asked.

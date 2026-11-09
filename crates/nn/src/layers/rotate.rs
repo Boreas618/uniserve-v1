@@ -83,7 +83,6 @@ impl Rotate {
         }
     }
 
-
     /// The width of one head.
     pub const fn head_dim(&self) -> u32 {
         self.head_dim

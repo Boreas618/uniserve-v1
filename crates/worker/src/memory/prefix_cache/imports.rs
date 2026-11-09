@@ -4,12 +4,9 @@
 
 use std::sync::Arc;
 
-
+use crate::Result;
 use crate::host::HostPool;
 use crate::transfer::{CacheImporter, ImportCopy, Retired};
-use crate::Result;
-
-
 
 /// Import workspaces, the host pool their copies run on and the retirement
 /// observers.

@@ -110,7 +110,6 @@ impl Recipe {
         self.module.clone()
     }
 
-
     /// The directory a buffer's `dump` is written under when the run states none.
     pub fn dump_dir(&self) -> PathBuf {
         self.origin
@@ -277,8 +276,6 @@ impl Parameter {
             )),
         }
     }
-
-
 }
 
 fn signed(value: &serde_json::Value, kind: &str) -> Result<i64, String> {
@@ -432,7 +429,6 @@ impl Word {
     pub fn len(&self) -> usize {
         self.bytes.len()
     }
-
 
     /// What the word is, for the run's record: a scalar's kind, a baked constant's name, or the
     /// buffer a pointer addresses.

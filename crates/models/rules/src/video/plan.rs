@@ -66,7 +66,10 @@ pub use proto::config::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
 /// The planning vectors the rules are tested against, generated from the
 /// reference pipeline: a file of this crate's, which the daemon's request tests
 /// read too.
-pub const PLAN_VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/minimax_h3_plan.json");
+pub const PLAN_VECTORS: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/data/minimax_h3_plan.json"
+);
 
 /// The audio VAE's sample rate and hop: 40 latents per second.
 pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
@@ -294,8 +297,6 @@ pub enum ConditionType {
 impl ConditionType {
     /// Every condition type.
     pub const ALL: [Self; 4] = [Self::Image, Self::Video, Self::VideoAudio, Self::Audio];
-
-
 }
 
 /// Whether a condition anchors a generated frame or is a reference: a
@@ -309,9 +310,7 @@ pub enum Role {
     Reference,
 }
 
-impl Role {
-
-}
+impl Role {}
 
 /// The generated frame a keyframe anchors.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]

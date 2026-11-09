@@ -60,7 +60,6 @@ impl VideoTask {
     pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|task| task.as_str() == name)
     }
-
 }
 
 /// How a condition relates to the generated video.

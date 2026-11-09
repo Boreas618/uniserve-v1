@@ -16,8 +16,7 @@ pub enum FactsError {
     Invalid(String),
 }
 
-impl FactsError {
-}
+impl FactsError {}
 
 /// Result of a family rule.
 pub type Result<T> = std::result::Result<T, FactsError>;

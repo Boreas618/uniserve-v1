@@ -94,7 +94,6 @@ impl DelimitedReasoningParser {
         })
     }
 
-
     /// Parses the buffered text, keeping back what a later delta may still
     /// change: a trailing partial delimiter, and the start of a section that
     /// may still grow into a longer label. `finishing` keeps back nothing.

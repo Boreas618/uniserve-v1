@@ -56,7 +56,6 @@ pub const TASK_DITS: [(VideoTask, Dit); 3] = [
     (VideoTask::ReferenceToVideoAudio, Dit::Reference),
 ];
 
-
 /// The pipeline class a load of this crate takes (`model_index.json`'s `_class_name`).
 ///
 /// A task export such as `MiniMax-H3/FL2VA` states `MiniMaxH3Pipeline` and names a `video_vae`

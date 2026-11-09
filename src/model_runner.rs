@@ -200,8 +200,7 @@ impl worker::data_plane::ModelLoad for RankModel {
     }
 }
 
-impl Served {
-}
+impl Served {}
 
 /// One rank's model runner: it loads the rank's model on its devices, sizes the KV cache from what
 /// the device has left, captures the rank's CUDA graphs and builds its compute runners. The ranks

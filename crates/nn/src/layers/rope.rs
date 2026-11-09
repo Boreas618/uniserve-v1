@@ -196,10 +196,6 @@ impl Rotary {
         Ok(self)
     }
 
-
-
-
-
     /// The factor table's descriptor at an element type of the caller's.
     ///
     /// FP32 is every trained transformer's table; a model whose reference rounds the factors to its

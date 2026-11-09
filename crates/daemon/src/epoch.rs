@@ -80,7 +80,6 @@ pub fn program_to_wire(program: &Program) -> proto::process::Program {
     }
 }
 
-
 /// One operator's program as the `Precopy` command states it (§7.3 step 2).
 pub fn kernel_to_wire(slot: &KernelKey, program: &Program) -> proto::process::KernelProgram {
     proto::process::KernelProgram {
@@ -567,7 +566,6 @@ impl Epochs {
         record.previous_policy = None;
         record.status = Status::Serving;
     }
-
 
     /// Ends a probation by putting the previous generation back: what the
     /// epoch executed before the update is what it executes again (§7.3
