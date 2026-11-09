@@ -49,7 +49,6 @@
 const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
 use crate::{Error, Result};
-use ops::values::f32_to_bf16;
 
 /// The spatial compression of the video encoder: input pixels per latent position.
 pub const SPATIAL_RATIO: u32 = 16;
@@ -189,14 +188,15 @@ impl nn::capability::MediaFormat for ConditionFormat {
         let channels = self.vision.in_channels as usize;
         let (height, width) = ((rows * patch) as usize, (columns * patch) as usize);
         let area = height * width;
-        let width_bytes = self.patch_width() as usize * 2;
-        let patches = time as usize * rows as usize * columns as usize;
-        if self.dtype != DType::BF16 {
-            return Err(nn::Error::from(Error::Unsupported(format!(
-                "H3's vision tower reads BF16 patch rows, not {}",
+        // The rows are stored in the tower's own element type, whatever its loader chose.
+        let element = self.dtype.bytes().ok_or_else(|| {
+            Error::Unsupported(format!(
+                "{} patch rows have no whole-byte element",
                 self.dtype
-            ))));
-        }
+            ))
+        })? as usize;
+        let width_bytes = self.patch_width() as usize * element;
+        let patches = time as usize * rows as usize * columns as usize;
         if planes.len() != frames as usize * channels * area
             || out.len() != patches * width_bytes
             || frames == 0
@@ -211,14 +211,15 @@ impl nn::capability::MediaFormat for ConditionFormat {
         let mean = self.pixels.mean.map(|value| value * 255.0);
         let std = self.pixels.std.map(|value| value * 255.0);
         let (patch, merge, temporal) = (patch as usize, merge as usize, temporal as usize);
-        // A byte has 256 values, so a channel's normalised BF16 is a table of them.
-        let mut table = vec![[0_u8; 2]; channels * 256];
+        // A byte has 256 values, so a channel's normalised element is a table of them, each the
+        // FP32 value rounded once to the tower's type.
+        let mut values = Vec::with_capacity(channels * 256);
         for channel in 0..channels {
             for byte in 0..=u8::MAX {
-                table[channel * 256 + usize::from(byte)] =
-                    f32_to_bf16((f32::from(byte) - mean[channel]) / std[channel]).to_le_bytes();
+                values.push((f32::from(byte) - mean[channel]) / std[channel]);
             }
         }
+        let table = self.dtype.encode(&values).map_err(nn::Error::from)?;
         let table = &table;
         // One band is one temporal patch's row of merge blocks: its bytes follow its predecessor's,
         // so the bands are shared out as they lie in `out`.
@@ -243,11 +244,11 @@ impl nn::capability::MediaFormat for ConditionFormat {
                                 for y in 0..patch {
                                     let line = plane + (top + y) * width + left;
                                     for x in 0..patch {
-                                        let bits =
-                                            table[channel * 256 + usize::from(planes[line + x])];
-                                        out[at] = bits[0];
-                                        out[at + 1] = bits[1];
-                                        at += 2;
+                                        let entry = (channel * 256 + usize::from(planes[line + x]))
+                                            * element;
+                                        out[at..at + element]
+                                            .copy_from_slice(&table[entry..entry + element]);
+                                        at += element;
                                     }
                                 }
                             }
@@ -1972,7 +1973,7 @@ impl GeGlu {
 mod tests {
     use super::*;
     use nn::capability::MediaFormat as _;
-    use ops::values::bf16_to_f32;
+    use ops::values::{bf16_to_f32, f32_to_bf16};
 
     /// The format of a tower of `patch`-pixel patches, two-frame tubelets and `2 x 2` merges.
     fn format(patch: u32) -> ConditionFormat {
@@ -2081,6 +2082,38 @@ mod tests {
         let second = 4 * row;
         assert_eq!(row_value(&out, second), pixel(30));
         assert_eq!(row_value(&out, second + 4), pixel(30));
+    }
+
+    /// The patch rows are stored in the tower's own element type: a tower loaded in FP32 reads
+    /// four-byte rows of the unrounded values, and a refusal of every type but BF16 left such a
+    /// tower with no rows at all.
+    #[test]
+    fn patch_rows_are_stored_in_the_towers_element_type() {
+        let format = ConditionFormat {
+            dtype: DType::F32,
+            ..format(1)
+        };
+        // One frame of 2 rows by 2 columns: one merge block, four patch rows.
+        let planes: Vec<u8> = (0..3 * 4).map(|value| (10 * value) as u8).collect();
+        let row = format.patch_width() as usize;
+        let mut out = vec![0_u8; 4 * row * 4];
+        format
+            .patches(&planes, 1, [1, 2, 2], &mut out)
+            .expect("FP32 rows");
+        let value = |index: usize| {
+            f32::from_le_bytes([
+                out[4 * index],
+                out[4 * index + 1],
+                out[4 * index + 2],
+                out[4 * index + 3],
+            ])
+        };
+        // Row 0 is pixel (0, 0): channel 0 holds byte 0, channel 1 byte 40, each frame twice.
+        assert_eq!(value(0), (0.0 - 127.5) / 127.5);
+        assert_eq!(value(2), (40.0 - 127.5) / 127.5);
+        // A buffer of BF16 width is two bytes per element short.
+        let mut short = vec![0_u8; 4 * row * 2];
+        assert!(format.patches(&planes, 1, [1, 2, 2], &mut short).is_err());
     }
 
     /// A condition's pixels are planar and normalised as the encoder reads them, and the track is
