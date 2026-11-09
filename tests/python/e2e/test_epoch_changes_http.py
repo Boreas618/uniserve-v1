@@ -81,9 +81,12 @@ CACHED_PROMPT = "Describe the sea in one sentence. " * 40
 # page with the other prompts.
 TRIAL_PROMPT = "List the colours of the rainbow and what each means. " * 40
 # Options every deployment of the tests serves with: few captured graphs,
-# so that epochs start while the count streams, and a small KV cache.
+# so that epochs start while the count streams, and a small KV cache. A
+# deployment names its attention backend, whose package fills
+# `paged_attention` at the Program Server.
 OPTIONS = (
     "dtype=bfloat16",
+    "attention_backend=trtllm",
     "kv_cache_config.max_tokens=32768",
     "chat_config.reasoning_parser=none",
     "cuda_graph_config.prefill_token_sizes=[512]",

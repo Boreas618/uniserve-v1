@@ -1114,7 +1114,10 @@ def _restart_while_streaming(
     # the successor reads the configuration the old process served rather than
     # a command line of its own (design 7.5).
     inherited = httpx.get(f"{base_url}/admin/config", timeout=60.0).json()
-    assert program_server_option()[1] in inherited["config"], (
+    served = tomllib.loads(inherited["config"])
+    assert served.get("program_config", {}).get("socket") == str(
+        PROGRAM_SERVER
+    ), (
         "the successor did not inherit the programs' server: "
         f"{inherited['config'][:2000]}"
     )
