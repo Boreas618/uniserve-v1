@@ -22,6 +22,8 @@
 //! - [`store`]: the module store of section 5.3, whose paths are made of the
 //!   operator's and backend's names, the revision, the target and the
 //!   descriptor key, and whose every directory ends in a `.committed` mark.
+//! - [`build`]: `uniserve program-server build`, which fills a store from
+//!   descriptor key lists.
 //! - [`builder`]: the compile queue of section 6.2, with its urgencies, its
 //!   deduplication by module path and its host-memory limit.
 //! - [`source`] and [`toolchain`]: how a package's sources become a module,
@@ -37,6 +39,7 @@
 //!   epoch fills each operator with (section 5.1), shared by the daemon and
 //!   the main process.
 
+pub mod build;
 pub mod builder;
 pub mod command;
 pub mod cubin_launch;
@@ -130,6 +133,22 @@ pub enum Error {
         target: String,
         descriptor: String,
         message: String,
+    },
+    /// A store build failed somewhere: the keys no installed backend built,
+    /// and how many installs, prepares or resolves failed in all. A key a
+    /// second backend built still counts its first backend's failure.
+    #[error(
+        "{failures} build failure(s), and {} of {total} keys did not build: [{}]",
+        keys.len(),
+        keys.join(", ")
+    )]
+    Unbuilt {
+        /// Each key no backend built, as `operator key`.
+        keys: Vec<String>,
+        /// How many keys the build was given.
+        total: usize,
+        /// How many failures the build reported.
+        failures: usize,
     },
     /// A toolchain is missing or is not the version the package declares.
     #[error("toolchain {kind}: {message}")]

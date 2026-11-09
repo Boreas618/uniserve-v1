@@ -1,6 +1,6 @@
 //! The `uniserve program-server` command (design sections 6.1 and 6.3).
 //!
-//! Three subcommands:
+//! Four subcommands:
 //!
 //! - `serve`: runs this host's Program Server until it is stopped. With
 //!   `--daemon` it leaves its starter's session first (`service::detach`),
@@ -11,6 +11,10 @@
 //!   another server answers where the upstream is.
 //! - `list`: prints the installed packages, their revisions and their
 //!   modules.
+//! - `build --keys <file>`: fills a store directory with the modules of
+//!   descriptor key lists, with a Program Server of its own for the length of
+//!   the build ([`crate::build`]). The store's `packages` and `modules` are
+//!   then a `serve`'s package root and store root.
 //!
 //! The server launches no kernel and allocates no device memory (design
 //! section 6.1). The targets it builds for are the `--target`s it is given,
@@ -59,6 +63,37 @@ pub enum Command {
         #[arg(long)]
         socket: Option<PathBuf>,
     },
+    /// Build the modules of descriptor key lists into a store directory.
+    Build(Box<BuildArgs>),
+}
+
+/// The arguments of `build`.
+#[derive(Debug, Clone, clap::Args)]
+pub struct BuildArgs {
+    /// A key list, `operator<TAB>descriptor key` per line; repeatable.
+    #[arg(long = "keys", value_name = "FILE", required = true)]
+    pub keys: Vec<PathBuf>,
+    /// The package tree: one directory per operator, one package directory
+    /// per backend. Relative to the directory the command runs in.
+    #[arg(long, value_name = "DIR", default_value = "crates/ops/kernels")]
+    pub packages: PathBuf,
+    /// The target the modules are built for, such as `sm_100a`.
+    #[arg(long, value_name = "NAME")]
+    pub target: String,
+    /// The store directory: installed packages under `packages`, modules
+    /// under `modules`. An existing store is extended.
+    #[arg(long, value_name = "DIR")]
+    pub store: PathBuf,
+    /// The interpreter of the Program Server's Python environment, which
+    /// Triton and CuTe DSL packages build with.
+    #[arg(long, value_name = "PATH")]
+    pub python: PathBuf,
+    /// The CUDA toolkit's nvcc; `$CUDA_HOME/bin/nvcc` when unset.
+    #[arg(long, value_name = "PATH")]
+    pub nvcc: Option<PathBuf>,
+    /// How many builds may run at once (4 when unset).
+    #[arg(long, value_name = "COUNT")]
+    pub max_jobs: Option<usize>,
 }
 
 /// The arguments of `serve`.
@@ -311,7 +346,91 @@ pub fn run(args: Args) -> Result<()> {
             }
             Ok(())
         }
+        Command::Build(build) => run_build(*build),
     }
+}
+
+/// Builds the key lists' modules into the store and prints one line per key:
+/// `ok`, the operator, the key and the backends that built it, or `FAILED`,
+/// the operator and the key. Every line is tab-separated.
+fn run_build(args: BuildArgs) -> Result<()> {
+    let python = absolute(args.python);
+    if !python.is_file() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "no interpreter at {}: `uv sync --project crates/program-server/python` \
+                 builds the Program Server's environment",
+                python.display()
+            ),
+        )));
+    }
+    let keys = crate::build::read_keys(&args.keys)?;
+    if keys.is_empty() {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "the key lists name no descriptor key",
+        )));
+    }
+
+    // The store's two directories are the roots a `serve` is given; the
+    // build's own server answers on a socket inside the store while it runs.
+    let store = absolute(args.store);
+    std::fs::create_dir_all(&store)?;
+    let settings = Settings {
+        socket: Some(store.join("program-server.sock")),
+        package_root: Some(store.join("packages")),
+        store_roots: vec![store.join("modules")],
+        targets: vec![args.target.clone()],
+        max_jobs: args.max_jobs,
+        nvcc: args.nvcc,
+        python: Some(python),
+        ..Settings::default()
+    };
+    let config = settings.config(settings.devices()?);
+
+    let report = crate::build::build(
+        &config,
+        &absolute(args.packages),
+        &keys,
+        &Target::new(args.target),
+        &mut |outcome| {
+            let (op, key) = (&outcome.key.op, &outcome.key.key);
+            if outcome.backends.is_empty() {
+                println!("FAILED\t{op}\t{key}");
+            } else {
+                let named: Vec<String> = outcome
+                    .backends
+                    .iter()
+                    .map(|(backend, files)| format!("{backend} ({files} files)"))
+                    .collect();
+                println!("ok\t{op}\t{key}\t{}", named.join(", "));
+            }
+        },
+    )?;
+
+    let unbuilt = report.unbuilt();
+    println!(
+        "\n{} of {} descriptors built into the store at {}",
+        keys.len() - unbuilt.len(),
+        keys.len(),
+        config.store_roots[0].path.display()
+    );
+    if report.failures.is_empty() {
+        return Ok(());
+    }
+    eprintln!("\n{} failure(s):", report.failures.len());
+    for failure in &report.failures {
+        eprintln!("  {failure}");
+    }
+    Err(Error::Unbuilt {
+        keys: unbuilt
+            .iter()
+            .map(|key| format!("{} {}", key.op, key.key))
+            .collect(),
+        total: keys.len(),
+        failures: report.failures.len(),
+    })
 }
 
 /// Serves until the process is stopped.

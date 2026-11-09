@@ -200,22 +200,22 @@ def build_store(
 ) -> None:
     """Builds a module for every kernel key this deployment launches.
 
-    `store` is ``build_fixtures``'s store, which it fills in its own shape: the
+    `store` is the store ``uniserve program-server build`` fills: the
     installed package sources under ``<store>/packages`` and the prepared
     modules under ``<store>/modules``. The directory a Program Server serves is
     the second of those — a store root holds the modules, not the store's
     parent.
 
-    ``build_fixtures`` (``crates/program-server/examples``) is the store's own
-    producer: for each ``operator<TAB>key`` line of the key file it installs the
-    operator's package, prepares that key for `target`, and resolves it to the
-    module it names. It is given :func:`deployment_keys`: this deployment's
-    rows only, so a package another deployment owes fails that deployment's run
-    and not this one. The builds are real — Triton, nvcc and
-    CuTe DSL all run — so this takes minutes rather than seconds, once per
-    module. The Program Server then
-    serves the store as it stands, which is why ``--store-root`` below is this
-    directory and no kernel package is installed a second time.
+    For each ``operator<TAB>key`` line of the key file the command installs the
+    operator's packages, prepares that key for `target`, and resolves it to the
+    module it names; a package unchanged since its revision in the store keeps
+    that revision, so a store built earlier is extended rather than rebuilt. It
+    is given :func:`deployment_keys`: this deployment's rows only, so a package
+    another deployment owes fails that deployment's run and not this one. The
+    builds are real — Triton, nvcc and CuTe DSL all run — so this takes minutes
+    rather than seconds, once per module. The Program Server then serves the
+    store as it stands, which is why ``--store-root`` below is this directory
+    and no kernel package is installed a second time.
 
     Every row it is given is one this deployment launches, so a row that does
     not build is this deployment's failure and the file stops here: a short
@@ -223,13 +223,9 @@ def build_store(
     build's own output names the key and the reason.
     """
     command = [
-        "cargo",
-        "run",
-        "--package",
+        str(require_uniserve_binary()),
         "program-server",
-        "--example",
-        "build_fixtures",
-        "--",
+        "build",
         "--keys",
         str(deployment_keys(store, checkpoint)),
         "--packages",
@@ -274,11 +270,11 @@ def program_server(
     once for the module:
 
     * the kernels — a module for every descriptor key the deployment launches,
-      built into the store by ``build_fixtures`` from :func:`deployment_keys`
-      over `checkpoint`, which defaults to the one ``UNISERVE_QWEN3_MODEL``
-      names. The epoch is
-      refused by the first slot no installed program fills, and a main process
-      serves nothing until it can install the kernels the model launches;
+      built into the store by ``uniserve program-server build`` from
+      :func:`deployment_keys` over `checkpoint`, which defaults to the one
+      ``UNISERVE_QWEN3_MODEL`` names. The epoch is refused by the first slot
+      no installed program fills, and a main process serves nothing until it
+      can install the kernels the model launches;
     * the policy — ``POLICY_PACKAGE``, installed below, because a policy is a
       wasm package this host precompiles rather than a kernel key.
 
@@ -289,8 +285,9 @@ def program_server(
     revision, target and descriptor, and a revision counts from 1 in a fresh
     package root, so a store kept across runs would answer a changed package
     with the module the older source built. The environment's
-    ``UNISERVE_PROGRAM_STORE`` names a store ``build_fixtures`` built from this
-    tree instead, for a run of several modules: a build takes minutes.
+    ``UNISERVE_PROGRAM_STORE`` names a store ``uniserve program-server build``
+    built from this tree instead, for a run of several modules: a build takes
+    minutes.
     """
     binary = require_uniserve_binary()
     work = tmp_path_factory.mktemp("program-server")

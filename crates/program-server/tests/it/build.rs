@@ -1,6 +1,7 @@
 //! The Program Server's witnesses that need no repository directory: a vendor cubin and an executable
 //! program are installed, stored and resolved as they are, a scheduling policy is built when it is
-//! installed and served afterwards without a compiler, and the command makes every path absolute.
+//! installed and served afterwards without a compiler, the command makes every path absolute, and
+//! `build` extends a store from key lists without reinstalling an unchanged package.
 //!
 //! The policy witness runs a Python build script and the wasm precompiler, which a host provisions:
 //! `UNISERVE_PROGRAM_SERVER_PYTHON` names the interpreter and `UNISERVE_SCHEDULING_PRECOMPILE` the
@@ -544,4 +545,154 @@ fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
         typed_in.join("relative/python"),
         "the relative interpreter did not resolve against the directory it was typed in",
     );
+}
+
+/// The vendor cubin package of [`CUBIN_MANIFEST`] for two page sizes, in a
+/// package tree as `build` reads one: `<tree>/<operator>/<backend>`.
+fn cubin_tree(tree: &Path) -> PathBuf {
+    let package = tree.join("paged_attention/trtllm");
+    std::fs::create_dir_all(package.join("artifact")).unwrap();
+    std::fs::write(
+        package.join("package.toml"),
+        CUBIN_MANIFEST.replace(r#"page = ["64"]"#, r#"page = ["64", "128"]"#),
+    )
+    .unwrap();
+    for key in ["dtype_bf16_page_64", "dtype_bf16_page_128"] {
+        std::fs::write(
+            package.join(format!("artifact/module_{key}.cubin")),
+            cubin_bytes(),
+        )
+        .unwrap();
+        std::fs::write(
+            package.join(format!("artifact/metadata_{key}.json")),
+            br#"{"name": "uniserve_paged_attention_trtllm"}"#,
+        )
+        .unwrap();
+    }
+    package
+}
+
+/// Runs `uniserve program-server build` over `tree` into `store` for the
+/// `paged_attention` keys named, from a key list written beside the store.
+fn build_store(
+    temporary: &Path,
+    tree: &Path,
+    store: &Path,
+    keys: &[&str],
+) -> Result<(), Box<program_server::Error>> {
+    use clap::Parser as _;
+
+    // A cubin package compiles nothing, so the interpreter is only a file the
+    // command finds.
+    let python = temporary.join("python");
+    std::fs::write(&python, b"").unwrap();
+    let list = temporary.join("keys.txt");
+    let lines: Vec<String> = keys
+        .iter()
+        .map(|key| format!("paged_attention\t{key}\n"))
+        .collect();
+    std::fs::write(&list, lines.concat()).unwrap();
+
+    let args = program_server::command::Args::try_parse_from([
+        "program-server",
+        "build",
+        "--keys",
+        list.to_str().unwrap(),
+        "--packages",
+        tree.to_str().unwrap(),
+        "--target",
+        "sm_100a",
+        "--store",
+        store.to_str().unwrap(),
+        "--python",
+        python.to_str().unwrap(),
+    ])
+    .expect("the build command parses");
+    program_server::command::run(args).map_err(Box::new)
+}
+
+/// The installed revisions of the cubin package in a built store.
+fn revisions(store: &Path) -> Vec<String> {
+    let installed = store.join("packages/paged_attention/trtllm");
+    let mut revisions: Vec<String> = std::fs::read_dir(installed)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    revisions.sort();
+    revisions
+}
+
+/// Whether a built store holds the committed module of `key` at `revision`.
+fn committed(store: &Path, revision: u32, key: &str) -> bool {
+    store
+        .join(format!("modules/paged_attention/trtllm/{revision}/sm_100a"))
+        .join(key)
+        .join(".committed")
+        .is_file()
+}
+
+/// A store is extended by building more keys into it: a package whose files
+/// are unchanged keeps its installed revision, so the modules built earlier
+/// stay under the revision the store serves, and Python bytecode beside the
+/// sources is not a change. A changed package is installed as a new revision.
+#[test]
+fn a_build_into_an_existing_store_keeps_the_revision_of_an_unchanged_package() {
+    let temporary = tempfile::tempdir().unwrap();
+    let tree = temporary.path().join("kernels");
+    let package = cubin_tree(&tree);
+    let store = temporary.path().join("store");
+
+    build_store(temporary.path(), &tree, &store, &["dtype_bf16_page_64"]).unwrap();
+    assert_eq!(revisions(&store), ["1"]);
+    assert!(committed(&store, 1, "dtype_bf16_page_64"));
+
+    // Bytecode a Python build or check left beside the sources.
+    std::fs::create_dir_all(package.join("__pycache__")).unwrap();
+    std::fs::write(package.join("__pycache__/build.cpython-312.pyc"), b"\0").unwrap();
+    build_store(temporary.path(), &tree, &store, &["dtype_bf16_page_128"]).unwrap();
+    assert_eq!(
+        revisions(&store),
+        ["1"],
+        "an unchanged package was installed again"
+    );
+    assert!(committed(&store, 1, "dtype_bf16_page_64"));
+    assert!(committed(&store, 1, "dtype_bf16_page_128"));
+
+    std::fs::write(
+        package.join("artifact/metadata_dtype_bf16_page_64.json"),
+        br#"{"name": "uniserve_paged_attention_trtllm", "shared": 0}"#,
+    )
+    .unwrap();
+    build_store(temporary.path(), &tree, &store, &["dtype_bf16_page_64"]).unwrap();
+    assert_eq!(
+        revisions(&store),
+        ["1", "2"],
+        "a changed package kept its revision"
+    );
+    assert!(committed(&store, 2, "dtype_bf16_page_64"));
+}
+
+/// A build fails with the keys it could not build, and still builds the rest.
+#[test]
+fn a_build_fails_with_the_keys_no_package_built() {
+    let temporary = tempfile::tempdir().unwrap();
+    let tree = temporary.path().join("kernels");
+    cubin_tree(&tree);
+    let store = temporary.path().join("store");
+
+    let error = build_store(
+        temporary.path(),
+        &tree,
+        &store,
+        &["dtype_bf16_page_64", "dtype_bf16_page_32"],
+    )
+    .expect_err("a key no package covers fails the build");
+    match *error {
+        program_server::Error::Unbuilt { keys, total, .. } => {
+            assert_eq!(keys, ["paged_attention dtype_bf16_page_32"]);
+            assert_eq!(total, 2);
+        }
+        other => panic!("the build failed with {other}, not the keys it did not build"),
+    }
+    assert!(committed(&store, 1, "dtype_bf16_page_64"));
 }

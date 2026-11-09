@@ -142,10 +142,11 @@ def model() -> Path:
 def program_server(model: Path, tmp_path_factory: pytest.TempPathFactory):
     """The host's Program Server, serving a store built for this deployment.
 
-    The kernels come from ``build_fixtures`` over the keys `model`'s own walk
-    states, and the scheduling policy is installed on top of them (a policy is
-    a wasm package this host precompiles rather than a kernel key); the shared
-    helper does both, so this file and the others serve one store the same way.
+    The kernels come from ``uniserve program-server build`` over the keys
+    `model`'s own walk states, and the scheduling policy is installed on top of
+    them (a policy is a wasm package this host precompiles rather than a kernel
+    key); the shared helper does both, so this file and the others serve one
+    store the same way.
     """
     with running_program_server(tmp_path_factory, checkpoint=model) as socket:
         yield {"socket": socket, "binary": require_uniserve_binary()}
