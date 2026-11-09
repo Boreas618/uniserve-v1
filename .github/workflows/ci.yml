@@ -34,13 +34,33 @@ jobs:
           FFMPEG_SOURCE="$RUNNER_TEMP/ffmpeg-8.1.2" crates/media/native/build.sh "$UNISERVE_FFMPEG_DIR"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
       - run: cargo bench --workspace --no-run
+      # The python job's tests ask the request rules through `uniserve rules`.
+      - run: cargo build -p uniserve --bin uniserve
+      - uses: actions/upload-artifact@v4
+        with:
+          name: uniserve
+          path: target/debug/uniserve
 
   python:
     runs-on: ubuntu-latest
+    needs: rust
+    env:
+      UNISERVE_EXECUTABLE: ${{ github.workspace }}/../bin/uniserve
     steps:
       - uses: actions/checkout@v4
+      # The binary the rust job built, and the FFmpeg runtime it links.
+      - uses: actions/download-artifact@v4
+        with:
+          name: uniserve
+          path: ${{ github.workspace }}/../bin
+      - run: chmod +x "$UNISERVE_EXECUTABLE"
+      - uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/../ffmpeg-prefix
+          key: ffmpeg-8.1.2-${{ runner.os }}-${{ hashFiles('crates/media/native/build.sh') }}
+          fail-on-cache-miss: true
       # The project builds with uv: `uniserve-eval` is a workspace package that uv finds through
       # its sources and pip looks for on PyPI. The checks need the tools, not the Rust build.
       - uses: astral-sh/setup-uv@v6
