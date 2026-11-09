@@ -3,7 +3,7 @@
 // (destination, index vector, source), so a probe reads its launch as what it does.
 //
 // `blocks` names field blocks, one per snapshot row: a negative index writes nothing (the inactive
-// pair's placeholder), the same reading `ops::block_copy` gives it.
+// pair's placeholder).
 
 extern "C" __global__ void state_snapshot(
     char* snapshot,

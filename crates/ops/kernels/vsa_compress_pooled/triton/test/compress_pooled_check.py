@@ -107,8 +107,8 @@ UNIT_ROUNDOFF = 2.0**-24
 # A BF16 significand is eight bits, so a value just above 0.25 steps by 2^-9, one step of 2^-7
 # relative to the bottom of its binade. The case allows the FULL step rather than the half a
 # round-to-nearest store needs: Triton's interpreter truncates a BF16 store where a device
-# rounds (cache_copy_region's check found the same), so the device answer lies inside this
-# bound and the case still fails if the arithmetic is wrong by more than the row type carries.
+# rounds, so the device answer lies inside this bound and the case still fails if the arithmetic
+# is wrong by more than the row type carries.
 BF16_ROUNDOFF = 2.0**-7
 
 

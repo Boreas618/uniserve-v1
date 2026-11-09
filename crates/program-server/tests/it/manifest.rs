@@ -92,12 +92,12 @@ fn a_package_covers_a_descriptor_by_its_enumerated_values() {
     assert!(!descriptors.covers("nonsense"));
 }
 
-/// The manifest of a Triton `cache_block_scatter` package whose `descriptors`
+/// The manifest of a Triton `kv_write` package whose `descriptors`
 /// line is `descriptors`: width-generic dimensions declared by constraint.
 fn generic(descriptors: &str) -> String {
     format!(
         r#"
-op = "cache_block_scatter"
+op = "kv_write"
 backend = "triton"
 
 [toolchain]
