@@ -57,7 +57,6 @@ pub mod codec;
 pub mod config;
 pub mod diffusion;
 pub mod error;
-pub mod exchange;
 pub mod family;
 pub mod forward;
 pub mod group;
@@ -78,7 +77,6 @@ pub use capability::{
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};
-pub use exchange::ExchangeViews;
 pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{

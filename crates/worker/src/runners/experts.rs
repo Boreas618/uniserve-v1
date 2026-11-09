@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 
-use nn::ExchangeViews;
+use nn::layers::DispatchViews;
 use ops::moe::exchange::{Group, Transport, TransportShape};
 
 use crate::job::JobQueue;
@@ -325,7 +325,7 @@ struct Backing {
     _channel: Box<Channel>,
     group: Box<Group>,
     transport: Option<Transport>,
-    views: Option<ExchangeViews>,
+    views: Option<DispatchViews>,
 }
 
 // SAFETY: a member moves once, with its runner, to the rank's device thread, and is used there alone;
@@ -384,7 +384,7 @@ impl Member {
     }
 
     /// The transport's views, once [`Self::ensure`] created it.
-    pub fn views(&self) -> Option<&ExchangeViews> {
+    pub fn views(&self) -> Option<&DispatchViews> {
         self.backend.views.as_ref()
     }
 
@@ -466,9 +466,9 @@ impl Member {
     }
 
     /// The layer's views of a transport's regions, with this member's group and its warm meeting.
-    fn exchange_views(&self, views: ops::moe::exchange::TransportViews) -> ExchangeViews {
+    fn exchange_views(&self, views: ops::moe::exchange::TransportViews) -> DispatchViews {
         let shape = self.shape;
-        ExchangeViews {
+        DispatchViews {
             transport: views.transport,
             ranks: shape.ranks,
             attention: shape.attention_ranks,
@@ -518,7 +518,7 @@ impl Member {
     pub fn recorded_views(
         &self,
         mut placeholder: impl FnMut(ops::DType, ops::Shape) -> Result<ops::TensorView>,
-    ) -> Result<ExchangeViews> {
+    ) -> Result<DispatchViews> {
         let [states, ids, weights, combined, live, packed, packed_scales] = self.shape.regions();
         let mut view = |(dtype, shape)| placeholder(dtype, shape);
         let views = ops::moe::exchange::TransportViews {

@@ -60,7 +60,7 @@ pub use linear::{
     Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, PACKED_M_CLASSES, Parallel, QkvBias, QkvLinear,
     QkvNames, QkvSpec, encode_block, packed_rows,
 };
-pub use moe::{ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
+pub use moe::{DispatchViews, ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
 pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{Epilogue, GroupNorm, LayerNorm, Modulation, ResidualStream, RmsNorm};
 pub use ops::activation::Activation;

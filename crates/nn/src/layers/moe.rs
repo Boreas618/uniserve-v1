@@ -21,6 +21,10 @@
 //! program selects the transport. A `Moe` layer built for a layout that does not hold every
 //! expert refuses the forward rather than computing a routing the weights do not have.
 
+mod dispatch;
+
+pub use dispatch::DispatchViews;
+
 use ops::activation::Activation;
 use ops::fp4::{Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
@@ -1136,7 +1140,7 @@ impl Moe {
 
     /// `out = Σ_routes weight · expert(hidden)` over this rank's experts and block.
     fn combine(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
-        if self.local != self.experts || f.exchange.is_some() {
+        if self.local != self.experts || f.dispatch.is_some() {
             return self.forward_expert_parallel(f, hidden, out);
         }
         let hidden_width = u64::from(self.hidden);
@@ -1531,7 +1535,7 @@ impl Moe {
         hidden: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        let exchange = f.exchange.ok_or_else(|| {
+        let exchange = f.dispatch.ok_or_else(|| {
             Error::shape(
                 "Moe",
                 "an expert-parallel block reads the group's exchange views, and the forward \
@@ -1635,7 +1639,7 @@ impl Moe {
     /// same dispatch on every rank. A rank with no batch of its own calls this: its experts serve the
     /// tokens routed to them and it sends none.
     pub fn join_expert_step(&self, f: &Forward) -> Result<()> {
-        let exchange = f.exchange.ok_or_else(|| {
+        let exchange = f.dispatch.ok_or_else(|| {
             Error::shape(
                 "Moe",
                 "a join reads the group's exchange views, and the forward borrows none".to_owned(),
@@ -1656,7 +1660,7 @@ impl Moe {
     fn exchange_routes(
         &self,
         f: &Forward,
-        exchange: &crate::exchange::ExchangeViews,
+        exchange: &DispatchViews,
         hidden: TensorView,
         sent: TensorView,
         weights: TensorView,
@@ -1838,7 +1842,7 @@ impl Moe {
     fn fused_routes(
         &self,
         f: &Forward,
-        exchange: &crate::exchange::ExchangeViews,
+        exchange: &DispatchViews,
         hidden: TensorView,
         sent: TensorView,
         weights: TensorView,
@@ -1925,7 +1929,7 @@ impl Moe {
     fn combine_routes(
         &self,
         f: &Forward,
-        exchange: &crate::exchange::ExchangeViews,
+        exchange: &DispatchViews,
         tokens: u32,
         out: TensorView,
     ) -> Result<()> {

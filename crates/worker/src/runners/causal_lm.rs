@@ -4979,7 +4979,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .and_then(super::experts::Member::views)
             .map(|views| views.at_rows(bucket.capacity));
         if let Some(views) = shaped.as_ref() {
-            forward = forward.with_exchange(views);
+            forward = forward.with_dispatch(views);
         }
         self.step(&forward, bucket)?;
         if runner_dump() {
@@ -5049,7 +5049,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             let views = shaped
                 .as_ref()
                 .ok_or_else(|| Error::Invariant("a join walked with no expert transport".into()))?;
-            let forward = walk.forward(None)?.with_exchange(views);
+            let forward = walk.forward(None)?.with_dispatch(views);
             return self.model.join_expert_step(&forward).map_err(Error::from);
         }
         match self.staging.staged() {
@@ -5062,7 +5062,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .forward(self.tensor.as_deref())?
             .with_live_tokens(self.columns.live_tokens.device);
         if let Some(views) = shaped.as_ref() {
-            forward = forward.with_exchange(views);
+            forward = forward.with_dispatch(views);
         }
         self.step(&forward, bucket)
     }
@@ -5140,7 +5140,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .and_then(super::experts::Member::views)
             .ok_or_else(|| Error::Invariant("a join walked with no expert transport".into()))?
             .at_rows(bucket.capacity);
-        let forward = Forward::new(&stream, generation, &arena).with_exchange(&views);
+        let forward = Forward::new(&stream, generation, &arena).with_dispatch(&views);
         self.model.join_expert_step(&forward).map_err(Error::from)?;
         if first {
             self.pool()?

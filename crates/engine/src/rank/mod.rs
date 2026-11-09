@@ -376,7 +376,7 @@ impl ModelRunner {
                 rank_runner.world_size = count;
                 if text {
                     // An attention rank holds the first rank's window and computes nothing with
-                    // it; `ExchangeViews::source_only` keeps it out of its forward.
+                    // it; `DispatchViews::source_only` keeps it out of its forward.
                     rank_runner.mapping.union_rank = index as u32;
                     rank_runner.mapping.attention_ranks = attention;
                     rank_runner.mapping.expert_parallel = expert_ranks;

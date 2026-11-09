@@ -8,7 +8,7 @@
 //! A model layer cannot build that transport: it may not create runtime objects, and the worker
 //! is the one that calls the package's creation entry. What travels through [`Forward`] is
 //! therefore only the views the transport wrote and the layer reads, lent by whoever owns them.
-//! The worker builds one [`ExchangeViews`] per device and group after loading the model, and
+//! The worker builds one [`DispatchViews`] per device and group after loading the model, and
 //! lends it on every forward of a block whose experts are split.
 //!
 //! [`Forward`]: crate::Forward
@@ -24,7 +24,7 @@ use ops::moe::exchange::ExchangeTransport;
 /// experts and writes its sums back, and never allocates or frees them. `hidden` and `top` describe
 /// one row of the received layout. `ranks x capacity` rows exist, and `live` states how many of them
 /// the running step holds, which the agreed capacity decides on the device.
-pub struct ExchangeViews {
+pub struct DispatchViews {
     /// The package's transport for this device and group.
     ///
     /// Opaque: the layer only hands it back to the exchange operator. Its lifetime belongs to the
@@ -67,7 +67,7 @@ pub struct ExchangeViews {
     pub meet: Arc<dyn Fn() -> crate::Result<()> + Send + Sync>,
 }
 
-impl ExchangeViews {
+impl DispatchViews {
     /// These views for a walk whose expert work holds `rows` rows per rank; zero keeps the whole
     /// capacity.
     #[must_use]
@@ -165,10 +165,10 @@ mod tests {
     use super::*;
     use crate::{DType, DevicePtr, Shape};
 
-    fn exchange(ranks: u32, capacity: u32, hidden: u64, top: u64) -> ExchangeViews {
+    fn exchange(ranks: u32, capacity: u32, hidden: u64, top: u64) -> DispatchViews {
         let rows = u64::from(ranks) * u64::from(capacity);
         let base = DevicePtr::new(0x1_0000);
-        ExchangeViews {
+        DispatchViews {
             transport: {
                 // SAFETY: the transport is opaque and never dereferenced by these tests; the null
                 // handle only stands in for a value the worker would build.

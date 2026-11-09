@@ -26,8 +26,8 @@ use ops::twins::Twins;
 use ops::{Generation, Op, Stream};
 
 use crate::error::{Error, Result};
-use crate::exchange::ExchangeViews;
 use crate::group::{self, Group, Transfer};
+use crate::layers::DispatchViews;
 use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 
 /// The alignment every arena reservation starts at.
@@ -243,8 +243,8 @@ pub struct Forward<'a> {
     /// The split a recording forward answers in place of a group's: the rank whose shapes the
     /// walk follows, and the member count.
     split: Option<Split>,
-    /// The expert exchange's received views, when the block's experts are split across ranks.
-    pub exchange: Option<&'a ExchangeViews>,
+    /// The expert-parallel dispatch's received views, when the block's experts are split across ranks.
+    pub dispatch: Option<&'a DispatchViews>,
     /// The operator this forward shadows, when it is a 7.3 comparison pass.
     pub shadow: Option<Shadow<'a>>,
     /// `[1]` i32: the token rows of this batch that are live, when the caller states them.
@@ -341,7 +341,7 @@ impl<'a> Forward<'a> {
             arena,
             group: None,
             split: None,
-            exchange: None,
+            dispatch: None,
             shadow: None,
             live_tokens: None,
             attention_probe: None,
@@ -365,7 +365,7 @@ impl<'a> Forward<'a> {
             arena,
             group: None,
             split: None,
-            exchange: None,
+            dispatch: None,
             shadow: None,
             live_tokens: None,
             attention_probe: None,
@@ -589,9 +589,9 @@ impl<'a> Forward<'a> {
         Ok(())
     }
 
-    /// The same forward over an expert exchange.
-    pub fn with_exchange(mut self, exchange: &'a ExchangeViews) -> Self {
-        self.exchange = Some(exchange);
+    /// The same forward over an expert-parallel dispatch.
+    pub fn with_dispatch(mut self, dispatch: &'a DispatchViews) -> Self {
+        self.dispatch = Some(dispatch);
         self
     }
 
