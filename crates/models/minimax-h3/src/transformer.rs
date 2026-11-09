@@ -2,7 +2,7 @@
 //!
 //! One `Transformer` is a checkpoint's DiT partition: a projection of each modality's patchified
 //! latent into the hidden width, the stack of dilated layers, and the output projections back to
-//! each modality's velocity (`uniserve/models/minimax_h3/transformer.py`). A layer is conditioned
+//! each modality's velocity. A layer is conditioned
 //! by the step's AdaLN rows - a modulated normalization of the attention's input, the attention, the
 //! gated residual into the feed-forward's normalization, and the feed-forward's own gated residual:
 //!
@@ -40,8 +40,8 @@ const TRANSFORMER_LAYER: &str = "models.minimax_h3.denoiser.TransformerLayer";
 /// The two halves of a packed `[value, gate]` projection, as strided views without a copy.
 ///
 /// The checkpoint fuses the feed-forward's value half first and its gate half second, and the
-/// reference projects it once and then reads `branches["up"]` and `branches["gate"]`
-/// (`transformer.py:141-153`). The stepwise activation takes the halves as separate operands, so
+/// reference projects it once and then reads `branches["up"]` and `branches["gate"]`.
+/// The stepwise activation takes the halves as separate operands, so
 /// they are views of the packed buffer: `value` at element zero, `gate` one half along, and both
 /// rows striding over the packed row.
 pub(crate) fn projection_halves(projection: TensorView) -> (TensorView, TensorView) {
@@ -67,8 +67,8 @@ pub(crate) fn projection_halves(projection: TensorView) -> (TensorView, TensorVi
 ///
 /// The width is the checkpoint's `rope_freq_dim`, not a constant of this module: the reference
 /// builds its rotary embedding as `RotaryEmbedding(2 * rope_frequency_dim)`
-/// (`uniserve/models/minimax_h3/denoiser.py:231`) and applies that one spectrum to each of the
-/// three coordinates (`attention.py:94-105`). Three is the model's own count: `position_ids` is
+/// and applies that one spectrum to each of the
+/// three coordinates. Three is the model's own count: `position_ids` is
 /// `[3, rows]`, one coordinate for time, height and width.
 pub fn rotated_axes(config: &TransformerConfig) -> [u32; 3] {
     [2 * config.rope_frequency_dim; 3]
@@ -81,8 +81,8 @@ pub struct Layer {
     attention: attention::Layer,
     gate_up: Linear,
     down: Linear,
-    /// The stepwise gated activation: the reference evaluates `silu(gate)` and the product
-    /// with one rounding each (`transformer.py:84-88`, `Rounding.STEPWISE`).
+    /// The stepwise gated activation (`GatedActivation::with_stepwise`): `silu(gate)` and the
+    /// product are evaluated with one rounding each.
     gated: GatedActivation,
     eps: f32,
 }
@@ -181,7 +181,7 @@ impl Layer {
         let residual = GatedResidual::new(gate_mlp)?;
         // Under Ulysses the attended rows return interval by interval, and what follows attention
         // reads a row alone, so an interval's output projection and feed-forward run while the
-        // later intervals travel (`uniserve/nn/attention/vsa/segments.py`).
+        // later intervals travel.
         if let (attention::Layer::Sparse(sparse), attention::LayerScratch::Sparse(views)) =
             (&self.attention, &scratch.attention)
             && sparse.exchanges()
@@ -307,7 +307,7 @@ impl Layer {
         // Feed-forward: the packed value and gate halves, the gated activation, the down
         // projection, and the second gated residual into the retained residual.
         self.gate_up.forward(f, normalized, packed)?;
-        // The reference's activation is stepwise here (`transformer.py:84-88`), so the packed
+        // The reference's activation is stepwise here, so the packed
         // projection is read as its two halves and gated with one rounding each - the video
         // decoder's SwiGLU is the same projection with the fused recipe, and that is why the
         // rounding is stated per site rather than per operator.
@@ -327,64 +327,13 @@ fn row_interval(view: TensorView, first: u64, count: u64) -> TensorView {
         .reshape(nn::Shape::new(&[count, width]))
 }
 
-/// One evaluation's selected layer outputs, as the caller's own diagnostic views.
-///
-/// The design's numeric diagnosis (`specs/worker.md` 10) compares one denoiser evaluation layer by
-/// layer. The model holds no host-to-device path and reads no environment, so the comparison's
-/// buffers are the caller's: this struct borrows them, and a forward with a `Trace` copies each
-/// named layer's packed output into its view. It is a diagnosis and never a gate: a forward with no
-/// `Trace` is byte-identical to the served one, because the copy is the only difference.
-pub struct Trace<'a> {
-    /// The layer indices to write, each below the stack's layer count.
-    pub layers: &'a [u32],
-    /// One `[tokens, hidden]` view per entry of `layers`, in the same order.
-    pub views: &'a [TensorView],
-    /// `[tokens]` int32 identities (`0..tokens`): the rows a copy of the output reads.
-    pub index: TensorView,
-}
-
-impl Trace<'_> {
-    /// Check the views against one forward's shape, so a mismatch is refused before the stack runs.
-    fn check(&self, layers: usize, tokens: u64, width: u64, dtype: nn::DType) -> Result<()> {
-        if self.layers.len() != self.views.len() {
-            return Err(Error::config(format!(
-                "the trace names {} layers and {} views",
-                self.layers.len(),
-                self.views.len()
-            )));
-        }
-        for (layer, view) in self.layers.iter().zip(self.views) {
-            if *layer as usize >= layers {
-                return Err(Error::config(format!(
-                    "the trace asks for layer {layer} of {layers}"
-                )));
-            }
-            if view.shape.dims() != [tokens, width] || view.dtype != dtype {
-                return Err(Error::Config(format!(
-                    "the trace's layer {layer} view is {:?} {}, [{tokens}, {width}] {dtype:?} \
-                     expected",
-                    view.shape.dims(),
-                    view.dtype
-                )));
-            }
-        }
-        if self.index.numel() != tokens {
-            return Err(Error::Config(format!(
-                "the trace's identity index covers {} rows and the pack has {tokens}",
-                self.index.numel()
-            )));
-        }
-        Ok(())
-    }
-}
-
 /// A parallel-decoding student's output heads, fused per evaluation block at load.
 ///
 /// A DMD/PDD student stacks one head per fine interval (`pdd_steps`, e.g. 32) and predicts one
-/// block's velocity from the weighted sum of its intervals' heads
-/// (`uniserve/diffusion/schedule.py:297-326`: weights and accumulation in FP32, rounded to the
-/// parameter's dtype). The fusion is arithmetic over the checkpoint's own numbers, so it is done
-/// once, on the host, at the loading boundary; what a forward does is pick one row.
+/// block's velocity from the weighted sum of its intervals' heads (weights and accumulation in
+/// FP32, rounded to the parameter's dtype). The fusion is arithmetic over the checkpoint's own
+/// numbers, so it is done once, on the host, at the loading boundary; what a forward does is pick
+/// one row.
 ///
 /// The table is laid out `[blocks, out * hidden]` so that one evaluation's head is **one table
 /// row**: `gather_rows` indexed by the worker's `step` view (`[1]` int32) gives `[1, out *
@@ -400,7 +349,7 @@ pub struct StudentHeads {
 struct FusedHeads {
     /// `[blocks, out * hidden]` FP32: block `b`'s fused weight.
     ///
-    /// FP32 because the reference builds a student's head FP32 (`transformer.py:307-311`): the fused
+    /// FP32 because the reference builds a student's head FP32: the fused
     /// row is a sum of the checkpoint's BF16 rows and rounding it back would round a number the
     /// reference keeps exact. The projection reads the widened FP32 rows (`Transformer::wide`), so
     /// its two operands are one type and the only rounding is the store into the velocity.
@@ -478,7 +427,7 @@ impl StudentHeads {
     /// `audio_proj_out` (`[output_heads * out, hidden]`, `[output_heads * out]`). Block `b`'s fused
     /// weight is `sum_n w[n] * head[start + n]` with `w` the block's normalized integration weights,
     /// the products and the sum in FP32, and the result rounded to the checkpoint's own type -
-    /// exactly `fuse_heads` (`uniserve/diffusion/schedule.py:297-326`). One derivation per block
+    /// exactly `fuse_heads`. One derivation per block
     /// per modality, once per load, published as a constant of the loader's store.
     pub fn fuse(
         source: &nn::Checkpoint,
@@ -601,7 +550,7 @@ impl FusedHeads {
 ///
 /// The stacked heads are `[heads * out, hidden]` and `[heads * out]`, head-major, so head `h`'s
 /// weight row `o` starts at `(h * out + o) * hidden` and its bias at `h * out + o`. The products and
-/// the sum stay FP32, and so does the table the caller stores them in (`transformer.py:307-311`).
+/// the sum stay FP32, and so does the table the caller stores them in.
 fn fuse_block(
     values: &[f32],
     biases: &[f32],
@@ -1066,8 +1015,8 @@ impl Transformer {
         let dtype = hidden.dtype;
         let normalized = arena.tensor(dtype, hidden.shape)?;
         norm.forward(f, hidden, None, rows, normalized, None, None)?;
-        // The final modulation is the checkpoint's own type (`modulation.py:62-75` multiplies the
-        // BF16 norm by the BF16 table), and the projection that follows is FP32 - so the widening is
+        // The final modulation is the checkpoint's own type (the BF16 norm times the BF16 table),
+        // and the projection that follows is FP32 - so the widening is
         // here, between them, and not inside the norm.
         let wide = self.wide(f, normalized)?;
         self.project_head(f, wide, modality, block, step, out)
@@ -1160,8 +1109,8 @@ impl Transformer {
     /// and every layer's operands are of it.
     ///
     /// The witness is a **block's** norm gain and not an end projection. Those four are pinned FP32
-    /// at every preset (`precision.py:106-117`), so `proj_in` reports the pin rather than the
-    /// stack: at `auto` a BF16 deployment would claim FP32, a harness would allocate FP32
+    /// at every preset, so `proj_in` reports the pin rather than the
+    /// stack: at `auto` a BF16 deployment would claim FP32, a caller would allocate FP32
     /// activations against BF16 blocks, and the sampler's first layer gemm would be the mixed pair
     /// this branch has already spent rounds removing (`input_f32_weight_bf16`). A block's gain is
     /// never pinned, so it is the deployment's type by construction.
@@ -1188,7 +1137,7 @@ impl Transformer {
         // tiles_bound`), and every layer that compresses reduces over it. Zero is legal only for a
         // dense stack, where nothing reads it: a sparse stack holding zero would hand `VsaTiles` a
         // bound of nothing, and the descriptor a plan reads would name a reduction over no tiles
-        // rather than refuse. A harness that passes zero for a sparse deployment is refused here
+        // rather than refuse. A caller that passes zero for a sparse deployment is refused here
         // instead of one layer later.
         if matches!(kind, AttentionKind::Sparse { .. }) && tile_bound == 0 {
             return Err(Error::config(
@@ -1227,11 +1176,11 @@ impl Transformer {
             .map(|index| Layer::load(kind, index, config, rows, tile_bound, partition, loader))
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            // **The four end projections are FP32 parameters at every preset**, because they are what
-            // touches the trajectory: `precision.py:106-117` pins `video_input`, `audio_input`,
-            // `video_output` and `audio_output` at FP32 whatever the attention, MLP and VAE tiers
-            // are. So the widening `wide` performs meets an FP32 weight and the product is FP32 on
-            // both sides, which is what makes the released BF16 stack run a FP32 sample at all.
+            // **The four end projections are FP32 parameters at every preset**, because they are
+            // what touches the trajectory: `video_input`, `audio_input`, `video_output` and
+            // `audio_output` are pinned at FP32 whatever the attention, MLP and VAE tiers are. So
+            // the widening `wide` performs meets an FP32 weight and the product is FP32 on both
+            // sides, which is what makes the released BF16 stack run a FP32 sample at all.
             proj_in: projection_with_bias(
                 loader,
                 "proj_in",
@@ -1278,11 +1227,10 @@ impl Transformer {
         })
     }
 
-
     /// The FP32 view an FP32 projection reads when `source` is not FP32 already.
     ///
     /// The reference builds all four of the transformer's end projections as FP32 parameters
-    /// (`transformer.py:366-372`, `:404-421`) and its `Linear` casts the activation up before the
+    /// and its `Linear` casts the activation up before the
     /// product, so the projection reads FP32 whatever the stack's own element type is. The
     /// checkpoint's weights need no conversion: a BF16 value is exactly representable in FP32, so a
     /// product of FP32 inputs against them is the same arithmetic as against widened FP32 weights -
@@ -1362,11 +1310,10 @@ impl Transformer {
         visible: Option<&Visible>,
         segments: Option<&Segments>,
         total_rows: u32,
-        trace: Option<&Trace<'_>>,
     ) -> Result<()> {
         f.fenced(TRANSFORMER, format_args!("transformer"), || {
             self.stack(
-                f, adaln, step, hidden, rows, factors, visible, segments, total_rows, trace,
+                f, adaln, step, hidden, rows, factors, visible, segments, total_rows,
             )
         })
     }
@@ -1384,7 +1331,6 @@ impl Transformer {
         visible: Option<&Visible>,
         segments: Option<&Segments>,
         total_rows: u32,
-        trace: Option<&Trace<'_>>,
     ) -> Result<()> {
         let groups = adaln.groups();
         let width = hidden.shape.last();
@@ -1409,9 +1355,6 @@ impl Transformer {
         let tables = [modulation, following];
         let per_layer = tables
             .map(|table| table.reshape(Shape::new(&[u64::from(groups.count()) * 3, 6 * width])));
-        if let Some(trace) = trace {
-            trace.check(self.layers.len(), tokens, width, hidden.dtype)?;
-        }
         let alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
         let scratch = Scratch::reserve(self, f, hidden, total_rows)?;
         adaln.layer(f, 0, entries, tables[0])?;
@@ -1436,13 +1379,6 @@ impl Transformer {
                     arrived,
                 )
             })?;
-            // A diagnosis reads the layer's packed output as it stands: the same rows the next
-            // layer reads, copied into the caller's view by an identity gather.
-            if let Some(trace) = trace
-                && let Some(position) = trace.layers.iter().position(|layer| *layer == index as u32)
-            {
-                nn::layers::gather_rows(f, hidden, trace.index, trace.views[position])?;
-            }
         }
         Ok(())
     }
@@ -1531,6 +1467,7 @@ fn gain(loader: &mut WeightLoader<'_>, name: &str, columns: u64) -> Result<Weigh
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// The stack states its programs from its configuration and its partition: one product, one
     /// output normalization, the three modulation gathers, the block's two modulated shapes, its
@@ -1727,16 +1664,6 @@ mod tests {
             "the bound the deployment states is the one the row names: {compress}"
         );
     }
-    use super::*;
-    use nn::DType;
-
-    fn view(tokens: u64, width: u64, dtype: DType) -> TensorView {
-        TensorView::new(nn::DevicePtr::new(0), dtype, Shape::new(&[tokens, width]))
-    }
-
-    fn index(tokens: u64) -> TensorView {
-        TensorView::new(nn::DevicePtr::new(0), DType::I32, Shape::new(&[tokens]))
-    }
 
     #[test]
     fn a_blocks_head_is_the_weighted_sum_of_its_stacked_heads() {
@@ -1785,77 +1712,5 @@ mod tests {
     fn a_head_type_the_host_fusion_cannot_read_is_refused() {
         assert!(host_f32(nn::DType::I32, &[0, 0, 0, 0], "test").is_err());
         assert!(host_bytes(nn::DType::I32, &[0.0]).is_err());
-    }
-
-    #[test]
-    fn a_trace_matching_the_forward_is_accepted() {
-        let views = [view(4, 8, DType::BF16), view(4, 8, DType::BF16)];
-        let trace = Trace {
-            layers: &[0, 49],
-            views: &views,
-            index: index(4),
-        };
-        assert!(trace.check(50, 4, 8, DType::BF16).is_ok());
-    }
-
-    #[test]
-    fn a_trace_of_another_shape_or_dtype_is_refused() {
-        let views = [view(4, 8, DType::BF16)];
-        assert!(
-            Trace {
-                layers: &[0],
-                views: &views,
-                index: index(4),
-            }
-            .check(50, 4, 9, DType::BF16)
-            .is_err(),
-            "a view of another width"
-        );
-        assert!(
-            Trace {
-                layers: &[0],
-                views: &views,
-                index: index(4),
-            }
-            .check(50, 4, 8, DType::F32)
-            .is_err(),
-            "a view of another dtype"
-        );
-    }
-
-    #[test]
-    fn a_trace_naming_a_layer_the_stack_does_not_have_is_refused() {
-        let views = [view(4, 8, DType::BF16)];
-        let trace = Trace {
-            layers: &[50],
-            views: &views,
-            index: index(4),
-        };
-        assert!(trace.check(50, 4, 8, DType::BF16).is_err());
-    }
-
-    #[test]
-    fn a_trace_whose_lists_disagree_or_whose_index_is_short_is_refused() {
-        let views = [view(4, 8, DType::BF16)];
-        assert!(
-            Trace {
-                layers: &[0, 1],
-                views: &views,
-                index: index(4),
-            }
-            .check(50, 4, 8, DType::BF16)
-            .is_err(),
-            "two layers, one view"
-        );
-        assert!(
-            Trace {
-                layers: &[0],
-                views: &views,
-                index: index(3),
-            }
-            .check(50, 4, 8, DType::BF16)
-            .is_err(),
-            "a short identity index"
-        );
     }
 }

@@ -48,7 +48,6 @@ impl Programs {
         self.rows.dedup();
         self.rows
     }
-
 }
 
 /// The element type of each component a deployment runs.
@@ -65,8 +64,7 @@ pub struct Types {
     pub transformer: nn::DType,
     /// The type the transformer's **boundary tensors** are stored in, where the checkpoint stores
     /// two: the four boundary projections and the timestep embedder's pair. Equal to
-    /// `transformer` on a checkpoint that stores one type, which is what
-    /// [`crate::load::boundary_dtype`] returning `None` means.
+    /// `transformer` on a checkpoint that stores one type.
     pub transformer_boundary: nn::DType,
     /// The video VAE, decoder and encoder.
     pub video: nn::DType,
@@ -157,7 +155,6 @@ impl Deployment {
             rungs,
         })
     }
-
 
     /// The tasks the checkpoint at `root` states it serves.
     ///

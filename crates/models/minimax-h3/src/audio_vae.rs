@@ -1,8 +1,7 @@
 //! H3's audio VAE decoder: BigVGAN's stage arithmetic, its alias-free activation, and the stereo PCM
 //! it ends in.
 //!
-//! `uniserve/models/minimax_h3/audio_vae.py` and diffusers'
-//! `autoencoders/autoencoder_kl_minimax_h3_audio.py` are the reference. The decoder is a
+//! Diffusers' `autoencoders/autoencoder_kl_minimax_h3_audio.py` is the reference. The decoder is a
 //! BigVGAN: a 1×1 input projection to `latent_dim`, a kernel-7 pre-convolution, seven transposed-conv
 //! upsampling stages (each followed by three anti-aliased multi-periodicity blocks whose outputs are
 //! summed and averaged), one alias-free activation, and a kernel-7 post-convolution to mono, clamped
@@ -12,21 +11,15 @@
 //!
 //! * the stage table a deployment builds from [`AudioVaeConfig`]: every convolution's channel pair,
 //!   rate, kernel and padding, so the layer stack and its weight names are derived, never transcribed;
-//! * the alias-free activation's length arithmetic ([`Resample`], [`Activation`]) — the two replicate
-//!   pads, the crop after the transposed convolution and the stride, which together map `length` to
-//!   `length · ratio` and back to `length`;
-//! * [`receptive_field`]: the latent frames of context one decoded sample needs on each side, which is
-//!   what the runner carries as a halo around a media window;
-//! * [`Pcm::quantize`]: the exact arithmetic of the `pcm_interleave` program, stated here so the
-//!   operator's implementation has one reference.
+//! * the decoder network itself ([`BigVgan`]), whose alias-free activations and stereo PCM step run
+//!   as fused `nn` layers.
 //!
 //! ## Precision
 //!
-//! The audio decoder is FP32 throughout (specs/worker.md 9; `precision.py` keeps it unquantized and
-//! unconverted). Its 135 weight-normalized convolutions are folded once at the loading boundary
-//! (`nn::WeightLoader::weight_norm`), so no layer carries the magnitude/direction pair, and its
-//! convolutions run through cuDNN without TF32: spec 9 keeps TF32 for the video VAE's FP32 `conv3d`
-//! alone.
+//! The audio decoder is FP32 throughout, unquantized and unconverted. Its 135 weight-normalized
+//! convolutions are folded once at the loading boundary (`nn::WeightLoader::weight_norm`), so no
+//! layer carries the magnitude/direction pair, and its convolutions run through cuDNN without TF32:
+//! TF32 is kept for the video VAE's FP32 `conv3d` alone.
 
 use crate::programs::Programs;
 use crate::{AudioVaeConfig, Error, Result};
@@ -105,132 +98,6 @@ pub fn stages(config: &AudioVaeConfig) -> Result<Vec<Stage>> {
     Ok(stages)
 }
 
-/// The alias-free resampler's geometry: one direction of the activation's two passes.
-///
-/// The upsample replicate-pads by `pad` on both sides, runs a transposed depthwise convolution of
-/// stride `ratio`, and crops `pad_left` samples from the front and `pad_right` from the end; the
-/// downsample replicate-pads the same way and runs a depthwise convolution of stride `ratio`. Both
-/// formulas are the reference's, and the operator refuses an output length they do not produce.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Resample {
-    /// The upsampling factor; 2 in the checkpoint.
-    pub ratio: u32,
-    /// The Kaiser-sinc filter's length; 12 in the checkpoint.
-    pub kernel: u32,
-    /// Samples replicate-padded on each side before the convolution.
-    pub pad: u32,
-    /// Samples cropped from the front after the transposed convolution.
-    pub pad_left: u32,
-    /// Samples cropped from the end after the transposed convolution.
-    pub pad_right: u32,
-}
-
-impl Resample {
-    /// The geometry of ratio `ratio` with a `kernel`-long filter.
-    ///
-    /// The reference states the three paddings once, for the upsampling direction; the downsampling
-    /// direction pads its own convolution's input, which is why [`Resample::upsample_length`] and
-    /// [`Resample::downsample_padding`] are separate.
-    pub fn new(ratio: u32, kernel: u32) -> Result<Self> {
-        if ratio == 0 || kernel == 0 {
-            return Err(Error::config(
-                "a resampler needs a positive ratio and kernel".to_owned(),
-            ));
-        }
-        if kernel < ratio || !kernel.is_multiple_of(ratio) {
-            return Err(Error::config(format!(
-                "a {kernel}-long filter does not divide a rate of {ratio}"
-            )));
-        }
-        Ok(Self {
-            ratio,
-            kernel,
-            pad: kernel / ratio - 1,
-            pad_left: (kernel / ratio - 1) * ratio + (kernel - ratio) / 2,
-            pad_right: (kernel / ratio - 1) * ratio + (kernel - ratio).div_ceil(2),
-        })
-    }
-
-    /// The output length of the upsampling direction for `length` input samples.
-    ///
-    /// The transposed convolution of a `length + 2·pad` input, stride `ratio` and kernel `kernel`
-    /// emits `(length + 2·pad − 1)·ratio + kernel`, and the crop removes `pad_left + pad_right`; the
-    /// two cancel to `length · ratio` for the kernel this constructor admits.
-    pub fn upsample_length(&self, length: u32) -> u32 {
-        (u64::from(length) * u64::from(self.ratio)) as u32
-    }
-
-    /// The samples the upsampling direction's transposed convolution emits before the crop.
-    pub fn transposed_length(&self, length: u32) -> u32 {
-        (u64::from(length) + 2 * u64::from(self.pad) - 1) as u32 * self.ratio + self.kernel
-    }
-
-    /// The padding of the downsampling direction's convolution: `[pad_left, pad_right]`.
-    pub fn downsample_padding(&self) -> (u32, u32) {
-        let even = self.kernel.is_multiple_of(2);
-        let left = self.kernel / 2 - u32::from(even);
-        (left, self.kernel / 2)
-    }
-
-    /// The output length of the downsampling direction for `length` input samples.
-    pub fn downsample_length(&self, length: u32) -> u32 {
-        let (left, right) = self.downsample_padding();
-        let padded = u64::from(length) + u64::from(left) + u64::from(right);
-        // `conv1d` with stride `ratio` and no padding: `⌊(padded − kernel)/ratio⌋ + 1`.
-        ((padded - u64::from(self.kernel)) / u64::from(self.ratio) + 1) as u32
-    }
-}
-
-/// The alias-free activation: upsample, activate, low-pass back down.
-///
-/// The activation's length is unchanged; the operator that runs it fuses the five passes (pad,
-/// transposed depthwise convolution, crop, SnakeBeta, pad, depthwise convolution) into one program
-/// (specs/worker.md 9, the BigVGAN row).
-///
-/// The passes, exactly (`autoencoder_kl_minimax_h3_audio.py`, `MiniMaxH3AudioActivation1d`):
-///
-/// 1. replicate-pad the track by [`Resample::pad`] on each side;
-/// 2. `ratio` times a depthwise transposed convolution of stride `ratio` with the Kaiser-sinc
-///    upsampling filter (`cutoff 0.5/ratio`, `half_width 0.6/ratio`) — the `ratio` factor is part of
-///    the result, not of the length, and a program that drops it is off by that factor;
-/// 3. crop [`Resample::pad_left`] from the front and [`Resample::pad_right`] from the end;
-/// 4. the activation itself: `x + (exp(beta) + 1e-9)^-1 * sin(exp(alpha) * x)^2` per channel, with
-///    `alpha` and `beta` stored in log space (the DAC encoder's `Snake` is the same formula with a
-///    single `alpha` and no exponentiation, which is why the two are not one layer);
-/// 5. replicate-pad by [`Resample::downsample_padding`] and run a depthwise convolution of stride
-///    `ratio` with the same Kaiser-sinc filter.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Activation {
-    /// The upsampling factor of both passes.
-    pub ratio: u32,
-    /// The Kaiser-sinc filter's length.
-    pub kernel: u32,
-}
-
-impl Activation {
-    /// The activation of `ratio` and `kernel`.
-    pub fn new(ratio: u32, kernel: u32) -> Result<Self> {
-        Resample::new(ratio, kernel)?;
-        Ok(Self { ratio, kernel })
-    }
-
-    /// The activation of the checkpoint's decoder: ratio 2, kernel 12.
-    pub fn bigvgan() -> Self {
-        Self {
-            ratio: 2,
-            kernel: 12,
-        }
-    }
-
-    /// The output length for `length` input samples, which is `length` itself.
-    ///
-    /// Stated as the two passes so that [`Resample`]'s arithmetic is the only place the formulas live.
-    pub fn length(&self, length: u32) -> Result<u32> {
-        let up = Resample::new(self.ratio, self.kernel)?;
-        Ok(up.downsample_length(up.upsample_length(length)))
-    }
-}
-
 /// The samples one latent frame decodes to.
 pub fn samples_per_latent(config: &AudioVaeConfig) -> u32 {
     config.decoder_hop()
@@ -250,88 +117,6 @@ pub fn latent_frames(config: &AudioVaeConfig, samples: u32) -> Result<u32> {
 /// The samples a latent frame count decodes to.
 pub fn track_samples(config: &AudioVaeConfig, latent_frames: u32) -> u64 {
     u64::from(latent_frames) * u64::from(samples_per_latent(config))
-}
-
-/// The latent frames of context one decoded sample depends on, per side.
-///
-/// This is the reference `receptive_field`: it walks the decoder in forward order, tracking how far
-/// one output sample's dependency spreads, with the residual branches of a stage running in parallel
-/// (so a stage contributes its widest branch, not their sum) and each alias-free activation spreading
-/// its own upsample, filter and low-pass. The result rounds up and may exceed the exact field, which
-/// costs context and never correctness — it is the halo the runner carries around a media window.
-pub fn receptive_field(config: &AudioVaeConfig) -> Result<u32> {
-    let stages = stages(config)?;
-    if config.resblock_kernel_sizes.len() != config.resblock_dilation_sizes.len() {
-        return Err(Error::config(format!(
-            "the audio decoder has {} residual kernels and {} dilation lists",
-            config.resblock_kernel_sizes.len(),
-            config.resblock_dilation_sizes.len()
-        )));
-    }
-    let activation = Activation::bigvgan();
-    let mut spread = 0.0f64;
-    let mut rate = 1.0f64;
-
-    // A convolution's spread is `(kernel − 1) · dilation / rate` output samples at the current rate.
-    let convolution = |kernel: u32, dilation: u32, rate: f64| -> f64 {
-        let width = f64::from(kernel) - 1.0;
-        width * f64::from(dilation) / rate
-    };
-    // One alias-free activation spreads its upsampled convolution and its low-pass, at the current
-    // rate: the reference computes the first pass with `ceil` because the crop only takes whole
-    // samples.
-    let activation_spread = |rate: f64| -> f64 {
-        let up = (f64::from(activation.kernel) / f64::from(activation.ratio)).ceil() - 1.0;
-        up / rate + (f64::from(activation.kernel) - 1.0) / (rate * f64::from(activation.ratio))
-    };
-
-    spread += convolution(7, 1, rate);
-    for stage in &stages {
-        spread += (f64::from(stage.kernel) / f64::from(stage.rate)).ceil() / rate - 1.0 / rate;
-        rate *= f64::from(stage.rate);
-        let mut widest = 0.0f64;
-        for (kernel, dilations) in config
-            .resblock_kernel_sizes
-            .iter()
-            .zip(&config.resblock_dilation_sizes)
-        {
-            let mut branch = 0.0f64;
-            for &dilation in dilations {
-                branch += activation_spread(rate) + convolution(*kernel, dilation, rate);
-                branch += activation_spread(rate) + convolution(*kernel, 1, rate);
-            }
-            widest = widest.max(branch);
-        }
-        spread += widest;
-    }
-    spread += activation_spread(rate) + convolution(7, 1, rate);
-
-    // The spread covers both sides of one dependency, so one side is half, rounded up.
-    Ok((spread / 2.0).ceil() as u32)
-}
-
-/// The arithmetic of the stereo PCM the audio decoder ends in.
-///
-/// The reference converts `[stereo, samples]` float waveforms to `[samples, 2]` `int16`:
-/// `clamp(x, −1, 1) · 32767`, `torch.round` (half to even), then the integer cast. `pcm_interleave`
-/// states the same thing on the device; this is the one reference an implementation is checked
-/// against.
-pub struct Pcm;
-
-impl Pcm {
-    /// The full-scale sample value: the scale the reference multiplies by.
-    pub const FULL_SCALE: f32 = 32767.0;
-
-    /// One sample's PCM value.
-    ///
-    /// `x` is clamped to [-1, 1] first, so the result never leaves `[-32767, 32767]` and the cast is
-    /// total.
-    pub fn quantize(x: f32) -> i16 {
-        let clamped = x.clamp(-1.0, 1.0) * Self::FULL_SCALE;
-        // `f32::round_ties_even` is `torch.round`'s rule; a value that is not finite cannot leave the
-        // clamp, so the cast is defined.
-        clamped.round_ties_even() as i16
-    }
 }
 
 /// Every buffer one audio decode takes from `Forward::arena()`, in reservation order.
@@ -440,7 +225,7 @@ pub enum Tensor {
     Region(String),
     /// A weight-normalized convolution: `value` holds the weight's extents and `gain` one magnitude
     /// per output channel. `nn::WeightLoader::weight_norm` folds the pair once at load, so no layer
-    /// below carries it (specs/worker.md 9, the BigVGAN row).
+    /// below carries it.
     Normalized {
         /// The key of the direction tensor (`weight_v`).
         value: String,
@@ -662,56 +447,6 @@ pub fn blocks(config: &AudioVaeConfig) -> Result<Vec<Block>> {
     Ok(blocks)
 }
 
-/// One buffer of the decoder's forward: the samples and channels it holds.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Workspace {
-    /// The stage the buffer belongs to: 0 is the input projection and the pre-convolution, `i + 1` is
-    /// the output of stage `i`, and the last entry is the decoder's single output channel.
-    pub stage: u32,
-    /// Samples the buffer holds.
-    pub samples: u32,
-    /// Channels the buffer holds.
-    pub channels: u32,
-}
-
-impl Workspace {
-}
-
-/// The buffers one decode of `latent_frames` needs, in the order the stages run.
-///
-/// The reference decodes a track's whole latent timeline at once, so the runner sizes these from the
-/// request; a window shorter than the track carries the halo [`receptive_field`] states on each side.
-pub fn workspace(config: &AudioVaeConfig, latent_frames: u32) -> Result<Vec<Workspace>> {
-    if latent_frames == 0 {
-        return Err(Error::config(
-            "an audio decode of no latent frame has no workspace".to_owned(),
-        ));
-    }
-    let stages = stages(config)?;
-    let mut buffers = vec![Workspace {
-        stage: 0,
-        samples: latent_frames,
-        channels: config.latent_dim,
-    }];
-    let mut samples = latent_frames;
-    for (index, stage) in stages.iter().enumerate() {
-        samples = samples
-            .checked_mul(stage.rate)
-            .ok_or_else(|| Error::config("the audio track's length overflows".to_owned()))?;
-        buffers.push(Workspace {
-            stage: index as u32 + 1,
-            samples,
-            channels: stage.channels_out,
-        });
-    }
-    buffers.push(Workspace {
-        stage: stages.len() as u32 + 1,
-        samples,
-        channels: 1,
-    });
-    Ok(buffers)
-}
-
 /// The latent statistics the decoder inverts before its first convolution.
 ///
 /// A generated audio latent is normalized per channel; the decoder restores it with
@@ -752,21 +487,6 @@ impl Statistics {
             mean: config.latents_mean.clone(),
             std: config.latents_std.clone(),
         })
-    }
-
-    /// Restore one channel's value: `value * std + mean`.
-    ///
-    /// The reference of the affine the decoder's input stage applies; a kernel that folds it into the
-    /// input projection's epilogue must agree with it.
-    pub fn denormalize(&self, channel: usize, value: f32) -> Result<f32> {
-        let mean = *self.mean.get(channel).ok_or_else(|| {
-            Error::config(format!(
-                "channel {channel} of {} audio latent channels",
-                self.mean.len()
-            ))
-        })?;
-        let std = self.std[channel];
-        Ok(value * std + mean)
     }
 }
 
@@ -1072,7 +792,7 @@ impl BigVgan {
     ///
     /// The two rows of the latent are the stereo pair the reference decodes; both hold the same latent,
     /// so the network's two output rows are equal and [`PcmInterleave`] writes them interleaved. Every
-    /// intermediate is FP32 — `specs/worker.md` 9's audio rows keep no reduced precision — and the
+    /// intermediate is FP32 — the audio decoder keeps no reduced precision — and the
     /// length grows only through the stages' transposed convolutions, so `samples` is `frames · Π rates`.
     pub fn forward(&self, f: &Forward, latents: TensorView, out: TensorView) -> Result<()> {
         let shape = latents.shape;
@@ -1693,11 +1413,14 @@ pub(crate) mod tests {
         let config = audio_config();
         let mut ours = BigVgan::keys(&config).expect("the decoder's keys");
         ours.sort_unstable();
-        let fixture: Vec<&str> = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/audio-decoder-names.txt"))
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .collect();
+        let fixture: Vec<&str> = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/audio-decoder-names.txt"
+        ))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
         assert_eq!(fixture.len(), 914, "the recorded export's decoder half");
         let missing: Vec<&str> = fixture
             .iter()
@@ -1983,42 +1706,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_alias_free_activation_keeps_its_length() {
-        let activation = Activation::bigvgan();
-        assert_eq!(activation.ratio, 2);
-        assert_eq!(activation.kernel, 12);
-        for length in [1u32, 2, 7, 40, 1000, 4000] {
-            assert_eq!(
-                activation.length(length).expect("a length"),
-                length,
-                "length {length}"
-            );
-        }
-        let resample = Resample::new(2, 12).expect("the checkpoint's resampler");
-        assert_eq!(resample.pad, 5);
-        assert_eq!(resample.pad_left, 15);
-        assert_eq!(resample.pad_right, 15);
-        assert_eq!(resample.transposed_length(40), 110);
-        assert_eq!(resample.upsample_length(40), 80);
-        assert_eq!(resample.downsample_padding(), (5, 6));
-        assert_eq!(resample.downsample_length(80), 40);
-    }
-
-    #[test]
-    fn a_resampler_refuses_a_kernel_its_ratio_does_not_divide() {
-        assert!(Resample::new(2, 11).is_err());
-        assert!(Resample::new(1, 12).is_ok());
-        assert!(Resample::new(0, 12).is_err());
-        assert!(Activation::new(3, 4).is_err());
-    }
-
-    #[test]
-    fn the_receptive_field_is_the_references_thirty_latent_frames() {
-        // Computed from the reference `receptive_field`: spread 58.31 output samples, one side 30.
-        assert_eq!(receptive_field(&audio_config()).expect("field"), 30);
-    }
-
-    #[test]
     fn the_restoring_convolution_is_the_diagonal_of_the_deviations() {
         let config = crate::audio_vae::tests::audio_config();
         let statistics = Statistics::of(&config).expect("the statistics");
@@ -2041,22 +1728,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_latent_statistics_restore_a_channel() {
+    fn latent_statistics_of_the_wrong_count_or_a_zero_deviation_are_refused() {
         let config = audio_config();
         let statistics = Statistics::of(&config).expect("the statistics");
         assert_eq!(statistics.mean.len(), 32);
         assert_eq!(statistics.std.len(), 32);
-        // A zero latent restores the channel's mean; a unit latent the mean plus its deviation.
-        assert_eq!(
-            statistics.denormalize(0, 0.0).expect("a value"),
-            statistics.mean[0]
-        );
-        assert_eq!(
-            statistics.denormalize(0, 1.0).expect("a value"),
-            statistics.mean[0] + statistics.std[0]
-        );
-        // A channel the statistics do not hold is refused rather than read past the end.
-        assert!(statistics.denormalize(32, 0.0).is_err());
         // A sidecar with the wrong counts, or a zero deviation, is refused at the boundary.
         let mut broken = config.clone();
         broken.latents_mean.pop();
@@ -2064,26 +1740,6 @@ pub(crate) mod tests {
         let mut broken = config.clone();
         broken.latents_std[3] = 0.0;
         assert!(Statistics::of(&broken).is_err());
-    }
-
-    #[test]
-    fn the_workspace_grows_to_one_stereo_track() {
-        let config = audio_config();
-        let buffers = workspace(&config, 1).expect("workspace");
-        // One latent frame is 800 samples: the projection's own buffer, one per stage and the mono
-        // output. The pre-convolution shares the projection's width, so it needs no buffer of its own.
-        assert_eq!(buffers.len(), 1 + 7 + 1);
-        assert_eq!(buffers[0].samples, 1);
-        assert_eq!(buffers[0].channels, 2048);
-        let samples: Vec<u32> = buffers.iter().map(|buffer| buffer.samples).collect();
-        assert_eq!(samples, vec![1, 5, 25, 50, 100, 200, 400, 800, 800]);
-        let channels: Vec<u32> = buffers.iter().map(|buffer| buffer.channels).collect();
-        assert_eq!(channels, vec![2048, 512, 256, 128, 64, 32, 16, 8, 1]);
-        // A whole second of audio is forty latent frames and 32000 samples.
-        let buffers = workspace(&config, 40).expect("workspace");
-        assert_eq!(buffers.last().expect("the output").samples, 32000);
-        assert_eq!(buffers.last().expect("the output").channels, 1);
-        assert!(workspace(&config, 0).is_err());
     }
 
     #[test]
@@ -2188,18 +1844,5 @@ pub(crate) mod tests {
                 gain: "decoder.conv_pre.weight_g".to_owned(),
             }
         );
-    }
-
-    #[test]
-    fn pcm_rounds_half_to_even_and_clamps() {
-        assert_eq!(Pcm::quantize(0.0), 0);
-        assert_eq!(Pcm::quantize(1.0), 32767);
-        assert_eq!(Pcm::quantize(-1.0), -32767);
-        assert_eq!(Pcm::quantize(2.0), 32767);
-        assert_eq!(Pcm::quantize(-2.0), -32767);
-        // 0.5 / 32767 lies halfway between 0 and 1: to even is 0; 1.5 / 32767 rounds to 2.
-        assert_eq!(Pcm::quantize(0.5 / Pcm::FULL_SCALE), 0);
-        assert_eq!(Pcm::quantize(1.5 / Pcm::FULL_SCALE), 2);
-        assert_eq!(Pcm::quantize(2.5 / Pcm::FULL_SCALE), 2);
     }
 }

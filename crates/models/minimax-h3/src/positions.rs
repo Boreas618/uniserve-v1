@@ -1,42 +1,29 @@
 //! The host-side position tables of the text encoder and its vision tower.
 //!
 //! Every table here is a function of the *request*, not of a step: the prompt's token ids and the
-//! grids of its condition media decide them once, before the encode is captured or replayed
-//! (specs/worker.md 4.3, 9). The worker's encoder runner calls these functions when it prepares a
-//! request and uploads the results into the views [`crate::text_encoder`] reads; the model crate
-//! itself owns no device storage and copies nothing (`AGENTS.md`, Model Library Boundary).
+//! grids of its condition media decide them once, before the encode is captured or replayed. The
+//! worker's encoder runner calls these functions when it prepares a request and uploads the results
+//! into the views [`crate::text_encoder`] reads; the model crate itself owns no device storage and
+//! copies nothing (`AGENTS.md`, Model Library Boundary).
 //!
 //! Four kinds of table are derived:
 //!
-//! - the language layers' interleaved M-RoPE coordinates ([`rope_index`], `uniserve/models/`
-//!   `qwen3_vl/positions.py`) and their FP32 factors ([`Mrope::factors`]);
+//! - the language layers' interleaved M-RoPE coordinates ([`rope_index`]), whose factors the device
+//!   computes from the uploaded positions under the [`Mrope`] cut;
 //! - the vision tower's 2-D rotary coordinates of a patch grid in merge-block order
 //!   ([`rotary_coordinates`]) and their factors ([`VisionRotary::factors`]);
 //! - the learned position table's bilinear sample of each merged patch ([`position_samples`]), the
-//!   indices and FP32 weights of the four table rows a merged row blends
-//!   (`uniserve/nn/vision/position.py::PositionEmbedding.interpolate`);
+//!   indices and FP32 weights of the four table rows a merged row blends;
 //! - the vision tower's attention lengths ([`vision_lengths`]: one bidirectional sequence per
-//!   temporal patch of every grid) and the row of the vision feature table each prompt placeholder
-//!   takes ([`placeholder_rows`]).
+//!   temporal patch of every grid) and the prompt row each merged vision row takes
+//!   ([`vision_destinations`]).
 //!
-//! The arithmetic is the reference's, in its order and precision: frequencies and factors in FP32,
+//! The arithmetic is Qwen3-VL's, in its order and precision: frequencies and factors in FP32,
 //! positions as integers, and the position table's sample coordinates on an FP32 `linspace` whose
 //! step is computed in FP32 (`torch.linspace` over a float32 scalar type).
 
 use crate::{Error, Result};
 
-/// The largest number of position axes a sectioned rotation reads.
-///
-/// The text encoder uses three (temporal, height, width); a fourth is room for a model that adds a
-/// modality axis, as `ops::rope::MAX_AXES` does.
-pub const MAX_AXES: usize = 4;
-
-/// The interleaved M-RoPE sections of the language layers.
-///
-/// The checkpoint states `mrope_section: [24, 20, 20]` and `mrope_interleaved: true`: the head's
-/// compact frequency `j` rotates by the coordinate of axis `j % 3` while `j < 24 * 3`, and axis 0
-/// takes every remaining frequency (`uniserve/nn/rope.py::_interleaved_axes`). Each axis therefore
-/// receives exactly its section width and keeps frequencies from the whole spectrum.
 /// The table rows one bilinear sample reads: four, the corners of one cell.
 pub const POSITION_TAPS: u64 = 4;
 
@@ -44,6 +31,11 @@ pub const POSITION_TAPS: u64 = 4;
 pub type PositionSamples = (Vec<[i32; 4]>, Vec<[f32; 4]>);
 
 /// The M-RoPE cut of a head's rotation: one width per axis, interleaved.
+///
+/// The checkpoint states `mrope_section: [24, 20, 20]` and `mrope_interleaved: true`: the head's
+/// compact frequency `j` rotates by the coordinate of axis `j % 3` while `j < 24 * 3`, and axis 0
+/// takes every remaining frequency (`ops::rope::interleaved_axes`). Each axis therefore receives
+/// exactly its section width and keeps frequencies from the whole spectrum.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Mrope {
     widths: [u32; 3],
@@ -87,74 +79,15 @@ impl Mrope {
     pub const fn widths(self) -> [u32; 3] {
         self.widths
     }
-
-
-    /// The position axis of every compact frequency, in frequency order.
-    ///
-    /// Interleaved M-RoPE cycles the axes: frequency `j` reads axis `j % 3` while
-    /// `j < widths[axis] * 3`, and axis 0 otherwise. With H3's `[24, 20, 20]` the bound is 72 for
-    /// all 64 frequencies, so every frequency is interleaved.
-    ///
-    /// The result is the per-column table the factor computation reads: `rope_index` gives one
-    /// coordinate per axis per token and this table names the axis each column takes.
-    pub fn frequency_axes(self) -> Vec<u32> {
-        let count = 3;
-        (0..self.head_dim / 2)
-            .map(|frequency| {
-                let axis = frequency % count;
-                if frequency < self.widths[axis as usize] * count {
-                    axis
-                } else {
-                    0
-                }
-            })
-            .collect()
-    }
-
-    /// The FP32 factors of `positions`, written into `cosine` and `sine`.
-    ///
-    /// `positions` is one `[temporal, height, width]` coordinate per token; `frequencies` is the
-    /// checkpoint's `inv_freq` table, one angle per compact frequency (`inverse_frequencies` of
-    /// `head_dim`). Both tables are `[tokens, head_dim / 2]` row-major.
-    ///
-    /// This is the host evaluation the numeric diagnosis compares against; a served forward
-    /// computes the same factors on the device from the uploaded positions
-    /// (`ops::rope::RotaryFactors` with the interleaved section rule).
-    pub fn factors(
-        self,
-        positions: &[[i64; 3]],
-        frequencies: &[f32],
-        cosine: &mut [f32],
-        sine: &mut [f32],
-    ) -> Result<()> {
-        let columns = (self.head_dim / 2) as usize;
-        check_factors(
-            "Mrope::factors",
-            positions.len(),
-            columns,
-            frequencies,
-            cosine,
-            sine,
-        )?;
-        let axes = self.frequency_axes();
-        for (token, position) in positions.iter().enumerate() {
-            for frequency in 0..columns {
-                let angle = position[axes[frequency] as usize] as f32 * frequencies[frequency];
-                cosine[token * columns + frequency] = angle.cos();
-                sine[token * columns + frequency] = angle.sin();
-            }
-        }
-        Ok(())
-    }
 }
 
 /// The vision tower's 2-D rotary embedding: half of each head by the patch row, half by its column.
 ///
 /// The reference builds one `RotaryEmbedding` of `head_dim / 2` **without sections** and calls it
-/// with two coordinates per patch (`uniserve/models/qwen3_vl/vision.py`), so the embedding
+/// with two coordinates per patch, so the embedding
 /// evaluates the whole `head_dim / 4`-frequency spectrum at each coordinate:
 /// `cos[p, a · (head_dim / 4) + f] = cos(coordinate(a) · inv_freq(f))`
-/// (`uniserve/nn/rope.py::RotaryEmbedding._factors` over a `[patches, 2]` position). Each axis
+/// over a `[patches, 2]` position. Each axis
 /// therefore repeats the same frequency band rather than owning a distinct one, which is why a
 /// sectioned `rotary_factors` call cannot produce these tables: its `sections` give every axis its
 /// own band (the contiguous cut) or interleave one band per axis (`_interleaved_axes`), and neither
@@ -176,7 +109,6 @@ impl VisionRotary {
         }
         Ok(Self { head_dim })
     }
-
 
     /// The compact frequencies one axis repeats: `head_dim / 4`.
     pub const fn per_axis(self) -> u32 {
@@ -252,11 +184,11 @@ pub fn inverse_frequencies(dim: u32, theta: f32) -> Result<Vec<f32>> {
 ///
 /// Every maximal run of [`Mrope`] placeholders is one vision block and consumes the next grid of
 /// its kind: `image_grids` for a run of `image_token_id`, `video_grids` for a run of
-/// `video_token_id` (`uniserve/models/qwen3_vl/positions.py::rope_index`). A video grid
+/// `video_token_id`. A video grid
 /// `(time, height, width)` covers `time` runs of one time step each, because Qwen3-VL presents
 /// every temporal patch of a video behind its own text timestamp.
 ///
-/// The reference is `uniserve/models/qwen3_vl/positions.py:21-149` (`rope_index`).
+/// This is Qwen3-VL's `rope_index`.
 ///
 /// Text advances all three axes together from the running origin. A block of grid `(t, h, w)` has
 /// `t * (h/merge) * (w/merge)` merged tokens; the token at merged coordinates `(i, j, k)` takes
@@ -370,29 +302,9 @@ pub fn rope_index(
     Ok(positions)
 }
 
-/// The row of the vision feature table each prompt placeholder takes, `-1` for a text token.
-///
-/// The vision tower emits its merged tokens in grid order, one block after another, and the
-/// prompt's placeholder run for a block holds exactly its merged tokens in that order
-/// (`uniserve/models/qwen3_vl/encoder.py`): the `k`-th placeholder of the prompt takes row `k` of
-/// the concatenated feature table.
-pub fn placeholder_rows(ids: &[u32], image_token_id: u32, video_token_id: u32) -> Vec<i32> {
-    let mut row: i32 = -1;
-    ids.iter()
-        .map(|id| {
-            if *id == image_token_id || *id == video_token_id {
-                row += 1;
-                row
-            } else {
-                -1
-            }
-        })
-        .collect()
-}
-
 /// The prompt position of every merged vision row, in prompt order.
 ///
-/// The inverse of [`placeholder_rows`], and the table the row operator reads
+/// The table the row operator reads
 /// (`ops::rows`: `destination[indices[j]] = source[j]`, `indices` `[count] i32`, `count` the number
 /// of source rows). Entry `k` is the prompt row the `k`-th merged vision row takes, so the prompt's
 /// placeholders are visited in the order the tower emits its tokens and a text row never appears.
@@ -408,8 +320,7 @@ pub fn vision_destinations(ids: &[u32], image_token_id: u32, video_token_id: u32
 ///
 /// A merging encoder serializes a `height x width` patch grid block by block: the `merge x merge`
 /// patches of each block, blocks in raster order, and the patches of a block in raster order, so a
-/// merged token reads `merge**2` consecutive patch rows
-/// (`uniserve/nn/vision/position.py::merged_grid_coordinates`).
+/// merged token reads `merge**2` consecutive patch rows.
 pub fn merged_coordinates(height: u32, width: u32, merge: u32) -> Result<(Vec<u32>, Vec<u32>)> {
     if merge == 0
         || height == 0
@@ -458,8 +369,7 @@ pub fn rotary_coordinates(height: u32, width: u32, merge: u32) -> Result<Vec<[i6
 /// The table is a `side x side` grid of learned rows; a `height x width` patch grid samples it with
 /// its corners aligned: patch row `i` reads table row `i * (side - 1) / (height - 1)` (an FP32
 /// `linspace`), and likewise for columns. Each patch blends its four neighbouring table rows with
-/// FP32 bilinear weights (`uniserve/nn/vision/position.py:167-200`,
-/// `PositionEmbedding.interpolate`).
+/// FP32 bilinear weights, as Qwen3-VL's learned position embedding interpolates its table.
 ///
 /// Returns, per patch row (in merge-block order), the four table row indices of the top-left,
 /// top-right, bottom-left and bottom-right neighbours and their weights. A device kernel blends the
@@ -534,30 +444,11 @@ fn grid_samples(extent: u32, size: u32) -> Result<Vec<(i32, i32, f32)>> {
         .collect())
 }
 
-/// The number of merged rows one grid's patches form: `time * h * w / merge**2`.
-pub fn merged_rows(time: u32, height: u32, width: u32, merge: u32) -> Result<u32> {
-    let patches = (time as u64)
-        .checked_mul(height as u64)
-        .and_then(|value| value.checked_mul(width as u64))
-        .ok_or_else(|| invalid("merged_rows", "the patch count overflows".to_owned()))?;
-    let block = (merge as u64) * (merge as u64);
-    if merge == 0 || patches % block != 0 {
-        return Err(invalid(
-            "merged_rows",
-            format!(
-                "{patches} patches of a {time}x{height}x{width} grid are not whole {merge}x{merge} blocks"
-            ),
-        ));
-    }
-    u32::try_from(patches / block)
-        .map_err(|_| invalid("merged_rows", "the merged row count overflows".to_owned()))
-}
-
 /// The attention lengths of one image's patch sequences: `time + 1` packed offsets.
 ///
 /// The vision tower never attends across a time step: each temporal patch of a grid is one
-/// bidirectional sequence of `height * width` patches
-/// (`uniserve/models/qwen3_vl/vision.py::VisionTower`), so the offsets are
+/// bidirectional sequence of `height * width` patches,
+/// so the offsets are
 /// `[0, hw, 2 hw, …, time hw]`. They are the `cu_seq_lens_q` and `cu_seq_lens_k` of the tower's
 /// dense attention, and the rows are the patches in grid order.
 pub fn vision_lengths(time: u32, height: u32, width: u32) -> Result<Vec<i32>> {
@@ -582,24 +473,6 @@ pub(crate) fn invalid(owner: &str, problem: impl Into<String>) -> Error {
         "{owner}: {}",
         problem.into()
     ))))
-}
-
-/// Check two factor tables against `rows` tokens and `columns` frequencies.
-fn check_factors(
-    owner: &'static str,
-    tokens: usize,
-    columns: usize,
-    frequencies: &[f32],
-    cosine: &[f32],
-    sine: &[f32],
-) -> Result<()> {
-    if frequencies.len() != columns {
-        return Err(invalid(
-            owner,
-            format!("{} frequencies for {columns} columns", frequencies.len()),
-        ));
-    }
-    check_len(owner, tokens, columns, cosine, sine)
 }
 
 /// Check that a factor table holds `rows * columns` values.
@@ -652,13 +525,13 @@ mod tests {
 
     #[test]
     fn interleaved_sections_cycle_their_axes() {
+        // The device's rule takes the section widths in rotated elements, two per frequency.
         let sections = mrope();
-        let axes = sections.frequency_axes();
         let widths = sections.widths();
+        let axes = ops::rope::interleaved_axes(&widths.map(|width| width * 2));
         assert_eq!(axes.len(), 64);
         // Each axis owns exactly its section's width of frequencies, counted from the whole
-        // spectrum: the reference's rule (`uniserve/nn/rope.py::_interleaved_axes`) gives every
-        // axis its stated count and no axis a contiguous block.
+        // spectrum: every axis takes its stated count and no axis a contiguous block.
         let mut owned = [0_usize; 3];
         for axis in &axes {
             owned[*axis as usize] += 1;
@@ -680,7 +553,7 @@ mod tests {
         // A narrower first section pushes the frequencies it cannot hold onto axis 0: with
         // `[16, 24, 24]` the bound of axis 0 is 48, so 48 itself falls back while 49 and 50 do not.
         let narrow = Mrope::new([16, 24, 24], HEAD_DIM).expect("sections");
-        let axes = narrow.frequency_axes();
+        let axes = ops::rope::interleaved_axes(&narrow.widths().map(|width| width * 2));
         assert_eq!(axes[48], 0);
         assert_eq!(axes[49], 1);
         assert_eq!(axes[50], 2);
@@ -767,28 +640,7 @@ mod tests {
             vision_destinations(&ids, IMAGE_TOKEN, VIDEO_TOKEN),
             vec![1, 3, 4, 6]
         );
-        // The two directions agree: the k-th placeholder takes row k, so inverting the destination
-        // list through the placeholder map returns the rows in order.
-        let rows = placeholder_rows(&ids, IMAGE_TOKEN, VIDEO_TOKEN);
-        let destinations = vision_destinations(&ids, IMAGE_TOKEN, VIDEO_TOKEN);
-        let mut next = 0;
-        for (token, row) in rows.iter().enumerate() {
-            if *row >= 0 {
-                assert_eq!(destinations[*row as usize], token as i32);
-                next += 1;
-            }
-        }
-        assert_eq!(next, destinations.len());
         assert!(vision_destinations(&[1, 2, 3], IMAGE_TOKEN, VIDEO_TOKEN).is_empty());
-    }
-
-    #[test]
-    fn placeholders_number_the_vision_rows() {
-        let ids = [5, IMAGE_TOKEN, 6, VIDEO_TOKEN, VIDEO_TOKEN, 7];
-        assert_eq!(
-            placeholder_rows(&ids, IMAGE_TOKEN, VIDEO_TOKEN),
-            vec![-1, 0, -1, 1, 2, -1]
-        );
     }
 
     #[test]
@@ -876,31 +728,7 @@ mod tests {
     }
 
     #[test]
-    fn mrope_factors_read_their_axis_coordinates() {
-        let sections = mrope();
-        let frequencies = inverse_frequencies(HEAD_DIM, THETA).expect("frequencies");
-        let positions = [[0, 0, 0], [1, 2, 3]];
-        let mut cosine = vec![0.0; 128];
-        let mut sine = vec![0.0; 128];
-        sections
-            .factors(&positions, &frequencies, &mut cosine, &mut sine)
-            .expect("factors");
-        // Frequency 0 reads the temporal axis, frequency 1 the height, frequency 2 the width.
-        let second = 64;
-        assert!((cosine[second] - 1.0f32.cos()).abs() < 1e-7);
-        assert!((cosine[second + 1] - (2.0f32 * frequencies[1]).cos()).abs() < 1e-7);
-        assert!((sine[second + 2] - (3.0f32 * frequencies[2]).sin()).abs() < 1e-7);
-        assert!(
-            sections
-                .factors(&positions, &frequencies[..63], &mut cosine, &mut sine)
-                .is_err()
-        );
-    }
-
-    #[test]
     fn one_sequence_per_temporal_patch() {
         assert_eq!(vision_lengths(2, 4, 6).unwrap(), vec![0, 24, 48]);
-        assert_eq!(merged_rows(2, 4, 6, 2).unwrap(), 12);
-        assert!(merged_rows(1, 3, 6, 2).is_err());
     }
 }

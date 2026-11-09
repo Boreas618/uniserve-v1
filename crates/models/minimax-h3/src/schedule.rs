@@ -11,7 +11,7 @@
 //!
 //! ## The arithmetic
 //!
-//! The formulas are the released ones (`uniserve/diffusion/schedule.py`), evaluated in the same
+//! The formulas are the released ones, evaluated in the same
 //! precision so the host-side sequences agree with them:
 //!
 //! ```text
@@ -103,9 +103,9 @@ impl Schedule {
     /// the clean endpoint `0`.
     ///
     /// Consecutive equal FP32 values collapse into one point, as the released grid's
-    /// `unique_consecutive` does (`schedule.py:140-146`) - a uniform grid's strong shift can produce
+    /// `unique_consecutive` does - a uniform grid's strong shift can produce
     /// them and its point count is a statement, not a count of evaluations. A **DMD ladder** is not
-    /// deduplicated by the reference (`schedule.py:154-174`): its rungs are one evaluation each and
+    /// deduplicated by the reference: its rungs are one evaluation each and
     /// its length must equal the fused per-step head tables' count, so collapsing two rungs would
     /// silently misalign every step's heads.
     pub fn sigmas(&self, modality: Modality) -> Vec<f32> {
@@ -155,12 +155,12 @@ impl Schedule {
 
     /// The level a draw is scaled to before the first evaluation, when the grid asks for one.
     ///
-    /// **Only a parallel-decoding (`PddGrid`) schedule scales its draw** - `denoiser.py:1103-1112`
-    /// multiplies the patched state by `sigmas[0]` exactly when `isinstance(config.schedule,
-    /// PddGrid)`, and the released and distilled grids start from unit noise. Gating on the grid's
-    /// kind and not on the number matters: a distilled grid's first sigma is also below one
-    /// (`max_t` is 0.999), so a value test would scale a draw the reference leaves alone - a 0.1%
-    /// offset in the initial sample of every distilled request, which no shape and no type refuses.
+    /// **Only a parallel-decoding (`PddGrid`) schedule scales its draw** - the patched state is
+    /// multiplied by `sigmas[0]` exactly when the schedule is a `PddGrid`, and the released and
+    /// distilled grids start from unit noise. Gating on the grid's kind and not on the number
+    /// matters: a distilled grid's first sigma is also below one (`max_t` is 0.999), so a value
+    /// test would scale a draw the reference leaves alone - a 0.1% offset in the initial sample of
+    /// every distilled request, which no shape and no type refuses.
     ///
     /// `None` means the draw is the start: either the level is exactly one, or the grid does not
     /// scale at all.
@@ -303,7 +303,7 @@ fn ladder_sigmas(rungs: &[u32], num_train_timesteps: f64, shift: f64) -> Vec<f32
         .map(|rung| shifted(f64::from(*rung) / num_train_timesteps, shift) as f32)
         .collect();
     sigmas.push(0.0);
-    // Not deduplicated: the reference keeps one sigma per trained rung (`schedule.py:154-174`), and
+    // Not deduplicated: the reference keeps one sigma per trained rung, and
     // a collapsed rung would leave the schedule with fewer evaluations than the checkpoint has head
     // tables. Only the uniform grid collapses equal points.
     sigmas
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn a_dmd_ladder_keeps_one_evaluation_per_rung_though_two_round_together() {
         // Two rungs one part in a billion apart under a strong shift collapse to one FP32 sigma. The
-        // reference keeps both (`schedule.py:154-174`): a ladder's length is its evaluations, and it
+        // reference keeps both: a ladder's length is its evaluations, and it
         // must match the checkpoint's fused per-step head tables, so a collapse would misalign every
         // step. The rungs descend, as a ladder's must - the collapse is in the shifted sigmas, not in
         // the rungs.

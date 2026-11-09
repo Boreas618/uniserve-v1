@@ -5,7 +5,7 @@
 //! normalization gains and the rotary embedding of the head, and one attention. The trailing
 //! channels of every head pass the rotation unchanged: H3 rotates 96 of each head's 128 channels
 //! over the (time, height, width) coordinates, 16 frequencies per axis, interleaved
-//! (`uniserve/models/minimax_h3/attention.py`, [`crate::packing`]'s coordinates).
+//! ([`crate::packing`]'s coordinates).
 //!
 //! ## The partition
 //!
@@ -22,11 +22,11 @@
 //!
 //! ## The two attention kinds
 //!
-//! [`Kind::Dense`] attends every used row of the packed sequence: the queries are this rank's rows
+//! [`Layer::Dense`] attends every used row of the packed sequence: the queries are this rank's rows
 //! and the keys are the request's used rows, both named by device boundary tables, so a padding row
-//! is no key. [`Kind::Sparse`] is FastH3's video sparse attention over the segment packing; it is
-//! composed from `nn::layers::VsaTiles` and `nn::layers::SegmentAttention` and lands with them
-//! (see `crate::transformer`'s note on the sparse preset).
+//! is no key. [`Layer::Sparse`] is FastH3's video sparse attention over the segment packing
+//! ([`crate::attention_sparse`]), composed from `nn::layers::VsaTiles` and
+//! `nn::layers::SegmentAttention`.
 //!
 //! ## Precision
 //!
@@ -35,7 +35,7 @@
 //! table; nothing here declares an FP32 attention and no layer casts to one. The sparse path's
 //! **compression** branch is the other row: the design requires FP32 there (cuBLASLt SGEMM plus a
 //! softmax program), and the reference computes its tile means, scores and weighting in FP32
-//! throughout (`uniserve/nn/attention/vsa/segments.py:60-77`, `:429-468`), so that branch declares
+//! throughout, so that branch declares
 //! FP32 when it lands - in its layer's dtype and in this doc - while the fine sparse attention over
 //! the prepared rows stays in the checkpoint's dtype like the dense one.
 
@@ -46,8 +46,8 @@ use ops::gemm::WeightOrder;
 
 use crate::config::TransformerConfig;
 use crate::partition::Partition;
-use nn::family::Projection;
 use crate::{Error, Result};
+use nn::family::Projection;
 
 /// A query, key, value or gate projection, as one rank's attention reads it: this rank's heads of
 /// every row of the sequence.
@@ -207,15 +207,6 @@ impl HeadsToRows {
         let strides = [local as i64, (members * local) as i64, local as i64, 1];
         Ok(CopyBlock::new(out.dtype)?.forward_wide(f, source, destination, &strides)?)
     }
-}
-
-/// Which attention a checkpoint's block composes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Kind {
-    /// Full bidirectional attention over the packed sequence: the base release and `fl2va`.
-    Dense,
-    /// Video sparse attention over the segment packing: FastH3's DMD students.
-    Sparse,
 }
 
 /// One layer's attention, of whichever kind its checkpoint composes.
@@ -697,14 +688,13 @@ fn heads(view: TensorView, count: u32, head_dim: u32) -> Shape {
 /// The rotary frequency table of `rotated` channels: one spectrum, repeated once per axis.
 ///
 /// The reference builds `RotaryEmbedding(2 * rope_frequency_dim, theta=...)` and hands it **one
-/// axis spanning the whole head** (`uniserve/models/minimax_h3/attention.py:94-105`,
-/// `axis_dims=(self.head_dim,)`), so the same `rope_frequency_dim` frequencies are evaluated at each
-/// of the three coordinate axes and the factors of the axes are three contiguous blocks of one
-/// table (`uniserve/nn/rope.py:355-380` builds `[axes, tokens, dim / 2]`, and the model flattens it
-/// to `[tokens, 3 * rope_frequency_dim]`). A single spectrum spread over all `rotated` channels
-/// instead gives the second and third axes frequencies that differ from the reference's by a
-/// constant factor of `theta^(-1/3)` and `theta^(-2/3)` at every pair - a slow phase drift with
-/// position, and not a mistake any shape or dtype check can see.
+/// axis spanning the whole head**, so the same `rope_frequency_dim` frequencies are evaluated at
+/// each of the three coordinate axes and the factors of the axes are three contiguous blocks of one
+/// table (`[axes, tokens, dim / 2]`, flattened to `[tokens, 3 * rope_frequency_dim]`). A single
+/// spectrum spread over all `rotated` channels instead gives the second and third axes frequencies
+/// that differ from the reference's by a constant factor of `theta^(-1/3)` and `theta^(-2/3)` at
+/// every pair - a slow phase drift with position, and not a mistake any shape or dtype check can
+/// see.
 ///
 /// The table is a constant of the checkpoint's rope parameters, published through the loader like
 /// any other weight, so the operator reads it as a device weight.
@@ -740,16 +730,15 @@ fn frequencies(
 
 /// The factor table of `axes` coordinate axes: one spectrum of `pairs` frequencies, repeated.
 ///
-/// The spectrum is the reference's `RotaryEmbedding(2 * pairs)` inverse frequency
-/// (`uniserve/nn/rope.py:294-306`: `theta ** (arange(0, dim, 2) / dim)`, `dim = 2 * pairs`,
-/// inverted), and the repetition is its flattening of `[axes, tokens, dim / 2]` factors into
-/// `[tokens, axes * dim / 2]` (`:355-380` and `attention.py:94-105`): pair `a * pairs + i` is the
-/// `i`-th frequency of axis `a`, so every axis rotates with the same spectrum and the axes occupy
-/// contiguous blocks.
+/// The spectrum is the reference's `RotaryEmbedding(2 * pairs)` inverse frequency (`theta **
+/// (arange(0, dim, 2) / dim)`, `dim = 2 * pairs`, inverted), and the repetition is its flattening
+/// of `[axes, tokens, dim / 2]` factors into `[tokens, axes * dim / 2]`: pair `a * pairs + i` is
+/// the `i`-th frequency of axis `a`, so every axis rotates with the same spectrum and the axes
+/// occupy contiguous blocks.
 ///
 /// Public because it is a host statement a comparison can read: the spectrum and the axes' order
 /// are the two facts a rotation can have wrong while every shape, type and count stays right, and
-/// only a table compares them (`tools/compare_rope_factors.py --dit`).
+/// only a table compares them.
 pub fn table(pairs: u32, axes: u32, theta: f32) -> Vec<f32> {
     let spectrum: Vec<f32> = (0..pairs)
         .map(|index| {
@@ -799,7 +788,7 @@ mod tests {
     /// Every coordinate axis rotates with the same spectrum, in its own contiguous block.
     ///
     /// The reference hands its rotary one axis spanning the whole head and flattens the three
-    /// axes' factors into one table (`uniserve/nn/rope.py:355-380`), so a table whose blocks differ
+    /// axes' factors into one table, so a table whose blocks differ
     /// would rotate the height and width coordinates with the wrong frequencies - which is a phase
     /// drift with position, not a shape or dtype error.
     #[test]

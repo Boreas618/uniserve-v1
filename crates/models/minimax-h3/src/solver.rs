@@ -1,8 +1,8 @@
 //! The denoiser's solver: one Euler step of a diffusion trajectory per evaluation.
 //!
 //! A network evaluates a velocity at a noise level; the solver advances the sample from that level
-//! to the next. MiniMax-H3 uses the released clean-sample Euler solver
-//! (`uniserve/diffusion/solver.py::CleanSampleEulerSolver`), whose two statements
+//! to the next. MiniMax-H3 uses the released clean-sample Euler solver,
+//! whose two statements
 //!
 //! ```text
 //! clean = 1 - timestep                  # = sigma, rounded to the sample's dtype
@@ -38,11 +38,11 @@
 //! `scaled_residual` reads its residual and its update in one element type. The released denoiser
 //! predicts in FP32 over a trajectory it keeps in the sample's own type, so that the Euler
 //! arithmetic stays FP32 and only the store rounds. This model instead declares the output heads'
-//! precision as the latents' type (specs/worker.md 9, the `torch.autocast` row: each layer declares
-//! its precision), so the trajectory and the velocity agree in type, the arithmetic inside the
+//! precision as the latents' type (each layer declares its precision rather than inheriting an
+//! autocast region), so the trajectory and the velocity agree in type, the arithmetic inside the
 //! operator is FP32, and the store rounds once per step. The difference from the released pipeline
-//! is one rounding per step of the velocity; it is inside the operator's tolerance (specs/worker.md
-//! 7.3) and is the `quality` preset's own representation.
+//! is one rounding per step of the velocity; it is inside the operator's tolerance and is the
+//! `quality` preset's own representation.
 
 use nn::layers::ScaledResidual;
 use nn::weights::{Weight, WeightLoader};
@@ -167,7 +167,7 @@ impl Solver {
     /// **The direction is the solver's, not a rumour of it.** The released network predicts a
     /// velocity pointing from the sample towards its clean end, and the released step advances the
     /// sample along the *time* the network reads, `x += v · (t_next - t)` with `t = 1 - sigma`
-    /// (`uniserve/diffusion/solver.py`, `CleanSampleEulerSolver`: `clean = 1 - timestep = sigma`,
+    /// (the clean-sample Euler step: `clean = 1 - timestep = sigma`,
     /// `x' = x·r + (v·sigma + x)·(1 - r) = x + (sigma - sigma_next)·v`, `r = sigma_next / sigma`).
     /// The interval is therefore positive on a descending trajectory, and the last one is the
     /// schedule's own final sigma: the last step lands the sample on its clean estimate.
@@ -372,7 +372,7 @@ mod tests {
         // The released grid starts at unit noise and needs no launch.
         assert_eq!(base().start_sigma(Modality::Video).expect("a level"), None);
         // And a distilled grid's first sigma is also below one, so the kind decides and not the
-        // number: the reference scales a `PddGrid`'s draw alone (`denoiser.py:1103-1112`).
+        // number: the reference scales a `PddGrid`'s draw alone.
         let distilled = dmd();
         assert!(distilled.sigmas(Modality::Video)[0] < 1.0);
         assert_eq!(

@@ -1,7 +1,7 @@
 //! The H3 video VAE decoder: its raster and tile arithmetic, and the numerical model that decodes one
 //! clip of latents into RGB frames.
 //!
-//! `uniserve/models/minimax_h3/video_vae.py` is the reference. The decoder is a non-causal ViT: one
+//! The decoder is a non-causal ViT: one
 //! latent voxel becomes one token, four learned register tokens and one zero token trail the voxels,
 //! and each token expands into a patch of RGB. `post_quant_conv` projects the latent channels, 36
 //! transformer layers attend over the whole token sequence, and the output projection writes
@@ -13,17 +13,17 @@
 //! * the arithmetic that turns a raster into token counts ([`Canvas`]) and a canvas into its
 //!   overlapping decode tiles ([`Tiles`], [`Seams`]) — the same `split_tiles` the reference runs, so a
 //!   tile's extent and every seam's overlap are host values a captured bucket can be planned from;
-//! * the per-layer composition and the element type each layer declares (specs/worker.md 9:
-//!   `torch.autocast` is replaced by a declaration, not by an implicit conversion).
+//! * the per-layer composition and the element type each layer declares (`torch.autocast` is
+//!   replaced by a declaration, not by an implicit conversion).
 //!
 //! ## Precision
 //!
 //! The reference runs this decoder under `torch.autocast(dtype=FP16)` with the checkpoint's weights
-//! converted per `precision.py`, and what autocast does to each operation is the table below. Every
-//! row is stated in code here, and no conversion happens that a row does not name. `dtype = "auto"`
-//! still decides everything this table does not: the parameters it lists as stored stay in the
-//! checkpoint's own representation, which is FP32. This is the model's own declaration, so it takes
-//! no preset and no switch.
+//! converted per its precision preset, and what autocast does to each operation is the table below.
+//! Every row is stated in code here, and no conversion happens that a row does not name. `dtype =
+//! "auto"` still decides everything this table does not: the parameters it lists as stored stay in
+//! the checkpoint's own representation, which is FP32. This is the model's own declaration, so it
+//! takes no preset and no switch.
 //!
 //! ```text
 //! latents, the restored latents        FP32        (`latents.float() * std + mean`)
@@ -60,7 +60,7 @@ use crate::{Error, Result, VideoVaeConfig};
 /// A clip's native output is the 17-frame body, the three frames the final clip drops and the
 /// five-frame tail — 25 frames — and the decoder emits `temporal_compression` frames per latent frame,
 /// so it reads `ceil(25 / 4) = 7` latent frames and trims the three it does not keep. The reference
-/// states the seven directly (`decoding.py`, `clip_input`); it is derived here so a checkpoint whose
+/// states the seven directly; it is derived here so a checkpoint whose
 /// clip, drop or compression differs cannot silently decode the wrong span.
 pub fn decode_latents(config: &VideoVaeConfig) -> u32 {
     let native = config.clip_length + config.token_drop + crate::decoding::OVERLAP_FRAMES;
@@ -206,7 +206,6 @@ impl Seams {
         self.starts.len()
     }
 
-
     /// The latent span of tile `index`: `(first, end)` in latent cells, end exclusive, over a raster
     /// whose extent is `raster` **output pixels** (the same unit `split` was given).
     pub fn latent(&self, index: usize, raster: u32, ratio: u32) -> (u32, u32) {
@@ -343,7 +342,7 @@ pub fn rotary(config: &VideoVaeConfig) -> Result<(u32, [u32; 3])> {
 /// The cell-centre rotary coordinates of the transformer's token rows, as `[3, rows]` FP32.
 ///
 /// Along an axis of `size`, row `i` sits at `2 * (i + 0.5) / size - 1`, in `[-1, 1)`: the reference's
-/// cell-centre grid (`video_vae.py`, `Transformer.forward`). The rows are the canvas's latent voxels in
+/// cell-centre grid. The rows are the canvas's latent voxels in
 /// raster order — frame, then row, then column — followed by the register tokens and the trailing zero
 /// token, whose coordinates are all zero because they are not placed in space.
 ///
@@ -387,9 +386,9 @@ pub fn positions(canvas: &Canvas) -> Result<Vec<f32>> {
 /// rotary call; the frequency table here is the raw inverse frequencies, so the angle comes out as
 /// `2π · position · frequency` with the `2π` folded into the table the runner uploads.
 fn axis(index: u32, size: u32) -> f32 {
-    // The reference's own arithmetic: the cell centre and the `2π` turn are both float32
-    // (`video_vae.py:583-600`, whose meshgrid is float32 and whose caller multiplies by `2π` in the
-    // same type), so one rounding stands between the reference and this table rather than two.
+    // The reference's own arithmetic: the cell centre and the `2π` turn are both float32 (its
+    // meshgrid is float32 and its caller multiplies by `2π` in the same type), so one rounding
+    // stands between the reference and this table rather than two.
     let centre = (index as f32 + 0.5) / size as f32;
     std::f32::consts::TAU * (2.0 * centre - 1.0)
 }
@@ -1268,14 +1267,12 @@ fn indices(
 /// The decoder's inverse frequencies, in the order its factors are laid out.
 ///
 /// One block per axis, each over that axis's own width: the reference builds its embedding with
-/// `head_dim · ratio / 3` and reuses those frequencies on all three axes (`video_vae.py:547-549`,
-/// `uniserve/nn/rope.py:355-380`), so axis `a` takes `theta^(-2k / sections[a])` rather than a slice
-/// of one wider spectrum.
+/// `head_dim · ratio / 3` and reuses those frequencies on all three axes, so axis `a` takes
+/// `theta^(-2k / sections[a])` rather than a slice of one wider spectrum.
 ///
 /// This is the table the decoder publishes as `video_vae.rotary.{rotated}.{theta}` and the one a
 /// factors comparison reads: a wrong spectrum or a wrong axis order is a phase drift that no shape,
-/// element type or key check can see, so the numbers have to be comparable without a device
-/// (`examples/vae_rope.rs`, `tools/compare_rope_factors.py --vae`).
+/// element type or key check can see, so the numbers have to be comparable without a device.
 pub fn inverse_frequencies(config: &VideoVaeConfig) -> Result<Vec<f32>> {
     let (rotated, sections) = rotary(config)?;
     let mut table = Vec::new();
@@ -1333,8 +1330,6 @@ impl VideoDecoder {
         table_bytes_into(&self.config, latent_height, latent_width, out)
     }
 
-
-
     /// The rasters this decoder serves: the deployment's canvases, every one of them.
     ///
     /// The constants a decode reads are a **tile's** (its register and zero-row offsets, its sequence
@@ -1343,7 +1338,6 @@ impl VideoDecoder {
     pub fn canvases(&self) -> &[Canvas] {
         &self.canvases
     }
-
 
     /// The largest of this clip's decode tiles: every tile of a served grid has its rows.
     pub fn largest_tile(&self, canvas: &Canvas) -> Result<Canvas> {
@@ -1446,7 +1440,7 @@ impl VideoDecoder {
         self.input.forward(f, scratch.rounded, scratch.projected)?;
 
         // A tile's sequence is its voxels in the order they arrive, then the register rows, then the
-        // zero row (`video_vae.py`, `Transformer.forward`: `cat((hidden, registers, zeros))`), so a
+        // zero row (`cat((hidden, registers, zeros))`), so a
         // voxel's token row is its own index within the tile. The voxels widen into the stream here:
         // that `cat` is what promotes the stream to FP32.
         let stream = scratch.stream;
@@ -1896,7 +1890,7 @@ pub(crate) mod tests {
     use super::*;
 
     /// A tile's sequence is its voxels in the order they arrive, then the trailing rows
-    /// (`video_vae.py`: `cat((hidden, registers, zeros))`), so a voxel's token row is its own index
+    /// (`cat((hidden, registers, zeros))`), so a voxel's token row is its own index
     /// within the tile: the position table and the stitch read the same row. The projected voxels
     /// therefore widen straight into the stream's leading rows, tile by tile, and only the register
     /// rows and the zero row are placed. Scattering the voxels through the denoiser's patch rows sent
@@ -2578,7 +2572,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// The dense checkpoint's video VAE config: the sidecar's numbers (specs/worker.md 9, `vae/config.json`).
+    /// The dense checkpoint's video VAE config: the sidecar's numbers (`vae/config.json`).
     pub(crate) fn video_config() -> VideoVaeConfig {
         let sidecar = serde_json::json!({
             "in_channels": 3,
@@ -2642,7 +2636,7 @@ pub(crate) mod tests {
         assert_eq!(count("dense_attention"), 1, "{programs:?}");
     }
 
-    /// `specs/worker.md`'s table replaces `torch.autocast` with a declaration per layer, and these rows
+    /// The precision table replaces `torch.autocast` with a declaration per layer, and these rows
     /// are that declaration: the stream and everything that reads or writes it wide says so in its key,
     /// and everything else is the activation's type. A row in a type nobody declared would be a layer
     /// silently computing in it, which is the behaviour the design removed.

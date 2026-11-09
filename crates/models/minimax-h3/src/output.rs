@@ -1,6 +1,6 @@
 //! What the H3 decoders hand the media stage: the RGB raster and the stereo PCM.
 //!
-//! `uniserve/models/minimax_h3/output.py` is the reference. The video decoder emits normalized RGB
+//! The video decoder emits normalized RGB
 //! per channel; the output stage restores it with `value * std + mean` — the ImageNet constants — then
 //! clamps it to [0, 1] and quantizes it to one byte per channel. The audio decoder emits samples in
 //! [-1, 1]; the output stage clamps and quantizes them to 16-bit integers. Both are the media stage's
@@ -18,8 +18,8 @@
 //! `[samples, 2]` **int16**, interleaved stereo: left then right, one pair per sample. The decoder's
 //! transforms are channel-major (`[2, channels, length]` inside a stage, and `[2, length]` for the mono
 //! signal the last step reads); its final step, `pcm_interleave`, quantizes each sample and interleaves
-//! the two channels into this layout, which is why no caller transposes. [`crate::audio_vae::Pcm`]
-//! states the quantization and the scale.
+//! the two channels into this layout, which is why no caller transposes. A sample quantizes to
+//! `clamp(x, -1, 1) · 32767`, rounded half to even.
 //!
 //! ## The overlap
 //!
@@ -47,9 +47,6 @@ pub const PIXEL_MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 
 /// The one byte per channel the video raster stores.
 pub const BYTE_MAX: f32 = 255.0;
-
-/// The one integer step of the audio raster: a sample of `1.0` quantizes to it.
-pub const PCM_MAX: f32 = 32767.0;
 
 /// The extents of one request's video raster, and the bytes it occupies.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -90,11 +87,6 @@ impl Rgb {
             * u64::from(Self::CHANNELS)
     }
 
-    /// The frames the decoder's own workspace holds: the longest clip, the last, which keeps its tail.
-    pub const fn workspace_frames() -> u32 {
-        25
-    }
-
     /// The extent of one overlap block, `[channels, OVERLAP_FRAMES, height, width]` as the decoder
     /// keeps it between clips.
     pub fn overlap_elements(&self) -> u64 {
@@ -103,60 +95,7 @@ impl Rgb {
             * u64::from(self.height)
             * u64::from(self.width)
     }
-
-    /// One normalized pixel's three bytes, the reference's arithmetic.
-    ///
-    /// `value * std + mean` per channel, clamped to [0, 1], scaled to 255, rounded half to even, and
-    /// truncated to a byte. This is the reference of the operator the output stage runs; a kernel
-    /// that computes it must agree with it on every input, including the ties a half-even round
-    /// resolves away from zero.
-    pub fn quantize(&self, normalized: [f32; 3]) -> [u8; 3] {
-        let mut bytes = [0u8; 3];
-        for (channel, value) in normalized.iter().enumerate() {
-            let restored = value * PIXEL_STD[channel] + PIXEL_MEAN[channel];
-            let clamped = restored.clamp(0.0, 1.0);
-            bytes[channel] = (clamped * BYTE_MAX).round_ties_even() as u8;
-        }
-        bytes
-    }
 }
-
-/// The extents of one request's audio raster.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Pcm {
-    /// Sample frames of the track.
-    pub samples: u32,
-}
-
-impl Pcm {
-    /// Interleaved channels: left and right.
-    pub const CHANNELS: u32 = 2;
-
-    /// The raster of `samples` sample frames.
-    pub const fn of(samples: u32) -> Self {
-        Self { samples }
-    }
-
-    /// The integers the raster holds: one per channel per sample.
-    pub fn elements(&self) -> u64 {
-        u64::from(self.samples) * u64::from(Self::CHANNELS)
-    }
-
-    /// The bytes the raster occupies, two per integer.
-    pub fn bytes(&self) -> u64 {
-        self.elements() * 2
-    }
-
-    /// One sample's integer: clamped to [-1, 1], scaled by 32767 and rounded half to even.
-    ///
-    /// The same arithmetic [`crate::audio_vae::Pcm::quantize`] states for the decoder's output
-    /// stage; the two must agree on every input.
-    pub fn quantize(&self, sample: f32) -> i16 {
-        (sample.clamp(-1.0, 1.0) * PCM_MAX).round_ties_even() as i16
-    }
-}
-
-
 
 /// One clip's position in the timeline, as the output stage reads it.
 ///
@@ -204,12 +143,12 @@ impl Splice {
 
 /// The video postprocessor: one clip's decoded frames into the request's bytes.
 ///
-/// `output.py:43-70` and `models/decoder.py:356-620` are the reference, and this is the step the design
-/// puts at the component's second entry point (`video_postprocessor.forward`): **the decoder decodes a
-/// clip, this splices it**. Per clip it drops the three VAE padding frames, cross-fades the clip's first
-/// five body frames against the predecessor's tail at weights `i/5` (the reference's
-/// `arange(5)/5`, so the first blended frame is entirely the predecessor's), yields the tail to the next
-/// clip as state, and writes the kept frames as `[frames, rows, columns, 3]` bytes.
+/// This is the step the design puts at the component's second entry point
+/// (`video_postprocessor.forward`): **the decoder decodes a clip, this splices it**. Per clip it
+/// drops the three VAE padding frames, cross-fades the clip's first five body frames against the
+/// predecessor's tail at weights `i/5` (the reference's `arange(5)/5`, so the first blended frame
+/// is entirely the predecessor's), yields the tail to the next clip as state, and writes the kept
+/// frames as `[frames, rows, columns, 3]` bytes.
 ///
 /// The blend is two `scaled_add` launches per overlap frame, with the frame's two weights as host
 /// scalars: the two sources a frame reads are each one contiguous run (one frame of a clip and one
@@ -217,8 +156,8 @@ impl Splice {
 /// frames axis: that operator is the row-and-column seam blend and refuses frames, so a frame-axis
 /// blend has no `CrossFade` row and this component states none.
 ///
-/// The weights are the reference's to the rounding: `i / 5` for frame `i` of the overlap, which is
-/// `torch.arange(5, dtype=torch.float16)/5` in `output.py`. The ramp is built here in FP32 where the
+/// The weights are the released pipeline's to the rounding: `i / 5` for frame `i` of the overlap,
+/// which it computes in FP16. The ramp is built here in FP32 where the
 /// reference builds it in the raster's type: one declared deviation, at the ramp's last bit and not in
 /// the blend's arithmetic. The arithmetic is the reference's decoded-precision blend followed by the
 /// FP32 de-normalization, in that order: the de-normalization is [`RgbBytes`]' and reads the same
@@ -255,7 +194,6 @@ impl VideoPostprocessor {
         }
         programs.finish()
     }
-
 
     /// The frames one clip of `splice` writes, which is what [`Self::forward`]'s `out` must hold.
     pub fn frames(splice: &Splice) -> u32 {
@@ -514,7 +452,7 @@ impl nn::capability::Decoder for VideoPostprocessor {
             .map_err(|error| refuse(format!("{error}")))
     }
 
-    /// The splices a timeline of `frames` frames is written in (`output.py:21-40`).
+    /// The splices a timeline of `frames` frames is written in.
     ///
     /// A timeline is `17 * n + 5` frames: `n` clips of a 17-frame body and a 5-frame tail, which the
     /// last clip keeps. Clip `i` writes the timeline's frames from `17 * i`, and every clip but the
@@ -787,18 +725,6 @@ fn frames_of(out: TensorView, start: u32, stop: u32) -> Result<TensorView> {
     ))
 }
 
-/// The whole timeline of `clips` clips: how many frames it writes.
-pub fn timeline_frames(clips: &[Splice]) -> Result<u32> {
-    if clips.is_empty() {
-        return Err(Error::config("a video timeline has a clip".to_owned()));
-    }
-    let mut frames = 0;
-    for clip in clips {
-        frames += clip.frames();
-    }
-    Ok(frames)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,52 +870,6 @@ mod tests {
         );
         assert_eq!(buffers[0].element, "f16");
         assert!(splice_arena(&config, &canvas, DType::BF16).is_err());
-    }
-
-    #[test]
-    fn a_normalized_pixel_restores_its_bytes() {
-        let rgb = Rgb::of(1, 1, 1);
-        // Mid grey of the normalization: value 0 restores the mean itself.
-        assert_eq!(rgb.quantize([0.0, 0.0, 0.0]), [124, 116, 104]);
-        // The ends clamp: a value past the range does not wrap.
-        assert_eq!(rgb.quantize([4.0, 4.0, 4.0]), [255, 255, 255]);
-        assert_eq!(rgb.quantize([-4.0, -4.0, -4.0]), [0, 0, 0]);
-        // A normalized value is a multiple of the channel's standard deviation above its mean, so 1.0
-        // restores the mean plus one standard deviation, not white.
-        assert_eq!(rgb.quantize([1.0, 1.0, 1.0]), [182, 173, 161]);
-        assert_eq!(rgb.quantize([-1.0, -1.0, -1.0]), [65, 59, 46]);
-        // White and black are the values that de-normalize to the ends of the range.
-        let white = [0usize, 1, 2].map(|channel| (1.0 - PIXEL_MEAN[channel]) / PIXEL_STD[channel]);
-        let black = [0usize, 1, 2].map(|channel| -PIXEL_MEAN[channel] / PIXEL_STD[channel]);
-        assert_eq!(rgb.quantize(white), [255, 255, 255]);
-        assert_eq!(rgb.quantize(black), [0, 0, 0]);
-    }
-
-    #[test]
-    fn a_tie_rounds_to_even() {
-        // 0.5 * 255 = 127.5 rounds to 128; 2.5 rounds to 2, not 3.
-        assert_eq!(0.5f32.round_ties_even(), 0.0);
-        assert_eq!(2.5f32.round_ties_even(), 2.0);
-        assert_eq!(127.5f32.round_ties_even(), 128.0);
-        // A pixel that lands exactly on 127.5 quantizes to 128, the even byte.
-        let rgb = Rgb::of(1, 1, 1);
-        let value = (127.5 / BYTE_MAX - PIXEL_MEAN[0]) / PIXEL_STD[0];
-        assert_eq!(rgb.quantize([value, 0.0, 0.0])[0], 128);
-    }
-
-    #[test]
-    fn a_sample_quantizes_to_the_integer_pcm() {
-        let pcm = Pcm::of(800);
-        assert_eq!(pcm.quantize(0.0), 0);
-        assert_eq!(pcm.quantize(1.0), 32767);
-        assert_eq!(pcm.quantize(-1.0), -32767);
-        assert_eq!(pcm.quantize(2.0), 32767);
-        assert_eq!(pcm.quantize(-2.0), -32767);
-        // Half a step is a tie: it rounds to even, which here is zero.
-        assert_eq!(pcm.quantize(0.5 / PCM_MAX), 0);
-        assert_eq!(pcm.quantize(1.5 / PCM_MAX), 2);
-        assert_eq!(pcm.elements(), 1600);
-        assert_eq!(pcm.bytes(), 3200);
     }
 
     /// The operators a splice launches, in order.
@@ -1216,7 +1096,6 @@ mod tests {
         let rgb = Rgb::of(107, 768, 1344);
         assert_eq!(rgb.bytes(), 107 * 768 * 1344 * 3);
         assert_eq!(rgb.overlap_elements(), 3 * 5 * 768 * 1344);
-        assert_eq!(Rgb::workspace_frames(), CLIP_OUTPUT_FRAMES);
         // A clip writes its body and shares a tail; the last writes its body **and** its tail, and the
         // three padding frames between them are dropped, which is what makes the timeline `17n + 5`.
         assert_eq!(Splice::CLIP.frames(), CLIP_FRAMES);
@@ -1225,13 +1104,12 @@ mod tests {
         let mut clips = vec![Splice::CLIP; clips_n as usize];
         *clips.last_mut().expect("a clip") = Splice::LAST;
         assert_eq!(
-            timeline_frames(&clips).expect("timeline"),
+            clips.iter().map(Splice::frames).sum::<u32>(),
             CLIP_FRAMES * clips_n + OVERLAP_FRAMES
         );
         // The padding frames are neither kept nor shared: `LAST`'s two ranges leave them out.
         let (start, stop) = Splice::LAST.overlap;
         assert!(Splice::LAST.body.1 < start && stop - start == OVERLAP_FRAMES);
-        assert!(timeline_frames(&[]).is_err());
     }
 
     /// The post-processor's programs follow from the raster sizes alone: the byte packing is one

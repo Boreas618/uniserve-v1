@@ -1,40 +1,36 @@
 //! The H3 condition encoders: the causal video encoder that turns a clip of raster frames into
 //! posterior moments, and the audio encoder that turns a reference waveform into latents.
 //!
-//! Only `ref2va` reads them (specs/worker.md 9): a reference video or audio clip is encoded once at
+//! Only `ref2va` reads them: a reference video or audio clip is encoded once at
 //! the request boundary and the latents join the packed sequence as clean condition rows. The rest of
 //! this module is the encoders' arithmetic — the stage table, the causal extents, the tile grid and
 //! the band rule a partial encoding follows — and their parameter tables. The numerical bodies follow
 //! the shared layers, as the decoders' do.
 //!
-//! `uniserve/models/minimax_h3/video_vae.py` (`CausalCNN`, `Encoder`) and `uniserve/nn/vae/tiled.py`
-//! (`TiledEncoder`) are the reference.
-//!
 //! ## Precision
 //!
-//! Every convolution of the video encoder runs FP32 with TF32 allowed — `specs/worker.md` 9's
-//! `conv3d` row — because the checkpoint's VAE encoder is evaluated at the quality preset. The audio
-//! encoder's convolutions and its `Snake` activations run FP32 and keep no TF32: its magnitudes are
-//! amplitudes, where the reference compares samples, not feature maps.
+//! Every convolution of the video encoder runs FP32 with TF32 allowed because the checkpoint's VAE
+//! encoder is evaluated at the quality preset. The audio encoder's convolutions and its `Snake`
+//! activations run FP32 and keep no TF32: its magnitudes are amplitudes, where the reference
+//! compares samples, not feature maps.
 //!
 //! **The audio encoder's attention is FP32 throughout** — query, key and value projections, the
-//! scores, the softmax and the output — whatever the checkpoint's preset says. `specs/worker.md` 9
-//! states the row in its own words: 「FP32 注意力（`ref2va` 的音频编码器、VSA 压缩分支） | cuBLASLt
-//! SGEMM 加 softmax kernel program」 — FP32 attention for `ref2va`'s audio encoder and the VSA
-//! compression branch, as a cuBLASLt SGEMM plus a softmax kernel program. It is the declaration §9
-//! asks the model to make instead of leaning on `torch.autocast`, and it is the opposite of the
-//! video VAE decoder's rule (one element type for both parameters and residual, whatever the
-//! deployment's preset - F32 under `dtype = "auto"`, because the checkpoint stores the VAE in F32 and
-//! auto converts nothing; FP16 is a *converted* deployment's element, and every size halves with it). The layer is
-//! [`nn::layers::Attention::fp32`]; no call site may construct the dense backend for these blocks.
+//! scores, the softmax and the output — whatever the checkpoint's preset says: FP32 attention for
+//! `ref2va`'s audio encoder and the VSA compression branch, as a cuBLASLt SGEMM plus a softmax
+//! kernel program. The model declares it instead of leaning on `torch.autocast`, and it is the
+//! opposite of the video VAE decoder's rule (one element type for both parameters and residual,
+//! whatever the deployment's preset - F32 under `dtype = "auto"`, because the checkpoint stores the
+//! VAE in F32 and auto converts nothing; FP16 is a *converted* deployment's element, and every size
+//! halves with it). The layer is [`nn::layers::Attention::fp32`]; no call site may construct the
+//! dense backend for these blocks.
 //!
 //! ## The encoder's input
 //!
-//! A reference video reaches the encoder as `[frames, height, width, 3]` **uint8** pixels — the same
-//! raster the decoder writes ([`crate::output::Rgb`]) — and is normalized per channel by
-//! `(pixel / 255 − mean) / std` with the ImageNet constants before the input convolution
-//! (`uniserve/models/minimax_h3/encoding.py`, `unpack_pixels`). A clip shorter than the checkpoint's
-//! [`crate::config::CLIP_FRAMES`] repeats its last frame; a single frame stays alone.
+//! A reference video reaches the encoder as `[frames, height, width, 3]` **uint8** pixels — the
+//! same raster the decoder writes ([`crate::output::Rgb`]) — and is normalized per channel by
+//! `(pixel / 255 − mean) / std` with the ImageNet constants before the input convolution. A clip
+//! shorter than the checkpoint's [`crate::config::CLIP_FRAMES`] repeats its last frame; a single
+//! frame stays alone.
 //!
 //! ## Causal extents
 //!
@@ -67,9 +63,8 @@ pub const PIXEL_CHANNELS: u32 = 3;
 
 /// How H3's encoders read a request's decoded media, on the host.
 ///
-/// Three layouts, one per encoder, each the reference's: the video encoder's normalised planar pixels
-/// (`encoding.py`, `unpack_pixels`), the vision tower's patch rows (`qwen3_vl/encoder.py`,
-/// `pack_pixels`) and the audio encoder's zero-padded channel rows (`encoding.py`, `unpack_samples`).
+/// Three layouts, one per encoder: the video encoder's normalised planar pixels, the vision tower's
+/// patch rows and the audio encoder's zero-padded channel rows.
 #[derive(Clone, Debug)]
 pub struct ConditionFormat {
     vision: crate::config::VisionConfig,
@@ -402,8 +397,8 @@ impl Clip {
     /// A condition is cut into clips of [`Self::frames`] frames, each yielding [`Self::latents`] latent
     /// frames, and the last clip's trailing [`Self::token_drop`] latent frames are dropped - so 17
     /// frames are 2 and 22 are 7. A single frame is a still and yields one: the network's causal front
-    /// padding makes one frame one latent frame (`video_vae.py:1105-1113`), and the reference encodes
-    /// an image or a keyframe through the same network alone (`encoding.py:41-51`).
+    /// padding makes one frame one latent frame, and the reference encodes
+    /// an image or a keyframe through the same network alone.
     ///
     /// This is a **different statement** from a generated timeline's (`packing::video_latent_frames`:
     /// `17n + 5` frames to `5n + 2` latents). The two agree on the counts a generation uses, and only
@@ -422,8 +417,8 @@ impl Clip {
 
     /// The clips a condition of `frames` frames is cut into, in order.
     ///
-    /// Each clip is encoded alone, as the reference's `clips` and `latent_slices` cut it
-    /// (`encoding.py:125-139`): the frames it reads and the latent frames it writes, the last clip
+    /// Each clip is encoded alone, as the reference's `clips` and `latent_slices` cut it:
+    /// the frames it reads and the latent frames it writes, the last clip
     /// holding what is left of both. A still is one clip of one frame.
     pub fn spans(&self, frames: u32) -> Result<Vec<ClipSpan>> {
         let total = self.latent_frames(frames)?;
@@ -533,7 +528,6 @@ impl Stack {
             .copied()
             .ok_or_else(|| Error::config("the video encoder's stack has no level".to_owned()))
     }
-
 }
 
 /// The tile grid of one raster, in input pixels, with the latent positions each seam shares.
@@ -610,9 +604,9 @@ impl Grid {
 
 /// One pixel's normalized channels: `(pixel / 255 − mean) / std`.
 ///
-/// The inverse of [`crate::output::Rgb::quantize`], and the input the video encoder reads. A kernel
-/// that normalizes the raster computes this; the round trip through the decoder's quantization
-/// recovers the byte.
+/// The inverse of the decoder's byte step (`value * std + mean`, clamped to [0, 1], scaled to 255
+/// and rounded half to even), and the input the video encoder reads. A kernel that normalizes the
+/// raster computes this; the round trip through the decoder's quantization recovers the byte.
 pub fn normalize(pixel: [u8; 3]) -> [f32; 3] {
     let mut values = [0.0f32; 3];
     for (channel, byte) in pixel.iter().enumerate() {
@@ -819,14 +813,15 @@ impl AudioStack {
 
 /// The latent frames a track of `samples` encodes to: `ceil(samples / hop)`.
 ///
-/// One statement of the rule, because two callers need it: the stack's geometry and the encoder's own
-/// output extent. **This is the encode's direction:** a requested duration is covered, so the track is
-/// `+0..hop-1` samples longer than the request and never short. [`crate::packing::audio_latent_frames`]
-/// is the other direction - a request's video frame count to its latents, rounded to nearest - and the
-/// two are deliberately named alike and documented against each other, because a reader who takes one
-/// for the other gets a figure that looks right. The ceiling is the reference's (`encoding.py:244`), and it is a ceiling because its
-/// `unpack_samples` right-pads the track with zeros to [`padded_samples`] first, so every strided
-/// convolution divides exactly and the last latent frame reads those zeros.
+/// One statement of the rule, because two callers need it: the stack's geometry and the encoder's
+/// own output extent. **This is the encode's direction:** a requested duration is covered, so the
+/// track is `+0..hop-1` samples longer than the request and never short.
+/// [`crate::packing::audio_latent_frames`] is the other direction - a request's video frame count
+/// to its latents, rounded to nearest - and the two are deliberately named alike and documented
+/// against each other, because a reader who takes one for the other gets a figure that looks right.
+/// The ceiling is the reference's, and it is a ceiling because its `unpack_samples` right-pads the
+/// track with zeros to [`padded_samples`] first, so every strided convolution divides exactly and
+/// the last latent frame reads those zeros.
 pub fn audio_latent_frames(samples: u64, hop: u64) -> Result<u64> {
     if samples == 0 || hop == 0 {
         return Err(Error::config(
@@ -921,13 +916,13 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
                 );
             }
         }
-        // The reference's `EncoderBlock.block` is five entries - three residual units at 0, 1 and 2,
-        // **the stage's Snake at 3**, and the widening convolution at 4 (`audio_vae.py`'s
-        // `EncoderBlock.__init__`). An extra entry was assumed before the Snake here, so every name
-        // in this block asked for one index too high: the widen convolution at `.5` and the Snake at
-        // `.4`, neither of which the checkpoint has. That is four names a stage and five stages -
-        // the twenty a run reported missing, with `.block.4.alpha` among them, and a Snake at an
-        // index the convolution occupies cannot exist.
+        // The reference's `EncoderBlock.block` is five entries - three residual units at 0, 1 and
+        // 2, **the stage's Snake at 3**, and the widening convolution at 4. An extra entry was
+        // assumed before the Snake here, so every name in this block asked for one index too high:
+        // the widen convolution at `.5` and the Snake at `.4`, neither of which the checkpoint has.
+        // That is four names a stage and five stages - the twenty a run reported missing, with
+        // `.block.4.alpha` among them, and a Snake at an index the convolution occupies cannot
+        // exist.
         normalized(&mut sources, at("widen.weight"), format!("{base}.4"));
         region(&mut sources, at("widen.bias"), format!("{base}.4.bias"));
         region(&mut sources, at("snake.alpha"), format!("{base}.3.alpha"));
@@ -982,8 +977,8 @@ pub fn audio_sources(config: &crate::AudioVaeConfig) -> Result<Vec<crate::audio_
         region(&mut sources, parameter.to_owned(), tensor.to_owned());
     }
     // The checkpoint fuses query, key and value into one `[3 * wide]` bias parameter and keeps its
-    // three windows as three tensors; the reference fills the windows from them in this order
-    // (`audio_vae.py:521-534`). This encoder's attention reads the three windows as three layers, so
+    // three windows as three tensors; the reference fills the windows from them in this order.
+    // This encoder's attention reads the three windows as three layers, so
     // each window is its own source and its own load: a window is a whole tensor here, while the
     // fused weight below is one tensor read at three offsets.
     //
@@ -1050,7 +1045,7 @@ struct Level {
 ///
 /// One call encodes one raster: the caller tiles a clip as `Grid` states, and a band of latent rows
 /// may be encoded on its own through `Grid::band`. Every convolution runs FP32 with TF32 allowed, the
-/// precision the checkpoint's preset declares for the video VAE's encoder (specs/worker.md 9).
+/// precision the checkpoint's preset declares for the video VAE's encoder.
 pub struct VideoEncoder {
     stack: Stack,
     /// The input convolution, over raw pixels.
@@ -1238,8 +1233,8 @@ impl Sample {
 ///
 /// **Every convolution here is channel-first, and the reference says why that costs no number.**
 /// Its stride-1 padded convolutions run under `torch.channels_last_3d` as a cuDNN speed path: "it
-/// selects the same algorithm for either order, which leaves the encoding unchanged"
-/// (`uniserve/models/minimax_h3/video_vae.py:950-959`). The order is therefore a throughput choice
+/// selects the same algorithm for either order, which leaves the encoding unchanged".
+/// The order is therefore a throughput choice
 /// rather than a fidelity one, and this encoder takes it only against a measured encode-convolution
 /// time. The same comment is why its strided downsamplers stay channel-first even there: under
 /// channels-last cuDNN picks another algorithm "whose rounding differs", so the reference keeps
@@ -1572,7 +1567,6 @@ impl EncoderScratch {
                 ))
             })
     }
-
 }
 
 /// One tile extent's buffers: the input pad, the input convolution's output and a set per level.
@@ -1762,23 +1756,6 @@ impl VideoEncoder {
         }
 
         Ok(programs.finish())
-    }
-
-    /// Encode one raster into the posterior moments of its latent.
-    ///
-    /// One tile, with its buffers reserved for the call: a driver of several tiles reserves once with
-    /// [`Self::reserve`] and calls [`Self::encode_tile`] instead, or the arena carries one tile's buffers
-    /// per tile.
-    pub fn encode(&self, f: &Forward, pixels: TensorView, out: TensorView) -> Result<()> {
-        let (_, _, frames, height, width) = extent(pixels)?;
-        let raster = Extent {
-            frames: u32::try_from(frames)
-                .map_err(|_| Error::config("too many frames".to_owned()))?,
-            height: u32::try_from(height).map_err(|_| Error::config("too tall".to_owned()))?,
-            width: u32::try_from(width).map_err(|_| Error::config("too wide".to_owned()))?,
-        };
-        let scratch = self.reserve(f, &[raster])?;
-        self.encode_tile(f, &scratch, pixels, out)
     }
 
     /// Reserve the buffers one run of tiles encodes in, one set per distinct tile extent.
@@ -2012,8 +1989,7 @@ impl VideoEncoder {
     /// A condition is cut into clips of `Stack::clip_frames` frames, each yielding
     /// `Stack::clip_latents` latent frames, and the last clip's trailing `Stack::token_drop` latent
     /// frames are dropped - so 17 frames are 2 latent frames and 22 are 7. A single frame is a still and
-    /// yields one (`encoding.py:104-111`; the network's causal front padding makes one frame one latent
-    /// frame, `video_vae.py:1105-1113`).
+    /// yields one (the network's causal front padding makes one frame one latent frame).
     ///
     /// This is a **different statement** from the generated timeline's `packing::video_latent_frames`
     /// (`17n + 5` frames to `5n + 2` latents). The two agree on the counts a generation uses and this
@@ -2149,8 +2125,7 @@ impl VideoEncoder {
         };
         // The reference groups the sum as `residual + (values + bias)` and adds the convolution's
         // bias in a pass of its own; cuDNN adds that bias in a pass of its own too, and IEEE addition
-        // commutes, so `(values + bias) + residual` here is the same rounded value
-        // (`video_vae.py:852-859`, `:1009-1020`).
+        // commutes, so `(values + bias) + residual` here is the same rounded value.
         Ok(ScaledAdd.forward(f, rows(out)?, rows(residual)?, 1.0, 1.0)?)
     }
 }
@@ -2347,8 +2322,8 @@ impl AudioEncoder {
         let head_dim = (width / config.num_attention_heads.max(1)).max(1);
         // **Causal**, because that is what this encoder's `Projection` builds when it loads
         // (`Projection::load` below passes `true`) and what the reference states: `DenseInput(
-        // causal=True)` over the latent frames, so a frame depends only on the audio before it
-        // (`audio_vae.py:433`). A non-causal row here is a row nothing launches - and the one that
+        // causal=True)` over the latent frames, so a frame depends only on the audio before it.
+        // A non-causal row here is a row nothing launches - and the one that
         // would be launched would then be missing from the store.
         let attention = Attention::dense(
             head_dim,
@@ -2428,7 +2403,7 @@ impl AudioEncoder {
 
     /// The latent frames `samples` samples encode to: `ceil(samples / hop)`.
     ///
-    /// This is the reference's rule (`encoding.py:244`) and the reason it is a ceiling is the pad its
+    /// This is the reference's rule and the reason it is a ceiling is the pad its
     /// The batch the track must carry: **the stereo pair is the batch**, and a mono track is refused.
     ///
     /// The reference expands a mono track to two identical channels before the encoder
@@ -2644,12 +2619,12 @@ impl AudioEncoder {
     /// Encode a `[batch, 1, length]` track into `out [batch · frames, latent_channels]` F32 rows of
     /// the normalized latent, `(mode - mean) / std`.
     ///
-    /// The reference's encoder is mono per batch row (`audio_vae.py:448-452`, "encode mono
-    /// `[batch, 1, samples]` waveforms") and its latent is a **two-row batch**: a stereo reference
-    /// arrives as `[2, 1, samples]` and its latent is `[2, latent_channels, frames]`, the same two-row
-    /// shape the audio decoder reads. The rows are written channel-major, `[batch · frames,
-    /// latent_channels]` with batch outermost, because that is the form the DiT's audio conditioning
-    /// reads (`denoiser.py:518`, `[2 · frames, audio_channels]`) - so no caller transposes.
+    /// The encoder is mono per batch row (it encodes `[batch, 1, samples]` waveforms) and its
+    /// latent is a **two-row batch**: a stereo reference arrives as `[2, 1, samples]` and its
+    /// latent is `[2, latent_channels, frames]`, the same two-row shape the audio decoder reads.
+    /// The rows are written channel-major, `[batch · frames, latent_channels]` with batch
+    /// outermost, because that is the form the DiT's audio conditioning reads (`[2 · frames,
+    /// audio_channels]`) - so no caller transposes.
     ///
     /// The length must be a whole number of hops and no longer than the deployment's bound. The
     /// activation of every stage runs at the stage's inner width, which is half of the width the
@@ -3603,11 +3578,14 @@ mod tests {
         let config = crate::audio_vae::tests::audio_config();
         let mut ours = AudioEncoder::keys(&config).expect("the encoder's keys");
         ours.sort_unstable();
-        let fixture: Vec<&str> = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/audio-encoder-names.txt"))
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .collect();
+        let fixture: Vec<&str> = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/audio-encoder-names.txt"
+        ))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
         assert_eq!(fixture.len(), 171, "the recorded export's encoder half");
         let missing: Vec<&str> = fixture
             .iter()
@@ -4329,7 +4307,18 @@ mod tests {
 
     #[test]
     fn a_pixel_normalizes_and_quantizes_back_to_itself() {
-        let rgb = crate::output::Rgb::of(1, 1, 1);
+        // The decoder's byte step, per channel: restore, clamp to [0, 1], scale and round half to
+        // even.
+        let quantize = |normalized: [f32; 3]| -> [u8; 3] {
+            let mut bytes = [0u8; 3];
+            for (channel, value) in normalized.iter().enumerate() {
+                let restored =
+                    value * crate::output::PIXEL_STD[channel] + crate::output::PIXEL_MEAN[channel];
+                bytes[channel] =
+                    (restored.clamp(0.0, 1.0) * crate::output::BYTE_MAX).round_ties_even() as u8;
+            }
+            bytes
+        };
         for pixel in [
             [0u8, 0, 0],
             [255, 255, 255],
@@ -4337,7 +4326,7 @@ mod tests {
             [1, 2, 3],
             [200, 10, 77],
         ] {
-            let restored = rgb.quantize(normalize(pixel));
+            let restored = quantize(normalize(pixel));
             for (channel, (got, want)) in restored.iter().zip(pixel.iter()).enumerate() {
                 assert!(
                     got.abs_diff(*want) <= 1,
@@ -4345,7 +4334,7 @@ mod tests {
                 );
             }
         }
-        // The extremes land outside the band the decoder works in - `Rgb::quantize` maps a value
+        // The extremes land outside the band the decoder works in - the byte step maps a value
         // back through `value · std + mean` and clamps to the byte range, so one inside [-1, 1]
         // loses nothing. Being outside is the property; how far outside is the checkpoint's
         // statistics' business, not this test's.

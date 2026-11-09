@@ -2,7 +2,7 @@
 //!
 //! The text encoder's Qwen hidden states are `text_dim` wide; the refiner projects them to the
 //! transformer's width and refines each document with dense bidirectional attention and a
-//! pre-normalized SwiGLU (`uniserve/models/minimax_h3/conditioning.py`). It runs once per request -
+//! pre-normalized SwiGLU. It runs once per request -
 //! the worker keeps its output in the request's state and hands it to every denoising step - so
 //! it is a plain block of the transformer component, not a schedule.
 //!
@@ -98,8 +98,8 @@ pub struct RefinerBlock {
     output: Linear,
     gate_up: Linear,
     down: Linear,
-    /// The stepwise gated activation, as the reference's refiner asks for
-    /// (`conditioning.py:75-80`, `Rounding.STEPWISE`).
+    /// The stepwise gated activation (`GatedActivation::with_stepwise`): the refiner rounds
+    /// `silu(gate)` and the product one step at a time.
     gated: GatedActivation,
     attention: Attention,
     /// The identity add of the attention and feed-forward residuals.
@@ -533,7 +533,6 @@ impl Scratch {
             ("ffn", self.ffn),
         ]
     }
-
 }
 
 impl Rows {

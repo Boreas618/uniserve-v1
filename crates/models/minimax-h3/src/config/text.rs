@@ -17,13 +17,6 @@ use crate::{Error, Result};
 /// checkpoint's configuration does not state how many layers a consumer keeps.
 pub const RETAINED_LAYERS: u32 = 50;
 
-/// The activation of the language layers. H3's checkpoint states SiLU.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Activation {
-    /// `x * sigmoid(x)`.
-    Silu,
-}
-
 /// How the checkpoint's processor normalizes a pixel before the vision tower patches it.
 ///
 /// Each RGB channel maps `x` in `[0, 255]` to `(x / 255 - mean) / std`.

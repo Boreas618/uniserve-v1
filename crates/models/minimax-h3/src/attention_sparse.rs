@@ -8,8 +8,8 @@ use ops::gemm::WeightOrder;
 use crate::attention::{Factors, HeadProjection, HeadsToRows};
 use crate::config::TransformerConfig;
 use crate::partition::Partition;
-use nn::family::Projection;
 use crate::{Error, Result};
+use nn::family::Projection;
 
 /// One layer's sparse attention: four projections, the tile preparation, and both attentions.
 pub struct Sparse {
@@ -18,7 +18,7 @@ pub struct Sparse {
     pub(crate) key: HeadProjection,
     pub(crate) value: HeadProjection,
     /// The gate the compression is weighted by, `[inner, hidden]`: a fourth projection of the same
-    /// fused matrix as the three above (`attention.py:139`).
+    /// fused matrix as the three above.
     pub(crate) gate: HeadProjection,
     /// The output projection back to the residual's width, `[hidden, inner]`.
     pub output: Linear,
@@ -50,7 +50,7 @@ impl Sparse {
     /// Every checkpoint tensor one layer's sparse attention reads, as complete names.
     ///
     /// The gate compression's projection is the fourth of the fused matrix the query, key and value
-    /// come from (`attention.py:139`), so it is one more weight than the dense branch reads.
+    /// come from, so it is one more weight than the dense branch reads.
     pub fn keys(index: u32) -> Vec<String> {
         let prefix = format!("transformer_blocks.{index}.attn");
         [
@@ -225,7 +225,7 @@ impl Sparse {
         // The compression is folded into the fine rows, in place, and one binding names both the
         // buffer the fold writes and the buffer the projection reads: `add_gated` modifies its first
         // argument only, so folding into any other buffer would drop this branch without a shape
-        // ever saying so (`vsa/segments.py:461-478`).
+        // ever saying so.
         let rows = scratch.query.shape.dim(0);
         let shape = Shape::new(&[rows, u64::from(self.local_heads), u64::from(self.head_dim)]);
         self.tiles.add_gated(
@@ -368,7 +368,7 @@ impl Sparse {
             scratch.pooled_value,
         )?;
         // `prepare` already stored zeros past each tile's valid size, for all three of Q, K and V,
-        // before it pooled them (`vsa_prepare_tiles.py:812-831`), so the fine attention reads the
+        // before it pooled them, so the fine attention reads the
         // same zeroed rows without a second pass: a `zero_padding` per tensor here would repeat
         // three launches of every layer of every evaluation to write what is already written.
         self.tiles
@@ -622,7 +622,7 @@ impl Scratch {
             scores: arena.tensor(nn::DType::F32, Shape::new(&[heads, tiles64, tiles64]))?,
             // The selection is as wide as the scores it comes from: `select` requires the index
             // matrix to have the scores' shape, and the reference returns one entry per key tile
-            // with the kept ones first (`vsa/segments.py:205-208`).
+            // with the kept ones first.
             indices: arena.tensor(nn::DType::I32, Shape::new(&[heads, tiles64, tiles64]))?,
             counts: arena.tensor(nn::DType::I32, Shape::new(&[heads, tiles64]))?,
             fine: arena.tensor(dtype, Shape::new(&[rows, inner]))?,

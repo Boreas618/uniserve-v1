@@ -1,7 +1,7 @@
 //! MiniMax-H3 with FastH3: the checkpoint configuration read once at the loading boundary, the
 //! mathematical partition of a deployment, and the model's blocks.
 //!
-//! The crate holds one pipeline (specs/worker.md 4.3, 9): the Qwen3-VL text encoder that conditions
+//! The crate holds one pipeline: the Qwen3-VL text encoder that conditions
 //! a request, one or two diffusion transformer (DiT) partitions of the checkpoint, the video and
 //! audio latent encoders `ref2va` uses, and the video and audio decoders. Each is a named block
 //! implementing an [`nn`] capability, and a deployment places a subset of them per worker group
@@ -18,8 +18,7 @@
 //!
 //! The checkpoint's own numerical representation is used as it is: each tensor keeps the element
 //! type it was stored in, every layer declares the precision it computes in, and nothing is
-//! converted at load unless the deployment asks for it with `dtype` or `quantization`
-//! (specs/worker.md 1).
+//! converted at load unless the deployment asks for it with `dtype` or `quantization`.
 //!
 //! ## What the partition owns
 //!
@@ -41,7 +40,6 @@ pub mod conditioning;
 pub mod config;
 pub mod decoding;
 pub mod denoiser;
-pub mod diagnosis;
 pub mod encoding;
 pub mod family;
 pub mod load;
@@ -67,24 +65,22 @@ pub use checkpoint::{
 pub use config::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, AUDIO_SAMPLE_RATE, AttentionKind,
     AudioVaeConfig, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, CLIP_FRAMES, CLIP_LATENTS, Canvas, Config,
-    DROPPED_LATENTS, DenoiserConfig, FPS, NAMED_ASPECT_RATIOS, NAMED_CANVASES,
-    NUM_TRAIN_TIMESTEPS, PixelConfig, RETAINED_LAYERS, SPARSE_TILE_ROWS, ScheduleGrid,
-    ScheduleSpec, Shifts, SpatialPadding, TextEncoderConfig, TransformerConfig,
-    UNIFORM_GRID_POINTS, VideoVaeConfig, VisionConfig,
+    DROPPED_LATENTS, DenoiserConfig, FPS, NAMED_ASPECT_RATIOS, NAMED_CANVASES, NUM_TRAIN_TIMESTEPS,
+    PixelConfig, RETAINED_LAYERS, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
+    SpatialPadding, TextEncoderConfig, TransformerConfig, UNIFORM_GRID_POINTS, VideoVaeConfig,
+    VisionConfig,
 };
 /// The rotation convention every fused normalization-and-rotation in this model uses.
 ///
-/// The reference rotates **split-half**: coordinate `i` of a rotated span pairs with
-/// `i + span / 2` (`uniserve/nn/functional/_rope.py:48`, and `:258` passes `"split"` at the fused
-/// call; `attention.py:94-96` says the same in words: "its leading 96 channels split-half"). The
-/// neox pairing - adjacent coordinates - is a different arithmetic from the same factor table, so
-/// the convention is stated once here and read by every call site and by the store's key list.
+/// The model rotates **split-half**: coordinate `i` of a rotated span pairs with `i + span / 2`,
+/// and the DiT's rotated span is each head's leading 96 channels. The neox pairing - adjacent
+/// coordinates - is a different arithmetic from the same factor table, so the convention is stated
+/// once here and read by every call site and by the store's key list.
 pub const SPLIT_HALF: ops::rope::Rotation = ops::rope::Rotation::Half;
 
 pub use load::load;
-pub use task::VideoTask;
 pub use partition::{Component, Partition};
-pub use transformer::Trace;
+pub use task::VideoTask;
 
 /// What this crate can fail with.
 #[derive(Debug, thiserror::Error)]
@@ -139,7 +135,6 @@ impl Error {
     pub(crate) fn checkpoint(problem: impl Into<String>) -> Self {
         Self::Checkpoint(problem.into())
     }
-
 }
 
 /// A result of this crate.

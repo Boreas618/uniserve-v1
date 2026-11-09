@@ -11,9 +11,8 @@
 //! the model is told how many ranks the exchange runs over, and the layer that shards a tensor
 //! reads only the degree and the rank's position in it.
 
-use nn::family::Projection;
 use crate::VideoTask;
-use nn::DType;
+use nn::family::Projection;
 
 use crate::checkpoint::TASK_DITS;
 use crate::denoiser::Arrangement;
@@ -23,7 +22,7 @@ use crate::{Error, Result, config::Config};
 ///
 /// **A prompt capacity is the deployment's, not the checkpoint's.** The reference reserves one prefix
 /// row per prompt token and states a request's text rows as its prompt rounded up to the attention
-/// unit's tile (`packing.py:557`, `denoiser.py:411`), so the row count follows what the serving
+/// unit's tile, so the row count follows what the serving
 /// deployment prepares - `video_config.text_capacities`, 1024 as the release's validated setting and
 /// this constant as the smallest rung its own table names. A served deployment states its capacity
 /// with [`Partition::sized`]; a model built at another number refuses every longer prompt at the
@@ -183,98 +182,6 @@ impl Component {
             Self::VideoPostprocessor => &[],
         }
     }
-
-    /// The element type this block is declared to compute in when a deployment states none.
-    ///
-    /// The design's default `dtype = "auto"` converts nothing at load, so each block keeps the
-    /// checkpoint's own representation: BF16 for the text encoder and the DiT partitions, FP16 for
-    /// the video VAE decoder (`specs/worker.md` 1; the `quality` preset of
-    /// `uniserve/models/minimax_h3/precision.py`, which is that representation). This is the type a
-    /// block whose constructor takes one is *converted to*; a constructor that takes none keeps the
-    /// stored representation, so this value is informational for those blocks. The design names no
-    /// representation for the audio VAE or the condition encoders, so they are declared BF16 like
-    /// the blocks beside them and no conversion is made for them.
-    pub const fn activation(self) -> DType {
-        match self {
-            // The postprocessor reads and writes the video decoder's rasters, so it holds their element type.
-            Self::VideoDecoder | Self::VideoPostprocessor => DType::F16,
-            Self::TextEncoder
-            | Self::Transformer
-            | Self::TransformerRef
-            | Self::AudioDecoder
-            | Self::LatentEncoder => DType::BF16,
-        }
-    }
-
-    /// The component a deployment file names, when it names one of these.
-    pub fn named(name: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|component| component.name() == name)
-    }
-}
-
-/// The largest request a deployment admits, as the counts that size its DiT.
-///
-/// The attention's scratch and the per-layer buffers of a DiT are allocated once at load, for the
-/// largest layout the deployment will serve, so these are capacities and not the request's own
-/// numbers: a request larger than them is refused rather than overrunning a table
-/// (specs/worker.md 9, `uniserve/models/minimax_h3/denoiser.py`). They belong to the loading
-/// boundary because serving capacity is the caller's decision, not the architecture's
-/// (`AGENTS.md`, Model Library Boundary).
-///
-/// `text_rows` and `condition_rows` are **rows**, and each is a whole number of the attention
-/// kind's capacity unit - 64 rows under dense attention, one VSA tile under sparse attention -
-/// which is also what `Denoiser::load`'s `Arrangement` takes. The released checkpoint's dense
-/// deployment is 128 text rows and 192 condition rows (two and three units: nine images, three
-/// videos and two keyframes at one unit each); under a 128-row tile the same deployment needs
-/// capacities in whole 128-row tiles instead.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Capacity {
-    /// Text rows every layout of this deployment holds, a whole number of capacity units.
-    pub text_rows: u32,
-    /// Condition rows it holds, a whole number of capacity units.
-    pub condition_rows: u32,
-    /// The largest frame count it serves.
-    ///
-    /// A layout's row count grows with the frames, so this is the frame count that sizes the
-    /// buffers; it is not aligned here, because `align_num_frames` lowers it to the legal
-    /// timeline the checkpoint serves.
-    pub frames: u32,
-}
-
-impl Capacity {
-    /// The padded row count of the largest layout this capacity can reach.
-    ///
-    /// Every canvas the DiT offers is packed at [`Capacity::frames`] and the largest padded row
-    /// count wins; that is the row bound the attention and the modulation tables are allocated
-    /// for. The packing's own rules refuse a canvas or a frame count they cannot serve, so a
-    /// capacity the checkpoint cannot reach is reported here rather than on the device.
-    pub fn rows(&self, config: &crate::config::DenoiserConfig) -> Result<u32> {
-        let unit = config.attention.capacity_rows();
-        let text = self.text_rows;
-        let condition = self.condition_rows;
-        let frames = crate::packing::align_num_frames(self.frames);
-        let mut largest = 0;
-        for canvas in crate::config::offered_canvases() {
-            let packing = crate::packing::dense_packing(frames, canvas, text, condition, unit)?;
-            largest = largest.max(packing.padded_tokens);
-            // A sparse deployment packs by video tiles as well, and its segments pad the audio
-            // and the video up to whole tiles; the bound is the larger of the two plans at the
-            // same admission, so neither can overrun the scratch.
-            if let crate::config::AttentionKind::Sparse { tile, .. } = config.attention {
-                let segments =
-                    crate::packing::segment_packing(frames, canvas, text, condition, tile, tile)?;
-                largest = largest.max(segments.extent.padded_tokens);
-            }
-        }
-        if largest == 0 {
-            return Err(Error::config(
-                "the DiT offers no canvas, so no layout can be sized".to_owned(),
-            ));
-        }
-        Ok(largest)
-    }
 }
 
 /// The set of blocks one rank places.
@@ -315,7 +222,6 @@ impl Components {
     pub const fn contains(self, component: Component) -> bool {
         self.0 & (1 << component.bit()) != 0
     }
-
 
     /// The blocks placed, in deployment order.
     pub fn iter(self) -> impl Iterator<Item = Component> {
@@ -952,7 +858,6 @@ mod tests {
         };
         assert_eq!(partition.vocabulary_shard(10), (9, 10));
     }
-
 
     #[test]
     fn a_rank_holds_one_denoiser() {

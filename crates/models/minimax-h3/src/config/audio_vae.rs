@@ -3,7 +3,7 @@
 //!
 //! The product of `encoder_rates` is the samples one latent frame stands for - the encoder's input
 //! hop and the decoder's output rate - and H3's timeline counts audio latents in those hops
-//! (specs/worker.md 9, `docs/minimax_h3/minimax_h3.md`).
+//! (`docs/minimax_h3/minimax_h3.md`).
 
 use serde_json::{Map, Value};
 

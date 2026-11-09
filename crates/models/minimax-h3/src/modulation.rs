@@ -4,13 +4,11 @@
 //! shift, scale and gate for the attention block and for the feed-forward block - and the final
 //! normalization carries two more. The released network computes them with one shared timestep
 //! embedding and one projection per layer, and the schedule is fixed, so the products are
-//! precomputed once for the schedule's distinct timesteps (the reference's `AdaLNCache`,
-//! `uniserve/models/minimax_h3/transformer.py:380-402` and
-//! `uniserve/models/minimax_h3/modulation.py`). The cache is computed at load on the device: one
-//! `Linear(frequency_dim → time_hidden_dim)`, a SiLU, one `Linear(time_hidden_dim → time_dim)` and
-//! then, per layer, one `Linear(time_dim → 18 · hidden_size)` - about 260 MMAC per layer per
-//! distinct timestep, which no host-side boundary can absorb (`crate::Solver`'s note has the
-//! arithmetic).
+//! precomputed once for the schedule's distinct timesteps (an AdaLN cache). The cache is computed
+//! at load on the device: one `Linear(frequency_dim → time_hidden_dim)`, a SiLU, one
+//! `Linear(time_hidden_dim → time_dim)` and then, per layer, one `Linear(time_dim → 18 ·
+//! hidden_size)` - about 260 MMAC per layer per distinct timestep, which no host-side boundary can
+//! absorb (`crate::Solver`'s note has the arithmetic).
 //!
 //! ## What a forward reads
 //!
@@ -179,13 +177,10 @@ impl AdaLnCache {
         })
     }
 
-
-
     /// The timestep groups a step reads.
     pub const fn groups(&self) -> Groups {
         self.groups
     }
-
 
     /// The entry ids one step reads: `[1, groups]` i32, gathered from the entry table's `step` row.
     ///
@@ -227,16 +222,13 @@ impl AdaLnCache {
     pub fn layer_width(&self) -> u64 {
         u64::from(TAGS) * VECTORS as u64 * u64::from(self.hidden_size)
     }
-
-
-
 }
 
 /// The distinct noise levels the cache holds and the entry each step's group reads.
 ///
 /// The cache is indexed by *value*, not by step: the generated video and audio have their own
 /// noise level per step, the visual condition's level is the video's floored at the clean level the
-/// reference anchors it at (`uniserve/models/minimax_h3/denoiser.py`, the modulation table), and an
+/// condition is anchored at ([`crate::denoiser::VISUAL_CONDITION_TIME`]), and an
 /// audio reference is clean at the top of the schedule. Steps whose levels coincide share one entry,
 /// which is where the cache's saving comes from - the schedule's points repeat across the two
 /// modalities and the condition groups.
@@ -283,8 +275,7 @@ pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>
 /// The checkpoint projections the cache is built from, read once at load.
 ///
 /// The reference builds the cache with one shared pair of FP32 linear maps over the sinusoidal
-/// timestep embedding and one projection per layer, then releases them
-/// (`uniserve/models/minimax_h3/modulation.py`, `TimestepEmbedding`). Nothing runs them per
+/// timestep embedding and one projection per layer, then releases them. Nothing runs them per
 /// evaluation, so they are held only until `Projections::fill` has produced the tables once.
 pub struct Projections {
     /// `time_embedder.linear_1`: `[time_hidden, frequency]`, FP32, with its bias.
@@ -308,8 +299,8 @@ impl Projections {
     ) -> Result<Self> {
         // **The element type of each tensor is pinned by the reference, not by the deployment.**
         // Its loading table fixes the timestep pair at FP32 and the modulation projections at BF16
-        // whatever the preset (`weights.py:186-224`), and it casts the activation to the weight's
-        // type before each product (`adaln_cache.py:128`). Our product has one element type for both
+        // whatever the preset, and it casts the activation to the weight's
+        // type before each product. Our product has one element type for both
         // operands, so the activation and the tables must agree with the weights on both sides - and
         // the run's first stop was exactly this: an FP32 activation against whatever type the
         // deployment's loader happened to publish.
@@ -420,14 +411,14 @@ impl Projections {
         // **The activation is cast to the weight's type, and the tables take the projection's type.**
         // The reference writes both halves of that in one line - `F.linear(activated_timesteps.to(
         // weight.dtype), weight, bias)` with the tables allocated as `projected.new_empty(...)`
-        // (`adaln_cache.py:128, 141-145`) - so at the released BF16 stack the tables are BF16, and at
+        // - so at the released BF16 stack the tables are BF16, and at
         // a deployment whose weights are FP32 they are FP32. Reading the tables' type from `out`
         // instead and leaving the weights at the checkpoint's type is what a device run found: the
         // first projection of the forward asked cuBLASLt for an FP32 activation against a BF16
         // weight, a pair no algorithm exists for (`input_f32_weight_bf16_...` refused at its plan).
         //
         // The two halves of the family have different types, and the reference says so: the timestep
-        // pair is FP32 at every preset (`weights.py:186-192`), the modulation projections take the
+        // pair is FP32 at every preset, the modulation projections take the
         // deployment's. So the activation the second pair leaves is FP32 and the modulation
         // projections read the deployment's type - **one narrowing between them**, which is the
         // reference's `.to(weight.dtype)` and the only crossing in this cache. At an FP32
@@ -477,7 +468,7 @@ impl Projections {
         linear(&self.first)?.forward(f, embedding, hidden)?;
         nn::layers::Silu.forward(f, hidden, activated)?;
         linear(&self.second)?.forward(f, activated, time)?;
-        // The reference feeds the projections `silu(embedding)` (`weights.py`, `activated`): the
+        // The projections read `silu(embedding)`: the
         // pair's output is activated once more before any modulation reads it.
         let activated_time = arena.tensor(time_type, time.shape)?;
         nn::layers::Silu.forward(f, time, activated_time)?;
@@ -511,18 +502,11 @@ impl Projections {
     pub fn dtype(&self) -> DType {
         self.layers[0].0.dtype()
     }
-
-    /// How many layers the projections cover.
-    pub fn layers(&self) -> usize {
-        self.layers.len()
-    }
-
-
 }
 
 /// The sinusoidal embedding of each entry time, `[entries, frequency_dim]` FP32.
 ///
-/// The reference's GLIDE/DiT order (`uniserve/nn/timestep.py`, `timestep_embedding`): the first half
+/// The GLIDE/DiT order: the first half
 /// of a row is a cosine per frequency and the second half is the sine of the same angle, so row
 /// `r`, element `i` is `cos(t_r · 10000^(-i/half))` for `i < half` and the sine for `i >= half`.
 ///

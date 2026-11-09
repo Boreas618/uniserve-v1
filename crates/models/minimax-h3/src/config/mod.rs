@@ -1,8 +1,8 @@
 //! MiniMax-H3's typed configuration: the checkpoint's architecture, read once at the loading
 //! boundary and immutable afterwards.
 //!
-//! `uniserve/models/minimax_h3/config.py` normalizes a checkpoint into one configuration before
-//! any module is built; this module does the same for the fields the Rust model reads. A
+//! A checkpoint is normalized into one configuration before any module is built, for the fields
+//! the model reads. A
 //! checkpoint is the base release (a pipeline index over the DiT partitions, text encoder, video
 //! VAE and audio VAE it holds) or a FastH3 export (one DiT partition and schedulers, with a
 //! contract naming the base revision it reads the rest from).
@@ -43,9 +43,7 @@ pub use denoiser::{
     AttentionKind, DenoiserConfig, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
     TransformerConfig,
 };
-pub use text::{
-    Activation, PixelConfig, RETAINED_LAYERS, TextEncoderConfig, VisionActivation, VisionConfig,
-};
+pub use text::{PixelConfig, RETAINED_LAYERS, TextEncoderConfig, VisionActivation, VisionConfig};
 pub use video_vae::{SpatialPadding, VideoVaeConfig};
 
 use crate::checkpoint::{ContractSchedule, Dit, Layout, Sidecars};
@@ -218,8 +216,8 @@ impl Config {
 
     /// The tasks a deployment of this checkpoint can serve: those of the network it holds.
     ///
-    /// A distilled export serves every task of the partition its student replaces, as the reference
-    /// reads it (`checkpoint.py`: "the student serves every task of the partition's network"). Which
+    /// A distilled export serves every task of the partition its student replaces: the student
+    /// serves every task of the partition's network. Which
     /// partition a deployment runs is the deployment page's statement, so a release that holds both
     /// serves the tasks of the one the page places.
     pub fn serving(&self) -> Vec<VideoTask> {

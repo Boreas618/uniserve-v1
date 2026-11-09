@@ -1,13 +1,11 @@
 //! The video encoder's tiled path: a raster larger than one tile becomes its latent by tiles that
 //! cross-fade where they meet.
 //!
-//! [`crate::encoding::VideoEncoder::encode`] encodes **one** tile; this module is the caller it
-//! describes. The reference
-//! (`uniserve/nn/vae/tiled.py:168-303`, `TiledEncoder.encode`) splits an aligned raster into
-//! overlapping tiles (`split_tiles`, `:9-44`), encodes the tile rows a band of latent rows depends
-//! on, blends the tiles vertically and then horizontally (`stitch_tiles`, `:46-81`), and crops the
-//! band. The geometry of that split is [`crate::encoding::Grid`], which the video encoder already
-//! owns because [`crate::video_vae::Seams`] is the decoder's split too.
+//! [`crate::encoding::VideoEncoder::encode_tile`] encodes **one** tile; this module is the caller
+//! it describes. A tiled encode splits an aligned raster into overlapping tiles, encodes the tile
+//! rows a band of latent rows depends on, blends the tiles vertically and then horizontally, and
+//! crops the band. The geometry of that split is [`crate::encoding::Grid`], which the video encoder
+//! already owns because [`crate::video_vae::Seams`] is the decoder's split too.
 //!
 //! What is here is the plan a driver executes: for each tile, where its latents land in the raster,
 //! how far it fades against the tile above and the tile to its left, and which tiles a band of
@@ -18,11 +16,11 @@
 //!
 //! - **A band equals the whole.** Encoding latent rows `[start, stop)` on its own encodes only the
 //!   tile rows those rows read and crops them from the same arithmetic, so the rows are identical to
-//!   the whole encoding's (`:236-240`). [`ClipEncoder::band`] states the tile rows and the crop.
+//!   the whole encoding's. [`ClipEncoder::band`] states the tile rows and the crop.
 //! - **Neighbours stay as decoded.** A tile's vertical fade reads the tile above *as decoded*, and
 //!   its horizontal fade reads the tile to its left *as decoded*, not as already faded, or the
-//!   overlap where two seams cross is computed in a different order from the seams themselves
-//!   (`:51-56`). [`Tile::above`] and [`Tile::left`] name those reads, and the driver keeps a second
+//!   overlap where two seams cross is computed in a different order from the seams themselves.
+//!   [`Tile::above`] and [`Tile::left`] name those reads, and the driver keeps a second
 //!   raster for them.
 
 use crate::encoding::{EncoderScratch, Extent, Grid, SPATIAL_RATIO, VideoEncoder};
@@ -341,43 +339,6 @@ impl ClipEncoder {
         Ok(programs.finish())
     }
 
-    /// Encode one run of the raster: every tile of `plan`, stitched into `scene.blended`.
-    ///
-    /// The tiles are written in [`Plan::tiles`] order, because a seam blend reads the block above it
-    /// and the block to its left, and both must be read **as decoded** rather than as already faded:
-    /// that is what makes the overlap where two seams cross follow the same arithmetic as the seams
-    /// themselves (`uniserve/nn/vae/tiled.py:51-56`). `nn::layers::CrossFade` reads its two sources as
-    /// contiguous blocks and writes its destination through the destination's strides, so the driver
-    /// keeps the decoded tiles in a ring of contiguous buffers and blends from there into the raster.
-    ///
-    /// Two buffers per tile column, one row of a two-row ring: row `r` reads row `r - 1`'s blocks and
-    /// overwrites row `r - 2`'s, which nothing reads again. One more block holds a tile whose fade is
-    /// both ways, because the second fade reads the first's result. A run's first tile row has nothing
-    /// above it, so its tiles blend only to the left; a run's first tile has nothing at all to blend
-    /// against, and its block reaches the raster through a blend of `extent` 1. That position takes
-    /// weight one on the **previous** source and zero on the current one
-    /// (`cross_fade.py`: `previous[along - extent + i] · (1 - i/extent) + current[i] · (i/extent)`),
-    /// so the pass-through is exact because the same block is passed as both sources - not because a
-    /// blend of one position ignores one of them.
-    pub fn encode(
-        &self,
-        f: &Forward,
-        encoder: &VideoEncoder,
-        plan: &Plan,
-        scene: Scene<'_>,
-    ) -> Result<()> {
-        let frames = scene
-            .pixels
-            .first()
-            .map(|tile| {
-                let axis = if scene.packed.is_some() { 1 } else { 2 };
-                u32::try_from(tile.shape.dim(axis)).unwrap_or(0)
-            })
-            .unwrap_or(0);
-        let run = self.reserve(f, encoder, plan, &[frames], scene.blended)?;
-        self.encode_in(f, encoder, plan, scene, &run)
-    }
-
     /// One reservation for clips of `frames` frames each, whose blocks are at most `raster`'s.
     ///
     /// The arena never rewinds inside a forward, so a reservation inside a loop is multiplied by the
@@ -442,7 +403,25 @@ impl ClipEncoder {
         })
     }
 
-    /// [`Self::encode`] in a reservation of [`Self::reserve`]: one clip's tiles into its raster.
+    /// Encode one clip's tiles of `plan` into its raster, `scene.blended`, in a reservation of
+    /// [`Self::reserve`].
+    ///
+    /// The tiles are written in [`Plan::tiles`] order, because a seam blend reads the block above
+    /// it and the block to its left, and both must be read **as decoded** rather than as already
+    /// faded: that is what makes the overlap where two seams cross follow the same arithmetic as
+    /// the seams themselves. `nn::layers::CrossFade` reads its two sources as contiguous blocks and
+    /// writes its destination through the destination's strides, so the driver keeps the decoded
+    /// tiles in a ring of contiguous buffers and blends from there into the raster.
+    ///
+    /// Two buffers per tile column, one row of a two-row ring: row `r` reads row `r - 1`'s blocks
+    /// and overwrites row `r - 2`'s, which nothing reads again. One more block holds a tile whose
+    /// fade is both ways, because the second fade reads the first's result. A run's first tile row
+    /// has nothing above it, so its tiles blend only to the left; a run's first tile has nothing at
+    /// all to blend against, and its block reaches the raster through a blend of `extent` 1. That
+    /// position takes weight one on the **previous** source and zero on the current one
+    /// (`previous[along - extent + i] · (1 - i/extent) + current[i] · (i/extent)`), so the
+    /// pass-through is exact because the same block is passed as both sources - not because a blend
+    /// of one position ignores one of them.
     pub fn encode_in(
         &self,
         f: &Forward,
@@ -701,8 +680,7 @@ impl ClipEncoder {
                     // band that starts inside a seam reads the row above it through
                     // `Grid::band`, so that row is in the run.
                     // A tile fades over the seam it shares with the neighbour *before* it: the row
-                    // above and the column to its left, each seam its own width
-                    // (`uniserve/nn/vae/tiled.py:63-73`).
+                    // above and the column to its left, each seam its own width.
                     above: if row > first { rows_blend[row - 1] } else { 0 },
                     left: if column > 0 {
                         columns_blend[column - 1]
@@ -723,8 +701,8 @@ impl ClipEncoder {
 #[cfg(test)]
 mod tests {
     //! The expectations below are the reference's own numbers, not this module's arithmetic run
-    //! backwards: `split_tiles` (`uniserve/nn/vae/tiled.py:9-44`) and the band prelude of
-    //! `TiledEncoder.encode` (`:246-262`) were extracted from the reference source and evaluated on
+    //! backwards: `split_tiles` and the band prelude of
+    //! `TiledEncoder.encode` were extracted from the reference source and evaluated on
     //! the rasters these tests use - 768 by 1344, 256 by 256, 480 by 832 - before the values were
     //! written down.
 

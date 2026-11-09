@@ -2468,7 +2468,6 @@ version = "2.0.0"
 dependencies = [
  "nn",
  "ops",
- "platform",
  "processing",
  "proto",
  "serde",

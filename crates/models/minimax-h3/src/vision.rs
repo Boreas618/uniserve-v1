@@ -1,7 +1,7 @@
 //! The Qwen3-VL vision tower: tubelet patches to language-width tokens.
 //!
-//! `uniserve/models/qwen3_vl/vision.py` is the reference, and `uniserve/nn/vision/position.py` the
-//! position helper it composes. One image block's patches - a still image is one time step - are
+//! The tower is Qwen3-VL's, with its learned position table resampled to each grid. One image
+//! block's patches - a still image is one time step - are
 //! projected by the patch embedding, given a learned 2-D position resampled to their grid, rotated
 //! by a 2-D rotary position, encoded by `depth` pre-norm blocks, and merged so that every
 //! `merge x merge` block of patches becomes one token of the language model's width. Three
@@ -11,7 +11,7 @@
 //! ## What the request decides, and where it enters
 //!
 //! Every value a request decides enters as a device table the encoder runner prepared on the host
-//! from the request's grids (`crate::positions`, specs/worker.md 9): the position table's four row
+//! from the request's grids ([`crate::positions`]): the position table's four row
 //! indices and FP32 weights per patch, the 2-D rotary cosine and sine per patch, and the attention
 //! lengths of the grid's time steps. Attention never crosses a time step - each temporal patch of a
 //! grid is one bidirectional sequence of `height * width` patches - so those lengths are both the
@@ -22,7 +22,7 @@
 //! coordinates as an ordinary trailing position axis: each axis therefore reads the whole
 //! `head_dim / 4`-frequency spectrum with its own coordinate, so compact frequency
 //! `a · (head_dim / 4) + f` of a patch at `(row, column)` turns by `coordinate(a) · inv_freq(f)`
-//! (`uniserve/nn/rope.py::RotaryEmbedding._factors` over a `[patches, 2]` position). That is
+//! over a `[patches, 2]` position. That is
 //! neither the contiguous nor the interleaved M-RoPE cut, both of which give each axis its own band
 //! of frequencies, so the factors are the runner's tables and
 //! [`crate::positions::VisionRotary::factors`] computes them in the reference's FP32 formulas.
@@ -37,11 +37,11 @@
 //!
 //! ## The tubelet layout
 //!
-//! The patch embedding reads the processor's flat tubelets, channel-major
-//! (`in_channels · temporal_patch · patch²`, the layout Qwen-VL image processors emit) against the
-//! checkpoint's Conv3d weight flattened in the same order (`uniserve/nn/vision/modules.py:37-46`,
-//! `TubeletEmbed`): the convolution's kernel equals its stride, so one matrix product over the
-//! flattened tubelets evaluates it, and no permutation sits between the checkpoint and the product.
+//! The patch embedding reads the processor's flat tubelets, channel-major (`in_channels ·
+//! temporal_patch · patch²`, the layout Qwen-VL image processors emit) against the checkpoint's
+//! Conv3d weight flattened in the same order: the convolution's kernel equals its stride, so one
+//! matrix product over the flattened tubelets evaluates it, and no permutation sits between the
+//! checkpoint and the product.
 //!
 //! ## The two GELUs
 //!
@@ -178,8 +178,8 @@ impl BlockRows {
 
     /// The elements of one head: the hidden state split evenly between the heads.
     ///
-    /// The checkpoint states no separate head width for the tower - the reference derives it the
-    /// same way (`VisionConfig::head_dim` in `uniserve/models/qwen3_vl/config.py`).
+    /// The checkpoint states no separate head width for the tower, so it is the hidden width over
+    /// the head count.
     pub fn head_dim(config: &VisionConfig) -> Result<u32> {
         if config.num_heads == 0 || !config.hidden_size.is_multiple_of(config.num_heads) {
             return Err(invalid(
@@ -316,28 +316,6 @@ impl Buffers {
             merged: reserve(Shape::new(&[blocks, width]))?,
             merged_activated: reserve(Shape::new(&[blocks, width]))?,
         })
-    }
-
-    /// Use `view` as the residual stream instead of this block's own arena buffer.
-    ///
-    /// The diagnosis of specs/worker.md 10 dumps the tower's residual stream after its last block,
-    /// which lives in an arena reservation whose address the runner does not know. Handing the
-    /// runner's own view in as the stream costs nothing and changes no number: the same kernels
-    /// write the same rows, at another address.
-    pub fn with_stream(mut self, view: TensorView) -> Result<Self> {
-        let rows = self.hidden.rows();
-        let columns = self.hidden.last();
-        if view.shape != self.hidden.shape {
-            return Err(invalid(
-                "VisionTower",
-                format!(
-                    "the diagnostic stream is {:?}, [{rows}, {columns}] expected",
-                    view.shape.dims()
-                ),
-            ));
-        }
-        self.hidden = view;
-        Ok(self)
     }
 
     /// The bytes [`Buffers::new`] reserves for a grid of `patches` patches.
@@ -913,8 +891,6 @@ impl VisionTower {
         })
     }
 
-
-
     /// How many DeepStack feature tables one block returns.
     pub fn deepstack_features(&self) -> usize {
         self.deepstack.len()
@@ -925,14 +901,13 @@ impl VisionTower {
         Buffers::new(arena, &self.config, patches, self.dtype)
     }
 
-
     /// Encode one image block's patches into `out`.
     ///
     /// `image` carries the patches and the five prepared tables of its grid; `out` receives tokens
     /// of the language model's width, `merge²` patches each: the tower's own features and one table
-    /// per DeepStack block. One call per block, in prompt order (`uniserve/models/qwen3_vl/vision.py`
-    /// runs one call over the concatenation of every block; the rows of one block never meet another
-    /// block's, so a call per block is the same arithmetic row by row).
+    /// per DeepStack block. One call per block, in prompt order: the rows of one block never meet
+    /// another block's, so a call per block is the arithmetic of one call over their concatenation,
+    /// row by row.
     pub fn encode(
         &self,
         f: &Forward,
@@ -982,7 +957,7 @@ impl VisionTower {
 
         // One bidirectional launch over the grid's time steps: the descriptor's key bound is the
         // block's own patches (the reference's attention declares none), and its scale the head's
-        // `head_dim^-0.5` (`uniserve/nn/attention/layer.py:90`).
+        // `head_dim^-0.5`.
         let attention = Attention::dense(
             self.head_dim,
             self.heads,

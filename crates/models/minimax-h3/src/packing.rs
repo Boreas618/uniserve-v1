@@ -1,9 +1,9 @@
 //! The host plan of one H3 request: its frames, clips and latents, the rows its packed sequence
 //! holds, and the tile order a sparse layout walks them in.
 //!
-//! `uniserve/models/minimax_h3/packing.py` is the released plan. Nothing here touches a device: the
+//! Nothing here touches a device: the
 //! worker uploads the tables this module computes into the batches its kernels read, so a
-//! captured graph addresses them unchanged from capture to replay (specs/worker.md 4.5).
+//! captured graph addresses them unchanged from capture to replay.
 //!
 //! ## The timeline
 //!
@@ -447,7 +447,7 @@ const ROPE_FRAMES_PER_LATENT: [u32; 5] = [1, 4, 4, 4, 4];
 const ROPE_SPATIAL_SCALE: f64 = 32.0;
 
 /// Latent frames one clip's decoder input covers: its five advancing frames and the two the next
-/// clip also reads (`uniserve/models/minimax_h3/decoding.py::VideoDecoder.clip_input`).
+/// clip also reads.
 const CLIP_DECODE_LATENTS: u32 = 7;
 
 /// The rotary coordinates of the patches along one spatial axis.
@@ -498,7 +498,7 @@ fn temporal_grid(count: u32, origin: f64) -> Vec<f64> {
 ///
 /// The reference sums this series sequentially for a reference video's clock and pairwise for a
 /// last keyframe's anchor; the two differ in the last place of FP64 from 16 latent frames on. This
-/// module sums sequentially, which the numeric diagnosis (specs/worker.md 10) tolerates.
+/// module sums sequentially.
 fn video_span(frames: u32) -> f64 {
     (0..frames)
         .map(|index| ROPE_FRAME_RESCALE * f64::from(ROPE_FRAMES_PER_LATENT[index as usize % 5]))

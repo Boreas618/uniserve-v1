@@ -1,13 +1,12 @@
 //! The Qwen3-VL text encoder of MiniMax-H3: a prompt's hidden states, its media spliced in.
 //!
-//! `uniserve/models/minimax_h3/encoder.py` is the reference: H3 places the Qwen3-VL language model
+//! H3 places the Qwen3-VL language model
 //! and the vision tower, runs only the first [`RETAINED_LAYERS`](crate::RETAINED_LAYERS) of the
 //! checkpoint's decoder layers, and returns the last retained layer's raw hidden state - the
 //! checkpoint's final normalization is not part of H3's conditioning path (`network.norm =
 //! Identity`). The tower's merged tokens replace the prompt's image and video placeholder tokens,
 //! and DeepStack feature `j` is added to the residual stream after retained layer `j`, whichever
-//! tower block it was merged from (`uniserve/models/encoder.py::_deepstack`, and
-//! `uniserve/models/transformer.py::_traverse` for the addition).
+//! tower block it was merged from.
 //!
 //! ## The layer recurrence
 //!
@@ -18,8 +17,7 @@
 //! `residual, hidden = add_rms_norm(attn, residual, post_attention_norm)`, and returns
 //! `mlp(hidden)` unsummed. The first layer receives the embeddings with no residual yet, and the
 //! last update is added once at the end, which is the reference's `norm(hidden + residual)` with
-//! `norm` the identity (`uniserve/models/qwen3/transformer.py:178-201` for the layer, and
-//! `uniserve/models/transformer.py:436-451` for the final fold).
+//! `norm` the identity.
 //!
 //! A DeepStack addition is the one place the recurrence is cut: the reference adds the layer's own
 //! output to the residual (`residual + hidden`, one rounding), then the features (a second
@@ -102,7 +100,7 @@ impl Plan {
     /// The plan of one prompt of `tokens` rows whose images have the patch grids `grids`.
     ///
     /// The grids are the request's host values; `grids.len()` is the number of tower calls. A
-    /// decode-style call ([`Plan::of_text`]) is a prompt with no images.
+    /// text-only prompt has no grids.
     pub fn new(
         config: &TextEncoderConfig,
         partition: &Partition,
@@ -141,11 +139,6 @@ impl Plan {
         })
     }
 
-    /// The plan of a text-only prompt of `tokens` rows.
-    pub fn of_text(config: &TextEncoderConfig, partition: &Partition, tokens: u32) -> Result<Self> {
-        Self::new(config, partition, tokens, &[])
-    }
-
     /// The plan of the layout a worker prepared.
     ///
     /// A layout that reserves more output rows than the prompt presents is refused: the batch's
@@ -169,7 +162,6 @@ impl Plan {
         }
         Ok(plan)
     }
-
 
     /// The bytes one encode call of this plan reserves in the arena.
     pub fn bytes(&self, config: &TextEncoderConfig, dtype: nn::DType) -> Result<u64> {
@@ -201,10 +193,9 @@ pub fn element_of(dtype: nn::DType) -> &'static str {
 ///
 /// The checkpoint states `mrope_section: [24, 20, 20]` and `mrope_interleaved: true`
 /// (`text_encoder/config.json`, `rope_scaling`). The widths count *frequencies*, and the rotary
-/// operator counts *rotated elements*, so each is doubled; the interleaved cut is the only one the
-/// reference implements for sectioned positions - `uniserve/nn/rope.py:280-284` assigns every
-/// compact frequency the axis `_interleaved_axes` gives it (`j % 3` while `j < widths[a] * 3`),
-/// and the contiguous cut is a different coordinate assignment.
+/// operator counts *rotated elements*, so each is doubled; the interleaved cut assigns every
+/// compact frequency the axis `ops::rope::interleaved_axes` gives it (`j % 3` while
+/// `j < widths[a] * 3`), and the contiguous cut is a different coordinate assignment.
 fn sections_of(config: &TextEncoderConfig) -> Result<Sections> {
     let mrope = Mrope::new(config.mrope_sections, config.head_dim)?;
     let widths = mrope.widths().map(|width| width * 2);
@@ -364,7 +355,6 @@ impl Buffers {
         })
     }
 
-
     /// The bytes [`Buffers::new`] reserves.
     fn bytes(plan: &Plan, dtype: nn::DType) -> Result<u64> {
         let arena = Arena::new(DevicePtr::new(0), u64::MAX);
@@ -380,7 +370,6 @@ impl Buffers {
     ) -> Result<u64> {
         crate::vision::Buffers::bytes(config, patches, dtype)
     }
-
 
     /// `view`'s rows as `[rows, heads, head_dim]` for the rotation and attention operators.
     fn as_heads(&self, view: TensorView, heads: u32, head_dim: u32) -> Result<TensorView> {
@@ -889,14 +878,6 @@ impl TextEncoder {
         })
     }
 
-
-
-    /// The element type of the encoder's activations.
-    pub const fn dtype(&self) -> nn::DType {
-        self.dtype
-    }
-
-
     /// How many prompt tokens one encode call of `grids` covers at most: the packed tokens.
     pub fn plan(&self, tokens: u32, grids: &[[u32; 3]]) -> Result<Plan> {
         Plan::new(&self.config, &self.partition, tokens, grids)
@@ -952,7 +933,6 @@ impl TextEncoder {
     ) -> Result<()> {
         write_state(&self.config, prompt.ids, layout, out)
     }
-
 
     /// Sum a row-parallel projection's partial product over the group.
     fn reduce(&self, f: &Forward, view: TensorView) -> Result<()> {
@@ -1041,32 +1021,6 @@ impl TextEncoder {
         let buffers = Buffers::new(f.arena(), &plan, self.dtype)?;
         let hidden = out.hidden;
 
-        // The diagnosis of specs/worker.md 10 asks for two values the runner cannot otherwise
-        // reach: the tower's residual stream after its last block and the merged feature table.
-        // Both arrive as borrowed views, are used in place of the arena's own buffers, and change
-        // no number; a serving call passes none.
-        let diagnostics = inputs.diagnostics;
-        let mut buffers = buffers;
-        if !diagnostics.is_empty() && diagnostics.len() != 2 {
-            return Err(invalid_input(format!(
-                "{} diagnostic views, [vision_hidden, merged] or none expected",
-                diagnostics.len()
-            )));
-        }
-        let vision_hidden = diagnostics.first().copied();
-        if let Some(merged) = diagnostics.get(1).copied() {
-            if merged.rows() != u64::from(plan.merged) || merged.last() != u64::from(plan.hidden) {
-                return Err(invalid_input(format!(
-                    "the diagnostic feature table is {} rows of {}, [{}, {}] expected",
-                    merged.rows(),
-                    merged.last(),
-                    plan.merged,
-                    plan.hidden
-                )));
-            }
-            buffers.features = merged;
-        }
-
         // 1. The vision tower, one call per image, in prompt order: the k-th merged row of the
         //    concatenation takes the k-th vision placeholder of the prompt.
         let merged = u64::from(plan.merged);
@@ -1090,14 +1044,7 @@ impl TextEncoder {
             // launches follow on the stream, so each block reuses the bytes of the one before it: a
             // request of several enlarged images took more than the arena holds.
             let block = f.arena().mark();
-            let mut tower = self.tower.buffers(f.arena(), patches)?;
-            if let Some(stream) = vision_hidden {
-                tower = tower.with_stream(stream).map_err(|error| {
-                    invalid_input(format!(
-                        "the diagnostic stream of the {patches} patch block: {error}"
-                    ))
-                })?;
-            }
+            let tower = self.tower.buffers(f.arena(), patches)?;
             let rows = u64::from(image_tables.rows.merged);
             for table in 0..self.tower.deepstack_features() {
                 deepstack.push(Buffers::rows_of(
@@ -1200,9 +1147,6 @@ impl TextEncoder {
     }
 }
 
-impl TextEncoder {
-}
-
 impl Encoder for TextEncoder {
     /// The layout of a batch and its images.
     ///
@@ -1303,8 +1247,7 @@ fn write_state(
 
     // A vision grid reaches `rope_index` in the shape the prompt presents it: an image block is
     // one run of `time · rows · columns` placeholders with its whole grid, a video block is one
-    // run per temporal patch, each of `rows · columns` placeholders on a single time step
-    // (`uniserve/models/qwen3_vl/positions.py:31-52`).
+    // run per temporal patch, each of `rows · columns` placeholders on a single time step.
     let (image_grids, video_grids) = run_grids(
         ids,
         &plan.grids,
@@ -1404,7 +1347,7 @@ fn write_state(
 ///
 /// This is the whole of [`Encoder::prepare_state`] without an encoder: the arithmetic depends on the
 /// configuration and the prompt, not on the weights, so the block-by-block diagnosis can compare the
-/// tables against the reference without loading a checkpoint (specs/worker.md 10). Serving does not
+/// tables against the reference without loading a checkpoint. Serving does not
 /// call it: the worker owns the buffers there, and `prepare_state` writes into them in place.
 pub fn table_bytes(
     config: &TextEncoderConfig,
@@ -1529,8 +1472,8 @@ fn layout_counts(layout: &EncoderLayout, merge: u32) -> (Vec<u32>, Vec<u32>, u32
 
 /// The two grid lists [`positions::rope_index`] reads, one entry per vision placeholder run.
 ///
-/// A vision grid reaches `rope_index` in the shape the prompt presents it
-/// (`uniserve/models/qwen3_vl/positions.py:31-52`): an image block is one run of
+/// A vision grid reaches `rope_index` in the shape the prompt presents it:
+/// an image block is one run of
 /// `time · rows · columns` placeholders under its whole grid, a video block is one run per temporal
 /// patch, each of `rows · columns` placeholders on a single time step. The run lengths are what
 /// tells the two apart, and the grids arrive in the prompt's block order.
@@ -1731,8 +1674,8 @@ fn normalization(
 
 /// The rotary frequency table: `theta^(-2j/head_dim)` for every rotated frequency, in FP32.
 ///
-/// It is computed once here from the configuration (specs/worker.md 9: the frequency table is a
-/// loading-boundary value) and published as a retained constant, so the factors op reads it as a
+/// It is computed once here from the configuration (the frequency table is a loading-boundary
+/// value) and published as a retained constant, so the factors op reads it as a
 /// device weight like any other.
 fn frequencies(loader: &mut WeightLoader<'_>, config: &TextEncoderConfig) -> Result<Weight> {
     let frequencies = positions::inverse_frequencies(config.head_dim, config.rope_theta)?;
@@ -1779,7 +1722,6 @@ mod tests {
         // norms, two layer norms and the gated MLP's three.
         assert_eq!(keys.len(), 11 * config.num_retained_layers as usize + 1);
     }
-
 
     /// The tower's named plan is its byte plan, for a block of patches.
     #[test]
@@ -1867,13 +1809,12 @@ mod tests {
             u64::from(widths.iter().sum::<u32>()),
             u64::from(config.head_dim)
         );
-        // The device's assignment (`ops::rope::interleaved_axes`, the kernel's rule) is the host's
-        // (`positions::Mrope::frequency_axes`, the tables the diagnosis compares).
-        let host = Mrope::new(config.mrope_sections, config.head_dim)
-            .expect("sections")
-            .frequency_axes();
-        assert_eq!(ops::rope::interleaved_axes(&widths), host);
-        assert_eq!(host.len(), (config.head_dim / 2) as usize);
+        // The device's assignment (`ops::rope::interleaved_axes`, the kernel's rule) names one
+        // axis per compact frequency.
+        assert_eq!(
+            ops::rope::interleaved_axes(&widths).len(),
+            (config.head_dim / 2) as usize
+        );
     }
 
     #[test]
@@ -2292,7 +2233,7 @@ mod tests {
     #[test]
     fn the_plan_of_a_text_prompt_has_no_vision_rows() {
         let config = config();
-        let plan = Plan::of_text(&config, &Partition::single(), 128).expect("one prompt");
+        let plan = Plan::new(&config, &Partition::single(), 128, &[]).expect("one prompt");
         assert!(plan.images.is_empty());
         assert_eq!(plan.merged, 0);
         assert_eq!(plan.rows, 128);
@@ -2302,9 +2243,9 @@ mod tests {
     fn the_plan_reserves_more_with_images_and_more_rows() {
         let config = config();
         let single = Partition::single();
-        let text = Plan::of_text(&config, &single, 512).expect("a text prompt");
+        let text = Plan::new(&config, &single, 512, &[]).expect("a text prompt");
         let prompt = Plan::new(&config, &single, 512, &[[1, 24, 24]]).expect("one image");
-        let longer = Plan::of_text(&config, &single, 1024).expect("a longer prompt");
+        let longer = Plan::new(&config, &single, 1024, &[]).expect("a longer prompt");
         let dtype = nn::DType::BF16;
         let text_bytes = text.bytes(&config, dtype).expect("bytes");
         let prompt_bytes = prompt.bytes(&config, dtype).expect("bytes");

@@ -2,7 +2,7 @@
 //! contract that states a student's schedule and sparse attention, and the JSON sidecars the
 //! loading boundary reads.
 //!
-//! A checkpoint is one of two things (specs/worker.md 9, `docs/minimax_h3/minimax_h3.md`):
+//! A checkpoint is one of two things (`docs/minimax_h3/minimax_h3.md`):
 //!
 //! - the base release, a pipeline index (`model_index.json`) over the directories
 //!   `transformer`, `transformer_ref`, `text_encoder`, `processor`, `vae` and `audio_vae`, of which
@@ -55,7 +55,6 @@ pub const TASK_DITS: [(VideoTask, Dit); 3] = [
     (VideoTask::FirstLastToVideoAudio, Dit::Base),
     (VideoTask::ReferenceToVideoAudio, Dit::Reference),
 ];
-
 
 /// The pipeline class a load of this crate takes (`model_index.json`'s `_class_name`).
 ///
