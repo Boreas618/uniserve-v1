@@ -274,33 +274,43 @@ pub(super) fn handshake(control: &mut Control, launch: &EngineArgs) -> Result<Ep
     if !welcome.refusal.is_empty() {
         bail!("the daemon refused this main process: {}", welcome.refusal);
     }
+    Epoch::of(launch)
+}
 
-    // The epoch's programs and the generation that serves at start are not in the launch file:
-    // the programs arrive as the daemon's first `Precopy` and the generation number
-    // is the daemon's own. Until it states one, this process serves generation zero, whose
-    // `Precopy` names the daemon's next number.
-    //
-    // The host identity is the daemon's fact and nothing else can supply it: the Storage Server
-    // keys this rank's claim by it, so an empty one would mint a claim on a host that does not
-    // exist and every peer would compare its products against the wrong node.
-    if launch.host.is_empty() {
-        bail!(
-            "the launch file states no host identity, which this rank's storage claim is keyed by"
-        );
+impl Epoch {
+    /// The epoch `launch` states, as this node takes it at start.
+    ///
+    /// # Errors
+    ///
+    /// When the launch states no host identity.
+    pub(super) fn of(launch: &EngineArgs) -> Result<Self> {
+        // The epoch's programs and the generation that serves at start are not in the launch file:
+        // the programs arrive as the daemon's first `Precopy` and the generation number
+        // is the daemon's own. Until it states one, this process serves generation zero, whose
+        // `Precopy` names the daemon's next number.
+        //
+        // The host identity is the daemon's fact and nothing else can supply it: the Storage Server
+        // keys this rank's claim by it, so an empty one would mint a claim on a host that does not
+        // exist and every peer would compare its products against the wrong node.
+        if launch.host.is_empty() {
+            bail!(
+                "the launch file states no host identity, which this rank's storage claim is keyed by"
+            );
+        }
+        let predecessor = launch.predecessor.as_ref();
+        Ok(Self {
+            generation: 0,
+            predecessor_epoch: predecessor.map(|predecessor| predecessor.epoch),
+            predecessor_cache: predecessor
+                .map(|predecessor| predecessor.segments.clone())
+                .unwrap_or_default(),
+            experts: launch
+                .expert_order
+                .iter()
+                .map(|(module, order)| (module.clone(), order.experts.clone()))
+                .collect(),
+            host: launch.host.clone(),
+            profiling: launch.engine_config.profiling.clone(),
+        })
     }
-    let predecessor = launch.predecessor.as_ref();
-    Ok(Epoch {
-        generation: 0,
-        predecessor_epoch: predecessor.map(|predecessor| predecessor.epoch),
-        predecessor_cache: predecessor
-            .map(|predecessor| predecessor.segments.clone())
-            .unwrap_or_default(),
-        experts: launch
-            .expert_order
-            .iter()
-            .map(|(module, order)| (module.clone(), order.experts.clone()))
-            .collect(),
-        host: launch.host.clone(),
-        profiling: launch.engine_config.profiling.clone(),
-    })
 }

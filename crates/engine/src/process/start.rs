@@ -6,22 +6,20 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail};
-use ops::Generation;
 use program_server::Client;
 use program_server::program::Programs;
 use proto::config::EngineArgs;
 use worker::blocking::{BlockingKind, ThreadPool};
 use worker::control::{Control, Endpoints};
-use worker::device::Worker;
 use worker::hot_update::HotUpdate;
-use worker::runners::products::{GroupProducts, RankProducts};
+use worker::runners::products::GroupProducts;
 use worker::watchdog::Watchdog;
 
 use super::MainProcess;
 use super::claim::claim;
 use super::device_command;
 use super::launch::{Epoch, ProcessInterface, handshake};
-use super::ranks::{LoadedRank, load_ranks, schedulers};
+use super::ranks::{Backing, LoadedRank, load_ranks, schedulers};
 use super::reports::{announce, state_failure};
 use super::serve::Wait;
 use crate::programs::modules::ModuleWork;
@@ -125,7 +123,7 @@ impl MainProcess {
             host_kv_cache,
             &rank_numbers,
         )?;
-        let ranks = load_ranks(rank_runners, &storage, launch, &epoch)?;
+        let ranks = load_ranks(rank_runners, Backing::Serving(&storage), launch, &epoch)?;
 
         // The resident owners are opened before any thread that borrows them, and
         // released in reverse order by `close`. The weights are mapped before the capacity plan
@@ -188,61 +186,25 @@ impl MainProcess {
         let mut scheduled = Vec::with_capacity(ranks.len());
         // The group's products, which every rank's runners reach through their own view of them.
         let group_products = GroupProducts::new(ranks.len());
-        let rank_count = ranks.len() as u32;
-        for (rank_index, rank) in ranks.into_iter().enumerate() {
+        let rank_count = ranks.len();
+        for (rank_index, mut rank) in ranks.into_iter().enumerate() {
+            let spawned = rank.spawn_workers(
+                (rank_index, rank_count),
+                &group_products,
+                epoch.generation,
+                &blocking,
+            )?;
             let LoadedRank {
                 model_runner: rank_runner,
                 weights,
                 client,
                 model,
-                mut memory,
-                mut inventory,
-                graph,
-                groups,
+                memory,
+                inventory,
+                ..
             } = rank;
-            // The scheduler sees the group as one pool, and each rank encodes its own units, so the
-            // pool holds every rank's host tasks.
-            inventory.host_task_capacity *= rank_count;
-            // The device's one pool set is the resident owners' allocator: it is opened with
-            // the memory and handed to the worker thread, so every owner and every runner books
-            // against the same allowance.
-            let pools = memory.pools();
-            // The scratch pool's figure comes from the one call that sized it, with the memory: the
-            // shadow region and the state group's snapshot are one reservation, and a second
-            // computation here could disagree with the pool the allocator reserved.
-            let scratch = graph.scratch;
-            // The shadow region alone: the twins allocate it, and the reservation beside it holds
-            // the state group's snapshot too.
-            let shadow = graph.shadow;
-            let products: Arc<dyn worker::runners::products::Products> =
-                Arc::new(RankProducts::new(Arc::clone(&group_products), rank_index));
-            // What the rank's trajectories are computed with, which keys the pages of its host latent
-            // pool: the weights it loaded.
-            let identity = worker::data_plane::identity_of(&weights);
-            for device in rank_runner.devices() {
-                let generation = Arc::new(Generation::new(epoch.generation, std::iter::empty()));
-                // The scheduler counts this process's ranks as one, the first rank's report, so the
-                // first rank states the host latent pool for all of them.
-                let runners = rank_runner.runners(
-                    *device,
-                    &model,
-                    &mut memory,
-                    &generation,
-                    &blocking,
-                    &groups,
-                    &client,
-                    &identity,
-                    (rank_index == 0).then_some(&mut inventory),
-                )?;
-                let worker = Worker::spawn(
-                    *device,
-                    runners,
-                    rank_runner.events(),
-                    Arc::clone(&pools),
-                    Arc::clone(&products),
-                    scratch,
-                    shadow,
-                )?;
+            let client = client.context("a serving rank holds its Storage Server client")?;
+            for (device, worker, generation) in spawned {
                 // The precopy shadows a replaced operator beside the serving one, so the region it
                 // runs in is mapped before any batch: the worker books it from the scratch pool
                 // the graph storage sized. Nothing is serving yet, so the control thread waits here;
@@ -254,7 +216,7 @@ impl MainProcess {
                 // yet. It runs at the first switchover, which is the boundary the first request is
                 // served at.
                 let shadow = worker.set_shadow()?;
-                device_command(&watchdog, *device, "shadow region", shadow)
+                device_command(&watchdog, device, "shadow region", shadow)
                     .with_context(|| format!("mapping the shadow region of device {}", device.0))?;
                 // The park's and the wake's commands reach the Storage Server's ledger from the
                 // device thread, which owns the stream a wake resets its units on, so the client is
@@ -271,7 +233,7 @@ impl MainProcess {
                 data_ranks.push(worker::data_plane::Rank {
                     rank: rank_runner.rank(),
                     worker: Arc::downgrade(&worker),
-                    device: *device,
+                    device,
                     storage: Arc::clone(&client),
                     cache: memory.shared_cache(),
                     model: Arc::new(crate::rank::RankModel::new(rank_runner.clone())),

@@ -596,73 +596,22 @@ impl EngineControl {
     }
 
     /// The launch file's contents for the process `engine`: `args`, with this
-    /// control's statement of the process's place and interfaces.
-    ///
-    /// A value the file requires and the daemon cannot state is an error here
-    /// rather than a default: the engine refuses a launch file that lacks one,
-    /// and a default would be a fact the daemon invented about the process.
+    /// control's statement of the process's place and interfaces ([`place`]).
     ///
     /// # Errors
     ///
-    /// Fails for a configuration of no model, a child on a host that does not
-    /// share this daemon's runtime directory, a rank of this host on a device
-    /// that is not CUDA's, a queue depth the file cannot hold, and a node with
-    /// no Program Server.
-    fn launch(&self, mut args: EngineArgs, engine: u64) -> anyhow::Result<EngineArgs> {
-        let config = &args.engine_config;
-        anyhow::ensure!(
-            !config.model.model.is_empty(),
-            "the engine configuration names no model"
-        );
-        // Form (A): the child opens the launch file this daemon wrote, so it
-        // has to be this daemon's own host. A remote host needs the launch
-        // contents carried in `process::Spawn`, which the protocol does not do
-        // yet, and a path that exists only here would fail in the child.
-        anyhow::ensure!(
-            config.parallel.engine_host == self.host,
-            "engine host {} does not share this daemon's runtime directory {}: a main process on \
-             another host needs the launch contents carried in `process::Spawn`",
-            config.parallel.engine_host,
-            self.runtime.display()
-        );
-        // The devices are the deployment's own: each host's ranks are on the
-        // ordinals the shorthand gives them (`0..` in rank order), or on the
-        // order `device_config.devices` names, which the shorthand has already
-        // folded into the ranks. Reading them from the ranks is the one account:
-        // a config that states no order still gives this node's ranks their
-        // devices, and a rank on `cpu` is refused here rather than in the child.
-        let devices = local_devices(&self.host, config)?;
-        let queue_depth = u32::try_from(config.device.queue_depth.get())
-            .context("`device_config.queue_depth` exceeds the launch file's field")?;
-        // A new epoch takes the identity of its first engine; an engine that
-        // replaces a lost one goes on with its epoch.
-        if args.epoch == 0 {
-            args.epoch = engine;
-        }
-        // One main process per node today, so it has no peer to accept: the
-        // world is this rank alone. A deployment that starts more states their
-        // addresses here, and the world grows with them (exec's rule: the
-        // epoch is its peers and itself).
-        let peers: Vec<String> = Vec::new();
-        args.world_size = u32::try_from(peers.len() + 1).unwrap_or(u32::MAX);
-        args.host = self.host.clone();
-        args.requests = self.request_address.clone();
-        args.processes = self.processes.clone();
-        args.engine = engine;
-        args.program_server = self.program_server.display().to_string();
-        args.devices = devices;
-        args.group = ENGINE_GROUP.to_owned();
-        args.rank = 0;
-        // The check above makes this node the engine's host, and the
-        // deployment keeps one scheduler node, which is this one.
-        args.scheduler_node = true;
-        args.peers = peers;
-        // Both are the epoch's, and the epoch states them in its engine
-        // configuration, which the child reads.
-        args.watchdog_timeout_s = None;
-        args.rollback_s = None;
-        args.queue_depth = queue_depth;
-        Ok(args)
+    /// As [`place`].
+    fn launch(&self, args: EngineArgs, engine: u64) -> anyhow::Result<EngineArgs> {
+        place(
+            args,
+            engine,
+            &Interfaces {
+                host: &self.host,
+                requests: &self.request_address,
+                processes: &self.processes,
+                program_server: &self.program_server,
+            },
+        )
     }
 
     /// What the epoch layer starts one epoch's main process with: the
@@ -1686,6 +1635,94 @@ fn unanswerable(host: &str, error: impl std::fmt::Display) -> crate::epoch::Fail
     }
 }
 
+/// What a node's main process reaches, as its launch file states it.
+pub(crate) struct Interfaces<'a> {
+    /// The node's host identity: the deployment's engine host must be this one.
+    pub(crate) host: &'a str,
+    /// The leader daemon's request interface.
+    pub(crate) requests: &'a str,
+    /// The daemon's process interface.
+    pub(crate) processes: &'a str,
+    /// The Program Server's socket.
+    pub(crate) program_server: &'a Path,
+}
+
+/// The launch file's contents for the process `engine` on the node `interfaces` describes:
+/// `args`, with the process's place in the deployment (its devices, group, rank and world) and
+/// its interfaces stated.
+///
+/// A value the file requires and the daemon cannot state is an error here
+/// rather than a default: the engine refuses a launch file that lacks one,
+/// and a default would be a fact the daemon invented about the process.
+///
+/// # Errors
+///
+/// Fails for a configuration of no model, an engine host that is not this
+/// node (a child on another host does not share this daemon's runtime
+/// directory), a rank of this host on a device that is not CUDA's, and a
+/// queue depth the file cannot hold.
+pub(crate) fn place(
+    mut args: EngineArgs,
+    engine: u64,
+    interfaces: &Interfaces<'_>,
+) -> anyhow::Result<EngineArgs> {
+    let config = &args.engine_config;
+    anyhow::ensure!(
+        !config.model.model.is_empty(),
+        "the engine configuration names no model"
+    );
+    // Form (A): the child opens the launch file this daemon wrote, so it
+    // has to be this daemon's own host. A remote host needs the launch
+    // contents carried in `process::Spawn`, which the protocol does not do
+    // yet, and a path that exists only here would fail in the child.
+    anyhow::ensure!(
+        config.parallel.engine_host == interfaces.host,
+        "engine host {} is not this node ({}), whose runtime directory the launch file is \
+         written to: a main process on another host needs the launch contents carried in \
+         `process::Spawn`",
+        config.parallel.engine_host,
+        interfaces.host
+    );
+    // The devices are the deployment's own: each host's ranks are on the
+    // ordinals the shorthand gives them (`0..` in rank order), or on the
+    // order `device_config.devices` names, which the shorthand has already
+    // folded into the ranks. Reading them from the ranks is the one account:
+    // a config that states no order still gives this node's ranks their
+    // devices, and a rank on `cpu` is refused here rather than in the child.
+    let devices = local_devices(interfaces.host, config)?;
+    let queue_depth = u32::try_from(config.device.queue_depth.get())
+        .context("`device_config.queue_depth` exceeds the launch file's field")?;
+    // A new epoch takes the identity of its first engine; an engine that
+    // replaces a lost one goes on with its epoch.
+    if args.epoch == 0 {
+        args.epoch = engine;
+    }
+    // One main process per node today, so it has no peer to accept: the
+    // world is this rank alone. A deployment that starts more states their
+    // addresses here, and the world grows with them (exec's rule: the
+    // epoch is its peers and itself).
+    let peers: Vec<String> = Vec::new();
+    args.world_size = u32::try_from(peers.len() + 1).unwrap_or(u32::MAX);
+    args.host = interfaces.host.to_owned();
+    args.requests = interfaces.requests.to_owned();
+    args.processes = interfaces.processes.to_owned();
+    args.engine = engine;
+    args.program_server = interfaces.program_server.display().to_string();
+    args.devices = devices;
+    args.group = ENGINE_GROUP.to_owned();
+    args.rank = 0;
+    // The check above makes this node the engine's host, and the
+    // deployment keeps one scheduler node, which is this one.
+    args.scheduler_node = true;
+    args.peers = peers;
+    // Both are the epoch's, and the epoch states them in its engine
+    // configuration, which the child reads.
+    args.watchdog_timeout_s = None;
+    args.rollback_s = None;
+    args.queue_depth = queue_depth;
+    Ok(args)
+}
+
 /// The CUDA ordinals `host`'s ranks serve, in rank order and without repeats.
 ///
 /// A deployment that states no `device_config.devices` still gives each
@@ -1739,6 +1776,40 @@ mod tests {
     use super::*;
     use crate::engine::stand_in::{Answer, Seen, main_processes, process};
     use crate::options::ServerArgs;
+
+    /// A launch places the process on this node's devices, as the deployment's ranks name them,
+    /// with the interfaces the node states and none it does not; a deployment whose engine runs
+    /// on another host is refused, because its launch file could not be read there.
+    #[test]
+    fn a_launch_places_the_process_on_this_nodes_devices() {
+        let mut options = ServerArgs {
+            model: Some("/models/qwen3".to_owned()),
+            host_identity: "rank-0".to_owned(),
+            tensor_parallel_size: std::num::NonZeroUsize::new(2).unwrap(),
+            ..Default::default()
+        };
+        options.device_config.devices = vec![6, 7];
+        let args = EngineArgs::new(options.engine_config().expect("the configuration resolves"));
+        let interfaces = |host| Interfaces {
+            host,
+            requests: "",
+            processes: "",
+            program_server: Path::new(""),
+        };
+
+        let placed = place(args.clone(), 1, &interfaces("rank-0")).expect("the process places");
+        assert_eq!(placed.devices, vec![6, 7]);
+        assert_eq!(placed.host, "rank-0");
+        assert_eq!(placed.engine, 1);
+        // A new epoch takes its first engine's number.
+        assert_eq!(placed.epoch, 1);
+        assert_eq!((placed.rank, placed.world_size), (0, 1));
+        assert!(placed.scheduler_node);
+        assert!(placed.requests.is_empty() && placed.processes.is_empty());
+        assert!(placed.program_server.is_empty());
+
+        place(args, 1, &interfaces("rank-1")).expect_err("another host's engine is refused");
+    }
 
     /// An epoch's start names this daemon's own build only for its own binary,
     /// and starts the process with the launch file alone: another executable's

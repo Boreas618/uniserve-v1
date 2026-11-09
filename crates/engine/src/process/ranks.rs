@@ -5,15 +5,32 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
+use ops::Generation;
 use proto::config::EngineArgs;
+use worker::blocking::ThreadPool;
 use worker::device::Worker;
 use worker::memory::Memory;
-use worker::memory::retained::Retained;
+use worker::memory::retained::{LocalStorage, Retained};
 use worker::memory::weights::WeightStore;
 use worker::parallel::host::{HostGroup, Rendezvous, STARTUP_TIMEOUT};
+use worker::runners::products::{GroupProducts, RankProducts};
 
 use super::launch::Epoch;
-use crate::rank::ModelRunner;
+use crate::rank::{ModelRunner, Weights};
+
+/// What the ranks of a start load onto.
+#[derive(Clone, Copy)]
+pub(super) enum Backing<'a> {
+    /// The node's Storage Server, whose claim the daemon answered: each rank publishes its weights
+    /// there and maps its resident memory from it, and its parallel groups form their NCCL
+    /// communicators.
+    Serving(&'a ipc::StorageLaunch),
+    /// Nothing outside this process: a recorded start ([`crate::record`]) loads each weight's
+    /// element type and extents from the shard headers alone, maps its resident memory as storage
+    /// of its own, and its parallel groups state their split with no communicator, since a
+    /// recorded walk issues no collective.
+    Recording,
+}
 
 /// One rank of this process, loaded: what its worker is built from.
 pub(super) struct LoadedRank {
@@ -21,8 +38,8 @@ pub(super) struct LoadedRank {
     pub(super) model_runner: ModelRunner,
     /// The weights its load reached, in order: what a weight update pairs against.
     pub(super) weights: Vec<worker::memory::weights::LoadedWeight>,
-    /// The rank's Storage Server client, whose scope is the rank's.
-    pub(super) client: Arc<Retained>,
+    /// The rank's Storage Server client, whose scope is the rank's; a recorded start has none.
+    pub(super) client: Option<Arc<Retained>>,
     /// The rank's partition of the model, mapped on its device.
     pub(super) model: crate::rank::Loaded,
     /// The rank's resident owners.
@@ -35,6 +52,70 @@ pub(super) struct LoadedRank {
     pub(super) groups: crate::rank::RankGroups,
 }
 
+impl LoadedRank {
+    /// Builds this rank's runners on each of its devices and starts each device's worker thread,
+    /// whose start records the runners' walk ([`Worker::recorded`]) and claims each stream's arena
+    /// region from it. Answers each device with its worker and the epoch's first generation, which
+    /// holds no kernel yet.
+    ///
+    /// `(index, count)` is this rank's place among the process's ranks and their count, `products`
+    /// the products the ranks share, `generation` the epoch's program generation and `blocking` the
+    /// process's lanes. A serving start and a recorded start build their workers here alike, so
+    /// what a recorded start reports is what a serving one launches.
+    pub(super) fn spawn_workers(
+        &mut self,
+        (index, count): (usize, usize),
+        products: &Arc<GroupProducts>,
+        generation: u64,
+        blocking: &ThreadPool,
+    ) -> Result<Vec<(platform::DeviceId, Worker, Arc<Generation>)>> {
+        // The scheduler sees the group as one pool, and each rank encodes its own units, so the
+        // pool holds every rank's host tasks.
+        self.inventory.host_task_capacity *= u32::try_from(count).unwrap_or(u32::MAX);
+        // The device's one pool set is the resident owners' allocator: it is opened with the memory
+        // and handed to the worker thread, so every owner and every runner books against the same
+        // allowance.
+        let pools = self.memory.pools();
+        let products: Arc<dyn worker::runners::products::Products> =
+            Arc::new(RankProducts::new(Arc::clone(products), index));
+        // What the rank's trajectories are computed with, which keys the pages of its host latent
+        // pool: the weights it loaded.
+        let identity = worker::data_plane::identity_of(&self.weights);
+        let mut spawned = Vec::with_capacity(self.model_runner.devices().len());
+        for device in self.model_runner.devices() {
+            let generation = Arc::new(Generation::new(generation, std::iter::empty()));
+            // The scheduler counts this process's ranks as one, the first rank's report, so the
+            // first rank states the host latent pool for all of them.
+            let runners = self.model_runner.runners(
+                *device,
+                &self.model,
+                &mut self.memory,
+                &generation,
+                blocking,
+                &self.groups,
+                self.client.as_ref(),
+                &identity,
+                (index == 0).then_some(&mut self.inventory),
+            )?;
+            // The scratch pool's figure comes from the one call that sized it, with the memory: the
+            // shadow region and the state group's snapshot are one reservation, and a second
+            // computation here could disagree with the pool the allocator reserved. The shadow
+            // region alone is what the twins allocate.
+            let worker = Worker::spawn(
+                *device,
+                runners,
+                self.model_runner.events(),
+                Arc::clone(&pools),
+                Arc::clone(&products),
+                self.graph.scratch,
+                self.graph.shadow,
+            )?;
+            spawned.push((*device, worker, generation));
+        }
+        Ok(spawned)
+    }
+}
+
 /// Loads every rank of this process, each on a thread of its own.
 ///
 /// The ranks agree their capacity and exchange their communicators' ids over one host group, whose
@@ -43,7 +124,7 @@ pub(super) struct LoadedRank {
 /// agrees over, formed here over the loopback because this process holds all its members.
 pub(super) fn load_ranks(
     model_runners: Vec<ModelRunner>,
-    storage: &ipc::StorageLaunch,
+    backing: Backing<'_>,
     launch: &EngineArgs,
     epoch: &Epoch,
 ) -> Result<Vec<LoadedRank>> {
@@ -70,7 +151,7 @@ pub(super) fn load_ranks(
                         rendezvous,
                         index,
                         count,
-                        storage,
+                        backing,
                         launch,
                         epoch,
                     )
@@ -95,7 +176,7 @@ fn load_rank(
     rendezvous: Rendezvous,
     index: usize,
     count: usize,
-    storage: &ipc::StorageLaunch,
+    backing: Backing<'_>,
     launch: &EngineArgs,
     epoch: &Epoch,
 ) -> Result<LoadedRank> {
@@ -129,14 +210,20 @@ fn load_rank(
     // The rank's Storage Server and its claim are the node's, which the daemon answered for; the
     // retained weights outlive the epoch, so the store is built once, before the model loads,
     // and keeps what it maps for the process's life.
-    let client = Retained::connect(
-        storage,
-        &launch.group,
-        model_runner.rank(),
-        epoch.generation,
-        epoch.predecessor_epoch,
-    )
-    .context("connecting to the Storage Server")?;
+    let client = match backing {
+        Backing::Serving(storage) => Some(
+            Retained::connect(
+                storage,
+                &launch.group,
+                model_runner.rank(),
+                epoch.generation,
+                epoch.predecessor_epoch,
+            )
+            .context("connecting to the Storage Server")?,
+        ),
+        Backing::Recording => None,
+    };
+    let communicates = client.is_some();
 
     // A weight's region is one device's address, so the store maps on the device this rank's model
     // is loaded for; the client is shared, the mapping is not.
@@ -149,21 +236,50 @@ fn load_rank(
     // NCCL keeps its own device buffers, so a communicator opens before the capacity plan measures
     // what is left of the device.
     let groups = crate::rank::RankGroups {
-        sequence: group_over(&host, device, shape.sequence, shape.sequence_rank, count)
-            .context("forming the sequence group")?,
-        tensor: group_over(&host, device, shape.tensor, shape.tensor_rank, count)
-            .context("forming the tensor group")?,
+        sequence: group_over(
+            &host,
+            device,
+            (shape.sequence, shape.sequence_rank),
+            count,
+            communicates,
+        )
+        .context("forming the sequence group")?,
+        tensor: group_over(
+            &host,
+            device,
+            (shape.tensor, shape.tensor_rank),
+            count,
+            communicates,
+        )
+        .context("forming the tensor group")?,
     };
-    let mut weights = WeightStore::new(Arc::clone(&client), device);
 
     // The load and the capacity plan are one call because the order between them is the plan's: the
     // weights are mapped first, so what the plan measures is what is left of the device rather than
     // what was there before the model.
-    let (model, memory, inventory, graph) = model_runner
-        .load_and_open(&mut weights, &mut &*client, &host, &epoch.experts)
-        .context("loading the epoch's model")?;
+    let ((model, memory, inventory, graph), weights) = match &client {
+        Some(client) => {
+            let mut weights = WeightStore::new(Arc::clone(client), device);
+            let loaded = model_runner
+                .load_and_open(
+                    Weights::Retained(&mut weights),
+                    &mut &**client,
+                    &host,
+                    &epoch.experts,
+                )
+                .context("loading the epoch's model")?;
+            (loaded, weights.take_log())
+        }
+        // No weight is mapped, so the plan sees the whole device: a recorded start sizes its cache
+        // larger than a served one wherever the deployment does not bound it.
+        None => {
+            let loaded = model_runner
+                .load_and_open(Weights::Meta, &mut LocalStorage, &host, &epoch.experts)
+                .context("loading the epoch's model from its checkpoint's headers")?;
+            (loaded, Vec::new())
+        }
+    };
     tracing::info!(rank = model_runner.rank(), "the rank loaded its model");
-    let weights = weights.take_log();
     Ok(LoadedRank {
         model_runner,
         weights,
@@ -178,14 +294,16 @@ fn load_rank(
 
 /// The collective group of `size` ranks this rank is member `rank` of, absent for a group of one.
 ///
-/// The first member draws the group's id and the host group carries it (`parallel`'s statement of
-/// what that channel is for); `Communicator::init` then blocks until every member joined.
+/// A group that `communicates` forms its NCCL communicator: the first member draws the group's id
+/// and the host group carries it (`parallel`'s statement of what that channel is for);
+/// `Communicator::init` then blocks until every member joined. One that does not states the split
+/// alone ([`nn::Group::recording`]).
 fn group_over(
     host: &HostGroup,
     device: platform::DeviceId,
-    size: usize,
-    rank: usize,
+    (size, rank): (usize, usize),
     ranks: usize,
+    communicates: bool,
 ) -> Result<Option<Arc<nn::Group>>> {
     if size == 1 {
         return Ok(None);
@@ -195,6 +313,12 @@ fn group_over(
             "a parallel group of {size} ranks in a process of {ranks}: this process forms one \
              group of all its ranks, and a deployment of several groups per host is not served"
         );
+    }
+    if !communicates {
+        return Ok(Some(Arc::new(nn::Group::recording(
+            rank as u64,
+            size as u64,
+        )?)));
     }
     let id = match rank {
         0 => Some(platform::UniqueId::new()?),

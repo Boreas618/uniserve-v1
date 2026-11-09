@@ -25,7 +25,9 @@
 //! - `options`: the serving option tree (`options::ServerArgs`);
 //! - `metrics`: the Prometheus registry the daemon exports;
 //! - `restart`: the hot restart that hands a deployment to a successor
-//!   daemon.
+//!   daemon;
+//! - `programs`: the launches of a deployment's main processes for a start
+//!   that records the programs they launch (`uniserve programs`).
 
 pub mod engine;
 pub mod epoch;
@@ -41,6 +43,7 @@ pub mod openai;
 pub mod options;
 pub mod output;
 pub mod profiling;
+pub mod programs;
 pub mod restart;
 pub mod standby;
 pub mod supervision;

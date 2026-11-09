@@ -7,7 +7,8 @@
 //! socket, the devices, the rank and the durations. [`run`] reads it, starts
 //! the control thread, one scheduler per DP rank, one executor per device and
 //! the blocking pool, and serves until its daemon commands it down or the
-//! epoch fails.
+//! epoch fails. [`record`] runs the same start to the point where every
+//! device has recorded the programs its runners launch, and serves nothing.
 
 mod catalogue;
 mod process;
@@ -15,4 +16,4 @@ mod programs;
 mod rank;
 
 pub use catalogue::Catalogue;
-pub use process::run;
+pub use process::{Recorded, record, run};

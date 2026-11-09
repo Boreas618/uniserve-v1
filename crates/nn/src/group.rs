@@ -125,10 +125,23 @@ pub(crate) fn exchanged(
     Ok((elements, dtype))
 }
 
-/// A rank's NCCL communicator, borrowed by forwards.
+/// A rank's place in a partitioned block's group, and the NCCL communicator its collectives are
+/// issued through, borrowed by forwards.
+///
+/// A group of a recorded start ([`Group::recording`]) states the split alone: a recording forward
+/// reads its rank and member count and issues nothing, so no communicator is formed for it, and
+/// every collective called on it is refused.
 pub struct Group {
-    communicator: Mutex<Communicator>,
+    /// This rank's index in the group.
+    rank: i32,
     ranks: u64,
+    /// What issues the group's collectives; absent on a recording group.
+    issue: Option<Issue>,
+}
+
+/// The communicator of a group that issues, with the lane its started collectives run on.
+struct Issue {
+    communicator: Mutex<Communicator>,
     /// The stream a started collective runs on, beside the forward's own, so a layer's compute
     /// overlaps the transfer. Inside a capture the events below make it a branch of the graph.
     lane: Stream,
@@ -149,14 +162,39 @@ impl Group {
         let lane =
             Stream::with_priority(communicator.device(), LANE_PRIORITY).map_err(Error::Platform)?;
         Ok(Self {
-            communicator: Mutex::new(communicator),
+            rank: communicator.rank(),
             ranks,
-            lane,
-            fork: Event::new(EventFlags::default()),
-            landings: (0..LANDINGS)
-                .map(|_| Event::new(EventFlags::default()))
-                .collect(),
-            next: AtomicUsize::new(0),
+            issue: Some(Issue {
+                communicator: Mutex::new(communicator),
+                lane,
+                fork: Event::new(EventFlags::default()),
+                landings: (0..LANDINGS)
+                    .map(|_| Event::new(EventFlags::default()))
+                    .collect(),
+                next: AtomicUsize::new(0),
+            }),
+        })
+    }
+
+    /// The split of member `rank` of a group of `ranks`, with no communicator: what the runners of
+    /// a recorded start walk with, whose forwards record and issue no collective.
+    ///
+    /// # Errors
+    ///
+    /// When `rank` is not below `ranks`, or is past what NCCL addresses.
+    pub fn recording(rank: u64, ranks: u64) -> Result<Self> {
+        if rank >= ranks {
+            return Err(Error::shape(
+                "Group::recording",
+                format!("rank {rank} is not a member of a group of {ranks}"),
+            ));
+        }
+        let rank = i32::try_from(rank)
+            .map_err(|_| Error::shape("Group::recording", "a rank past what NCCL addresses"))?;
+        Ok(Self {
+            rank,
+            ranks,
+            issue: None,
         })
     }
 
@@ -167,7 +205,7 @@ impl Group {
 
     /// This rank's index, as NCCL reports it.
     pub fn rank(&self) -> i32 {
-        self.locked().rank()
+        self.rank
     }
 
     /// Sum every rank's `view` into every rank's `view`, in place.
@@ -187,7 +225,8 @@ impl Group {
     ) -> Result<()> {
         let (count, dtype) = collective(send, recv, "all_reduce")?;
         let bytes = dtype.bytes() * count;
-        self.locked()
+        self.issue()?
+            .locked()
             .all_reduce(
                 stream,
                 range(send, bytes),
@@ -211,7 +250,8 @@ impl Group {
     ) -> Result<()> {
         let (count, expected, dtype) = gathered(send, recv, self.ranks)?;
         let bytes = dtype.bytes();
-        self.locked()
+        self.issue()?
+            .locked()
             .all_gather(
                 stream,
                 range(send, bytes * count),
@@ -237,7 +277,8 @@ impl Group {
         let (elements, dtype) = exchanged(send, recv, self.ranks)?;
         let ranks = usize::try_from(self.ranks).unwrap_or(usize::MAX);
         let bytes = dtype.bytes() * elements;
-        self.locked()
+        self.issue()?
+            .locked()
             .all_to_all(
                 stream,
                 range(send, bytes),
@@ -259,12 +300,16 @@ impl Group {
         recv: TensorView,
         stream: &Stream,
     ) -> Result<Transfer> {
-        self.fork.record(stream).map_err(Error::Platform)?;
-        self.lane.wait_event(&self.fork).map_err(Error::Platform)?;
-        self.all_to_all(send, recv, &self.lane)?;
-        let landing = self.next.fetch_add(1, Ordering::Relaxed) % LANDINGS;
-        self.landings[landing]
-            .record(&self.lane)
+        let issue = self.issue()?;
+        issue.fork.record(stream).map_err(Error::Platform)?;
+        issue
+            .lane
+            .wait_event(&issue.fork)
+            .map_err(Error::Platform)?;
+        self.all_to_all(send, recv, &issue.lane)?;
+        let landing = issue.next.fetch_add(1, Ordering::Relaxed) % LANDINGS;
+        issue.landings[landing]
+            .record(&issue.lane)
             .map_err(Error::Platform)?;
         Ok(Transfer {
             landing: Some(landing),
@@ -294,26 +339,42 @@ impl Group {
             let at = gathered.offset_elements((member * owner_rows + first) * width);
             range(gathered.at(at), bytes)
         };
-        self.fork.record(stream).map_err(Error::Platform)?;
-        self.lane.wait_event(&self.fork).map_err(Error::Platform)?;
+        let issue = self.issue()?;
+        issue.fork.record(stream).map_err(Error::Platform)?;
+        issue
+            .lane
+            .wait_event(&issue.fork)
+            .map_err(Error::Platform)?;
         {
-            let communicator = self.locked();
+            let communicator = issue.locked();
             let rank = communicator.rank();
             ops::platform::collective_group(|| {
                 for peer in 0..self.ranks as i32 {
                     if peer != rank {
-                        communicator.send(&self.lane, block(rank as u64), elements, dtype, peer)?;
-                        communicator.recv(&self.lane, block(peer as u64), elements, dtype, peer)?;
+                        communicator.send(
+                            &issue.lane,
+                            block(rank as u64),
+                            elements,
+                            dtype,
+                            peer,
+                        )?;
+                        communicator.recv(
+                            &issue.lane,
+                            block(peer as u64),
+                            elements,
+                            dtype,
+                            peer,
+                        )?;
                     }
                 }
                 Ok(())
             })
             .map_err(Error::Platform)?;
         }
-        Self::settled(&self.lane)?;
-        let landing = self.next.fetch_add(1, Ordering::Relaxed) % LANDINGS;
-        self.landings[landing]
-            .record(&self.lane)
+        Self::settled(&issue.lane)?;
+        let landing = issue.next.fetch_add(1, Ordering::Relaxed) % LANDINGS;
+        issue.landings[landing]
+            .record(&issue.lane)
             .map_err(Error::Platform)?;
         Ok(Transfer {
             landing: Some(landing),
@@ -326,7 +387,7 @@ impl Group {
             return Ok(());
         };
         stream
-            .wait_event(&self.landings[landing])
+            .wait_event(&self.issue()?.landings[landing])
             .map_err(Error::Platform)
     }
 
@@ -350,6 +411,18 @@ impl Group {
         Ok(())
     }
 
+    /// What issues this group's collectives, refused on a recording group: a collective reaches a
+    /// group only from a launching forward, and a recorded start launches nothing.
+    fn issue(&self) -> Result<&Issue> {
+        self.issue.as_ref().ok_or_else(|| {
+            Error::Unsupported(
+                "a recording group has no communicator and issues no collective".to_owned(),
+            )
+        })
+    }
+}
+
+impl Issue {
     /// The communicator, for one call. A panic while it was held leaves nothing half-issued that
     /// this type could repair, so a poisoned lock answers the communicator as it stands.
     fn locked(&self) -> MutexGuard<'_, Communicator> {

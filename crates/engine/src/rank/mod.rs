@@ -66,6 +66,29 @@ pub(crate) enum Loaded {
     Video(Arc<dyn VideoModel>),
 }
 
+/// Where a rank's model load puts its weights.
+pub(crate) enum Weights<'a> {
+    /// Retained storage: each weight is read from the checkpoint, converted and published.
+    Retained(&'a mut dyn nn::RetainedWeights),
+    /// Nowhere: each weight's element type and extents come from the shard headers, at a synthetic
+    /// address ([`nn::WeightLoader::meta`]), for a start that records its walk and serves nothing.
+    Meta,
+}
+
+impl<'a> Weights<'a> {
+    /// The loader of `checkpoint` that puts its weights here, keeping the checkpoint's own
+    /// representation: the launch states no precision of its own to the loader.
+    fn loader<'c>(self, checkpoint: &'c nn::Checkpoint) -> nn::WeightLoader<'c>
+    where
+        'a: 'c,
+    {
+        match self {
+            Self::Retained(store) => nn::WeightLoader::new(checkpoint, store, None, None),
+            Self::Meta => nn::WeightLoader::meta(checkpoint, None, None),
+        }
+    }
+}
+
 /// How the data plane loads this rank's model again: the rank's model runner, pointed at the
 /// target.
 pub(crate) struct RankModel {
@@ -90,7 +113,7 @@ impl worker::data_plane::ModelLoad for RankModel {
             .model
             .model = target.checkpoint.to_string_lossy().into_owned();
         model_runner
-            .load_model(weights, &target.experts)
+            .load_model(Weights::Retained(weights), &target.experts)
             .map(drop)
             .map_err(|error| format!("{error:#}"))
     }
@@ -656,7 +679,7 @@ impl ModelRunner {
     /// holds no knowledge of the order the two must be done in.
     pub(crate) fn load_and_open(
         &self,
-        weights: &mut dyn nn::RetainedWeights,
+        weights: Weights<'_>,
         storage: &mut dyn worker::memory::retained::ExclusiveStorage,
         host_group: &worker::parallel::host::HostGroup,
         experts: &ExpertOrder,
@@ -668,12 +691,9 @@ impl ModelRunner {
 
     /// The model this rank's checkpoint holds, its weights reached through `weights` in the order
     /// the model's load asks for them. An update walks the same code, so what this function reads
-    /// is exactly what a load of another checkpoint or another expert order would.
-    pub(crate) fn load_model(
-        &self,
-        weights: &mut dyn nn::RetainedWeights,
-        experts: &ExpertOrder,
-    ) -> Result<Loaded> {
+    /// is exactly what a load of another checkpoint or another expert order would, and a meta load
+    /// answers the same weights' element types and extents without reading them.
+    pub(crate) fn load_model(&self, weights: Weights<'_>, experts: &ExpertOrder) -> Result<Loaded> {
         let mapping = &self.mapping;
         match self.family {
             Family::Text(family) => {
@@ -681,7 +701,7 @@ impl ModelRunner {
                 // which is the build config's `dtype` and `quantization`.
                 let checkpoint = family.open(self.checkpoint())?;
                 let opened = nn::Checkpoint::open(self.checkpoint())?;
-                let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
+                let mut loader = weights.loader(&opened);
                 let placement = TextPlacement {
                     tensor: Split {
                         size: mapping.tensor_parallel,
@@ -706,7 +726,7 @@ impl ModelRunner {
                 }
                 let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
                 let opened = nn::Checkpoint::open_roots(&roots)?;
-                let mut loader = nn::WeightLoader::new(&opened, weights, None, None);
+                let mut loader = weights.loader(&opened);
 
                 // **The video pipeline's parallel shape is the deployment's, and the deployment
                 // file is where it is stated.** The build config carries the tensor-parallel width

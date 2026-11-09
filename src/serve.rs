@@ -29,6 +29,7 @@ pub(crate) fn run(
         "Daemon",
         log.log_level.as_deref(),
         log.log_level_http.as_deref(),
+        logging::Output::Stdout,
     );
     let runtime = crate::runtime()?;
     if let Some(descriptor) = args.predecessor {

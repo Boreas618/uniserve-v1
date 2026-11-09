@@ -11,7 +11,8 @@
 //! `WARN` is printed as `WARNING`, the Python `logging` name, and
 //! `--log-level` and `--log-level-http` take Python level names.
 //!
-//! Logs go to stdout. ANSI colors follow the `fmt` layer's default: they are
+//! Logs go to stdout, except where a command's own output is stdout
+//! (`uniserve programs`): there they go to stderr ([`Output`]). ANSI colors follow the `fmt` layer's default: they are
 //! on unless `NO_COLOR` is set to a non-empty value, with no terminal
 //! detection, so redirected output also carries escape sequences.
 
@@ -25,6 +26,7 @@ use tracing_subscriber::Layer as _;
 use tracing_subscriber::filter::Targets;
 use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
 use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::fmt::writer::BoxMakeWriter;
 use tracing_subscriber::fmt::{FmtContext, FormattedFields};
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::registry::LookupSpan;
@@ -45,23 +47,42 @@ const LOCAL_TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
 /// target.
 const HTTP_LOG_TARGETS: &[&str] = &["axum", "hyper", "tower_http", "server"];
 
-/// Installs the process-wide tracing subscriber for the CLI binary.
+/// Where a process's log lines are written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Output {
+    /// Standard output: the log every process of a deployment shares.
+    Stdout,
+    /// Standard error, for a command whose standard output is its result.
+    Stderr,
+}
+
+/// Installs the process-wide tracing subscriber for the CLI binary, writing to `output`.
 ///
 /// Reads `RUST_LOG` from the environment (see `build_targets_filter` for
 /// precedence). Installation failure, for example because a global subscriber
 /// is already set, is reported on stderr and is not fatal.
-pub(crate) fn init_tracing(process: &str, log_level: Option<&str>, log_level_http: Option<&str>) {
+pub(crate) fn init_tracing(
+    process: &str,
+    log_level: Option<&str>,
+    log_level_http: Option<&str>,
+    output: Output,
+) {
     let filter = build_targets_filter(
         log_level,
         log_level_http,
         env::var("RUST_LOG").ok().as_deref(),
     );
     let formatter = UniserveEventFormatter::new(process);
+    let writer = match output {
+        Output::Stdout => BoxMakeWriter::new(std::io::stdout),
+        Output::Stderr => BoxMakeWriter::new(std::io::stderr),
+    };
 
     if let Err(err) = tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .event_format(formatter)
+                .with_writer(writer)
                 .with_filter(filter),
         )
         .try_init()

@@ -36,7 +36,7 @@ impl ModelRunner {
         generation: &Arc<Generation>,
         blocking: &worker::blocking::ThreadPool,
         groups: &RankGroups,
-        client: &Arc<worker::memory::retained::Retained>,
+        client: Option<&Arc<worker::memory::retained::Retained>>,
         identity: &str,
         report: Option<&mut ipc::MainProcessInfo>,
     ) -> Result<Vec<NamedRunner>> {
@@ -137,24 +137,33 @@ impl ModelRunner {
         // resumed request: one per host, shared by its ranks and epochs. This encoder writes the
         // conditioning alone; the vision and latent features are computed inside the calls that
         // read them, so they are no output of their own. The engine counts this process's ranks as
-        // one, and the first writes the states it computed.
+        // one, and the first writes the states it computed. A recorded start, which has no Storage
+        // Server, maps none.
         let reports = report.is_some();
         let longest = u64::from(capacities.iter().copied().max().unwrap_or(0));
         let element = dtype
             .bytes()
             .context("the encoder's states have no whole-byte element")?;
-        let (encoder_pool, encoder_info) = worker::memory::encoders::EncoderHostPool::start(
-            client,
-            device,
-            worker::memory::encoders::pool_pages(
-                &[longest * u64::from(hidden) * element],
-                self.engine_config().max_running_requests.get(),
-            ),
-            BTreeMap::from([(ipc::product::CONDITIONING.to_owned(), identity.to_owned())]),
-            None,
-        )
-        .context("mapping the host encoder pool")?;
-        let encoder = encoder.with_host_outputs(Arc::new(encoder_pool), reports);
+        let (encoder, encoder_info) = match client {
+            Some(client) => {
+                let (pool, info) = worker::memory::encoders::EncoderHostPool::start(
+                    client,
+                    device,
+                    worker::memory::encoders::pool_pages(
+                        &[longest * u64::from(hidden) * element],
+                        self.engine_config().max_running_requests.get(),
+                    ),
+                    BTreeMap::from([(ipc::product::CONDITIONING.to_owned(), identity.to_owned())]),
+                    None,
+                )
+                .context("mapping the host encoder pool")?;
+                (
+                    encoder.with_host_outputs(Arc::new(pool), reports),
+                    Some(info),
+                )
+            }
+            None => (encoder, None),
+        };
         let warm = worker::runners::warm::distinct(&*denoiser, &candidates);
         // The denoiser's own buckets are the layouts those candidates collapse to: its phase is
         // derived from them rather than named, so a rank that captures no denoise bucket states no
@@ -226,20 +235,28 @@ impl ModelRunner {
                 .context("a trajectory of more pages than a u32 counts")?,
             pages: trajectory.div_ceil(page_bytes),
         };
-        let (pool, pool_info) = worker::memory::latent::host::LatentHostPool::start(
-            client,
-            device,
-            pages,
-            identity,
-            WHOLE_SAMPLES,
-            None,
-        )
-        .context("mapping the host latent pool")?;
+        let (denoise, latent_info) = match client {
+            Some(client) => {
+                let (pool, info) = worker::memory::latent::host::LatentHostPool::start(
+                    client,
+                    device,
+                    pages,
+                    identity,
+                    WHOLE_SAMPLES,
+                    None,
+                )
+                .context("mapping the host latent pool")?;
+                (
+                    denoise.with_host_latents(Arc::new(pool), 0, reports),
+                    Some(info),
+                )
+            }
+            None => (denoise, None),
+        };
         if let Some(report) = report {
-            report.latent_pool = Some(Box::new(pool_info));
-            report.encoder_pool = Some(Box::new(encoder_info));
+            report.latent_pool = latent_info.map(Box::new);
+            report.encoder_pool = encoder_info.map(Box::new);
         }
-        let denoise = denoise.with_host_latents(Arc::new(pool), 0, reports);
         let decoder = pipeline
             .video_decoder()
             .context("the checkpoint holds no video decoder, so no clip could be decoded")?;

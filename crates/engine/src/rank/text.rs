@@ -24,7 +24,9 @@ impl ModelRunner {
     ///
     /// A media rank also maps the host latent pool its denoiser writes preempted trajectories to,
     /// at its Storage Server through `client`, keyed by `identity`, the weights it loaded; `report`
-    /// is the report that states the pool for the worker group, given to the rank that states it.
+    /// is the report that states the pool for the worker group, given to the rank that states it. A
+    /// recorded start has no Storage Server (`client` is `None`) and maps no host pool: a host page
+    /// is read and written by a request's copies, which no recorded walk makes.
     #[expect(
         clippy::too_many_arguments,
         reason = "the device, the model and its memory, the generation, the lanes, the groups, and the host latent pool's storage"
@@ -37,7 +39,7 @@ impl ModelRunner {
         generation: &Arc<Generation>,
         blocking: &worker::blocking::ThreadPool,
         groups: &RankGroups,
-        client: &Arc<worker::memory::retained::Retained>,
+        client: Option<&Arc<worker::memory::retained::Retained>>,
         identity: &str,
         report: Option<&mut ipc::MainProcessInfo>,
     ) -> Result<Vec<NamedRunner>> {

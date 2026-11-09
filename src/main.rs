@@ -2,7 +2,8 @@
 //!
 //! `main` parses the command line and runs its command: `serve` (a node's
 //! daemon, and on the leader the application, [`serve`]), `engine` (a node's
-//! main process for one epoch), and the host services `storage-server` and
+//! main process for one epoch), `programs` (a deployment's recorded key list,
+//! [`programs`]), and the host services `storage-server` and
 //! `program-server`, whose commands are their crates' own. `serve` installs
 //! tracing and builds the Tokio runtime; its module hands the resolved
 //! configuration to `daemon::serve` with a cancellation token that fires on
@@ -14,6 +15,7 @@
 
 mod cli;
 mod logging;
+mod programs;
 mod serve;
 
 use std::env;
@@ -126,12 +128,14 @@ fn main() -> Result<std::process::ExitCode> {
     };
     match cli.command {
         Command::Serve(args) => serve::run(*args, &command_matches(), &cli.log),
+        Command::Programs(args) => programs::run(*args, &command_matches(), &cli.log),
         Command::Engine { launch } => {
             follow_lifeline(lifeline);
             logging::init_tracing(
                 "Engine",
                 cli.log.log_level.as_deref(),
                 cli.log.log_level_http.as_deref(),
+                logging::Output::Stdout,
             );
             engine::run(&launch, &catalogue()?).map(|()| std::process::ExitCode::SUCCESS)
         }

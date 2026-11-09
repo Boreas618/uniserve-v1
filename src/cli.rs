@@ -2,12 +2,13 @@
 //!
 //! One executable runs every UniServe process, each as a command. The public
 //! commands are `serve` (a node's daemon, and on the leader the application),
+//! `programs` (the key list a deployment's main processes launch),
 //! `storage-server` (a host's Storage Server) and `program-server` (a host's
 //! Program Server); the host services' commands are their crates' own
 //! (`storage_server::command`, `program_server::command`). `engine` (a node's
 //! main process for one epoch) is started by the daemon and hidden from the
 //! help. The binary's own options, its log levels, are global; each command
-//! declares its own. `serve` takes the serving command line
+//! declares its own. `serve` and `programs` take the serving command line
 //! (`daemon::options::ServerArgs`), which resolves one configuration from a
 //! `--config` file, a few flags and `--set` assignments.
 
@@ -48,6 +49,16 @@ pub(crate) enum Command {
         override_usage = "uniserve serve [MODEL] [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
     )]
     Serve(Box<ServerArgs>),
+    /// Print the programs the deployment's main processes launch, as the key
+    /// list `uniserve program-server build --keys` reads (`operator<TAB>key`
+    /// lines, sorted, each once), and exit. Takes `serve`'s options and starts
+    /// the deployment's ranks on this node's devices as `serve` does, loading
+    /// the model from its checkpoint's headers; no weight is read, and no
+    /// daemon, Storage Server, communicator or Program Server is started.
+    #[command(
+        override_usage = "uniserve programs MODEL [OPTIONS] [--config FILE] [--set PATH=VALUE]..."
+    )]
+    Programs(Box<ServerArgs>),
     /// Run the main process of this node and epoch: its schedulers and the
     /// request interface.
     #[command(hide = true)]
@@ -92,17 +103,56 @@ mod tests {
     fn each_process_is_a_command() {
         for (args, expected) in [
             (vec!["uniserve", "serve", "model"], "serve"),
+            (vec!["uniserve", "programs", "model"], "programs"),
             (vec!["uniserve", "storage-server", "list"], "storage-server"),
             (vec!["uniserve", "program-server", "list"], "program-server"),
         ] {
             let cli = Cli::try_parse_from(args).expect("parses");
             let name = match cli.command {
                 Command::Serve(_) => "serve",
+                Command::Programs(_) => "programs",
                 Command::StorageServer(_) => "storage-server",
                 Command::ProgramServer(_) => "program-server",
                 Command::Engine { .. } => "other",
             };
             assert_eq!(name, expected);
         }
+    }
+
+    /// `programs` takes `serve`'s options and resolves them to the same configuration, so the
+    /// key list it prints is the one of the deployment `serve` starts with the same command line.
+    #[test]
+    fn programs_resolves_the_serving_configuration() {
+        let resolve = |command: &str| {
+            let matches = <Cli as clap::CommandFactory>::command().get_matches_from([
+                "uniserve",
+                command,
+                "/models/qwen3",
+                "--max-model-len",
+                "2048",
+                "--max-running-requests",
+                "8",
+                "--set",
+                "dtype=bfloat16",
+                "--set",
+                "kv_cache_config.max_tokens=8192",
+            ]);
+            let cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches).expect("parses");
+            let (_, command_matches) = matches.subcommand().expect("a command");
+            let args = match cli.command {
+                Command::Serve(args) | Command::Programs(args) => args,
+                _ => panic!("{command} takes the serving options"),
+            };
+            args.resolve(command_matches)
+                .expect("the options resolve")
+                .0
+        };
+        let programs = resolve("programs");
+        assert_eq!(programs, resolve("serve"));
+        assert_eq!(programs.model.as_deref(), Some("/models/qwen3"));
+        assert_eq!(
+            programs.max_model_len.map(|length| length.get()),
+            Some(2048)
+        );
     }
 }

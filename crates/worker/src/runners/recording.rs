@@ -262,6 +262,26 @@ mod tests {
         assert_eq!(footprint.keys[LogitsGather::NAME].len(), 2);
     }
 
+    /// A group that states its split without a communicator splits the walk's forward as its rank
+    /// of its members, which is all a recording forward reads of a group.
+    #[test]
+    fn a_recording_group_splits_the_walk() {
+        let group = nn::Group::recording(1, 4).expect("rank 1 is a member of four");
+        let mut footprint = Footprint::default();
+        footprint
+            .walk(None, |walk| {
+                let split = walk.forward(Some(&group))?.split();
+                assert_eq!(split, Some(nn::Split { rank: 1, ranks: 4 }));
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            nn::Group::recording(4, 4).is_err(),
+            "rank 4 is not a member of four"
+        );
+    }
+
     /// Placeholders stand for memory outside the stream's region, so they never move its peak.
     #[test]
     fn placeholders_are_not_the_streams_arena() {

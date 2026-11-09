@@ -2,7 +2,8 @@
 //! `uniserve program-server build` does.
 //!
 //! A key list names one `operator<TAB>descriptor key` per line, the
-//! descriptors a deployment launches. For every operator the lists name, each
+//! descriptors a deployment launches; `uniserve programs` writes a
+//! deployment's ([`key_list`]). For every operator the lists name, each
 //! package under `<packages>/<operator>/` is installed into the store's
 //! package root, every key a package's manifest covers is prepared for one
 //! target, and each key is resolved to the module it names. A key is built
@@ -28,7 +29,8 @@
 //! configuration names, and a build whose socket another server owns is
 //! refused before it installs anything.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -123,6 +125,33 @@ pub fn read_keys(paths: &[PathBuf]) -> Result<Vec<Key>> {
         }
     }
     Ok(keys)
+}
+
+/// Writes `keys`, descriptor keys by operator name, as a key list [`read_keys`] reads: one
+/// `operator<TAB>key` line per key, sorted by operator and then by key, each once.
+///
+/// # Errors
+///
+/// Fails when an operator or a key is empty, holds a tab or a line break, or has surrounding
+/// whitespace: no line states it so that it reads back as written.
+pub fn key_list(keys: &BTreeMap<String, BTreeSet<String>>) -> Result<String> {
+    let unwritable = |field: &str| {
+        field.is_empty() || field.contains(['\t', '\n', '\r']) || field.trim() != field
+    };
+    let mut list = String::new();
+    for (op, keys) in keys {
+        for key in keys {
+            if unwritable(op) || unwritable(key) {
+                return Err(Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("{op:?} {key:?} cannot be written as an `operator<TAB>key` line"),
+                )));
+            }
+            // Writing to a `String` cannot fail.
+            let _ = writeln!(list, "{op}\t{key}");
+        }
+    }
+    Ok(list)
 }
 
 /// Builds `keys` for `target` from the packages under `packages` into the
@@ -322,4 +351,74 @@ fn install(server: &ProgramServer, directory: &Path) -> Result<Vec<(String, Mani
         backends.push((installed.package.backend, manifest));
     }
     Ok(backends)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(entries: &[(&str, &[&str])]) -> BTreeMap<String, BTreeSet<String>> {
+        entries
+            .iter()
+            .map(|(op, keys)| {
+                (
+                    (*op).to_owned(),
+                    keys.iter().map(|key| (*key).to_owned()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// A written key list states every key once, sorted by operator and key, and reads back as
+    /// the keys it was written from.
+    #[test]
+    fn a_key_list_reads_back_as_written() {
+        let written = key_list(&keys(&[
+            (
+                "rms_norm",
+                &["dtype=bf16;hidden=4096", "dtype=bf16;hidden=2048"],
+            ),
+            ("attention", &["head_dim=128"]),
+        ]))
+        .expect("the keys are writable");
+        assert_eq!(
+            written,
+            "attention\thead_dim=128\n\
+             rms_norm\tdtype=bf16;hidden=2048\n\
+             rms_norm\tdtype=bf16;hidden=4096\n"
+        );
+
+        let directory = tempfile::tempdir().expect("a scratch directory");
+        let path = directory.path().join("keys.txt");
+        std::fs::write(&path, &written).expect("the key list is written");
+        let read: Vec<(String, String)> = read_keys(&[path])
+            .expect("the key list reads")
+            .into_iter()
+            .map(|key| (key.op, key.key))
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("attention", "head_dim=128"),
+                ("rms_norm", "dtype=bf16;hidden=2048"),
+                ("rms_norm", "dtype=bf16;hidden=4096"),
+            ]
+            .map(|(op, key)| (op.to_owned(), key.to_owned()))
+        );
+    }
+
+    /// A field no line states as it is - a tab, a line break, surrounding whitespace or nothing -
+    /// is refused rather than written as another key.
+    #[test]
+    fn a_key_no_line_states_is_refused() {
+        for (op, key) in [
+            ("rms_norm", "a\tb"),
+            ("rms_norm", "a\nb"),
+            ("rms_norm", " a"),
+            ("rms_norm", ""),
+            ("rms\tnorm", "a"),
+        ] {
+            key_list(&keys(&[(op, &[key])])).expect_err("the key is refused");
+        }
+    }
 }

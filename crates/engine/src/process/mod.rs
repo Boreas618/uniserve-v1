@@ -45,6 +45,8 @@
 //!
 //! - `launch`, `claim`, `ranks`, `start`: the launch file, the handshake, the Storage Server
 //!   claim, the ranks' load and the process's start and close.
+//! - `record`: a start that records the programs its devices launch and serves nothing
+//!   ([`record()`]).
 //! - `serve`, `commands`, `requests`, `reports`, `operations`, `weights`: the serve loop and
 //!   what it serves - the daemon's and the peers' messages, requests and their event streams,
 //!   reports and metrics, storage commands and weight updates.
@@ -60,6 +62,7 @@ mod operations;
 mod policy;
 mod precopy;
 mod ranks;
+mod record;
 mod reports;
 mod requests;
 mod serve;
@@ -92,6 +95,7 @@ use epoch::Draining;
 use launch::{ProcessInterface, read_engine_args};
 use operations::Owed;
 use precopy::Precopy;
+pub use record::{Recorded, record};
 use requests::Served;
 use serve::Wait;
 use weights::WeightUpdate;
