@@ -459,7 +459,7 @@ impl Daemon {
         if let Some(table) = &self.table {
             epochs.attach_processes(Arc::clone(table));
         }
-        let roster = roster::ProcessRoster::new(epochs.clone(), deployment, Vec::new(), link);
+        let roster = roster::ProcessRoster::new(Arc::clone(&epochs), deployment, Vec::new(), link);
         Some((
             Arc::new(crate::updates::driver::Driver::new(
                 epochs,
@@ -789,15 +789,19 @@ mod tests {
     }
 }
 
+/// The commands the adapter sends down to a peer, by engine number.
+#[cfg(test)]
+type CommandsDown = std::sync::mpsc::Receiver<(u64, proto::process::Command)>;
+
+/// The way a test plays a peer's reports up, by engine number.
+#[cfg(test)]
+type ReportsUp = std::sync::mpsc::Sender<(u64, proto::process::Report)>;
+
 #[cfg(test)]
 impl ProcessCommands {
     /// The ends an epoch-layer test needs: the commands the adapter sends
     /// down to a peer, and the way a test plays a peer's reports up.
-    pub(crate) fn pair() -> (
-        Self,
-        std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
-        std::sync::mpsc::Sender<(u64, proto::process::Report)>,
-    ) {
+    pub(crate) fn pair() -> (Self, CommandsDown, ReportsUp) {
         let (commands, sent) = std::sync::mpsc::channel();
         let (reports, received) = std::sync::mpsc::channel();
         (

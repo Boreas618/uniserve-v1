@@ -19,6 +19,9 @@ use crate::programs::select::{
 };
 
 /// What the walk does when a program cannot serve a shape of this generation.
+/// The installs an admission started, and the cell their unavailable kernels are reported in.
+type Admitted = (Vec<Arc<HostTask<ModuleWork>>>, UnavailableCell);
+
 pub(super) enum Advance {
     /// The operator's next candidate was chosen and its install admitted.
     Retry(Vec<Arc<HostTask<ModuleWork>>>),
@@ -243,7 +246,7 @@ impl MainProcess {
         &mut self,
         programs: &Programs,
         learned: &BTreeMap<String, Vec<String>>,
-    ) -> std::result::Result<(Vec<Arc<HostTask<ModuleWork>>>, UnavailableCell), UpdateFailure> {
+    ) -> std::result::Result<Admitted, UpdateFailure> {
         let invalid = |reason: String| UpdateFailure::Precopy { reason };
         // The Program Server's listing, read at most once and only when a program's keys cannot be
         // taken from a generation that already launched it: the epoch's first generation has

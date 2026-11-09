@@ -13,6 +13,7 @@
 //! `--keys` names a key file: a build of a source kind then takes the package of the first operator
 //! the file lists. The exit status is 1 when any build fails.
 
+use std::fmt::Display;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -28,6 +29,30 @@ use program_server::store::{ModulePath, Root};
 use program_server::target::{Device, Target};
 use program_server::toolchain::ToolchainConfig;
 use program_server::{Client, ProgramSlot};
+
+/// A check's result: `Err` names what failed, and `main` reports it beside the check's name. An
+/// assertion that fails panics instead, and `main` reports that panic the same way.
+type Outcome<T = ()> = Result<T, String>;
+
+/// One check of the example, over the caller's directories and toolchains.
+type Check = fn(&Args) -> Outcome;
+
+/// A step's failure, stated as what the check needed and the error that denied it.
+trait Context<T> {
+    fn context(self, what: &str) -> Outcome<T>;
+}
+
+impl<T, E: Display> Context<T> for Result<T, E> {
+    fn context(self, what: &str) -> Outcome<T> {
+        self.map_err(|error| format!("{what}: {error}"))
+    }
+}
+
+impl<T> Context<T> for Option<T> {
+    fn context(self, what: &str) -> Outcome<T> {
+        self.ok_or_else(|| what.to_owned())
+    }
+}
 
 struct Args {
     kernels: PathBuf,
@@ -80,7 +105,7 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let checks: [(&str, fn(&Args)); 6] = [
+    let checks: [(&str, Check); 6] = [
         (
             "a Triton package builds a cubin module",
             a_triton_package_builds_a_cubin_module_and_resolves_it,
@@ -109,7 +134,12 @@ fn main() -> ExitCode {
     let mut failed = false;
     for (name, check) in checks {
         match std::panic::catch_unwind(|| check(&args)) {
-            Ok(()) => println!("passed  {name}"),
+            Ok(Ok(())) => println!("passed  {name}"),
+            Ok(Err(message)) => {
+                failed = true;
+                eprintln!("check_builds: {name}: {message}");
+                println!("FAILED  {name}");
+            }
             Err(_) => {
                 failed = true;
                 println!("FAILED  {name}");
@@ -311,7 +341,8 @@ fn descriptor_key(text: &str) -> Option<String> {
 }
 
 /// A copy of a package in `temporary` that declares this host's version of
-/// the toolchain, or `None` when the host has no such toolchain.
+/// the toolchain, or `None` when the host has no such toolchain. A copy that
+/// cannot be written is the check's failure.
 ///
 /// A checked-in package is written for one toolkit version, and a version
 /// change is a new revision (design sections 5.1 and 5.2), so a package of the
@@ -323,41 +354,50 @@ fn at_host_version(
     source: &Path,
     temporary: &Path,
     toolchains: &ToolchainConfig,
-) -> Option<PathBuf> {
-    let manifest = program_server::manifest::Manifest::load(source).ok()?;
+) -> Outcome<Option<PathBuf>> {
+    let Ok(manifest) = program_server::manifest::Manifest::load(source) else {
+        return Ok(None);
+    };
     let kind = manifest.toolchain.kind;
-    let version = program_server::toolchain::Toolchains::discover(toolchains)
-        .ok()?
-        .version(kind)
-        .ok()?
-        .to_owned();
+    let Some(version) = program_server::toolchain::Toolchains::discover(toolchains)
+        .ok()
+        .and_then(|discovered| discovered.version(kind).ok().map(str::to_owned))
+    else {
+        return Ok(None);
+    };
     let name = source
         .file_name()
         .map(|name| name.to_owned())
         .unwrap_or_else(|| "package".into());
     let destination = temporary.join(name);
-    copy_tree(source, &destination);
-    let text = std::fs::read_to_string(destination.join("package.toml")).ok()?;
-    std::fs::write(
+    copy_tree(source, &destination)?;
+    let Ok(text) = std::fs::read_to_string(destination.join("package.toml")) else {
+        return Ok(None);
+    };
+    if std::fs::write(
         destination.join("package.toml"),
         declare_toolchain_version(&text, &version),
     )
-    .ok()?;
-    Some(destination)
+    .is_err()
+    {
+        return Ok(None);
+    }
+    Ok(Some(destination))
 }
 
 /// Every file and directory of `source`, under `destination`.
-fn copy_tree(source: &Path, destination: &Path) {
-    std::fs::create_dir_all(destination).expect("the copied package's directory");
-    for entry in std::fs::read_dir(source).expect("the package's files") {
-        let entry = entry.expect("a package file");
+fn copy_tree(source: &Path, destination: &Path) -> Outcome {
+    std::fs::create_dir_all(destination).context("the copied package's directory")?;
+    for entry in std::fs::read_dir(source).context("the package's files")? {
+        let entry = entry.context("a package file")?;
         let target = destination.join(entry.file_name());
-        if entry.file_type().expect("a file type").is_dir() {
-            copy_tree(&entry.path(), &target);
+        if entry.file_type().context("a file type")?.is_dir() {
+            copy_tree(&entry.path(), &target)?;
         } else {
-            std::fs::copy(entry.path(), &target).expect("a copied package file");
+            std::fs::copy(entry.path(), &target).context("a copied package file")?;
         }
     }
+    Ok(())
 }
 
 /// `manifest` with the `[toolchain]` section's `version` set to `version`.
@@ -378,15 +418,16 @@ fn declare_toolchain_version(manifest: &str, version: &str) -> String {
     lines.join("\n") + "\n"
 }
 
-/// Starts a server on its socket and answers it with its stop flag.
-fn start(
-    configuration: &ServerConfig,
-) -> (
+/// A running server, the flag that stops it, and the thread that serves it.
+type Serving = (
     Arc<ProgramServer>,
     Arc<AtomicBool>,
     std::thread::JoinHandle<()>,
-) {
-    let server = Arc::new(ProgramServer::open(configuration).expect("the server opens"));
+);
+
+/// Starts a server on its socket and answers it with its stop flag.
+fn start(configuration: &ServerConfig) -> Outcome<Serving> {
+    let server = Arc::new(ProgramServer::open(configuration).context("the server opens")?);
     let stop = Arc::new(AtomicBool::new(false));
     let running = Arc::clone(&server);
     let stopping = Arc::clone(&stop);
@@ -404,17 +445,25 @@ fn start(
         );
         std::thread::sleep(Duration::from_millis(10));
     }
-    (server, stop, thread)
+    Ok((server, stop, thread))
+}
+
+/// Stops a server `start` started and waits for its thread to end.
+fn stop_server(stop: &AtomicBool, thread: std::thread::JoinHandle<()>) -> Outcome {
+    stop.store(true, Ordering::SeqCst);
+    thread
+        .join()
+        .map_err(|_| "the server thread panicked".to_owned())
 }
 
 /// A server over a fresh package root and module store, with the compilers
 /// `toolchains` names.
-fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> ServerConfig {
+fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> Outcome<ServerConfig> {
     let package_root = temporary.join("packages");
-    std::fs::create_dir_all(&package_root).expect("the package root");
+    std::fs::create_dir_all(&package_root).context("the package root")?;
     let store = temporary.join("store");
-    std::fs::create_dir_all(&store).expect("the store");
-    ServerConfig {
+    std::fs::create_dir_all(&store).context("the store")?;
+    Ok(ServerConfig {
         socket: temporary.join("program-server.sock"),
         package_root,
         store_roots: vec![Root {
@@ -428,7 +477,7 @@ fn configuration(temporary: &Path, toolchains: ToolchainConfig) -> ServerConfig 
             arch: Target::new("sm_100a"),
             model: Target::new("b200"),
         }],
-    }
+    })
 }
 
 /// What one witness observed: the module `resolve` answered, the listing, and
@@ -452,13 +501,13 @@ fn witness(
     backend: &str,
     key: &str,
     toolchains: ToolchainConfig,
-) -> Witness {
-    let temporary = tempfile::tempdir().unwrap();
-    let configuration = configuration(temporary.path(), toolchains);
-    let (_server, stop, thread) = start(&configuration);
-    let mut client = Client::connect(&configuration.socket).unwrap();
+) -> Outcome<Witness> {
+    let temporary = tempfile::tempdir().context("a temporary directory")?;
+    let configuration = configuration(temporary.path(), toolchains)?;
+    let (_server, stop, thread) = start(&configuration)?;
+    let mut client = Client::connect(&configuration.socket).context("a client connects")?;
 
-    let installed = client.install(package).unwrap();
+    let installed = client.install(package).context("the package installs")?;
     assert_eq!(installed.package.revision, 1);
     assert_eq!(installed.package.op, op);
     assert_eq!(installed.package.backend, backend);
@@ -481,33 +530,33 @@ fn witness(
     let mut progress = Vec::new();
     let prepared = client
         .prepare(&request, &mut |step| progress.push(step))
-        .unwrap();
+        .context("the descriptor prepares")?;
     assert_eq!(prepared.programs.len(), 1);
     assert_eq!(prepared.programs[0].program.revision, 1);
 
     let program = prepared.programs[0].program.clone();
     let resolved = client
         .resolve(op, &program, &target, key, &mut |_| {})
-        .unwrap();
-    Witness {
+        .context("the committed module resolves")?;
+    Ok(Witness {
         _temporary: temporary,
         stop,
         thread,
         program,
         progress,
         resolved,
-    }
+    })
 }
 
 /// Reads a file of a resolved module, by its name.
-fn file_of(module: &Module, name: &str) -> Vec<u8> {
+fn file_of(module: &Module, name: &str) -> Outcome<Vec<u8>> {
     let mut bytes = Vec::new();
     module
         .files
         .iter()
         .find(|file| file.name == name)
-        .unwrap_or_else(|| {
-            panic!(
+        .ok_or_else(|| {
+            format!(
                 "the module has no {name}, only {:?}",
                 module
                     .files
@@ -515,28 +564,29 @@ fn file_of(module: &Module, name: &str) -> Vec<u8> {
                     .map(|file| file.name.as_str())
                     .collect::<Vec<_>>()
             )
-        })
+        })?
         .file
         .try_clone()
-        .unwrap()
+        .context("the module file's descriptor")?
         .read_to_end(&mut bytes)
-        .unwrap();
-    bytes
+        .context("the module file reads")?;
+    Ok(bytes)
 }
 
 /// Installs and prepares one package, answering the failure's message when it
-/// fails.
+/// fails. The outer `Err` is a failure of the server the check runs, not of
+/// the package.
 fn prepare_outcome(
     package: &Path,
     op: &str,
     backend: &str,
     key: &str,
     toolchains: ToolchainConfig,
-) -> std::result::Result<(), String> {
-    let temporary = tempfile::tempdir().unwrap();
-    let configuration = configuration(temporary.path(), toolchains);
-    let (_server, stop, thread) = start(&configuration);
-    let mut client = Client::connect(&configuration.socket).unwrap();
+) -> Outcome<std::result::Result<(), String>> {
+    let temporary = tempfile::tempdir().context("a temporary directory")?;
+    let configuration = configuration(temporary.path(), toolchains)?;
+    let (_server, stop, thread) = start(&configuration)?;
+    let mut client = Client::connect(&configuration.socket).context("a client connects")?;
     let outcome = client
         .install(package)
         .map_err(|error| error.to_string())
@@ -560,16 +610,15 @@ fn prepare_outcome(
                 .map(|_| ())
                 .map_err(|error| error.to_string())
         });
-    stop.store(true, Ordering::SeqCst);
-    thread.join().unwrap();
-    outcome
+    stop_server(&stop, thread)?;
+    Ok(outcome)
 }
 
-fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) {
+fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) -> Outcome {
     let python = args.python.clone();
     let Some(package) = tree_package(args, "triton") else {
         eprintln!("SKIPPED: the tree holds no Triton package");
-        return;
+        return Ok(());
     };
     let toolchains = ToolchainConfig {
         nvcc: Some(args.nvcc.clone()),
@@ -580,10 +629,11 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) {
     };
     // The tree's package is written for one Triton version; this host's may be
     // another patch, which is a new revision and not a defect of the witness.
-    let temporary = tempfile::tempdir().unwrap();
-    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains) else {
+    let temporary = tempfile::tempdir().context("a temporary directory")?;
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)?
+    else {
         eprintln!("SKIPPED (provisioning): this host reports no Triton version to build with");
-        return;
+        return Ok(());
     };
     let witness = witness(
         &directory,
@@ -591,10 +641,11 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) {
         &package.backend,
         &package.descriptor,
         toolchains,
-    );
+    )?;
 
     // The package's `[parameters]` fill the selected program's arguments.
-    let manifest = std::fs::read_to_string(directory.join("package.toml")).unwrap();
+    let manifest = std::fs::read_to_string(directory.join("package.toml"))
+        .context("the package's manifest")?;
     let parameters = manifest
         .split("[parameters]")
         .nth(1)
@@ -604,7 +655,7 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) {
                 .collect::<String>()
         })
         .unwrap_or_default();
-    let declared: toml::Table = parameters.parse().expect("the package's parameters");
+    let declared: toml::Table = parameters.parse().context("the package's parameters")?;
     for (name, default) in &declared {
         assert_eq!(
             witness.program.arguments.get(name),
@@ -628,7 +679,7 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) {
         "sm_100a",
         &package.descriptor,
     )
-    .unwrap();
+    .context("the module's path")?;
     assert_eq!(witness.progress[0].path, path);
 
     // The module is a cubin and the metadata that says how to launch it.
@@ -637,19 +688,20 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) {
         .resolved
         .metadata
         .clone()
-        .expect("a cubin module names its launch metadata");
+        .context("a cubin module names its launch metadata")?;
     assert!(
         witness.resolved.entries.is_empty(),
         "a cubin has no C entry"
     );
-    let cubin = file_of(&witness.resolved, "module.cubin");
+    let cubin = file_of(&witness.resolved, "module.cubin")?;
     assert_eq!(
         &cubin[..4],
         b"\x7fELF",
         "a cubin is an ELF file the CUDA driver loads"
     );
-    let text = String::from_utf8(file_of(&witness.resolved, &metadata)).unwrap();
-    let parsed: serde_json::Value = serde_json::from_str(&text).expect("the metadata is JSON");
+    let text = String::from_utf8(file_of(&witness.resolved, &metadata)?)
+        .context("the metadata is UTF-8")?;
+    let parsed: serde_json::Value = serde_json::from_str(&text).context("the metadata is JSON")?;
     assert!(
         !parsed
             .get("name")
@@ -659,16 +711,15 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) {
         "the metadata names the kernel it launches"
     );
 
-    witness.stop.store(true, Ordering::SeqCst);
-    witness.thread.join().unwrap();
+    stop_server(&witness.stop, witness.thread)
 }
 
-fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) {
+fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) -> Outcome {
     let Some(package) = tree_package(args, "cuda") else {
         eprintln!("SKIPPED: the tree holds no CUDA package");
-        return;
+        return Ok(());
     };
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir().context("a temporary directory")?;
     let toolchains = ToolchainConfig {
         nvcc: Some(args.nvcc.clone()),
         python: Some(args.python.clone()),
@@ -678,21 +729,23 @@ fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) {
     };
     // A package of the tree declares one toolkit version, and a version change
     // is a new revision; the witness builds this host's toolkit instead.
-    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains) else {
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)?
+    else {
         eprintln!("SKIPPED (provisioning): this host reports no nvcc version to build with");
-        return;
+        return Ok(());
     };
     // What the package declares is what the module must be: nvcc writes a
     // cubin and its launch metadata, or a native library with the entries the
     // package names (design section 5.3).
-    let manifest = program_server::manifest::Manifest::load(&directory).expect("the package loads");
+    let manifest =
+        program_server::manifest::Manifest::load(&directory).context("the package loads")?;
     let witness = witness(
         &directory,
         &package.op,
         &package.backend,
         &package.descriptor,
         toolchains,
-    );
+    )?;
 
     assert_eq!(witness.progress[0].state, BuildState::Committed);
     assert_eq!(witness.resolved.form, manifest.module.form);
@@ -702,16 +755,17 @@ fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) {
                 .resolved
                 .metadata
                 .clone()
-                .expect("a cubin module names its launch metadata");
+                .context("a cubin module names its launch metadata")?;
             assert!(
                 witness.resolved.entries.is_empty(),
                 "a cubin has no C entry"
             );
-            let cubin = file_of(&witness.resolved, "module.cubin");
+            let cubin = file_of(&witness.resolved, "module.cubin")?;
             assert_eq!(&cubin[..4], b"\x7fELF");
-            let text = String::from_utf8(file_of(&witness.resolved, &metadata)).unwrap();
+            let text = String::from_utf8(file_of(&witness.resolved, &metadata)?)
+                .context("the metadata is UTF-8")?;
             let parsed: serde_json::Value =
-                serde_json::from_str(&text).expect("the metadata is JSON");
+                serde_json::from_str(&text).context("the metadata is JSON")?;
             assert!(
                 !parsed
                     .get("name")
@@ -728,13 +782,13 @@ fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) {
                 manifest.module.entries.get("launch"),
                 "the module's launch symbol is the package's"
             );
-            let library = file_of(&witness.resolved, "module.so");
+            let library = file_of(&witness.resolved, "module.so")?;
             assert_eq!(&library[..4], b"\x7fELF");
             let launch = manifest
                 .module
                 .entries
                 .get("launch")
-                .expect("a native package names its launch entry");
+                .context("a native package names its launch entry")?;
             assert!(
                 String::from_utf8_lossy(&library).contains(launch),
                 "the module exports the entry its package names"
@@ -743,15 +797,14 @@ fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) {
         other => panic!("a CUDA package builds a cubin or a native module, not {other:?}"),
     }
 
-    witness.stop.store(true, Ordering::SeqCst);
-    witness.thread.join().unwrap();
+    stop_server(&witness.stop, witness.thread)
 }
 
-fn a_cute_dsl_package_builds_a_native_module_with_its_entries(args: &Args) {
+fn a_cute_dsl_package_builds_a_native_module_with_its_entries(args: &Args) -> Outcome {
     let python = args.python.clone();
     let Some(package) = tree_package(args, "cute_dsl") else {
         eprintln!("SKIPPED: the tree holds no CuTe DSL package");
-        return;
+        return Ok(());
     };
     let toolchains = ToolchainConfig {
         nvcc: Some(args.nvcc.clone()),
@@ -760,10 +813,11 @@ fn a_cute_dsl_package_builds_a_native_module_with_its_entries(args: &Args) {
         cargo: None,
         max_jobs: 2,
     };
-    let temporary = tempfile::tempdir().unwrap();
-    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains) else {
+    let temporary = tempfile::tempdir().context("a temporary directory")?;
+    let Some(directory) = at_host_version(&package.directory, temporary.path(), &toolchains)?
+    else {
         eprintln!("SKIPPED (provisioning): this host reports no CuTe DSL version to build with");
-        return;
+        return Ok(());
     };
     let witness = witness(
         &directory,
@@ -771,16 +825,15 @@ fn a_cute_dsl_package_builds_a_native_module_with_its_entries(args: &Args) {
         &package.backend,
         &package.descriptor,
         toolchains,
-    );
+    )?;
 
     assert_eq!(witness.progress[0].state, BuildState::Committed);
     assert_eq!(witness.resolved.form, ModuleForm::Native);
     assert!(witness.resolved.metadata.is_none());
-    let library = file_of(&witness.resolved, "module.so");
+    let library = file_of(&witness.resolved, "module.so")?;
     assert_eq!(&library[..4], b"\x7fELF");
 
-    witness.stop.store(true, Ordering::SeqCst);
-    witness.thread.join().unwrap();
+    stop_server(&witness.stop, witness.thread)
 }
 
 /// A package that declares no toolchain version is built by whatever this host
@@ -792,41 +845,45 @@ fn a_cute_dsl_package_builds_a_native_module_with_its_entries(args: &Args) {
 /// depend on the patch release declares it empty so that it builds on whichever
 /// host the caller's test uses (design section 5.2). The same package with a
 /// version no host has proves the comparison is still made.
-fn a_package_that_declares_no_toolchain_version_builds_on_any_host(args: &Args) {
+fn a_package_that_declares_no_toolchain_version_builds_on_any_host(args: &Args) -> Outcome {
     let toolchains = toolchains(args);
     let source = args.kernels.join("moe_sort/trtllm");
-    let manifest = std::fs::read_to_string(source.join("package.toml")).unwrap();
+    let manifest =
+        std::fs::read_to_string(source.join("package.toml")).context("the package's manifest")?;
     let Some(key) = descriptor_key(&manifest) else {
         panic!("the moe_sort package declares no descriptor");
     };
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir().context("a temporary directory")?;
 
     // The same sources twice: once declaring no version, once declaring one no
     // host has.
     let mut packages = Vec::new();
     for (name, version) in [("any-version", ""), ("another-version", "0.0.1")] {
         let directory = temporary.path().join(name);
-        copy_tree(&source, &directory);
+        copy_tree(&source, &directory)?;
         std::fs::write(
             directory.join("package.toml"),
             declare_toolchain_version(&manifest, version),
         )
-        .unwrap();
+        .context("the copied package's manifest")?;
         packages.push(directory);
     }
 
-    let built = prepare_outcome(&packages[0], "moe_sort", "trtllm", &key, toolchains.clone());
+    let built = prepare_outcome(&packages[0], "moe_sort", "trtllm", &key, toolchains.clone())?;
     assert!(
         built.is_ok(),
         "a package declaring no version was not built: {built:?}"
     );
 
-    let refused = prepare_outcome(&packages[1], "moe_sort", "trtllm", &key, toolchains);
-    let message = refused.expect_err("a package declaring another version was built");
+    let refused = prepare_outcome(&packages[1], "moe_sort", "trtllm", &key, toolchains)?;
+    let Err(message) = refused else {
+        return Err("a package declaring another version was built".to_owned());
+    };
     assert!(
         message.contains("is written for nvcc"),
         "the refusal does not name the version: {message}"
     );
+    Ok(())
 }
 
 /// A package compiles from the copy its install kept, not from the tree it was
@@ -837,34 +894,36 @@ fn a_package_that_declares_no_toolchain_version_builds_on_any_host(args: &Args) 
 /// installs a package from a checkout it may later lose, and a downstream server's
 /// package root is a read-only mount of the upstream's; neither has the tree, so
 /// what compiles must be what was installed.
-fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) {
+fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) -> Outcome {
     let toolchains = toolchains(args);
     let source = args.kernels.join("moe_sort/trtllm");
     let Ok(manifest) = std::fs::read_to_string(source.join("package.toml")) else {
         eprintln!("SKIPPED: the tree holds no moe_sort package");
-        return;
+        return Ok(());
     };
     let Some(key) = descriptor_key(&manifest) else {
         panic!("the moe_sort package declares no descriptor");
     };
 
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir().context("a temporary directory")?;
     // The publisher's directory: a copy of the tree package, declaring this
     // host's toolkit so the witness is not about the version.
     let publisher = temporary.path().join("publisher");
-    std::fs::create_dir_all(&publisher).unwrap();
-    let Some(to_build_from) = at_host_version(&source, &publisher, &toolchains) else {
+    std::fs::create_dir_all(&publisher).context("the publisher's directory")?;
+    let Some(to_build_from) = at_host_version(&source, &publisher, &toolchains)? else {
         eprintln!("SKIPPED (provisioning): this host reports no nvcc version to build with");
-        return;
+        return Ok(());
     };
 
-    let configuration = configuration(temporary.path(), toolchains);
-    let (_server, stop, thread) = start(&configuration);
-    let mut client = Client::connect(&configuration.socket).unwrap();
-    client.install(&to_build_from).unwrap();
+    let configuration = configuration(temporary.path(), toolchains)?;
+    let (_server, stop, thread) = start(&configuration)?;
+    let mut client = Client::connect(&configuration.socket).context("a client connects")?;
+    client
+        .install(&to_build_from)
+        .context("the publisher's package installs")?;
 
     // The tree the install named is gone; the installed copy is all there is.
-    std::fs::remove_dir_all(&to_build_from).unwrap();
+    std::fs::remove_dir_all(&to_build_from).context("the publisher's directory is removed")?;
     assert!(!to_build_from.exists());
 
     let request = PrepareRequest {
@@ -884,13 +943,12 @@ fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) {
     let mut states = Vec::new();
     client
         .prepare(&request, &mut |progress| states.push(progress.state))
-        .expect("the package compiles from the installed copy");
+        .context("the package compiles from the installed copy")?;
     assert!(
         states.contains(&BuildState::Committed),
         "the build of the installed copy committed nothing: {states:?}"
     );
-    stop.store(true, Ordering::SeqCst);
-    thread.join().unwrap();
+    stop_server(&stop, thread)
 }
 
 /// The policy fixture the delivery test installs: a real policy crate, built for
@@ -903,19 +961,19 @@ fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) {
 /// built. The package itself carries neither a wasm binary nor the policy's
 /// source — the build asks cargo for sched's own crate — which is why the install
 /// is the step that must have the tree.
-fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) {
+fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) -> Outcome {
     let precompiler = args.precompile.clone();
     let package = args.fixtures.join("policy");
     if !package.join("package.toml").is_file() {
         eprintln!("SKIPPED: the tree holds no policy fixture");
-        return;
+        return Ok(());
     }
 
-    let temporary = tempfile::tempdir().unwrap();
+    let temporary = tempfile::tempdir().context("a temporary directory")?;
     let root = temporary.path().join("packages");
-    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&root).context("the package root")?;
     let store = temporary.path().join("store");
-    std::fs::create_dir_all(&store).unwrap();
+    std::fs::create_dir_all(&store).context("the store")?;
     let with_precompiler = ServerConfig {
         socket: temporary.path().join("first.sock"),
         package_root: root.clone(),
@@ -937,16 +995,15 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) {
             model: Target::new("b200"),
         }],
     };
-    let (_server, stop, thread) = start(&with_precompiler);
-    let mut client = Client::connect(&with_precompiler.socket).unwrap();
+    let (_server, stop, thread) = start(&with_precompiler)?;
+    let mut client = Client::connect(&with_precompiler.socket).context("a client connects")?;
     let installed = client
         .install(&package)
-        .expect("the policy fixture installs");
+        .context("the policy fixture installs")?;
     assert_eq!(installed.package.op, "scheduling");
     assert_eq!(installed.package.backend, "fcfs");
     assert_eq!(installed.package.revision, 1);
-    stop.store(true, Ordering::SeqCst);
-    thread.join().unwrap();
+    stop_server(&stop, thread)?;
 
     // The precompiled module is beside the installed manifest, and it is wasmtime's
     // artifact rather than the raw module the policy crate produced.
@@ -957,7 +1014,9 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) {
         "the install kept no module beside the manifest at {}",
         revision.display()
     );
-    let bytes = std::fs::metadata(&artifact).unwrap().len();
+    let bytes = std::fs::metadata(&artifact)
+        .context("the artifact's metadata")?
+        .len();
     assert!(
         bytes > 512 * 1024,
         "the artifact is {bytes} bytes, too small to be a precompiled policy"
@@ -967,8 +1026,8 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) {
     let mut without_precompiler = with_precompiler.clone();
     without_precompiler.socket = temporary.path().join("second.sock");
     without_precompiler.toolchains.wasm = None;
-    let (_server, stop, thread) = start(&without_precompiler);
-    let mut client = Client::connect(&without_precompiler.socket).unwrap();
+    let (_server, stop, thread) = start(&without_precompiler)?;
+    let mut client = Client::connect(&without_precompiler.socket).context("a client connects")?;
     let program = program_server::Program {
         backend: "fcfs".to_owned(),
         revision: 1,
@@ -982,13 +1041,12 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) {
             program_server::manifest::POLICY_DESCRIPTOR,
             &mut |_| {},
         )
-        .expect("the installed policy resolves without a compiler");
+        .context("the installed policy resolves without a compiler")?;
     assert_eq!(module.form, ModuleForm::Wasm);
     assert_eq!(
-        file_of(&module, program_server::source::MODULE_WASM).len() as u64,
+        file_of(&module, program_server::source::MODULE_WASM)?.len() as u64,
         bytes,
         "the resolved module is the artifact the install kept"
     );
-    stop.store(true, Ordering::SeqCst);
-    thread.join().unwrap();
+    stop_server(&stop, thread)
 }

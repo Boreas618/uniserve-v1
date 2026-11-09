@@ -156,6 +156,11 @@ enum Control {
 }
 
 /// What a connection's pause of one response found.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a `Pause` answers one handover of one response and is matched at once; boxing \
+              `Frozen` would add an allocation to the only variant that carries state"
+)]
 pub(crate) enum Pause {
     /// The response stopped at an event boundary; this is the state a
     /// successor resumes it from.

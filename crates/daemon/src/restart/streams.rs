@@ -419,7 +419,7 @@ fn take_over(
                 content.content_type.clone(),
                 media,
             )
-            .from_offset(usize::try_from(content.offset).unwrap_or(usize::MAX));
+            .resumed_at(usize::try_from(content.offset).unwrap_or(usize::MAX));
             // Artifact bytes, not events: no server-sent keep-alive.
             ResponseStream::start(Box::new(run), false)
         }

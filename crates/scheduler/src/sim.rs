@@ -124,6 +124,11 @@ const DEFAULT_DENOISE_STEPS: u16 = 50;
 const DEFAULT_IMAGE_HW: (u32, u32) = (512, 512);
 
 /// Work sent to the simulator thread.
+#[expect(
+    clippy::large_enum_variant,
+    reason = "nearly every job is a batch and `Shutdown` is sent once per worker, so boxing \
+              `Batch` would add an allocation to every batch and save nothing"
+)]
 enum Job {
     Batch(ExecutionBatch),
     Shutdown,
@@ -136,6 +141,10 @@ enum Job {
 /// The scheduler stops when every model group is closed. Without this a
 /// simulated worker's workers never die, so no case could state what
 /// happens when they all do.
+/// A loss report a simulated worker answers a poll with: the group, why it
+/// failed, and the requests whose work is gone.
+type LossReport = (WorkerGroupId, String, Vec<ipc::RequestKey>);
+
 #[derive(Clone, Default)]
 pub struct SimLoss {
     /// The group reported lost: it stays lost for the worker's lifetime, so
@@ -147,7 +156,7 @@ pub struct SimLoss {
     closed: Arc<Mutex<bool>>,
     /// The report the worker's next poll answers with, taken once: the
     /// group, why it failed, and the requests whose work is gone.
-    pending: Arc<Mutex<Option<(WorkerGroupId, String, Vec<ipc::RequestKey>)>>>,
+    pending: Arc<Mutex<Option<LossReport>>>,
     /// Wakes a scheduler parked on this worker, so the loss is answered
     /// without waiting out its park.
     wake: Arc<Mutex<Option<CommandWaker>>>,
@@ -339,6 +348,11 @@ pub struct SimWorker {
 /// What the simulated worker observed at its boundary, in the order it
 /// happened: a batch the scheduler submitted and a result it was handed back.
 #[derive(Debug, Clone, PartialEq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "readers destructure the events by value, and the log holds one `Submitted` per \
+              batch, so boxing it would change every reader to shrink only `Resolved` entries"
+)]
 pub enum BatchEvent {
     /// A batch as the worker accepted it.
     Submitted(ExecutionBatch),

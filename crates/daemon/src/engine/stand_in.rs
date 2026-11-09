@@ -47,12 +47,16 @@ pub(crate) struct PrecopyPayload {
     pub(crate) policy: String,
 }
 
+/// What each stand-in engine was sent, by engine number, in arrival order.
+pub(crate) type SeenLog = Arc<Mutex<Vec<(u64, Seen)>>>;
+
+/// The programs each `Precopy` carried, by engine number, in arrival order.
+pub(crate) type PrecopyLog = Arc<Mutex<Vec<(u64, PrecopyPayload)>>>;
+
 /// The service's end of the daemon's channel, with stand-in main processes
 /// behind it: every command is answered as the protocol says, recording what
 /// each engine was sent.
-pub(crate) fn main_processes(
-    answers: Vec<(u64, Answer)>,
-) -> (ProcessCommands, Arc<Mutex<Vec<(u64, Seen)>>>) {
+pub(crate) fn main_processes(answers: Vec<(u64, Answer)>) -> (ProcessCommands, SeenLog) {
     let (commands, seen, _) = main_processes_recording(answers);
     (commands, seen)
 }
@@ -61,11 +65,7 @@ pub(crate) fn main_processes(
 /// main process must be handed the epoch's own programs, not none.
 pub(crate) fn main_processes_recording(
     answers: Vec<(u64, Answer)>,
-) -> (
-    ProcessCommands,
-    Arc<Mutex<Vec<(u64, Seen)>>>,
-    Arc<Mutex<Vec<(u64, PrecopyPayload)>>>,
-) {
+) -> (ProcessCommands, SeenLog, PrecopyLog) {
     let answers: std::collections::BTreeMap<u64, Answer> = answers.into_iter().collect();
     let (processes, commands, reports) = ProcessCommands::channel();
     let seen = Arc::new(Mutex::new(Vec::new()));

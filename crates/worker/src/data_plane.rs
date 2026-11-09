@@ -538,9 +538,7 @@ impl DataPlane {
                 )
             };
             let mut walk = Walk::default();
-            model
-                .load(&target, &mut walk)
-                .map_err(|error| Error::Invalid(error))?;
+            model.load(&target, &mut walk).map_err(Error::Invalid)?;
             let log = walk.into_log();
             let pairs = paired(&serving, &log, matching).map_err(|difference| {
                 Error::Invalid(format!(
@@ -575,12 +573,15 @@ impl DataPlane {
     /// on as they did.
     pub fn load(&self, mut planned: Planned) -> Result<Planned> {
         let target = planned.target.clone();
-        let loads: Vec<(
+        // One rank's share of the load: its model, its storage, its device and the weights it
+        // serves now, copied out so no rank's lock is held while the loads run.
+        type RankLoad = (
             Arc<dyn ModelLoad>,
             Arc<Retained>,
             platform::DeviceId,
             Vec<LoadedWeight>,
-        )> = self
+        );
+        let loads: Vec<RankLoad> = self
             .ranks
             .iter()
             .map(|rank| {

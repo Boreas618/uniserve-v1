@@ -837,6 +837,11 @@ impl CommandSender {
     }
 
     /// Enqueues a command, then wakes the scheduler after a successful send.
+    #[expect(
+        clippy::result_large_err,
+        reason = "the error hands the unsent command back as the channel's own `SendError` \
+                  does, and it arises only once the scheduler has exited"
+    )]
     pub(crate) fn send(&self, cmd: Command) -> Result<(), crossbeam_channel::SendError<Command>> {
         let r = self.tx.send(cmd);
         // Wake only on a successful enqueue: if the channel is closed there is

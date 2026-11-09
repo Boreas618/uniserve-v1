@@ -117,13 +117,19 @@ pub(super) fn tier_refusal(
 /// device that did not state these three would refuse the first encode of every request.
 /// The one host call every rank serves: the encode of the units it decoded.
 pub(super) fn unit_phases() -> Vec<PhaseId> {
-    vec![PhaseId(
-        u16::try_from(scheduler::phase_id(scheduler::PhaseKind::VideoEncode).0)
-            .expect("a phase id fits"),
-    )]
+    vec![phase(scheduler::PhaseKind::VideoEncode)]
 }
 
 /// The phase id `kind` is planned as.
+///
+/// # Panics
+///
+/// For `PhaseKind::Other`, the policy-side placeholder numbered `u32::MAX`, which no rank plans.
+#[expect(
+    clippy::expect_used,
+    reason = "every kind a rank plans is numbered below 21; only the policy-side placeholder \
+              `PhaseKind::Other` is numbered past `u16`, and no rank plans it"
+)]
 pub(super) fn phase(kind: scheduler::PhaseKind) -> PhaseId {
     PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"))
 }
@@ -138,7 +144,7 @@ pub(super) fn host_phases() -> Vec<PhaseId> {
         scheduler::PhaseKind::LatentEncoding,
     ]
     .into_iter()
-    .map(|kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits")))
+    .map(phase)
     .collect()
 }
 
@@ -185,7 +191,7 @@ pub(super) fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
         // The scheduler numbers a phase with the epoch's `u32` and the worker names one with the
         // wire's `u16`: the plan is where the two meet, and a kind that did not fit would be a table
         // this process cannot state rather than a phase to serve quietly.
-        .map(|kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits")))
+        .map(phase)
         .collect()
 }
 

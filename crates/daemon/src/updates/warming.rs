@@ -146,14 +146,15 @@ mod tests {
         }
     }
 
+    /// One round of a source's reads, answered at once.
+    type Round = std::future::Ready<Result<Vec<Snapshot>, String>>;
+
+    /// The prefill budgets a source was given, in the order it was given them.
+    type Budgets = Arc<Mutex<Vec<Option<u32>>>>;
+
     /// A source whose rounds read `reads` in turn, and that records every
     /// prefill budget it was given.
-    fn source(
-        reads: Vec<Vec<Prefix>>,
-    ) -> (
-        impl FnMut(Operation) -> std::future::Ready<Result<Vec<Snapshot>, String>>,
-        Arc<Mutex<Vec<Option<u32>>>>,
-    ) {
+    fn source(reads: Vec<Vec<Prefix>>) -> (impl FnMut(Operation) -> Round, Budgets) {
         let budgets = Arc::new(Mutex::new(Vec::new()));
         let told = Arc::clone(&budgets);
         let mut reads = reads.into_iter();

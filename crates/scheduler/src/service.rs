@@ -2223,7 +2223,7 @@ mod tests {
             stated: Default::default(),
         };
         let policy = RoutePolicy::install(
-            &engine,
+            engine,
             &crate::PolicyBytes::new(crate::testing::toy_module(&toy)),
             program,
             &TrialState::default(),

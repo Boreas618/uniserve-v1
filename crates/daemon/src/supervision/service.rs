@@ -442,6 +442,11 @@ fn same_process(
         && row.generation == process.generation
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the service takes each channel end and resource it owns separately: they come from \
+              different owners, and `resume` takes the same ends from a handoff"
+)]
 pub(crate) fn serve_leader(
     host: &str,
     local: Local,
@@ -1150,6 +1155,11 @@ fn answer(
 /// process the request is answered *for* — the engine number a process states,
 /// or the epoch's own owner for a client. They differ for a client, which holds
 /// no engine number but whose launches are answered for the deployment.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request, its two engine numbers and the service's routing state it reads and \
+              updates are distinct borrows of the service loop's own locals"
+)]
 fn route(
     engine: u64,
     owner: u64,
@@ -1481,6 +1491,11 @@ impl LeaderService {
 
 /// Goes on with the service a predecessor handed over, with its
 /// descriptors in the handoff's order, until `stop`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the service takes each channel end and resource it owns separately, as \
+              `serve_leader` does, beside the state its predecessor handed over"
+)]
 pub(crate) fn resume(
     host: String,
     handed: HandedService,

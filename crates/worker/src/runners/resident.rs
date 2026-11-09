@@ -105,7 +105,7 @@ impl Table {
             ));
         }
         let bytes = usize::try_from(u64::from(rows) * u64::from(width) * 4)
-            .map_err(|_| Error::Resource("a block table is larger than memory".into()))?;
+            .map_err(|_| Error::Resource("a block table is larger than memory"))?;
         Ok(Self {
             buffer: pools.allocate(pool, bytes as u64)?,
             rows,
@@ -286,8 +286,7 @@ impl ResidentCache {
         if self.tables.is_empty() {
             return Err(Error::State(
                 "the cache provider has no gather columns: the worker attaches the device's \
-                 pools before the first capture"
-                    .into(),
+                 pools before the first capture",
             ));
         }
         let table = self
@@ -699,8 +698,7 @@ impl KvProvider for ResidentCache {
                 .ok_or_else(|| {
                     Error::State(
                         "the cache provider has no pools: the worker attaches them before the \
-                         first capture"
-                            .into(),
+                         first capture",
                     )
                 })?;
             let cache = self

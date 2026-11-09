@@ -56,6 +56,12 @@ pub(crate) fn unnamed_deployment() -> String {
 #[cfg(feature = "testing")]
 pub fn sim_args(model: impl Into<String>) -> EngineArgs {
     use std::num::NonZeroUsize;
+    #[expect(
+        clippy::expect_used,
+        reason = "DEFAULT_MAX_RUNNING_REQUESTS is a positive constant"
+    )]
+    let max_running_requests =
+        NonZeroUsize::new(DEFAULT_MAX_RUNNING_REQUESTS).expect("a positive default");
     let group = WorkerGroupConfig::placed(
         &["localhost".to_owned()],
         "cpu",
@@ -87,8 +93,7 @@ pub fn sim_args(model: impl Into<String>) -> EngineArgs {
             worker_groups: vec![group.clone()],
         },
         deployment: unnamed_deployment(),
-        max_running_requests: NonZeroUsize::new(DEFAULT_MAX_RUNNING_REQUESTS)
-            .expect("a positive default"),
+        max_running_requests,
         max_num_batched_tokens: None,
         attention_backend: String::new(),
         prefill_attention_backend: None,
@@ -111,7 +116,12 @@ pub fn sim_args(model: impl Into<String>) -> EngineArgs {
     args.engine_config.kv_cache.host_tier = false;
     args.host = "localhost".to_owned();
     args.group = group.id.0.clone();
-    args.world_size = u32::try_from(group.ranks.len()).expect("one rank");
+    #[expect(
+        clippy::expect_used,
+        reason = "the simulated group is placed with one rank, which a u32 holds"
+    )]
+    let world_size = u32::try_from(group.ranks.len()).expect("one rank");
+    args.world_size = world_size;
     args.queue_depth = 2;
     args
 }

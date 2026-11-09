@@ -1128,9 +1128,7 @@ fn graph_diff() -> bool {
 }
 
 /// Every kernel node of one walk's table, in capture order, with the operator it belongs to.
-fn kernel_nodes<'a>(
-    nodes: &'a crate::captured::Nodes,
-) -> Vec<(&'static str, &'a platform::GraphNode)> {
+fn kernel_nodes(nodes: &crate::captured::Nodes) -> Vec<(&'static str, &platform::GraphNode)> {
     nodes
         .iter()
         .flat_map(|(operator, _, launch)| launch.iter().map(move |node| (*operator, &node.node)))
@@ -2380,7 +2378,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
                         "this replay walks the batch eagerly instead of launching its graph"
                     );
                     // Cloned before the walk: the epoch is borrowed for the walk itself.
-                    let kernels = self.lifecycle.generation_named(*generation)?.clone();
+                    let kernels = self.lifecycle.generation_named(*generation)?;
                     self.walk(*bucket, &kernels)?;
                 }
                 // A bucket this generation did not prepare launches only operators that did not
@@ -3447,7 +3445,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
             match page_of_slot(*slot) {
                 Some(page) => written.push_str(&page.to_string()),
-                None => written.push_str("-"),
+                None => written.push('-'),
             }
         }
         let (start_page, units, allocated) =
@@ -3830,8 +3828,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 continue;
             };
             let values: Vec<i32> = raw
-                .chunks_exact(4)
-                .map(|four| i32::from_ne_bytes([four[0], four[1], four[2], four[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|four| i32::from_ne_bytes(*four))
                 .collect();
             out.push_str(&format!(" {name}={values:?}"));
         }
@@ -4016,14 +4016,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             tail.push_str(&format!("{} ", integer(at)));
         }
         out.push_str(&format!(" tail@1256=[{tail}]"));
-        if let Ok(planes) = self.kv.planes(0) {
-            if let Some(first) = planes.first() {
-                out.push_str(&format!(
-                    " plane_heads={} plane_pages={}",
-                    first.key.shape.dim(2),
-                    first.key.shape.dim(0)
-                ));
-            }
+        if let Ok(planes) = self.kv.planes(0)
+            && let Some(first) = planes.first()
+        {
+            out.push_str(&format!(
+                " plane_heads={} plane_pages={}",
+                first.key.shape.dim(2),
+                first.key.shape.dim(0)
+            ));
         }
         out.push_str(&verdict(
             "cum_q",
@@ -4157,8 +4157,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let mut negative = 0_usize;
         let mut largest = i64::MIN;
         let mut first_few = String::new();
-        for (index, word) in raw.chunks_exact(4).enumerate() {
-            let slot = i32::from_ne_bytes(word.try_into().unwrap_or([0; 4]));
+        for (index, word) in raw.as_chunks::<4>().0.iter().enumerate() {
+            let slot = i32::from_ne_bytes(*word);
             if slot < 0 {
                 negative += 1;
             } else {
@@ -4206,7 +4206,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         let (start, reserved) = match self.pool() {
             Ok(mut pool) => match pool.base(self.stream_id()) {
-                Ok(base) => (base.address(), pool.reserved() as u64),
+                Ok(base) => (base.address(), pool.reserved()),
                 Err(error) => return format!(" probes=no-arena({error})"),
             },
             Err(error) => return format!(" probes=no-pool({error})"),
@@ -4227,8 +4227,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // launch's own `max_q`/`sum_q` disagree, and every row after the batch's own comes from that.
         let spelled = |raw: &[u8]| {
             let values: Vec<String> = raw
-                .chunks_exact(4)
-                .map(|word| i32::from_ne_bytes(word.try_into().unwrap_or([0; 4])).to_string())
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|word| i32::from_ne_bytes(*word).to_string())
                 .collect();
             if values.len() > 8 {
                 format!("{},+{}", values[..8].join(","), values.len() - 8)
@@ -4331,10 +4333,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 if layer == 0 && address != 0 {
                     layer0_out = address;
                 }
-                if let Some(value) = counter_value {
-                    if value != 0 {
-                        dirty.push((layer, value));
-                    }
+                if let Some(value) = counter_value
+                    && value != 0
+                {
+                    dirty.push((layer, value));
                 }
                 // Where the launch's own tensor map says the output is. A kernel may store O through
                 // `tmaO_` rather than through `ptrO`, and the two are different statements of one
@@ -4451,7 +4453,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             }
         }
         out.push_str(&format!(" attn_extents={}", attn_extents.len()));
-        functions.sort_by(|left, right| right.1.cmp(&left.1));
+        functions.sort_by_key(|function| std::cmp::Reverse(function.1));
         // Every function of the graph, not the twelve most frequent: the question the histogram
         // answers is which kernels are *absent* (a reduction node, a reduction's second launch), and
         // a truncated list cannot answer it - a count of 1 at the end of the list is exactly what an
@@ -4512,10 +4514,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
                                 .ok()
                                 .map(|params| {
                                     params.parameters.iter().any(|blob| {
-                                        blob.chunks_exact(8).any(|word| {
-                                            u64::from_ne_bytes(word.try_into().unwrap_or([0; 8]))
-                                                == layer0_out
-                                        })
+                                        blob.as_chunks::<8>()
+                                            .0
+                                            .iter()
+                                            .any(|word| u64::from_ne_bytes(*word) == layer0_out)
                                     })
                                 })
                                 .unwrap_or(false)
@@ -4545,8 +4547,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     continue;
                 };
                 for blob in &params.parameters {
-                    for word in blob.chunks_exact(8) {
-                        let address = u64::from_ne_bytes(word.try_into().unwrap_or([0; 8]));
+                    for word in blob.as_chunks::<8>().0 {
+                        let address = u64::from_ne_bytes(*word);
                         // Sixty-four bytes is the smallest span worth a digest: a sequence vector, a
                         // counter and a page table all fit in it, and a digest of a shorter span
                         // would name nothing.
@@ -4595,7 +4597,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let Ok(base) = pool.base(self.stream_id()) else {
             return false;
         };
-        let reserved = pool.reserved() as u64;
+        let reserved = pool.reserved();
         let start = base.address();
         address >= start && (address - start).saturating_add(bytes as u64) <= reserved
     }
@@ -5389,41 +5391,6 @@ pub fn calls_output(
     Ok(output)
 }
 
-/// Refuses a decode batch whose rows disagree with the bucket's sampling path.
-///
-/// A bucket's variant fixes the sampler launch sequence for every row: [`Variant::DecodeGreedy`]
-/// argmaxes each row's penalized logits and [`Variant::DecodeSampled`] draws one token per row from
-/// its distribution. Neither sequence can serve a row of the other class - a draw cannot produce a
-/// greedy token (the candidates are ordered by token id before the inverse CDF, so a draw selects an
-/// id, not the largest logit), and an argmax is not what a row that states a temperature asked for.
-///
-/// Which requests share a batch is the batcher's decision, so the composition is not the worker's
-/// to change: it states that the batch it was handed cannot be served, naming the row and the
-/// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
-/// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
-/// host argmax of the row's kept logits (`greedy_first_tokens`).
-
-/// The sampling parameters a warm pose states: one valid, permissive draw per row.
-///
-/// `TEMPERATURE` is 1 rather than 0 because the sampler's forward divides by it - a zeroed row
-/// asks for a division by zero, and the capture would hang or produce a value no kernel can use.
-/// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
-/// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
-/// The span a warm pose states: `seq_lens` per row, and `query_offsets` per row boundary.
-///
-/// A prefill row carries a multi-token run, so the first row holds the bucket's whole extent and the
-/// rest hold none - a partition of `num_tokens` into one run. **A decode row is one query token of
-/// its own sequence**, so its partition is the identity: row `i` holds `cum_seq_lens_q[i]..[i + 1]`,
-/// which is one token. Stating the prefill form for a decode bucket tells the attention kernel that
-/// row 0 holds every query while the query tensor holds one row per token, and a kernel given a
-/// partition no tensor has computes a tiling and a mask that no buffer matches.
-/// The calls a warm pose states: one per row for a decode bucket, one over the run for a prefill.
-///
-/// A decode row is one request's one token, and `Staging::stage` extends a batch to one call per
-/// padded row in exactly this form, so a decode pose that stated one call holding the whole token run
-/// would describe a batch no serving batch has - and a capture states its pose to the model for the
-/// life of the bucket. A prefill row genuinely carries a run, so its pose states one call over the
-/// bucket's tokens.
 /// The call ids of a bucket's warm pose: one per call `warm_calls` states.
 ///
 /// `Staging::stage` refuses a pose whose call ids do not name every call of its rows, and a decode
@@ -5438,6 +5405,13 @@ fn warm_call_ids(bucket: Bucket) -> Vec<CallId> {
         .collect()
 }
 
+/// The calls a warm pose states: one per row for a decode bucket, one over the run for a prefill.
+///
+/// A decode row is one request's one token, and `Staging::stage` extends a batch to one call per
+/// padded row in exactly this form, so a decode pose that stated one call holding the whole token run
+/// would describe a batch no serving batch has - and a capture states its pose to the model for the
+/// life of the bucket. A prefill row genuinely carries a run, so its pose states one call over the
+/// bucket's tokens.
 fn warm_calls(bucket: Bucket) -> Vec<nn::BatchRow> {
     let rows = bucket.rows;
     if bucket.variant.is_decode() {
@@ -5459,6 +5433,14 @@ fn warm_calls(bucket: Bucket) -> Vec<nn::BatchRow> {
     }
 }
 
+/// The span a warm pose states: `seq_lens` per row, and `query_offsets` per row boundary.
+///
+/// A prefill row carries a multi-token run, so the first row holds the bucket's whole extent and the
+/// rest hold none - a partition of `num_tokens` into one run. **A decode row is one query token of
+/// its own sequence**, so its partition is the identity: row `i` holds `cum_seq_lens_q[i]..[i + 1]`,
+/// which is one token. Stating the prefill form for a decode bucket tells the attention kernel that
+/// row 0 holds every query while the query tensor holds one row per token, and a kernel given a
+/// partition no tensor has computes a tiling and a mask that no buffer matches.
 fn warm_span(bucket: Bucket) -> (Vec<i32>, Vec<i32>) {
     let rows = usize::try_from(bucket.rows).unwrap_or(0);
     let tokens = bucket.tokens as i32;
@@ -5480,6 +5462,12 @@ fn warm_span(bucket: Bucket) -> (Vec<i32>, Vec<i32>) {
     (lengths, offsets)
 }
 
+/// The sampling parameters a warm pose states: one valid, permissive draw per row.
+///
+/// `TEMPERATURE` is 1 rather than 0 because the sampler's forward divides by it - a zeroed row
+/// asks for a division by zero, and the capture would hang or produce a value no kernel can use.
+/// `TOP_K` 0 keeps every candidate, `TOP_P` 1 keeps all of the nucleus, `MIN_P` 0 keeps every
+/// candidate above it, and the three penalties are 0. The token the pose draws is discarded.
 fn warm_parameters(rows: usize) -> Vec<f32> {
     let columns = ops::sampler::PARAMETER_COLUMNS as usize;
     let mut parameters = vec![0.0; rows * columns];
@@ -5491,6 +5479,19 @@ fn warm_parameters(rows: usize) -> Vec<f32> {
     parameters
 }
 
+/// Refuses a decode batch whose rows disagree with the bucket's sampling path.
+///
+/// A bucket's variant fixes the sampler launch sequence for every row: [`Variant::DecodeGreedy`]
+/// argmaxes each row's penalized logits and [`Variant::DecodeSampled`] draws one token per row from
+/// its distribution. Neither sequence can serve a row of the other class - a draw cannot produce a
+/// greedy token (the candidates are ordered by token id before the inverse CDF, so a draw selects an
+/// id, not the largest logit), and an argmax is not what a row that states a temperature asked for.
+///
+/// Which requests share a batch is the batcher's decision, so the composition is not the worker's
+/// to change: it states that the batch it was handed cannot be served, naming the row and the
+/// bucket, rather than serving a token the request did not ask for. Prefill buckets are exempt - a
+/// prompt-ending greedy row inside a drawing prefill bucket is ordinary, and its first token is the
+/// host argmax of the row's kept logits (`greedy_first_tokens`).
 fn refuse_mixed_sampling(variant: crate::plan::Variant, parameters: &[f32]) -> Result<()> {
     if !variant.is_decode() {
         return Ok(());

@@ -523,9 +523,7 @@ impl Scheduler {
         // request that has not run this component yet is placed where the
         // policy says (§4.4); one that has goes back to the replica holding its
         // state, whatever the policy would answer.
-        let Some(choice) = self.place_call(&call) else {
-            return None;
-        };
+        let choice = self.place_call(&call)?;
         let Some((worker, entry)) =
             self.dispatch
                 .select_worker(&self.worker, &self.info, &call, &choice)

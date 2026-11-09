@@ -3,6 +3,10 @@
 //! cannot hold the request, and one above it a layout larger than the request needs, so the two
 //! statements are held against each other here over every kind of condition.
 
+// Always true in an integration test crate; it makes clippy treat the helpers
+// below as test code, where a failed unwrap is the test's failure report.
+#![cfg(test)]
+
 use minimax_h3::packing::{self, Condition, Frame, Role};
 use minimax_h3::processing::plan::{
     AudioClip, ConditionInput, FramePosition, KeyframeFit, Prepared, VideoClip,
