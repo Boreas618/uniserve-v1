@@ -956,7 +956,12 @@ pub trait Encoder {
 /// A diffusion model that denoises latents step by step.
 pub trait Denoiser {
     /// The latent layout this request needs.
-    fn layout(&self, request: &VideoRequest<'_>) -> Layout;
+    ///
+    /// # Errors
+    ///
+    /// A request whose canvas or frame count the model does not lay out; no layout is invented
+    /// for it.
+    fn layout(&self, request: &VideoRequest<'_>) -> Result<Layout>;
 
     /// The denoising steps `request` runs, in order.
     ///

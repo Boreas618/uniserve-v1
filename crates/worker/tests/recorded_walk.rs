@@ -125,14 +125,14 @@ fn latent(channels: u32, frames: u32, height: u32, width: u32) -> LatentShape {
 struct Stepping;
 
 impl Denoiser for Stepping {
-    fn layout(&self, _request: &VideoRequest<'_>) -> Layout {
-        Layout {
+    fn layout(&self, _request: &VideoRequest<'_>) -> Result<Layout> {
+        Ok(Layout {
             video: latent(4, 1, 2, 2),
             audio: None,
             text_rows: 8,
             condition_rows: 0,
             condition_elements: 0,
-        }
+        })
     }
 
     fn schedule(&self, _request: &VideoRequest<'_>) -> Result<Vec<Step>> {
@@ -242,7 +242,7 @@ fn a_denoiser_records_its_opening_and_its_step() {
     assert_eq!(footprint.peak, 2048 + 3072 + 4096);
     assert_eq!(
         footprint.widest,
-        Some(Bucket::denoise(1, model.layout(&warm().view())).serving(1, 16, 16))
+        Some(Bucket::denoise(1, model.layout(&warm().view()).unwrap()).serving(1, 16, 16))
     );
 }
 
@@ -454,7 +454,7 @@ fn an_encoder_records_its_vision_prompts() {
 struct Anchoring;
 
 impl Denoiser for Anchoring {
-    fn layout(&self, request: &VideoRequest<'_>) -> Layout {
+    fn layout(&self, request: &VideoRequest<'_>) -> Result<Layout> {
         Stepping.layout(request)
     }
 
@@ -611,6 +611,6 @@ fn a_denoiser_records_the_openings_its_conditions_admit() {
     assert_eq!(footprint.peak, 2048 + 32768 + 4096);
     assert_eq!(
         footprint.widest,
-        Some(Bucket::denoise(1, model.layout(&warm.view())).serving(1, 16, 16))
+        Some(Bucket::denoise(1, model.layout(&warm.view()).unwrap()).serving(1, 16, 16))
     );
 }

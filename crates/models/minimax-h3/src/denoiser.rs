@@ -363,30 +363,17 @@ impl Layouts {
 
     /// The layout a request is laid out in, without packing it.
     ///
-    /// The capability asks for a layout and cannot refuse one, so this snaps the request the way
-    /// [`Layouts::layout`] does and takes the deployment's text capacity and the request's rung. A
-    /// request whose packing is then refused is one the runner never asks for: the packing is the
-    /// same function of the same values, and the runner must lay the request out before it captures
-    /// anything.
-    pub fn cover(&self, request: &VideoRequest<'_>) -> Layout {
+    /// This snaps the request the way [`Layouts::layout`] does and takes the deployment's text
+    /// capacity and the request's rung; a canvas or a frame count the packing refuses is refused
+    /// here by the same rule.
+    pub fn cover(&self, request: &VideoRequest<'_>) -> Result<Layout> {
         let frames = frames_of(request);
-        let canvas = canvas_of(request).unwrap_or(Canvas {
-            short_edge: 768,
-            aspect: (16, 9),
-            width: 1344,
-            height: 768,
-        });
-        let raster = packing::latent_raster(&canvas).unwrap_or(packing::LatentRaster {
-            // A snapped canvas is a whole number of 16-pixel latent cells, so this is the raster the
-            // packing states; the fallback only keeps the capability's infallible call free of a
-            // panic when a caller passes a raster the checkpoint never served.
-            height: canvas.height / 16,
-            width: canvas.width / 16,
-        });
-        Layout {
+        let canvas = canvas_of(request)?;
+        let raster = packing::latent_raster(&canvas)?;
+        Ok(Layout {
             video: LatentShape {
                 channels: self.config.transformer.video_channels,
-                frames: packing::video_latent_frames(frames).unwrap_or(2),
+                frames: packing::video_latent_frames(frames)?,
                 height: raster.height,
                 width: raster.width,
             },
@@ -394,7 +381,7 @@ impl Layouts {
             text_rows: self.arrangement.text_rows,
             condition_rows: self.condition_rows_of(request),
             condition_elements: self.condition_elements(&conditions_of(request), &canvas),
-        }
+        })
     }
 
     /// The condition rows `request`'s layout holds: the rung it states, the deployment's capacity
@@ -1058,6 +1045,12 @@ fn draw_offsets(layout: Layout) -> (u64, u64) {
 /// Public for a caller that must size a stage before loading it: the canvas is what a case's rows,
 /// elements and tiles all follow from, and a second rounding is a second answer to it.
 pub fn canvas_of(request: &VideoRequest) -> Result<Canvas> {
+    if request.width == 0 || request.height == 0 {
+        return Err(Error::config(format!(
+            "a {}x{} request has no canvas",
+            request.width, request.height
+        )));
+    }
     let width = round_up(request.width, crate::CANVAS_MULTIPLE);
     let height = round_up(request.height, crate::CANVAS_MULTIPLE);
     let divisor = gcd(width, height);
@@ -1467,8 +1460,8 @@ pub fn schedule_for(
 }
 
 impl nn::capability::Denoiser for Denoiser {
-    fn layout(&self, request: &VideoRequest<'_>) -> Layout {
-        self.rules.cover(request)
+    fn layout(&self, request: &VideoRequest<'_>) -> nn::Result<Layout> {
+        Ok(self.rules.cover(request)?)
     }
 
     /// The denoising steps this checkpoint runs for `request`'s task ([`crate::VideoTask::of`]).
@@ -2881,30 +2874,44 @@ mod tests {
         assert_eq!(ladder(512), [512]);
     }
 
+    /// A request the packing cannot lay out is refused, not covered by another canvas.
+    #[test]
+    fn a_request_without_a_canvas_has_no_layout() {
+        let rules = layouts();
+        assert!(rules.cover(&request(22, 0, 768)).is_err());
+        assert!(rules.cover(&request(22, 1344, 0)).is_err());
+        let covered = rules.cover(&request(22, 1344, 768)).unwrap();
+        assert_eq!((covered.video.width, covered.video.height), (84, 48));
+    }
+
     /// A layout holds the rung its request states, its rows are that rung's, and a request that
     /// states none holds the capacity. A request without conditions holds none at any rung.
     #[test]
     fn a_layout_holds_the_rung_of_its_request() {
         let mut rules = sparse_layouts();
         rules.arrangement.condition_rows = 2048;
-        let widest = rules.cover(&conditioned());
+        let widest = rules.cover(&conditioned()).unwrap();
         assert_eq!(widest.condition_rows, 2048);
-        let rung = rules.cover(&VideoRequest {
-            condition_rows: Some(1024),
-            ..conditioned()
-        });
+        let rung = rules
+            .cover(&VideoRequest {
+                condition_rows: Some(1024),
+                ..conditioned()
+            })
+            .unwrap();
         assert_eq!(rung.condition_rows, 1024);
         let rows = |layout| rules.segment_of(layout).unwrap().extent.padded_tokens;
         assert_eq!(rows(&widest) - rows(&rung), 1024);
         // A request of no anchor and no reference is `t2va`, whatever rung it states.
-        let plain = rules.cover(&VideoRequest {
-            condition_rows: Some(1024),
-            first_frames: 0,
-            last_frames: 0,
-            references: 0,
-            conditions: &[],
-            ..conditioned()
-        });
+        let plain = rules
+            .cover(&VideoRequest {
+                condition_rows: Some(1024),
+                first_frames: 0,
+                last_frames: 0,
+                references: 0,
+                conditions: &[],
+                ..conditioned()
+            })
+            .unwrap();
         assert_eq!(plain.condition_rows, 0);
     }
 
@@ -3427,7 +3434,7 @@ mod tests {
         // product is what sizes the latent and its draw.
         let rule = layouts();
         let request = conditioned();
-        let covered = rule.cover(&request);
+        let covered = rule.cover(&request).unwrap();
         let (laid, _) = rule
             .layout(&request)
             .expect("the conditioned request packs");
@@ -3804,7 +3811,7 @@ mod tests {
         // The names are positional: the worker passes its views in `table_specs`' order, so a set
         // that is not exactly that order reads another tensor without any shape complaining.
         let dense = layouts();
-        let layout = dense.cover(&request(22, 1344, 768));
+        let layout = dense.cover(&request(22, 1344, 768)).unwrap();
         let names: Vec<&str> = dense
             .table_specs(&layout)
             .unwrap()
@@ -3814,7 +3821,7 @@ mod tests {
         assert_eq!(names, DENSE_TABLES);
 
         let sparse = sparse_layouts();
-        let layout = sparse.cover(&request(22, 1344, 768));
+        let layout = sparse.cover(&request(22, 1344, 768)).unwrap();
         let names: Vec<&str> = sparse
             .table_specs(&layout)
             .unwrap()

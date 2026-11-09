@@ -33,17 +33,20 @@ use nn::WarmRequest;
 /// caller decides which request walks a bucket by ordering its candidates. The result may be empty,
 /// and an empty warm set is refused where the runner is bound rather than here, so the refusal names
 /// the deployment's missing statement rather than this function's input.
-pub fn distinct<M: Denoiser + ?Sized>(model: &M, candidates: &[WarmRequest]) -> Vec<WarmRequest> {
+pub fn distinct<M: Denoiser + ?Sized>(
+    model: &M,
+    candidates: &[WarmRequest],
+) -> nn::Result<Vec<WarmRequest>> {
     let mut kept: Vec<WarmRequest> = Vec::new();
     let mut layouts: Vec<nn::Layout> = Vec::new();
     for candidate in candidates {
-        let layout = model.layout(&candidate.view());
+        let layout = model.layout(&candidate.view())?;
         if !layouts.contains(&layout) {
             layouts.push(layout);
             kept.push(candidate.clone());
         }
     }
-    kept
+    Ok(kept)
 }
 
 #[cfg(test)]
@@ -66,10 +69,10 @@ mod tests {
     }
 
     impl Denoiser for Padding {
-        fn layout(&self, request: &VideoRequest<'_>) -> Layout {
+        fn layout(&self, request: &VideoRequest<'_>) -> nn::Result<Layout> {
             let rows = request.first_frames + request.last_frames + request.references;
             let condition_rows = rows.div_ceil(self.tile) * self.tile;
-            Layout {
+            Ok(Layout {
                 video: LatentShape {
                     channels: 16,
                     frames: 1,
@@ -80,7 +83,7 @@ mod tests {
                 text_rows: request.text_tokens,
                 condition_rows,
                 condition_elements: 0,
-            }
+            })
         }
 
         fn draw_noise(&self, _: &Forward, _: Seed, _: Layout, _: Latents) -> Result<()> {
@@ -161,7 +164,7 @@ mod tests {
     fn one_warm_request_per_layout_the_model_states() {
         let model = Padding { tile: 4 };
         // Rows 1 and 2 both round up to 4, so the first two share a layout and the third does not.
-        let kept = distinct(&model, &[warm(1, 0, 0), warm(0, 2, 0), warm(0, 0, 5)]);
+        let kept = distinct(&model, &[warm(1, 0, 0), warm(0, 2, 0), warm(0, 0, 5)]).unwrap();
 
         assert_eq!(
             kept.len(),
@@ -185,7 +188,7 @@ mod tests {
     #[test]
     fn the_callers_order_decides_the_representative() {
         let model = Padding { tile: 4 };
-        let kept = distinct(&model, &[warm(0, 0, 5), warm(2, 0, 0), warm(1, 0, 0)]);
+        let kept = distinct(&model, &[warm(0, 0, 5), warm(2, 0, 0), warm(1, 0, 0)]).unwrap();
 
         assert_eq!(kept.len(), 2);
         assert_eq!(
@@ -209,7 +212,7 @@ mod tests {
         let model = Padding { tile: 1 };
         // Rows 0, 1 and 2: with no padding to collapse them, three candidates are three layouts.
         let candidates = [warm(0, 0, 0), warm(1, 0, 0), warm(1, 1, 0)];
-        let kept = distinct(&model, &candidates);
+        let kept = distinct(&model, &candidates).unwrap();
 
         assert_eq!(kept.len(), candidates.len());
         for (kept, stated) in kept.iter().zip(candidates.iter()) {

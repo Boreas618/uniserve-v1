@@ -174,17 +174,22 @@ impl ModelRunner {
             }
             None => (encoder, None),
         };
-        let warm = worker::runners::warm::distinct(&*denoiser, &candidates);
+        let warm = worker::runners::warm::distinct(&*denoiser, &candidates)
+            .context("a warm request the denoiser lays out")?;
         // The denoiser's own buckets are the layouts those candidates collapse to: its phase is
         // derived from them rather than named, so a rank that captures no denoise bucket states no
         // denoise phase.
-        let denoise_set = Buckets::new(warm.iter().map(|candidate| {
-            worker::plan::Bucket::denoise(1, denoiser.layout(&candidate.view())).serving(
-                candidate.frames,
-                candidate.width,
-                candidate.height,
-            )
-        }));
+        let denoise_buckets =
+            warm.iter()
+                .map(|candidate| {
+                    Ok(
+                        worker::plan::Bucket::denoise(1, denoiser.layout(&candidate.view())?)
+                            .serving(candidate.frames, candidate.width, candidate.height),
+                    )
+                })
+                .collect::<nn::Result<Vec<_>>>()
+                .context("a warm request the denoiser lays out")?;
+        let denoise_set = Buckets::new(denoise_buckets);
         // One audio decode bucket per distinct track those layouts carry. A `t2va` clip is a picture
         // **and** a soundtrack, so a deployment that captured clips alone would produce video with
         // no track; the track's extent is the layout the denoiser already states, and two canvases

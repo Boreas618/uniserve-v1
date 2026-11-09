@@ -612,7 +612,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         }
         let mut buckets: Vec<BucketPlan> = Vec::with_capacity(warm.len());
         for request in warm {
-            let layout = model.layout(&request.view());
+            let layout = model.layout(&request.view())?;
             let bucket =
                 Bucket::denoise(1, layout).serving(request.frames, request.width, request.height);
             if buckets.iter().any(|plan| plan.bucket == bucket) {
@@ -1426,7 +1426,10 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         // The stream's first elements are the conditions' draws, so the trajectory's offsets
         // are the request's own and not the warm request's the bucket was captured from.
         let drawn = Layout {
-            condition_elements: self.model.layout(&opening.stated.view()).condition_elements,
+            condition_elements: self
+                .model
+                .layout(&opening.stated.view())?
+                .condition_elements,
             ..layout
         };
         if !opening.restored {
@@ -2669,8 +2672,8 @@ mod tests {
     struct NoModel;
 
     impl Denoiser for NoModel {
-        fn layout(&self, _request: &VideoRequest<'_>) -> Layout {
-            layout(1, 1, 1, 1, 1)
+        fn layout(&self, _request: &VideoRequest<'_>) -> nn::Result<Layout> {
+            Ok(layout(1, 1, 1, 1, 1))
         }
 
         fn prepare_conditioning(
