@@ -73,3 +73,23 @@ pub fn configured_tokenizer() -> DynTokenizer {
     ]);
     Arc::new(load_tokenizer(&tokenizer))
 }
+
+/// A model the serving tests' families name and never load: opening a checkpoint of it is refused.
+/// The request-processing side of a family is what those tests serve.
+pub struct Unloaded;
+
+impl nn::family::TextFamily for Unloaded {
+    fn open(&self, _: &nn::Checkpoint) -> nn::Result<Box<dyn nn::family::TextCheckpoint>> {
+        Err(nn::Error::Unsupported(
+            "a test family loads no model".to_owned(),
+        ))
+    }
+}
+
+impl nn::family::VideoFamily for Unloaded {
+    fn open(&self, _: &nn::Checkpoint) -> nn::Result<Box<dyn nn::family::VideoCheckpoint>> {
+        Err(nn::Error::Unsupported(
+            "a test family loads no model".to_owned(),
+        ))
+    }
+}

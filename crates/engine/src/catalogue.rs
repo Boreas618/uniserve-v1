@@ -1,65 +1,34 @@
-//! The model families this executable serves, and the family a checkpoint resolves to.
+//! The family a checkpoint resolves to.
 //!
-//! The executable registers each family once ([`Catalogue::new`]); a main process resolves its
-//! checkpoint by the class the checkpoint declares and from then on dispatches by the family's kind
-//! and the capabilities its model implements. Nothing else in this crate names a model.
+//! The executable registers each family once (`nn::family::Catalogue`); a main process resolves
+//! its checkpoint by the class the checkpoint declares ([`resolve`]) and from then on dispatches by
+//! the family's model and the capabilities it implements. Nothing else in this crate names a model.
 
 use std::path::Path;
 
 use anyhow::{Context as _, Result, bail};
-use nn::family::Family;
+use nn::family::{Catalogue, Family};
 
-/// The model families a build serves, each claiming the classes its checkpoints declare.
-#[derive(Clone, Debug)]
-pub struct Catalogue {
-    families: Vec<Family>,
-}
-
-impl Catalogue {
-    /// A catalogue of `families`.
-    ///
-    /// # Errors
-    ///
-    /// Fails when two families claim one class: a checkpoint of it would resolve to either.
-    pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self> {
-        let families: Vec<Family> = families.into_iter().collect();
-        for (index, family) in families.iter().enumerate() {
-            for class in family.classes() {
-                if families[..index]
-                    .iter()
-                    .any(|earlier| earlier.classes().contains(class))
-                {
-                    bail!("two model families claim the class {class}");
-                }
-            }
-        }
-        Ok(Self { families })
-    }
-
-    /// The family of the checkpoint at `checkpoint`, by the class it declares.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the checkpoint declares no class, or one no family of this build claims; the
-    /// refusal names the classes the build serves.
-    pub fn resolve(&self, checkpoint: &Path) -> Result<Family> {
-        let declared = architectural_class(checkpoint)?;
-        self.families
-            .iter()
-            .copied()
-            .find(|family| family.classes().contains(&declared.as_str()))
-            .with_context(|| {
-                format!(
-                    "{} declares model class {declared}, which this build cannot serve: it serves {}",
-                    checkpoint.display(),
-                    self.families
-                        .iter()
-                        .flat_map(|family| family.classes().iter().copied())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            })
-    }
+/// The family of the checkpoint at `checkpoint`, by the class it declares.
+///
+/// # Errors
+///
+/// Fails when the checkpoint declares no class, or one no family of `catalogue` claims; the
+/// refusal names the classes the build serves.
+pub fn resolve(catalogue: &Catalogue, checkpoint: &Path) -> Result<Family> {
+    let declared = architectural_class(checkpoint)?;
+    catalogue.by_class(&declared).with_context(|| {
+        format!(
+            "{} declares model class {declared}, which this build cannot serve: it serves {}",
+            checkpoint.display(),
+            catalogue
+                .families()
+                .iter()
+                .flat_map(|family| family.classes.iter().copied())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })
 }
 
 /// The model class a checkpoint declares, as the checkpoint itself states it.
@@ -109,42 +78,57 @@ fn architectural_class(checkpoint: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
 
-    use nn::family::{TextCheckpoint, TextFamily, VideoCheckpoint, VideoFamily};
+    use nn::family::{Model, TextCheckpoint, TextFamily, VideoCheckpoint, VideoFamily};
+    use processing::{ChatProfile, Serving};
 
     use super::*;
 
-    /// A family that claims one class and opens nothing: the catalogue reads only its classes.
-    struct Claims(&'static [&'static str]);
+    /// A model that opens nothing: resolution reads only a family's classes.
+    struct Unopened;
 
-    impl TextFamily for Claims {
-        fn classes(&self) -> &'static [&'static str] {
-            self.0
-        }
-
+    impl TextFamily for Unopened {
         fn open(&self, _: &nn::Checkpoint) -> nn::Result<Box<dyn TextCheckpoint>> {
             Err(nn::Error::Unsupported("no checkpoint".to_owned()))
         }
     }
 
-    impl VideoFamily for Claims {
-        fn classes(&self) -> &'static [&'static str] {
-            self.0
-        }
-
+    impl VideoFamily for Unopened {
         fn open(&self, _: &nn::Checkpoint) -> nn::Result<Box<dyn VideoCheckpoint>> {
             Err(nn::Error::Unsupported("no checkpoint".to_owned()))
         }
     }
 
-    static TEXT: Claims = Claims(&["TextForCausalLM"]);
-    static VIDEO: Claims = Claims(&["VideoModularPipeline"]);
+    /// The families of a text class and a video class.
+    fn catalogue() -> Catalogue {
+        let chat = Serving::Chat(ChatProfile {
+            reasoning: None,
+            tool_calls: None,
+        });
+        Catalogue::new([
+            Family {
+                id: "text",
+                model_types: &[],
+                classes: &["TextForCausalLM"],
+                model: Model::Text(&Unopened),
+                serving: chat,
+            },
+            Family {
+                id: "video",
+                model_types: &[],
+                classes: &["VideoModularPipeline"],
+                model: Model::Video(&Unopened),
+                serving: chat,
+            },
+        ])
+        .unwrap()
+    }
 
     /// A checkpoint resolves by the class it declares, read from whichever file its format states
     /// it in: a transformers checkpoint's `config.json`, a diffusers modular pipeline's
     /// `modular_model_index.json`.
     #[test]
     fn a_checkpoint_resolves_by_the_class_it_declares() {
-        let catalogue = Catalogue::new([Family::Text(&TEXT), Family::Video(&VIDEO)]).unwrap();
+        let catalogue = catalogue();
         let root = tempfile::tempdir().unwrap();
 
         std::fs::write(
@@ -152,27 +136,21 @@ mod tests {
             r#"{"_class_name": "VideoModularPipeline"}"#,
         )
         .unwrap();
-        assert!(matches!(
-            catalogue.resolve(root.path()).unwrap(),
-            Family::Video(_)
-        ));
+        assert_eq!(resolve(&catalogue, root.path()).unwrap().id, "video");
 
         std::fs::write(
             root.path().join("config.json"),
             r#"{"architectures": ["TextForCausalLM"]}"#,
         )
         .unwrap();
-        assert!(matches!(
-            catalogue.resolve(root.path()).unwrap(),
-            Family::Text(_)
-        ));
+        assert_eq!(resolve(&catalogue, root.path()).unwrap().id, "text");
     }
 
     /// A class no family claims is refused naming the classes the build serves, and a checkpoint
     /// that declares none is refused naming both files a class is read from.
     #[test]
     fn an_unknown_or_missing_class_is_refused_by_name() {
-        let catalogue = Catalogue::new([Family::Text(&TEXT), Family::Video(&VIDEO)]).unwrap();
+        let catalogue = catalogue();
         let root = tempfile::tempdir().unwrap();
 
         std::fs::write(
@@ -180,7 +158,7 @@ mod tests {
             r#"{"architectures": ["OtherForCausalLM"]}"#,
         )
         .unwrap();
-        let error = format!("{:#}", catalogue.resolve(root.path()).unwrap_err());
+        let error = format!("{:#}", resolve(&catalogue, root.path()).unwrap_err());
         assert!(error.contains("OtherForCausalLM"), "{error}");
         assert!(
             error.contains("TextForCausalLM, VideoModularPipeline"),
@@ -188,15 +166,8 @@ mod tests {
         );
 
         std::fs::remove_file(root.path().join("config.json")).unwrap();
-        let error = format!("{:#}", catalogue.resolve(root.path()).unwrap_err());
+        let error = format!("{:#}", resolve(&catalogue, root.path()).unwrap_err());
         assert!(error.contains("declares no model class"), "{error}");
         assert!(error.contains("modular_model_index.json"), "{error}");
-    }
-
-    /// Two families that claim one class are refused: a checkpoint of it would resolve to either.
-    #[test]
-    fn two_families_may_not_claim_one_class() {
-        let error = Catalogue::new([Family::Text(&TEXT), Family::Video(&TEXT)]).unwrap_err();
-        assert!(error.to_string().contains("TextForCausalLM"), "{error}");
     }
 }

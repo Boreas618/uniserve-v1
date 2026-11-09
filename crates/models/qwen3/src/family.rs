@@ -1,17 +1,20 @@
-//! The Qwen3 family as execution loads it ([`nn::family`]).
+//! The Qwen3 family as execution loads it and request processing serves it ([`nn::family`]).
 //!
-//! [`FAMILY`] claims the `Qwen3MoeForCausalLM` class. A checkpoint opens to its configuration and
-//! its quantization declaration, both read once from its sidecars; a load places the model by the
-//! deployment's tensor and expert splits; the loaded [`Qwen3Moe`] states its widths, its cache and
-//! its experts to the execution that serves it.
+//! [`FAMILY`] claims the `qwen3` and `qwen3_moe` model types and the `Qwen3MoeForCausalLM` class.
+//! A checkpoint opens to its configuration and its quantization declaration, both read once from
+//! its sidecars; a load places the model by the deployment's tensor and expert splits; the loaded
+//! [`Qwen3Moe`] states its widths, its cache and its experts to the execution that serves it. Its
+//! outputs delimit reasoning between `<think>` and `</think>` and write tool calls as JSON between
+//! `<tool_call>` and `</tool_call>`, when its chat template asks for them.
 
 use std::sync::Arc;
 
 use nn::family::{
-    CacheShape, ExpertOrder, ExpertShape, Family, TextCheckpoint, TextFamily, TextModel,
+    CacheShape, ExpertOrder, ExpertShape, Family, Model, TextCheckpoint, TextFamily, TextModel,
     TextPlacement,
 };
 use nn::{Checkpoint, DType, WeightLoader};
+use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
 
 use nn::quantization::Declaration;
 
@@ -19,16 +22,21 @@ use crate::config::MoeConfig;
 use crate::moe::Qwen3Moe;
 
 /// The Qwen3 family.
-pub const FAMILY: Family = Family::Text(&Qwen3MoeFamily);
+pub const FAMILY: Family = Family {
+    id: "qwen3",
+    model_types: &["qwen3", "qwen3_moe"],
+    classes: &["Qwen3MoeForCausalLM"],
+    model: Model::Text(&Qwen3MoeFamily),
+    serving: Serving::Chat(ChatProfile {
+        reasoning: Some(ReasoningFormat::Qwen3),
+        tool_calls: Some(ToolCallFormat::Qwen3),
+    }),
+};
 
 /// The family's one value, which [`FAMILY`] refers to.
 struct Qwen3MoeFamily;
 
 impl TextFamily for Qwen3MoeFamily {
-    fn classes(&self) -> &'static [&'static str] {
-        &["Qwen3MoeForCausalLM"]
-    }
-
     fn open(&self, checkpoint: &Checkpoint) -> nn::Result<Box<dyn TextCheckpoint>> {
         let config = MoeConfig::open(checkpoint)?;
         let declaration = Declaration::read(checkpoint)?;

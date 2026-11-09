@@ -69,7 +69,7 @@ pub(crate) fn router_with(engine: Leader, server: &ServerConfig) -> Router {
 /// `<|im_end|>` (ID 2) is the end-of-sequence token, and the chat template
 /// renders only the first message's content. A MiniMax H3 model serves the
 /// API's longest duration capacity, as a default video deployment does.
-pub(crate) fn sim_engine(family: processing::Family) -> Leader {
+pub(crate) fn sim_engine(family: nn::family::Family) -> Leader {
     let model = sim_model(family);
     let core = sim_core(scheduler::sim_args(SERVED_MODEL), SimEngine::new());
     engine_over(model, configured_tokenizer(), vec![core])
@@ -160,7 +160,7 @@ pub(crate) fn packaged_policy(
 
 /// Builds an engine for a model of `family` over started schedulers,
 /// one per data-parallel rank; see [`sim_engine`].
-pub(crate) fn sim_engine_over(family: processing::Family, cores: Vec<SchedulerHandle>) -> Leader {
+pub(crate) fn sim_engine_over(family: nn::family::Family, cores: Vec<SchedulerHandle>) -> Leader {
     engine_over(sim_model(family), configured_tokenizer(), cores)
 }
 
@@ -230,10 +230,11 @@ pub(crate) fn sim_client(cores: Vec<SchedulerHandle>) -> EngineClient {
 }
 
 /// A chat family whose outputs are parsed in the Qwen3 formats.
-pub(crate) const CHAT: processing::Family = processing::Family {
+pub(crate) const CHAT: nn::family::Family = nn::family::Family {
     id: "chat",
     model_types: &["chat"],
-    pipeline_classes: &[],
+    classes: &[],
+    model: nn::family::Model::Text(&frontend::test_support::Unloaded),
     serving: processing::Serving::Chat(processing::ChatProfile {
         reasoning: Some(processing::ReasoningFormat::Qwen3),
         tool_calls: Some(processing::ToolCallFormat::Qwen3),
@@ -241,10 +242,11 @@ pub(crate) const CHAT: processing::Family = processing::Family {
 };
 
 /// A video family whose processor is [`TestProcessor`].
-pub(crate) const VIDEO: processing::Family = processing::Family {
+pub(crate) const VIDEO: nn::family::Family = nn::family::Family {
     id: "video",
     model_types: &[],
-    pipeline_classes: &["TestVideoPipeline"],
+    classes: &["TestVideoPipeline"],
+    model: nn::family::Model::Video(&frontend::test_support::Unloaded),
     serving: processing::Serving::Video(&TestVideo),
 };
 
@@ -365,7 +367,7 @@ pub(crate) fn test_video_service() -> VideoService {
 }
 
 /// The simulated model's facts.
-pub(crate) fn sim_model(family: processing::Family) -> ModelConfig {
+pub(crate) fn sim_model(family: nn::family::Family) -> ModelConfig {
     ModelConfig {
         family,
         sampling_defaults: SamplingDefaults::default(),

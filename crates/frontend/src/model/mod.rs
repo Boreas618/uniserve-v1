@@ -24,13 +24,14 @@ pub mod generation;
 //
 // The checkpoint's files are resolved and read here ([`assets`]); which family
 // a checkpoint is, and what that family serves, is the executable's catalogue
-// of families (`processing::Catalogue`), whose request processing reads the
+// of families (`nn::family::Catalogue`), whose request processing reads the
 // checkpoint's tokenizer (`crate::tokenizer`) through `processing::Vocabulary`.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-use processing::{Catalogue, ChatProfile, Family, Serving, VideoFamily};
+use nn::family::{Catalogue, Family};
+use processing::{ChatProfile, Serving, VideoFamily};
 
 use crate::model::assets::{
     GenerationConfig, HfTokenizerConfig, ResolvedModelFiles, load_generation_config,
@@ -225,9 +226,10 @@ mod tests {
     use tokenizers::models::bpe::{BPE, Vocab};
     use tokenizers::{AddedToken, Tokenizer as TokenizerBuilder};
 
+    use nn::family::{Catalogue, Family, Model};
     use processing::{
-        Catalogue, ChatProfile, Family, ReasoningFormat, Serving, ToolCallFormat, VideoBinding,
-        VideoFamily, VideoProcessor,
+        ChatProfile, ReasoningFormat, Serving, ToolCallFormat, VideoBinding, VideoFamily,
+        VideoProcessor,
     };
 
     use super::ModelConfig;
@@ -320,7 +322,8 @@ mod tests {
     const CHAT: Family = Family {
         id: "chat",
         model_types: &["qwen3", "qwen3_moe"],
-        pipeline_classes: &[],
+        classes: &[],
+        model: Model::Text(&crate::test_support::Unloaded),
         serving: Serving::Chat(ChatProfile {
             reasoning: Some(ReasoningFormat::Qwen3),
             tool_calls: Some(ToolCallFormat::Qwen3),
@@ -347,7 +350,8 @@ mod tests {
     const VIDEO: Family = Family {
         id: "video",
         model_types: &["video"],
-        pipeline_classes: &["VideoModularPipeline"],
+        classes: &["VideoModularPipeline"],
+        model: Model::Video(&crate::test_support::Unloaded),
         serving: Serving::Video(&Video),
     };
 

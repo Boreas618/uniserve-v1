@@ -1,8 +1,10 @@
-//! Model families: what a concrete model supplies to execution.
+//! Model families: what a concrete model supplies to execution and to request processing.
 //!
-//! A model crate exports one [`Family`] value, and the executable registers it; execution resolves a
-//! checkpoint to the family that claims its declared class and from then on dispatches by
-//! capability alone. The two kinds of family differ in what they compute:
+//! A model crate exports one [`Family`] value, and the executable registers it in one
+//! [`Catalogue`]: execution resolves a checkpoint to the family that claims its declared class and
+//! from then on dispatches by capability alone ([`Family::model`]), and request processing resolves
+//! the same checkpoint to the same value and serves it as its [`processing::Serving`] states. The
+//! two kinds of model differ in what they compute:
 //!
 //! - a [`TextFamily`] loads a causal language model ([`TextModel`]), which execution serves with
 //!   prefill and decode forwards over a paged key/value cache;
@@ -31,33 +33,103 @@ use crate::capability::{
 };
 use crate::{Checkpoint, DType, Result, WeightLoader};
 
-/// One model family a build serves.
+/// One model family a build serves: how its checkpoints declare it, what execution loads of them
+/// and what request processing serves.
 #[derive(Clone, Copy)]
-pub enum Family {
-    /// A causal language model family.
-    Text(&'static dyn TextFamily),
-    /// A video generation pipeline family.
-    Video(&'static dyn VideoFamily),
-}
-
-impl Family {
+pub struct Family {
+    /// The family's stable identifier, as the daemon reports it.
+    pub id: &'static str,
+    /// The `model_type` values of a root `config.json` that declare this family; empty for a
+    /// family that ships only as a diffusers pipeline.
+    pub model_types: &'static [&'static str],
     /// The model classes a checkpoint of this family declares: a transformers checkpoint's
     /// `config.json` `architectures[0]`, or a diffusers pipeline's `_class_name`.
-    pub fn classes(&self) -> &'static [&'static str] {
-        match self {
-            Self::Text(family) => family.classes(),
-            Self::Video(family) => family.classes(),
-        }
-    }
+    pub classes: &'static [&'static str],
+    /// What execution loads of a checkpoint.
+    pub model: Model,
+    /// What request processing serves.
+    pub serving: processing::Serving,
+}
+
+/// The model a family's checkpoints load to.
+#[derive(Clone, Copy)]
+pub enum Model {
+    /// A causal language model.
+    Text(&'static dyn TextFamily),
+    /// A video generation pipeline.
+    Video(&'static dyn VideoFamily),
 }
 
 impl std::fmt::Debug for Family {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let kind = match self {
-            Self::Text(_) => "Text",
-            Self::Video(_) => "Video",
-        };
-        write!(formatter, "Family::{kind}({:?})", self.classes())
+        formatter
+            .debug_struct("Family")
+            .field("id", &self.id)
+            .field("model_types", &self.model_types)
+            .field("classes", &self.classes)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for Family {
+    /// Families are one value each: equal when they are the same family.
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for Family {}
+
+/// The families an executable serves, each claiming the `model_type`s and classes its checkpoints
+/// declare.
+#[derive(Clone, Debug, Default)]
+pub struct Catalogue {
+    families: Vec<Family>,
+}
+
+impl Catalogue {
+    /// A catalogue of `families`.
+    ///
+    /// # Errors
+    ///
+    /// Fails, naming the class, when two families claim one `model_type` or class: a checkpoint of
+    /// it would resolve to either.
+    pub fn new(families: impl IntoIterator<Item = Family>) -> Result<Self> {
+        let families: Vec<Family> = families.into_iter().collect();
+        for (index, family) in families.iter().enumerate() {
+            for class in family.model_types.iter().chain(family.classes) {
+                if families[..index].iter().any(|earlier| {
+                    earlier.model_types.contains(class) || earlier.classes.contains(class)
+                }) {
+                    return Err(crate::Error::Unsupported(format!(
+                        "two model families claim the class {class}"
+                    )));
+                }
+            }
+        }
+        Ok(Self { families })
+    }
+
+    /// The family a root `config.json` declares by its `model_type`.
+    pub fn by_model_type(&self, model_type: &str) -> Option<Family> {
+        self.families
+            .iter()
+            .copied()
+            .find(|family| family.model_types.contains(&model_type))
+    }
+
+    /// The family a checkpoint declares by its class: a transformers checkpoint's
+    /// `architectures[0]`, or a diffusers pipeline's `_class_name`.
+    pub fn by_class(&self, class: &str) -> Option<Family> {
+        self.families
+            .iter()
+            .copied()
+            .find(|family| family.classes.contains(&class))
+    }
+
+    /// Every family, in registration order.
+    pub fn families(&self) -> &[Family] {
+        &self.families
     }
 }
 
@@ -186,9 +258,6 @@ impl FromIterator<Component> for Components {
 
 /// A causal language model family.
 pub trait TextFamily: Send + Sync {
-    /// The `architectures` classes this family loads.
-    fn classes(&self) -> &'static [&'static str];
-
     /// Reads and normalizes `checkpoint`'s configuration, once, from its sidecars.
     ///
     /// # Errors
@@ -282,9 +351,6 @@ pub struct ExpertShape {
 
 /// A video generation pipeline family.
 pub trait VideoFamily: Send + Sync {
-    /// The diffusers pipeline classes this family loads.
-    fn classes(&self) -> &'static [&'static str];
-
     /// Reads and normalizes `checkpoint`'s configuration, once, from its sidecars.
     ///
     /// `checkpoint` may span several roots, an export first and the base release it continues
@@ -499,4 +565,58 @@ pub struct Description {
     pub denoise_steps: u32,
     /// The rest, as the family's own request processing reads it; execution reads none of it.
     pub details: Vec<u8>,
+}
+
+#[cfg(test)]
+mod tests {
+    use processing::{ChatProfile, Serving};
+
+    use super::*;
+
+    /// A model that opens nothing: the catalogue reads only a family's claims.
+    struct Unopened;
+
+    impl TextFamily for Unopened {
+        fn open(&self, _: &Checkpoint) -> Result<Box<dyn TextCheckpoint>> {
+            Err(crate::Error::Unsupported("no checkpoint".to_owned()))
+        }
+    }
+
+    const CHAT: Family = Family {
+        id: "chat",
+        model_types: &["chat_model"],
+        classes: &["ChatForCausalLM"],
+        model: Model::Text(&Unopened),
+        serving: Serving::Chat(ChatProfile {
+            reasoning: None,
+            tool_calls: None,
+        }),
+    };
+
+    /// A checkpoint resolves by the `model_type` or the class its own file declares, and one no
+    /// family claims resolves to none.
+    #[test]
+    fn a_family_is_found_by_what_its_checkpoints_declare() {
+        let catalogue = Catalogue::new([CHAT]).unwrap();
+        assert_eq!(catalogue.by_model_type("chat_model"), Some(CHAT));
+        assert_eq!(catalogue.by_class("ChatForCausalLM"), Some(CHAT));
+        assert_eq!(catalogue.by_model_type("other"), None);
+        assert_eq!(catalogue.by_class("chat_model"), None);
+    }
+
+    /// Two families that claim one `model_type` or class are refused: a checkpoint of it would
+    /// resolve to either.
+    #[test]
+    fn two_families_may_not_claim_one_class() {
+        let twin = Family { id: "twin", ..CHAT };
+        let error = Catalogue::new([CHAT, twin]).unwrap_err();
+        assert!(error.to_string().contains("chat_model"), "{error}");
+        let class = Family {
+            id: "class",
+            model_types: &[],
+            ..CHAT
+        };
+        let error = Catalogue::new([CHAT, class]).unwrap_err();
+        assert!(error.to_string().contains("ChatForCausalLM"), "{error}");
+    }
 }

@@ -672,7 +672,7 @@ async fn receive(
 /// Fails when the handoff fails or the deployment's serving fails.
 pub async fn take_over(
     descriptor: i32,
-    catalogue: processing::Catalogue,
+    catalogue: nn::family::Catalogue,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     // SAFETY: the daemon that started this process placed the handoff
@@ -703,7 +703,7 @@ pub async fn take_over(
 async fn prepared_successor(
     channel: &mut Channel,
     prepare: Prepare,
-    catalogue: &processing::Catalogue,
+    catalogue: &nn::family::Catalogue,
     shutdown: CancellationToken,
 ) -> anyhow::Result<()> {
     let (mut config, _) = crate::options::resolve_text(&prepare.config, &[])?;

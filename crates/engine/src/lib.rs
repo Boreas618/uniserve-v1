@@ -15,5 +15,5 @@ mod process;
 mod programs;
 mod rank;
 
-pub use catalogue::Catalogue;
+pub use catalogue::resolve;
 pub use process::{Recorded, record, run};

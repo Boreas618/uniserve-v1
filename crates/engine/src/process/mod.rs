@@ -111,7 +111,7 @@ use weights::WeightUpdate;
 ///
 /// Fails when the launch file cannot be read, the process cannot start, its
 /// control thread fails, or its epoch fails.
-pub fn run(launch_file: &Path, catalogue: &crate::Catalogue) -> Result<()> {
+pub fn run(launch_file: &Path, catalogue: &nn::family::Catalogue) -> Result<()> {
     worker::profiling::counters::inject();
 
     let launch = read_engine_args(launch_file)?;

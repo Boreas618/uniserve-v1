@@ -1,4 +1,4 @@
-//! MiniMax-H3 and FastH3 as execution loads them ([`nn::family`]).
+//! MiniMax-H3 and FastH3 as execution loads them and request processing serves them ([`nn::family`]).
 //!
 //! [`FAMILY`] claims the `MiniMaxH3ModularPipeline` class. A checkpoint opens to its configuration
 //! (an export and the base release it pins read as one), a load places the network the deployment
@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use nn::capability::{Decoder, Encoder, ImageShape, MediaFormat, WarmPrompt, WarmRequest};
 use nn::family::{
-    Component, ConditionBounds, Description, Family, VideoCheckpoint, VideoFamily, VideoModel,
-    VideoPlacement, VideoServing,
+    Component, ConditionBounds, Description, Family, Model, VideoCheckpoint, VideoFamily,
+    VideoModel, VideoPlacement, VideoServing,
 };
 use nn::{Checkpoint, DType, WeightLoader};
 
@@ -26,17 +26,20 @@ use crate::{AUDIO_CHANNELS, AUDIO_HOP, AUDIO_SAMPLE_RATE, Config, FPS, Partition
 use proto::video::Canvas;
 use qwen3::processor::ProcessorConfig;
 
-/// The MiniMax-H3 family.
-pub const FAMILY: Family = Family::Video(&MinimaxH3Family);
+/// The MiniMax-H3 family: a diffusers modular pipeline, which request processing serves through its
+/// video processor ([`crate::processing`]).
+pub const FAMILY: Family = Family {
+    id: "minimax_h3",
+    model_types: &[],
+    classes: &["MiniMaxH3ModularPipeline"],
+    model: Model::Video(&MinimaxH3Family),
+    serving: ::processing::Serving::Video(&crate::processing::H3Family),
+};
 
 /// The family's one value, which [`FAMILY`] refers to.
 struct MinimaxH3Family;
 
 impl VideoFamily for MinimaxH3Family {
-    fn classes(&self) -> &'static [&'static str] {
-        &["MiniMaxH3ModularPipeline"]
-    }
-
     fn open(&self, checkpoint: &Checkpoint) -> nn::Result<Box<dyn VideoCheckpoint>> {
         // A checkpoint is one directory, or an export and the base release it pins.
         if checkpoint.roots().len() > 2 {

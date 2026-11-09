@@ -33,9 +33,9 @@ impl MainProcess {
     /// ([`ModelRunner`]), because three of the things the main process needs are the
     /// node's rather than the epoch's: which devices it serves, where its Program
     /// Server is, and what those devices measure.
-    pub(super) fn start(launch: &EngineArgs, catalogue: &crate::Catalogue) -> Result<Self> {
+    pub(super) fn start(launch: &EngineArgs, catalogue: &nn::family::Catalogue) -> Result<Self> {
         let build = &launch.engine_config;
-        let family = catalogue.resolve(Path::new(&launch.engine_config.model.model))?;
+        let family = crate::resolve(catalogue, Path::new(&launch.engine_config.model.model))?;
         let model_runner = ModelRunner::of(launch, family)?;
         let mut control = Control::connect(
             &Endpoints {

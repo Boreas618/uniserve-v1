@@ -10,7 +10,7 @@
 //!   tables, which [`VlConfig`] describes;
 //! - [`processor`]: the Qwen-VL processor that sizes media to patch grids and lays pixels out as
 //!   patch rows;
-//! - [`family`] and [`processing`]: the family as execution loads it and as request processing
+//! - [`family`]: the family as execution loads it and as request processing
 //!   serves it.
 //!
 //! Nothing here owns a runtime object: a model receives borrowed [`nn::Forward`] resources and
@@ -20,7 +20,6 @@ pub mod config;
 pub mod decoder;
 pub mod family;
 pub mod moe;
-pub mod processing;
 pub mod processor;
 pub mod vl;
 

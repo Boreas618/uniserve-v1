@@ -13,7 +13,7 @@
 //! So the derivation lives here, on the consumer's side of the daemon/engine seam: a
 //! [`ModelRunner`] is one rank of the epoch's engine configuration resolved against the process's
 //! arguments, and the accessors below are the whole of what the main process asks of it. It
-//! dispatches by the kind of the family the checkpoint resolved to ([`Family`]) and by the
+//! dispatches by the model of the family the checkpoint resolved to ([`Family::model`]) and by the
 //! capabilities the loaded model implements; no concrete model is named here.
 //!
 //! The capacity plan - what the rank's resident memory is - is not here: it is resolved from a
@@ -50,7 +50,7 @@ use tokens::{checkpoint_tokens, understanding_limits};
 use video::{SharedCodec, prompt_capacity};
 
 use nn::family::{
-    ExpertOrder, Family, Split, TextModel, TextPlacement, VideoModel, VideoPlacement,
+    ExpertOrder, Family, Model, Split, TextModel, TextPlacement, VideoModel, VideoPlacement,
 };
 use proto::config::EngineArgs;
 
@@ -119,7 +119,7 @@ impl worker::data_plane::ModelLoad for RankModel {
     }
 
     fn expert_layers(&self) -> BTreeMap<String, u32> {
-        let Family::Text(family) = self.model_runner.family else {
+        let Model::Text(family) = self.model_runner.family.model else {
             return BTreeMap::new();
         };
         nn::Checkpoint::open(self.model_runner.checkpoint())
@@ -307,7 +307,7 @@ impl ModelRunner {
     /// its own device, so each is planned, loaded and opened as a rank of its own. The text class
     /// keeps one model runner, whose second device is refused where its runner is built.
     pub(crate) fn ranks(&self) -> Result<Vec<Self>> {
-        let text = matches!(self.family, Family::Text(_));
+        let text = matches!(self.family.model, Model::Text(_));
         let attention = self.attention_ranks()?;
         // Dedicated expert ranks hold the experts between them, whatever the schedulers number.
         let expert_ranks = match attention {
@@ -612,7 +612,7 @@ impl ModelRunner {
         let (max_batch, max_num_batched_tokens, graph_tiers) = match loaded {
             Loaded::Text(_) => {
                 let (rows, tokens) = self.buckets.bounds();
-                let Family::Text(family) = self.family else {
+                let Model::Text(family) = self.family.model else {
                     bail!("a text rank's family is a text family");
                 };
                 let end_of_text = family
@@ -697,8 +697,8 @@ impl ModelRunner {
     /// answers the same weights' element types and extents without reading them.
     pub(crate) fn load_model(&self, weights: Weights<'_>, experts: &ExpertOrder) -> Result<Loaded> {
         let mapping = &self.mapping;
-        match self.family {
-            Family::Text(family) => {
+        match self.family.model {
+            Model::Text(family) => {
                 // The checkpoint's own representation stands unless the deployment fixed another,
                 // which is the build config's `dtype` and `quantization`.
                 let opened = nn::Checkpoint::open(self.checkpoint())?;
@@ -717,7 +717,7 @@ impl ModelRunner {
                 let model = checkpoint.load(&opened, &mut loader, &placement, experts)?;
                 Ok(Loaded::Text(model))
             }
-            Family::Video(_) => {
+            Model::Video(_) => {
                 // The deployment's own representation, which the daemon resolved against the
                 // checkpoint before it wrote this build config (`dtype = "auto"` never reaches a
                 // main process as `auto`).

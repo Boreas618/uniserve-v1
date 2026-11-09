@@ -42,12 +42,9 @@ pub(crate) fn run(
          in --config"
     );
 
-    let launches = crate::runtime()?.block_on(daemon::programs::launches(
-        &crate::processing()?,
-        &config,
-        &stated,
-    ))?;
     let catalogue = crate::catalogue()?;
+    let launches =
+        crate::runtime()?.block_on(daemon::programs::launches(&catalogue, &config, &stated))?;
     let mut recorded = engine::Recorded::new();
     for launch in &launches {
         merge(&mut recorded, engine::record(launch, &catalogue)?);

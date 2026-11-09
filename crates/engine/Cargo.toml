@@ -26,6 +26,8 @@ tracing.workspace = true
 worker.workspace = true
 
 [dev-dependencies]
+# A test states the serving a family it resolves names.
+processing.workspace = true
 tempfile.workspace = true
 # A test states the arguments a deployment pinned on a program, which are a TOML table
 # (`program_server::Program`).

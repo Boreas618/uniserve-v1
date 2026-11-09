@@ -7,12 +7,14 @@ publish = false
 
 # The application's view of the served checkpoint: its tokenizer, files,
 # configuration and family profile, which the daemon's HTTP and OpenAI API
-# reads. It links no numerical code.
+# reads. It runs no numerical code: of a family (`nn::family::Family`) it
+# reads only what request processing serves.
 [dependencies]
 # The tokenizer's decoder chain, which the served tokenizer loads.
 fastokens.workspace = true
 # The checkpoint's own files and the Hub's cache layout.
 hf-hub.workspace = true
+nn.workspace = true
 processing.workspace = true
 proto.workspace = true
 serde.workspace = true

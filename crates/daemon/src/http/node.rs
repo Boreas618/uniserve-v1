@@ -64,7 +64,7 @@ struct Node {
     /// at.
     program_config: program_server::command::Settings,
     /// The model families the executable serves.
-    catalogue: processing::Catalogue,
+    catalogue: nn::family::Catalogue,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -82,7 +82,7 @@ pub async fn node(
     admin: AdminConfig,
     server: ServerConfig,
     program_config: program_server::command::Settings,
-    catalogue: processing::Catalogue,
+    catalogue: nn::family::Catalogue,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let listener = Listener::bind(&admin)

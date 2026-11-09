@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result, bail};
-use nn::family::{Family, Projection, SequenceSplit, Split, VideoCheckpoint};
+use nn::family::{Model, Projection, SequenceSplit, Split, VideoCheckpoint};
 use proto::config::EngineArgs;
 
 use super::{ModelRunner, ParallelShape};
@@ -12,7 +12,7 @@ impl ModelRunner {
     /// The parallel groups this rank joins: `(sequence group's ranks, tensor group's ranks)` and its
     /// place in each. A rank of a media deployment is in both; the text class joins neither here.
     pub(crate) fn parallel_shape(&self) -> Result<ParallelShape> {
-        let Family::Video(_) = self.family else {
+        let Model::Video(_) = self.family.model else {
             // The tensor group is the text model's only collective group: an expert union
             // exchanges over its own transport (`union_member`).
             return Ok(ParallelShape {
@@ -47,7 +47,7 @@ impl ModelRunner {
         &self,
         checkpoint: &nn::Checkpoint,
     ) -> Result<Box<dyn VideoCheckpoint>> {
-        let Family::Video(family) = self.family else {
+        let Model::Video(family) = self.family.model else {
             bail!("a causal language model holds no video pipeline");
         };
         Ok(family.open(checkpoint)?)

@@ -13,7 +13,8 @@ use daemon::openai::ApiError;
 use daemon::options::ChatTemplateContentFormat;
 use daemon::output::OutputParams;
 use daemon::tokenizer::{DynTokenizer, HuggingFaceTokenizer};
-use processing::{Catalogue, ChatProfile, Family, ReasoningFormat, Serving, ToolCallFormat};
+use nn::family::{Catalogue, Family};
+use processing::{ChatProfile, ReasoningFormat, Serving, ToolCallFormat};
 use proto::request::{GenerationLimits, GenerationRequest};
 use tempfile::tempdir;
 use tokenizers::models::bpe::{BPE, Vocab};
@@ -44,7 +45,8 @@ const SPECIAL_TOKENS: &[&str] = &[
 const CHAT: Family = Family {
     id: "chat",
     model_types: &["qwen3", "qwen3_moe"],
-    pipeline_classes: &[],
+    classes: &[],
+    model: nn::family::Model::Text(&frontend::test_support::Unloaded),
     serving: Serving::Chat(ChatProfile {
         reasoning: Some(ReasoningFormat::Qwen3),
         tool_calls: Some(ToolCallFormat::Qwen3),

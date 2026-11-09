@@ -43,8 +43,8 @@ pub type Recorded = BTreeMap<String, BTreeSet<String>>;
 ///
 /// Fails where a serving start of the same launch fails before its workers run: the family, the
 /// placement, the model's load from its shard headers, the capacity plan, a runner, or a walk.
-pub fn record(launch: &EngineArgs, catalogue: &crate::Catalogue) -> Result<Recorded> {
-    let family = catalogue.resolve(Path::new(&launch.engine_config.model.model))?;
+pub fn record(launch: &EngineArgs, catalogue: &nn::family::Catalogue) -> Result<Recorded> {
+    let family = crate::resolve(catalogue, Path::new(&launch.engine_config.model.model))?;
     let model_runner = ModelRunner::of(launch, family)?;
     let epoch = Epoch::of(launch)?;
     let mut ranks = load_ranks(model_runner.ranks()?, Backing::Recording, launch, &epoch)?;

@@ -18,16 +18,9 @@ use ::processing::{CanvasRule, FrameClips};
 use proto::video::Canvas;
 use serde::{Deserialize, Serialize};
 
-/// MiniMax-H3 as request processing serves it.
-pub const FAMILY: ::processing::Family = ::processing::Family {
-    id: "minimax_h3",
-    model_types: &[],
-    pipeline_classes: &["MiniMaxH3ModularPipeline"],
-    serving: ::processing::Serving::Video(&H3Family),
-};
-
-/// The family's one value, which [`FAMILY`] refers to.
-struct H3Family;
+/// MiniMax-H3 as request processing serves it: the family's [`crate::family::FAMILY`] serves video
+/// through this processor family.
+pub(crate) struct H3Family;
 
 impl ::processing::VideoFamily for H3Family {
     fn default_prompt_tokens(&self) -> u32 {

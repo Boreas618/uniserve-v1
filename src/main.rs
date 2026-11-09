@@ -148,16 +148,14 @@ fn main() -> Result<std::process::ExitCode> {
     }
 }
 
-/// The model families this executable's main processes load: with [`processing`], the one place
-/// a concrete model is named. A model is added with its crate and one entry in each.
-fn catalogue() -> Result<engine::Catalogue> {
-    engine::Catalogue::new([qwen3::family::FAMILY, minimax_h3::family::FAMILY])
-}
-
-/// The model families this executable's daemon serves requests of.
-pub(crate) fn processing() -> Result<processing::Catalogue> {
-    processing::Catalogue::new([qwen3::processing::FAMILY, minimax_h3::processing::FAMILY])
-        .map_err(anyhow::Error::msg)
+/// The model families this executable serves: the one place a concrete model is named. Its main
+/// processes load them and its daemon serves requests of them. A model is added with its crate and
+/// one entry here.
+pub(crate) fn catalogue() -> Result<nn::family::Catalogue> {
+    Ok(nn::family::Catalogue::new([
+        qwen3::family::FAMILY,
+        minimax_h3::family::FAMILY,
+    ])?)
 }
 
 /// The lifeline this process inherited from the daemon that supervises it

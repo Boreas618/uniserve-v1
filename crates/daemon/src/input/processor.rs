@@ -18,7 +18,8 @@ use std::sync::Arc;
 use crate::model::ModelConfig;
 use crate::model::assets::{PipelineCheckpoint, ResolvedModelFiles};
 use crate::tokenizer::{DynTokenizer, HuggingFaceTokenizer, TokenizerError};
-use processing::{Catalogue, ReasoningFormat, Serving, ToolCallFormat, VideoFamily};
+use nn::family::Catalogue;
+use processing::{ReasoningFormat, Serving, ToolCallFormat, VideoFamily};
 use proto::request::{
     CachePolicy, GenerationConstraint, GenerationFeatures, GenerationLimits, GenerationRequest,
     ImageGenerationConfig,
@@ -176,7 +177,7 @@ impl LoadModel for ModelConfig {
         // selected by that file alone, even when the checkpoint publishes an
         // index beside it.
         if let Some(pipeline) = PipelineCheckpoint::resolve(config.model()).await?
-            && let Some(family) = catalogue.by_pipeline_class(pipeline.class_name())
+            && let Some(family) = catalogue.by_class(pipeline.class_name())
             && let Serving::Video(video) = family.serving
         {
             let tokenizer: DynTokenizer = Arc::new(pipeline_tokenizer(&pipeline).await?);
