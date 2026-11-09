@@ -163,7 +163,7 @@ impl RefinerBlock {
         let rows = Rows::reserve(self, f, row_count)?;
 
         // Attention: normalize, project every head, normalize each head's query and key, attend.
-        self.norm1.forward(f, hidden, rows.normed)?;
+        self.norm1.forward(f, hidden, None, rows.normed)?;
         self.qkv
             .forward(f, rows.normed, rows.query, rows.key, rows.value)?;
         // The query and key norms are **per head**: a projection writes `[rows, heads · head]` and
@@ -176,11 +176,13 @@ impl RefinerBlock {
         self.query_norm.forward(
             f,
             rows.query.reshape(per_head(rows.query, head)),
+            None,
             rows.query_normed.reshape(per_head(rows.query, head)),
         )?;
         self.key_norm.forward(
             f,
             rows.key.reshape(per_head(rows.key, head)),
+            None,
             rows.key_normed.reshape(per_head(rows.key, head)),
         )?;
 
@@ -204,7 +206,7 @@ impl RefinerBlock {
             .forward(f, hidden, rows.update, None, hidden)?;
 
         // Feed-forward: normalize, project the packed value and gate halves, gate, project back.
-        self.norm2.forward(f, hidden, rows.normed)?;
+        self.norm2.forward(f, hidden, None, rows.normed)?;
         self.gate_up.forward(f, rows.normed, rows.packed)?;
         let (value, gate) = crate::transformer::projection_halves(rows.packed);
         self.gated.forward(f, gate, value, rows.ffn)?;
@@ -301,7 +303,7 @@ impl TokenRefiner {
         for block in &self.blocks {
             block.forward(f, working, visible)?;
         }
-        Ok(self.norm.forward(f, working, out)?)
+        Ok(self.norm.forward(f, working, None, out)?)
     }
 }
 

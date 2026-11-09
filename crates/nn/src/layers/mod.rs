@@ -29,7 +29,6 @@ mod exchange;
 mod frame;
 mod head;
 mod linear;
-mod modulation;
 mod moe;
 mod noise;
 mod norm;
@@ -65,12 +64,9 @@ pub use linear::{
     Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, PACKED_M_CLASSES, Parallel, QkvBias, QkvLinear,
     QkvNames, QkvSpec, encode_block, packed_rows,
 };
-pub use modulation::ModulatedRmsNorm;
 pub use moe::{ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
 pub use noise::{Key as NoiseKey, Noise};
-pub use norm::{
-    LayerNorm, RmsNorm, ScaledResidualLayerNorm, ScaledResidualRmsNorm, WeightedRmsNorm,
-};
+pub use norm::{Epilogue, LayerNorm, Modulation, ResidualStream, RmsNorm};
 pub use ops::activation::Activation;
 pub use ops::gemm::WeightOrder;
 pub use ops::rope::Rotation;

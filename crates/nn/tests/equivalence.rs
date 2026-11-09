@@ -59,8 +59,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use nn::layers::{
-    Axpby, Conv1d, Conv3d, ConvGeometry, CrossFade, Linear, Residual, RmsNorm, Rotary, Rotation,
-    Scale, Sections, TileGrid, TileStitch, WeightOrder,
+    Axpby, Conv1d, Conv3d, ConvGeometry, CrossFade, Epilogue, Linear, Residual, RmsNorm, Rotary,
+    Rotation, Scale, Sections, TileGrid, TileStitch, WeightOrder,
 };
 use nn::{Arena, Backing, DType, DevicePtr, Forward, Shape, Strides, TensorView, Weight};
 use ops::values::{f16_to_f32, f32_to_bf16, f32_to_f16};
@@ -1047,8 +1047,8 @@ mod device {
         if let Some(sections) = site.sections {
             rotary = rotary.sectioned(Sections::new(&sections)?)?;
         }
-        let q_norm = RmsNorm::new(q_gain, site.eps)?;
-        let k_norm = RmsNorm::new(k_gain, site.eps)?;
+        let q_norm = RmsNorm::new(q_gain, site.eps, Epilogue::None)?;
+        let k_norm = RmsNorm::new(k_gain, site.eps, Epilogue::None)?;
         // The rotation alone: `nn::Rotate`'s descriptor (8 tokens a program, 128-element tiles),
         // with the rotated width the DiT turns, which that layer does not yet state.
         let rotation = |heads: u32| ops::rope::RopeApplyDescriptor {
@@ -1078,8 +1078,8 @@ mod device {
                 fused_k,
             )?;
 
-            q_norm.forward(f, per_head(query), per_head(normed_q))?;
-            k_norm.forward(f, per_head(key), per_head(normed_k))?;
+            q_norm.forward(f, per_head(query), None, per_head(normed_q))?;
+            k_norm.forward(f, per_head(key), None, per_head(normed_k))?;
             for (input, out, heads) in [
                 (normed_q, split_q, site.q_heads),
                 (normed_k, split_k, site.k_heads),

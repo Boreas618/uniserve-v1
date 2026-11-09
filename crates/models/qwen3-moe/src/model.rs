@@ -18,7 +18,7 @@
 //! ```
 //!
 //! The residual stream is carried separately, summed in FP32, and normalized once per sublayer
-//! ([`RmsNorm::forward_with_residual`]): the model never computes `hidden + residual` and then
+//! ([`RmsNorm::forward`] with a [`ResidualStream`]): the model never computes `hidden + residual` and then
 //! normalizes the rounded sum.
 //!
 //! ## Buffers
@@ -38,7 +38,7 @@
 
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::layers::{
-    Attention, Linear, Moe, ParallelLMHead, QkvLinear, RmsNorm, Rotary, SwiGlu,
+    Attention, Linear, Moe, ParallelLMHead, QkvLinear, ResidualStream, RmsNorm, Rotary, SwiGlu,
     TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
 };
 use nn::weights::Weight;
@@ -491,10 +491,15 @@ impl DecoderLayer {
         // Layer 0's input residual is the embedding itself, so it normalizes alone and the
         // addition starts at the next layer.
         if layer == 0 {
-            self.input_norm.forward(f, hidden, normalized)?;
+            self.input_norm.forward(f, hidden, None, normalized)?;
         } else {
             self.input_norm
-                .forward_with_residual(f, hidden, residual, residual, normalized)
+                .forward(
+                    f,
+                    hidden,
+                    Some(ResidualStream::in_place(residual)),
+                    normalized,
+                )
                 .map_err(Error::from)?;
         }
 
@@ -504,8 +509,12 @@ impl DecoderLayer {
             )
         })?;
 
+        let stream = ResidualStream {
+            input: residual,
+            output: residual_out,
+        };
         self.post_attention_norm
-            .forward_with_residual(f, update, residual, residual_out, normalized)
+            .forward(f, update, Some(stream), normalized)
             .map_err(Error::from)?;
 
         f.fenced(MOE, format_args!("layers.{layer}.mlp"), || {
@@ -676,7 +685,7 @@ impl CausalLm for Qwen3Moe {
             // needs from it, and `add_rms_norm` loads a whole row before storing any of it, so the
             // alias is safe.
             self.norm
-                .forward_with_residual(f, input, residual, residual, hidden)
+                .forward(f, input, Some(ResidualStream::in_place(residual)), hidden)
         })
     }
 

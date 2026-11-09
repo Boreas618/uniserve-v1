@@ -2236,9 +2236,9 @@ impl Projection {
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, channels]))?;
         let normed = f.arena().tensor(DType::F32, shape)?;
-        self.shortcut_norm.forward(f, values, normed)?;
+        self.shortcut_norm.forward(f, values, None, normed)?;
         self.shortcut.forward(f, normed, shortcut)?;
-        self.attention_norm.forward(f, values, normed)?;
+        self.attention_norm.forward(f, values, None, normed)?;
         // Three contiguous head-group blocks, then causal attention over the frames.
         let head_shape = Shape::new(&[frames, heads, u64::from(self.attention.head_dim())]);
         let attended = f.arena().tensor(DType::F32, head_shape)?;
@@ -2272,7 +2272,7 @@ impl Projection {
         let normed = f
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, channels]))?;
-        self.mlp_norm.forward(f, shortcut, normed)?;
+        self.mlp_norm.forward(f, shortcut, None, normed)?;
         let updated = f
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, channels]))?;
@@ -2315,7 +2315,7 @@ impl GeGlu {
         let normed = f
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, x.shape.dim(1)]))?;
-        self.norm.forward(f, x, normed)?;
+        self.norm.forward(f, x, None, normed)?;
         let gate = f
             .arena()
             .tensor(DType::F32, Shape::new(&[frames, hidden]))?;

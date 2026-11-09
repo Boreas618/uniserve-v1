@@ -27,7 +27,8 @@ use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
 use nn::layers::{
-    Bias, GatedActivation, Linear, ModulatedRmsNorm, Parallel, Residual, RmsNorm, Scale,
+    Bias, Epilogue, GatedActivation, Linear, Modulation, Parallel, Residual, ResidualStream,
+    RmsNorm, Scale,
 };
 use nn::tensor::Backing;
 use nn::weights::{Weight, WeightLoader};
@@ -161,23 +162,11 @@ impl Layer {
         arrived: Vec<nn::Transfer>,
     ) -> Result<Vec<nn::Transfer>> {
         let width = hidden.shape.last();
-        let (_, _, gate_attention) = chunks(modulation, width, 0)?;
-        let (shift_mlp, scale_mlp, gate_mlp) = chunks(modulation, width, 3)?;
         let normalized = scratch.normalized;
         let update = scratch.update;
 
         // Attention: normalize, attend, and fold the gated update into `out` while normalizing the
         // feed-forward's input.
-        let attention_norm = self.attention_norm(modulation, width)?;
-        let mlp_norm = ModulatedRmsNorm::new(
-            self.norm2,
-            shift_mlp,
-            scale_mlp,
-            Some(gate_attention),
-            self.eps,
-        )?
-        .with_retain();
-        let residual = Residual::new(Scale::Row(gate_mlp), None)?;
         // Under Ulysses the attended rows return interval by interval, and what follows attention
         // reads a row alone, so an interval's output projection and feed-forward run while the
         // later intervals travel.
@@ -193,10 +182,12 @@ impl Layer {
             let mut arrived = arrived;
             // The stack's first layer has no layer before it to start its gather.
             if !ahead {
-                attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
+                self.attention_norm(modulation, width, rows)?
+                    .forward(f, hidden, None, normalized)?;
             } else if arrived.is_empty() {
                 let rows_here = sparse.gathered_rows(views, own, 0, own);
-                attention_norm.forward(f, hidden, None, rows, rows_here, None, None)?;
+                self.attention_norm(modulation, width, rows)?
+                    .forward(f, hidden, None, rows_here)?;
                 arrived.push(sparse.start_gather(f, views, own, 0, own)?);
             }
             let gate = sparse.attend(
@@ -219,8 +210,7 @@ impl Layer {
                 sparse.receive(f, interval, views, part(update))?;
                 self.feed_forward(
                     f,
-                    &mlp_norm,
-                    &residual,
+                    modulation,
                     part(hidden),
                     part(update),
                     part(out),
@@ -233,21 +223,19 @@ impl Layer {
                 // sequence, so they leave now, beside the rest of this layer.
                 if ahead && let Some((layer, modulation)) = next {
                     let rows_here = sparse.gathered_rows(views, own, first, count);
-                    layer.attention_norm(modulation, width)?.forward(
+                    layer.attention_norm(modulation, width, selected)?.forward(
                         f,
                         part(hidden),
                         None,
-                        selected,
                         rows_here,
-                        None,
-                        None,
                     )?;
                     gathering.push(sparse.start_gather(f, views, own, first, count)?);
                 }
             }
             return Ok(gathering);
         }
-        attention_norm.forward(f, hidden, None, rows, normalized, None, None)?;
+        self.attention_norm(modulation, width, rows)?
+            .forward(f, hidden, None, normalized)?;
         self.attention.forward(
             f,
             normalized,
@@ -259,8 +247,7 @@ impl Layer {
         )?;
         self.feed_forward(
             f,
-            &mlp_norm,
-            &residual,
+            modulation,
             hidden,
             update,
             out,
@@ -272,22 +259,36 @@ impl Layer {
         Ok(Vec::new())
     }
 
-    /// The normalization of this layer's attention input, under its `modulation` table.
-    fn attention_norm(&self, modulation: TensorView, width: u64) -> Result<ModulatedRmsNorm> {
+    /// The normalization of this layer's attention input, under its `modulation` table at the
+    /// AdaLN row `rows` names for each activation row.
+    fn attention_norm(
+        &self,
+        modulation: TensorView,
+        width: u64,
+        rows: TensorView,
+    ) -> Result<RmsNorm> {
         let (shift, scale, _) = chunks(modulation, width, 0)?;
-        Ok(ModulatedRmsNorm::new(
-            self.norm1, shift, scale, None, self.eps,
+        let modulation = Modulation {
+            shift,
+            scale,
+            gate: None,
+            rows,
+            retained: None,
+        };
+        Ok(RmsNorm::new(
+            self.norm1,
+            self.eps,
+            Epilogue::Modulated(modulation),
         )?)
     }
 
     /// The block after attention, over any rows of the layer: `update` is the attention's output
-    /// for them, and the layer's output lands in `hidden`.
+    /// for them, `rows` their AdaLN rows in `modulation`, and the layer's output lands in `hidden`.
     #[allow(clippy::too_many_arguments)]
     fn feed_forward(
         &self,
         f: &Forward,
-        mlp_norm: &ModulatedRmsNorm,
-        residual: &Residual,
+        modulation: TensorView,
         hidden: TensorView,
         update: TensorView,
         out: TensorView,
@@ -301,7 +302,25 @@ impl Layer {
         // `update`, and `retain` is what lets one launch produce both the normalized feed-forward
         // input and that residual base (`crates/ops/kernels/modulated_rms_norm`: with `update` the
         // kernel stores the gated sum, and with `retain` it copies the same value out).
-        mlp_norm.forward(f, hidden, Some(update), rows, normalized, None, Some(out))?;
+        let width = hidden.shape.last();
+        let (_, _, gate_attention) = chunks(modulation, width, 0)?;
+        let (shift_mlp, scale_mlp, gate_mlp) = chunks(modulation, width, 3)?;
+        let mlp_norm = RmsNorm::new(
+            self.norm2,
+            self.eps,
+            Epilogue::Modulated(Modulation {
+                shift: shift_mlp,
+                scale: scale_mlp,
+                gate: Some(gate_attention),
+                rows,
+                retained: Some(out),
+            }),
+        )?;
+        let stream = ResidualStream {
+            input: hidden,
+            output: update,
+        };
+        mlp_norm.forward(f, update, Some(stream), normalized)?;
 
         // Feed-forward: the packed value and gate halves, the gated activation, the down
         // projection, and the second gated residual into the retained residual.
@@ -315,6 +334,7 @@ impl Layer {
         // `hidden` is spent by now, so the down projection lands there, and the gated residual
         // writes over its `update` operand: the layer's output is `hidden`, in place.
         self.down.forward(f, mlp, hidden)?;
+        let residual = Residual::new(Scale::Row(gate_mlp), None)?;
         Ok(residual.forward(f, out, hidden, Some(rows), hidden)?)
     }
 }
@@ -613,17 +633,19 @@ impl Transformer {
     ) -> Result<()> {
         let width = hidden.shape.last();
         let (shift, scale) = halves(modulation, width)?;
-        let norm = ModulatedRmsNorm::new(
-            borrowed(self.norm_out.weight())?,
+        let modulation = Modulation {
             shift,
             scale,
-            None,
+            gate: None,
+            rows,
+            retained: None,
+        };
+        let norm = RmsNorm::new(
+            borrowed(self.norm_out.weight())?,
             self.config.norm_eps,
+            Epilogue::Modulated(modulation),
         )?;
-        let arena = f.arena();
-        let dtype = hidden.dtype;
-        let normalized = arena.tensor(dtype, hidden.shape)?;
-        norm.forward(f, hidden, None, rows, normalized, None, None)?;
+        let normalized = norm.apply(f, hidden, None)?;
         // The final modulation is the checkpoint's own type (the BF16 norm times the BF16 table),
         // and the projection that follows is FP32 - so the widening is
         // here, between them, and not inside the norm.

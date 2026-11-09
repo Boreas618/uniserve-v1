@@ -41,7 +41,7 @@ use nn::capability::{
 use nn::family::Split;
 use nn::layers::{
     Attention, Bias, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames, QkvSpec,
-    Residual, RmsNorm, Rotary, Rows, Sections, VocabParallelEmbedding,
+    Residual, ResidualStream, RmsNorm, Rotary, Rows, Sections, VocabParallelEmbedding,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -481,11 +481,16 @@ impl Layer {
         match carried {
             Some(carried) => self
                 .input_norm
-                .forward_with_residual(f, carried, residual, residual, buffers.normalized)
+                .forward(
+                    f,
+                    carried,
+                    Some(ResidualStream::in_place(residual)),
+                    buffers.normalized,
+                )
                 .map_err(Error::from)?,
             None => self
                 .input_norm
-                .forward(f, residual, buffers.normalized)
+                .forward(f, residual, None, buffers.normalized)
                 .map_err(Error::from)?,
         }
 
@@ -530,7 +535,12 @@ impl Layer {
             .map_err(Error::from)?;
 
         self.post_norm
-            .forward_with_residual(f, buffers.projected, residual, residual, buffers.normalized)
+            .forward(
+                f,
+                buffers.projected,
+                Some(ResidualStream::in_place(residual)),
+                buffers.normalized,
+            )
             .map_err(Error::from)?;
 
         self.gate

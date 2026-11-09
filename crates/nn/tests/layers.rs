@@ -7,9 +7,9 @@
 //! region that is never read, because construction only inspects extents and strides.
 
 use nn::{
-    AdaptivePool, Arena, Conv3d, ConvGeometry, DType, DevicePtr, Forward, FrameNormPad, KvGroup,
-    KvPlanes, KvView, Linear, ModulatedRmsNorm, Patch, Residual, Rotary, Rotate, Rotation, Scale,
-    ScaledResidualRmsNorm, Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight, WeightedRmsNorm,
+    AdaptivePool, Arena, Conv3d, ConvGeometry, DType, DevicePtr, Epilogue, Forward, FrameNormPad,
+    KvGroup, KvPlanes, KvView, LayerNorm, Linear, Modulation, Patch, Residual, ResidualStream,
+    RmsNorm, Rotary, Rotate, Rotation, Scale, Shape, Snake, SwiGlu, TensorView, VsaTiles, Weight,
 };
 use ops::gemm::WeightOrder;
 
@@ -39,24 +39,6 @@ fn a_projection_derives_its_contraction_and_channels_from_the_storage_order() {
         "a bias of the wrong width is a loading error"
     );
     assert!(Linear::new(weight(&[64, 8]), Some(weight(&[8])), WeightOrder::KxN).is_ok());
-}
-
-#[test]
-fn the_residual_layers_refuse_parameters_of_different_channel_counts() {
-    assert!(WeightedRmsNorm::new(weight(&[16, 8]), 1e-6).is_err());
-    assert!(WeightedRmsNorm::new(weight(&[8]), 1e-6).is_ok());
-
-    assert!(
-        ScaledResidualRmsNorm::new(weight(&[8]), None, weight(&[16]), 1e-6).is_err(),
-        "the residual's scale and the normalization's weight are the same width"
-    );
-    assert!(
-        ScaledResidualRmsNorm::new(weight(&[16]), Some(weight(&[8])), weight(&[16]), 1e-6).is_err(),
-        "the update's bias is the residual's width"
-    );
-    assert!(
-        ScaledResidualRmsNorm::new(weight(&[16]), Some(weight(&[16])), weight(&[16]), 1e-6).is_ok()
-    );
 }
 
 /// A residual's bias is the update's, added under a channel scale of its width; a row scale is a
@@ -138,38 +120,120 @@ fn a_residual_writes_only_the_operand_its_scale_updates() {
     assert!(gated.forward(&f, residual, update, None, update).is_err());
 }
 
+/// A normalization's epilogue parameters are the normalization's width: a scaled residual's scale
+/// and bias are vectors of it, a modulation's tables are `[parameters, width]`.
 #[test]
-fn a_modulation_needs_two_dimensional_parameter_tables_of_its_width() {
-    let learned = weight(&[64]);
-    let table = weight(&[4, 64]);
-    let modulation = ModulatedRmsNorm::new(learned, table, weight(&[4, 64]), None, 1e-6).unwrap();
-    assert_eq!(modulation.width(), 64);
-    assert!(!modulation.has_update());
+fn a_normalization_refuses_epilogue_parameters_of_another_width() {
+    let rows = TensorView::new(DevicePtr::new(0x1_0000), DType::I32, Shape::new(&[3]));
+    let scaled = |scale: &[u64], bias: Option<&[u64]>| Epilogue::ScaledResidual {
+        scale: weight(scale),
+        bias: bias.map(weight),
+    };
+    assert!(RmsNorm::new(weight(&[16, 8]), 1e-6, Epilogue::None).is_err());
+    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[8], None)).is_err());
+    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[16], Some(&[8]))).is_err());
+    assert!(RmsNorm::new(weight(&[16]), 1e-6, scaled(&[16], Some(&[16]))).is_ok());
 
-    let gated = ModulatedRmsNorm::new(
-        weight(&[64]),
-        weight(&[4, 64]),
-        weight(&[4, 64]),
-        Some(weight(&[4, 64])),
-        1e-6,
-    )
-    .unwrap();
-    assert!(gated.has_update());
-
+    let modulated = |shift: &[u64], gate: Option<&[u64]>| {
+        Epilogue::Modulated(Modulation {
+            shift: weight(shift),
+            scale: weight(&[4, 64]),
+            gate: gate.map(weight),
+            rows,
+            retained: None,
+        })
+    };
+    assert!(RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 64], None)).is_ok());
+    assert!(RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 64], Some(&[4, 64]))).is_ok());
     assert!(
-        ModulatedRmsNorm::new(weight(&[64]), weight(&[64]), weight(&[4, 64]), None, 1e-6).is_err(),
+        RmsNorm::new(weight(&[64]), 1e-6, modulated(&[64], None)).is_err(),
         "a shift table is [parameters, width], not one row"
     );
     assert!(
-        ModulatedRmsNorm::new(
-            weight(&[64]),
-            weight(&[4, 32]),
-            weight(&[4, 64]),
-            None,
-            1e-6
-        )
-        .is_err(),
+        RmsNorm::new(weight(&[64]), 1e-6, modulated(&[4, 32], None)).is_err(),
         "a table of another width is not this layer's"
+    );
+
+    let (gain, bias) = (weight(&[16]), Some(weight(&[16])));
+    assert!(LayerNorm::new(gain, bias, 1e-6, scaled(&[16], None)).is_ok());
+    assert!(
+        LayerNorm::new(gain, None, 1e-6, scaled(&[16], None)).is_err(),
+        "a scaled residual layer normalization adds its bias"
+    );
+    assert!(LayerNorm::new(gain, bias, 1e-6, modulated(&[4, 16], None)).is_err());
+}
+
+/// The residual stream is a call operand: a plain normalization adds into it when one is passed, a
+/// scaled residual requires one updated in place, and a modulation takes one exactly when it gates
+/// an update, writing the sum over that update.
+#[test]
+fn a_normalization_reads_the_residual_stream_its_epilogue_folds() {
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let view = |dtype, dims: &[u64]| arena.tensor(dtype, Shape::new(dims)).unwrap();
+    let held = |view: TensorView| Weight {
+        backing: nn::Backing::new(view.ptr, view.numel() * 2),
+        view,
+    };
+    let (x, out, stream, other) = (
+        view(DType::BF16, &[3, 16]),
+        view(DType::BF16, &[3, 16]),
+        view(DType::BF16, &[3, 16]),
+        view(DType::BF16, &[3, 16]),
+    );
+    let gain = held(view(DType::BF16, &[16]));
+
+    let plain = RmsNorm::new(gain, 1e-6, Epilogue::None).unwrap();
+    assert!(plain.forward(&f, x, None, out).is_ok());
+    assert!(
+        plain
+            .forward(&f, x, Some(ResidualStream::in_place(stream)), out)
+            .is_ok()
+    );
+    let moved = ResidualStream {
+        input: other,
+        output: stream,
+    };
+    assert!(plain.forward(&f, x, Some(moved), out).is_ok());
+
+    let scale = held(view(DType::BF16, &[16]));
+    let epilogue = Epilogue::ScaledResidual { scale, bias: None };
+    let scaled = RmsNorm::new(gain, 1e-6, epilogue).unwrap();
+    assert!(
+        scaled
+            .forward(&f, x, Some(ResidualStream::in_place(stream)), out)
+            .is_ok()
+    );
+    assert!(scaled.forward(&f, x, None, out).is_err());
+    assert!(scaled.forward(&f, x, Some(moved), out).is_err());
+
+    let table = held(view(DType::BF16, &[4, 16]));
+    let rows = view(DType::I32, &[3]);
+    let modulation = |gate| Modulation {
+        shift: table,
+        scale: table,
+        gate,
+        rows,
+        retained: None,
+    };
+    let ungated = RmsNorm::new(gain, 1e-6, Epilogue::Modulated(modulation(None))).unwrap();
+    assert!(ungated.forward(&f, x, None, out).is_ok());
+    assert!(
+        ungated
+            .forward(&f, x, Some(ResidualStream::in_place(x)), out)
+            .is_err()
+    );
+    let gated = RmsNorm::new(gain, 1e-6, Epilogue::Modulated(modulation(Some(table)))).unwrap();
+    let into_update = ResidualStream {
+        input: stream,
+        output: x,
+    };
+    assert!(gated.forward(&f, x, Some(into_update), out).is_ok());
+    assert!(gated.forward(&f, x, None, out).is_err());
+    assert!(
+        gated
+            .forward(&f, x, Some(ResidualStream::in_place(stream)), out)
+            .is_err()
     );
 }
 

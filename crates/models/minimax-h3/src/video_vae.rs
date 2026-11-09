@@ -410,8 +410,8 @@ pub const MINIMUM_OVERLAP: u32 = 64;
 
 use nn::Forward;
 use nn::layers::{
-    Attention, Bias, Cast, Linear, MergedColumnLinear, PackedSwiGlu, Parallel, Rotary, Rows,
-    ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections, WeightedRmsNorm,
+    Attention, Bias, Cast, Epilogue, LayerNorm, Linear, MergedColumnLinear, PackedSwiGlu, Parallel,
+    ResidualStream, RmsNorm, Rotary, Rows, Sections,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
@@ -437,12 +437,12 @@ struct Layer {
     query_key_value: MergedColumnLinear,
     output: Linear,
     /// `scale1`, then the second normalization.
-    attended: ScaledResidualRmsNorm,
+    attended: RmsNorm,
     gate_up: Linear,
     gated: PackedSwiGlu,
     down: Linear,
     /// `scale2`, then the next layer's first normalization; the last layer folds into `last`.
-    fed: Option<ScaledResidualRmsNorm>,
+    fed: Option<RmsNorm>,
 }
 
 /// The video decoder's latent stage: one clip's latent voxels become the clip's pixels.
@@ -470,11 +470,12 @@ pub struct VideoDecoder {
     register_rows: Weight,
     zero_row: Weight,
     zero_rows: Weight,
-    /// The first layer's first normalization, which has no update to fold.
-    first: WeightedRmsNorm,
+    /// The first layer's first normalization, which has no update to fold: it narrows the FP32
+    /// stream into the FP16 rows the projections read.
+    first: RmsNorm,
     layers: Vec<Layer>,
     /// The last layer's feed-forward update and the final normalization.
-    last: ScaledResidualLayerNorm,
+    last: LayerNorm,
     output: Linear,
     rotary: Rotary,
     place: Rows,
@@ -750,23 +751,26 @@ impl VideoDecoder {
                 .pinned(STREAM)
                 .tensor(leaf, &[u64::from(width)])?)
         };
-        let first = WeightedRmsNorm::new(
+        let first = RmsNorm::new(
             vector(
                 loader,
                 "decoder.transformer_blocks.0.norm1".to_owned(),
                 "weight",
             )?,
             epsilon,
+            Epilogue::None,
         )?;
         let weight = vector(loader, "decoder.norm_out".to_owned(), "weight")?;
         let bias = vector(loader, "decoder.norm_out".to_owned(), "bias")?;
+        // Every residual update is scaled per channel and has no bias of its own.
+        let scaled = |scale: Weight| Epilogue::ScaledResidual { scale, bias: None };
         let count = config.decoder_num_layers;
         let last_scale = vector(
             loader,
             format!("decoder.transformer_blocks.{}", count - 1),
             "scale2",
         )?;
-        let last = ScaledResidualLayerNorm::new(last_scale, None, weight, bias, epsilon)?;
+        let last = LayerNorm::new(weight, Some(bias), epsilon, scaled(last_scale))?;
 
         let mut layers = Vec::with_capacity(count as usize);
         for index in 0..count {
@@ -777,7 +781,7 @@ impl VideoDecoder {
                 let scale2 = vector(loader, base.clone(), "scale2")?;
                 let next = format!("decoder.transformer_blocks.{}.norm1", index + 1);
                 let norm1 = vector(loader, next, "weight")?;
-                Some(ScaledResidualRmsNorm::new(scale2, None, norm1, epsilon)?)
+                Some(RmsNorm::new(norm1, epsilon, scaled(scale2))?)
             } else {
                 None
             };
@@ -801,7 +805,7 @@ impl VideoDecoder {
             layers.push(Layer {
                 query_key_value,
                 output: projection("attn.to_out.0", width, width)?,
-                attended: ScaledResidualRmsNorm::new(scale1, None, norm2, epsilon)?,
+                attended: RmsNorm::new(norm2, epsilon, scaled(scale1))?,
                 // The feed-forward's projection is packed: its rows hold the value half and then the
                 // gate half, so it is twice the feed-forward's width.
                 gate_up: projection("ff.net.0.proj", width, 2 * ffn)?,
@@ -1120,7 +1124,8 @@ impl VideoDecoder {
             .map_err(|_| Error::config("too many tokens for one sequence".to_owned()))?;
         let bound = u32::try_from(rows).map_err(|_| Error::config("too many tokens".to_owned()))?;
 
-        self.first.forward(f, stream, normalized)?;
+        self.first.forward(f, stream, None, normalized)?;
+        let stream = Some(ResidualStream::in_place(stream));
         for layer in &self.layers {
             layer.query_key_value.forward(f, normalized, merged)?;
             self.rotary
@@ -1136,18 +1141,16 @@ impl VideoDecoder {
                 per_head(attended),
             )?;
             layer.output.forward(f, attended, update)?;
-            layer
-                .attended
-                .forward(f, stream, update, normalized, None)?;
+            layer.attended.forward(f, update, stream, normalized)?;
             layer.gate_up.forward(f, normalized, gate_up)?;
             layer.gated.forward(f, gate_up, gated, None)?;
             layer.down.forward(f, gated, update)?;
             if let Some(fed) = &layer.fed {
-                fed.forward(f, stream, update, normalized, None)?;
+                fed.forward(f, update, stream, normalized)?;
             }
         }
 
-        self.last.forward(f, stream, update, normalized, None)?;
+        self.last.forward(f, update, stream, normalized)?;
         Ok(self.output.forward(f, normalized, out)?)
     }
 }

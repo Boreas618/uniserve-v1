@@ -488,7 +488,7 @@ impl Block {
         let hidden = buffers.hidden;
 
         self.input_norm
-            .forward(f, hidden, buffers.normalized)
+            .forward(f, hidden, None, buffers.normalized)
             .map_err(Error::from)?;
         self.qkv.forward(
             f,
@@ -533,7 +533,7 @@ impl Block {
             .map_err(Error::from)?;
 
         self.output_norm
-            .forward(f, hidden, buffers.normalized)
+            .forward(f, hidden, None, buffers.normalized)
             .map_err(Error::from)?;
         self.first
             .forward(f, buffers.normalized, buffers.gate)
@@ -646,12 +646,13 @@ impl Merger {
                 .forward(
                     f,
                     hidden.reshape(merged),
+                    None,
                     buffers.normalized.reshape(merged),
                 )
                 .map_err(Error::from)?;
         } else {
             self.norm
-                .forward(f, hidden, buffers.normalized)
+                .forward(f, hidden, None, buffers.normalized)
                 .map_err(Error::from)?;
         }
         self.first
