@@ -6,7 +6,7 @@
 //! `uniserve program-server serve`, and by a daemon whose host has none. It
 //! does three things: compile a program package
 //! into the modules of its descriptors, keep those modules, and answer
-//! `install`, `prepare`, `resolve` and `list` on its Unix socket. It launches
+//! `install`, `prepare`, `resolve`, `list` and `cover` on its Unix socket. It launches
 //! no kernel and allocates no device memory, and it is not on the serving
 //! path: a main process asks it for modules when it starts and when a program
 //! changes, so a Program Server restart delays only those two moments.
@@ -18,7 +18,8 @@
 //! The pieces of the design:
 //!
 //! - [`server`]: the object model of section 6.2, and `install`, `prepare`,
-//!   `resolve`, `list` (section 6.3).
+//!   `resolve`, `list` (section 6.3) and `cover`, which answers the package
+//!   whose manifest covers each of an operator's descriptor keys.
 //! - [`store`]: the module store of section 5.3, whose paths are made of the
 //!   operator's and backend's names, the revision, the target and the
 //!   descriptor key, and whose every directory ends in a `.committed` mark.
@@ -54,10 +55,10 @@ pub mod toolchain;
 
 pub use builder::{BuildState, Limits, Urgency};
 pub use manifest::{Manifest, ManifestError, ModuleForm, SourceKind, TargetKind, ToolchainKind};
-pub use program::{PhaseKind, Program, ProgramSlot};
+pub use program::{PhaseKind, Program, ProgramSlot, preference};
 pub use protocol::{
-    Client, Descriptors, Module, ModuleFile, PrepareRequest, Prepared, ProgramRequest, Progress,
-    Selector,
+    Client, CoverRequest, Coverage, Covered, Descriptors, Module, ModuleFile, PrepareRequest,
+    Prepared, ProgramRequest, Progress, Selector,
 };
 pub use server::{Installed, Listing, ProgramServer, ServerConfig};
 pub use store::{ModulePath, Root, Store};

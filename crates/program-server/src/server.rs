@@ -1,12 +1,13 @@
-//! The Program Server's object model (design section 6.2) and its four
+//! The Program Server's object model (design section 6.2) and its
 //! operations (design section 6.3).
 //!
 //! A [`ProgramServer`] keeps what is installed — one [`Package`] per
 //! `(operator, backend, revision)`, each holding its manifest, its directory
 //! and its [`Source`] — the module [`Store`] of section 5.3, the host's
 //! [`Toolchains`] and the compile [`Queue`] of section 6.2. It serves
-//! `install`, `prepare`, `resolve` and `list` on a Unix socket to any number
-//! of clients: one thread per connection, one driver thread for the queue.
+//! `install`, `prepare`, `resolve`, `list` and `cover` on a Unix socket to any
+//! number of clients: one thread per connection, one driver thread for the
+//! queue.
 //!
 //! The server compiles, keeps and provides. It launches no kernel and
 //! allocates no device memory (section 6.1), and it never starts an update of
@@ -330,6 +331,34 @@ impl ProgramServer {
                         })),
                     },
                     &descriptors,
+                )
+            }
+            wire::request::Request::Cover(cover) => {
+                let coverage = self.cover(&protocol::CoverRequest {
+                    op: cover.op,
+                    targets: cover.targets.into_iter().map(Target::new).collect(),
+                    keys: cover.keys,
+                })?;
+                let coverage = wire::Coverage {
+                    covered: coverage
+                        .covered
+                        .into_iter()
+                        .map(|covered| wire::Covered {
+                            package: Some(wire::Package {
+                                op: covered.package.op,
+                                backend: covered.package.backend,
+                                revision: covered.package.revision,
+                            }),
+                            keys: covered.keys,
+                        })
+                        .collect(),
+                    uncovered: coverage.uncovered,
+                };
+                connection.send(
+                    &wire::ServerMessage {
+                        message: Some(wire::server_message::Message::Coverage(coverage)),
+                    },
+                    &[],
                 )
             }
             wire::request::Request::List(_) => {
@@ -822,6 +851,116 @@ impl ProgramServer {
         Ok(protocol::Listing {
             packages: listed.into_values().collect(),
         })
+    }
+
+    /// Answers which installed package covers each of an operator's descriptor
+    /// keys, so a caller asks every package only for keys it can build.
+    ///
+    /// A package is a candidate when it is its backend's latest installed
+    /// revision of the operator - the revision `prepare` selects for a backend -
+    /// and builds for every requested target. A key goes to a candidate whose
+    /// manifest covers it, preferring one whose module of the key is already
+    /// committed for every target (a store built ahead keeps serving the
+    /// modules it holds), then by [`preference`](crate::program::preference).
+    /// A key no candidate covers is answered in `uncovered`. Nothing is built.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the request names no target, or names a key that cannot be
+    /// a module path.
+    pub fn cover(&self, request: &protocol::CoverRequest) -> Result<protocol::Coverage> {
+        if request.targets.is_empty() {
+            return Err(Error::Protocol(format!(
+                "a cover of {} names no target to build for",
+                request.op
+            )));
+        }
+        let packages = self
+            .packages
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Each backend's latest revision of the operator, kept when it builds
+        // for every requested target, in the store's preference order.
+        let mut latest: BTreeMap<&str, (u32, &Arc<Package>)> = BTreeMap::new();
+        for ((op, backend, revision), package) in packages.iter() {
+            if *op != request.op {
+                continue;
+            }
+            let held = latest
+                .entry(backend.as_str())
+                .or_insert((*revision, package));
+            if *revision > held.0 {
+                *held = (*revision, package);
+            }
+        }
+        let mut candidates: Vec<(&str, u32, &Arc<Package>)> = latest
+            .into_iter()
+            .filter(|(_, (_, package))| {
+                request
+                    .targets
+                    .iter()
+                    .all(|target| package.manifest.builds_for(target.as_str()))
+            })
+            .map(|(backend, (revision, package))| (backend, revision, package))
+            .collect();
+        candidates.sort_by(|left, right| {
+            crate::program::preference((left.0, left.1), (right.0, right.1))
+        });
+
+        // The keys chosen for each candidate, index for index: a key joins the
+        // first covering candidate that holds its modules, or else the first
+        // covering one.
+        let mut chosen: Vec<Vec<String>> = vec![Vec::new(); candidates.len()];
+        let mut uncovered: Vec<String> = Vec::new();
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for key in &request.keys {
+            if !seen.insert(key.as_str()) {
+                continue;
+            }
+            let mut first: Option<usize> = None;
+            let mut built: Option<usize> = None;
+            for (index, (backend, revision, package)) in candidates.iter().enumerate() {
+                if !package.manifest.covers(key) {
+                    continue;
+                }
+                first = first.or(Some(index));
+                let mut committed = true;
+                for target in &request.targets {
+                    let path = ModulePath::new(
+                        request.op.clone(),
+                        *backend,
+                        *revision,
+                        target.to_string(),
+                        key.clone(),
+                    )?;
+                    committed &= self.store.contains(&path);
+                }
+                if committed {
+                    built = Some(index);
+                    break;
+                }
+            }
+            match built.or(first) {
+                Some(index) => chosen[index].push(key.clone()),
+                None => uncovered.push(key.clone()),
+            }
+        }
+
+        let covered = candidates
+            .iter()
+            .zip(chosen)
+            .filter(|(_, keys)| !keys.is_empty())
+            .map(|((backend, revision, _), keys)| protocol::Covered {
+                package: protocol::Package {
+                    op: request.op.clone(),
+                    backend: (*backend).to_owned(),
+                    revision: *revision,
+                },
+                keys,
+            })
+            .collect();
+        Ok(protocol::Coverage { covered, uncovered })
     }
 
     /// The program a `prepare` names for an operator, with the package's

@@ -1,4 +1,4 @@
-//! The server's four operations (design section 6.3): what an installation
+//! The server's operations (design section 6.3): what an installation
 //! numbers and where it lands, what a server that is not the upstream
 //! answers, and the errors a request gets before any build starts.
 

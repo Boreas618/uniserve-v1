@@ -16,7 +16,8 @@
 //! [`Client`] is the half the daemon and the main process use: the daemon
 //! calls [`Client::prepare`] before a deployment starts and before an update,
 //! and the main process calls [`Client::resolve`] when it starts and when a
-//! program changes.
+//! program changes, and [`Client::cover`] to learn which installed package
+//! builds each descriptor key of an operator the deployment does not name.
 
 use std::io::{self, IoSlice, IoSliceMut};
 use std::mem::MaybeUninit;
@@ -171,6 +172,33 @@ pub struct ListedPackage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Listing {
     pub packages: Vec<ListedPackage>,
+}
+
+/// What `cover` asks: which installed package covers each of an operator's
+/// descriptor keys when its modules are built for `targets`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CoverRequest {
+    pub op: String,
+    pub targets: Vec<Target>,
+    /// Descriptor keys, in the canonical form the operator's `Display` gives.
+    pub keys: Vec<String>,
+}
+
+/// The keys of a `cover` one package was chosen for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Covered {
+    pub package: Package,
+    pub keys: Vec<String>,
+}
+
+/// The answer to `cover`: each requested key once, either under the package
+/// chosen for it or in `uncovered`. `covered` is in the server's preference
+/// order, and each package's keys in the order the request named them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Coverage {
+    pub covered: Vec<Covered>,
+    /// The keys no installed package of the operator covers for the targets.
+    pub uncovered: Vec<String>,
 }
 
 impl From<&Program> for wire::ProgramRef {
@@ -749,6 +777,45 @@ impl Client {
                     });
                 }
                 Ok(Listing { packages })
+            }
+            wire::server_message::Message::Refused(refused) => Err(refused_error(refused)),
+            other => Err(unexpected(Some(other))),
+        }
+    }
+
+    /// Answers which installed package covers each of an operator's
+    /// descriptor keys for `request.targets`; nothing is built.
+    pub fn cover(&mut self, request: &CoverRequest) -> Result<Coverage> {
+        self.connection.send(
+            &wire::Request {
+                request: Some(wire::request::Request::Cover(wire::Cover {
+                    op: request.op.clone(),
+                    targets: request.targets.iter().map(Target::to_string).collect(),
+                    keys: request.keys.clone(),
+                })),
+            },
+            &[],
+        )?;
+        match self.answer()? {
+            wire::server_message::Message::Coverage(coverage) => {
+                let mut covered = Vec::with_capacity(coverage.covered.len());
+                for entry in coverage.covered {
+                    let package = entry.package.ok_or_else(|| {
+                        Error::Protocol("a covering entry names no package".into())
+                    })?;
+                    covered.push(Covered {
+                        package: Package {
+                            op: package.op,
+                            backend: package.backend,
+                            revision: package.revision,
+                        },
+                        keys: entry.keys,
+                    });
+                }
+                Ok(Coverage {
+                    covered,
+                    uncovered: coverage.uncovered,
+                })
             }
             wire::server_message::Message::Refused(refused) => Err(refused_error(refused)),
             other => Err(unexpected(Some(other))),
