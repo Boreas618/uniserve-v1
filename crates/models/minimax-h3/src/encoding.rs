@@ -62,7 +62,7 @@ pub const PIXEL_CHANNELS: u32 = 3;
 /// patch rows and the audio encoder's zero-padded channel rows.
 #[derive(Clone, Debug)]
 pub struct ConditionFormat {
-    vision: crate::config::VisionConfig,
+    vision: qwen3::VisionConfig,
     pixels: crate::config::PixelConfig,
     /// The element type the tower's patch rows are rounded to: its weights' own.
     dtype: DType,
@@ -75,7 +75,7 @@ impl ConditionFormat {
     pub fn new(config: &crate::Config, dtype: DType) -> Result<Self> {
         Ok(Self {
             vision: config.text_encoder.vision.clone(),
-            pixels: config.text_encoder.pixels,
+            pixels: config.pixels,
             dtype,
             hop: u64::from(AudioStack::of(&config.audio_vae)?.samples_per_latent),
         })
@@ -164,7 +164,7 @@ impl nn::capability::MediaFormat for ConditionFormat {
     }
 
     fn patch_width(&self) -> u32 {
-        crate::vision::BlockRows::tubelet(&self.vision)
+        qwen3::vl::vision::BlockRows::tubelet(&self.vision)
     }
 
     fn patch_side(&self) -> u32 {
@@ -1778,7 +1778,7 @@ mod tests {
     /// The format of a tower of `patch`-pixel patches, two-frame tubelets and `2 x 2` merges.
     fn format(patch: u32) -> ConditionFormat {
         ConditionFormat {
-            vision: crate::config::VisionConfig {
+            vision: qwen3::VisionConfig {
                 depth: 1,
                 hidden_size: 8,
                 intermediate_size: 8,

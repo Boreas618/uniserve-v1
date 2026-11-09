@@ -119,7 +119,7 @@ pub enum Error {
 
 impl Error {
     /// A shape disagreement of `owner`.
-    pub(crate) fn shape(owner: &'static str, problem: impl Into<String>) -> Self {
+    pub fn shape(owner: &'static str, problem: impl Into<String>) -> Self {
         Self::Shape {
             owner,
             problem: problem.into(),

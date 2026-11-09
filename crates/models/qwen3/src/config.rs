@@ -7,7 +7,8 @@
 //! Model Library Boundary).
 //!
 //! [`TextConfig`] is the decoder stack every Qwen3 model shares; [`MoeConfig`] adds the routed
-//! experts of `Qwen3MoeForCausalLM`.
+//! experts of `Qwen3MoeForCausalLM`, and [`VlConfig`] the vision tower and the placeholder tokens
+//! of a Qwen3-VL checkpoint.
 
 use nn::config::Fields;
 use nn::family::Split;
@@ -353,9 +354,318 @@ impl MoeConfig {
     }
 }
 
+/// The dimensions of the Qwen3-VL vision encoder and its token mergers.
+///
+/// Pixels arrive as tubelets of `in_channels x temporal_patch_size x patch_size x patch_size`
+/// values. `depth` blocks of width `hidden_size` with `num_heads` heads encode them; every
+/// `spatial_merge_size x spatial_merge_size` patch block merges into one `out_hidden_size` token,
+/// which is the language model's width.
+#[derive(Clone, PartialEq, Debug)]
+pub struct VisionConfig {
+    /// Transformer blocks of the tower.
+    pub depth: u32,
+    /// The tower's width.
+    pub hidden_size: u32,
+    /// The tower's feed-forward width.
+    pub intermediate_size: u32,
+    /// Attention heads.
+    pub num_heads: u32,
+    /// The blocks' MLP activation: PyTorch's tanh-approximated GELU, the one the blocks are
+    /// served with.
+    pub hidden_act: Activation,
+    /// Pixel channels of one tubelet voxel.
+    pub in_channels: u32,
+    /// Side of one square spatial patch, in pixels.
+    pub patch_size: u32,
+    /// Frames of one temporal patch.
+    pub temporal_patch_size: u32,
+    /// Side, in patches, of one block that merges into a language token.
+    pub spatial_merge_size: u32,
+    /// Width of a merged token: the language model's.
+    pub out_hidden_size: u32,
+    /// Entries of the learned position table, a square grid.
+    pub num_position_embeddings: u32,
+    /// The index of each block whose output feeds a DeepStack merger, in increasing order.
+    pub deepstack_visual_indexes: Vec<u32>,
+}
+
+impl VisionConfig {
+    /// Read a Qwen3-VL checkpoint's `vision_config`.
+    ///
+    /// # Errors
+    ///
+    /// A field of the wrong type, a block activation other than `gelu_pytorch_tanh`, DeepStack
+    /// blocks out of order or outside the tower, heads that do not split the width into two even
+    /// rotary halves, or a position table that is not a square grid.
+    pub fn parse(values: &Fields<'_>) -> Result<Self> {
+        let owner = values.owner();
+        let hidden_act = values.activation("hidden_act")?;
+        if hidden_act != Activation::GeluTanh {
+            return Err(Error::Config(format!(
+                "{owner}.hidden_act must be gelu_pytorch_tanh, got {hidden_act}"
+            )));
+        }
+        let depth = values.count("depth")?;
+        // The DeepStack mergers join the language model after the blocks their indexes name, so an
+        // index outside the tower, or two out of order, is refused here.
+        let deepstack_visual_indexes = values.indices("deepstack_visual_indexes")?;
+        if deepstack_visual_indexes
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err(Error::Config(format!(
+                "{owner}.deepstack_visual_indexes must increase strictly"
+            )));
+        }
+        if let Some(outside) = deepstack_visual_indexes
+            .iter()
+            .find(|index| **index >= depth - 1)
+        {
+            return Err(Error::Config(format!(
+                "{owner}.deepstack_visual_indexes names block {outside}, outside the {depth}-block \
+                 tower"
+            )));
+        }
+        let config = Self {
+            depth,
+            hidden_size: values.count("hidden_size")?,
+            intermediate_size: values.count("intermediate_size")?,
+            num_heads: values.count("num_heads")?,
+            hidden_act,
+            in_channels: values.count("in_channels")?,
+            patch_size: values.count("patch_size")?,
+            temporal_patch_size: values.count("temporal_patch_size")?,
+            spatial_merge_size: values.count("spatial_merge_size")?,
+            out_hidden_size: values.count("out_hidden_size")?,
+            num_position_embeddings: values.count("num_position_embeddings")?,
+            deepstack_visual_indexes,
+        };
+        if !config.hidden_size.is_multiple_of(config.num_heads) {
+            return Err(Error::Config(format!(
+                "Qwen3-VL vision heads {} do not divide the hidden size {}",
+                config.num_heads, config.hidden_size
+            )));
+        }
+        // The 2D rotary embedding rotates half of each head by the patch row and half by its
+        // column, each as split-half pairs.
+        if !(config.hidden_size / config.num_heads).is_multiple_of(4) {
+            return Err(Error::Config(format!(
+                "Qwen3-VL vision head width {} must split into two even rotary halves",
+                config.hidden_size / config.num_heads
+            )));
+        }
+        let side = f64::from(config.num_position_embeddings).sqrt().round();
+        if (side * side) as u32 != config.num_position_embeddings {
+            return Err(Error::Config(
+                "Qwen3-VL vision position table must be a square grid".to_owned(),
+            ));
+        }
+        Ok(config)
+    }
+}
+
+/// A Qwen3-VL checkpoint's configuration: the language model, the vision tower, and the
+/// placeholder tokens a prompt presents its media by.
+#[derive(Clone, PartialEq, Debug)]
+pub struct VlConfig {
+    /// The language model: a Qwen3 decoder stack rotating by interleaved M-RoPE.
+    pub text: TextConfig,
+    /// The vision tower.
+    pub vision: VisionConfig,
+    /// The token that stands for one merged image patch.
+    pub image_token_id: u32,
+    /// The token that stands for one merged video patch.
+    pub video_token_id: u32,
+}
+
+impl VlConfig {
+    /// The precision the Qwen3-VL reference computes the language model's spectrum in: FP32.
+    const PRECISION: Precision = Precision::F32;
+
+    /// The position axes of the language model's M-RoPE: time, height and width.
+    pub const POSITION_AXES: u32 = 3;
+
+    /// Read a Qwen3-VL `config.json`: its `text_config`, `vision_config` and placeholder ids.
+    ///
+    /// # Errors
+    ///
+    /// What [`TextConfig::parse`] and [`VisionConfig::parse`] refuse, a language model that does
+    /// not rotate by three-axis M-RoPE, a placeholder outside the vocabulary, or merged tokens of
+    /// another width than the language model's.
+    pub fn parse(values: &Fields<'_>) -> Result<Self> {
+        let text = TextConfig::parse(&values.object("text_config")?, Self::PRECISION)?;
+        let axes = match text.rope {
+            Spectrum::Sectioned { sections, .. } => sections.axes(),
+            _ => 0,
+        };
+        if axes != Self::POSITION_AXES {
+            return Err(Error::Config(format!(
+                "a Qwen3-VL language model rotates by interleaved M-RoPE over {} axes, not {:?}",
+                Self::POSITION_AXES,
+                text.rope
+            )));
+        }
+        let config = Self {
+            text,
+            vision: VisionConfig::parse(&values.object("vision_config")?)?,
+            image_token_id: values.index("image_token_id")?,
+            video_token_id: values.index("video_token_id")?,
+        };
+        for token in [config.image_token_id, config.video_token_id] {
+            if token >= config.text.vocab_size {
+                return Err(Error::Config(format!(
+                    "vision placeholder {token} is outside the {} entry vocabulary",
+                    config.text.vocab_size
+                )));
+            }
+        }
+        // The tower's merged tokens replace placeholder rows of the language model.
+        if config.vision.out_hidden_size != config.text.hidden_size {
+            return Err(Error::Config(format!(
+                "vision tokens are {} wide and the language model {}",
+                config.vision.out_hidden_size, config.text.hidden_size
+            )));
+        }
+        Ok(config)
+    }
+}
+
+/// A released Qwen3-VL checkpoint's configuration, as this crate's tests read it.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use super::*;
+
+    /// [`vl`], read.
+    pub(crate) fn released() -> VlConfig {
+        VlConfig::parse(&Fields::of("config.json", &vl()).expect("an object"))
+            .expect("the released configuration")
+    }
+
+    /// The configuration, trimmed to the fields the family reads.
+    pub(crate) fn vl() -> serde_json::Value {
+        serde_json::json!({
+            "image_token_id": 151655,
+            "video_token_id": 151656,
+            "tie_word_embeddings": false,
+            "text_config": {
+                "attention_bias": false,
+                "head_dim": 128,
+                "hidden_act": "silu",
+                "hidden_size": 5120,
+                "intermediate_size": 25600,
+                "max_position_embeddings": 262144,
+                "num_attention_heads": 64,
+                "num_hidden_layers": 64,
+                "num_key_value_heads": 8,
+                "rms_norm_eps": 1e-06,
+                "rope_scaling": {
+                    "mrope_interleaved": true,
+                    "mrope_section": [24, 20, 20],
+                    "rope_type": "default"
+                },
+                "rope_theta": 5000000,
+                "vocab_size": 151936
+            },
+            "vision_config": {
+                "deepstack_visual_indexes": [8, 16, 24],
+                "depth": 27,
+                "hidden_act": "gelu_pytorch_tanh",
+                "hidden_size": 1152,
+                "in_channels": 3,
+                "intermediate_size": 4304,
+                "num_heads": 16,
+                "num_position_embeddings": 2304,
+                "out_hidden_size": 5120,
+                "patch_size": 16,
+                "spatial_merge_size": 2,
+                "temporal_patch_size": 2
+            }
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::fixtures::vl;
     use super::*;
+
+    fn parse_vl(value: &serde_json::Value) -> Result<VlConfig> {
+        VlConfig::parse(&Fields::of("config.json", value)?)
+    }
+
+    #[test]
+    fn a_vl_checkpoint_reads_its_dimensions_and_an_fp32_mrope_spectrum() {
+        let config = parse_vl(&vl()).expect("parsed");
+        assert_eq!(config.text.hidden_size, 5120);
+        assert_eq!(config.text.num_hidden_layers, 64);
+        assert_eq!(config.text.num_key_value_heads * config.text.head_dim, 1024);
+        let Spectrum::Sectioned {
+            sections,
+            precision,
+            ..
+        } = config.text.rope
+        else {
+            panic!("an M-RoPE spectrum, not {:?}", config.text.rope);
+        };
+        assert_eq!(sections.widths(), [24, 20, 20]);
+        assert_eq!(precision, Precision::F32);
+        assert_eq!(config.vision.depth, 27);
+        assert_eq!(config.vision.deepstack_visual_indexes, vec![8, 16, 24]);
+        // The checkpoint's widths count frequencies and the operator's count rotated elements;
+        // the device's assignment names one axis per compact frequency.
+        let widths: Vec<u32> = sections.widths().iter().map(|width| width * 2).collect();
+        assert_eq!(
+            ops::rope::interleaved_axes(&widths).len(),
+            (config.text.head_dim / 2) as usize
+        );
+        let frequencies = config.text.rope.inverse_frequencies().expect("the recipe");
+        assert_eq!(frequencies.len(), config.text.head_dim as usize / 2);
+        assert_eq!(frequencies[0], 1.0);
+        assert!(frequencies[63] < frequencies[0]);
+    }
+
+    #[test]
+    fn a_vl_checkpoint_refuses_mrope_sections_that_do_not_split_a_head() {
+        let mut values = vl();
+        values["text_config"]["rope_scaling"]["mrope_section"] = serde_json::json!([24, 20, 19]);
+        let error = parse_vl(&values).expect_err("sections");
+        assert!(
+            matches!(error, Error::Config(ref problem) if problem.contains("M-RoPE")),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_vl_checkpoint_refuses_a_rope_that_is_not_interleaved_mrope() {
+        let mut plain = vl();
+        plain["text_config"]["rope_scaling"] = serde_json::json!({"rope_type": "default"});
+        assert!(parse_vl(&plain).is_err());
+        let mut contiguous = vl();
+        contiguous["text_config"]["rope_scaling"]["mrope_interleaved"] = serde_json::json!(false);
+        assert!(parse_vl(&contiguous).is_err());
+    }
+
+    #[test]
+    fn a_vision_tower_refuses_a_position_table_that_is_not_square_and_blocks_outside_it() {
+        let mut table = vl();
+        table["vision_config"]["num_position_embeddings"] = serde_json::json!(2305);
+        assert!(parse_vl(&table).is_err());
+
+        let mut blocks = vl();
+        blocks["vision_config"]["deepstack_visual_indexes"] = serde_json::json!([8, 16, 27]);
+        assert!(parse_vl(&blocks).is_err());
+
+        let mut repeated = vl();
+        repeated["vision_config"]["deepstack_visual_indexes"] = serde_json::json!([8, 8]);
+        assert!(parse_vl(&repeated).is_err());
+    }
+
+    #[test]
+    fn merged_tokens_must_be_the_language_models_width() {
+        let mut values = vl();
+        values["vision_config"]["out_hidden_size"] = serde_json::json!(4096);
+        assert!(parse_vl(&values).is_err());
+    }
 
     /// The metadata of a Qwen3-30B-A3B checkpoint parses to the published architecture.
     #[test]

@@ -14,8 +14,7 @@ use ops::DType;
 use ops::TensorView;
 use ops::position::{Descriptor, PositionInterpolate as PositionInterpolateOp};
 
-use crate::error::{Error, Result};
-use crate::forward::Forward;
+use nn::{Error, Forward, Result};
 
 /// Elements one thread block handles.
 const BLOCK: u32 = 1024;

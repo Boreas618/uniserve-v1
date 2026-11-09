@@ -12,6 +12,7 @@ publish = false
 nn = { path = "../../nn" }
 ops = { path = "../../ops" }
 processing.workspace = true
+qwen3.workspace = true
 proto.workspace = true
 thiserror.workspace = true
 serde.workspace = true

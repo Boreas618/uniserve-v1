@@ -198,7 +198,7 @@ impl VideoModel for H3Pipeline {
     }
 
     fn text_width(&self) -> u32 {
-        self.config.text_encoder.hidden_size
+        self.config.text_encoder.text.hidden_size
     }
 
     fn denoiser(&self) -> Option<Arc<dyn nn::Denoiser + Send + Sync>> {

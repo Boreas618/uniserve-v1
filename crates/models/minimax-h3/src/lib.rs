@@ -46,7 +46,6 @@ pub mod modulation;
 pub mod output;
 pub mod packing;
 pub mod partition;
-pub mod positions;
 pub mod processing;
 pub mod schedule;
 pub mod solver;
@@ -55,7 +54,6 @@ pub mod text_encoder;
 pub mod tiled_encode;
 pub mod transformer;
 pub mod video_vae;
-pub mod vision;
 
 pub use checkpoint::{
     AttentionBackend, Contract, ContractSchedule, Dit, Layout, Sidecars, SparseContract,
@@ -65,7 +63,7 @@ pub use config::{
     AudioVaeConfig, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, CLIP_FRAMES, CLIP_LATENTS, Canvas, Config,
     DROPPED_LATENTS, DenoiserConfig, FPS, NAMED_ASPECT_RATIOS, NAMED_CANVASES, NUM_TRAIN_TIMESTEPS,
     PixelConfig, RETAINED_LAYERS, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
-    TextEncoderConfig, TransformerConfig, UNIFORM_GRID_POINTS, VideoVaeConfig, VisionConfig,
+    TransformerConfig, UNIFORM_GRID_POINTS, VideoVaeConfig,
 };
 
 pub use load::load;
@@ -106,6 +104,13 @@ impl Error {
     /// A checkpoint whose layout or files this crate cannot open.
     pub(crate) fn checkpoint(problem: impl Into<String>) -> Self {
         Self::Checkpoint(problem.into())
+    }
+}
+
+impl From<qwen3::Error> for Error {
+    /// A refusal of the Qwen3 family this crate composes, as the shared library reports it.
+    fn from(error: qwen3::Error) -> Self {
+        Self::Nn(error.into())
     }
 }
 

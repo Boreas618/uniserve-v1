@@ -11,7 +11,7 @@
 //! ## What the request decides, and where it enters
 //!
 //! Every value a request decides enters as a device table the encoder runner prepared on the host
-//! from the request's grids ([`crate::positions`]): the position table's four row
+//! from the request's grids ([`super::positions`]): the position table's four row
 //! indices and FP32 weights per patch, the 2-D rotary cosine and sine per patch, and the attention
 //! lengths of the grid's time steps. Attention never crosses a time step - each temporal patch of a
 //! grid is one bidirectional sequence of `height * width` patches - so those lengths are both the
@@ -25,7 +25,7 @@
 //! over a `[patches, 2]` position. That is
 //! neither the contiguous nor the interleaved M-RoPE cut, both of which give each axis its own band
 //! of frequencies, so the factors are the runner's tables and
-//! [`crate::positions::VisionRotary::factors`] computes them in the reference's FP32 formulas over the
+//! [`super::positions::VisionRotary::factors`] computes them in the reference's FP32 formulas over the
 //! tower's [`spectrum`].
 //!
 //! ## Precision
@@ -54,15 +54,14 @@ use nn::blocks::{AttentionKind, Keys, QkNormNames, QkvAttention, QkvAttentionSpe
 use nn::capability::ImageInput;
 use nn::family::Split;
 use nn::layers::{
-    Bias, Gelu, LayerNorm, Linear, Parallel, PositionInterpolate, Precision, QkNorm, QkvBias,
-    QkvNames, QkvSpec, Residual, Rotary, RotarySpec, Spectrum, Varlen,
+    Bias, Gelu, LayerNorm, Linear, Parallel, Precision, QkNorm, QkvBias, QkvNames, QkvSpec,
+    Residual, Rotary, RotarySpec, Spectrum, Varlen,
 };
 use nn::weights::{Scope, WeightLoader};
-use nn::{Arena, Forward, Shape, TensorView, Weight};
+use nn::{Arena, Error, Forward, Result, Shape, TensorView, Weight};
 
+use super::interpolate::PositionInterpolate;
 use crate::config::VisionConfig;
-use crate::positions::invalid;
-use crate::{Error, Result};
 
 /// Every normalization of the tower's variance floor: `LAYER_NORM_EPS` in the reference.
 const LAYER_NORM_EPS: f32 = 1e-6;
@@ -81,7 +80,7 @@ const ROTARY_AXES: u32 = 2;
 pub fn spectrum(config: &VisionConfig) -> Result<Spectrum> {
     let head_dim = BlockRows::head_dim(config)?;
     if !head_dim.is_multiple_of(4) {
-        return Err(invalid(
+        return Err(Error::shape(
             "VisionTower",
             format!("a {head_dim}-element head does not split into two even rotary halves"),
         ));
@@ -94,7 +93,7 @@ pub fn spectrum(config: &VisionConfig) -> Result<Spectrum> {
     })
 }
 
-/// The checkpoint's tensor names under the text encoder's component.
+/// The checkpoint's module path of the vision tower.
 const PREFIX: &str = "model.visual";
 
 /// One image block's row counts, as its forward and its tables see them.
@@ -126,13 +125,13 @@ impl BlockRows {
         let [time, height, width] = grid;
         let merge = config.spatial_merge_size;
         if time == 0 || height == 0 || width == 0 {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!("the grid {grid:?} has an empty side"),
             ));
         }
         if !height.is_multiple_of(merge) || !width.is_multiple_of(merge) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!("the grid {height}x{width} is not whole {merge}x{merge} merge blocks"),
             ));
@@ -143,13 +142,13 @@ impl BlockRows {
         let patches = u64::from(time) * u64::from(height) * u64::from(width);
         let sequence = u64::from(height) * u64::from(width);
         let patches = u32::try_from(patches).map_err(|_| {
-            invalid(
+            Error::shape(
                 "VisionTower",
                 format!("the grid {grid:?} holds more patches than a u32 counts"),
             )
         })?;
         let sequence = u32::try_from(sequence)
-            .map_err(|_| invalid("VisionTower", "an attention sequence longer than a u32"))?;
+            .map_err(|_| Error::shape("VisionTower", "an attention sequence longer than a u32"))?;
         Ok(Self {
             time,
             patches,
@@ -166,20 +165,20 @@ impl BlockRows {
     pub fn of_counts(config: &VisionConfig, patches: u32, time: u32) -> Result<Self> {
         let merge = config.spatial_merge_size;
         if time == 0 || patches == 0 {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!("a block of {patches} patches over {time} time steps"),
             ));
         }
         if !patches.is_multiple_of(time) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!("{patches} patches do not spread over {time} time steps"),
             ));
         }
         let sequence = patches / time;
         if !sequence.is_multiple_of(merge * merge) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!(
                     "a time step of {sequence} patches is not whole {merge}x{merge} merge blocks"
@@ -210,7 +209,7 @@ impl BlockRows {
     /// the head count.
     pub fn head_dim(config: &VisionConfig) -> Result<u32> {
         if config.num_heads == 0 || !config.hidden_size.is_multiple_of(config.num_heads) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!(
                     "{} heads do not split the {} element hidden state",
@@ -228,9 +227,9 @@ impl BlockRows {
                 .sqrt()
                 .round() as u64,
         )
-        .map_err(|_| invalid("VisionTower", "a position grid wider than a u32"))?;
+        .map_err(|_| Error::shape("VisionTower", "a position grid wider than a u32"))?;
         if u64::from(side) * u64::from(side) != u64::from(config.num_position_embeddings) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!(
                     "the {} entry position table is not a square grid",
@@ -252,13 +251,13 @@ fn deepstack_layers(config: &VisionConfig) -> Result<Vec<usize>> {
     let mut layers: Vec<usize> = Vec::with_capacity(config.deepstack_visual_indexes.len());
     for &index in &config.deepstack_visual_indexes {
         if u64::from(index) >= u64::from(config.depth) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!("DeepStack block {index} of a {} block tower", config.depth),
             ));
         }
         if layers.last().is_some_and(|last| *last >= index as usize) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!(
                     "the DeepStack blocks {:?} are not increasing",
@@ -313,9 +312,7 @@ impl Buffers {
         let merge = u64::from(config.spatial_merge_size);
         let blocks = rows / (merge * merge);
         let width = u64::from(BlockRows::merged_width(config));
-        let reserve = |shape: Shape| -> Result<TensorView> {
-            arena.tensor(dtype, shape).map_err(Error::from)
-        };
+        let reserve = |shape: Shape| -> Result<TensorView> { arena.tensor(dtype, shape) };
         Ok(Self {
             hidden: reserve(Shape::new(&[rows, hidden]))?,
             normalized: reserve(Shape::new(&[rows, hidden]))?,
@@ -365,7 +362,7 @@ impl ImageTables {
         tables: &[TensorView],
     ) -> Result<Self> {
         let [position_index, position_weight, cosine, sine, lengths] = tables else {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!(
                     "{} prepared tables for one image, five expected",
@@ -474,8 +471,7 @@ impl Block {
         let hidden = buffers.hidden;
 
         self.input_norm
-            .forward(f, hidden, None, buffers.normalized)
-            .map_err(Error::from)?;
+            .forward(f, hidden, None, buffers.normalized)?;
         // Both projections rotate by the patch's own 2-D factors; nothing normalizes them. One
         // sequence per time step, packed in one launch: the key bound is every step together and
         // the longest query run is one step, so a video block of several steps launches as an
@@ -495,25 +491,18 @@ impl Block {
             .forward(f, buffers.normalized, Some(rope), keys, buffers.projected)?;
         tower
             .residual
-            .forward(f, hidden, buffers.projected, None, hidden)
-            .map_err(Error::from)?;
+            .forward(f, hidden, buffers.projected, None, hidden)?;
 
         self.output_norm
-            .forward(f, hidden, None, buffers.normalized)
-            .map_err(Error::from)?;
-        self.first
-            .forward(f, buffers.normalized, buffers.gate)
-            .map_err(Error::from)?;
+            .forward(f, hidden, None, buffers.normalized)?;
+        self.first.forward(f, buffers.normalized, buffers.gate)?;
         tower
             .blocks_gelu
             .forward(f, buffers.gate, buffers.activated)?;
-        self.second
-            .forward(f, buffers.activated, buffers.down)
-            .map_err(Error::from)?;
+        self.second.forward(f, buffers.activated, buffers.down)?;
         tower
             .residual
             .forward(f, hidden, buffers.down, None, hidden)
-            .map_err(Error::from)
     }
 }
 
@@ -523,7 +512,7 @@ impl Block {
 /// difference as `normalize_merged`: the final merger normalizes each patch *before* the
 /// concatenation (`normalize_merged = false`), a DeepStack merger normalizes the concatenated row
 /// (`true`).
-struct Merger {
+struct PatchMerger {
     norm: LayerNorm,
     first: Linear,
     second: Linear,
@@ -533,7 +522,7 @@ struct Merger {
     normalizes_merged: bool,
 }
 
-impl Merger {
+impl PatchMerger {
     /// The merger the module at `scope` states.
     fn load(
         scope: &mut Scope<'_, '_>,
@@ -582,14 +571,14 @@ impl Merger {
         let rows = hidden.rows();
         let block = u64::from(self.merge) * u64::from(self.merge);
         if !rows.is_multiple_of(block) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!("{rows} patch rows are not whole {block}-patch merge blocks"),
             ));
         }
         let merged = Shape::new(&[rows / block, u64::from(self.width)]);
         if out.rows() != merged.dim(0) || out.last() != u64::from(self.out_hidden) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!(
                     "a merger writes {} rows of {} but the output is {} rows of {}",
@@ -604,26 +593,20 @@ impl Merger {
         // The variants differ in whether the rows are concatenated before the normalization or
         // after it; the normalized values are `[blocks, width]` either way.
         if self.normalizes_merged {
-            self.norm
-                .forward(
-                    f,
-                    hidden.reshape(merged),
-                    None,
-                    buffers.normalized.reshape(merged),
-                )
-                .map_err(Error::from)?;
-        } else {
-            self.norm
-                .forward(f, hidden, None, buffers.normalized)
-                .map_err(Error::from)?;
-        }
-        self.first
-            .forward(
+            self.norm.forward(
                 f,
+                hidden.reshape(merged),
+                None,
                 buffers.normalized.reshape(merged),
-                buffers.merged.reshape(merged),
-            )
-            .map_err(Error::from)?;
+            )?;
+        } else {
+            self.norm.forward(f, hidden, None, buffers.normalized)?;
+        }
+        self.first.forward(
+            f,
+            buffers.normalized.reshape(merged),
+            buffers.merged.reshape(merged),
+        )?;
         tower.merger_gelu.forward(
             f,
             buffers.merged.reshape(merged),
@@ -631,11 +614,10 @@ impl Merger {
         )?;
         self.second
             .forward(f, buffers.merged_activated.reshape(merged), out)
-            .map_err(Error::from)
     }
 }
 
-/// The vision tower of the Qwen3-VL text encoder.
+/// The Qwen3-VL vision tower.
 pub struct VisionTower {
     config: VisionConfig,
     dtype: nn::DType,
@@ -648,8 +630,8 @@ pub struct VisionTower {
     layers: Vec<Block>,
     /// The layers whose hidden state a DeepStack merger reads, in checkpoint order.
     deepstack_layers: Vec<usize>,
-    merger: Merger,
-    deepstack: Vec<Merger>,
+    merger: PatchMerger,
+    deepstack: Vec<PatchMerger>,
     blocks_gelu: Gelu,
     merger_gelu: Gelu,
     residual: Residual,
@@ -671,7 +653,7 @@ impl VisionTower {
         let blocks_gelu = match config.hidden_act {
             ops::activation::Activation::GeluTanh => Gelu::tanh(),
             other => {
-                return Err(Error::config(format!(
+                return Err(Error::Unsupported(format!(
                     "the vision tower gates with gelu_pytorch_tanh, not {other}"
                 )));
             }
@@ -687,7 +669,7 @@ impl VisionTower {
             .collect::<Result<Vec<_>>>()?;
         let deepstack = (0..config.deepstack_visual_indexes.len())
             .map(|index| {
-                Merger::load(
+                PatchMerger::load(
                     &mut tower.scope(format!("deepstack_merger_list.{index}")),
                     config,
                     true,
@@ -699,7 +681,7 @@ impl VisionTower {
         let patch = Linear::load(
             &mut tower.scope("patch_embed.proj"),
             u32::try_from(tubelet)
-                .map_err(|_| invalid("VisionTower", "a tubelet wider than a u32"))?,
+                .map_err(|_| Error::shape("VisionTower", "a tubelet wider than a u32"))?,
             config.hidden_size,
             Bias::Present,
             Parallel::None,
@@ -708,7 +690,7 @@ impl VisionTower {
             "weight",
             &[u64::from(config.num_position_embeddings), hidden],
         )?;
-        let merger = Merger::load(&mut tower.scope("merger"), config, false)?;
+        let merger = PatchMerger::load(&mut tower.scope("merger"), config, false)?;
         // The factor tables are the runner's host tables (`positions::VisionRotary`), so the
         // rotation publishes no spectrum.
         let rotary = Rotary::new(
@@ -764,7 +746,7 @@ impl VisionTower {
     ) -> Result<()> {
         let rows = image.rows;
         if out.deepstack.len() != self.deepstack.len() {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!(
                     "{} DeepStack outputs for a checkpoint that names {}",
@@ -777,9 +759,7 @@ impl VisionTower {
 
         // The patch embedding reads the tubelets the processor packed; the position blend is added
         // into the same rows, and the residual stream starts there.
-        self.patch
-            .forward(f, image.pixels, buffers.hidden)
-            .map_err(Error::from)?;
+        self.patch.forward(f, image.pixels, buffers.hidden)?;
         // The resample reads the request's own tables and only counts output points, so the
         // descriptor names the learned side and the point count. The block's two spatial extents
         // exist on the host (`positions::position_samples`) and nowhere in a captured call: a model
@@ -788,19 +768,16 @@ impl VisionTower {
             self.dtype,
             u64::from(self.config.hidden_size),
             self.position_grid,
-        )
-        .map_err(Error::from)?
+        )?
         .forward(
             f,
             self.position.view(),
             image.position_index,
             image.position_weight,
             buffers.normalized,
-        )
-        .map_err(Error::from)?;
+        )?;
         self.residual
-            .forward(f, buffers.hidden, buffers.normalized, None, buffers.hidden)
-            .map_err(Error::from)?;
+            .forward(f, buffers.hidden, buffers.normalized, None, buffers.hidden)?;
 
         let mut next = 0;
         for (index, block) in self.layers.iter().enumerate() {
@@ -857,7 +834,7 @@ impl VisionTower {
         ];
         for (name, view, shape) in tables {
             if view.shape != shape {
-                return Err(invalid(
+                return Err(Error::shape(
                     "VisionTower",
                     format!(
                         "the {name} table is {:?} for a {}-patch block over {} time steps, \
@@ -871,7 +848,7 @@ impl VisionTower {
         }
         for deepstack in out.deepstack {
             if deepstack.shape != Shape::new(&[merged, out_hidden]) {
-                return Err(invalid(
+                return Err(Error::shape(
                     "VisionTower",
                     format!(
                         "a DeepStack output is {:?} for a {}-patch block, [{merged}, {out_hidden}] \
@@ -884,7 +861,7 @@ impl VisionTower {
         }
         let lengths = u64::from(rows.time) + 1;
         if image.lengths.numel() != lengths {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!(
                     "{} attention lengths for {} time steps",
@@ -894,7 +871,7 @@ impl VisionTower {
             ));
         }
         if image.cosine.dtype != nn::DType::F32 || image.sine.dtype != nn::DType::F32 {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 "the rotary factors are FP32".to_owned(),
             ));
@@ -904,7 +881,7 @@ impl VisionTower {
             || buffers.merged.rows() != merged
             || buffers.merged.last() != width
         {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionTower",
                 format!(
                     "the block's buffers hold {} rows of {} and {} merged rows of {}, a {} row \
@@ -928,9 +905,7 @@ mod tests {
 
     /// The released vision tower's configuration.
     fn config() -> VisionConfig {
-        crate::config::tests_support::released_config()
-            .text_encoder
-            .vision
+        crate::config::fixtures::released().vision
     }
 
     #[test]

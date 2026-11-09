@@ -1,6 +1,6 @@
 [package]
 name = "qwen3"
-description = "The Qwen3 family: its configurations, decoder layer and stack, Qwen3MoeForCausalLM and the Qwen3 chat profile"
+description = "The Qwen3 family: its configurations, decoder layer and stack, Qwen3MoeForCausalLM, the Qwen3-VL model and vision tower, and the Qwen3 chat profile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

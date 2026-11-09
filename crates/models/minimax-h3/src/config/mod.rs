@@ -43,7 +43,7 @@ pub use denoiser::{
     AttentionKind, DenoiserConfig, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
     TransformerConfig,
 };
-pub use text::{PixelConfig, RETAINED_LAYERS, TextEncoderConfig, VisionConfig};
+pub use text::{PixelConfig, RETAINED_LAYERS};
 pub use video_vae::VideoVaeConfig;
 
 use crate::checkpoint::{ContractSchedule, Dit, Layout, Sidecars};
@@ -97,7 +97,9 @@ pub const UNIFORM_GRID_POINTS: u32 = 50;
 #[derive(Clone, PartialEq, Debug)]
 pub struct Config {
     /// The Qwen3-VL text encoder that conditions a request.
-    pub text_encoder: TextEncoderConfig,
+    pub text_encoder: qwen3::VlConfig,
+    /// The pixel normalization the text encoder's processor applies.
+    pub pixels: PixelConfig,
     /// Each DiT partition the checkpoint holds, by network.
     pub denoisers: BTreeMap<Dit, DenoiserConfig>,
     /// The video VAE: the decoder every task uses and the encoder `ref2va` uses.
@@ -129,7 +131,11 @@ impl Config {
     /// timeline the packing assumes, the sparse attention against its tile shapes - so no layer
     /// below sees a value it cannot use.
     pub fn normalize(layout: &Layout, sidecars: &Sidecars) -> Result<Self> {
-        let text_encoder = TextEncoderConfig::parse(&sidecars.text_encoder, &sidecars.processor)?;
+        let text_encoder = text::text_encoder(&sidecars.text_encoder)?;
+        let pixels = PixelConfig::parse(&Fields::of(
+            "processor/preprocessor_config.json",
+            &sidecars.processor,
+        )?)?;
         let processor = sidecars
             .video_processor
             .as_ref()
@@ -205,6 +211,7 @@ impl Config {
 
         let config = Self {
             text_encoder,
+            pixels,
             denoisers,
             video_vae,
             audio_vae,
@@ -285,10 +292,10 @@ impl Config {
         // Each DiT's latent widths and conditioning width are the VAEs' and the text encoder's.
         for (dit, denoiser) in &self.denoisers {
             let transformer = &denoiser.transformer;
-            if self.text_encoder.hidden_size != transformer.text_dim {
+            if self.text_encoder.text.hidden_size != transformer.text_dim {
                 return Err(Error::config(format!(
                     "H3 text features are {} wide and the {} DiT conditions on {}",
-                    self.text_encoder.hidden_size,
+                    self.text_encoder.text.hidden_size,
                     dit.directory(),
                     transformer.text_dim
                 )));

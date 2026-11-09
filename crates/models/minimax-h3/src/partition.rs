@@ -12,7 +12,7 @@
 //! reads only the degree and the rank's position in it.
 
 use crate::VideoTask;
-use nn::family::Projection;
+use nn::family::{Projection, Split};
 
 use crate::checkpoint::TASK_DITS;
 use crate::denoiser::Arrangement;
@@ -630,20 +630,7 @@ impl Partition {
                 )));
             }
         }
-        let text = &config.text_encoder;
-        if !(text.num_attention_heads as usize).is_multiple_of(self.tensor_parallel) {
-            return Err(Error::config(format!(
-                "the tensor-parallel degree {} does not divide the text encoder's {} query heads",
-                self.tensor_parallel, text.num_attention_heads
-            )));
-        }
-        if !(text.num_key_value_heads as usize).is_multiple_of(self.tensor_parallel) {
-            return Err(Error::config(format!(
-                "the tensor-parallel degree {} does not divide the text encoder's {} key/value \
-                 heads",
-                self.tensor_parallel, text.num_key_value_heads
-            )));
-        }
+        config.text_encoder.text.local_heads(self.text_split()?)?;
         Ok(())
     }
 
@@ -652,14 +639,16 @@ impl Partition {
         heads / self.ulysses_degree as u32
     }
 
-    /// The query heads one tensor-parallel rank of the text encoder holds.
-    pub const fn text_query_heads(&self, config: &Config) -> u32 {
-        config.text_encoder.num_attention_heads / self.tensor_parallel as u32
-    }
-
-    /// The key/value heads one tensor-parallel rank of the text encoder holds.
-    pub const fn text_key_value_heads(&self, config: &Config) -> u32 {
-        config.text_encoder.num_key_value_heads / self.tensor_parallel as u32
+    /// The text encoder's tensor-parallel split: this rank's place in its group.
+    pub fn text_split(&self) -> Result<Split> {
+        let count = |value: usize, what: &str| {
+            u32::try_from(value)
+                .map_err(|_| Error::config(format!("a tensor-parallel {what} wider than a u32")))
+        };
+        Ok(Split {
+            size: count(self.tensor_parallel, "degree")?,
+            rank: count(self.tensor_rank, "rank")?,
+        })
     }
 }
 
@@ -750,8 +739,13 @@ mod tests {
         let partition = Partition::single();
         partition.validate(&config).expect("one rank");
         assert_eq!(partition.denoiser_heads(56), 56);
-        assert_eq!(partition.text_query_heads(&config), 64);
-        assert_eq!(partition.text_key_value_heads(&config), 8);
+        let split = partition.text_split().expect("a split");
+        let heads = config
+            .text_encoder
+            .text
+            .local_heads(split)
+            .expect("the heads");
+        assert_eq!(heads, (64, 8));
         // One rank holds every component of a base deployment, and one denoiser: the task's. A
         // `ref2va` deployment places `TransformerRef` instead.
         assert!(partition.blocks.contains(Component::Transformer));
@@ -764,8 +758,13 @@ mod tests {
         let config = config();
         let partition = Partition::new(&config, 4, 4, 2, 0).expect("four ranks");
         assert_eq!(partition.denoiser_heads(56), 14);
-        assert_eq!(partition.text_query_heads(&config), 16);
-        assert_eq!(partition.text_key_value_heads(&config), 2);
+        let split = partition.text_split().expect("a split");
+        let heads = config
+            .text_encoder
+            .text
+            .local_heads(split)
+            .expect("the heads");
+        assert_eq!(heads, (16, 2));
     }
 
     #[test]
@@ -808,8 +807,11 @@ mod tests {
         );
         let error =
             Partition::new(&config, 1, 3, 0, 0).expect_err("three does not divide 64 heads");
+        // The text encoder's stack states its own divisibility rule.
         assert!(
-            matches!(error, Error::Config(ref problem) if problem.contains("query heads")),
+            error
+                .to_string()
+                .contains("does not divide 64 attention heads"),
             "{error}"
         );
         let error = Partition::new(&config, 1, 1, 1, 0).expect_err("rank outside the degree");

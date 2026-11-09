@@ -1,15 +1,15 @@
-//! The host-side position tables of the text encoder and its vision tower.
+//! The host-side position tables of the Qwen3-VL language model and its vision tower.
 //!
 //! Every table here is a function of the *request*, not of a step: the prompt's token ids and the
-//! grids of its condition media decide them once, before the encode is captured or replayed. The
-//! worker's encoder runner calls these functions when it prepares a request and uploads the results
-//! into the views [`crate::text_encoder`] reads; the model crate itself owns no device storage and
+//! grids of its media decide them once, before the encode is captured or replayed. The worker's
+//! encoder runner calls these functions when it prepares a request and uploads the results into the
+//! views [`crate::vl::Qwen3VlModel`] reads; the model crate itself owns no device storage and
 //! copies nothing (`AGENTS.md`, Model Library Boundary).
 //!
 //! Four kinds of table are derived:
 //!
 //! - the language layers' interleaved M-RoPE coordinates ([`rope_index`]), whose factors the device
-//!   computes from the uploaded positions under the text encoder's sectioned spectrum;
+//!   computes from the uploaded positions under the language model's sectioned spectrum;
 //! - the vision tower's 2-D rotary coordinates of a patch grid in merge-block order
 //!   ([`rotary_coordinates`]) and their factors ([`VisionRotary::factors`]);
 //! - the learned position table's bilinear sample of each merged patch ([`position_samples`]), the
@@ -22,7 +22,7 @@
 //! positions as integers, and the position table's sample coordinates on an FP32 `linspace` whose
 //! step is computed in FP32 (`torch.linspace` over a float32 scalar type).
 
-use crate::{Error, Result};
+use nn::{Error, Result};
 
 /// The table rows one bilinear sample reads: four, the corners of one cell.
 pub const POSITION_TAPS: u64 = 4;
@@ -51,7 +51,7 @@ impl VisionRotary {
     /// The 2-D rotation of a `head_dim`-element head.
     pub fn new(head_dim: u32) -> Result<Self> {
         if !head_dim.is_multiple_of(4) {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionRotary",
                 format!("a {head_dim}-element head does not split into two even rotary halves"),
             ));
@@ -79,7 +79,7 @@ impl VisionRotary {
         let columns = (self.head_dim / 2) as usize;
         let per_axis = columns / 2;
         if frequencies.len() != columns {
-            return Err(invalid(
+            return Err(Error::shape(
                 "VisionRotary::factors",
                 format!(
                     "{} frequencies for the {columns} rotated pairs of a {}-element head",
@@ -129,7 +129,10 @@ pub fn rope_index(
     merge: u32,
 ) -> Result<Vec<[i64; 3]>> {
     if merge == 0 {
-        return Err(invalid("rope_index", "the merge side must be positive"));
+        return Err(Error::shape(
+            "rope_index",
+            "the merge side must be positive",
+        ));
     }
     // A video contributes one single-step grid per temporal patch.
     let mut images = image_grids.iter().copied();
@@ -177,7 +180,7 @@ pub fn rope_index(
                 videos.next()
             };
             let grid = grid.ok_or_else(|| {
-                invalid(
+                Error::shape(
                     "rope_index",
                     format!(
                         "the placeholder run at token {index} has no {}grid",
@@ -187,7 +190,7 @@ pub fn rope_index(
             })?;
             let [time, height, width] = grid;
             if height % merge != 0 || width % merge != 0 {
-                return Err(invalid(
+                return Err(Error::shape(
                     "rope_index",
                     format!("the vision grid {grid:?} is not whole {merge}-patch blocks"),
                 ));
@@ -195,7 +198,7 @@ pub fn rope_index(
             let rows = height / merge;
             let columns = width / merge;
             if run != time * rows * columns {
-                return Err(invalid(
+                return Err(Error::shape(
                     "rope_index",
                     format!(
                         "the placeholder run at token {index} holds {run} tokens, the grid \
@@ -221,12 +224,114 @@ pub fn rope_index(
         index = stop;
     }
     if images.next().is_some() || videos.next().is_some() {
-        return Err(invalid(
+        return Err(Error::shape(
             "rope_index",
             "a vision grid has no placeholder run".to_owned(),
         ));
     }
     Ok(positions)
+}
+
+/// The grids [`rope_index`] reads: one list per placeholder kind, in prompt order.
+pub type GridRuns = (Vec<[u32; 3]>, Vec<[u32; 3]>);
+
+/// The two grid lists [`rope_index`] reads, one entry per vision placeholder run of `ids`.
+///
+/// A vision grid reaches `rope_index` in the shape the prompt presents it: an image block is one
+/// run of `time · rows · columns` placeholders under its whole grid, a video block is one run per
+/// temporal patch, each of `rows · columns` placeholders on a single time step. The run lengths are
+/// what tells the two apart, and the grids arrive in the prompt's block order.
+pub fn run_grids(
+    ids: &[u32],
+    grids: &[[u32; 3]],
+    image_token_id: u32,
+    video_token_id: u32,
+    merge: u32,
+) -> Result<GridRuns> {
+    if merge == 0 {
+        return Err(Error::shape("run_grids", "the merge side must be positive"));
+    }
+    // The prompt's vision runs, in order: which placeholder they hold and how many.
+    let mut runs: Vec<(u32, u64)> = Vec::new();
+    let mut row = 0;
+    while row < ids.len() {
+        let id = ids[row];
+        if id != image_token_id && id != video_token_id {
+            row += 1;
+            continue;
+        }
+        let start = row;
+        while row < ids.len() && ids[row] == id {
+            row += 1;
+        }
+        runs.push((id, (row - start) as u64));
+    }
+
+    let mut images = Vec::with_capacity(grids.len());
+    let mut videos = Vec::new();
+    let mut next = 0_usize;
+    for &grid in grids {
+        let [time, height, width] = grid;
+        if height % merge != 0 || width % merge != 0 {
+            return Err(Error::shape(
+                "run_grids",
+                format!(
+                    "the vision grid {grid:?} does not hold whole {merge}x{merge} merge blocks"
+                ),
+            ));
+        }
+        let step = u64::from(height / merge) * u64::from(width / merge);
+        let Some(&(id, run)) = runs.get(next) else {
+            return Err(Error::shape(
+                "run_grids",
+                format!("the vision grid {grid:?} has no placeholder run"),
+            ));
+        };
+        if id == image_token_id {
+            if run != step * u64::from(time) {
+                return Err(Error::shape(
+                    "run_grids",
+                    format!(
+                        "an image run of {run} placeholders for a {grid:?} grid of {}",
+                        step * u64::from(time)
+                    ),
+                ));
+            }
+            images.push(grid);
+            next += 1;
+            continue;
+        }
+        for _ in 0..time {
+            let Some(&(id, run)) = runs.get(next) else {
+                return Err(Error::shape(
+                    "run_grids",
+                    format!("the video grid {grid:?} has fewer than {time} placeholder runs"),
+                ));
+            };
+            if id != video_token_id || run != step {
+                return Err(Error::shape(
+                    "run_grids",
+                    format!(
+                        "a video run of {run} placeholders of type {id} for one {height}x{width} \
+                         time step of {step}"
+                    ),
+                ));
+            }
+            videos.push([1, height, width]);
+            next += 1;
+        }
+    }
+    if next != runs.len() {
+        return Err(Error::shape(
+            "run_grids",
+            format!(
+                "{} vision placeholder runs for {} grids",
+                runs.len() - next,
+                grids.len()
+            ),
+        ));
+    }
+    Ok((images, videos))
 }
 
 /// The prompt position of every merged vision row, in prompt order.
@@ -255,7 +360,7 @@ pub fn merged_coordinates(height: u32, width: u32, merge: u32) -> Result<(Vec<u3
         || !height.is_multiple_of(merge)
         || !width.is_multiple_of(merge)
     {
-        return Err(invalid(
+        return Err(Error::shape(
             "merged_coordinates",
             format!("a {height}x{width} patch grid is not whole {merge}x{merge} blocks"),
         ));
@@ -305,7 +410,7 @@ pub fn rotary_coordinates(height: u32, width: u32, merge: u32) -> Result<Vec<[i6
 /// the same `height x width` grid (`PositionEmbedding.interpolate(...).repeat(time, 1)`).
 pub fn position_samples(side: u32, height: u32, width: u32, merge: u32) -> Result<PositionSamples> {
     if side == 0 {
-        return Err(invalid(
+        return Err(Error::shape(
             "position_samples",
             "the position table needs at least one row".to_owned(),
         ));
@@ -341,7 +446,7 @@ pub fn position_samples(side: u32, height: u32, width: u32, merge: u32) -> Resul
 /// table row, with the upper neighbour clamped at the last row.
 fn grid_samples(extent: u32, size: u32) -> Result<Vec<(i32, i32, f32)>> {
     if size == 0 || extent == 0 {
-        return Err(invalid(
+        return Err(Error::shape(
             "position_samples",
             format!("a {extent}-row table cannot sample a {size}-patch axis"),
         ));
@@ -384,7 +489,7 @@ pub fn vision_lengths(time: u32, height: u32, width: u32) -> Result<Vec<i32>> {
     for step in 0..=time {
         let end = i64::from(step) * patches;
         let end = i32::try_from(end).map_err(|_| {
-            invalid(
+            Error::shape(
                 "vision_lengths",
                 format!("a {time}x{height}x{width} grid packs more patches than an i32 holds"),
             )
@@ -392,14 +497,6 @@ pub fn vision_lengths(time: u32, height: u32, width: u32) -> Result<Vec<i32>> {
         offsets.push(end);
     }
     Ok(offsets)
-}
-
-/// The error a table's inputs raise: a shape disagreement of `owner`.
-pub(crate) fn invalid(owner: &str, problem: impl Into<String>) -> Error {
-    Error::Nn(nn::Error::from(ops::Error::Shape(format!(
-        "{owner}: {}",
-        problem.into()
-    ))))
 }
 
 /// Check that a factor table holds `rows * columns` values.
@@ -412,7 +509,7 @@ fn check_len(
 ) -> Result<()> {
     let expected = rows * columns;
     if cosine.len() != expected || sine.len() != expected {
-        return Err(invalid(
+        return Err(Error::shape(
             owner,
             format!(
                 "{} and {} factor values for {rows} rows of {columns} columns",
@@ -530,6 +627,44 @@ mod tests {
         assert!(rope_index(&ids, &[[1, 4, 4]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
         // A 2x2 grid does merge to one row, so the same prompt with it is well formed.
         assert!(rope_index(&ids, &[[1, 2, 2]], &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_ok());
+    }
+
+    #[test]
+    fn a_run_that_does_not_hold_its_grid_is_refused() {
+        // A 4x6 image block merges to six rows; five placeholders are one short.
+        let ids = [
+            7,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+        ];
+        assert!(run_grids(&ids, &[[1, 4, 6]], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
+        // A grid with no run left, and a run with no grid, are both refused.
+        assert!(run_grids(&[7, 8], &[[1, 4, 6]], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
+        let six = [
+            7,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+            IMAGE_TOKEN,
+        ];
+        assert!(run_grids(&six, &[], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
+        assert!(run_grids(&six, &[[1, 4, 6]], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_ok());
+        // A video grid of two time steps needs two runs.
+        let one = [
+            7,
+            VIDEO_TOKEN,
+            VIDEO_TOKEN,
+            VIDEO_TOKEN,
+            VIDEO_TOKEN,
+            VIDEO_TOKEN,
+            VIDEO_TOKEN,
+        ];
+        assert!(run_grids(&one, &[[2, 4, 6]], IMAGE_TOKEN, VIDEO_TOKEN, 2).is_err());
     }
 
     #[test]

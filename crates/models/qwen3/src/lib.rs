@@ -6,6 +6,8 @@
 //! - [`decoder`]: [`DecoderLayer`] and [`DecoderStack`], one implementation whatever the
 //!   consumer's attention, rounding and rotary precision;
 //! - [`moe`]: `Qwen3MoeForCausalLM`, implementing [`nn::CausalLm`];
+//! - [`vl`]: the Qwen3-VL language model, vision tower, patch mergers and their host position
+//!   tables, which [`VlConfig`] describes;
 //! - [`family`] and [`processing`]: the family as execution loads it and as request processing
 //!   serves it.
 //!
@@ -17,8 +19,9 @@ pub mod decoder;
 pub mod family;
 pub mod moe;
 pub mod processing;
+pub mod vl;
 
-pub use config::{MoeConfig, TextConfig};
+pub use config::{MoeConfig, TextConfig, VisionConfig, VlConfig};
 pub use decoder::{DecoderLayer, DecoderStack};
 
 /// What this crate can fail with.
@@ -31,6 +34,13 @@ pub enum Error {
     /// A layer, an operator or the weight loader refused the call.
     #[error(transparent)]
     Nn(#[from] nn::Error),
+}
+
+impl From<ops::Error> for Error {
+    /// An operator-level refusal of a view (a narrow) as the shared library reports it.
+    fn from(error: ops::Error) -> Self {
+        Self::Nn(error.into())
+    }
 }
 
 /// The crate's result type.
