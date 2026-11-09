@@ -1,9 +1,9 @@
 //! Cache import destinations and conversion workspaces retained through physical reads.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 
-use ipc::{BufferId, RequestKey};
+use ipc::BufferId;
 
 use super::read::ReadRef;
 use crate::{Error, Result, lock};
@@ -26,34 +26,13 @@ struct ImportState {
 /// One destination held until adoption or abandonment and all physical access
 /// finishes: the reads writing it and the workspace converting into it.
 pub(crate) struct CacheImport {
-    pub(crate) buffer: BufferId,
-    pub(crate) request_pool_idx: usize,
     state: Mutex<ImportState>,
 }
 
 impl CacheImport {
-    pub(crate) fn new(buffer: BufferId, request_pool_idx: usize, copy: bool) -> Self {
-        Self {
-            buffer,
-            request_pool_idx,
-            state: Mutex::new(ImportState {
-                reads: Vec::new(),
-                workspace: None,
-                started: false,
-                finished: !copy,
-                drained: !copy,
-                cancelled: false,
-                released: false,
-            }),
-        }
-    }
 
     pub(crate) fn cancelled(&self) -> bool {
         self.lock().cancelled
-    }
-
-    pub(crate) fn released(&self) -> bool {
-        self.lock().released
     }
 
     fn drained(&self) -> bool {
@@ -130,41 +109,7 @@ impl CacheImporter {
         lock(&self.state)
     }
 
-    /// Reserve native cache intervals and register their owner in one critical
-    /// section. The reservation callback performs no foreign or device work.
-    pub(crate) fn reserve(
-        &self,
-        write: ImportEntry,
-        reserve_destination: impl FnOnce() -> Result<()>,
-    ) -> Result<()> {
-        let mut state = self.lock();
-        if state.closed || state.imports.contains_key(&write.buffer) {
-            return Err(Error::Invalid(
-                "cache import destination is closed or already reserved".into(),
-            ));
-        }
-        reserve_destination()?;
-        state.imports.insert(write.buffer, write);
-        Ok(())
-    }
 
-    /// The backend first observes successful copy-task completion. Physical
-    /// transport accesses may outlive that result and continue to hold pages.
-    pub(crate) fn adopt(&self, write: &CacheImport) -> Result<()> {
-        let state = self.lock();
-        let owned = state
-            .imports
-            .get(&write.buffer)
-            .is_some_and(|active| std::ptr::eq(&**active, write));
-        let mut write = write.lock();
-        if !owned || write.cancelled {
-            return Err(Error::Invalid(
-                "cache import destination is no longer active".into(),
-            ));
-        }
-        write.released = true;
-        Ok(())
-    }
 
     /// Wait only on a thread of the import pool, never on the builder or
     /// control thread. Cancellation and shutdown wake blocked workspace
@@ -193,36 +138,6 @@ impl CacheImporter {
         Ok(())
     }
 
-    pub(crate) fn abandon(&self, write: &CacheImport) -> Vec<Arc<ReadRef>> {
-        let state = self.lock();
-        let reads = if state
-            .imports
-            .get(&write.buffer)
-            .is_some_and(|active| std::ptr::eq(&**active, write))
-        {
-            cancel(write)
-        } else {
-            Vec::new()
-        };
-        drop(state);
-        self.available.notify_all();
-        reads
-    }
-
-    pub(crate) fn release(&self, buffers: &HashSet<BufferId>) -> Vec<Arc<ReadRef>> {
-        self.cancel_matching(|buffer| buffers.contains(&buffer), false)
-    }
-
-    pub(crate) fn cancel_requests(
-        &self,
-        requests: &HashSet<RequestKey>,
-        retained: &HashSet<BufferId>,
-    ) -> Vec<Arc<ReadRef>> {
-        self.cancel_matching(
-            |buffer| requests.contains(&buffer.owner) && !retained.contains(&buffer),
-            false,
-        )
-    }
 
     pub(crate) fn stop(&self) -> Vec<Arc<ReadRef>> {
         self.cancel_matching(|_| true, true)

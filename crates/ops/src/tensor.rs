@@ -276,17 +276,6 @@ impl Shape {
         dims
     }
 
-    /// This shape with one axis replaced.
-    ///
-    /// # Panics
-    ///
-    /// When `axis` is past the last one.
-    #[track_caller]
-    pub fn with_dim(&self, axis: usize, extent: u64) -> Self {
-        let mut changed = *self;
-        changed.dims[axis] = extent;
-        changed
-    }
 
     /// Whether this shape and `other` have the same extents.
     pub fn matches(&self, other: &Shape) -> bool {

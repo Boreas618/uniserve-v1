@@ -95,9 +95,6 @@ impl Registration {
         self.region
     }
 
-    pub fn access(&self) -> Access {
-        self.access
-    }
 }
 
 impl std::fmt::Debug for Registration {

@@ -160,10 +160,6 @@ impl Store {
         Ok(Store { roots })
     }
 
-    /// The roots, writable first.
-    pub fn roots(&self) -> &[Root] {
-        &self.roots
-    }
 
     /// The directory a module is published to: the writable root's.
     pub fn directory(&self, path: &ModulePath) -> PathBuf {

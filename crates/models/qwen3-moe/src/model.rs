@@ -42,10 +42,8 @@ use nn::layers::{
     Attention, Embedding, Linear, Moe, Nvfp4Linear, ParallelLMHead, RmsNorm, Rotary, SwiGlu,
     TILE_ROWS, TRTLLM_WORKSPACE_BYTES,
 };
-use nn::model::{Block, BlockName, Model};
 use nn::weights::Weight;
 use nn::{Arena, DType, Forward, Shape, Strides, TensorView};
-use std::sync::Arc;
 
 use crate::{Config, Error, Partition, Result};
 
@@ -975,13 +973,6 @@ impl Qwen3Moe {
         Ok((input, residual, buffers))
     }
 
-    /// The model as the worker sees it: one causal-LM block named `backbone`.
-    pub fn into_model(self) -> Model {
-        Model::new(vec![(
-            BlockName::new("backbone"),
-            Block::CausalLm(Arc::new(self)),
-        )])
-    }
 
     /// The number of tokens one page of the prefix cache holds.
     /// The tokens one prefix-cache page holds, which the deployment's cache chose.

@@ -16,8 +16,7 @@
 //!
 //! **It runs the served entry point, not a method of convenience.** `Denoiser::prepare_conditioning`
 //! is what a runner calls once per request, and it is the arm that carried the defect that every
-//! condition was written where nothing gathers it (`39a41fd55`); `encode_conditions` was the arm that
-//! was right. A stage that exercised only the second would have printed a healthy page.
+//! condition was written where nothing gathers it (`39a41fd55`).
 //!
 //! **The verdict is a readback, not a row count.** For each piece the page prints the prefix rows the
 //! packing gathers for it - `layout.text_rows` plus the rows of the pieces before it - and the mean

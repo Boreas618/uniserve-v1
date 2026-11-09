@@ -95,10 +95,6 @@ impl Migrator {
         }
     }
 
-    /// The hold every submission goes through.
-    pub fn hold(&self) -> &Arc<RequestHold> {
-        &self.hold
-    }
 
     /// Submits `request` through the hold and returns its events and the
     /// scheduler serving it, as `RequestHold::submit` does. A token request
@@ -354,11 +350,6 @@ impl RequestEvents {
         }
     }
 
-    /// Registers a callback to run once, on the terminal event, the end of
-    /// the stream or its drop.
-    pub fn set_on_finish(&mut self, on_finish: impl FnOnce() + Send + 'static) {
-        self.on_finish = Some(Box::new(on_finish));
-    }
 
     /// Receives the next event; `None` once the request ended.
     pub async fn recv(&mut self) -> Option<Event> {

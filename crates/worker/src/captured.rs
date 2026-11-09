@@ -418,24 +418,7 @@ impl Captured {
         Ok(None)
     }
 
-    /// How many launches of `operator` the capture recorded.
-    pub fn launches(&self, operator: &'static str) -> usize {
-        self.nodes
-            .iter()
-            .filter(|(name, _, _)| *name == operator)
-            .count()
-    }
 
-    /// The kernels of the graph that belong to `generation`, by (operator, descriptor key).
-    ///
-    /// A purge report names what a graph still holds of an old generation; the ownership itself is
-    /// the `Arc`s in `kernels`.
-    pub fn kernel_names(&self) -> Vec<(&'static str, &str)> {
-        self.nodes
-            .iter()
-            .map(|(operator, key, _)| (*operator, key.as_str()))
-            .collect()
-    }
 }
 
 impl std::fmt::Debug for Captured {

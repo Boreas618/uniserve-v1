@@ -39,37 +39,6 @@ pub struct RetainedStorage {
     pub storage: Storage,
 }
 
-/// What a rank plans of its weights before its epoch starts (`uniserve
-/// worker --plan`), without reading the checkpoint or retaining anything:
-/// a daemon plans a change of the parallel configuration from every target
-/// rank's.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct PlannedRank {
-    /// The GPU the rank planned on, and its total and free bytes before
-    /// the rank's model was materialized there.
-    pub gpu: Gpu,
-    pub total_bytes: u64,
-    pub free_bytes: u64,
-    /// Allocation unit for retained conversion scratch on this GPU.
-    pub allocation_granularity: u64,
-    /// Resident deployment storage and the Transfer Server context needed
-    /// beside this rank, measured from the device ledger.
-    pub resident_bytes: u64,
-    pub device_quota: Option<u64>,
-    /// Target numerical capacity, independent of the source rank's layout.
-    pub budget: Option<RankBudget>,
-    /// The digest of what determines the bytes of the rank's tensors, by
-    /// tensor name, in hex as a manifest states them: received fields have
-    /// the same digests ([`sources`]).
-    pub fingerprints: BTreeMap<String, String>,
-    /// The storages its weights take on its GPU, chunked and keyed as the
-    /// rank retains them; `None` for a rank that does not receive its
-    /// weights (it retains none, or they span devices or stream from host
-    /// storage), which loads them.
-    pub storages: Option<Vec<Storage>>,
-    /// Retained source weights and measured links on the deployment's nodes.
-    pub sources: Option<Sources>,
-}
 
 /// What a successor rank must hold on its GPU before it can serve.
 /// Weight bytes are filled from the concrete transfer manifest; the other
@@ -111,24 +80,7 @@ pub struct CachePage {
 }
 
 impl RankBudget {
-    /// Storage the new rank adds beside already retained chunks.
-    pub fn required(&self) -> u64 {
-        self.process
-            + self.graphs
-            + self.fixed
-            + self.weights
-            + (self.cache + self.in_flight.map_or(0, |cache| cache.mapped)).max(self.cache_capacity)
-    }
 
-    /// The exact value demand and segment-rounded device demand of this rank.
-    pub fn reserve_requests(&self, tokens: &[u32]) -> CacheReservation {
-        let bytes = self.request_bytes(tokens);
-        let segment = self.cache_segment.max(1);
-        CacheReservation {
-            bytes,
-            mapped: bytes.div_ceil(segment) * segment,
-        }
-    }
 
     /// Writable cache needed to resume accepted request prefixes at this
     /// target layout. Windowed attention keeps the pages intersecting its

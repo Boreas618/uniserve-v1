@@ -262,10 +262,8 @@ fn hex_key(key: &[u8; 32]) -> String {
 /// One part of a predecessor epoch's segment that a worker maps.
 struct InheritedPart {
     key: Key,
-    /// The storage that maps the part, as its part `index`.
-    storage: Arc<Storage>,
-    index: usize,
-    segment: ipc::CacheSegment,
+    /// The storage that maps the part, held while the part is inherited.
+    _storage: Arc<Storage>,
 }
 
 impl State {
@@ -421,11 +419,6 @@ impl Retained {
             .map_err(|error| storage_error("publishing a segment", error))
     }
 
-    /// The UUID of `device`, which retained keys and records name.
-    pub(crate) fn gpu(&self, device: DeviceId) -> Result<[u8; 16]> {
-        lock(&self.state).gpu(device)
-    }
-
     /// Make one call on the connection, as the worker doing `what`.
     pub(crate) fn call<T>(
         &self,
@@ -433,100 +426,6 @@ impl Retained {
         request: impl FnOnce(&mut Client) -> ::storage::Result<T>,
     ) -> Result<T> {
         request(&mut lock(&self.state).client).map_err(|error| storage_error(what, error))
-    }
-
-    /// Submit `spans` to the host's Transfer Server as one task of
-    /// `update` at `priority` (`Request::Transfer`); returns the task. The
-    /// task ends with the worker's connection, so the worker keeps its
-    /// sources and destinations until [`Self::transferred`] answers.
-    pub(crate) fn transfer(
-        &self,
-        spans: Vec<::storage::protocol::Span>,
-        priority: ::storage::protocol::Priority,
-        update: u64,
-    ) -> Result<u64> {
-        self.call("submitting a transfer", |client| {
-            client.transfer(spans, priority, update)
-        })
-    }
-
-    /// Consume the completion of one transfer without waiting. Other tasks'
-    /// completions remain queued for their owners. Returns false while copying.
-    pub(crate) fn poll_transfer(&self, task: u64) -> Result<bool> {
-        use ::storage::protocol::TransferEnd;
-
-        let completion = lock(&self.state)
-            .client
-            .poll_transfer(task)
-            .map_err(|error| storage_error("reading transfer completions", error))?;
-        let Some((bytes, end)) = completion else {
-            return Ok(false);
-        };
-        match end {
-            TransferEnd::Complete => {
-                tracing::info!(task, bytes, "the transfer copied every span");
-                Ok(true)
-            }
-            TransferEnd::Cancelled => Err(Error::Interface(format!(
-                "transfer {task} was cancelled after {bytes} bytes"
-            ))),
-            TransferEnd::Failed { message } => Err(Error::Interface(format!(
-                "transfer {task} failed after {bytes} bytes: {message}"
-            ))),
-        }
-    }
-
-    /// Wait until every span of transfer `task` has copied, preserving other
-    /// transfers' completions for their owners.
-    pub(crate) fn transferred(&self, task: u64) -> Result<()> {
-        while !self.poll_transfer(task)? {
-            // Leave the connection available for other calls between polls.
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        Ok(())
-    }
-
-    /// Cancel a task and wait for its final event before freeing its targets.
-    pub(crate) fn cancel_transfer(&self, task: u64) -> Result<()> {
-        self.call("cancelling a transfer", |client| {
-            client.cancel(vec![task], None)
-        })?;
-        loop {
-            if self
-                .call("draining a cancelled transfer", |client| {
-                    client.poll_transfer(task)
-                })?
-                .is_some()
-            {
-                return Ok(());
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-    }
-
-    /// Note tensors the worker uses, which its startup retains.
-    pub(crate) fn use_keys(&self, keys: impl IntoIterator<Item = Key>) {
-        lock(&self.state).used.extend(keys);
-    }
-
-    /// Move the worker's read-only tensors to new keys, each `(old, new)`,
-    /// as their bytes were rewritten in place (`Request::Rekey`).
-    pub(crate) fn rekey(&self, moves: Vec<(Key, Key)>) -> Result<()> {
-        if moves.is_empty() {
-            return Ok(());
-        }
-        let mut state = lock(&self.state);
-        let at = state.locations();
-        state
-            .client
-            .rekey(moves.clone(), at)
-            .map_err(|error| storage_error("renaming retained weights", error))?;
-        for (old, new) in moves {
-            if state.used.remove(&old) {
-                state.used.insert(new);
-            }
-        }
-        Ok(())
     }
 
     /// The bytes already retained under `key`, mapped read-only on `device`,
@@ -587,36 +486,6 @@ impl Retained {
         state.used.insert(key);
         state.weights.insert((device.0, key), Arc::clone(&storage));
         Ok(Some(storage))
-    }
-
-    /// Release the scope's read-only tensors the worker does not bind
-    /// before it loads the rest of its weights, so the storage of weights it
-    /// no longer binds, such as another checkpoint's of the same model,
-    /// returns before loading needs it. Exclusive storages stay.
-    pub(crate) fn release_read_only(&self) -> Result<()> {
-        let mut state = lock(&self.state);
-        let listing = state
-            .client
-            .list()
-            .map_err(|error| storage_error("listing the storage server", error))?;
-        let keep: Vec<Key> = listing
-            .tensors
-            .iter()
-            .filter(|tensor| {
-                self.retains(tensor)
-                    && (tensor.access != Access::ReadOnly || state.used.contains(&tensor.key))
-            })
-            .map(|tensor| tensor.key)
-            .collect();
-        let at = state.locations();
-        let released = state
-            .client
-            .retain(keep, at)
-            .map_err(|error| storage_error("releasing retained weights", error))?;
-        if released > 0 {
-            tracing::info!(released, "released retained weights before loading");
-        }
-        Ok(())
     }
 
     /// The scope's retained device bytes on `device`, which NVML attributes
@@ -715,15 +584,6 @@ impl Retained {
         self.epoch
     }
 
-    /// Whether `entry` is one the worker's process books itself: an item of
-    /// its scope and epoch that a process books ([`Item::booked`]). A
-    /// measurement of the process stands for these.
-    pub(crate) fn books(&self, entry: &::storage::LedgerEntry) -> bool {
-        entry.item.booked()
-            && entry.scope.as_ref() == Some(&self.scope)
-            && entry.epochs == [self.epoch]
-    }
-
     /// States this epoch's quota of the GPU of `device`, `fraction` of the whole of it: every storage
     /// retained there from now on fits it or is refused, and the cache's segments are given back
     /// against it (`docs/admin.md`, The KV cache's storage and the weights). What this rank holds
@@ -810,85 +670,9 @@ impl Retained {
             .any(|retainer| retainer.scope == self.scope && retainer.epoch == self.epoch)
     }
 
-    /// Release every tensor of the scope the worker's startup did not use.
-    pub(crate) fn retain_used(&self) -> Result<()> {
-        let mut state = lock(&self.state);
-        let used = state.used.iter().copied().collect();
-        let at = state.locations();
-        let released = state
-            .client
-            .retain(used, at)
-            .map_err(|error| storage_error("retaining the worker's storages", error))?;
-        if released > 0 {
-            tracing::info!(
-                released,
-                "released retained storages the worker no longer uses"
-            );
-        }
-        Ok(())
-    }
 
-    /// Park a standby worker once it warmed up: its exclusive storages
-    /// become read-only, so it writes none of them until it is promoted.
-    pub fn park(&self) -> Result<()> {
-        let state = lock(&self.state);
-        let Some(standby) = &state.standby else {
-            return Ok(());
-        };
-        for storage in &standby.storages {
-            storage.protect(Protection::ReadOnly)?;
-        }
-        tracing::info!(
-            storages = standby.storages.len(),
-            "the standby worker parked"
-        );
-        Ok(())
-    }
 
-    /// Promote a parked standby worker: take write access to its exclusive
-    /// storages once their previous writer is out (released, or shot down
-    /// by the server), and make the mappings writable at unchanged
-    /// addresses, which its captured graphs address. Fails for a worker
-    /// that is not a standby.
-    pub fn promote(&self) -> Result<()> {
-        let mut state = lock(&self.state);
-        let standby = state
-            .standby
-            .take()
-            .ok_or_else(|| Error::State("only a standby worker is promoted"))?;
-        state
-            .client
-            .promote(standby.keys.clone())
-            .map_err(|error| storage_error("promoting the standby worker", error))?;
-        for storage in &standby.storages {
-            storage.protect(Protection::ReadWrite)?;
-        }
-        state.written.extend(standby.keys.iter().copied());
-        tracing::info!(
-            storages = standby.storages.len(),
-            "the standby worker was promoted"
-        );
-        Ok(())
-    }
 
-    /// Whether the worker stands by, not yet promoted.
-    pub fn standing_by(&self) -> bool {
-        lock(&self.state).standby.is_some()
-    }
-
-    /// Give up write access at an orderly close, once the worker drained
-    /// its streams: a successor takes the storages without a shoot-down.
-    pub(crate) fn release(&self) -> Result<()> {
-        let mut state = lock(&self.state);
-        if state.written.is_empty() {
-            return Ok(());
-        }
-        let keys: Vec<Key> = std::mem::take(&mut state.written).into_iter().collect();
-        state
-            .client
-            .release(keys)
-            .map_err(|error| storage_error("releasing write access", error))
-    }
 }
 
 impl ExclusiveStorage for &Retained {
@@ -1359,93 +1143,7 @@ impl Retained {
         self.release_keys(&mut state, &released, "releasing an abandoned weight load")
     }
 
-    /// Publishes a page of the state a model keeps per unit under `key` (design 4.5, 8): the
-    /// publisher allocates the exportable device block, `write` fills it with the page's blocks in
-    /// the layout the destination scatters, and the record names that allocation, so a reader maps
-    /// the same bytes by handle instead of copying them.
-    ///
-    /// The caller owns the page's cells: `rows` blocks of `width` bytes is what the record states.
-    /// A page is published once per generation per unit, before the generation is published as
-    /// serving, and never inside a step.
-    pub(crate) fn store_state(
-        &self,
-        device: DeviceId,
-        key: &[u8; 32],
-        rows: u32,
-        width: u64,
-        write: impl FnOnce(&Arc<Storage>, &platform::Stream) -> Result<()>,
-    ) -> Result<()> {
-        let bytes = u64::from(rows) * width;
-        if bytes == 0 {
-            return Err(Error::Invalid("a state page holds no block".into()));
-        }
-        let granularity = platform::HandleType::Descriptor.granularity(device)?;
-        // The record states the allocation, which the driver sizes in whole granules: a reader
-        // imports that many bytes and reads the page's own within them.
-        let allocation = usize::try_from(bytes.div_ceil(granularity as u64) * granularity as u64)
-            .map_err(|_| {
-            Error::Invalid("a state page is larger than this host can map".into())
-        })?;
-        let mut state = lock(&self.state);
-        let gpu = state.gpu(device)?;
-        let (staging, descriptor) = Storage::retainable(device, allocation, &[])?;
-        let stream = platform::Stream::new(device)?;
-        write(&staging, &stream)?;
-        // The reader maps what the publisher wrote, so the copy is complete before the record is
-        // published: a half-written page would be read as a valid one.
-        stream.synchronize()?;
-        let record = ::storage::StorageRecord {
-            location: Location::Device { gpu },
-            segment: None,
-            bytes: staging.bytes() as u64,
-            fabric: None,
-        };
-        let tensor = ::storage::TensorRecord {
-            key: Key(*key),
-            name: format!("state-{}", hex_key(key)),
-            storage: 0,
-            offset: 0,
-            dtype: "uint8".into(),
-            shape: vec![u64::from(rows), width],
-            strides: vec![width, 1],
-            access: Access::ReadOnly,
-        };
-        state
-            .client
-            .put(
-                vec![tensor],
-                &[(record, std::os::fd::AsFd::as_fd(&descriptor))],
-            )
-            .map_err(|error| storage_error("publishing a state page", error))?;
-        Ok(())
-    }
 
-    /// The state page retained under `key`, mapped read-only by handle, when the scope holds one.
-    ///
-    /// The caller checks the shape against its own page: the storage is `rows * width` bytes
-    /// rounded up to the granule the driver allocated, so a page that disagrees is refused by
-    /// whoever knows what it expected rather than silently read.
-    pub(crate) fn state_page(
-        &self,
-        device: DeviceId,
-        key: &[u8; 32],
-        rows: u32,
-        width: u64,
-    ) -> Result<Option<Arc<Storage>>> {
-        let bytes = u64::from(rows) * width;
-        let Some(storage) = self.weight(device, Key(*key))? else {
-            return Ok(None);
-        };
-        if (storage.bytes() as u64) < bytes {
-            return Err(Error::Interface(format!(
-                "the state page retained under {} holds {} bytes, and its stated {rows} rows of \
-                 {width} bytes are {bytes}",
-                hex_key(key),
-                storage.bytes()
-            )));
-        }
-        Ok(Some(storage))
-    }
 
     /// Takes the parts of a segmented storage: as
     /// [`ExclusiveStorage::exclusive`] takes whole ones, except that a
@@ -1544,9 +1242,7 @@ impl Retained {
                     storage.import_segment_read_only(index, &descriptor)?;
                     state.inherited.push(InheritedPart {
                         key: *key,
-                        storage: Arc::clone(&storage),
-                        index,
-                        segment: spec.parts[index].segment,
+                        _storage: Arc::clone(&storage),
                     });
                 }
                 Some(descriptor) => storage.import_segment(index, &descriptor)?,
@@ -1620,87 +1316,6 @@ impl Retained {
         Ok(())
     }
 
-    /// Maps exclusive storages the predecessor epoch `epoch` created,
-    /// read-only, as the worker of its scope keeps them: a successor reads
-    /// the predecessor's cache flags and scales once it parked. Fails when
-    /// one is missing.
-    pub(crate) fn map_inherited(
-        &self,
-        specs: &[ExclusiveSpec<'_>],
-        epoch: u64,
-    ) -> Result<Vec<(Key, Arc<Storage>)>> {
-        let mut state = lock(&self.state);
-        let mut keys = Vec::with_capacity(specs.len());
-        for spec in specs {
-            let gpu = state.gpu(spec.device)?;
-            keys.push(self.storage_key(spec.name, spec.bytes, &gpu, epoch));
-        }
-        let got = state
-            .client
-            .get(keys.clone(), Mode::Standby, Vec::new())
-            .map_err(|error| storage_error("mapping the predecessor's storages", error))?;
-        if let Some(missing) = got.missing.first() {
-            let name = keys
-                .iter()
-                .position(|key| key == missing)
-                .map_or("an exclusive storage", |index| specs[index].name);
-            return Err(Error::Invalid(format!(
-                "the predecessor epoch holds no {name} of this shape any more"
-            )));
-        }
-        let mut storages: Vec<Option<(StorageRecord, std::os::fd::OwnedFd)>> =
-            got.storages.into_iter().map(Some).collect();
-        let mut mapped = BTreeMap::new();
-        for tensor in &got.tensors {
-            let (record, descriptor) = storages
-                .get_mut(tensor.storage as usize)
-                .and_then(Option::take)
-                .ok_or_else(|| Error::Interface("a retained storage was named twice".into()))?;
-            let index = keys
-                .iter()
-                .position(|key| *key == tensor.key)
-                .ok_or_else(|| Error::Interface("an unasked storage was found".into()))?;
-            let spec = &specs[index];
-            let mapped_storage = match record.location {
-                ::storage::Location::Host { .. } => {
-                    Storage::import_host(descriptor, record.bytes as usize, spec.device)?
-                }
-                ::storage::Location::Device { .. } => Storage::import(
-                    descriptor,
-                    record.bytes as usize,
-                    spec.device,
-                    spec.access,
-                    Protection::ReadOnly,
-                )?,
-            };
-            mapped.insert(tensor.key, mapped_storage);
-        }
-        keys.iter()
-            .map(|key| {
-                let storage = mapped
-                    .remove(key)
-                    .ok_or_else(|| Error::Interface("a mapped storage is missing".into()))?;
-                Ok((*key, storage))
-            })
-            .collect()
-    }
-
-    /// Ends the worker's epoch's retention of storages `keys` it mapped from
-    /// its predecessor and no longer reads: the predecessor's epoch keeps
-    /// them until it is retired.
-    pub(crate) fn forget(&self, keys: &[Key]) -> Result<()> {
-        let mut state = lock(&self.state);
-        for key in keys {
-            state.used.remove(key);
-        }
-        let forgotten = keys.iter().copied().collect();
-        self.release_keys(
-            &mut state,
-            &forgotten,
-            "forgetting the predecessor's storages",
-        )
-    }
-
     /// Ends the epoch's retention of `keys` alone. The server's retention is
     /// the scope's in the epoch, which every worker of the scope shares: a
     /// standby maps its predecessor's storages under it, and the worker's own
@@ -1728,56 +1343,6 @@ impl Retained {
         Ok(())
     }
 
-    /// Maps the predecessor epoch's `segments` writable, every column's
-    /// part: the predecessor lent them for the epoch's trial, and its
-    /// writer, parked, writes none of them until the epoch's processes are
-    /// gone. The worker takes them like the others at the commit. Returns
-    /// how many parts it mapped writable.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the driver refuses.
-    pub(crate) fn borrow(&self, segments: &[ipc::CacheSegment]) -> Result<usize> {
-        let state = lock(&self.state);
-        let mut borrowed = 0;
-        for part in state
-            .inherited
-            .iter()
-            .filter(|part| segments.contains(&part.segment))
-        {
-            part.storage
-                .protect_segment(part.index, Protection::ReadWrite)?;
-            borrowed += 1;
-        }
-        Ok(borrowed)
-    }
-
-    /// Takes write access to the predecessor epoch's segments the worker
-    /// maps, once their writer is gone, and makes them writable at
-    /// unchanged addresses: the epoch's commit, after which they are its
-    /// own. Returns how many segments it took.
-    pub(crate) fn take_inherited(&self) -> Result<usize> {
-        let mut state = lock(&self.state);
-        let inherited = std::mem::take(&mut state.inherited);
-        if inherited.is_empty() {
-            return Ok(0);
-        }
-        let keys: Vec<Key> = inherited.iter().map(|part| part.key).collect();
-        if let Err(error) = state.client.promote(keys.clone()) {
-            state.inherited = inherited;
-            return Err(storage_error("taking the predecessor's segments", error));
-        }
-        for part in &inherited {
-            part.storage
-                .protect_segment(part.index, Protection::ReadWrite)?;
-        }
-        state.written.extend(keys);
-        tracing::info!(
-            segments = inherited.len(),
-            "took the predecessor epoch's cache segments"
-        );
-        Ok(inherited.len())
-    }
 }
 
 /// The name a part of a segmented storage is retained under.

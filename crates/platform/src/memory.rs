@@ -185,9 +185,6 @@ impl DeviceAllocation {
         self.bytes
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
 
     /// The handle type of an exportable allocation; `None` for linear storage.
     pub fn handle_type(&self) -> Option<HandleType> {
@@ -317,9 +314,6 @@ impl PinnedBuffer {
         self.bytes
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
 
     /// Views the buffer on the host.
     ///
@@ -367,7 +361,6 @@ impl Drop for PinnedBuffer {
 pub struct HostRegistration {
     context: PrimaryContext,
     pointer: NonNull<u8>,
-    bytes: usize,
     registered: bool,
 }
 
@@ -435,7 +428,6 @@ impl HostRegistration {
         Ok(Self {
             context,
             pointer,
-            bytes,
             registered: true,
         })
     }
@@ -444,13 +436,7 @@ impl HostRegistration {
         self.pointer.as_ptr() as u64
     }
 
-    pub fn len(&self) -> usize {
-        self.bytes
-    }
 
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
 
     /// Unregisters the range, reporting failure.
     pub fn unregister(mut self) -> Result<()> {

@@ -77,13 +77,6 @@ pub enum Error {
 }
 
 impl Error {
-    /// A call of `operator` this operator cannot express.
-    pub(crate) fn unsupported(operator: &'static str, problem: impl Into<String>) -> Self {
-        Self::Unsupported {
-            operator,
-            problem: problem.into(),
-        }
-    }
 
     /// An argument mismatch of `operator`.
     pub(crate) fn argument(operator: &'static str, problem: impl Into<String>) -> Self {

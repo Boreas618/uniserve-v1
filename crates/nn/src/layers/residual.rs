@@ -55,10 +55,6 @@ impl WeightedRmsNorm {
         self.weight.shape().numel() as u32
     }
 
-    /// The learned scale.
-    pub fn weight(&self) -> TensorView {
-        self.weight.view()
-    }
 
     /// The descriptor one launch without a magnitude takes, for a walk without a device: rows of
     /// `dtype`, normalized into `activation`.
@@ -81,17 +77,6 @@ impl WeightedRmsNorm {
         self.run(f, x, out, None)
     }
 
-    /// The same normalization, recording each row's largest normalized magnitude into `partials`
-    /// (`[rows]` FP32) for the caller's reduction.
-    pub fn forward_absmax(
-        &self,
-        f: &Forward,
-        x: TensorView,
-        out: TensorView,
-        partials: TensorView,
-    ) -> Result<()> {
-        self.run(f, x, out, Some(partials))
-    }
 
     fn run(
         &self,
@@ -178,46 +163,6 @@ impl ScaledResidual {
         f.operate::<residual::ScaledResidual>(&descriptor, args)
     }
 
-    /// Fold `update` into `hidden` with a scale the caller brings: `[1]` or `[columns]`.
-    ///
-    /// A diffusion solver's step scales the residual stream by one device scalar per
-    /// `(layout, step)` that the runner uploads, so the scale cannot be the layer's retained weight.
-    /// The operator reads one element as a factor for every channel and a whole row as the
-    /// per-channel weights, so both forms are one program and neither moves a key; the width stays
-    /// the layer's, from the weight it was built with (specs/worker.md 9, 求解器).
-    pub fn forward_with_scale(
-        &self,
-        f: &Forward,
-        hidden: TensorView,
-        update: TensorView,
-        scale: TensorView,
-    ) -> Result<()> {
-        let columns = self.scale.shape().numel();
-        if hidden.shape.rank() != 2 || hidden.shape.last() != columns {
-            return Err(Error::shape(
-                "ScaledResidual::forward_with_scale",
-                format!("{:?} is not [rows, {columns}]", hidden.shape.dims()),
-            ));
-        }
-        if scale.shape.numel() != 1 && scale.shape.numel() != columns {
-            return Err(Error::shape(
-                "ScaledResidual::forward_with_scale",
-                format!(
-                    "{} scale elements for {columns} channels; one element is the broadcast form",
-                    scale.shape.numel()
-                ),
-            ));
-        }
-        let descriptor = self.descriptor(hidden.dtype)?;
-        let args = residual::ScaledResidualArgs {
-            hidden,
-            update,
-            update_bias: self.bias.as_ref().map(Weight::view),
-            scale,
-        };
-
-        f.operate::<residual::ScaledResidual>(&descriptor, args)
-    }
 }
 
 /// `hidden += (update + bias) · scale; out = rms(hidden) · weight`.
@@ -256,21 +201,12 @@ impl ScaledResidualRmsNorm {
         })
     }
 
-    /// Record each row's largest normalized magnitude on every call.
-    pub fn with_absmax(mut self) -> Self {
-        self.absmax = true;
-        self
-    }
 
     /// Channels per row.
     pub fn columns(&self) -> u32 {
         self.weight.shape().numel() as u32
     }
 
-    /// The normalization's learned scale.
-    pub fn weight(&self) -> TensorView {
-        self.weight.view()
-    }
 
     /// Fold `update` into `hidden` and normalize it into `out`.
     ///
@@ -380,11 +316,6 @@ impl ScaledResidualLayerNorm {
         })
     }
 
-    /// Record each row's largest normalized magnitude on every call.
-    pub fn with_absmax(mut self) -> Self {
-        self.absmax = true;
-        self
-    }
 
     /// Channels per row.
     pub fn columns(&self) -> u32 {

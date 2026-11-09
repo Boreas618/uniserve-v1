@@ -138,10 +138,6 @@ impl TokenBatch {
         u64::from(self.num_tokens)
     }
 
-    /// Whether this batch is a single generated token per row.
-    pub fn is_decode(&self) -> bool {
-        self.phase == PhaseKind::Decode
-    }
 
     /// Check the batch's own parts against each other: the shapes a layer reads by pointer.
     ///

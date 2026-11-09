@@ -122,10 +122,6 @@ impl<I: Copy + Eq + Hash> Lru<I> {
         })
     }
 
-    /// How many objects are in the order.
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
 
     /// Whether no object is in the order.
     pub fn is_empty(&self) -> bool {

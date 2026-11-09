@@ -10,7 +10,6 @@
 
 mod grants;
 mod handle;
-mod peer;
 pub(crate) mod pool;
 
 pub(crate) use grants::DescriptorGrants;
@@ -34,7 +33,7 @@ use super::{ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, Spans, copy_plann
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::MemoryKind;
-use crate::memory::allocation::{Residency, Storage, StorageView};
+use crate::memory::allocation::{Storage, StorageView};
 use crate::stream::EventPool;
 use crate::stream::Issue;
 use crate::{Error, Result, lock};
@@ -207,13 +206,13 @@ impl CudaExports {
             // has a handle its readers can import: retained storage exports
             // its descriptor, which reaches this host's readers only.
             let in_place = match Storage::exportable_containing(first) {
-                Some((storage, offset, residency)) => storage
+                Some((storage, offset)) => storage
                     .export(self.cross_host)?
-                    .map(|shareable| (storage, offset, residency, shareable)),
+                    .map(|shareable| (storage, offset, shareable)),
                 None => None,
             };
-            let (spans, handle, size, offset, residency) = match in_place {
-                Some((storage, offset, residency, shareable)) => {
+            let (spans, handle, size, offset) = match in_place {
+                Some((storage, offset, shareable)) => {
                     let handle = AllocationHandle::of(&shareable);
                     if let ShareableHandle::Descriptor(fd) = shareable {
                         state.descriptor = Some(fd);
@@ -223,7 +222,6 @@ impl CudaExports {
                         handle,
                         storage.bytes() as u64,
                         offset,
-                        residency,
                     )
                 }
                 None => {
@@ -260,7 +258,6 @@ impl CudaExports {
                         pool.handle,
                         storage_bytes,
                         chunk.payload_offset() as u64,
-                        Residency::Resident,
                     )
                 }
             };
@@ -298,7 +295,7 @@ impl CudaExports {
                     .allocation
                     .as_ref()
                     .map_or(-1, |(_, chunk)| chunk.offset as i64),
-                resident: residency == Residency::Resident,
+                resident: true,
             })?;
 
             let pooled = state.allocation.is_some();
@@ -441,12 +438,6 @@ impl CudaExports {
             lock(&pool.pool).reap()?;
         }
         Ok(())
-    }
-
-    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
-        self.pools()
-            .iter()
-            .any(|pool| lock(&pool.pool).awaiting_acknowledgment())
     }
 
     pub(crate) fn close(&self) -> Result<()> {

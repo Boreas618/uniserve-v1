@@ -857,7 +857,6 @@ impl Connection {
         // field until it does.
         let (decision, _undecided) = tokio::sync::oneshot::channel();
         let frozen = FrozenStream {
-            id: registration.id(),
             request_id: request_id.to_owned(),
             frozen_at_ns,
             state,
@@ -2697,7 +2696,7 @@ mod tests {
             false,
         );
         let (server, client) = pair();
-        let Either::Right(mut predecessor) = server else {
+        let Either::Right(predecessor) = server else {
             unreachable!("a socket pair is a Unix stream")
         };
         let mut client = TestClient::new(client);

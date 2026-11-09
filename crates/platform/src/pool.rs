@@ -156,9 +156,6 @@ impl VirtualPool {
         })
     }
 
-    pub fn device(&self) -> DeviceId {
-        self.device
-    }
 
     /// Whether the pool is parked: its blocks reserve addresses but none is
     /// mapped, and every one holds a saved host copy of its contents.
@@ -190,25 +187,7 @@ impl VirtualPool {
         }
     }
 
-    /// Whether `address` lies in the pool's reservation.
-    pub fn contains(&self, address: u64) -> bool {
-        address >= self.address && address - self.address < self.reserved as u64
-    }
 
-    /// A chunk of at least `bytes`, readable and writable by the pool's
-    /// device and its peers, at an address it keeps for the pool's life: a
-    /// freed chunk of
-    /// the same rounded size, or new physical storage mapped after the
-    /// chunks given out so far.
-    ///
-    /// # Errors
-    ///
-    /// Fails while the pool is suspended, when the reservation is
-    /// exhausted, when the driver cannot allocate or map the storage, and
-    /// when the pool's budget refuses the new total (nothing is mapped then).
-    pub fn allocate(&mut self, bytes: usize) -> Result<u64> {
-        Ok(self.allocate_block(bytes)?.0)
-    }
 
     /// [`Self::allocate`], also answering with the block it gave out, so that a
     /// buffer can export it.

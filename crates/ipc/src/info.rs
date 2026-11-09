@@ -133,22 +133,6 @@ pub struct CacheTable {
     pub held: u32,
 }
 
-/// What a rank of an epoch that succeeds another maps of the predecessor's
-/// KV cache: the predecessor's epoch, and the segments its rank of the same
-/// scope holds, in unit order, which the rank maps read-only after a head
-/// segment of its own.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PredecessorCache {
-    pub epoch: u64,
-    /// The segments the predecessor's planes hold.
-    pub segments: Vec<CacheSegment>,
-    /// The units of the predecessor's planes, those of the segments it gave
-    /// back included: its flags and scales are laid out over them.
-    pub num_units: u32,
-    /// The units `1..=scratch_units` the predecessor's warmup lent, which a
-    /// successor of the same configuration needs as many of.
-    pub scratch_units: u32,
-}
 
 /// The host page pool of one cache group on one rank: the Storage Server
 /// pool its pages are copied to and from, and what the pages hold.
@@ -234,10 +218,6 @@ pub struct ImageEncoderOutput {
 }
 
 impl PrefixCacheInfo {
-    /// Returns the units the scheduler may allocate: all but the sentinel.
-    pub fn usable_units(&self) -> u32 {
-        self.num_units.saturating_sub(1)
-    }
 
     /// Returns the largest block size of any group, in tokens.
     ///

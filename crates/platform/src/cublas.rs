@@ -505,10 +505,6 @@ impl Matmul {
         })
     }
 
-    /// The device the handle belongs to.
-    pub fn device(&self) -> DeviceId {
-        self.device
-    }
 
     /// The algorithms cuBLASLt proposes for `descriptor`, best first, at most
     /// `limit`, none needing more than `workspace_bytes` of workspace.

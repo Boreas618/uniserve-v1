@@ -668,10 +668,6 @@ impl Recording {
         }
     }
 
-    /// The per-launch node table, in capture order: `Captured.index_nodes`'s own input.
-    pub fn nodes(&self) -> &Nodes {
-        &self.nodes
-    }
 
     /// The first failure a record reported, if any: a capture that failed part-way through.
     pub fn failure(&self) -> Option<&platform::Error> {

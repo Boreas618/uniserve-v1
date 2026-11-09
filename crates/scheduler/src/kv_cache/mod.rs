@@ -471,6 +471,21 @@ pub(crate) struct BlockPool {
 }
 
 impl BlockPool {
+    /// The units from `first` on, short of the withdrawn ones, that hold
+    /// published pages no request holds: the idle cached pages a withdrawal
+    /// from `first` evicts.
+    #[cfg(test)]
+    pub(crate) fn cached_from(&self, first: u32) -> u32 {
+        let inner = lock(&self.inner);
+        let end = inner.withdrawn.min(inner.meta.len() as u32);
+        (first.min(end)..end)
+            .filter(|&unit| {
+                let meta = &inner.meta[unit as usize];
+                meta.state == UnitState::Cached && meta.published.is_some()
+            })
+            .count() as u32
+    }
+
     /// Creates a pool of `num_units` units, including the unit-zero sentinel.
     /// Units `1..=scratch` are never allocated: they are the workers' warmup
     /// scratch, which a standby worker warms up on while the pool's units
@@ -536,20 +551,6 @@ impl BlockPool {
         }
         inner.recount();
         inner.withdrawn_held()
-    }
-
-    /// The units from `first` on, short of the withdrawn ones, that hold
-    /// published pages no request holds: the idle cached pages a withdrawal
-    /// from `first` evicts.
-    pub(crate) fn cached_from(&self, first: u32) -> u32 {
-        let inner = lock(&self.inner);
-        let end = inner.withdrawn.min(inner.meta.len() as u32);
-        (first.min(end)..end)
-            .filter(|&unit| {
-                let meta = &inner.meta[unit as usize];
-                meta.state == UnitState::Cached && meta.published.is_some()
-            })
-            .count() as u32
     }
 
     /// The withdrawn units requests still hold.
@@ -3683,28 +3684,6 @@ mod tests {
         assert_eq!(pool.free_units(), 15);
     }
 
-    /// The idle cached pages from a unit on are those published pages no
-    /// request holds: a page still held, an unpublished free unit and a
-    /// withdrawn unit do not count.
-    #[test]
-    fn cached_pages_from_a_unit_count_the_idle_published_ones() {
-        let pool = BlockPool::new(16, 0);
-        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
-        let source = endpoint();
-        let prompt: Vec<u32> = (100..112).collect();
-        // Twelve pages on units 1..=12, all held by the request.
-        let held = publish(&coordinator, &pool, &prompt, &source);
-        assert_eq!(pool.cached_from(1), 0);
-
-        // Released, they are cached and idle.
-        drop(held);
-        assert_eq!(pool.cached_from(1), 12);
-        assert_eq!(pool.cached_from(9), 4);
-        // A withdrawal from unit 11 evicts the two pages there.
-        pool.withdraw(11);
-        assert_eq!(pool.cached_from(9), 2);
-    }
-
     #[test]
     fn a_restore_queues_the_withdrawn_units_requests_hold_once_released() {
         let pool = BlockPool::new(8, 0);
@@ -4440,5 +4419,27 @@ mod tests {
         assert_eq!(allocation.tables[0].fresh_units(watermark).len(), 1);
         assert_eq!(allocation.tables[1].fresh_units(watermark).len(), 2);
         assert!(allocation.tables.iter().all(BlockTable::changed_since_sent));
+    }
+
+    /// The idle cached pages from a unit on are those published pages no
+    /// request holds: a page still held, an unpublished free unit and a
+    /// withdrawn unit do not count.
+    #[test]
+    fn cached_pages_from_a_unit_count_the_idle_published_ones() {
+        let pool = BlockPool::new(16, 0);
+        let coordinator = PrefixCacheCoordinator::new(vec![full(1, 1)]);
+        let source = endpoint();
+        let prompt: Vec<u32> = (100..112).collect();
+        // Twelve pages on units 1..=12, all held by the request.
+        let held = publish(&coordinator, &pool, &prompt, &source);
+        assert_eq!(pool.cached_from(1), 0);
+
+        // Released, they are cached and idle.
+        drop(held);
+        assert_eq!(pool.cached_from(1), 12);
+        assert_eq!(pool.cached_from(9), 4);
+        // A withdrawal from unit 11 evicts the two pages there.
+        pool.withdraw(11);
+        assert_eq!(pool.cached_from(9), 2);
     }
 }

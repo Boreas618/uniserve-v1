@@ -133,10 +133,6 @@ impl PackageSource {
         Self { root, manifest }
     }
 
-    /// The module form the package's manifest names.
-    pub fn form(&self) -> ModuleForm {
-        self.manifest.module.form
-    }
 
     /// A file of the package, by the manifest's relative path.
     pub fn file(&self, relative: &str) -> PathBuf {

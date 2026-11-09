@@ -196,32 +196,9 @@ impl Rotary {
         Ok(self)
     }
 
-    /// The query heads: the rank the factors and the per-head norm are applied at.
-    pub const fn heads(&self) -> u32 {
-        self.q_heads
-    }
 
-    /// The rotated width of one head: `head_dim` unless the rotation was narrowed.
-    pub const fn rotated(&self) -> u32 {
-        self.rotated
-    }
 
-    /// The rotation pairing.
-    pub const fn rotation(&self) -> Rotation {
-        self.rotation
-    }
 
-    /// Turn `positions` into `cosine` and `sine` tables, both `[tokens, rotated / 2]` FP32.
-    ///
-    /// A one-dimensional rotation's `positions` is `[…, tokens]`; a sectioned rotation's is
-    /// `[axes, …, tokens]`, one coordinate per axis per token, and the tables cover the tokens.
-    /// The descriptor the factor tables are built with, for positions of `positions`.
-    ///
-    /// The token count is not in it: how many positions a call carries is a launch value, and the
-    /// sections' widths, the axis count and the interleaving are the geometry a model binds once.
-    pub fn factors_descriptor(&self, positions: ops::DType) -> FactorsDescriptor {
-        Self::factors_descriptor_of(self.rotated, self.scale, self.sections, positions)
-    }
 
     /// The factor table's descriptor at an element type of the caller's.
     ///

@@ -286,52 +286,7 @@ impl ForwardBatch {
         self.write_cache.push(write_cache);
     }
 
-    /// Move forward inputs into a physical batch, offsetting only physical row ownership.
-    ///
-    /// Fails without modifying this batch when an offset call index exceeds `u32`.
-    pub fn append(&mut self, other: Self, call_offset: u32) -> ValidationResult<()> {
-        // Offset every index before extending any column so a failure leaves
-        // the columns aligned.
-        let call_indices = other
-            .call_indices
-            .into_iter()
-            .map(|index| {
-                index.checked_add(call_offset).ok_or_else(|| {
-                    invalid_message!(
-                        "physical call index {index} with offset {call_offset} exceeds u32"
-                    )
-                })
-            })
-            .collect::<ValidationResult<Vec<_>>>()?;
 
-        self.call_indices.extend(call_indices);
-        self.request_pool_indices.extend(other.request_pool_indices);
-        self.seq_lens.extend(other.seq_lens);
-        self.query_lens.extend(other.query_lens);
-        self.write_cache.extend(other.write_cache);
-        Ok(())
-    }
-
-    /// Select a rank's calls and map their forward rows to the local call array.
-    ///
-    /// `calls` lists the batch-level call indices the rank owns, in the order
-    /// of its projected call array. Rows of other calls are dropped, and each
-    /// kept row's call index becomes its position in `calls`.
-    pub fn select(&self, calls: &[usize]) -> Self {
-        let mut selected = Self::default();
-        for (row, index) in self.call_indices.iter().enumerate() {
-            if let Some(local) = calls.iter().position(|call| *call == *index as usize) {
-                selected.push(
-                    local as u32,
-                    self.request_pool_indices[row],
-                    self.seq_lens[row],
-                    self.query_lens[row],
-                    self.write_cache[row],
-                );
-            }
-        }
-        selected
-    }
 
     /// Validate column alignment and numerical ranges before indexing model inputs.
     pub fn validate(&self, call_count: usize) -> ValidationResult<()> {

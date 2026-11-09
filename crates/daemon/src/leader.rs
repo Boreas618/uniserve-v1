@@ -33,11 +33,11 @@ use crate::metrics::{EngineLabels, METRICS};
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use proto::request::wire;
-use proto::request::{GenerationLimits, Request};
+use proto::request::Request;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::engine::client::{EngineClient, EngineInfo, EngineState, StatsSink, SubmitError};
+use crate::engine::client::{EngineClient, EngineState, StatsSink, SubmitError};
 use crate::engine::control::EngineControl;
 use crate::engine::hold::{HoldState, RequestHold};
 use crate::input::media::MediaConnector;
@@ -90,8 +90,6 @@ pub struct Leader {
     /// The model the request and scheduler metrics are labelled with.
     model_name: String,
     processor: Arc<InputProcessor>,
-    /// What the engine the model was bound to reported it serves.
-    info: EngineInfo,
     /// Independent replica epochs behind the public request entry point.
     pub(crate) replicas: Arc<Replicas>,
     images: MediaConnector,
@@ -112,7 +110,6 @@ pub(crate) struct Replicas {
     pub(crate) serving: watch::Sender<Vec<Arc<Replica>>>,
     pub(crate) replacing: tokio::sync::Mutex<()>,
     pub(crate) adapters: Arc<std::sync::Mutex<BTreeMap<String, Adapter>>>,
-    pub(crate) schedulers: Arc<std::sync::atomic::AtomicUsize>,
     /// The update layer, so a replica that loses its engine asks whether an
     /// update in flight owns that decision (§7.2, §7.4).
     pub(crate) updates: std::sync::Weak<crate::updates::driver::Driver>,
@@ -243,7 +240,6 @@ pub(crate) struct Prepared {
     renderer: LoadedRenderer,
     /// The deployment's engine configuration, with the facts the model's files determine.
     pub(crate) engine: proto::config::EngineConfig,
-    max_model_len: u32,
 }
 
 impl Leader {
@@ -395,13 +391,6 @@ impl Leader {
         Ok(results)
     }
 
-    pub async fn hook(&self, name: &str, payload: &str) -> Result<Vec<String>, UpdateError> {
-        let mut results = Vec::new();
-        for replica in self.replicas() {
-            results.extend(replica.hook(name, payload).await?);
-        }
-        Ok(results)
-    }
 
     /// The LoRA adapter named `name` the workers hold, which a request
     /// naming it as its model computes with.
@@ -577,7 +566,7 @@ impl Leader {
     /// ([`ServerArgs::engine_config`]), when the engine process fails to
     /// start, or when the model cannot be bound to the capabilities its
     /// workers report.
-    pub async fn start(
+    pub(crate) async fn start(
         config: &ServerArgs,
         stated: &Stated,
         daemon: String,
@@ -929,7 +918,6 @@ impl Leader {
             tokenizer,
             renderer,
             engine,
-            max_model_len,
         })
     }
 
@@ -954,7 +942,6 @@ impl Leader {
             tokenizer,
             renderer,
             engine: _,
-            max_model_len: _,
         } = prepared;
         let model_name = config.model().to_owned();
         let info = client.info().clone();
@@ -1039,7 +1026,8 @@ impl Leader {
     /// `images` resolves the image references of every request, and `options`
     /// states the request and statistics logging (`logging_config`) and
     /// request migration (`migration_config`).
-    pub fn new(
+    #[cfg(test)]
+    pub(crate) fn new(
         served_model_name: String,
         model_name: String,
         clients: Vec<Arc<EngineClient>>,
@@ -1110,7 +1098,6 @@ impl Leader {
             ),
             replacing: tokio::sync::Mutex::new(()),
             adapters: Arc::clone(&adapters),
-            schedulers,
             updates: Arc::downgrade(&updates),
         });
         for replica in replicas.serving.borrow().iter() {
@@ -1120,7 +1107,6 @@ impl Leader {
             served_model_name,
             model_name,
             processor: Arc::new(processor),
-            info,
             replicas,
             images,
             updates,
@@ -1139,10 +1125,6 @@ impl Leader {
         &self.served_model_name
     }
 
-    /// The generation limits the engine serves.
-    pub fn generation_limits(&self) -> GenerationLimits {
-        self.info.limits.clone()
-    }
 
     /// The video denoiser this deployment serves; `None` for a model that
     /// generates no video.
@@ -1173,11 +1155,6 @@ impl Leader {
             .borrow()
             .iter()
             .any(|replica| replica.hold.is_serving())
-    }
-
-    /// The connector every request's image references go through.
-    pub(crate) fn images(&self) -> &MediaConnector {
-        &self.images
     }
 
     /// Fetches the input images of a generation request, renders and
@@ -1954,9 +1931,6 @@ pub enum UpdateError {
     /// Another change is in progress.
     #[error("a change of the deployment is in progress")]
     InProgress,
-    /// An epoch is on trial: it is committed or rolled back first.
-    #[error("epoch {0} is on trial: commit it or roll it back first")]
-    OnTrial(u64),
     /// The configuration is invalid, or asks for a change the deployment
     /// does not make.
     #[error("{0}")]
@@ -2153,8 +2127,6 @@ pub(crate) struct Replica {
     /// The profiling session that runs, or the last that ended
     /// (`crate::profiling`).
     pub(crate) profiles: crate::profiling::Profiles,
-    /// Numerical manifests reused when planning successor rank budgets.
-    pub(crate) manifests: std::sync::Mutex<storage::manifest::Planner>,
     /// The parked standby standing beside the serving engine (§2.5), if one is
     /// live. Started by [`Replica::keep_standby`], taken by
     /// [`Replica::promote_standby`].
@@ -2206,7 +2178,6 @@ impl Replica {
             }),
             observer,
             profiles: crate::profiling::Profiles::default(),
-            manifests: std::sync::Mutex::new(storage::manifest::Planner::default()),
             standby: std::sync::Mutex::new(None),
             standby_starting: tokio::sync::Mutex::new(()),
             programs_serve: std::sync::atomic::AtomicBool::new(false),
@@ -2314,7 +2285,7 @@ impl Replica {
                 .kv_cache
                 .block_size
                 .map_or(0, std::num::NonZeroU32::get);
-            let mut source = None;
+            let mut source;
             let handed = tokio::task::spawn_blocking(move || {
                 // The update names backends, and a revision is the Program Server's to select.
                 let steps = crate::engine::control::PrepareSteps::new();

@@ -17,16 +17,6 @@ use ipc::{CacheGroup, CacheGroupKind, PrefixCacheDtype};
 
 use crate::memory::GroupShape;
 use crate::memory::allocation::ElementType;
-use crate::memory::request_slots::SlotField;
-/// One field of a cache layer kept per request slot: `name` is
-/// `layer/field`, `shape` one slot's extent.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct StateField {
-    pub name: String,
-    pub dtype: ElementType,
-    pub shape: Vec<i64>,
-}
-
 /// One layer's checkpoint, packed into consecutive planes of a state page.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct Checkpoint {
@@ -35,17 +25,6 @@ pub struct Checkpoint {
     pub fields: Vec<::storage::manifest::Field>,
 }
 
-impl StateField {
-    /// The field as a device bank of the request slots.
-    pub(crate) fn slot(&self) -> SlotField {
-        SlotField {
-            name: self.name.clone(),
-            dtype: self.dtype,
-            shape: self.shape.clone(),
-            host: false,
-        }
-    }
-}
 use crate::{Error, Result};
 
 /// Where this rank's layers of a group lie in the group's transfer layer
@@ -131,8 +110,6 @@ pub struct CachePlan {
     /// The published stored dtype (`PrefixCacheInfo::dtype`).
     pub dtype: PrefixCacheDtype,
     pub groups: Vec<CacheGroupPlan>,
-    /// The fields of the layers kept per request slot (`state_fields`).
-    pub states: Vec<StateField>,
     pub checkpoints: Vec<Checkpoint>,
 }
 
@@ -202,7 +179,6 @@ impl CachePlan {
                 },
                 compute_dtype: ElementType::BF16,
             }],
-            states: Vec::new(),
             checkpoints: Vec::new(),
         }
     }
@@ -244,7 +220,6 @@ impl CachePlan {
             unit_bytes,
             dtype,
             groups,
-            states,
             checkpoints,
         } = self;
         if groups.is_empty() {
@@ -307,7 +282,6 @@ impl CachePlan {
             unit_bytes,
             dtype,
             groups,
-            states,
             checkpoints,
         })
     }
@@ -339,32 +313,12 @@ impl CachePlan {
         last.div_ceil(capacity)
     }
 
-    /// Whether groups store different element types: stale bytes of one type
-    /// need not decode as finite values of another, so recycled units are
-    /// zeroed completely.
-    pub(crate) fn mixed_types(&self) -> bool {
-        self.groups
-            .iter()
-            .any(|group| group.dtype != self.groups[0].dtype)
-    }
 
-    /// The largest page of any group: a unit's whole token range.
-    pub(crate) fn unit_tokens(&self) -> u32 {
-        self.groups
-            .iter()
-            .map(|group| group.block_size)
-            .max()
-            .unwrap_or(0)
-    }
 
     pub(crate) fn group_shapes(&self) -> Result<Vec<GroupShape>> {
         self.groups.iter().map(CacheGroupPlan::shape).collect()
     }
 
-    /// The compute dtype cache exports declare.
-    pub(crate) fn compute_dtype(&self) -> ElementType {
-        self.groups[0].compute_dtype
-    }
 
     /// The pool description reported to the engine.
     pub fn info(&self, num_units: u32) -> PrefixCacheInfo {
@@ -400,22 +354,6 @@ impl CachePlan {
             host_token_bytes: 0,
             storage_endpoint: None,
         }
-    }
-
-    /// Whether the model keeps layers per request slot, whose checkpoints
-    /// fill the state group.
-    pub(crate) fn states(&self) -> bool {
-        self.groups.iter().any(|group| group.state)
-    }
-
-    /// Writable units needed to advance one request: one page of every
-    /// K/V group and two state checkpoints. The input checkpoint stays
-    /// readable until the call writing its successor has completed.
-    pub(crate) fn progress_units(&self) -> u32 {
-        self.groups
-            .iter()
-            .map(|group| group.units_per_page * if group.state { 2 } else { 1 })
-            .sum()
     }
 
     /// The units a token capacity of `tokens` takes: the whole pages of
@@ -466,29 +404,6 @@ impl CachePlan {
     }
 }
 
-/// The request state fields of a plan's `state_fields`: a JSON list of
-/// `{"name", "dtype", "shape"}`, `shape` one slot's extent.
-fn state_fields(text: &str) -> Result<Vec<StateField>> {
-    #[derive(serde::Deserialize)]
-    struct Field {
-        name: String,
-        dtype: String,
-        shape: Vec<i64>,
-    }
-    let fields: Vec<Field> = serde_json::from_str(text)
-        .map_err(|error| Error::Interface(format!("the cache plan's state fields: {error}")))?;
-    fields
-        .into_iter()
-        .map(|field| {
-            Ok(StateField {
-                dtype: ElementType::parse(&field.dtype)?,
-                name: field.name,
-                shape: field.shape,
-            })
-        })
-        .collect()
-}
-
 /// The greatest common divisor of two counts; `gcd(0, n) == n`.
 fn gcd(left: u32, right: u32) -> u32 {
     if right == 0 {
@@ -531,7 +446,6 @@ mod tests {
             unit_bytes: 64,
             dtype: PrefixCacheDtype::BFloat16,
             groups: vec![group(state)],
-            states: Vec::new(),
             checkpoints,
         };
         let checkpoint = |first_plane: u32, planes: u32| Checkpoint {
@@ -574,32 +488,4 @@ mod tests {
         Ok(())
     }
 
-    /// A plan's request state fields read as the fields of device banks.
-    #[test]
-    fn state_fields_read_as_device_bank_fields() -> Result<()> {
-        let fields = state_fields(
-            r#"[{"name": "layers.0.mixer/conv.values", "dtype": "bfloat16", "shape": [4, 8]},
-                {"name": "layers.0.mixer/conv.initialized", "dtype": "bool", "shape": []}]"#,
-        )?;
-        assert_eq!(
-            fields.iter().map(StateField::slot).collect::<Vec<_>>(),
-            vec![
-                SlotField {
-                    name: "layers.0.mixer/conv.values".into(),
-                    dtype: ElementType::BF16,
-                    shape: vec![4, 8],
-                    host: false,
-                },
-                SlotField {
-                    name: "layers.0.mixer/conv.initialized".into(),
-                    dtype: ElementType::Bool,
-                    shape: vec![],
-                    host: false,
-                },
-            ]
-        );
-        assert!(state_fields("[]")?.is_empty());
-        assert!(state_fields(r#"[{"name": "x/y", "dtype": "complex", "shape": []}]"#).is_err());
-        Ok(())
-    }
 }

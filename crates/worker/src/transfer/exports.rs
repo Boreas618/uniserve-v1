@@ -177,14 +177,6 @@ impl Exports {
         Ok(locations)
     }
 
-    /// Revoke the locations of an export that is not published and give up
-    /// what it still stages. As [`Exports::locate`], call this once the
-    /// issuer the export was given performed its work: the work addresses
-    /// what this releases.
-    pub(crate) fn revoke(self) {
-        revoke(&self.locations);
-        discard(self.staged);
-    }
 }
 
 /// Give up the staged exports of an export that failed or is not

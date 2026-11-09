@@ -1,9 +1,8 @@
 //! A loaded model as the worker is to see it: named blocks, each implementing one capability.
 //!
 //! This is the **producer half** of the seam `specs/worker.md` 4.3 states — a block per capability,
-//! addressed by a name and a phase — and the consumer half is not wired yet. A model builds one of
-//! these with its own loader (`qwen3_moe::Qwen3Moe::into_model`,
-//! `minimax_h3::MinimaxH3::into_model`) and nothing in the tree hands it on: the engine's plan
+//! addressed by a name and a phase — and the consumer half is not wired yet. A model's loader
+//! builds one of these and nothing in the tree hands it on: the engine's plan
 //! (`src/model_runner.rs`) ends at `Arc<qwen3_moe::Qwen3Moe>`, and the worker's runners
 //! (`crates/worker/src/runners/`) address work by `ipc::PhaseId` with no block registry. **The
 //! consumer is `exec`'s to land**; until it does, this is a stated contract whose other half is owed
@@ -36,10 +35,6 @@ impl BlockName {
         Self(Arc::from(name.as_ref()))
     }
 
-    /// The name as text.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
 }
 
 impl fmt::Display for BlockName {
@@ -96,42 +91,18 @@ impl fmt::Debug for Block {
 /// block from the capability it implements (specs/worker.md 4.3, 4.5).
 #[derive(Debug)]
 pub struct Model {
-    blocks: Vec<(BlockName, Block)>,
+    /// Held for the model's lifetime.
+    _blocks: Vec<(BlockName, Block)>,
 }
 
 impl Model {
     /// The model with `blocks`, in deployment order.
     pub fn new(blocks: Vec<(BlockName, Block)>) -> Self {
-        Self { blocks }
+        Self { _blocks: blocks }
     }
 
-    /// The blocks, in deployment order.
-    pub fn blocks(&self) -> impl Iterator<Item = (&BlockName, &Block)> {
-        self.blocks.iter().map(|(name, block)| (name, block))
-    }
 
-    /// The block named `name`.
-    pub fn block(&self, name: &BlockName) -> Option<&Block> {
-        self.blocks
-            .iter()
-            .find_map(|(block, capability)| (block == name).then_some(capability))
-    }
 
-    /// Take the block named `name` out of the model, for the runner that serves it.
-    pub fn take(&mut self, name: &BlockName) -> Option<Block> {
-        self.blocks
-            .iter()
-            .position(|(block, _)| block == name)
-            .map(|index| self.blocks.remove(index).1)
-    }
 
-    /// How many blocks the model has.
-    pub fn len(&self) -> usize {
-        self.blocks.len()
-    }
 
-    /// Whether the model has no block.
-    pub fn is_empty(&self) -> bool {
-        self.blocks.is_empty()
-    }
 }

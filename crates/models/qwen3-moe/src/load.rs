@@ -78,35 +78,6 @@ pub fn load(
     )
 }
 
-/// Load a model whose expert stacks are stored encoded (NVFP4).
-///
-/// Everything but the expert block is identical to [`load`]; the expert block's weights are the
-/// checkpoint's packed E2M1 field, its swizzled block scales and its per-expert tensor scales, in the
-/// layout the caller names. A checkpoint that stores them any other way is refused rather than
-/// reinterpreted, and the BF16 path above is untouched byte for byte.
-pub fn load_encoded(
-    root: &Path,
-    partition: Partition,
-    loader: &mut WeightLoader<'_>,
-    options: LoadOptions,
-    layout: ScaleLayout,
-) -> Result<Qwen3Moe> {
-    // Likewise for the encoded stacks: this entry point is the one that reads them, so the plan's
-    // reservation follows from the call rather than from a second statement the caller could get
-    // wrong.
-    load_with(
-        root,
-        partition,
-        loader,
-        LoadOptions {
-            experts_encoded: true,
-            ..options
-        },
-        Quantization::Nvfp4(layout),
-        &Representation::read(root)?,
-        &ExpertOrder::new(),
-    )
-}
 
 /// Load a checkpoint in the representation it declares about itself.
 ///

@@ -69,14 +69,12 @@ impl TransferTicket {
         self.value.is_some() || self.error.is_some()
     }
 
+    #[cfg(test)]
     pub(crate) fn retired(&self) -> bool {
         self.retirement.succeeded()
     }
 
-    pub(crate) fn undrained(&self) -> bool {
-        self.undrained
-    }
-
+    #[cfg(test)]
     pub(crate) fn retirement_ready(&self) -> Result<bool> {
         if self.undrained {
             return Err(Error::Resource("transfer physical completion is unknown"));
@@ -84,6 +82,12 @@ impl TransferTicket {
 
         Ok(self.retired())
     }
+
+
+    pub(crate) fn undrained(&self) -> bool {
+        self.undrained
+    }
+
 
     pub(crate) fn add_done_callback(&mut self, callback: Notify) -> Option<Notify> {
         if self.ready() {
@@ -292,37 +296,29 @@ mod tests {
     }
 
     #[test]
-    fn cancelling_a_read_does_not_return_its_physical_credit() -> Result<()> {
-        let capacity = Arc::new(TransferCapacity::new(8, 1)?);
-        capacity.take_reads(1)?;
-        let mut ticket = TransferTicket::new(false);
-        let (done, calls) = observer();
-        assert!(ticket.add_done_callback(done).is_none());
+    fn borrowed_consumption_closes_before_its_shared_retirement_completes() -> Result<()> {
+        let mut borrowed = TransferTicket::new(true);
+        assert!(borrowed.result().is_err());
+        notify(borrowed.complete(value(1)?, None));
+        assert!(borrowed.close());
+        assert!(!borrowed.close());
+        assert!(borrowed.result().is_err());
+        assert!(!borrowed.retirement_ready()?);
 
-        let released = Arc::clone(&capacity);
-        let returned: Notify = Arc::new(move || {
-            if let Err(error) = released.return_reads(1) {
-                panic!("{error}");
-            }
-        });
-        assert!(ticket.retirement.subscribe(returned).is_none());
-        notify(ticket.cancel(Error::Resource("transfer read was cancelled")));
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
-        // A copy completing after the cancellation leaves the cancellation
-        // as the result.
-        notify(ticket.complete(value(3)?, None));
-        assert!(matches!(ticket.result()?, Outcome::Failed(_)));
-        assert!(ticket.cancellation_error().is_some());
-        assert!(!ticket.retirement_ready()?);
-        assert!(matches!(
-            capacity.take_reads(1),
-            Err(Error::ReadBackpressure { .. })
-        ));
+        let retirement = Arc::clone(&borrowed.retirement);
+        drop(borrowed);
+        // A transport can finish the consumer fences after the ticket is
+        // dropped.
+        notify(retirement.complete(Ok(()))?);
+        assert!(retirement.succeeded());
+        let (late, _) = observer();
+        assert!(retirement.subscribe(late).is_some());
 
-        notify(ticket.retire()?);
-        assert!(ticket.retirement_ready()?);
-        capacity.take_reads(1)?;
-        capacity.return_reads(1)
+        let mut copied = TransferTicket::new(false);
+        notify(copied.complete(value(1)?, None));
+        assert!(!copied.close());
+        assert!(matches!(copied.result()?, Outcome::Success(_)));
+        Ok(())
     }
 
     #[test]
@@ -359,28 +355,36 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_consumption_closes_before_its_shared_retirement_completes() -> Result<()> {
-        let mut borrowed = TransferTicket::new(true);
-        assert!(borrowed.result().is_err());
-        notify(borrowed.complete(value(1)?, None));
-        assert!(borrowed.close());
-        assert!(!borrowed.close());
-        assert!(borrowed.result().is_err());
-        assert!(!borrowed.retirement_ready()?);
+    fn cancelling_a_read_does_not_return_its_physical_credit() -> Result<()> {
+        let capacity = Arc::new(TransferCapacity::new(8, 1)?);
+        capacity.take_reads(1)?;
+        let mut ticket = TransferTicket::new(false);
+        let (done, calls) = observer();
+        assert!(ticket.add_done_callback(done).is_none());
 
-        let retirement = Arc::clone(&borrowed.retirement);
-        drop(borrowed);
-        // A transport can finish the consumer fences after the ticket is
-        // dropped.
-        notify(retirement.complete(Ok(()))?);
-        assert!(retirement.succeeded());
-        let (late, _) = observer();
-        assert!(retirement.subscribe(late).is_some());
+        let released = Arc::clone(&capacity);
+        let returned: Notify = Arc::new(move || {
+            if let Err(error) = released.return_reads(1) {
+                panic!("{error}");
+            }
+        });
+        assert!(ticket.retirement.subscribe(returned).is_none());
+        notify(ticket.cancel(Error::Resource("transfer read was cancelled")));
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        // A copy completing after the cancellation leaves the cancellation
+        // as the result.
+        notify(ticket.complete(value(3)?, None));
+        assert!(matches!(ticket.result()?, Outcome::Failed(_)));
+        assert!(ticket.cancellation_error().is_some());
+        assert!(!ticket.retirement_ready()?);
+        assert!(matches!(
+            capacity.take_reads(1),
+            Err(Error::ReadBackpressure { .. })
+        ));
 
-        let mut copied = TransferTicket::new(false);
-        notify(copied.complete(value(1)?, None));
-        assert!(!copied.close());
-        assert!(matches!(copied.result()?, Outcome::Success(_)));
-        Ok(())
+        notify(ticket.retire()?);
+        assert!(ticket.retirement_ready()?);
+        capacity.take_reads(1)?;
+        capacity.return_reads(1)
     }
 }

@@ -1349,6 +1349,7 @@ impl Watchdog {
 mod tests {
     use super::*;
     use crate::policy::{PolicyReverted, TrialState};
+    
     use scheduling::guest::{ComponentId, RequestClass, Room, Storage, Warming};
 
     fn request(id: u64, state: RequestState) -> RequestView {
@@ -1378,7 +1379,7 @@ mod tests {
         }
     }
 
-    fn live(requests: Vec<RequestView>, queue: Vec<RequestId>, kinds: &[(u32, PhaseKind)]) -> Live {
+    fn live(requests: Vec<RequestView>, queue: Vec<RequestId>, kinds: &[(u32, PhaseKind)]) -> Live<'_> {
         let mut live = Live {
             requests: requests.into_iter().map(|r| (r.id, r)).collect(),
             queue,
@@ -1438,126 +1439,6 @@ mod tests {
             prefetch: Vec::new(),
             refill: Vec::new(),
         }
-    }
-
-    /// A fixed policy, standing in for `policy.rs`'s slot in the mechanism's
-    /// tests: it hands the validators plans, victims, and failures without
-    /// wasmtime and without the switch.
-    struct Static {
-        plan: Plan,
-        victims: Vec<Victim>,
-        failures: usize,
-    }
-
-    impl Static {
-        fn observe(&mut self, _events: &[Event]) -> Result<(), PolicyError> {
-            Ok(())
-        }
-
-        fn dispatch(&mut self, _room: &Room) -> Result<Plan, PolicyError> {
-            Ok(self.plan.clone())
-        }
-
-        fn reclaim(&mut self, _shortage: &Shortage) -> Result<Vec<Victim>, PolicyError> {
-            Ok(self.victims.clone())
-        }
-
-        fn place(
-            &mut self,
-            _call: &CallView,
-            replicas: &[ReplicaView],
-        ) -> Result<usize, PolicyError> {
-            Ok(replicas.first().map(|replica| replica.index).unwrap_or(0))
-        }
-
-        fn warm(&mut self, room: &Room) -> Result<Vec<PageId>, PolicyError> {
-            Ok(room
-                .warming
-                .iter()
-                .flat_map(|warming| warming.pages.iter().copied())
-                .collect())
-        }
-
-        fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
-            Ok(ExpertOrder {
-                layout: (0..load.experts)
-                    .map(|expert| expert % load.ranks.max(1))
-                    .collect(),
-            })
-        }
-
-        fn fail(
-            &mut self,
-            error: &PolicyError,
-            _state: &TrialState,
-        ) -> Result<PolicyReverted, PolicyError> {
-            self.failures += 1;
-            Err(PolicyError::invalid(Call::Init, error.to_string()))
-        }
-
-        fn boundary(&mut self, _state: &TrialState) -> Result<Option<PolicyReverted>, PolicyError> {
-            Ok(None)
-        }
-    }
-
-    #[test]
-    fn a_static_policy_goes_through_the_same_validators_the_live_path_does() {
-        let mut live = live(
-            vec![
-                {
-                    let r = request(1, RequestState::Queued);
-                    r
-                },
-                {
-                    let mut r = request(2, RequestState::Resident);
-                    r.phase = Some(PhaseId(1));
-                    r.next_tokens = 1;
-                    r
-                },
-            ],
-            vec![RequestId(1)],
-            &[(0, PhaseKind::Prefill), (1, PhaseKind::Decode)],
-        );
-        let mut plan = plan(vec![Work {
-            request: RequestId(2),
-            phase: PhaseId(1),
-            tokens: 1,
-        }]);
-        plan.admit = vec![RequestId(1)];
-        let mut policy = Static {
-            plan,
-            victims: Vec::new(),
-            failures: 0,
-        };
-
-        // A good answer validates and executes; the failed one is the policy's.
-        let decision = policy.dispatch(&room()).expect("the fixed plan");
-        validate_plan(&decision, &room(), &live).expect("a valid plan");
-
-        policy.plan.work[0].tokens = 9;
-        let decision = policy.dispatch(&room()).expect("the fixed plan");
-        let error = validate_plan(&decision, &room(), &live).expect_err("an invalid plan");
-        let report = policy.fail(&error, &TrialState::default());
-        assert_eq!(policy.failures, 1);
-        assert!(
-            report.is_err(),
-            "a policy with no previous one cannot serve on"
-        );
-        assert!(
-            policy
-                .boundary(&TrialState::default())
-                .expect("a boundary")
-                .is_none()
-        );
-
-        // The routing and dispatch answers are checked the same way.
-        let ranks = vec![RankView {
-            index: 0,
-            in_flight: 0,
-            alive: true,
-        }];
-        validate_route(&live.requests[&RequestId(2)], &ranks, 0).expect("a live rank");
-        live.queue.clear();
     }
 
     #[test]
@@ -2088,7 +1969,7 @@ mod tests {
         let mut live = live(
             vec![
                 {
-                    let mut r = request(1, RequestState::Resident);
+                    let r = request(1, RequestState::Resident);
                     r
                 },
                 {
@@ -2097,7 +1978,7 @@ mod tests {
                     r
                 },
                 {
-                    let mut r = request(3, RequestState::Resident);
+                    let r = request(3, RequestState::Resident);
                     r
                 },
             ],
@@ -2128,5 +2009,88 @@ mod tests {
             watchdog.starved(&live, Nanos(20_000_000_000), timeout),
             None
         );
+    }
+
+    struct Static {
+        plan: Plan,
+        failures: usize,
+    }
+
+    impl Static {
+        fn dispatch(&mut self, _room: &Room) -> Result<Plan, PolicyError> {
+            Ok(self.plan.clone())
+        }
+
+        fn fail(
+            &mut self,
+            error: &PolicyError,
+            _state: &TrialState,
+        ) -> Result<PolicyReverted, PolicyError> {
+            self.failures += 1;
+            Err(PolicyError::invalid(Call::Init, error.to_string()))
+        }
+
+        fn boundary(&mut self, _state: &TrialState) -> Result<Option<PolicyReverted>, PolicyError> {
+            Ok(None)
+        }
+    }
+
+    #[test]
+    fn a_static_policy_goes_through_the_same_validators_the_live_path_does() {
+        let mut live = live(
+            vec![
+                {
+                    let r = request(1, RequestState::Queued);
+                    r
+                },
+                {
+                    let mut r = request(2, RequestState::Resident);
+                    r.phase = Some(PhaseId(1));
+                    r.next_tokens = 1;
+                    r
+                },
+            ],
+            vec![RequestId(1)],
+            &[(0, PhaseKind::Prefill), (1, PhaseKind::Decode)],
+        );
+        let mut plan = plan(vec![Work {
+            request: RequestId(2),
+            phase: PhaseId(1),
+            tokens: 1,
+        }]);
+        plan.admit = vec![RequestId(1)];
+        let mut policy = Static {
+            plan,
+            failures: 0,
+        };
+
+        // A good answer validates and executes; the failed one is the policy's.
+        let decision = policy.dispatch(&room()).expect("the fixed plan");
+        validate_plan(&decision, &room(), &live).expect("a valid plan");
+
+        policy.plan.work[0].tokens = 9;
+        let decision = policy.dispatch(&room()).expect("the fixed plan");
+        let error = validate_plan(&decision, &room(), &live).expect_err("an invalid plan");
+        let report = policy.fail(&error, &TrialState::default());
+        assert_eq!(policy.failures, 1);
+        assert!(
+            report.is_err(),
+            "a policy with no previous one cannot serve on"
+        );
+        assert!(
+            policy
+                .boundary(&TrialState::default())
+                .expect("a boundary")
+                .is_none()
+        );
+
+        // The routing and dispatch answers are checked the same way.
+        let ranks = vec![RankView {
+            index: 0,
+            in_flight: 0,
+            alive: true,
+        }];
+        validate_route(&live.requests[&RequestId(2)], &ranks, 0).expect("a live rank");
+        live.queue.clear();
     }
 }

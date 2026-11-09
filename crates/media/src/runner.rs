@@ -43,10 +43,6 @@ impl MediaRunner {
         }
     }
 
-    /// The configuration this runner was created with.
-    pub fn config(&self) -> &MediaConfig {
-        &self.config
-    }
 
     /// Verifies that the linked FFmpeg runtime provides the serving encoders.
     ///

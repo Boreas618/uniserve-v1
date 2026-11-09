@@ -17,10 +17,6 @@ pub enum FactsError {
 }
 
 impl FactsError {
-    /// A violated invariant, described by `message`.
-    pub fn invalid(message: impl Into<String>) -> Self {
-        Self::Invalid(message.into())
-    }
 }
 
 /// Result of a family rule.

@@ -36,10 +36,6 @@ impl HandleType {
         }
     }
 
-    /// Whether a handle of this type can be imported on another host.
-    pub fn crosses_hosts(self) -> bool {
-        self == Self::Fabric
-    }
 
     /// The handle type exportable allocations on `device` use: fabric if the
     /// driver can create a fabric-exportable allocation there, otherwise a
@@ -622,9 +618,6 @@ impl PeerMapping {
         self.bytes
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
 }
 
 /// A reserved virtual range whose segments are physical allocations of
@@ -746,9 +739,6 @@ impl SegmentedMapping {
         })
     }
 
-    pub fn device(&self) -> DeviceId {
-        self.device
-    }
 
     /// The device address of byte 0.
     pub fn address(&self) -> u64 {
@@ -759,9 +749,6 @@ impl SegmentedMapping {
         self.bytes
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
 
     /// The segments' count.
     pub fn segments(&self) -> usize {
@@ -938,8 +925,7 @@ impl SegmentedMapping {
 
     /// Maps segment `index` from the POSIX descriptor of a physical
     /// allocation of its length with `protection`, which the segment keeps
-    /// through later changes of the mapping's protection until
-    /// [`Self::protect_segment`] changes it: a segment another process
+    /// through later changes of the mapping's protection: a segment another process
     /// writes is mapped read-only, so a fault here cannot corrupt it.
     ///
     /// # Errors
@@ -962,24 +948,6 @@ impl SegmentedMapping {
         self.map(index, offset, bytes, handle)
     }
 
-    /// Changes one mapped segment's access in place, at unchanged
-    /// addresses.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the segment is not mapped or the driver refuses.
-    pub fn protect_segment(&mut self, index: usize, protection: Protection) -> Result<()> {
-        let Some((offset, bytes, handle, _)) = self.segments.get(index).copied() else {
-            return Err(Error::invalid(format!("segment {index} does not exist")));
-        };
-        if handle.is_none() {
-            return Err(Error::invalid(format!("segment {index} is not mapped")));
-        }
-        self.segments[index].3 = protection;
-        let context = PrimaryContext::retain(self.device)?;
-        let _guard = context.enter()?;
-        self.grant(offset, bytes, protection)
-    }
 
     /// Unmaps segment `index` and releases this process's mapped reference to
     /// its storage; the caller has drained every device access to it. The

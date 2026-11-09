@@ -539,62 +539,6 @@ mod tests {
         );
     }
 
-    /// §7.5.1's ownership rule, which no run reaches: the responses the
-    /// successor reported taking are adopted — it writes the rest of them —
-    /// and the ones it did not report resume here, so a response the successor
-    /// could not take over is the predecessor's again from the boundary it
-    /// stopped at.
-    #[tokio::test]
-    async fn the_predecessor_adopts_what_the_successor_took_and_resumes_the_rest() {
-        let socket = |request_id: &str| {
-            let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
-            // The far end outlives the handoff in a real deployment (it is the
-            // client); the test's pauses are microseconds and the socket is
-            // never written, so dropping it here changes nothing.
-            drop(theirs);
-            let (decision, answer) = tokio::sync::oneshot::channel();
-            let frozen = FrozenStream {
-                id: 1,
-                request_id: request_id.to_owned(),
-                frozen_at_ns: 1_000,
-                state: handoff::Stream::default(),
-                descriptor: std::os::fd::OwnedFd::from(ours),
-                decision,
-            };
-            (frozen, answer)
-        };
-        let (taken, mut taken_answer) = socket("taken");
-        let (resumed, mut resumed_answer) = socket("resumed");
-        let paused = Paused {
-            records: Vec::new(),
-            descriptors: Vec::new(),
-            frozen: vec![taken, resumed],
-            handoff: None,
-            decided: false,
-        };
-
-        paused.decide(
-            &[Taken {
-                request_id: "taken".to_owned(),
-                at_ns: 1_500,
-            }],
-            4_242,
-        );
-
-        assert_eq!(
-            taken_answer
-                .try_recv()
-                .expect("the taken response is answered"),
-            Decision::Adopt
-        );
-        assert_eq!(
-            resumed_answer
-                .try_recv()
-                .expect("the untaken response is answered"),
-            Decision::Resume
-        );
-    }
-
     /// A response the successor cannot read is not taken over: it stays the
     /// predecessor's, it is reported as taken over by nobody, and the
     /// successor does not take its socket out of the handover — it does not
@@ -680,5 +624,60 @@ mod tests {
         assert!(adoption.streams.is_empty());
         assert!(take_adopted().is_empty());
         assert!(!socket_taken, "a response without framing does not move");
+    }
+
+    /// §7.5.1's ownership rule, which no run reaches: the responses the
+    /// successor reported taking are adopted — it writes the rest of them —
+    /// and the ones it did not report resume here, so a response the successor
+    /// could not take over is the predecessor's again from the boundary it
+    /// stopped at.
+    #[tokio::test]
+    async fn the_predecessor_adopts_what_the_successor_took_and_resumes_the_rest() {
+        let socket = |request_id: &str| {
+            let (ours, theirs) = std::os::unix::net::UnixStream::pair().expect("a socket pair");
+            // The far end outlives the handoff in a real deployment (it is the
+            // client); the test's pauses are microseconds and the socket is
+            // never written, so dropping it here changes nothing.
+            drop(theirs);
+            let (decision, answer) = tokio::sync::oneshot::channel();
+            let frozen = FrozenStream {
+                request_id: request_id.to_owned(),
+                frozen_at_ns: 1_000,
+                state: handoff::Stream::default(),
+                descriptor: std::os::fd::OwnedFd::from(ours),
+                decision,
+            };
+            (frozen, answer)
+        };
+        let (taken, mut taken_answer) = socket("taken");
+        let (resumed, mut resumed_answer) = socket("resumed");
+        let paused = Paused {
+            records: Vec::new(),
+            descriptors: Vec::new(),
+            frozen: vec![taken, resumed],
+            handoff: None,
+            decided: false,
+        };
+
+        paused.decide(
+            &[Taken {
+                request_id: "taken".to_owned(),
+                at_ns: 1_500,
+            }],
+            4_242,
+        );
+
+        assert_eq!(
+            taken_answer
+                .try_recv()
+                .expect("the taken response is answered"),
+            Decision::Adopt
+        );
+        assert_eq!(
+            resumed_answer
+                .try_recv()
+                .expect("the untaken response is answered"),
+            Decision::Resume
+        );
     }
 }

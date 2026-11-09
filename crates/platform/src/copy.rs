@@ -189,10 +189,6 @@ impl CopyBatch {
         self.sizes.push(bytes);
     }
 
-    /// When the batch's sources are read.
-    pub fn order(&self) -> SourceOrder {
-        self.order
-    }
 
     pub fn len(&self) -> usize {
         self.sizes.len()
@@ -202,11 +198,6 @@ impl CopyBatch {
         self.sizes.is_empty()
     }
 
-    pub fn clear(&mut self) {
-        self.destinations.clear();
-        self.sources.clear();
-        self.sizes.clear();
-    }
 
     /// The `(destination, source, bytes)` entries in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64, usize)> + '_ {

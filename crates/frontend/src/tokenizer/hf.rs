@@ -167,10 +167,6 @@ impl HuggingFaceTokenizer {
         self.tokenizer.token_to_id(token)
     }
 
-    /// Resolves one vocabulary identifier to its token text.
-    pub fn id_to_token(&self, id: u32) -> Option<String> {
-        self.tokenizer.id_to_token(id).map(ToOwned::to_owned)
-    }
 
     /// Returns whether an identifier belongs to the special-token set.
     pub fn is_special_id(&self, token_id: u32) -> bool {

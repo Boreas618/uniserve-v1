@@ -65,19 +65,6 @@ pub enum PolicyError {
 }
 
 impl PolicyError {
-    /// The call this failure happened in, when it belongs to one.
-    pub const fn call(&self) -> Option<Call> {
-        match self {
-            Self::Load { .. }
-            | Self::Instantiate { .. }
-            | Self::BadLimits { .. }
-            | Self::Starved { .. } => None,
-            Self::Trap { call, .. }
-            | Self::FuelExhausted { call }
-            | Self::Malformed { call, .. }
-            | Self::Poisoned { call } => Some(*call),
-        }
-    }
 
     /// A decision the mechanism found invalid, reported as a policy failure
     /// (§4.4: a decision naming an object that does not exist, does not fit or

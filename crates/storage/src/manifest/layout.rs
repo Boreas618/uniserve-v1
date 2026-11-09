@@ -34,7 +34,7 @@ use std::ops::Range;
 
 use serde::{Deserialize, Serialize};
 
-use super::region::{Span, volume};
+use super::region::Span;
 use super::{Error, Result};
 
 /// Logical indices `span` of one dimension, held from local position
@@ -722,10 +722,6 @@ impl StorageLayout {
     }
 }
 
-/// The number of elements of the logical box `spans`.
-pub fn elements(spans: &[Span]) -> u64 {
-    volume(spans)
-}
 
 #[cfg(test)]
 mod tests {

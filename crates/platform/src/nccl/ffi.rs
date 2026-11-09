@@ -110,7 +110,6 @@ pub(super) struct Api {
     pub(super) comm_destroy: unsafe extern "C" fn(Handle) -> NcclResult,
     pub(super) comm_abort: unsafe extern "C" fn(Handle) -> NcclResult,
     pub(super) all_reduce: Reduction,
-    pub(super) reduce_scatter: Reduction,
     pub(super) all_gather: Collective,
     /// `ncclBroadcast(send, recv, count, type, root, comm, stream)`.
     pub(super) broadcast: Reduction,
@@ -120,10 +119,6 @@ pub(super) struct Api {
     pub(super) group_end: unsafe extern "C" fn() -> NcclResult,
     // An entry point of newer releases (2.28).
     pub(super) all_to_all: Result<Collective>,
-    /// `ncclCommSuspend(comm, flags)` and `ncclCommResume(comm)`, entry
-    /// points of newer releases (2.30).
-    pub(super) comm_suspend: Result<unsafe extern "C" fn(Handle, i32) -> NcclResult>,
-    pub(super) comm_resume: Result<unsafe extern "C" fn(Handle) -> NcclResult>,
     // Declared last: the library outlives every copied function pointer.
     _library: Library,
 }
@@ -161,7 +156,6 @@ pub(super) fn api() -> Result<&'static Api> {
                 comm_destroy: symbol(&library, "ncclCommDestroy")?,
                 comm_abort: symbol(&library, "ncclCommAbort")?,
                 all_reduce: symbol(&library, "ncclAllReduce")?,
-                reduce_scatter: symbol(&library, "ncclReduceScatter")?,
                 all_gather: symbol(&library, "ncclAllGather")?,
                 broadcast: symbol(&library, "ncclBroadcast")?,
                 send: symbol(&library, "ncclSend")?,
@@ -169,8 +163,6 @@ pub(super) fn api() -> Result<&'static Api> {
                 group_start: symbol(&library, "ncclGroupStart")?,
                 group_end: symbol(&library, "ncclGroupEnd")?,
                 all_to_all: symbol(&library, "ncclAlltoAll"),
-                comm_suspend: symbol(&library, "ncclCommSuspend"),
-                comm_resume: symbol(&library, "ncclCommResume"),
                 _library: library,
             })
         }

@@ -27,8 +27,8 @@
 //!
 //! Two model calls fill it, in either order, because they write disjoint rows and neither reads the
 //! other's: the text encoder's own features and the zero row are the encoder stage's, and then
-//! [`Denoiser::encode_conditions`] projects each condition's own rows into the condition rows, and
-//! `Denoiser::prepare_conditioning` refines the prompt's rows in place. The condition projection
+//! `Denoiser::prepare_conditioning` projects each condition's own rows into the condition rows and
+//! refines the prompt's rows in place. The condition projection
 //! needs the request's declared condition shapes and therefore the stage that holds the request;
 //! the refinement needs only the buffer, which is why it is the denoiser's own per-request hook.
 //!
@@ -1392,48 +1392,7 @@ pub const AUDIO_CONDITION_TIME: f32 = 1.0;
 /// `std * (eps_request - eps_42)` - and the rows that disagreement lands in feed every evaluation.
 pub const POSTERIOR_SEED: u64 = 42;
 
-/// A request's condition rows, each condition's visual view and its audio view.
-struct ConditionViews {
-    pairs: Vec<(Option<TensorView>, Option<TensorView>)>,
-}
 
-impl ConditionViews {
-    /// Pair the request's flat view list with its conditions: each condition contributes its
-    /// visual patch rows when it has pixels and its audio rows when it has samples, in that order,
-    /// which is the order the reference's `latents` tuple holds them
-    /// (`uniserve/models/minimax_h3/denoiser.py:553-561`).
-    fn new(conditions: &[packing::Condition], views: &[TensorView]) -> Result<Self> {
-        let mut offered = views.iter();
-        let mut pairs = Vec::with_capacity(conditions.len());
-        let missing = || Error::config("a condition's latents were not offered".to_owned());
-        for condition in conditions {
-            let visual = if condition.frame.is_some() {
-                Some(*offered.next().ok_or_else(missing)?)
-            } else {
-                None
-            };
-            let audio = if condition.audio_samples > 0 {
-                Some(*offered.next().ok_or_else(missing)?)
-            } else {
-                None
-            };
-            pairs.push((visual, audio));
-        }
-        if offered.next().is_some() {
-            return Err(Error::config(format!(
-                "{} condition latents were offered for {} conditions",
-                views.len(),
-                conditions.len()
-            )));
-        }
-        Ok(Self { pairs })
-    }
-
-    /// One condition's visual and audio latents, in request order.
-    fn of(&self, condition: u32) -> (Option<TensorView>, Option<TensorView>) {
-        self.pairs[condition as usize]
-    }
-}
 
 /// Refuse a diagnostic view whose shape is not the tensor it is meant to hold.
 fn check_trace_view(view: TensorView, rows: u64, columns: u64, name: &str) -> Result<()> {
@@ -2539,10 +2498,6 @@ impl Denoiser {
         Ok(())
     }
 
-    /// The condition encoders, when this deployment holds them.
-    pub fn encoders(&self) -> Option<&ConditionEncoders> {
-        self.encoders.as_ref()
-    }
 
     /// Whether this deployment places the condition encoders.
     ///
@@ -3031,182 +2986,6 @@ impl Denoiser {
         )
     }
 
-    pub fn encode_conditions(
-        &self,
-        f: &Forward,
-        request: &VideoRequest<'_>,
-        layout: Layout,
-        conditions: ConditionLatents<'_>,
-        out: TensorView,
-        trace: Option<&ConditionTrace<'_>>,
-    ) -> Result<()> {
-        let canvas = canvas_of_latents(&layout)?;
-        let declared = conditions_of(request);
-        let segments = packing::condition_segments(&declared, &canvas, self.config.clip)?;
-        // The source is sized by the layout the runner laid the request out under, so a buffer of
-        // another size is refused here rather than read past its rows below.
-        let packing = self.rules.packing_of(&layout)?;
-        let hidden = u64::from(self.config.transformer.hidden_size);
-        let rows = u64::from(packing.text_rows + packing.condition_rows + 1);
-        if out.shape.rank() != 2 || out.shape.dim(0) != rows || out.shape.dim(1) != hidden {
-            return Err(Error::config(format!(
-                "the H3 prefix source is [{rows}, {hidden}] rows for this layout, got {:?}",
-                out.shape.dims()
-            )));
-        }
-        if segments.is_empty() {
-            return Ok(());
-        }
-        let video_channels = u64::from(self.config.transformer.video_channels);
-        let audio_channels = u64::from(self.config.transformer.audio_channels);
-        let width = video_channels * 4;
-        let views = ConditionViews::new(&declared, conditions.latents)?;
-        let visual = segments
-            .iter()
-            .filter(|segment| segment.visual.is_some())
-            .count();
-        if let Some(trace) = trace
-            && (trace.draws.len() != visual || trace.clean.len() != visual)
-        {
-            return Err(Error::config(format!(
-                "the condition trace offers {} draws and {} latents for {visual} visual conditions",
-                trace.draws.len(),
-                trace.clean.len()
-            )));
-        }
-        let mut traced = 0usize;
-        let mut draws = conditions.noise.iter();
-        let mut row = packing.text_rows;
-        for segment in &segments {
-            let (visual_view, audio_view) = views.of(segment.condition);
-            // Audio rows lead their segment in the packed order.
-            if segment.audio_rows() > 0 {
-                let audio = audio_view.ok_or_else(|| {
-                    Error::config(format!(
-                        "condition {} carries {} audio rows and no latents were offered",
-                        segment.condition,
-                        segment.audio_rows()
-                    ))
-                })?;
-                let count = u64::from(segment.audio_rows());
-                if audio.dtype != DType::F32 {
-                    return Err(Error::config(format!(
-                        "condition {}'s audio rows are {}, and the reference projects them in \
-                         FP32 (`denoiser.py:613-618`)",
-                        segment.condition, audio.dtype
-                    )));
-                }
-                if audio.shape.dims() != [count, audio_channels] {
-                    return Err(Error::config(format!(
-                        "condition {}'s audio rows are [{count}, {audio_channels}], got {:?}",
-                        segment.condition,
-                        audio.shape.dims()
-                    )));
-                }
-                self.transformer
-                    .project_audio(f, audio, row_range(out, row, count)?)?;
-                row += segment.audio_rows();
-            }
-            let Some(visual) = segment.visual else {
-                continue;
-            };
-            let clean = visual_view.ok_or_else(|| {
-                Error::config(format!(
-                    "condition {} carries {} visual rows and no latents were offered",
-                    segment.condition,
-                    visual.rows()
-                ))
-            })?;
-            let count = u64::from(visual.rows());
-            if clean.dtype != DType::F32 {
-                return Err(Error::config(format!(
-                    "condition {}'s patch rows are {}, and the encoder's normalised rows are \
-                     FP32 (`denoiser.py:605`)",
-                    segment.condition, clean.dtype
-                )));
-            }
-            if clean.shape.dims() != [count, width] {
-                return Err(Error::config(format!(
-                    "condition {}'s visual patch rows are [{count}, {width}], got {:?}",
-                    segment.condition,
-                    clean.shape.dims()
-                )));
-            }
-            let (frames, height, columns) = (
-                u64::from(visual.frames),
-                u64::from(visual.raster.height),
-                u64::from(visual.raster.width),
-            );
-            let draw = draws.next().ok_or_else(|| {
-                Error::config(format!(
-                    "condition {} is visual and the runner offered no draw for it",
-                    segment.condition
-                ))
-            })?;
-            if draw.shape.dims() != [video_channels, frames, height, columns] {
-                return Err(Error::config(format!(
-                    "condition {}'s draw is [{video_channels}, {frames}, {height}, {columns}], \
-                     got {:?}",
-                    segment.condition,
-                    draw.shape.dims()
-                )));
-            }
-            if draw.dtype != DType::F32 {
-                return Err(Error::config(format!(
-                    "condition {}'s draw is {}, and the reference anchors in FP32 \
-                     (`denoiser.py:609-615`)",
-                    segment.condition, draw.dtype
-                )));
-            }
-            // The draw becomes packed rows, then the anchoring mixes the condition's latents in at
-            // the conditioning level: `target = (1 - t) target + t clean`. The canvas is FP32
-            // because the reference's is: both operands are FP32 there, and the projection reads
-            // the anchored rows in FP32 and rounds once, into `out` (`denoiser.py:609-620`).
-            let anchor = f.arena().tensor(DType::F32, Shape::new(&[count, width]))?;
-            nn::layers::Patch::new(video_channels, height, columns)?
-                .forward(f, *draw, anchor, frames)
-                .map_err(Error::from)?;
-            if let Some(trace) = trace {
-                // The two operands before the mix: `target = 0 * target + 1 * source` writes the
-                // view without reading what it held.
-                check_trace_view(trace.draws[traced], count, width, "draw")?;
-                check_trace_view(trace.clean[traced], count, width, "clean")?;
-                nn::layers::ScaledAdd
-                    .forward(f, trace.draws[traced], anchor, 1.0, 0.0)
-                    .map_err(Error::from)?;
-                nn::layers::ScaledAdd
-                    .forward(f, trace.clean[traced], clean, 1.0, 0.0)
-                    .map_err(Error::from)?;
-                traced += 1;
-            }
-            nn::layers::ScaledAdd
-                .forward(
-                    f,
-                    anchor,
-                    clean,
-                    VISUAL_CONDITION_TIME,
-                    1.0 - VISUAL_CONDITION_TIME,
-                )
-                .map_err(Error::from)?;
-            self.transformer
-                .project(f, anchor, row_range(out, row, count)?)?;
-            row += visual.rows();
-        }
-        if let Some(source) = trace.and_then(|trace| trace.source) {
-            let rows = u64::from(packing.condition_rows);
-            check_trace_view(source, rows, hidden, "source")?;
-            nn::layers::ScaledAdd
-                .forward(
-                    f,
-                    source,
-                    row_range(out, packing.text_rows, rows)?,
-                    1.0,
-                    0.0,
-                )
-                .map_err(Error::from)?;
-        }
-        Ok(())
-    }
 
     /// One denoising step: the latents in, the model's velocity, and the schedule's update.
     ///
@@ -3803,10 +3582,6 @@ impl Denoiser {
         &self.schedule
     }
 
-    /// The solver that advances a sample.
-    pub const fn solver(&self) -> &Solver {
-        &self.solver
-    }
 
     /// The element type the block computes in: the checkpoint's own, read from a block's gain.
     ///
@@ -3820,10 +3595,6 @@ impl Denoiser {
         self.transformer.dtype()
     }
 
-    /// How many solver evaluations one request makes.
-    pub const fn evaluations(&self) -> u32 {
-        self.evaluations
-    }
 
     /// The tables the runner fills after loading.
     ///
@@ -4844,32 +4615,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn each_condition_s_latents_are_paired_with_it_in_request_order() {
-        // A condition contributes its visual latents when it has pixels and its audio latents when
-        // it has samples, in that order; the packed order is another thing, so a view handed to the
-        // wrong condition would project one condition's media into another's rows.
-        let conditions = conditions_of(&conditioned());
-        let views: Vec<TensorView> = (0..5)
-            .map(|index| {
-                TensorView::with_strides(
-                    nn::DevicePtr::new(index * 4096),
-                    DType::BF16,
-                    Shape::new(&[1, 1]),
-                    nn::Strides::new(&[1, 1]),
-                )
-            })
-            .collect();
-        // Four latents: the keyframe's rows, the clip's rows and its track, the audio reference's
-        // track - `sum((video is not None) + (audio_samples > 0))`, the reference's own count.
-        let paired = ConditionViews::new(&conditions, &views[..4]).unwrap();
-        assert!(paired.of(0).0.is_some() && paired.of(0).1.is_none());
-        assert!(paired.of(1).0.is_some() && paired.of(1).1.is_some());
-        assert!(paired.of(2).0.is_none() && paired.of(2).1.is_some());
-        // Every expected view is required, and one too many is refused rather than dropped.
-        assert!(ConditionViews::new(&conditions, &views[..3]).is_err());
-        assert!(ConditionViews::new(&conditions, &views).is_err());
-    }
 
     #[test]
     fn the_tables_are_the_layout_s_and_the_step_is_the_worker_s_to_write() {

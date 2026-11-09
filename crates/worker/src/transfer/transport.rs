@@ -19,7 +19,7 @@ use std::ops::Range;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, Weak};
 
-use ipc::{Locator, MainProcessEndpoint, TransferTransport, Wake};
+use ipc::{Locator, MainProcessEndpoint, TransferTransport};
 use platform::{DeviceId, Event, Stream};
 
 use super::backing::TransportBuffer;
@@ -28,7 +28,7 @@ use super::pool::TransferPool;
 use super::read::{self, BorrowedReads, NativeRead, Read, ReadCall, ReadContext};
 use super::vmm::{CudaExports, Exported};
 use super::{
-    ByteReservation, Notify, ReadReservation, Retirement, Spans, TransferCapacity, notify,
+    ByteReservation, ReadReservation, Retirement, Spans, TransferCapacity, notify,
 };
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::MemoryKind;
@@ -56,15 +56,6 @@ impl TransportKind {
         }
     }
 
-    pub fn parse(name: &str) -> Result<Self> {
-        Ok(match name {
-            "local" => Self::Local,
-            "posix_shm" => Self::PosixShm,
-            "cuda_vmm" => Self::CudaVmm,
-            "channel" => Self::Channel,
-            _ => return Err(Error::Invalid(format!("unknown transport: {name}"))),
-        })
-    }
 
     /// The mechanism a locator was exported through.
     pub fn of(locator: &Locator) -> Self {
@@ -512,15 +503,6 @@ impl Transport {
         }
     }
 
-    /// Install the service wake fired when reads complete or exports retire.
-    pub(crate) fn set_wake(&self, wake: Option<Wake>) {
-        if let Some(endpoint) = self.endpoint() {
-            endpoint.set_wake(wake.clone());
-        }
-        self.reads
-            .set_completion_wake(wake.map(|wake| -> Notify { Arc::new(move || wake.wake()) }));
-    }
-
     pub(crate) fn reap(&self) -> Result<()> {
         match &self.backend {
             Backend::Shared { endpoint, .. } => endpoint.reap(),
@@ -530,16 +512,6 @@ impl Transport {
             }
             Backend::Local { endpoint, .. } => endpoint.reap(),
             Backend::Channel { .. } => Ok(()),
-        }
-    }
-
-    /// Whether remote readers still hold exports; their acknowledgments have
-    /// no wake source, so the service polls while this holds.
-    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
-        match &self.backend {
-            Backend::Shared { endpoint, .. } => endpoint.awaiting_acknowledgment(),
-            Backend::Cuda(cuda) => cuda.awaiting_acknowledgment(),
-            _ => false,
         }
     }
 
@@ -608,40 +580,6 @@ pub(super) fn read_destination(
     Ok(destination.clone())
 }
 
-/// The byte offset and length of whole leading rows of a shared export;
-/// `region`'s leading range is in logical coordinates.
-pub(super) fn row_span(locator: &Locator, region: Option<&[Range<u64>]>) -> Result<(usize, usize)> {
-    let element = ElementType::parse(&locator.dtype)?.bytes() as u64;
-    let shape = &locator.shape;
-    let rows = shape.first().copied().unwrap_or(1);
-    let row_bytes = element * shape.iter().skip(1).product::<u64>();
-    let Some(region) = region else {
-        return Ok((0, (row_bytes * rows) as usize));
-    };
-    if region.len() != shape.len()
-        || region
-            .iter()
-            .zip(shape)
-            .skip(1)
-            .any(|(range, &extent)| range.start != 0 || range.end != extent)
-    {
-        return Err(Error::Invalid(
-            "a borrowed span covers whole rows of the leading axis".into(),
-        ));
-    }
-    let origin = locator.offset.first().copied().unwrap_or(0);
-    let first = region[0].start.checked_sub(origin);
-    let last = region[0].end.checked_sub(origin);
-    match (first, last) {
-        (Some(first), Some(last)) if first < last && last <= rows => Ok((
-            (first * row_bytes) as usize,
-            ((last - first) * row_bytes) as usize,
-        )),
-        _ => Err(Error::Invalid(
-            "a borrowed span lies outside its location".into(),
-        )),
-    }
-}
 
 /// The transports a rank configured, sharing one capacity and event pool.
 ///
@@ -682,21 +620,6 @@ impl Transports {
         })
     }
 
-    /// Publish products only over `kinds`, each of which must be configured.
-    pub(crate) fn with_exports(mut self, kinds: &[TransportKind]) -> Result<Self> {
-        if let Some(kind) = kinds
-            .iter()
-            .find(|kind| !self.transports.contains_key(kind))
-        {
-            return Err(Error::Invalid(format!(
-                "export mechanism {} is not a configured transport",
-                kind.name()
-            )));
-        }
-        self.exports = kinds.iter().copied().collect();
-        Ok(self)
-    }
-
     pub fn get(&self, kind: TransportKind) -> Option<&Arc<Transport>> {
         self.transports.get(&kind)
     }
@@ -709,21 +632,9 @@ impl Transports {
             .flatten()
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.transports.is_empty()
-    }
-
     /// Whether the rank publishes over no mechanism.
     pub(crate) fn exports_nothing(&self) -> bool {
         self.exports.is_empty()
-    }
-
-    /// Whether the rank publishes over a mechanism other ranks can read:
-    /// anything but the process-local registry.
-    pub(crate) fn exports_remotely(&self) -> bool {
-        self.exports
-            .iter()
-            .any(|&kind| kind != TransportKind::Local)
     }
 
     pub fn capacity(&self) -> &Arc<TransferCapacity> {
@@ -734,19 +645,8 @@ impl Transports {
         self.transports.values()
     }
 
-    pub(crate) fn set_wake(&self, wake: Option<Wake>) {
-        for transport in self.iter() {
-            transport.set_wake(wake.clone());
-        }
-    }
-
     pub fn reap(&self) -> Result<()> {
         self.iter().try_for_each(|transport| transport.reap())
-    }
-
-    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
-        self.iter()
-            .any(|transport| transport.awaiting_acknowledgment())
     }
 
     /// Close every transport, returning the first failure.
@@ -756,40 +656,5 @@ impl Transports {
             result = result.and(transport.close());
         }
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn locator(shape: Vec<u64>, offset: Vec<u64>) -> Locator {
-        Locator {
-            source: MainProcessEndpoint {
-                host: "n".into(),
-                address_space: "a".into(),
-                incarnation: "i".into(),
-            },
-            transport: TransferTransport::PosixShm {
-                endpoint: "e".into(),
-                name: "s".into(),
-            },
-            nbytes: shape.iter().product::<u64>() * 2,
-            dtype: "bfloat16".into(),
-            shape,
-            offset,
-            device: "cpu".into(),
-        }
-    }
-
-    #[test]
-    fn borrowed_rows_are_whole_rows_relative_to_the_location() -> Result<()> {
-        let rows = locator(vec![4, 3], vec![10, 0]);
-        assert_eq!(row_span(&rows, None)?, (0, 24));
-        assert_eq!(row_span(&rows, Some(&[11..13, 0..3]))?, (6, 12));
-        assert!(row_span(&rows, Some(&[11..13, 0..2])).is_err());
-        assert!(row_span(&rows, Some(&[9..13, 0..3])).is_err());
-        assert!(row_span(&rows, Some(&[12..15, 0..3])).is_err());
-        Ok(())
     }
 }

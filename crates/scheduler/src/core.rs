@@ -534,29 +534,7 @@ impl SchedulerHandle {
         done
     }
 
-    /// One command of the program-layer update (§2.3, §7.3), as this scheduler
-    /// applies it: the stages, at the boundary they name.
-    ///
-    /// A `Switchover` that names the step its expert group agreed is applied at
-    /// that step alone; one that arrives after it is refused rather than applied
-    /// at a boundary the other ranks did not take.
-    pub fn command(
-        &self,
-        command: ipc::ProgramCommand,
-    ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.program_command(command)
-    }
 
-    /// One of the epoch's engine commands, as this scheduler applies it (§7.3):
-    /// a stage is answered when it applies; the commands that belong to the
-    /// main process or to the process holding the Program Server are answered
-    /// with that reason.
-    pub fn engine_command(
-        &self,
-        command: proto::process::Command,
-    ) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.engine_command(command)
-    }
 
     /// What this scheduler has done and what its policy has cost (§12), answered
     /// by the scheduler thread.
@@ -632,13 +610,6 @@ impl SchedulerHandle {
         &self.model
     }
 
-    /// Allocates the next request id of this scheduler's own requests.
-    ///
-    /// Ids start at 1 and are unique for the lifetime of this scheduler;
-    /// `Relaxed` suffices because only uniqueness is required.
-    pub fn next_request_id(&self) -> RequestId {
-        RequestId(self.next_id.fetch_add(1, Ordering::Relaxed))
-    }
 
     /// Returns whether the scheduler stopped on a terminal worker or
     /// worker failure: from its first fatal error on, before its thread
@@ -773,15 +744,7 @@ impl SchedulerHandle {
         self.commands.revert_policy()
     }
 
-    /// §7.3 step 6: the module a revert could return to is dropped.
-    pub fn purge_policy(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
-        self.commands.purge_policy()
-    }
 
-    /// §7.3 step 2's failure: a precopied generation is dropped.
-    pub fn discard_policy(&self) {
-        self.commands.discard_policy();
-    }
 
     /// The step this scheduler reached and §12's cost counters for its policy,
     /// or a timeout when the scheduler does not answer.

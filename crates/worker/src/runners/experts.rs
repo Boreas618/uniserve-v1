@@ -120,10 +120,6 @@ impl Union {
         })
     }
 
-    /// How many ranks the union has.
-    pub const fn ranks(&self) -> usize {
-        self.ranks
-    }
 
     /// States where `rank` is woken, once its worker exists.
     pub fn bind(&self, rank: usize, queue: Arc<JobQueue>, runner: RunnerId) -> Result<()> {
@@ -325,8 +321,9 @@ pub struct Member {
 
 /// The transport and what must outlive it.
 struct Backing {
-    /// Read by the package through the group structure.
-    channel: Box<Channel>,
+    /// Read by the package through the group structure: `group.handle` points into this box, so
+    /// it lives as long as the transport.
+    _channel: Box<Channel>,
     group: Box<Group>,
     transport: Option<Transport>,
     views: Option<ExchangeViews>,
@@ -359,7 +356,7 @@ impl Member {
             rank,
             shape,
             backend: Backing {
-                channel,
+                _channel: channel,
                 group,
                 transport: None,
                 views: None,
@@ -382,10 +379,6 @@ impl Member {
         self
     }
 
-    /// The rank's place in the union.
-    pub const fn rank(&self) -> usize {
-        self.rank
-    }
 
     /// Whether this rank only holds experts: every walk it takes is a join.
     pub const fn experts_only(&self) -> bool {

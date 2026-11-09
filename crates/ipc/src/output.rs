@@ -296,10 +296,6 @@ impl BatchOutput {
         self.completions.iter()
     }
 
-    /// Iterates over resolved product payloads in report order.
-    pub fn products(&self) -> impl Iterator<Item = &TensorExport> {
-        self.products.iter()
-    }
 
     /// Validates completion and product identities for this batch.
     pub fn validate(&self) -> ValidationResult<()> {

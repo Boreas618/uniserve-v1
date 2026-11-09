@@ -8,16 +8,6 @@ use ffi::{Handle, RawConfig, RawUniqueId, api};
 
 use crate::{DataType, DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, Result, Stream};
 
-/// `ncclCommSuspend`'s flag that releases the communicator's dynamic device
-/// storage.
-///
-/// The API documentation gives it as `0x01`; the system `nccl.h` this crate
-/// builds against does not define it at all, and only newer NCCL headers carry
-/// `#define NCCL_SUSPEND_MEM 0x01`. It is therefore a flag from the
-/// documentation rather than a header number, and
-/// `tests::the_nccl_constants_are_the_headers` does not table it: naming it
-/// there would fail on every machine whose header lacks it.
-const NCCL_SUSPEND_MEM: i32 = 0x01;
 
 /// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes,
 /// `#define NCCL_SPLIT_NOCOLOR -1` in `nccl.h`, compared there by
@@ -235,43 +225,6 @@ impl Communicator {
         api.check(status, "ncclAllReduce")
     }
 
-    /// Reduces `size * count` elements and leaves block `rank` (`count`
-    /// elements) in `recv`.
-    ///
-    /// The checks are [`Self::all_reduce`]'s, with `size * count` elements
-    /// required in `send` and `count` in `recv`.
-    pub fn reduce_scatter(
-        &self,
-        stream: &Stream,
-        send: DeviceRange,
-        recv: DeviceRange,
-        count: usize,
-        dtype: DataType,
-        op: ReduceOp,
-    ) -> Result<()> {
-        self.ready(stream, "ncclReduceScatter")?;
-        require_room(send.bytes(), ranks_bytes(count, dtype, self.size)?, "send")?;
-        require_room(recv.bytes(), elements_bytes(count, dtype)?, "recv")?;
-        // NCCL launches on `stream`, which the driver accepts only with the
-        // stream's context current on the calling thread; entering it here is
-        // what lets any thread issue a collective.
-        let _guard = self.context.enter()?;
-
-        let api = api()?;
-        // SAFETY: as in `all_reduce`, with `size * count` elements in `send`.
-        let status = unsafe {
-            (api.reduce_scatter)(
-                pointer(send.ptr()),
-                pointer(recv.ptr()),
-                count,
-                dtype.nccl(),
-                op as i32,
-                self.raw,
-                stream.handle(),
-            )
-        };
-        api.check(status, "ncclReduceScatter")
-    }
 
     /// Gathers `count` elements from every rank into `recv`, rank-major.
     ///
@@ -580,42 +533,8 @@ impl Communicator {
         api.check(unsafe { (api.comm_destroy)(self.raw) }, "ncclCommDestroy")
     }
 
-    /// Releases the communicator's dynamic device storage
-    /// (`ncclCommSuspend(NCCL_SUSPEND_MEM)`) until [`Self::resume`]. No
-    /// operation may run on it, nor a graph that captured one, in between.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the loaded NCCL predates suspension (2.30) or refuses it.
-    pub fn suspend(&mut self) -> Result<()> {
-        let api = api()?;
-        let suspend = api.comm_suspend.as_ref().map_err(Clone::clone)?;
-        let _guard = self.context.enter()?;
-        // SAFETY: the communicator is live and idle by the caller's contract.
-        api.check(
-            unsafe { suspend(self.raw, NCCL_SUSPEND_MEM) },
-            "ncclCommSuspend",
-        )
-    }
 
-    /// Allocates again what [`Self::suspend`] released; the communicator,
-    /// and graphs that captured its operations, run afterwards.
-    pub fn resume(&mut self) -> Result<()> {
-        let api = api()?;
-        let resume = api.comm_resume.as_ref().map_err(Clone::clone)?;
-        let _guard = self.context.enter()?;
-        // SAFETY: the communicator is live and suspended.
-        api.check(unsafe { resume(self.raw) }, "ncclCommResume")
-    }
 
-    /// Tears down this rank's communicator without waiting for peers, aborting
-    /// its pending operations.
-    pub fn abort(self) -> Result<()> {
-        let api = api()?;
-        let _guard = self.context.enter()?;
-        // SAFETY: the communicator is owned and aborted once.
-        api.check(unsafe { (api.comm_abort)(self.raw) }, "ncclCommAbort")
-    }
 }
 
 /// The bytes `count` elements of `dtype` occupy, without overflowing.

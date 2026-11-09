@@ -206,10 +206,6 @@ impl Seams {
         self.starts.len()
     }
 
-    /// Whether the axis has no tile, which only an empty extent would produce.
-    pub fn is_empty(&self) -> bool {
-        self.starts.is_empty()
-    }
 
     /// The latent span of tile `index`: `(first, end)` in latent cells, end exclusive, over a raster
     /// whose extent is `raster` **output pixels** (the same unit `split` was given).
@@ -1337,23 +1333,7 @@ impl VideoDecoder {
         table_bytes_into(&self.config, latent_height, latent_width, out)
     }
 
-    /// The layout's tables, keyed by the extents the layout states.
-    ///
-    /// This is the shape the capability protocol asks for; a request's own state is none of it.
-    pub fn layout_tables(&self, layout: &nn::capability::Layout) -> Result<Vec<StateTable>> {
-        let video = layout.video;
-        self.tables(video.height, video.width)
-    }
 
-    /// Write the layout's table bytes, in [`Self::layout_tables`]' order.
-    pub fn prepare_layout(
-        &self,
-        layout: &nn::capability::Layout,
-        out: &mut [Vec<u8>],
-    ) -> Result<()> {
-        let video = layout.video;
-        self.table_bytes(video.height, video.width, out)
-    }
 
     /// The rasters this decoder serves: the deployment's canvases, every one of them.
     ///
@@ -1364,24 +1344,6 @@ impl VideoDecoder {
         &self.canvases
     }
 
-    /// The served canvas a clip's latent extents name, refused by name when the deployment serves
-    /// another set.
-    pub fn canvas_of(&self, height: u32, width: u32) -> Result<Canvas> {
-        self.canvases
-            .iter()
-            .copied()
-            .find(|canvas| canvas.height == height && canvas.width == width)
-            .ok_or_else(|| {
-                Error::config(format!(
-                    "this decoder serves {} and the clip states {height}x{width} latent cells",
-                    self.canvases
-                        .iter()
-                        .map(|canvas| format!("{}x{}", canvas.height, canvas.width))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ))
-            })
-    }
 
     /// The largest of this clip's decode tiles: every tile of a served grid has its rows.
     pub fn largest_tile(&self, canvas: &Canvas) -> Result<Canvas> {

@@ -7,30 +7,23 @@
 //! retired worker's transfer module, with their operations unchanged.
 
 pub(crate) mod backing;
-pub(crate) mod cache_export;
-pub use cache_export::{CacheExport, StateIdentity};
 mod cache_import;
 mod capacity;
 mod channel;
 mod export_table;
 pub mod exports;
 pub mod fetch;
-pub(crate) mod links;
 mod local;
 mod pool;
 mod posix_shm;
 mod read;
 mod registry;
 pub mod spans;
-pub(crate) mod staging;
 mod ticket;
 mod transport;
 pub(crate) mod vmm;
-pub(crate) mod warming;
 
-pub(crate) use cache_import::{
-    CacheImport, CacheImporter, ImportCopy, ImportEntry, ImportWorkspace, Retired,
-};
+pub(crate) use cache_import::{CacheImporter, ImportCopy, ImportWorkspace, Retired};
 pub(crate) use posix_shm::SharedBuffer;
 pub use posix_shm::SharedRead;
 pub use read::Read;

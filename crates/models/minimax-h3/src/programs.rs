@@ -49,10 +49,6 @@ impl Programs {
         self.rows
     }
 
-    /// Whether no launch has been added.
-    pub fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
 }
 
 /// The element type of each component a deployment runs.
@@ -166,21 +162,6 @@ impl Deployment {
         })
     }
 
-    /// A deployment of the checkpoint at `root`.
-    ///
-    /// The configuration is read through [`Config::read`], which normalizes the checkpoint's sidecars
-    /// at this boundary - the one place that knows how a checkpoint's directories become a deployment.
-    /// A walk that parsed the component directories itself lacks the clip rule, the attention kind and
-    /// the canvas set, which are exactly the facts `rows_bound` needs; building a denoiser config from
-    /// what it has would be a second normalization of the same checkpoint.
-    pub fn read(
-        root: &std::path::Path,
-        types: Types,
-        rungs: Vec<u32>,
-        tasks: Vec<nn::VideoTask>,
-    ) -> Result<Self> {
-        Self::new(Config::read(root, None)?, types, rungs, tasks)
-    }
 
     /// The tasks the checkpoint at `root` states it serves.
     ///

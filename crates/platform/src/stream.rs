@@ -13,8 +13,6 @@ const CU_EVENT_WAIT_EXTERNAL: u32 = 1;
 /// What keeps a stream's (and its events') CUDA context alive.
 #[derive(Clone)]
 pub(crate) enum Retention {
-    /// The creator of a borrowed stream keeps its context alive.
-    Borrowed,
     Primary {
         _context: PrimaryContext,
     },
@@ -157,34 +155,6 @@ impl Stream {
         })
     }
 
-    /// Borrows a stream created outside this crate (for example by PyTorch
-    /// or NCCL) from its integer handle. A stream this crate created is
-    /// shared by cloning its handle instead.
-    ///
-    /// # Safety
-    /// `raw` must be a live stream on `device`, and its creator must keep the
-    /// stream and its context alive for as long as the returned value, its
-    /// clones, any stream forked from it, and any event recorded on it are
-    /// used.
-    pub unsafe fn borrowed(device: DeviceId, raw: usize) -> Result<Self> {
-        let raw = raw as Handle;
-        let driver = driver()?;
-        let mut context = std::ptr::null_mut();
-        driver.check(
-            // SAFETY: the caller guarantees the stream is live; the driver writes
-            // its context to the local `context`.
-            unsafe { (driver.stream_get_ctx)(raw, &mut context) },
-            "cuStreamGetCtx",
-        )?;
-
-        Ok(Self {
-            raw,
-            device,
-            context,
-            retention: Retention::Borrowed,
-            _created: None,
-        })
-    }
 
     /// Creates an independent owned stream in this stream's context with the
     /// same priority. It retains whatever this stream retains; forking a

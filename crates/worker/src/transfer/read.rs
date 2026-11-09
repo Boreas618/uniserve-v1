@@ -81,15 +81,6 @@ impl Read {
         lock(&self.state)
     }
 
-    /// Whether a result or an error is consumable.
-    pub(crate) fn ready(&self) -> bool {
-        self.lock().ticket.ready()
-    }
-
-    /// Whether the read retired; an error when its completion is unknown.
-    pub(crate) fn retirement_ready(&self) -> Result<bool> {
-        self.lock().ticket.retirement_ready()
-    }
 
     /// The physical retirement signal storage owners wait on.
     pub fn retirement(&self) -> Arc<Retirement> {

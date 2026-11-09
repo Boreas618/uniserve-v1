@@ -80,19 +80,6 @@ pub enum SequenceParallel {
 }
 
 impl SequenceParallel {
-    /// Context ranks precede the Ulysses ranks, which vary fastest.
-    pub fn dimensions(&self) -> [(&'static str, usize); 2] {
-        let (context, ulysses) = match *self {
-            Self::Local => (1, 1),
-            Self::Ulysses { ulysses_degree, .. } => (1, ulysses_degree),
-            Self::Allgather { allgather_degree } => (allgather_degree, 1),
-            Self::Hybrid {
-                ulysses_degree,
-                allgather_degree,
-            } => (allgather_degree, ulysses_degree),
-        };
-        [("cp", context), ("ulysses", ulysses)]
-    }
 
     /// Derives sequence degree from the selected strategy's independent dimensions.
     ///
@@ -219,16 +206,6 @@ impl BlockConfig {
         }
     }
 
-    /// Row-major rank order shared by rank layout, numerical meshes and routing.
-    pub fn dimensions(&self) -> [(&'static str, usize); 4] {
-        let [context, ulysses] = self.sequence_parallel.dimensions();
-        [
-            ("pp", self.pipeline_parallel_size),
-            context,
-            ("tp", self.tensor_parallel_size),
-            ulysses,
-        ]
-    }
 
     /// The rank count one model-parallel group of this block needs: the product
     /// of the tensor, pipeline, and sequence degrees.
@@ -272,23 +249,6 @@ impl BlockConfig {
         Ok(())
     }
 
-    /// Final-stage output ranks with tensor replicas counted once.
-    pub fn output_ranks(&self) -> Vec<usize> {
-        if self.distribution.is_some() {
-            return self.ranks.clone();
-        }
-        let stage = self.ranks.len() / self.pipeline_parallel_size;
-        let ulysses = self.sequence_parallel.dimensions()[1].1;
-        self.ranks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, &rank)| {
-                (index >= self.ranks.len() - stage
-                    && (index / ulysses).is_multiple_of(self.tensor_parallel_size))
-                .then_some(rank)
-            })
-            .collect()
-    }
 
     /// Reports whether every member rank publishes its own copy of the
     /// block's products.
@@ -297,8 +257,7 @@ impl BlockConfig {
     /// sequence-parallel ranks each publish their own shard. A tensor replica
     /// publishes once, from tensor-parallel coordinate zero, and only the
     /// final pipeline stage publishes, so a block with either degree above one
-    /// leaves some member ranks without a copy. [`Self::output_ranks`] selects
-    /// the publishing ranks by the same rule.
+    /// leaves some member ranks without a copy.
     pub fn publishes_on_every_rank(&self) -> bool {
         self.distribution.is_some()
             || (self.tensor_parallel_size == 1 && self.pipeline_parallel_size == 1)

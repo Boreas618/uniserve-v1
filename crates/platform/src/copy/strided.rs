@@ -76,10 +76,6 @@ impl StridedCopy {
         self.linear.is_empty() && self.pitched.is_empty()
     }
 
-    pub fn clear(&mut self) {
-        self.linear.clear();
-        self.pitched.clear();
-    }
 
     /// Appends the copies of `source` into `destination`. On error nothing is
     /// appended.

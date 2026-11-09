@@ -138,44 +138,6 @@ impl VsaTiles {
         self.width
     }
 
-    /// The descriptor this layer's `vsa_prepare_tiles` launch takes.
-    ///
-    /// Each program needs its own accessor rather than one shared descriptor, because they are
-    /// different operators with different geometry: `vsa_prepare_tiles`, `vsa_scores`,
-    /// `vsa_select_tiles`, `vsa_compress_pooled` and `vsa_add_gated_tiles` are the five this chain
-    /// launches. Two neighbours are declared and not this layer's: `vsa_compose_gated_rows` is
-    /// reached by no launch at all, and `vsa_zero_padding` is launched by the fine attention
-    /// (`SegmentAttention::forward`, which zeroes the rows it just wrote), so its descriptor lives
-    /// there — with the **output's** element type, which is what the padding rows are.
-    ///
-    /// The prepare launch is the one whose descriptor reads **strides**, so a walk without a device
-    /// can state it only for the layout the model's buffers have: `query_row_stride` and
-    /// `query_head_stride` are the caller's views, not the layer's geometry.
-    pub fn prepare_tiles_descriptor(
-        &self,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
-        cosine: Option<TensorView>,
-    ) -> segments::PrepareTilesDescriptor {
-        segments::PrepareTilesDescriptor {
-            dtype: query.dtype,
-            heads: self.heads,
-            width: self.width,
-            rotated: self.rotated,
-            tile_rows: self.tile_rows,
-            block_rows: self.block_rows,
-            epsilon: Float::from(self.eps),
-            norm: self.norm,
-            query_row_stride: query.strides.get(0),
-            query_head_stride: query.strides.get(1),
-            key_row_stride: key.strides.get(0),
-            key_head_stride: key.strides.get(1),
-            value_row_stride: value.strides.get(0),
-            value_head_stride: value.strides.get(1),
-            factor_stride: cosine.map(|table| table.strides.get(0)).unwrap_or(0),
-        }
-    }
 
     /// The descriptor one `vsa_add_gated_tiles` launch takes.
     pub fn add_gated_tiles_descriptor(&self, dtype: DType) -> segments::AddGatedTilesDescriptor {

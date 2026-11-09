@@ -35,15 +35,6 @@ const PAGE_ENCODING: u32 = 1;
 /// page each.
 pub const PAGE_BYTES: u64 = 256 << 10;
 
-/// The names of a video request's encoder outputs, whose largest bytes
-/// size the pool of a video encoding rank.
-pub(crate) const OUTPUTS: [&str; 4] = [
-    "vision_features",
-    "conditioning",
-    "condition_video_latents",
-    "condition_audio_latents",
-];
-
 /// The pages the pool holds: the encoder outputs of every request whose
 /// outputs can be needed at once, `largest` holding each output of a request
 /// at its largest bytes (a video request's outputs; the vision and latent
@@ -212,59 +203,9 @@ pub(crate) fn page_copies(
     copies
 }
 
-/// The copies of a rank's write of a call's output: the write holds the
-/// call-local rows `rows` (the rank's region of the output, or every row),
-/// the call's output holds the stored output's rows from `first` on, rows of
-/// `row_bytes` bytes, in pages of `page_bytes`. Each copy's `output` is the
-/// byte offset in the write, whose first byte is row `rows.start`'s.
-pub(crate) fn write_copies(
-    first: u32,
-    rows: std::ops::Range<u64>,
-    row_bytes: u64,
-    page_bytes: u64,
-) -> Vec<PageCopy> {
-    let start = rows.start * row_bytes;
-    page_copies(first, rows, row_bytes, page_bytes)
-        .into_iter()
-        .map(|copy| PageCopy {
-            output: copy.output - start,
-            ..copy
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Ranks that each write a region of a call's output copy the bytes of
-    /// their own write, from its first byte, to the stored bytes of the rows
-    /// the region holds.
-    #[test]
-    fn each_region_copies_its_own_write_to_its_rows_stored_bytes() {
-        // Stored rows of 3 bytes from row 2 on, pages of 8 bytes, four ranks
-        // of 5 rows each: regions cross page boundaries at uneven offsets.
-        let (first, row_bytes, page_bytes) = (2u32, 3u64, 8u64);
-        for rank in 0..4u64 {
-            let rows = 5 * rank..5 * rank + 5;
-            let copies = write_copies(first, rows.clone(), row_bytes, page_bytes);
-            // The copies cover the write's bytes once, in order, from 0.
-            let mut covered = 0;
-            for copy in &copies {
-                assert_eq!(copy.output, covered, "rank {rank}: {copies:?}");
-                covered += copy.bytes;
-                // Each piece lands at its rows' stored bytes.
-                let stored = (u64::from(first) + rows.start) * row_bytes + copy.output;
-                assert_eq!(
-                    copy.page as u64 * page_bytes + copy.offset,
-                    stored,
-                    "rank {rank}: {copies:?}"
-                );
-                assert!(copy.offset + copy.bytes <= page_bytes);
-            }
-            assert_eq!(covered, 5 * row_bytes, "rank {rank}: {copies:?}");
-        }
-    }
 
     /// A round's rows of a stored output split at every page boundary they
     /// cross, each piece at its place in the call's output and in its page.

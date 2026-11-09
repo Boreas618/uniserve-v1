@@ -55,14 +55,6 @@ pub enum ForwardMode {
 }
 
 impl ForwardMode {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Prefill => "prefill",
-            Self::Decode => "decode",
-            Self::Verify => "verify",
-            Self::TokenDenoising => "token_denoising",
-        }
-    }
 }
 
 /// The storage action performed between concrete producers and consumers.
@@ -79,13 +71,6 @@ impl TransferMode {
     /// Every transfer mode in declaration order.
     pub const ALL: [Self; 3] = [Self::Tensor, Self::CacheExport, Self::CacheInstall];
 
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Tensor => "tensor",
-            Self::CacheExport => "cache_export",
-            Self::CacheInstall => "cache_install",
-        }
-    }
 }
 
 /// Exactly one call classification. The sum preserves the distinct
@@ -138,13 +123,6 @@ impl CallKind {
         )
     }
 
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Forward(mode) => mode.as_str(),
-            Self::Media(call) => call.as_str(),
-            Self::Transfer(mode) => mode.as_str(),
-        }
-    }
 }
 
 /// Hard resource maxima the scheduler reserves before a call runs.
@@ -193,19 +171,6 @@ pub struct SamplingState {
 }
 
 impl SamplingState {
-    /// Sorts and deduplicates token identifier sets for deterministic encoding.
-    pub fn canonicalize(&mut self) {
-        if let Some(allowed) = &mut self.allowed_token_ids {
-            allowed.sort_unstable();
-            allowed.dedup();
-        }
-        self.suppressed_token_ids.sort_unstable();
-        self.suppressed_token_ids.dedup();
-        self.finish_token_ids.sort_unstable();
-        self.finish_token_ids.dedup();
-        self.transition_token_ids.sort_unstable();
-        self.transition_token_ids.dedup();
-    }
 }
 
 /// The coordinates one call executes at.
@@ -591,19 +556,7 @@ impl Call {
         self.latent_input.is_some() || self.latent_output.is_some()
     }
 
-    /// A context prefill interleaves prompt tokens and input-image blocks.
-    pub fn writes_context(&self) -> bool {
-        self.kind == CallKind::Forward(ForwardMode::Prefill)
-            && !self.vision_inputs.is_empty()
-            && self.completion_output.is_none()
-    }
 
-    /// Image feedback or a latent input writes one visual-state row.
-    /// Context-prefill vision blocks instead belong to its prompt segments.
-    pub fn writes_visual_state(&self) -> bool {
-        !self.writes_context()
-            && (!self.vision_inputs.is_empty() || self.latent_feature_input.is_some())
-    }
 
     /// Tensor dependencies in the call's signature, excluding its predicate.
     ///
@@ -973,22 +926,6 @@ impl MediaCall {
         Self::Muxing,
     ];
 
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::MediaReading => "media_reading",
-            Self::VisionEncoding => "vision_encoding",
-            Self::LatentEncoding => "latent_encoding",
-            Self::TextEncoding => "text_encoding",
-            Self::LatentPreparation => "latent_preparation",
-            Self::Denoising => "denoising",
-            Self::ImageDecoding => "image_decoding",
-            Self::VideoDecoding => "video_decoding",
-            Self::AudioDecoding => "audio_decoding",
-            Self::VideoEncoding => "video_encoding",
-            Self::AudioEncoding => "audio_encoding",
-            Self::Muxing => "muxing",
-        }
-    }
 
     /// The calls that read this call's products in a video request's graph,
     /// in the order the graph consumes them.

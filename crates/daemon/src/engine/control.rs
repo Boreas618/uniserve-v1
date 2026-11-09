@@ -270,11 +270,6 @@ impl EngineControl {
         &self.request_address
     }
 
-    /// The daemon process interface used to launch planning ranks on their nodes.
-    pub(crate) fn process_address(&self) -> &str {
-        &self.processes
-    }
-
     /// The identity the next engine this control starts takes.
     pub fn next_engine(&self) -> u64 {
         self.next_engine.load(Ordering::Relaxed)
@@ -439,84 +434,6 @@ impl EngineControl {
         Ok((control, welcome.nodes))
     }
 
-    /// Queries each daemon for its CUDA-visible devices with no compute or
-    /// graphics owner. These ordinals can be assigned to a successor without
-    /// displacing another serving epoch.
-    pub fn available_devices(&self) -> anyhow::Result<BTreeMap<String, Vec<u32>>> {
-        let (mut connection, nodes) = self.connect()?;
-        let mut devices = BTreeMap::new();
-        for (index, node) in nodes.into_iter().enumerate() {
-            connection.send(&process::Upstream {
-                kind: Some(upstream::Kind::Request(process::Request {
-                    id: index as u64 + 1,
-                    kind: Some(request::Kind::Devices(process::DeviceQuery {
-                        host: node.host.clone(),
-                    })),
-                })),
-            })?;
-            let answer: process::Downstream = connection
-                .recv(DAEMON_TIMEOUT)?
-                .context("the daemon did not report its available devices")?;
-            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
-                anyhow::bail!("the daemon did not answer its device query");
-            };
-            anyhow::ensure!(
-                answer.error.is_empty(),
-                "device inventory for {}: {}",
-                node.host,
-                answer.error
-            );
-            let Some(reply::Kind::Devices(inventory)) = answer.kind else {
-                anyhow::bail!("the daemon returned no device inventory");
-            };
-            devices.insert(node.host, inventory.available);
-        }
-        Ok(devices)
-    }
-
-    /// Reads host admission from the deployment's existing Storage Server
-    /// claims, including target nodes with no serving worker yet.
-    pub(crate) fn host_storage(
-        &self,
-        hosts: &[String],
-    ) -> anyhow::Result<BTreeMap<String, storage::protocol::HostStorage>> {
-        let (mut connection, _) = self.connect()?;
-        let mut storage = BTreeMap::new();
-        for (index, host) in hosts.iter().enumerate() {
-            connection.send(&process::Upstream {
-                kind: Some(upstream::Kind::Request(process::Request {
-                    id: index as u64 + 1,
-                    kind: Some(request::Kind::Ledger(process::LedgerQuery {
-                        host: host.clone(),
-                        deployment: self.deployment.clone(),
-                    })),
-                })),
-            })?;
-            let answer: process::Downstream = connection
-                .recv(DAEMON_TIMEOUT)?
-                .context("the daemon did not report its host storage")?;
-            let Some(downstream::Kind::Reply(answer)) = answer.kind else {
-                anyhow::bail!("the daemon did not answer its ledger query");
-            };
-            anyhow::ensure!(
-                answer.error.is_empty(),
-                "host storage for {host}: {}",
-                answer.error
-            );
-            let Some(reply::Kind::Ledger(report)) = answer.kind else {
-                anyhow::bail!("the daemon returned no storage ledger");
-            };
-            #[derive(serde::Deserialize)]
-            struct Ledger {
-                host_storage: storage::protocol::HostStorage,
-            }
-            storage.insert(
-                host.clone(),
-                serde_json::from_str::<Ledger>(&report.ledgers)?.host_storage,
-            );
-        }
-        Ok(storage)
-    }
 
     /// The storage ledgers every node's Storage Server keeps for the deployment, one JSON report
     /// per node: `{"host": ..., "ledgers": [...], "host_storage": {...}, "transfers": [...]}`.

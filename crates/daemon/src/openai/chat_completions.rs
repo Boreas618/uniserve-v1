@@ -7,8 +7,7 @@
 //! `Leader::generate`. Both response paths consume the `RequestOutput`
 //! stream it returns: [`collect_chat_completion`] folds it into one
 //! `ChatCompletionResponse`; [`chat_completion_chunk_stream`] maps it to
-//! `ChatCompletionStreamResponse` chunks, and [`chat_completion_sse_stream`]
-//! frames those chunks as SSE events ending in `data: [DONE]`.
+//! `ChatCompletionStreamResponse` chunks.
 //!
 //! One decoded update from the engine becomes several events: semantic events
 //! (reasoning and text deltas, block and tool-call boundaries) followed by the
@@ -18,7 +17,6 @@
 //! updates that contain hidden reasoning.
 
 use std::collections::HashMap;
-use std::convert::Infallible;
 use std::result::Result;
 use std::sync::Arc;
 
@@ -27,7 +25,6 @@ use axum::body::Body;
 use axum::extract::State;
 use axum::http::StatusCode;
 use axum::http::header;
-use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Extension, Router};
@@ -37,7 +34,7 @@ use proto::handoff;
 use proto::request::GenerationConstraint;
 use serde_json::Value;
 use thiserror_ext::AsReport as _;
-use tracing::{debug, error, trace};
+use tracing::{debug, error};
 use tracing_futures::Instrument as _;
 
 use crate::http::handoff::Handoff;
@@ -1377,67 +1374,10 @@ fn append_delta_text(slot: &mut Option<String>, delta: String) {
     }
 }
 
-/// Converts one chunk stream into OpenAI-style SSE events.
-///
-/// OpenAI-style streaming errors are encoded as ordinary `data: {"error":...}`
-/// events followed by `data: [DONE]`, so the transport stream itself stays
-/// infallible even when generation fails after the HTTP response has started.
-#[try_stream]
-pub async fn chat_completion_sse_stream(
-    stream: impl Stream<Item = Result<ChatCompletionStreamResponse, ApiError>>,
-    mut y: TryYielder<Event, Infallible>,
-) -> Result<(), Infallible> {
-    pin_mut!(stream);
 
-    while let Some(next) = stream.next().await {
-        match next {
-            Ok(chunk) => y.yield_ok(to_sse_event(&chunk)).await,
-            Err(error) => {
-                y.yield_ok(to_error_sse_event(&error)).await;
-                break;
-            }
-        }
-    }
 
-    y.yield_ok(done_sse_event()).await;
-    Ok(())
-}
 
-/// Serializes one OpenAI chunk payload into one SSE `data:` event.
-fn to_sse_event(chunk: &ChatCompletionStreamResponse) -> Event {
-    let payload = serde_json::to_string(chunk).unwrap_or_else(|_| {
-        r#"{"error":{"message":"failed to serialize chat completion chunk","type":"server_error"}}"#
-            .to_string()
-    });
-    trace!(payload, "chat completion emitting chunk");
-    json_sse_event(payload)
-}
 
-/// Serializes one OpenAI error payload into one SSE `data:` event.
-fn to_error_sse_event(error: &ApiError) -> Event {
-    let payload = serde_json::to_string(&error.to_error_response()).unwrap_or_else(|_| {
-        r#"{"error":{"message":"failed to serialize error response","type":"server_error"}}"#
-            .to_string()
-    });
-    trace!(payload, "chat completion emitting error");
-    json_sse_event(payload)
-}
-
-/// Wraps a serialized JSON payload in a server-sent event.
-///
-/// Compact `serde_json` output already escapes line breaks inside strings;
-/// the replacement guarantees that one payload stays on one `data:` line.
-/// axum's `Event::data` splits a raw `\n` across several `data:` fields and
-/// panics on a raw `\r`.
-fn json_sse_event(payload: String) -> Event {
-    Event::default().data(payload.replace('\r', "\\r").replace('\n', "\\n"))
-}
-
-/// Builds the terminal OpenAI SSE sentinel event.
-fn done_sse_event() -> Event {
-    trace!("chat completion emitting done");
-    Event::default().data("[DONE]")
-}
 
 /// Builds the initial assistant-role SSE chunk required by OpenAI streaming.
 fn start_chunk(

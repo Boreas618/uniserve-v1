@@ -70,13 +70,6 @@ impl Noise {
         }
     }
 
-    /// The same stream drawn as uniforms in `[0, 1)`, for a schedule that keeps a request's noise
-    /// reproducible without a normal's tail.
-    pub const fn uniform(self) -> Self {
-        Self {
-            kind: NoiseKind::Uniform,
-        }
-    }
 
     /// Draw `out` `[rows, elements]` in its own element type.
     ///

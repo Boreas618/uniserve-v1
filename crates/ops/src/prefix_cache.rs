@@ -72,13 +72,6 @@ impl Field {
         }
     }
 
-    /// The index of the field inside the scratch's raw halves.
-    pub const fn index(self) -> u64 {
-        match self {
-            Self::Key => 0,
-            Self::Value => 1,
-        }
-    }
 }
 
 impl fmt::Display for Field {

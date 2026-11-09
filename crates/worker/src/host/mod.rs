@@ -47,12 +47,6 @@ impl<A: HostAction> Lane<A> {
         Ok(task)
     }
 
-    /// Asks for a queued task's cancellation before it runs, answering whether
-    /// it was still cancellable; a running task keeps its capacity until it
-    /// completes. `abandon` gives up the completion, so nothing observes it.
-    pub fn cancel(&self, task: &Arc<HostTask<A>>, abandon: bool) -> Result<bool> {
-        task.cancel(abandon)
-    }
 }
 
 #[cfg(test)]

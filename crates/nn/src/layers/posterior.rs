@@ -30,11 +30,6 @@ impl Posterior {
         Self { pdl: false }
     }
 
-    /// The same, launched with programmatic dependent launch.
-    pub fn with_pdl(mut self, pdl: bool) -> Self {
-        self.pdl = pdl;
-        self
-    }
 
     /// `out[p, c] = round_to_f16(mean[p, c] + exp(0.5 · clamp(log_variance[p, c])) · noise[p, c])`.
     ///

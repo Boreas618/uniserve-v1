@@ -56,10 +56,6 @@ impl GatedActivation {
         self
     }
 
-    /// The activation this layer applies.
-    pub const fn activation(&self) -> Activation {
-        self.activation
-    }
 
     /// The descriptor one gated activation of `width` channels launches, stated without a device.
     ///
@@ -210,11 +206,6 @@ impl SwiGlu {
         Ok(self)
     }
 
-    /// Record each program's largest output magnitude into `partials` on every call.
-    pub fn with_absmax(mut self) -> Self {
-        self.absmax = true;
-        self
-    }
 
     /// Channels of one output row.
     pub const fn width(&self) -> u32 {
@@ -241,17 +232,6 @@ impl SwiGlu {
         self.run(f, gate, value, out, None)
     }
 
-    /// The same activation, recording each program's largest magnitude into `partials`.
-    pub fn forward_absmax(
-        &self,
-        f: &Forward,
-        gate: TensorView,
-        value: TensorView,
-        out: TensorView,
-        partials: TensorView,
-    ) -> Result<()> {
-        self.run(f, gate, value, out, Some(partials))
-    }
 
     fn run(
         &self,
@@ -354,11 +334,6 @@ impl PackedSwiGlu {
         })
     }
 
-    /// Record each program's largest output magnitude into `partials` on every call.
-    pub fn with_absmax(mut self) -> Self {
-        self.absmax = true;
-        self
-    }
 
     /// The activation of a packed `[..., 2 · width]` projection into `[..., width]`.
     ///
@@ -429,10 +404,6 @@ impl Gelu {
         }
     }
 
-    /// Which formula this layer evaluates.
-    pub const fn approximation(&self) -> ops::gelu::Approximation {
-        self.approximation
-    }
 
     /// The descriptor one GELU over rows of `columns` channels launches, stated without a device.
     ///

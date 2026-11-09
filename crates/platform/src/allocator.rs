@@ -290,9 +290,6 @@ impl Buffer {
         self.block.bytes()
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.block.bytes() == 0
-    }
 
     pub fn device(&self) -> DeviceId {
         self.device

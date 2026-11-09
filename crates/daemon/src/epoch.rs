@@ -80,23 +80,6 @@ pub fn program_to_wire(program: &Program) -> proto::process::Program {
     }
 }
 
-/// The program `wire` states, its parameters read back as TOML values.
-pub fn program_from_wire(wire: proto::process::Program) -> Program {
-    Program {
-        backend: wire.backend,
-        revision: wire.revision,
-        arguments: wire
-            .arguments
-            .into_iter()
-            .map(|(key, value)| {
-                let value = value
-                    .parse::<toml::Value>()
-                    .unwrap_or(toml::Value::String(value));
-                (key, value)
-            })
-            .collect(),
-    }
-}
 
 /// One operator's program as the `Precopy` command states it (§7.3 step 2).
 pub fn kernel_to_wire(slot: &KernelKey, program: &Program) -> proto::process::KernelProgram {
@@ -585,14 +568,6 @@ impl Epochs {
         record.status = Status::Serving;
     }
 
-    /// Records that everything older than the generation epoch `epoch`
-    /// executes is gone (§7.3 step 6).
-    pub fn purged(&self, epoch: u64) {
-        let mut records = locked(&self.records);
-        if let Some(record) = records.get_mut(&epoch) {
-            record.status = Status::Purged;
-        }
-    }
 
     /// Ends a probation by putting the previous generation back: what the
     /// epoch executed before the update is what it executes again (§7.3

@@ -18,8 +18,6 @@ use crate::weights::Weight;
 /// A vocabulary-parallel output projection.
 pub struct ParallelLMHead {
     weight: Weight,
-    first: u32,
-    local: u32,
     vocabulary: u32,
     padded: u32,
 }
@@ -63,8 +61,6 @@ impl ParallelLMHead {
         }
         Ok(Self {
             weight,
-            first,
-            local,
             vocabulary,
             padded,
         })
@@ -75,10 +71,6 @@ impl ParallelLMHead {
         self.padded
     }
 
-    /// The vocabulary size of the whole model.
-    pub const fn vocabulary(&self) -> u32 {
-        self.vocabulary
-    }
 
     /// Project `hidden` into `out`, gathering the ranks' shards.
     ///
@@ -181,26 +173,6 @@ impl ParallelLMHead {
         f.operate::<VocabUnpad>(&descriptor, args)
     }
 
-    /// The descriptor the vocabulary shard's projection launches with.
-    ///
-    /// The head projects through an ordinary dense product whose output width is the rank's shard,
-    /// so its descriptor is a [`Linear`]'s: this answers that layer's descriptor for the element
-    /// types a deployment names, without the caller building the layer. It is fallible where
-    /// [`Linear::new`] is, which for the head's own two-dimensional weight is never.
-    pub fn projection_descriptor(
-        &self,
-        input: DType,
-        output: DType,
-    ) -> Result<ops::gemm::Descriptor> {
-        Ok(Linear::descriptor_of(
-            self.weight.shape().last() as u32,
-            input,
-            self.weight.dtype(),
-            ops::gemm::WeightOrder::NxK,
-            false,
-            output,
-        ))
-    }
 
     /// The descriptor the vocabulary unpad launches with, for a gathered matrix of `gathered_width`
     /// columns.
@@ -249,15 +221,7 @@ impl ParallelLMHead {
         }
     }
 
-    /// The offset of this rank's shard in the gathered vocabulary; 0 for an unsharded head.
-    pub const fn first(&self) -> u32 {
-        self.first
-    }
 
-    /// The rows this rank's projection computes before padding.
-    pub const fn local(&self) -> u32 {
-        self.local
-    }
 }
 
 /// Gather `rows` of `hidden` into a `[rows, hidden]` view, for the head.

@@ -127,23 +127,6 @@ impl SpeculationMeter {
         }
     }
 
-    /// The decode step time `d`, standing in `v` until a step without
-    /// drafts is measured.
-    fn decode_step_us(&self) -> Option<f64> {
-        self.plain_step_us.or(self.drafted_step_us)
-    }
-
-    /// The speedup `g` of a speculating request, once measured.
-    pub(crate) fn speedup(&self) -> Option<f64> {
-        let drafted = self.drafted_step_us.filter(|time| *time > 0.0)?;
-        Some(self.tokens_per_step? * self.decode_step_us()? / drafted)
-    }
-
-    /// The cost `k` of a refilled token, in decode steps, once measured.
-    pub(crate) fn token_cost(&self) -> Option<f64> {
-        let decode = self.decode_step_us().filter(|time| *time > 0.0)?;
-        Some(self.prompt_token_us? / decode)
-    }
 }
 
 /// A running request's draft cache, in a deployment that speculates.

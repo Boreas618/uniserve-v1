@@ -45,7 +45,7 @@ use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Storage, StorageView};
 use crate::memory::retained::{
-    Exclusive, ExclusiveSpec, ExclusiveStorage, Retained, SegmentPart, SegmentedSpec,
+    Exclusive, ExclusiveSpec, ExclusiveStorage, SegmentPart, SegmentedSpec,
 };
 use crate::stream::{Issue, RowFill};
 use crate::{Error, Result};
@@ -285,73 +285,6 @@ pub struct CachePlanes {
 }
 
 impl CachePlanes {
-    /// One plane cell as a borrowed region of its retained allocation.
-    /// The caller keeps the scheduler's page reference until every reader
-    /// of this region finishes; a descriptor alone does not pin a page.
-    pub(crate) fn retained_region(
-        &self,
-        retained: &Retained,
-        field: usize,
-        column: u32,
-        unit: u32,
-        suffix: &str,
-        resident: bool,
-    ) -> Result<::storage::manifest::Chunk> {
-        let device = self
-            .device
-            .ok_or_else(|| Error::Invalid("cache transfers require a device pool".into()))?;
-        let gpu = device.uuid()?.0;
-        let name = format!("prefix_cache.{}.{suffix}", FIELDS[field]);
-        let bytes = match suffix {
-            "values" => self.plan.plane_bytes,
-            "scale" => 4,
-            "initialized" => 1,
-            _ => return Err(Error::Invalid(format!("unknown cache field {suffix}"))),
-        };
-        let (key, offset) = if suffix == "values"
-            && let Some(segmented) = &self.segmenting
-        {
-            let mut first = 0;
-            let segment = segmented
-                .segments
-                .iter()
-                .enumerate()
-                .find_map(|(index, (segment, _))| {
-                    let start = first;
-                    first += segment.units;
-                    (unit < first).then_some((index, start))
-                })
-                .ok_or_else(|| Error::Invalid(format!("cache unit {unit} is outside its pool")))?;
-            if resident && segment.0 as u32 >= segmented.released_from.load(Ordering::Acquire) {
-                return Err(Error::Invalid(format!(
-                    "cache unit {unit} has no retained storage"
-                )));
-            }
-            let part = &segmented.parts[column as usize * segmented.segments.len() + segment.0];
-            (
-                retained.segment_key(&name, part, &gpu),
-                u64::from(unit - segment.1) * bytes,
-            )
-        } else {
-            let spec = ExclusiveSpec {
-                name: &name,
-                device,
-                bytes: (u64::from(self.plan.columns) * u64::from(self.num_units) * bytes) as usize,
-                access: &[],
-            };
-            (
-                retained.exclusive_key(&spec, &gpu),
-                (u64::from(column) * u64::from(self.num_units) + u64::from(unit)) * bytes,
-            )
-        };
-        Ok(::storage::manifest::Chunk {
-            offset: 0,
-            length: bytes,
-            key,
-            storage_offset: offset,
-            binding: ::storage::manifest::Binding::Rank,
-        })
-    }
 
     /// Allocate a pool of `num_units` units (the sentinel included), and
     /// reset the planes whose storage is new: values and flags zero, scales
@@ -366,9 +299,7 @@ impl CachePlanes {
     /// owner.
     ///
     /// Every local peer device may address the values, because readers on
-    /// those devices in this process copy from the pages directly; other
-    /// ranks read a frozen copy of the pages of segmented planes
-    /// (`cache_export`).
+    /// those devices in this process copy from the pages directly.
     pub fn allocate(
         plan: Arc<CachePlan>,
         device: Option<DeviceId>,
@@ -651,117 +582,6 @@ impl CachePlanes {
         2 * u64::from(self.plan.columns) * self.plan.plane_bytes
     }
 
-    /// Takes the segments mapped read-only from the predecessor epoch, whose
-    /// writer is gone, through `retained`: they become writable at unchanged
-    /// addresses and the epoch's own. Returns how many it took.
-    pub(crate) fn take_inherited(
-        &self,
-        retained: &crate::memory::retained::Retained,
-    ) -> Result<usize> {
-        let taken = retained.take_inherited()?;
-        if let Some(segmenting) = &self.segmenting {
-            for (_, inherited) in &segmenting.segments {
-                inherited.store(false, Ordering::Release);
-            }
-        }
-        Ok(taken)
-    }
-
-    /// Maps the inherited segments that hold exactly the units of
-    /// `borrowed` writable through `retained`: the predecessor lent them for
-    /// the epoch's trial, and the engine allocates their units as its own.
-    /// Returns how many segments it mapped writable.
-    ///
-    /// # Errors
-    ///
-    /// Fails when a range is not made of whole inherited segments, or when
-    /// the driver refuses.
-    pub(crate) fn borrow(
-        &self,
-        borrowed: &[std::ops::Range<u32>],
-        retained: &crate::memory::retained::Retained,
-    ) -> Result<usize> {
-        if borrowed.is_empty() {
-            return Ok(0);
-        }
-        let (segmenting, _) = self.segmented()?;
-        let mut segments = Vec::new();
-        let mut covered = 0;
-        for (index, (segment, inherited)) in segmenting.segments.iter().enumerate() {
-            let first = segmenting.first_unit(index as u32);
-            let units = first..first + segment.units;
-            if inherited.load(Ordering::Acquire)
-                && borrowed
-                    .iter()
-                    .any(|range| range.start <= units.start && units.end <= range.end)
-            {
-                segments.push(*segment);
-                covered += segment.units;
-            }
-        }
-        // A range that splits a segment would leave part of it read-only to
-        // the epoch while the engine allocates all of its units.
-        let requested: u32 = borrowed.iter().map(|range| range.end - range.start).sum();
-        if covered != requested {
-            return Err(Error::Invalid(format!(
-                "the borrowed cache units {borrowed:?} are not whole inherited segments"
-            )));
-        }
-        retained.borrow(&segments)?;
-        Ok(segments.len())
-    }
-
-    /// Copies the predecessor's cache flags and scales of the units the
-    /// planes inherit from it into the planes' own, issued to `stream`,
-    /// which is synchronized before returning: the predecessor's planes
-    /// hold the flags and scales of `predecessor_units` units in
-    /// `predecessor` (each field's flags, then its scales when quantized),
-    /// and the predecessor parked, so they no longer change.
-    pub(crate) fn adopt_inherited(
-        &self,
-        predecessor: &[Arc<Storage>],
-        predecessor_units: u32,
-        stream: &Stream,
-    ) -> Result<()> {
-        let inherited = self.inherited();
-        if inherited.is_empty() {
-            return Ok(());
-        }
-        let per_field = if self.scales.is_some() { 2 } else { 1 };
-        if predecessor.len() != 2 * per_field {
-            return Err(Error::Invariant(
-                "a predecessor's cache flags and scales are missing".into(),
-            ));
-        }
-        let mut batch = CopyBatch::new(SourceOrder::DuringCall);
-        for field in 0..2 {
-            let mut targets = vec![(&self.initialized[field], 1_u64)];
-            if let Some(scales) = &self.scales {
-                targets.push((&scales[field], 4));
-            }
-            for (offset, (target, width)) in targets.into_iter().enumerate() {
-                let source = &predecessor[field * per_field + offset];
-                for column in 0..self.plan.columns {
-                    let from = (u64::from(column) * u64::from(predecessor_units)) * width;
-                    let to = (u64::from(column) * u64::from(self.num_units)
-                        + u64::from(inherited.start))
-                        * width;
-                    batch.push(
-                        target.address() + to,
-                        source.address() + from,
-                        (u64::from(inherited.end - inherited.start) * width) as usize,
-                    );
-                }
-            }
-        }
-        // SAFETY: every range lies inside its storage: the predecessor's
-        // planes hold `predecessor_units` units of every column and the
-        // inherited ones are their leading units; the stream is drained.
-        unsafe { stream.copy(&batch) }?;
-        stream.synchronize()?;
-        Ok(())
-    }
-
     /// Gives back the storage of the value planes' segments from `first` on,
     /// every column's, through `storage`, which retained them. The engine
     /// allocates none of their units and no device work accesses them any
@@ -1010,35 +830,17 @@ impl CachePlanes {
         Ok(())
     }
 
-    /// The units this pool holds, the sentinel included.
-    pub(crate) fn units(&self) -> u32 {
-        self.num_units
-    }
 
     /// The whole value storage of `field`, cell-major: `columns * units` planes of
     /// `CachePlan::plane_bytes` bytes, the shape the block copy reads.
+    #[cfg(test)]
     pub(crate) fn value_storage(&self, field: usize) -> Result<&Arc<Storage>> {
         self.values
             .get(field)
             .ok_or_else(|| Error::Invalid(format!("a cache pool holds no field {field}")))
     }
 
-    /// One field run of a state page's checkpoint planes. A state page's planes
-    /// live in their own storages, `CachePlan::state_fields` of them, so a state
-    /// plane never takes a K/V cell.
-    pub(crate) fn state_storage(&self, field: usize) -> Result<&Arc<Storage>> {
-        self.state.get(field).ok_or_else(|| {
-            Error::Invalid(format!(
-                "a cache pool holds {} state field runs, not {field}",
-                self.state.len()
-            ))
-        })
-    }
 
-    /// The device the planes live on, or `None` for a host pool.
-    pub(crate) fn device_of(&self) -> Option<DeviceId> {
-        self.device
-    }
 
     pub(crate) fn plan(&self) -> &Arc<CachePlan> {
         &self.plan
@@ -1046,10 +848,6 @@ impl CachePlanes {
 
     pub(crate) fn device(&self) -> Option<DeviceId> {
         self.device
-    }
-
-    pub(crate) fn num_units(&self) -> u32 {
-        self.num_units
     }
 
     fn cell(&self, column: u32, unit: u32) -> u64 {
@@ -1230,6 +1028,19 @@ impl CachePlanes {
                 .sum::<u64>()
         });
         values + initialized + scales
+    }
+
+    /// One field run of a state page's checkpoint planes. A state page's planes
+    /// live in their own storages, `CachePlan::state_fields` of them, so a state
+    /// plane never takes a K/V cell.
+    #[cfg(test)]
+    pub(crate) fn state_storage(&self, field: usize) -> Result<&Arc<Storage>> {
+        self.state.get(field).ok_or_else(|| {
+            Error::Invalid(format!(
+                "a cache pool holds {} state field runs, not {field}",
+                self.state.len()
+            ))
+        })
     }
 
     /// Tokens one page of `group` holds, which every per-page view is sized by.
@@ -1580,11 +1391,6 @@ impl CachePlanes {
         Ok(self.scale(field, column, unit)?.address())
     }
 
-    /// Reset units `1..=count` (contiguous startup scratch) with native
-    /// fills issued to `stream`: values and flags zero, scales one.
-    pub fn zero_leading(&self, count: u32, stream: impl Issue) -> Result<()> {
-        self.reset_units(1, count, true, stream)
-    }
 }
 
 /// The scattered unit resets of one stream: the units a recycle, an import or
@@ -1638,39 +1444,6 @@ impl UnitColumn {
         Ok(())
     }
 
-    /// Prepare units that held earlier tokens for a new owner. Readers never
-    /// weigh unwritten positions, so stale finite values may stay: a
-    /// single-dtype unquantized pool needs no device work, a quantized one
-    /// resets flags and scales, and a mixed-dtype pool is zeroed because
-    /// stale bytes of one type need not decode as finite values of another.
-    pub(crate) fn recycle(&self, units: &[u32], stream: impl Issue) -> Result<()> {
-        self.require_stream(stream)?;
-        let plan = &self.planes.plan;
-        if plan.mixed_types() {
-            return self.zero(units, stream);
-        }
-        if !plan.quantized {
-            return Ok(());
-        }
-        // One fill per run of consecutive units per column, in the order the
-        // caller gave them: a reused unit's scales are one again, so a later
-        // import re-converts it, and a scattered release costs its runs and not
-        // its units.
-        let mut units = units.to_vec();
-        units.sort_unstable();
-        units.dedup();
-        let mut start = 0;
-        while start < units.len() {
-            let mut end = start + 1;
-            while end < units.len() && units[end] == units[end - 1] + 1 {
-                end += 1;
-            }
-            self.planes
-                .reset_units(units[start], (end - start) as u32, false, stream)?;
-            start = end;
-        }
-        Ok(())
-    }
 
     /// Commit transferred values and scales of whole units: set both fields'
     /// initialization flags in every column, in runs like `recycle`.
@@ -1767,7 +1540,6 @@ mod layer_view_tests {
                 unit_bytes,
                 dtype: ipc::PrefixCacheDtype::BFloat16,
                 groups,
-                states: Vec::new(),
                 checkpoints,
             },
             num_units,
@@ -1960,6 +1732,17 @@ mod layer_view_tests {
         Ok(())
     }
 
+
+    /// A dense pool holds no scale, and states so instead of inventing one.
+    #[test]
+    fn a_dense_pool_states_no_scale() -> Result<()> {
+        let pool = pool(vec![group(2, 0)], 2, 8, false);
+        assert!(pool.key_scale(0, 0)?.is_none());
+        assert!(pool.value_scale(0, 1)?.is_none());
+        assert_eq!(pool.key_initialized(0, 0)?.shape(), &[8, 1, 1, 1]);
+        Ok(())
+    }
+
     /// A state page's checkpoints live in field storages of their own, one per field run of the
     /// page - never in a K/V plane's storage, because every group indexes the same units.
     #[test]
@@ -1973,7 +1756,6 @@ mod layer_view_tests {
             unit_bytes: 64,
             dtype: ipc::PrefixCacheDtype::BFloat16,
             groups: vec![with_state],
-            states: Vec::new(),
             // Four checkpoint planes over two columns and one unit per page: two field runs.
             checkpoints: vec![super::super::plan::Checkpoint {
                 first_plane: 0,
@@ -1987,16 +1769,6 @@ mod layer_view_tests {
             assert_ne!(pool.state_storage(field)?.address(), value);
         }
         assert!(pool.state_storage(2).is_err());
-        Ok(())
-    }
-
-    /// A dense pool holds no scale, and states so instead of inventing one.
-    #[test]
-    fn a_dense_pool_states_no_scale() -> Result<()> {
-        let pool = pool(vec![group(2, 0)], 2, 8, false);
-        assert!(pool.key_scale(0, 0)?.is_none());
-        assert!(pool.value_scale(0, 1)?.is_none());
-        assert_eq!(pool.key_initialized(0, 0)?.shape(), &[8, 1, 1, 1]);
         Ok(())
     }
 }

@@ -500,10 +500,6 @@ impl<'a> Forward<'a> {
         }
     }
 
-    /// The kernels generation this forward launches against, or `None` for a recording forward.
-    pub fn kernels(&self) -> Option<&'a Generation> {
-        self.kernels
-    }
 
     /// The arena of this forward.
     pub fn arena(&self) -> &Arena {

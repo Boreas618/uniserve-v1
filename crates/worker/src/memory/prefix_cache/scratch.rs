@@ -39,9 +39,6 @@ impl PooledBuffer {
         Arc::new(Self { buffer })
     }
 
-    fn view(self: &Arc<Self>, dtype: ElementType, shape: &[i64]) -> Result<StorageView> {
-        StorageView::contiguous(Arc::clone(self) as Arc<dyn Backing>, 0, dtype, shape)
-    }
 }
 
 impl Backing for PooledBuffer {
@@ -247,18 +244,6 @@ impl ScratchCache {
         })
     }
 
-    /// The set's key and value scales of `group`, as the paired forward reads
-    /// them; `None` on a dense pool.
-    pub fn scales(&self, _group: usize) -> Option<(StorageView, StorageView)> {
-        let scales = self.scales.as_ref()?;
-        let key = scales[0]
-            .view(ElementType::F32, &[i64::from(self.num_units)])
-            .ok()?;
-        let value = scales[1]
-            .view(ElementType::F32, &[i64::from(self.num_units)])
-            .ok()?;
-        Some((key, value))
-    }
 }
 
 impl PrefixCache {

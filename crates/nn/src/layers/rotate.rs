@@ -83,29 +83,6 @@ impl Rotate {
         }
     }
 
-    /// Turn only the leading `rotated` channels of each head, copying the rest unchanged.
-    ///
-    /// The default is the whole head. A model whose heads interleave a rotation of a few axes with
-    /// channels that must keep their value states that cut here - the descriptor has carried the
-    /// count all along, and this is the layer's way of saying it instead of pinning it to
-    /// `head_dim`.
-    ///
-    /// The count must be positive, even, and no wider than the head; the tables are then
-    /// `[tokens, rotated / 2]`. Each count is a separate compilation, so one the store does not
-    /// carry yet is a load-time gap rather than a wrong result.
-    pub fn rotated(mut self, rotated: u32) -> Result<Self> {
-        if rotated == 0 || !rotated.is_multiple_of(2) || rotated > self.head_dim {
-            return Err(Error::shape(
-                "Rotate",
-                format!(
-                    "a rotation of {rotated} of {} channels is not a positive even count within the head",
-                    self.head_dim
-                ),
-            ));
-        }
-        self.rotated = rotated;
-        Ok(self)
-    }
 
     /// The width of one head.
     pub const fn head_dim(&self) -> u32 {

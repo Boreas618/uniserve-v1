@@ -118,10 +118,6 @@ impl Planned {
         self.ranks.iter().map(|rank| rank.bytes).max().unwrap_or(0)
     }
 
-    /// How many weights move, over every rank.
-    pub fn weights(&self) -> usize {
-        self.ranks.iter().map(|rank| rank.pairs.len()).sum()
-    }
 }
 
 /// The room one device has beside what it holds.
@@ -434,10 +430,6 @@ impl DataPlane {
         lock(&self.poisoned).clone()
     }
 
-    /// Whether any slot holds an adapter.
-    pub fn holds_adapters(&self) -> bool {
-        !lock(&self.adapters).is_empty()
-    }
 
     /// The target the ranks serve now.
     pub fn target(&self) -> Target {

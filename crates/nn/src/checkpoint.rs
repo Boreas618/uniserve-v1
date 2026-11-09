@@ -148,10 +148,6 @@ pub struct CheckpointFile {
 }
 
 impl CheckpointFile {
-    /// The shard's path.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
 
     /// The shard's identity.
     pub fn identity(&self) -> &FileIdentity {

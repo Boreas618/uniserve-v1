@@ -196,10 +196,6 @@ impl Control {
         })
     }
 
-    /// The state the daemon last commanded, and its changes after that.
-    pub fn state(&self) -> watch::Receiver<State> {
-        self.state.subscribe()
-    }
 
     /// The state the daemon last commanded.
     pub fn current(&self) -> State {

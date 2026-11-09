@@ -284,10 +284,6 @@ impl Graphs {
         buckets
     }
 
-    /// How many graphs the runner holds, of every generation.
-    pub fn len(&self) -> usize {
-        self.captured.len()
-    }
 
     /// Whether the runner holds no graph.
     pub fn is_empty(&self) -> bool {

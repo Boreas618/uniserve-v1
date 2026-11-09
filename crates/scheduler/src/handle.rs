@@ -294,25 +294,7 @@ struct EventCancellation {
 }
 
 impl EventRx {
-    /// Wraps a Tokio receiver without engine cancellation or wake integration.
-    pub fn from_receiver(inner: mpsc::Receiver<Event>) -> Self {
-        Self {
-            inner,
-            handoff: Handoff::default(),
-            waker: CommandWaker::noop(),
-            cancellation: None,
-            text_tokens_received: 0,
-            acknowledged_token_count: 0,
-            on_finish: None,
-        }
-    }
 
-    /// Registers a callback to run once on terminal completion or channel close.
-    ///
-    /// Dropping the receiver also runs a callback that has not yet run.
-    pub fn set_on_finish(&mut self, on_finish: impl FnOnce() + Send + 'static) {
-        self.on_finish = Some(Box::new(on_finish));
-    }
 
     /// Receives the next event and advances the received token count.
     ///
@@ -335,10 +317,6 @@ impl EventRx {
         event
     }
 
-    /// Receives the next event.
-    pub async fn next(&mut self) -> Option<Event> {
-        self.recv().await
-    }
 
     /// Attempts to receive an event without waiting.
     ///
@@ -383,8 +361,8 @@ impl EventRx {
     ///
     /// Sends nothing for a request without stop strings, whose tokens await
     /// no decision, when no token arrived since the last acknowledgement, or
-    /// when the receiver has no armed cancellation (built by `from_receiver`,
-    /// finished, or already cancelled).
+    /// when the receiver has no armed cancellation (finished, or already
+    /// cancelled).
     pub fn acknowledge_consumed_prefix(&mut self) {
         if self.text_tokens_received <= self.acknowledged_token_count {
             return;
@@ -402,10 +380,6 @@ impl EventRx {
         }
     }
 
-    /// Cancels the request.
-    pub fn cancel(&mut self) {
-        self.cancel_at_consumed_prefix(StreamCancelCause::DroppedStream);
-    }
 
     /// Closes generation after the tokens the consumer has received.
     ///
@@ -487,7 +461,7 @@ pub struct Submission {
 /// One path applies every stage; the answer shape is the only difference, so a
 /// stage has exactly one place where it changes the slot.
 #[derive(Debug)]
-pub(crate) enum StageAnswer {
+pub enum StageAnswer {
     /// A handle's `stage`, answered with the step it applied at.
     Step(crossbeam_channel::Sender<Result<StageApplied, String>>),
     /// An engine or program-layer command, answered with whether it applied.
@@ -1276,10 +1250,6 @@ impl CommandSender {
         Ok(())
     }
 
-    /// Drops a precopied generation that failed or was abandoned (§7.3 step 2).
-    pub fn discard_policy(&self) {
-        let _ = self.send(Command::DiscardPolicy);
-    }
 
     /// The step and cost counters, polled rather than waited for: the caller is
     /// the engine's control thread, which no scheduler may hold.
@@ -1498,11 +1468,6 @@ impl PolicySlotHandle {
             .unwrap_or_default()
     }
 
-    /// The program the serving policy was instantiated from, `None` before the
-    /// epoch's first switchover.
-    pub fn running(&self) -> Option<crate::PolicyProgram> {
-        self.programs().running
-    }
 
     /// The program a precopy prepared for the next switchover, `None` when none
     /// waits.

@@ -457,12 +457,9 @@ pub struct TransportViews {
 /// it through its life.
 pub struct Transport {
     /// Keeps the module loaded while the handle lives.
-    kernel: Arc<Kernel>,
+    _kernel: Arc<Kernel>,
     call: Lifecycle,
     step: LifecycleEntry,
-    suspend: LifecycleEntry,
-    restore: LifecycleEntry,
-    release: LifecycleEntry,
     info: InfoEntry,
     shape: TransportShape,
 }
@@ -483,13 +480,10 @@ impl Transport {
         stream: &Stream,
     ) -> Result<Self> {
         // SAFETY: each symbol is the package's entry of the signature the header declares for it.
-        let (create, step, suspend, restore, release, info) = unsafe {
+        let (create, step, info) = unsafe {
             (
                 kernel.native_symbol::<LifecycleEntry>("uniserve_expert_exchange_create")?,
                 kernel.native_symbol::<LifecycleEntry>("uniserve_expert_exchange_step")?,
-                kernel.native_symbol::<LifecycleEntry>("uniserve_expert_exchange_suspend")?,
-                kernel.native_symbol::<LifecycleEntry>("uniserve_expert_exchange_restore")?,
-                kernel.native_symbol::<LifecycleEntry>("uniserve_expert_exchange_release")?,
                 kernel.native_symbol::<InfoEntry>("uniserve_expert_exchange_info")?,
             )
         };
@@ -514,12 +508,9 @@ impl Transport {
         let status = unsafe { create(&mut call, handle) };
         check(status, "create", &call.error)?;
         Ok(Self {
-            kernel,
+            _kernel: kernel,
             call,
             step,
-            suspend,
-            restore,
-            release,
             info,
             shape,
         })
@@ -531,10 +522,6 @@ impl Transport {
         unsafe { ExchangeTransport::from_handle(self.call.transport) }
     }
 
-    /// The module the transport was created from.
-    pub fn kernel(&self) -> &Arc<Kernel> {
-        &self.kernel
-    }
 
     /// The transport's views, as the package laid them out.
     pub fn views(&self) -> Result<TransportViews> {
@@ -594,29 +581,8 @@ impl Transport {
         check(status, "step", &self.call.error)
     }
 
-    /// Returns the workspace's storage, keeping its addresses. Collective over the group.
-    pub fn suspend(&mut self, stream: &Stream) -> Result<()> {
-        let handle = crate::platform::stream_handle(stream);
-        // SAFETY: the transport is live and the call has the header's layout.
-        let status = unsafe { (self.suspend)(&mut self.call, handle) };
-        check(status, "suspend", &self.call.error)
-    }
 
-    /// Maps new storage at the workspace's addresses. Collective over the group.
-    pub fn restore(&mut self, stream: &Stream) -> Result<()> {
-        let handle = crate::platform::stream_handle(stream);
-        // SAFETY: the transport is live and the call has the header's layout.
-        let status = unsafe { (self.restore)(&mut self.call, handle) };
-        check(status, "restore", &self.call.error)
-    }
 
-    /// Releases the transport. Collective over the group; nothing launches over it afterwards.
-    pub fn release(mut self, stream: &Stream) -> Result<()> {
-        let handle = crate::platform::stream_handle(stream);
-        // SAFETY: the transport is live, the call has the header's layout, and `self` ends here.
-        let status = unsafe { (self.release)(&mut self.call, handle) };
-        check(status, "release", &self.call.error)
-    }
 }
 
 /// A lifecycle entry's status, with the message it left.

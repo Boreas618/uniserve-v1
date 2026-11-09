@@ -432,14 +432,6 @@ impl Control {
         self.engine
     }
 
-    /// The addresses this node listens on for peers, as bound; empty when it
-    /// accepts none.
-    pub fn peer_addresses(&self) -> Vec<String> {
-        self.listener
-            .as_ref()
-            .map(|listener| listener.addresses().to_vec())
-            .unwrap_or_default()
-    }
 
     /// Closes every connection, letting each peer observe the close.
     pub fn close(&mut self) {

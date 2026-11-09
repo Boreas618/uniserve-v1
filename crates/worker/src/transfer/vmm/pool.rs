@@ -266,12 +266,6 @@ impl VmmPool {
         Ok(())
     }
 
-    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
-        self.allocations
-            .values()
-            .any(|allocation| allocation.readers.is_some())
-    }
-
     /// Consume only completed readback, then submit the next bounded snapshot.
     pub(crate) fn reap(&mut self) -> Result<()> {
         self.backing()?;

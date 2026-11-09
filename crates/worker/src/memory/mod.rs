@@ -1,34 +1,26 @@
 //! The main process's resident memory (`specs/worker.md` §4 `MainProcess.memory`).
 //!
 //! Resident memory is device storage the epoch keeps until it retires: the KV
-//! cache planes, the latent pages, the products of cross-call tensors, the
-//! request slots, the retained weights and the encoder cache. Every one of
+//! cache planes, the latent pages, the retained weights and the encoder cache. Every one of
 //! them is an exclusive storage at the host's Storage Server, keyed by the
 //! inputs `crate::keys` composes, so a restarted main process of the same
 //! scope and epoch maps what its predecessor left instead of loading it
 //! again.
 
 pub mod allocation;
-pub mod buffer;
 pub mod encoders;
 pub mod latent;
-pub mod output;
-pub mod pinned_pool;
 pub mod prefix_cache;
-pub mod products;
 pub mod reload;
-pub mod request_slots;
-pub use request_slots::SlotField;
 pub mod retained;
 pub mod weights;
 
 pub use prefix_cache::block_tables::{
     BlockTableStorage, BlockTableUpdate, BlockTables, GroupShape, GroupTable,
 };
-pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, Checkpoint, GroupAxis, StateField};
+pub use prefix_cache::plan::{CacheGroupPlan, CachePlan, Checkpoint, GroupAxis};
 pub use prefix_cache::planes::{CachePlanes, LaidSegment, PlaneLayout, UnitColumn};
-pub use prefix_cache::{PendingImport, PrefixCache};
-pub(crate) use prefix_cache::{TransferBases, UnitAccesses};
+pub use prefix_cache::PrefixCache;
 
 use std::sync::Mutex;
 
@@ -37,10 +29,6 @@ use std::sync::Arc;
 
 use platform::Stream;
 
-use self::buffer::BufferPool;
-use self::pinned_pool::PinnedPool;
-use self::products::ProductStore;
-use self::request_slots::RequestSlots;
 use self::retained::ExclusiveStorage;
 use crate::Result;
 
@@ -53,15 +41,8 @@ use crate::Result;
 /// loaders publish; their storage is already keyed by `crate::keys`.
 pub struct Memory {
     /// The KV cache planes, their block tables and their host pages, or `None` on a rank that
-    /// keeps no paged cache: a media rank's resident state is each request's own footprint, and
-    /// what it opens here is the product store and the request slots.
+    /// keeps no paged cache: a media rank's resident state is each request's own footprint.
     pub prefix_cache: Option<Arc<Mutex<PrefixCache>>>,
-    /// The products of cross-call tensors.
-    pub products: ProductStore,
-    /// The banks of the layers a request keeps per slot.
-    pub(crate) slots: RequestSlots,
-    /// The page-locked host blocks copies go through.
-    pub pinned: Arc<PinnedPool>,
     /// The device this rank's memory lives on, as the plan states it.
     pub device: crate::config::Device,
     /// The device's pools, which the scratch page set a paired forward writes
@@ -79,19 +60,13 @@ pub struct Memory {
 pub struct OpenMemory<'a> {
     /// The memory [`capacity::plan_rank`](crate::capacity::plan_rank) resolved.
     pub plan: &'a crate::capacity::MemoryConfig,
-    /// The deployed blocks' slot fields, from the model.
-    pub slots: &'a [self::request_slots::SlotField],
     /// The rank's device, or `None` for a host-only rank.
     pub device: Option<platform::DeviceId>,
     /// The device's stream: any reset the owners queue runs here, before the
     /// worker thread exists, and a stream accepts work without one.
     pub stream: Option<&'a Stream>,
-    /// The devices the product store's arenas live on.
-    pub devices: Vec<crate::memory::allocation::MemoryKind>,
     /// The conversion program the import path launches.
     pub conversion: Arc<dyn prefix_cache::conversion::PageConversion>,
-    /// The pool's completion events.
-    pub events: Arc<crate::stream::EventPool>,
     /// The device's pools, which a paired forward's scratch page set is taken
     /// from.
     pub pools: Arc<Mutex<crate::arena::Pools>>,
@@ -160,9 +135,7 @@ pub fn wake(
 
 impl Memory {
     /// Allocates every resident owner the plan sized, in one call: the cache
-    /// planes and block tables (on a rank that keeps a paged cache), the latent
-    /// pages, the product store, the request slots, the buffer pool and the
-    /// page-locked blocks.
+    /// planes and block tables, on a rank that keeps a paged cache.
     ///
     /// This is the epoch's budget becoming real: each owner is booked against
     /// the device's allowance as it is mapped, so the first `mapped <= budget`
@@ -195,35 +168,11 @@ impl Memory {
                 storage,
                 Arc::clone(&request.conversion),
             )?),
-            // A rank that keeps no paged cache still owns the rest: the products its runners
-            // publish and the request slots its scheduler hands out. Only the cache planes and their block tables are absent.
+            // A rank that keeps no paged cache opens no cache planes and no block tables.
             (None, _) => None,
         };
-        // One buffer pool per rank, given to the product store, which binds the scheduler's
-        // dispatches into it; a second pool would allocate the same bytes twice.
-        let buffer = BufferPool::allocate(
-            plan.info.buffer_pool_bytes.max(1),
-            &request.devices,
-            storage,
-        )?;
-        let products = ProductStore::new(
-            usize::try_from(plan.arena.device_product_bytes.max(1))
-                .map_err(|_| crate::Error::Invalid("product store capacity overflows".into()))?,
-            usize::try_from(plan.info.encoder_entry_bytes.max(1))
-                .map_err(|_| crate::Error::Invalid("product entry size overflows".into()))?,
-            request.devices.clone(),
-            usize::try_from(plan.info.request_slots).unwrap_or(0),
-            plan.arena.relay_depth,
-            buffer,
-            Arc::clone(&request.events),
-        )?;
-        let slots = RequestSlots::allocate(request.slots, plan.info.request_slots, request.device)?;
-        let pinned = PinnedPool::new(request.device);
         Ok(Self {
             prefix_cache: cache.map(|cache| Arc::new(Mutex::new(cache))),
-            products,
-            slots,
-            pinned,
             device: request
                 .device
                 .map_or(crate::config::Device::Cpu, crate::config::Device::Cuda),
@@ -231,82 +180,25 @@ impl Memory {
         })
     }
 
-    /// Releases every owner, in the design's order: the products and the
-    /// encoders first, then the cache planes (which give their segments back),
-    /// the slots, the buffer pool and the page-locked blocks.
+    /// Releases every owner: the cache planes give their segments back.
     ///
     /// The owners' storage returns itself as each owner goes, so this needs no
     /// storage handle; it is the main process's last call on `Memory`.
     pub fn close(self) -> Result<()> {
         let Memory {
             prefix_cache,
-            products,
-            slots,
-            pinned,
             device,
             pools,
         } = self;
         drop((device, pools));
-        // The products go first: their reads retain views into the cache, and the cache's
-        // segments are the last thing an epoch gives back.
-        products.close();
         if let Some(cache) = prefix_cache {
             lock(&cache).close()?;
         }
-        drop(slots);
-        drop(pinned);
         Ok(())
     }
 
-    /// The device bytes this rank's owners map, which the metrics report states
-    /// as the `resident` pool.
-    ///
-    /// It is the cache planes, the product store's arenas and
-    /// the request-slot banks, and it counts MAPPED device storage only: host and
-    /// page-locked storage is outside the device's budget, and a sleeping rank's
-    /// released segments are not in it. It excludes the graph pools and the
-    /// cache's scratch page set as well: those are the worker's and the
-    /// paired forward's own regions, so `graph + resident + scratch <= budget`
-    /// is three disjoint figures of one device allowance. It reads the owners'
-    /// books and asks no driver, so a figure that could not be computed is left
-    /// out rather than failing the report.
-    pub fn mapped_resident(&self) -> u64 {
-        let planes = self
-            .prefix_cache
-            .as_ref()
-            .map_or(0, |cache| lock(cache).mapped_bytes());
-        planes + self.products.mapped_bytes() + self.slots.mapped_bytes()
-    }
 
-    /// Release the resident cache segments: what a sleep gives back and a wake
-    /// maps again.
-    ///
-    /// Takes `&self`: the one thing it touches is the shared cache, which the
-    /// caller reaches through an `Arc<Mutex<_>>`, so the device thread and the
-    /// control thread call the same body - [`sleep`].
-    pub fn sleep(&self, storage: &mut dyn ExclusiveStorage) -> Result<()> {
-        match &self.prefix_cache {
-            Some(cache) => sleep(cache, storage),
-            // No cache planes, no segments: a rank that keeps none sleeps and wakes as it stands.
-            None => Ok(()),
-        }
-    }
 
-    /// Map the released cache segments again, `limit` of them or all.
-    ///
-    /// Takes `&self` for the same reason as [`Memory::sleep`]; the body is
-    /// [`wake`], which the device thread calls with the cache handle it holds.
-    pub fn wake(
-        &self,
-        storage: &mut dyn ExclusiveStorage,
-        stream: &Stream,
-        limit: Option<u32>,
-    ) -> Result<()> {
-        match &self.prefix_cache {
-            Some(cache) => wake(cache, storage, stream, limit),
-            None => Ok(()),
-        }
-    }
 
     /// The bytes one token of this rank's pages takes in the host KV cache; zero on a rank that
     /// keeps no paged cache.
@@ -323,10 +215,6 @@ impl Memory {
             .map_or(0, |cache| lock(cache).plan().groups.len())
     }
 
-    /// The device this rank's memory lives on.
-    pub fn device(&self) -> crate::config::Device {
-        self.device
-    }
 
     /// The device's pools, so a paired forward can take its scratch page set
     /// from the same allowance as every other pool.

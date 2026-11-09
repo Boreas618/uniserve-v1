@@ -114,7 +114,7 @@ pub struct SortArgs {
     /// count, has padding to mark.
     ///
     /// A captured bucket is wider than the batch that fills it, and a row past the batch's extent has
-    /// no route: the program writes [`PADDED`] into `expanded_to_permuted` for every route of such a
+    /// no route: the program writes `-1` into `expanded_to_permuted` for every route of such a
     /// row, which the combine skips because it refuses any negative index. The value lives on the
     /// device rather than in [`Call`]'s host scalars because it changes per replay of one captured
     /// graph, and a host value is read once at launch. `None` states no count, which every row live
@@ -131,11 +131,6 @@ pub struct SortArgs {
     pub local_offset: u32,
 }
 
-/// The map's value for a route of a token row the batch does not fill.
-///
-/// Distinct from `-1`, which means the route is held by another rank. The combine refuses any
-/// negative index, so both are skipped by one predicate.
-pub const PADDED: i32 = -2;
 
 /// The call structure the package's entry receives.
 ///

@@ -360,24 +360,6 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         format!("decode-{:?}-{}", bucket.extent, bucket.rows)
     }
 
-    /// Allocates and fills the tables of every bucket's layout, once, when the runner loads (4.3).
-    pub fn load(&mut self) -> Result<()> {
-        if self.pools.is_none() {
-            return Err(Error::Resource(
-                "the decoder runner loaded before its device's pools were attached",
-            ));
-        }
-        // **The plan is the floor of the device's share, checked here rather than discovered by a
-        // capture that has to be thrown away.** The pool is the runtime's policy - a share of the
-        // device per stream - and the model states what one decode of a layout reserves, so a share
-        // below the plan is refused while the deployment is being assembled, naming the bucket and
-        // both numbers, rather than at the first frame that reaches the arena.
-        self.claim()?;
-        for bucket in self.capture_order() {
-            self.fill(bucket)?;
-        }
-        Ok(())
-    }
 
     /// Claims the arena the largest bucket's decode plans.
     fn claim(&mut self) -> Result<()> {
@@ -456,7 +438,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                 "bucket {bucket} is not a decode bucket"
             )));
         };
-        let layout = self.layout(bucket)?;
+        self.layout(bucket)?;
         let elements = u64::from(RASTER_CHANNELS)
             .checked_mul(u64::from(frames))
             .and_then(|elements| elements.checked_mul(u64::from(height)))
@@ -737,7 +719,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     }
 
     /// The raster this runner's replay writes, `[channels, frames, rows, columns]`.
-    fn raster(&self, bucket: Bucket, layout: &Layout) -> Result<TensorView> {
+    fn raster(&self, bucket: Bucket) -> Result<TensorView> {
         let Extent::Clip {
             frames,
             height,
@@ -781,13 +763,13 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
                  it served was never staged, so the clip has no name to publish under"
             )));
         };
-        let layout = self.layout(bucket)?;
+        self.layout(bucket)?;
         // With a postprocessor the request's product is the timeline's frames - `[frames, rows,
         // columns, 3]` bytes, which is what an encoder takes - and without one it is the clip's own
         // raster, which is all such a deployment has to publish.
         let published = match self.postprocessor {
             Some(_) => self.frames_view(bucket)?,
-            None => self.raster(bucket, &layout)?,
+            None => self.raster(bucket)?,
         };
         let written = crate::runners::products::written_on(&self.stream)?;
         products.publish(
@@ -831,7 +813,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
             .tables
             .views(self.lifecycle.generation.number(), &key, &tables)?;
         let latents = self.latents(&layout)?;
-        let raster = self.raster(bucket, &layout)?;
+        let raster = self.raster(bucket)?;
         self.model
             .decode(
                 &forward,
@@ -868,8 +850,8 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
         let forward = nn::Forward::new(&stream, &kernels, &arena);
-        let layout = self.layout(bucket)?;
-        self.splice_clip(&forward, bucket, &layout)
+        self.layout(bucket)?;
+        self.splice_clip(&forward, bucket)
     }
 
     /// Writes the clip a replay just decoded into its request's timeline.
@@ -884,12 +866,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
     /// body each clip keeps and the overlap the fade reads are all the checkpoint's arithmetic. This
     /// runner states only where the clip is: **each clip gets its own raster**, so the splice's
     /// destination starts at frame zero and the product names the frames this clip wrote.
-    fn splice_clip(
-        &mut self,
-        forward: &nn::Forward,
-        bucket: Bucket,
-        layout: &Layout,
-    ) -> Result<()> {
+    fn splice_clip(&mut self, forward: &nn::Forward, bucket: Bucket) -> Result<()> {
         let Some(postprocessor) = self.postprocessor.clone() else {
             return Ok(());
         };
@@ -940,7 +917,7 @@ impl<M: Decoder + Send + Sync> DecoderRunner<M> {
         } else {
             None
         };
-        let clip = self.raster(bucket, layout)?;
+        let clip = self.raster(bucket)?;
         if self.diag.enabled() {
             let _ = self.diag.write(
                 self.device,

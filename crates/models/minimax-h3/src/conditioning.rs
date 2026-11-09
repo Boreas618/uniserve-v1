@@ -534,13 +534,6 @@ impl Scratch {
         ]
     }
 
-    /// The elements all ten hold.
-    pub fn elements(&self) -> u64 {
-        self.entries()
-            .iter()
-            .map(|(_, shape)| shape.dims().iter().product::<u64>())
-            .sum()
-    }
 }
 
 impl Rows {

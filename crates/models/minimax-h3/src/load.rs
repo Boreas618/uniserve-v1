@@ -51,8 +51,8 @@ pub use crate::partition::Component;
 
 /// A loaded deployment: the blocks this rank serves, and the components they were built from.
 ///
-/// The runner needs the first and only the first: [`MinimaxH3::into_model`] hands it over and the
-/// worker serves each block by the capability it implements. The second is what makes the
+/// The blocks are what the worker serves, each by the capability it implements. The second is what
+/// makes the
 /// deployment able to answer for itself: a block is boxed as `Arc<dyn Encoder>` and the trait does
 /// not publish descriptors, so the model's programs can only be enumerated from the components
 /// before they are erased - `keys` walks these handles, and nothing else in the crate reads them.
@@ -106,16 +106,7 @@ impl std::fmt::Debug for MinimaxH3 {
 }
 
 impl MinimaxH3 {
-    /// The blocks this rank serves, as the worker consumes them.
-    pub fn model(&self) -> &nn::Model {
-        &self.model
-    }
 
-    /// The blocks, consuming the deployment: what a runner is handed once nothing else needs to
-    /// enumerate the deployment's programs.
-    pub fn into_model(self) -> nn::Model {
-        self.model
-    }
 
     /// The text encoder, when this rank places it.
     pub fn text_encoder(&self) -> Option<&Arc<TextEncoder>> {
@@ -342,35 +333,6 @@ impl ElementTypes {
             .join(", ")
     }
 
-    /// Check the statement against a checkpoint's own shard headers, refusing a disagreement by
-    /// component, type and count.
-    ///
-    /// A statement that can be checked is checked, and one that cannot is not pretended to be: a host
-    /// with no shard cannot open the checkpoint, so its caller skips this - and that is exactly the
-    /// host the committed summary serves.
-    pub fn verify(&self, checkpoint: &nn::Checkpoint) -> Result<()> {
-        for stated in &self.components {
-            let found = count_stored_types(checkpoint, stated.component)?;
-            if found == stated.dtypes {
-                continue;
-            }
-            let show = |pairs: &[(String, usize)]| {
-                pairs
-                    .iter()
-                    .map(|(dtype, count)| format!("{dtype} x{count}"))
-                    .collect::<Vec<_>>()
-                    .join(" + ")
-            };
-            return Err(Error::checkpoint(format!(
-                "{}: the statement holds {} for {}, and the checkpoint's shards hold {}",
-                self.source.display(),
-                show(&stated.dtypes),
-                stated.component,
-                show(&found)
-            )));
-        }
-        Ok(())
-    }
 }
 
 /// One component's stored element types as its shards state them, counted per type.

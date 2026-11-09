@@ -150,10 +150,6 @@ impl WeightLayout {
         Self(name)
     }
 
-    /// The layout's name.
-    pub const fn name(self) -> &'static str {
-        self.0
-    }
 }
 
 impl fmt::Display for WeightLayout {

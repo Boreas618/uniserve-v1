@@ -593,25 +593,13 @@ impl Jobs {
         }
     }
 
-    /// A submission with nothing for the device to issue.
-    pub fn none() -> Self {
-        Self::default()
-    }
 
     /// Every job, in order.
     pub fn iter(&self) -> impl Iterator<Item = &Job> {
         self.jobs.iter()
     }
 
-    /// How many jobs the submission holds.
-    pub fn len(&self) -> usize {
-        self.jobs.len()
-    }
 
-    /// Whether the submission holds no job.
-    pub fn is_empty(&self) -> bool {
-        self.jobs.is_empty()
-    }
 }
 
 /// One job the device worker issues, in submission order.
@@ -730,25 +718,7 @@ impl Job {
         }
     }
 
-    /// What kind of job this is, for the watchdog's report.
-    pub fn kind(&self) -> JobKind {
-        match self {
-            Self::Join { .. } | Self::Replay { .. } => JobKind::Replay,
-            Self::Capture { .. } => JobKind::Capture,
-            Self::Rebind { .. } => JobKind::Rebind,
-            Self::Shadow { .. } => JobKind::Shadow,
-            Self::Host { .. } => JobKind::Host,
-            Self::Prepare { .. } => JobKind::Prepare,
-        }
-    }
 
-    /// The batch a serving job belongs to, when it serves one (2.4's stall report names it).
-    pub fn batch(&self) -> Option<BatchId> {
-        match self {
-            Self::Replay { batch, .. } => Some(*batch),
-            _ => None,
-        }
-    }
 
     /// The runner that performs the job, if a runner does.
     pub fn runner(&self) -> Option<crate::runner::RunnerId> {
@@ -996,10 +966,6 @@ pub struct Workers {
 }
 
 impl Workers {
-    /// The node's devices, in the order they were spawned.
-    pub fn new(workers: Vec<crate::device::Worker>) -> Result<Self> {
-        Self::shared(workers.into_iter().map(Arc::new).collect())
-    }
 
     /// The rank's devices, as the handles the rest of the process already holds.
     ///
@@ -1105,15 +1071,7 @@ impl Workers {
         Ok(submit(first, batch)?.joined(peers))
     }
 
-    /// How many devices the rank hands batches to.
-    pub fn len(&self) -> usize {
-        self.workers.len()
-    }
 
-    /// Whether the rank has no device at all.
-    pub fn is_empty(&self) -> bool {
-        self.workers.is_empty()
-    }
 }
 
 /// The refusal of a batch whose phase no device of this rank serves.
@@ -1327,30 +1285,6 @@ pub enum JobKind {
 }
 
 impl JobKind {
-    /// The kind's name, as a stall report prints it.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Batch => "batch",
-            Self::Replay => "replay",
-            Self::Capture => "capture",
-            Self::Rebind => "rebind",
-            Self::Shadow => "shadow",
-            Self::Host => "host",
-            Self::Warmup => "warmup",
-            Self::Precopy => "precopy",
-            Self::Switchover => "switchover",
-            Self::Revert => "revert",
-            Self::Purge => "purge",
-            Self::Discard => "discard",
-            Self::Sleep => "sleep",
-            Self::HostCache => "host cache",
-            Self::Prepare => "prepare",
-            Self::LatentOffload => "latent offload",
-            Self::Wake => "wake",
-            Self::Profile => "profile",
-            Self::After => "after",
-        }
-    }
 }
 
 /// What the caller of a submission holds until its jobs ended.
@@ -1419,10 +1353,6 @@ impl Submission {
         )
     }
 
-    /// The submission's number, in the mechanism's order.
-    pub fn id(&self) -> SubmissionId {
-        self.id
-    }
 
     /// The state the queue completes, and the submission's number.
     pub(crate) fn parts(&self) -> (Arc<SubmissionState>, SubmissionId) {

@@ -82,7 +82,7 @@ static DROPPED: AtomicU64 = AtomicU64::new(0);
 ///
 /// Fails when `libcupti.so` is missing or another CUPTI client (a profiler
 /// that injected CUPTI) holds the process's subscription, with
-/// [`Error::Cupti`] code [`super::MULTIPLE_SUBSCRIBERS`].
+/// [`Error::Cupti`] code `CUPTI_ERROR_MULTIPLE_SUBSCRIBERS_NOT_SUPPORTED`.
 pub fn subscribe() -> Result<()> {
     SUBSCRIPTION
         .get_or_init(|| {

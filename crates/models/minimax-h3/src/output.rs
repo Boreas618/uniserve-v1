@@ -156,11 +156,7 @@ impl Pcm {
     }
 }
 
-/// The element type of the video raster the media stage reads.
-pub const VIDEO_DTYPE: &str = "u8";
 
-/// The element type of the audio raster the media stage reads.
-pub const AUDIO_DTYPE: &str = "i16";
 
 /// One clip's position in the timeline, as the output stage reads it.
 ///
@@ -260,10 +256,6 @@ impl VideoPostprocessor {
         programs.finish()
     }
 
-    /// The element type of the clip raster this reads.
-    pub const fn dtype(&self) -> DType {
-        self.dtype
-    }
 
     /// The frames one clip of `splice` writes, which is what [`Self::forward`]'s `out` must hold.
     pub fn frames(splice: &Splice) -> u32 {

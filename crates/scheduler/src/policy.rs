@@ -522,21 +522,9 @@ pub struct Candidate {
     /// knowledge starts from, which the mechanism seeds the recorder with when
     /// the candidate starts serving (§4.4).
     state: Snapshot,
-    /// The pages the candidate asked to warm, in its own order (§4.4's warming
-    /// row). The decision is taken and validated here and performed by the KV
-    /// storage client, which serves no page-addressed load yet; keeping it on
-    /// the candidate is what distinguishes "the policy decided" from "the
-    /// mechanism dropped it" — see `mechanism.rs`'s "Validated and deferred".
-    warm: Vec<scheduling::guest::PageId>,
 }
 
 impl Candidate {
-    /// The pages the candidate asked to warm, in its own order — the decision
-    /// §4.4's warming row calls for, waiting on the storage client that
-    /// performs it.
-    pub fn warm(&self) -> &[scheduling::guest::PageId] {
-        &self.warm
-    }
 }
 
 /// What an epoch's policy has cost so far, in the two counters `Metrics`
@@ -688,20 +676,6 @@ pub struct PolicyReverted {
 }
 
 impl PolicyReverted {
-    /// The report as the process interface carries it (§7.3).
-    ///
-    /// A scheduler thread does not know its index, so it reports `None` and the
-    /// control thread names it; the control thread's own instance is absent
-    /// (`None`) on the wire as well (§7.3).
-    pub fn to_process(&self) -> proto::process::PolicyReverted {
-        proto::process::PolicyReverted {
-            scheduler: self.scheduler.map(|index| index as u32),
-            backend: self.program.backend.clone(),
-            revision: self.program.revision,
-            reason: self.reason.clone(),
-            fatal: self.fatal,
-        }
-    }
 }
 
 /// A request that has just reached the main process, as the control thread
@@ -893,11 +867,6 @@ impl PolicySlot {
         cost.call(instance, |instance| instance.place(call, replicas))
     }
 
-    /// `warm`: which pages to warm, in order, during an epoch's precopy (§4.4).
-    pub fn warm(&mut self, room: &Room) -> Result<Vec<PageId>, PolicyError> {
-        let (instance, cost) = (&mut self.instance, &mut self.cost);
-        cost.call(instance, |instance| instance.warm(room))
-    }
 
     /// `experts`: the layout of experts on ranks (§4.4).
     pub fn experts(&mut self, load: &ExpertLoad) -> Result<ExpertOrder, PolicyError> {
@@ -1015,7 +984,6 @@ impl PolicySlot {
             // A route-only precopy asks no warming decision: the room it has
             // is the routing one, and warming belongs to the precopy that
             // prepares a serving policy.
-            warm: Vec::new(),
         })
     }
 
@@ -1069,10 +1037,6 @@ impl PolicySlot {
         self.pending = Some(stage);
     }
 
-    /// The stage asked for and not applied yet, if any.
-    pub fn pending(&self) -> Option<Stage> {
-        self.pending
-    }
 
     /// Applies the stage a daemon asked for at a batch boundary, where no batch
     /// and no submission is in flight (§7.3 steps 3 to 6).
@@ -1310,12 +1274,6 @@ impl RoutePolicy {
         }
     }
 
-    /// The snapshot the serving instance was instantiated on: the state the
-    /// policy knows, which the mechanism's recorder is seeded from when this
-    /// instance starts serving (§4.4).
-    pub fn instantiated_on(&self) -> &Snapshot {
-        &self.state
-    }
 
     /// The program the route instance runs.
     pub fn program(&self) -> &PolicyProgram {
@@ -1389,7 +1347,6 @@ impl RoutePolicy {
             // A route-only precopy asks no warming decision: the room it has
             // is the routing one, and warming belongs to the precopy that
             // prepares a serving policy.
-            warm: Vec::new(),
         })
     }
 
@@ -1433,10 +1390,6 @@ impl RoutePolicy {
         self.previous = Some((replaced_program, replaced_module));
     }
 
-    /// §7.3 step 6 for the control thread's instance.
-    pub fn purge(&mut self) {
-        self.previous = None;
-    }
 
     /// §7.3 step 4 for the control thread's instance, on `state`.
     pub fn revert(&mut self, state: &TrialState) -> Result<(), PolicyError> {

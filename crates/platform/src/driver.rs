@@ -317,7 +317,6 @@ driver_table! {
 
         stream_create_with_priority = "cuStreamCreateWithPriority": fn(*mut Handle, u32, i32);
         stream_get_priority = "cuStreamGetPriority": fn(Handle, *mut i32);
-        stream_get_ctx = "cuStreamGetCtx": fn(Handle, *mut Handle);
         stream_is_capturing = "cuStreamIsCapturing": fn(Handle, *mut i32);
         stream_query = "cuStreamQuery": fn(Handle);
         stream_synchronize = "cuStreamSynchronize": fn(Handle);

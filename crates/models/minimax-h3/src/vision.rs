@@ -913,15 +913,7 @@ impl VisionTower {
         })
     }
 
-    /// The tower's configuration.
-    pub const fn config(&self) -> &VisionConfig {
-        &self.config
-    }
 
-    /// The element type of the tower's activations.
-    pub const fn dtype(&self) -> nn::DType {
-        self.dtype
-    }
 
     /// How many DeepStack feature tables one block returns.
     pub fn deepstack_features(&self) -> usize {
@@ -933,10 +925,6 @@ impl VisionTower {
         Buffers::new(arena, &self.config, patches, self.dtype)
     }
 
-    /// The bytes a block of `patches` patches reserves in the arena.
-    pub fn bytes(&self, patches: u32) -> Result<u64> {
-        Buffers::bytes(&self.config, patches, self.dtype)
-    }
 
     /// Encode one image block's patches into `out`.
     ///

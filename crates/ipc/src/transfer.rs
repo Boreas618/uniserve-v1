@@ -482,40 +482,7 @@ impl CacheTransfer {
         self.groups.iter().flat_map(|group| &group.tensors)
     }
 
-    /// Iterates mutably over every published tensor, in the same order, for
-    /// rebinding or pruning their locators.
-    pub fn tensors_mut(&mut self) -> impl Iterator<Item = &mut TensorTransfer> {
-        self.groups.iter_mut().flat_map(|group| &mut group.tensors)
-    }
 
-    /// Merge reports for one immutable export without exposing a partial update.
-    ///
-    /// The engine merges reports that carry locators for the same `source`,
-    /// such as per-rank reports of one call, this way. Every export field
-    /// except the locators must agree, and the merged result must pass
-    /// [`CacheTransfer::validate`]; on any error `self` is left unchanged.
-    pub fn merge_locations(&mut self, other: &Self) -> ValidationResult<()> {
-        ensure_valid!(
-            self.source == other.source
-                && self.destination == other.destination
-                && self.base == other.base
-                && self.base_extent == other.base_extent
-                && self.exported_extent == other.exported_extent
-                && self.compute_dtype == other.compute_dtype
-                && self.groups.len() == other.groups.len()
-                && self.groups.iter().zip(&other.groups).all(|(left, right)| {
-                    left.start == right.start && left.block_size == right.block_size
-                }),
-            "cache locations disagree on export metadata"
-        );
-        let mut candidate = self.clone();
-        for (destination, source) in candidate.groups.iter_mut().zip(&other.groups) {
-            merge_tensor_locations(&mut destination.tensors, &source.tensors)?;
-        }
-        candidate.validate()?;
-        *self = candidate;
-        Ok(())
-    }
 }
 
 /// Encoding represented by a reusable image-feature export.
@@ -599,10 +566,6 @@ impl TransferHandle {
         }
     }
 
-    /// Returns every physical shard and replica carried by this product.
-    pub fn locators(&self) -> impl Iterator<Item = &Locator> {
-        self.tensors().iter().flat_map(|tensor| &tensor.locations)
-    }
 }
 
 /// Appends `source`'s locators to the matching tensors of `destination`,

@@ -88,10 +88,6 @@ impl RgbBytes {
         })
     }
 
-    /// The raster's element type.
-    pub const fn dtype(&self) -> DType {
-        self.dtype
-    }
 
     /// Map `input [channels, frames, rows, columns]` into `out [frames, rows, columns, channels]`.
     ///

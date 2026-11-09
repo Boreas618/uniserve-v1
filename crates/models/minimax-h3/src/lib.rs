@@ -136,10 +136,6 @@ impl Error {
         Self::Checkpoint(problem.into())
     }
 
-    /// A capability this crate does not implement yet, said precisely.
-    pub fn unsupported(problem: impl Into<String>) -> Self {
-        Self::Unsupported(problem.into())
-    }
 }
 
 /// A result of this crate.

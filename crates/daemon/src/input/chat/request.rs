@@ -72,10 +72,6 @@ impl ChatContentPart {
         }
     }
 
-    /// Returns whether this part is a text block with empty content.
-    pub fn is_empty_text(&self) -> bool {
-        matches!(self, Self::Text { text } if text.is_empty())
-    }
 
     /// Returns whether this part contains any multimodal content.
     pub fn is_multimodal(&self) -> bool {
@@ -113,13 +109,6 @@ impl ChatContent {
         })
     }
 
-    /// Returns whether there is no text content or only empty text blocks.
-    pub fn is_empty(&self) -> bool {
-        match self {
-            Self::Text(text) => text.is_empty(),
-            Self::Parts(parts) => parts.iter().all(ChatContentPart::is_empty_text),
-        }
-    }
 
     /// Returns whether this content contains any multimodal parts.
     pub fn has_multimodal(&self) -> bool {

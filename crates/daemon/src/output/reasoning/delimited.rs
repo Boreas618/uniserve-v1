@@ -44,8 +44,7 @@ impl DelimitedReasoningParser {
     /// Creates one delimited parser state machine.
     ///
     /// `start_token` and `end_token` are the delimiter texts, each a single
-    /// vocabulary token; `with_start_labels` names the section labels that
-    /// may follow the start token.
+    /// vocabulary token.
     /// `default_in_reasoning` is the initial region when `initialize` finds no
     /// delimiter token after the prompt's last other special token, and also
     /// when `initialize` is never called.
@@ -95,28 +94,6 @@ impl DelimitedReasoningParser {
         })
     }
 
-    /// Names the section labels that may follow the start token.
-    ///
-    /// A label belongs to the delimiter, so it is neither reasoning nor
-    /// content text: a `<|channel>` delimiter opens reasoning with that token
-    /// and a channel name such as `thought`, normally followed by a newline.
-    /// The longest label that opens a section is stripped; a section that
-    /// opens with none keeps all of its text as reasoning. Prompt
-    /// initialization matches the start token alone, and a prompt that opens
-    /// the section carries its label, so generation that starts inside
-    /// reasoning strips none.
-    pub fn with_start_labels<I, S>(mut self, labels: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        self.start_labels = labels
-            .into_iter()
-            .map(Into::into)
-            .filter(|label| !label.is_empty())
-            .collect();
-        self
-    }
 
     /// Parses the buffered text, keeping back what a later delta may still
     /// change: a trailing partial delimiter, and the start of a section that

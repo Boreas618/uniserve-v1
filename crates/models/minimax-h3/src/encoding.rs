@@ -534,10 +534,6 @@ impl Stack {
             .ok_or_else(|| Error::config("the video encoder's stack has no level".to_owned()))
     }
 
-    /// The tile grid of a raster, in input pixels, and the latent extent it produces.
-    pub fn grid(&self, height: u32, width: u32) -> Result<Grid> {
-        Grid::of(height, width)
-    }
 }
 
 /// The tile grid of one raster, in input pixels, with the latent positions each seam shares.
@@ -1577,10 +1573,6 @@ impl EncoderScratch {
             })
     }
 
-    /// How many distinct tile extents the scratch covers.
-    pub fn sets(&self) -> usize {
-        self.sets.len()
-    }
 }
 
 /// One tile extent's buffers: the input pad, the input convolution's output and a set per level.

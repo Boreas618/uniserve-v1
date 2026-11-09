@@ -329,21 +329,23 @@ mod tests {
         let order = Arc::new(AtomicUsize::new(0));
 
         let first = Arc::clone(&order);
-        // SAFETY: four bytes of host storage this test owns.
+        // The copy runs when the batch is performed, so its destination outlives the recording.
+        let mut destination = Box::new([0_u8; 4]);
+        let source = [1_u8, 2, 3, 4];
+        // SAFETY: four bytes of host storage this test owns until the batch is performed; the
+        // source is read during the call.
         unsafe {
-            let mut bytes = [0_u8; 4];
             let mut copies = CopyBatch::new(platform::SourceOrder::DuringCall);
             copies.push(
-                bytes.as_mut_ptr() as u64,
-                [1_u8, 2, 3, 4].as_ptr() as u64,
+                destination.as_mut_ptr() as u64,
+                source.as_ptr() as u64,
                 4,
             );
             batch.on().copy(&copies)?;
-            std::mem::forget(bytes);
         }
         batch.on().launch_host_fn(Box::new(move || {
             first.fetch_add(1, Ordering::SeqCst);
-        }));
+        }))?;
 
         assert!(!batch.is_empty());
         assert_eq!(
@@ -353,6 +355,7 @@ mod tests {
         );
         batch.perform()?;
         assert_eq!(order.load(Ordering::SeqCst), 1);
+        assert_eq!(*destination, source, "the recorded copy ran");
         assert!(batch.perform().is_err(), "a batch is performed once");
         Ok(())
     }

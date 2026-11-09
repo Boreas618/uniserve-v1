@@ -211,13 +211,6 @@ pub enum MemoryKind {
 }
 
 impl MemoryKind {
-    /// The CUDA device of device storage.
-    pub fn cuda(self) -> Option<DeviceId> {
-        match self {
-            Self::Cuda(device) => Some(device),
-            Self::Host | Self::PinnedHost => None,
-        }
-    }
 
     /// The locator spelling of transfer peers (`cuda:<ordinal>`, or `cpu` for
     /// host storage of either kind), which consumers read back with
@@ -373,26 +366,6 @@ impl HostMapping {
         Ok(())
     }
 
-    /// Make the mapping read-only for the host and the devices. No copy may
-    /// use the range meanwhile.
-    fn seal(&self) -> Result<()> {
-        let mut registration = lock(&self.registration);
-        if let Some(registered) = registration.take() {
-            registered.unregister()?;
-        }
-        // SAFETY: the range is this live mapping.
-        if unsafe { libc::mprotect(self.address as *mut _, self.bytes, libc::PROT_READ) } != 0 {
-            return Err(Error::transport_source(
-                "protecting retained host storage",
-                std::io::Error::last_os_error(),
-            ));
-        }
-        // SAFETY: as in `register`.
-        *registration = Some(unsafe {
-            HostRegistration::read_only(self.device, self.address as *mut u8, self.bytes)
-        }?);
-        Ok(())
-    }
 }
 
 impl Drop for HostMapping {
@@ -403,21 +376,11 @@ impl Drop for HostMapping {
     }
 }
 
-/// How long an exportable allocation lives, which its exports state so a
-/// reader knows whether it may keep its mapping for later reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Residency {
-    /// Storage the rank keeps until it closes: product arenas, pools, cache
-    /// planes, latent pages.
-    Resident,
-    /// Storage made for one export and released when that export retires.
-    Transient,
-}
 
-/// Exportable allocations by base address, with their residency. Entries
+/// Exportable allocations by base address. Entries
 /// are weak: the registry never extends an allocation's lifetime, and a
 /// dropped allocation removes its own entry.
-static EXPORTABLE: Mutex<BTreeMap<u64, (Weak<Storage>, Residency)>> = Mutex::new(BTreeMap::new());
+static EXPORTABLE: Mutex<BTreeMap<u64, Weak<Storage>>> = Mutex::new(BTreeMap::new());
 
 impl Storage {
     /// Device storage on `device`. Contents are uninitialized.
@@ -437,31 +400,21 @@ impl Storage {
         bytes: usize,
         access: &[DeviceId],
     ) -> Result<Arc<Self>> {
-        Self::register_exportable(device, bytes, access, Residency::Resident)
+        Self::register_exportable(device, bytes, access)
     }
 
-    /// Exportable device storage, as [`Storage::exportable`], that holds the
-    /// payload of one export and is released when that export retires.
-    pub(crate) fn export_staging(
-        device: DeviceId,
-        bytes: usize,
-        access: &[DeviceId],
-    ) -> Result<Arc<Self>> {
-        Self::register_exportable(device, bytes, access, Residency::Transient)
-    }
 
     fn register_exportable(
         device: DeviceId,
         bytes: usize,
         access: &[DeviceId],
-        residency: Residency,
     ) -> Result<Arc<Self>> {
         let allocation = DeviceAllocation::exportable(device, bytes, access)?;
         let address = allocation.address();
         let storage = Arc::new(Self {
             kind: Kind::Device(allocation),
         });
-        lock(&EXPORTABLE).insert(address, (Arc::downgrade(&storage), residency));
+        lock(&EXPORTABLE).insert(address, Arc::downgrade(&storage));
         Ok(storage)
     }
 
@@ -473,7 +426,7 @@ impl Storage {
         let storage = Arc::new(Self {
             kind: Kind::Device(allocation),
         });
-        lock(&EXPORTABLE).insert(address, (Arc::downgrade(&storage), Residency::Resident));
+        lock(&EXPORTABLE).insert(address, Arc::downgrade(&storage));
         Ok(storage)
     }
 
@@ -553,19 +506,6 @@ impl Storage {
         Ok(lock(&self.segments()?.mapping).create(index)?)
     }
 
-    /// The fabric handle of segment `index`, which this process created and
-    /// keeps the creating handle of, when its device makes fabric-exportable
-    /// storage: what a chunk's record states for other hosts of the NVLink
-    /// fabric, which import it while this process holds the segment.
-    pub(crate) fn segment_fabric(
-        &self,
-        index: usize,
-    ) -> Result<Option<::storage::protocol::FabricHandle>> {
-        Ok(lock(&self.segments()?.mapping)
-            .fabric_handle(index)
-            .map(::storage::protocol::FabricHandle))
-    }
-
     /// Maps segment `index` from the descriptor of storage another process
     /// created and the Storage Server retains.
     pub(crate) fn import_segment(&self, index: usize, descriptor: &OwnedFd) -> Result<()> {
@@ -586,30 +526,10 @@ impl Storage {
         )?)
     }
 
-    /// Changes segment `index`'s access in place, as an epoch takes the
-    /// storage of a segment it mapped read-only once its writer is gone.
-    pub(crate) fn protect_segment(&self, index: usize, protection: Protection) -> Result<()> {
-        Ok(lock(&self.segments()?.mapping).protect_segment(index, protection)?)
-    }
-
     /// Unmaps segment `index` at once, as its storage is given back: no
     /// device work may access it any more.
     pub(crate) fn release_segment(&self, index: usize) -> Result<()> {
         Ok(lock(&self.segments()?.mapping).release(index)?)
-    }
-
-    /// Install completed allocations at these addresses, once computations
-    /// have drained. Their owner keeps creating handles for fabric exports.
-    pub(crate) fn remap(&self, allocations: &[(usize, &OwnedFd)]) -> Result<()> {
-        Ok(lock(&self.segments()?.mapping).remap(allocations, Protection::ReadOnly)?)
-    }
-
-    /// Keep a segment's creating handle across remapping or alias retirement.
-    pub(crate) fn physical_allocation(
-        &self,
-        index: usize,
-    ) -> Result<Option<Arc<platform::PhysicalAllocation>>> {
-        Ok(lock(&self.segments()?.mapping).allocation(index))
     }
 
     /// Map a **device** allocation the Storage Server retains, `bytes` long,
@@ -621,8 +541,8 @@ impl Storage {
     /// a `cuMemCreate` allocation, which is what a device location's is: this
     /// is the VMM import, and it cannot take a host record. A `Location::Host`
     /// record's storage is a memfd, and it is mapped and registered instead by
-    /// [`Storage::import_host`] (read-only) or [`Storage::map_host`]
-    /// (read-write). The record's location is the rule, not this function.
+    /// [`Storage::map_host`]. The record's location is the rule, not this
+    /// function.
     pub(crate) fn import(
         descriptor: OwnedFd,
         bytes: usize,
@@ -638,7 +558,7 @@ impl Storage {
                 descriptor: Mutex::new(Some(descriptor)),
             },
         });
-        lock(&EXPORTABLE).insert(address, (Arc::downgrade(&storage), Residency::Resident));
+        lock(&EXPORTABLE).insert(address, Arc::downgrade(&storage));
         Ok(storage)
     }
 
@@ -667,44 +587,6 @@ impl Storage {
         Ok((storage, descriptor))
     }
 
-    /// New host storage for the Storage Server to retain, at least `bytes`
-    /// long, mapped writable and registered in `device`'s context, and the
-    /// descriptor that publishes it. Contents are zero.
-    ///
-    /// The driver imports a retained allocation in whole granules, so the
-    /// allocation is rounded up to the granularity of the handle the import
-    /// uses: a weight's length is its shape's and is rarely a granule, and the
-    /// server refuses the import rather than padding it. What the tail holds is
-    /// the caller's record's business, so [`Storage::bytes`] answers the
-    /// rounded length while the record states the bytes that mean something.
-    pub(crate) fn host_retainable(device: DeviceId, bytes: usize) -> Result<(Arc<Self>, OwnedFd)> {
-        let granularity = platform::HandleType::probe(device)?.granularity(device)?;
-        let bytes = bytes
-            .div_ceil(granularity)
-            .checked_mul(granularity)
-            .ok_or_else(|| {
-                Error::Invalid(format!("a retained allocation of {bytes} bytes overflows"))
-            })?;
-        let descriptor =
-            rustix::fs::memfd_create("uniserve-retained", rustix::fs::MemfdFlags::CLOEXEC)
-                .map_err(|error| {
-                    Error::transport_source(
-                        "creating retained host storage",
-                        std::io::Error::from(error),
-                    )
-                })?;
-        rustix::fs::ftruncate(&descriptor, bytes as u64).map_err(|error| {
-            Error::transport_source("sizing retained host storage", std::io::Error::from(error))
-        })?;
-        let mapping = HostMapping::map(&descriptor, bytes, device, true)?;
-        Ok((
-            Arc::new(Self {
-                kind: Kind::Retained(mapping),
-            }),
-            descriptor,
-        ))
-    }
-
     /// Map host storage the Storage Server keeps, `bytes` long, through its
     /// `descriptor`, writable or read-only, registered in `device`'s
     /// context: a page pool, which the rank's copies write and read.
@@ -715,19 +597,6 @@ impl Storage {
         writable: bool,
     ) -> Result<Arc<Self>> {
         let mapping = HostMapping::map(&descriptor, bytes, device, writable)?;
-        Ok(Arc::new(Self {
-            kind: Kind::Retained(mapping),
-        }))
-    }
-
-    /// Map retained host storage, `bytes` long, read-only through its
-    /// `descriptor`, registered in `device`'s context.
-    pub(crate) fn import_host(
-        descriptor: OwnedFd,
-        bytes: usize,
-        device: DeviceId,
-    ) -> Result<Arc<Self>> {
-        let mapping = HostMapping::map(&descriptor, bytes, device, false)?;
         Ok(Arc::new(Self {
             kind: Kind::Retained(mapping),
         }))
@@ -755,22 +624,6 @@ impl Storage {
         }
     }
 
-    /// Change the access of every device mapping the storage has, in place
-    /// at an unchanged address: retained weights are downgraded to
-    /// read-only once published, so any write through them faults.
-    pub(crate) fn protect(&self, protection: Protection) -> Result<()> {
-        match &self.kind {
-            Kind::Device(allocation) => Ok(allocation.protect(protection)?),
-            Kind::Mapped { mapping, .. } => Ok(lock(mapping).protect(protection)?),
-            Kind::Segmented(segments) => Ok(lock(&segments.mapping).protect(protection)?),
-            Kind::Retained(mapping) if protection == Protection::ReadOnly => mapping.seal(),
-            Kind::Retained(_) | Kind::Pinned(_) | Kind::Host(_) => Err(Error::Invariant(
-                "only device storage changes its protection, and retained host storage \
-                 only to read-only"
-                    .into(),
-            )),
-        }
-    }
 
     /// The device allocation, `None` for host storage and mappings.
     pub(crate) fn allocation(&self) -> Option<&DeviceAllocation> {
@@ -778,33 +631,6 @@ impl Storage {
             Kind::Device(allocation) => Some(allocation),
             _ => None,
         }
-    }
-
-    /// Replace a drained composite alias while preserving every tensor address.
-    /// Both storages must be unretained aliases; retained manifests own their
-    /// descriptors and use segmented remapping instead.
-    pub(crate) fn remap_alias(&self, source: &Self) -> Result<()> {
-        let (
-            Kind::Mapped {
-                mapping: target,
-                descriptor: target_descriptor,
-            },
-            Kind::Mapped {
-                mapping: source,
-                descriptor: source_descriptor,
-            },
-        ) = (&self.kind, &source.kind)
-        else {
-            return Err(Error::State(
-                "alias replacement requires composite mappings",
-            ));
-        };
-        if lock(target_descriptor).is_some() || lock(source_descriptor).is_some() {
-            return Err(Error::State(
-                "alias replacement requires composite mappings",
-            ));
-        }
-        Ok(lock(target).remap_from(&lock(source), Protection::ReadWrite)?)
     }
 
     /// Puts the physical allocation `source` maps at this storage's address: a retained weight
@@ -847,12 +673,12 @@ impl Storage {
     }
 
     /// The live exportable allocation containing `address`, with the
-    /// address's byte offset inside it and the allocation's residency.
-    pub(crate) fn exportable_containing(address: u64) -> Option<(Arc<Self>, u64, Residency)> {
+    /// address's byte offset inside it.
+    pub(crate) fn exportable_containing(address: u64) -> Option<(Arc<Self>, u64)> {
         let registry = lock(&EXPORTABLE);
-        let (&base, (storage, residency)) = registry.range(..=address).next_back()?;
+        let (&base, storage) = registry.range(..=address).next_back()?;
         let storage = storage.upgrade()?;
-        (address < base + storage.bytes() as u64).then(|| (storage, address - base, *residency))
+        (address < base + storage.bytes() as u64).then(|| (storage, address - base))
     }
 
     /// The allocation's host-visible bytes. `None` for device storage.
@@ -897,7 +723,7 @@ impl Drop for Storage {
             // dead entry.
             if registry
                 .get(&address)
-                .is_some_and(|(entry, _)| entry.strong_count() == 0)
+                .is_some_and(|entry| entry.strong_count() == 0)
             {
                 registry.remove(&address);
             }
@@ -1033,21 +859,12 @@ impl StorageView {
         }
     }
 
-    /// A whole allocation viewed as `[len / dtype.bytes()]` elements.
-    pub fn whole(storage: Arc<dyn Backing>, dtype: ElementType) -> Result<Self> {
-        let elements = storage.bytes() / dtype.bytes();
-        Self::contiguous(storage, 0, dtype, &[elements as i64])
-    }
 
     /// The allocation this view retains.
     pub fn storage(&self) -> &Arc<dyn Backing> {
         &self.storage
     }
 
-    /// Byte offset of the first element inside the allocation.
-    pub(crate) fn offset(&self) -> usize {
-        self.offset
-    }
 
     pub(crate) fn device(&self) -> MemoryKind {
         self.storage.device()
@@ -1070,9 +887,6 @@ impl StorageView {
         self.storage.address() + self.offset as u64
     }
 
-    pub fn is_contiguous(&self) -> bool {
-        self.strides == contiguous_strides(&self.shape)
-    }
 
     /// Elements addressed by the view.
     pub fn numel(&self) -> u64 {
@@ -1136,15 +950,6 @@ impl StorageView {
         let mut shape = self.shape.clone();
         shape[axis] = length;
         Ok(self.derive(offset, shape, self.strides.clone()))
-    }
-
-    /// The view at `index` of `axis`, with that axis removed.
-    pub(crate) fn select(&self, axis: usize, index: i64) -> Result<Self> {
-        let row = self.narrow(axis, index, 1)?;
-        let (mut shape, mut strides) = (row.shape, row.strides);
-        shape.remove(axis);
-        strides.remove(axis);
-        Ok(self.derive(row.offset, shape, strides))
     }
 
     /// The per-axis `[start, end)` region of this view.
@@ -1260,7 +1065,22 @@ mod tests {
     }
 
     #[test]
-    fn regions_select_and_transposes_address_the_same_elements() -> Result<()> {
+    fn dtype_names_round_trip() -> Result<()> {
+        for dtype in [
+            ElementType::Bool,
+            ElementType::U8,
+            ElementType::BF16,
+            ElementType::F8E4M3,
+            ElementType::F64,
+        ] {
+            assert_eq!(ElementType::parse(dtype.name())?, dtype);
+        }
+        assert!(ElementType::parse("complex64").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn regions_and_transposes_address_the_same_elements() -> Result<()> {
         let storage: Arc<dyn Backing> = Storage::host(4 * 6 * 4);
         let base = storage.address();
         let grid = StorageView::contiguous(Arc::clone(&storage), 0, ElementType::F32, &[4, 6])?;
@@ -1273,31 +1093,11 @@ mod tests {
             vec![base + 32..base + 44, base + 56..base + 68,]
         );
 
-        let column = grid.select(1, 5)?;
-        assert_eq!(
-            (column.shape(), column.strides()),
-            (&[4_i64][..], &[6_i64][..])
-        );
         let transposed = StorageView::strided(storage, 0, ElementType::F32, &[6, 4], &[1, 6])?;
         assert_eq!(transposed.shape(), &[6, 4]);
         // A transposed view addresses the same bytes: one contiguous interval.
         assert_eq!(transposed.intervals(), vec![base..base + 96]);
         assert!(grid.region(&[0..5, 0..6]).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn dtype_names_round_trip() -> Result<()> {
-        for dtype in [
-            ElementType::Bool,
-            ElementType::U8,
-            ElementType::BF16,
-            ElementType::F8E4M3,
-            ElementType::F64,
-        ] {
-            assert_eq!(ElementType::parse(dtype.name())?, dtype);
-        }
-        assert!(ElementType::parse("complex64").is_err());
         Ok(())
     }
 }

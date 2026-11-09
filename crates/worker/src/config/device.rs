@@ -8,7 +8,6 @@
 use platform::DeviceId;
 
 use super::DescriptorError;
-use crate::memory::allocation::MemoryKind;
 
 /// A device a rank computes on, parsed once from the launch descriptor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -41,21 +40,6 @@ impl Device {
         matches!(self, Self::Cuda(_))
     }
 
-    /// The CUDA device, if this is one.
-    pub(crate) fn cuda(self) -> Option<DeviceId> {
-        match self {
-            Self::Cpu => None,
-            Self::Cuda(device) => Some(device),
-        }
-    }
-
-    /// The storage a binding on this device computes in.
-    pub(crate) fn storage(self) -> MemoryKind {
-        match self {
-            Self::Cpu => MemoryKind::Host,
-            Self::Cuda(device) => MemoryKind::Cuda(device),
-        }
-    }
 }
 
 impl std::fmt::Display for Device {
@@ -65,43 +49,6 @@ impl std::fmt::Display for Device {
             Self::Cuda(device) => write!(formatter, "{device}"),
         }
     }
-}
-
-/// Resolve the generation (flow) tower device from `worker_config.mesh`.
-///
-/// The declaration is `tower=gen:<device>`: the text tower runs on the
-/// rank's device, and model loading places the flow route, denoiser and
-/// image decoder modules on `<device>`, which must differ from it. An empty
-/// declaration places no tower apart.
-pub(crate) fn generation_device(
-    mesh: &str,
-    device: Device,
-) -> Result<Option<Device>, DescriptorError> {
-    let mesh = mesh.trim();
-    if mesh.is_empty() {
-        return Ok(None);
-    }
-
-    let target = mesh
-        .split_once('=')
-        .filter(|(key, _)| key.trim().eq_ignore_ascii_case("tower"))
-        .and_then(|(_, selection)| selection.split_once(':'))
-        .filter(|(name, target)| {
-            name.trim().eq_ignore_ascii_case("gen") && !target.trim().is_empty()
-        })
-        .map(|(_, target)| target.trim())
-        .ok_or_else(|| {
-            DescriptorError::new(format!(
-                "worker_config.mesh must be tower=gen:<device>, got {mesh:?}"
-            ))
-        })?;
-    let generation = Device::parse(target, "worker_config.mesh tower gen")?;
-    if generation == device {
-        return Err(DescriptorError::new(
-            "worker_config.mesh tower gen must name a device other than the rank's",
-        ));
-    }
-    Ok(Some(generation))
 }
 
 #[cfg(test)]
@@ -123,18 +70,4 @@ mod tests {
         assert!(Device::parse("cuda:-1", "rank device").is_err());
     }
 
-    /// `tower=gen:<device>` places the generation tower on another device
-    /// than the rank's; the text tower always runs on the rank's own.
-    #[test]
-    fn tower_layout_requires_a_distinct_generation_device() {
-        let rank = Device::Cuda(DeviceId(0));
-        assert_eq!(
-            generation_device("tower=gen:cuda:1", rank).ok(),
-            Some(Some(Device::Cuda(DeviceId(1))))
-        );
-        assert!(generation_device("tower=gen:cuda:0", rank).is_err());
-        assert!(generation_device("tower=text:cuda:0;gen:cuda:1", rank).is_err());
-        assert!(generation_device("other=1", rank).is_err());
-        assert_eq!(generation_device(" ", rank).ok(), Some(None));
-    }
 }

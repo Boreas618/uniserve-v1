@@ -4,14 +4,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use ipc::UnitId;
-use ipc::{BlockTable, CacheTransfer, RequestKey};
+use ipc::{BlockTable, RequestKey};
 
 use crate::{Error, Result};
 
-mod attention;
 mod backing;
 
-pub(crate) use attention::{AttentionRow, TablePages};
 pub use backing::BlockTableStorage;
 
 /// Page dimensions needed to address one cache group.
@@ -23,13 +21,6 @@ pub struct GroupShape {
 }
 
 impl GroupShape {
-    /// Installed tables retain the complete reservation, including history
-    /// that a sliding-window reader no longer selects.
-    pub(crate) fn resident_width(&self, max_sequence_tokens: u64) -> u64 {
-        max_sequence_tokens
-            .max(1)
-            .div_ceil(u64::from(self.block_size))
-    }
 
     pub fn new(block_size: u32, units_per_page: u32, window: Option<u32>) -> Result<Self> {
         if block_size == 0 || units_per_page == 0 {
@@ -61,6 +52,7 @@ impl GroupTable {
     }
 
     /// The physical units at one position in each logical page.
+    #[cfg(test)]
     pub(crate) fn row(&self, position: usize) -> Vec<u32> {
         self.row_units(position).collect()
     }
@@ -192,94 +184,7 @@ impl BlockTables {
         })
     }
 
-    pub(crate) fn groups(&self) -> &[GroupShape] {
-        &self.groups
-    }
 
-    /// Resolve physical writes before an import starts. Existing prefix pages
-    /// keep their addresses and initialization; only newly assigned units reset.
-    /// This does not install the tables or change their visible lengths.
-    pub(crate) fn import_spans(
-        &self,
-        slot: u32,
-        tables: &[Arc<GroupTable>],
-        transfer: &CacheTransfer,
-        initialized: &[u32],
-    ) -> Result<Vec<(u32, u32, u32)>> {
-        if slot == 0 || slot > self.request_pool_size || tables.len() != self.groups.len() {
-            return Err(Error::Invalid(
-                "cache import requires a destination table per group".into(),
-            ));
-        }
-        if !transfer.groups.is_empty() && transfer.groups.len() != tables.len() {
-            return Err(Error::Invalid(
-                "cache transfer groups do not match destination groups".into(),
-            ));
-        }
-
-        let reset: HashSet<_> = initialized.iter().copied().collect();
-        let mut spans = Vec::new();
-        for (group, table) in tables.iter().enumerate() {
-            self.validate_table(group, table)?;
-            let block_size = u64::from(table.shape.block_size);
-            if table.allocated_tokens < transfer.exported_extent
-                || u64::from(table.start_page) * block_size > u64::from(transfer.exported_extent)
-            {
-                return Err(Error::Invalid(
-                    "cache import exceeds its scheduler block table".into(),
-                ));
-            }
-
-            if transfer.base_extent > 0 {
-                let installed = self.table(slot, group as u32)?;
-                let first = table.start_page.max(installed.start_page) as u64;
-                let last = u64::from(transfer.base_extent)
-                    .div_ceil(block_size)
-                    .min(table.end_page())
-                    .min(installed.end_page());
-                let per_page = table.shape.units_per_page as usize;
-                for page in first..last {
-                    let new = (page - u64::from(table.start_page)) as usize * per_page;
-                    let old = (page - u64::from(installed.start_page)) as usize * per_page;
-                    let units = &table.units[new..new + per_page];
-                    if units != &installed.units[old..old + per_page]
-                        || units.iter().any(|unit| reset.contains(&unit.0))
-                    {
-                        return Err(Error::Invalid(
-                            "cache import would replace its installed base units".into(),
-                        ));
-                    }
-                }
-            }
-
-            if let Some(source) = transfer.groups.get(group) {
-                let start = table.shape.window.map_or(transfer.base_extent, |window| {
-                    transfer
-                        .base_extent
-                        .max(transfer.exported_extent.saturating_sub(window))
-                });
-                if source.start != start || start > transfer.exported_extent {
-                    return Err(Error::Invalid(
-                        "cache transfer starts outside its destination history".into(),
-                    ));
-                }
-                spans.extend(table.spans(
-                    u64::from(start),
-                    u64::from(transfer.exported_extent - start),
-                )?);
-            }
-        }
-
-        // A physical unit can serve any group. Reset reserves its full token
-        // range, while the access owner coalesces it with the copied suffix.
-        let unit_tokens = self
-            .groups
-            .iter()
-            .map(|group| group.block_size)
-            .fold(0, u32::max);
-        spans.extend(initialized.iter().map(|&unit| (unit, 0, unit_tokens)));
-        Ok(spans)
-    }
 
     /// Check a table against the rank's own table storage: its group's
     /// shape, whole pages within the row width, allocated tokens within its
@@ -425,49 +330,7 @@ impl BlockTables {
             .ok_or_else(|| Error::Invalid("request slot has no installed block table".into()))
     }
 
-    pub(crate) fn allocated_length(&self, slot: u32) -> u32 {
-        self.lengths.get(&slot).copied().unwrap_or(0)
-    }
 
-    /// Resolve one request's visible prefix against every installed cache group.
-    /// The returned capacity is the common extent, including sliding windows.
-    pub(crate) fn coordinates(&self, slot: u32, visible: u64) -> Result<(u32, u64, u32)> {
-        for group in 0..self.groups.len() as u32 {
-            if !self.tables.contains_key(&(slot, group)) {
-                return Err(Error::Invalid(
-                    "request slot has no installed block table".into(),
-                ));
-            }
-        }
-
-        let capacity = self.allocated_length(slot);
-        if visible > u64::from(capacity) {
-            return Err(Error::Invalid(
-                "call visibility exceeds scheduler block table".into(),
-            ));
-        }
-        Ok((slot, visible, capacity))
-    }
-
-    /// Validate releases together so an invalid slot cannot partially clear
-    /// device or host rows. Duplicate slots require only one device write.
-    pub(crate) fn release_slots(&self, slots: &[u32]) -> Result<Vec<u32>> {
-        if slots
-            .iter()
-            .any(|&slot| slot == 0 || slot > self.request_pool_size)
-        {
-            return Err(Error::Invalid(
-                "released request slot is outside capacity".into(),
-            ));
-        }
-
-        Ok(slots
-            .iter()
-            .copied()
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect())
-    }
 
     /// Commit a release after its device clears have been submitted.
     pub fn release(&mut self, slots: &[u32]) {
@@ -479,27 +342,8 @@ impl BlockTables {
         }
     }
 
-    pub(crate) fn retain_prefix(&mut self, request: RequestKey, slot: u32) {
-        self.prefixes.entry(request).or_default().insert(slot);
-    }
 
-    pub(crate) fn prefix_slots(&self, request: RequestKey) -> Vec<u32> {
-        self.prefixes
-            .get(&request)
-            .map_or_else(Vec::new, |slots| slots.iter().copied().collect())
-    }
 
-    pub(crate) fn release_prefixes(&mut self, request: RequestKey, slots: &[u32]) {
-        self.release(slots);
-        if let Some(tracked) = self.prefixes.get_mut(&request) {
-            for slot in slots {
-                tracked.remove(slot);
-            }
-            if tracked.is_empty() {
-                self.prefixes.remove(&request);
-            }
-        }
-    }
 
     pub(crate) fn clear(&mut self) {
         self.tables.clear();
@@ -511,40 +355,7 @@ impl BlockTables {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ipc::RequestId;
-
-    #[test]
-    fn visible_prefix_requires_every_group_and_fits_the_common_extent() -> Result<()> {
-        let groups = vec![
-            GroupShape::new(4, 1, None)?,
-            GroupShape::new(8, 2, Some(8))?,
-        ];
-        let mut tables = BlockTables::new(groups, 1, 3, 6)?;
-        let update = tables.prepare(&[BlockTable {
-            request_pool_idx: 1,
-            group_id: 0,
-            start_page: 0,
-            unit_ids: vec![UnitId(1), UnitId(2), UnitId(3)],
-            allocated_tokens: 12,
-        }])?;
-        tables.commit(update);
-        assert!(tables.coordinates(1, 8).is_err());
-
-        let update = tables.prepare(&[BlockTable {
-            request_pool_idx: 1,
-            group_id: 1,
-            start_page: 0,
-            unit_ids: vec![UnitId(4), UnitId(5)],
-            allocated_tokens: 8,
-        }])?;
-        tables.commit(update);
-        assert_eq!(tables.coordinates(1, 8)?, (1, 8, 8));
-        assert!(tables.coordinates(1, 9).is_err());
-
-        tables.release(&[1]);
-        assert!(tables.coordinates(1, 0).is_err());
-        Ok(())
-    }
+    
 
     #[test]
     fn batch_assignments_replace_only_supplied_groups_until_commit() -> Result<()> {
@@ -612,42 +423,4 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn retained_prefixes_follow_the_request_epoch_and_preserve_borrowed_tables() -> Result<()> {
-        let shape = GroupShape::new(4, 1, None)?;
-        let mut tables = BlockTables::new(vec![shape], 3, 2, 9)?;
-        let update = tables.prepare(&[BlockTable {
-            request_pool_idx: 2,
-            group_id: 0,
-            start_page: 0,
-            unit_ids: vec![UnitId(7)],
-            allocated_tokens: 4,
-        }])?;
-        tables.commit(update);
-        let borrowed = tables.table(2, 0)?;
-        let request = RequestKey::new(1, RequestId(4), 1);
-        let replacement = RequestKey::new(1, RequestId(4), 2);
-        tables.retain_prefix(request, 2);
-        tables.retain_prefix(request, 3);
-        assert!(tables.prefix_slots(replacement).is_empty());
-
-        let slots = tables.release_slots(&[2, 2])?;
-        tables.release_prefixes(request, &slots);
-        assert_eq!(tables.prefix_slots(request), vec![3]);
-        assert_eq!(tables.allocated_length(2), 0);
-        assert!(tables.table(2, 0).is_err());
-        assert_eq!(borrowed.units, vec![UnitId(7)]);
-
-        let update = tables.prepare(&[BlockTable {
-            request_pool_idx: 2,
-            group_id: 0,
-            start_page: 1,
-            unit_ids: vec![UnitId(8)],
-            allocated_tokens: 8,
-        }])?;
-        tables.commit(update);
-        assert_eq!(tables.table(2, 0)?.units, vec![UnitId(8)]);
-        assert_eq!(borrowed.units, vec![UnitId(7)]);
-        Ok(())
-    }
 }

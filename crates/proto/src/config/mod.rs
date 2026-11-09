@@ -2,9 +2,8 @@
 //!
 //! Each type is the section of the deployment file named after it (`kv_cache_config` is
 //! [`KvCacheConfig`]): the daemon parses the file into it, and the same type travels to the
-//! frontend and the engine processes. A type does not refuse unknown fields, so a process of an
-//! older build reads what a newer daemon writes; the daemon refuses a key no section knows when it
-//! parses the file (`daemon::options`).
+//! frontend and the engine processes. Every type refuses a field it does not know, so a key no
+//! section knows fails the parse instead of being ignored.
 
 pub mod block;
 pub mod values;

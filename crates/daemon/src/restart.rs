@@ -801,7 +801,7 @@ async fn prepared_successor(
         .processes
         .strip_prefix("unix:")
         .map(std::path::PathBuf::from);
-    let mut daemon = Daemon::resume(
+    let daemon = Daemon::resume(
         config.host_identity.clone(),
         Some((prepare.processes.clone(), socket)),
         service,

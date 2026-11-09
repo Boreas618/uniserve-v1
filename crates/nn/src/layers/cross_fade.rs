@@ -57,10 +57,6 @@ impl CrossFade {
         })
     }
 
-    /// The voxels the two tiles share.
-    pub const fn extent(&self) -> u32 {
-        self.extent
-    }
 
     /// Blend `previous` and `current` into `out`, all `[channels, frames, rows, columns]`.
     ///
