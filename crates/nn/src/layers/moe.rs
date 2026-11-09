@@ -2177,7 +2177,7 @@ pub(super) mod tests {
     }
 
     #[test]
-    fn the_qwen3_shapes_build() {
+    fn a_block_of_128_experts_top_8_builds() {
         let block = block(128, 8, 2048, 768).unwrap();
         assert_eq!(block.experts(), 128);
         assert_eq!(block.top(), 8);
