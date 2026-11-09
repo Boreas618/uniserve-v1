@@ -357,17 +357,17 @@ fn an_executable_program_is_installed_stored_and_resolved_as_it_is() {
 /// built while the publisher's directory exists. Building it at install is what
 /// removes that dependency from everything after (design section 6.2).
 #[test]
+#[ignore = "requires the Program Server's interpreter (UNISERVE_PROGRAM_SERVER_PYTHON) and the wasm precompiler (UNISERVE_SCHEDULING_PRECOMPILE)"]
 fn a_policy_is_built_when_it_is_installed_and_needs_no_compiler_after() {
-    let (Some(python), Some(precompiler)) = (
-        std::env::var_os("UNISERVE_PROGRAM_SERVER_PYTHON").map(PathBuf::from),
-        std::env::var_os("UNISERVE_SCHEDULING_PRECOMPILE").map(PathBuf::from),
-    ) else {
-        eprintln!(
-            "SKIPPED (provisioning): name the interpreter with UNISERVE_PROGRAM_SERVER_PYTHON \
-             and the precompiler with UNISERVE_SCHEDULING_PRECOMPILE"
+    let python = std::env::var_os("UNISERVE_PROGRAM_SERVER_PYTHON")
+        .map(PathBuf::from)
+        .expect("UNISERVE_PROGRAM_SERVER_PYTHON must name the Program Server's interpreter");
+    let precompiler = std::env::var_os("UNISERVE_SCHEDULING_PRECOMPILE")
+        .map(PathBuf::from)
+        .expect(
+            "UNISERVE_SCHEDULING_PRECOMPILE must name the precompiler: \
+             `cargo build -p scheduling --bin scheduling-precompile` builds it",
         );
-        return;
-    };
     let temporary = tempfile::tempdir().unwrap();
     let package = temporary.path().join("policy");
     std::fs::create_dir_all(package.join("src")).unwrap();
