@@ -3,7 +3,7 @@
 //! A deployment fixes how the model is split: tensor parallelism shards the vocabulary, the
 //! attention heads and every dense projection; expert parallelism shards the expert set, so each
 //! rank holds a subset and an exchange carries tokens to the experts that own them
-//! (specs/worker.md 4.3, 9). The partition is a *mathematical* description the layers apply; it is
+//! The partition is a *mathematical* description the layers apply; it is
 //! not a runner, a communicator or a rank layout, and it holds no runtime object (`AGENTS.md`, Model
 //! Library Boundary).
 
@@ -130,8 +130,8 @@ impl Partition {
     }
 
     /// The intermediate width of one routed expert on this rank: the tensor group splits every
-    /// expert's `moe_intermediate_size` and sums the partial outputs once after the experts, as
-    /// the Python worker's tensor-parallel binding does (`uniserve/nn/moe.py`, `FusedMoE`).
+    /// expert's `moe_intermediate_size` over its ranks and sums the partial outputs once after the
+    /// experts.
     pub const fn local_expert_intermediate(&self, config: &crate::Config) -> usize {
         config.moe_intermediate_size / self.tensor_parallel
     }
@@ -147,7 +147,6 @@ impl Partition {
         let first = self.expert_rank * per_rank;
         first..first + per_rank
     }
-
 }
 
 #[cfg(test)]

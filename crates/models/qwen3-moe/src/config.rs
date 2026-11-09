@@ -5,9 +5,8 @@
 //! exists. The model, the layers and the weight layouts then consume typed fields and never parse a
 //! dictionary again (`AGENTS.md`, Model Library Boundary).
 //!
-//! The rules are those of `uniserve/models/qwen3/config.py` (`read_config`, `Config`) restricted to
-//! the mixture-of-experts architecture this crate serves, and `uniserve/rotary.py` for the rotary
-//! recipe.
+//! The rules are those of the Hugging Face `Qwen3MoeConfig`, restricted to the mixture-of-experts
+//! architecture this crate serves, together with its rotary recipe (plain or YaRN).
 
 use std::fs;
 use std::path::Path;
@@ -24,9 +23,6 @@ pub enum Activation {
     Silu,
     /// Tanh-approximated GELU, the checkpoint's `gelu_pytorch_tanh`.
     GeluTanh,
-}
-
-impl Activation {
 }
 
 /// A YaRN rotary recipe, the only scaled recipe a Qwen3 checkpoint may use.
@@ -271,12 +267,6 @@ impl Config {
             && !self.mlp_only_layers.contains(&layer)
             && (layer + 1).is_multiple_of(self.decoder_sparse_step)
     }
-
-
-    /// Query heads per key/value head.
-    pub const fn group_size(&self) -> usize {
-        self.num_attention_heads / self.num_key_value_heads
-    }
 }
 
 /// The rotary recipe resolved from the checkpoint's metadata.
@@ -287,7 +277,7 @@ struct Rotary {
 
 impl RawConfig {
     /// Resolve `rope_theta`, `rope_scaling`/`rope_parameters` and the partial factor, rejecting the
-    /// recipes this model does not serve (`uniserve/rotary.py:read_rotary`).
+    /// recipes this model does not serve.
     fn rotary(&self, max_position_embeddings: usize) -> Result<Rotary> {
         let scaling = self.rope_scaling.as_ref();
         let parameters = self.rope_parameters.as_ref();
@@ -518,24 +508,14 @@ impl RawConfig {
 mod tests {
     use super::*;
 
-    /// The metadata of the deployment this crate was written for, when the machine has it.
-    ///
-    /// The path is the one `specs/worker.md` names for the local checkpoint; a machine without the
-    /// asset skips the test rather than failing, and a machine with it checks the parse against the
-    /// values the design's slice depends on.
+    /// The metadata of a Qwen3-30B-A3B checkpoint parses to the published architecture.
     #[test]
+    #[ignore = "requires UNISERVE_QWEN3_MODEL naming a Qwen3-MoE checkpoint"]
     fn the_local_checkpoint_metadata_parses() {
-        // The local checkpoint's metadata, when `UNISERVE_QWEN3_MODEL` names one.
-        let Some(root) = std::env::var_os("UNISERVE_QWEN3_MODEL") else {
-            return;
-        };
-        let path = std::path::Path::new(&root).join("config.json");
-        let path = path.as_path();
-        if !path.is_file() {
-            return;
-        }
-        let config = Config::read(path.parent().expect("a parent directory"))
-            .expect("the local Qwen3-30B-A3B metadata");
+        let root = std::env::var_os("UNISERVE_QWEN3_MODEL")
+            .expect("UNISERVE_QWEN3_MODEL names a Qwen3-MoE checkpoint");
+        let config =
+            Config::read(std::path::Path::new(&root)).expect("the local Qwen3-30B-A3B metadata");
         assert_eq!(config.vocab_size, 151936);
         assert_eq!(config.hidden_size, 2048);
         assert_eq!(config.intermediate_size, 6144);
@@ -590,7 +570,6 @@ mod tests {
         let config = Config::from_raw(&raw(complete())).expect("a supported checkpoint");
         assert_eq!(config.hidden_size, 2048);
         assert_eq!(config.head_dim, 128);
-        assert_eq!(config.group_size(), 8);
         assert_eq!(config.num_experts, 128);
         assert!(config.sparse(0) && config.sparse(3));
         assert_eq!(config.hidden_act, Activation::Silu);

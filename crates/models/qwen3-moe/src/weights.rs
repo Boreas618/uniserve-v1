@@ -1,10 +1,9 @@
 //! The declarative weight mapping of `Qwen3MoeForCausalLM`.
 //!
 //! Every parameter of the loaded model is named here once, together with the checkpoint tensor it
-//! comes from (`uniserve/models/qwen3/weights.py`, `parameter_sources`/`expert_sources`). The
-//! mapping is data: it names no device, no layout and no partition — the [`WeightLoader`] applies
-//! the deployment's partition and the layout the reading operator declares, and converts the
-//! element type once (specs/worker.md 4.3, 8).
+//! comes from ([`parameter_sources`], [`expert_sources`]). The mapping is data: it names no
+//! device, no layout and no partition — the [`WeightLoader`] applies the deployment's partition
+//! and the layout the reading operator declares, and converts the element type once.
 //!
 //! [`WeightLoader`]: nn::WeightLoader
 //!
@@ -22,10 +21,7 @@
 //! Released checkpoints store the stack under `model.layers.<i>…`, and every name in this table is
 //! that canonical form. [`WeightLoader`] matches a checkpoint tensor's name **exactly** - the load
 //! path has no `model.`-prefix fallback - so a checkpoint serialized without the prefix is refused
-//! by the name it lacks rather than silently bound to a different tensor. The audit
-//! (`examples/audit_checkpoint.rs`) strips the prefix itself, only to report how many names the
-//! prefix accounts for, and `declared_not_consumed` does the same to recognise the two calibrated
-//! cache scales under either form; neither is the load.
+//! by the name it lacks rather than silently bound to a different tensor.
 
 use crate::Config;
 
@@ -85,92 +81,6 @@ impl ExpertSource {
             gate: at("gate"),
         }
     }
-}
-
-/// One expert's three projections in an encoded (NVFP4) checkpoint.
-///
-/// A quantized checkpoint stores each projection three times over: the packed E2M1 nibbles in
-/// `…{projection}_proj.weight` (`[rows, columns/2]` U8), the block scales in
-/// `…{projection}_proj.weight_scale` (one E4M3 scale per sixteen elements in the package's swizzled
-/// layout), and the projection's own FP32 scale in `…{projection}_proj.weight_scale_2`.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct EncodedProjection {
-    /// The packed weights, two E2M1 codes per byte along the contraction.
-    pub values: String,
-    /// The block scales.
-    pub scales: String,
-    /// The projection's FP32 tensor scale, whose reciprocal the loader carries.
-    pub global_scale: String,
-}
-
-/// One expert's three encoded projections.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct EncodedTensors {
-    /// The causal (down) projection.
-    pub down: EncodedProjection,
-    /// The up projection.
-    pub up: EncodedProjection,
-    /// The gate projection.
-    pub gate: EncodedProjection,
-}
-
-impl ExpertSource {
-    /// The encoded checkpoint tensor names of expert `expert` under this source.
-    ///
-    /// The suffix set is the one ModelOpt writes and `WeightLoader::nvfp4` consumes; a checkpoint
-    /// that names them differently is a layout the loader does not know and must refuse rather than
-    /// reinterpret bytes.
-    pub fn encoded(&self, expert: usize) -> EncodedTensors {
-        let at = |projection: &str| {
-            let stem = format!("{}.{expert}.{projection}_proj", self.checkpoint_prefix);
-            EncodedProjection {
-                values: format!("{stem}.weight"),
-                scales: format!("{stem}.weight_scale"),
-                global_scale: format!("{stem}.weight_scale_2"),
-            }
-        };
-        EncodedTensors {
-            down: at("down"),
-            up: at("up"),
-            gate: at("gate"),
-        }
-    }
-}
-
-/// Why a tensor a ModelOpt checkpoint declares is declared here and not consumed.
-pub const CALIBRATED_CACHE_SCALE: &str = "a calibrated per-tensor FP8 cache scalar, declared by the \
-checkpoint's `kv_cache_quant_algo FP8`; the cache takes one scale per page and derives it from the \
-values it writes, and the reference's quantizer refuses a calibrated scalar for FP8";
-
-/// The tensors a checkpoint declares that this model knows about and deliberately does not consume.
-///
-/// A ModelOpt checkpoint quantized to NVFP4 with `kv_cache_quant_algo: FP8` carries, in every layer,
-/// `self_attn.k_proj.k_scale` and `self_attn.v_proj.v_scale` as F32 scalars. They calibrate a
-/// *per-tensor* FP8 K/V cache. This model's cache stores **one scale per page** and derives it from
-/// the values it writes (`uniserve/prefix_cache/mha.py:282-299`), and a calibrated scalar is
-/// inexpressible for an FP8 cache by the reference quantizer's own rule — `calibrated_scale` is
-/// refused unless the format is `nvfp4` (`uniserve/quantization/quantizer.py:63-70`). A per-tensor
-/// scalar for the whole cache would be a different layout with a different reader, and seeding one
-/// into a page's buffer would change nothing: a page whose initialized flag is clear takes the
-/// derived scale.
-///
-/// Returns the reason for such a name, and `None` for every other tensor — so a loader or an audit
-/// can say *declared, not consumed* rather than silently dropping two F32 tensors per layer, which is
-/// indistinguishable from never having seen them.
-pub fn declared_not_consumed(name: &str) -> Option<&'static str> {
-    let stripped = name.strip_prefix("model.").unwrap_or(name);
-    for suffix in [".self_attn.k_proj.k_scale", ".self_attn.v_proj.v_scale"] {
-        if let Some(prefix) = stripped.strip_suffix(suffix) {
-            // `layers.<index>`: the declaration is per layer, and a name outside the stack is not one.
-            let per_layer = prefix.strip_prefix("layers.").is_some_and(|index| {
-                !index.is_empty() && index.chars().all(|character| character.is_ascii_digit())
-            });
-            if per_layer {
-                return Some(CALIBRATED_CACHE_SCALE);
-            }
-        }
-    }
-    None
 }
 
 /// Every parameter of a Qwen3-MoE model, keyed by the model's path.
@@ -267,72 +177,8 @@ pub fn expert_sources(config: &Config) -> Vec<ExpertSource> {
 mod tests {
     use super::*;
 
-    /// The declaration is per layer and in both directions: the model knows these names, must not
-    /// claim them, and must not treat any other tensor as one of them.
-    #[test]
-    fn the_calibrated_cache_scalars_are_declared_and_not_consumed() {
-        for layer in [0, 1, 47] {
-            for projection in ["k_proj.k_scale", "v_proj.v_scale"] {
-                for name in [
-                    format!("model.layers.{layer}.self_attn.{projection}"),
-                    // Without the prefix the stack is serialized under, the loader's fallback form.
-                    format!("layers.{layer}.self_attn.{projection}"),
-                ] {
-                    assert_eq!(
-                        declared_not_consumed(&name),
-                        Some(CALIBRATED_CACHE_SCALE),
-                        "{name}"
-                    );
-                }
-            }
-        }
-        assert!(CALIBRATED_CACHE_SCALE.contains("derives it"));
-        for name in [
-            "model.layers.3.self_attn.k_proj.weight",
-            "model.layers.3.self_attn.k_proj.input_scale",
-            "model.layers.3.self_attn.q_proj.k_scale",
-            "model.layers.3.self_attn.v_proj.weight_scale",
-            "model.layers.3.mlp.gate.weight",
-            "lm_head.weight",
-            // A name that carries the suffix outside the stack is not the declaration.
-            "self_attn.k_proj.k_scale",
-            "model.layers.x.self_attn.k_proj.k_scale",
-        ] {
-            assert_eq!(declared_not_consumed(name), None, "{name}");
-        }
-    }
     use crate::{Activation, Config};
     use nn::Shape;
-
-    #[test]
-    fn an_encoded_expert_names_the_packed_scales_and_tensor_scale_the_loader_reads() {
-        let source = ExpertSource {
-            module: "layers.3.mlp.experts".to_owned(),
-            checkpoint_prefix: "model.layers.3.mlp.experts".to_owned(),
-        };
-        let expert = source.encoded(17);
-        // Three names per projection, in the suffix set `WeightLoader::nvfp4` consumes; a checkpoint
-        // that spells them otherwise is a layout the loader refuses rather than reinterprets.
-        assert_eq!(
-            expert.up.values,
-            "model.layers.3.mlp.experts.17.up_proj.weight"
-        );
-        assert_eq!(
-            expert.up.scales,
-            "model.layers.3.mlp.experts.17.up_proj.weight_scale"
-        );
-        assert_eq!(
-            expert.up.global_scale,
-            "model.layers.3.mlp.experts.17.up_proj.weight_scale_2"
-        );
-        assert!(expert.down.values.ends_with("17.down_proj.weight"));
-        assert!(expert.gate.scales.ends_with("17.gate_proj.weight_scale"));
-        // The dense path's names are untouched by the encoded one.
-        assert_eq!(
-            source.tensors(17).up,
-            "model.layers.3.mlp.experts.17.up_proj.weight"
-        );
-    }
 
     fn config(sparse_layers: &[usize], bias: bool, tied: bool) -> Config {
         Config {
@@ -361,20 +207,19 @@ mod tests {
         }
     }
 
+    /// The checkpoint root `UNISERVE_QWEN3_MODEL` names, required by the asset-gated tests below.
+    fn local_checkpoint() -> std::path::PathBuf {
+        std::env::var_os("UNISERVE_QWEN3_MODEL")
+            .expect("UNISERVE_QWEN3_MODEL names a Qwen3-MoE checkpoint")
+            .into()
+    }
+
     #[test]
-    fn the_slice_checkpoint_maps_every_parameter() {
-        // The local 30B-A3B metadata, when the machine has it: 48 sparse layers, untied head.
-        // The local checkpoint's metadata, when `UNISERVE_QWEN3_MODEL` names one.
-        let Some(root) = std::env::var_os("UNISERVE_QWEN3_MODEL") else {
-            return;
-        };
-        let path = std::path::Path::new(&root).join("config.json");
-        let path = path.as_path();
-        if !path.is_file() {
-            return;
-        }
-        let config = crate::Config::read(path.parent().expect("a parent directory"))
-            .expect("the local Qwen3-30B-A3B metadata");
+    #[ignore = "requires UNISERVE_QWEN3_MODEL naming a Qwen3-MoE checkpoint"]
+    fn the_local_checkpoint_maps_every_parameter() {
+        // Qwen3-30B-A3B: 48 sparse layers and an untied head.
+        let config =
+            crate::Config::read(&local_checkpoint()).expect("the local Qwen3-30B-A3B metadata");
         let sources = parameter_sources(&config);
         // embedding, norm and head; then per layer two norms, four projections (q, k, v, o), two
         // per-head norms and the router.
@@ -397,37 +242,14 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires UNISERVE_QWEN3_MODEL naming a Qwen3-MoE checkpoint"]
     fn every_parameter_of_the_local_checkpoint_has_the_shape_the_loader_expects() {
         // The name mapping alone cannot catch a transposed or mis-shaped request; the checkpoint's
         // own headers can, before anything reaches a device. Shapes are derived from `config.json`
         // here rather than from the loader, so the two agree only if both read the design right.
-        // The local checkpoint's metadata, when `UNISERVE_QWEN3_MODEL` names one.
-        let Some(root) = std::env::var_os("UNISERVE_QWEN3_MODEL") else {
-            return;
-        };
-        let path = std::path::Path::new(&root).join("config.json");
-        let path = path.as_path();
-        if !path.is_file() {
-            return;
-        }
-        let root = path.parent().expect("a parent directory");
-        // The metadata is here on every machine; the shards are not. Without at least one shard
-        // there are no headers to read, so the shape check runs where the weights live (a GPU host)
-        // and is skipped where they do not.
-        let shards = std::fs::read_dir(root)
-            .expect("the checkpoint's directory")
-            .filter_map(|entry| entry.ok())
-            .any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .ends_with(".safetensors")
-            });
-        if !shards {
-            return;
-        }
-        let config = crate::Config::read(root).expect("the local Qwen3-30B-A3B metadata");
-        let checkpoint = nn::Checkpoint::open(root).expect("the local checkpoint's headers");
+        let root = local_checkpoint();
+        let config = crate::Config::read(&root).expect("the local Qwen3-30B-A3B metadata");
+        let checkpoint = nn::Checkpoint::open(&root).expect("the local checkpoint's headers");
 
         let hidden = config.hidden_size as u64;
         let query = (config.num_attention_heads * config.head_dim) as u64;

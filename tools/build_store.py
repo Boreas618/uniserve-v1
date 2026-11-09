@@ -6,8 +6,7 @@ the environment the Program Server passes (`UNISERVE_OP`, `UNISERVE_BACKEND`, `U
 `UNISERVE_TARGET`, `UNISERVE_PACKAGE`, `UNISERVE_OUT`), then publish the result under the store
 layout `<root>/<op>/<backend>/<revision>/<target>/<descriptor>/` with the `.committed` mark.
 
-The output is a store a reader can use: `program_server::store::Store::open([root])`, or the
-`qwen3_moe_slice` example's `--store`. It is a stopgap for a host where the Program Server has not
+The output is a store a reader can use: `program_server::store::Store::open([root])`. It is a stopgap for a host where the Program Server has not
 run; the published layout and the environment are the Program Server's own, so the two cannot
 disagree about what a module looks like.
 

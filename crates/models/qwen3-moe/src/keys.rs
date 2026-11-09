@@ -88,7 +88,7 @@ impl Qwen3Moe {
             self.config(),
             self.partition(),
             self.dtype(),
-            self.cache_page_tokens(),
+            self.page_tokens(),
             cache_dtype,
             capacity,
             buckets,

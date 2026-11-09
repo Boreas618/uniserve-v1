@@ -2,8 +2,8 @@
 //!
 //! ## What one forward does
 //!
-//! The layer equations are `uniserve/models/qwen3/transformer.py` (`Qwen3MoeDecoderLayer`,
-//! `Qwen3MoeAttention`, `Qwen3MoeSparseMoeBlock`) and specs/worker.md 9's Qwen3-MoE rows:
+//! The layer equations are Hugging Face's `Qwen3MoeDecoderLayer`, `Qwen3MoeAttention` and
+//! `Qwen3MoeSparseMoeBlock`:
 //!
 //! ```text
 //! embedding:  hidden = Σ_ranks embed_shard(ids)                       (vocabulary parallel)
@@ -34,7 +34,7 @@
 //! The model receives borrowed execution resources in [`Forward`] and holds weights, the partition
 //! and the checkpoint-derived configuration. It never allocates device memory, creates a stream,
 //! captures a graph, selects a program or owns a runtime object (`AGENTS.md`, Model Library
-//! Boundary; specs/worker.md 4.3).
+//! Boundary).
 
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::forward::ALIGNMENT;
@@ -86,8 +86,8 @@ pub struct LoadOptions {
 }
 
 impl Default for LoadOptions {
-    /// The BF16 vertical slice's deployment: 64-token pages and the trtllm-gen attention
-    /// program's workspace.
+    /// A single-rank BF16 deployment: 64-token pages and the trtllm-gen attention program's
+    /// workspace.
     fn default() -> Self {
         Self {
             attention_workspace_bytes: TRTLLM_WORKSPACE_BYTES,
@@ -194,9 +194,9 @@ pub(crate) struct AttentionLayer {
 
 /// The feed-forward sublayer.
 ///
-/// The expert block is by far the larger variant and the common one (every layer of the slice
-/// routes); boxing it would put an indirection on every forward to save a few hundred bytes in a
-/// vector of 48 layers.
+/// The expert block is by far the larger variant and the common one (every layer of
+/// Qwen3-30B-A3B routes); boxing it would put an indirection on every forward to save a few
+/// hundred bytes in a vector of 48 layers.
 #[allow(
     clippy::large_enum_variant,
     reason = "the routed block is the common case and is held once per layer"
@@ -634,291 +634,22 @@ impl Qwen3Moe {
             .is_some_and(|layer| layer.attention.q_proj.is_encoded())
     }
 
-    /// Run the decoder layers `0..=last` over `hidden`, and answer the layer's output rows.
+    /// Run every decoder layer over `hidden`, answering the last layer's update together with the
+    /// residual stream it has not yet been added into; the caller's output norm performs that add.
     ///
-    /// This is the bisection tool a wrong number needs: `forward` walks all 48 layers and then
-    /// normalizes, so a defect shows up only as a bad logit row with nothing saying which layer
-    /// produced it. Naming a layer runs the same code up to and including it, with the same rotary
-    /// tables and the same residual stream, and returns the rows that layer wrote.
-    ///
-    /// `last` past the last layer is refused rather than clamped: a stage asking for layer 60 of a
-    /// 48-layer model is a caller error, and clamping it would answer a different question.
-    ///
-    /// The answer is the **state** after layer `last` — the reference's `hidden_{last + 1}` — and
-    /// not the block's update, which is one fold short of it (see `fold`).
-    ///
-    /// **Each call reserves the plan's step from `f`'s arena and leaves it reserved**, because the
-    /// answer lives in it: the rows a caller compares are the arena's own. A caller that runs two
-    /// measurements in a row — the same layer twice, or a layer and then its prefix — must take a
-    /// mark before the first and release it after it has read the first answer, or the second call
-    /// asks for a second step past the region's end.
-    pub fn forward_through(
+    /// `plan` is the plan of `batch`'s token count, and `hidden` has already been checked against
+    /// it. The rotary tables, the plan's buffers and the attention counter are reserved from `f`'s
+    /// arena in a fixed order before the first layer, so a replayed graph finds every operand at the
+    /// address it was captured with.
+    fn layers(
         &self,
         f: &Forward,
         batch: &TokenBatch,
         cache: &KvView<'_>,
         hidden: TensorView,
-        last: usize,
-    ) -> Result<TensorView> {
-        if last >= self.layers.len() {
-            return Err(Error::Config(format!(
-                "layer {last} was asked for but the model has {}",
-                self.layers.len()
-            )));
-        }
+        plan: &Plan,
+    ) -> Result<(TensorView, TensorView)> {
         let tokens = batch.tokens();
-        let plan = self.plan(tokens)?;
-        if hidden.shape.rank() != 2
-            || hidden.shape.dim(0) != tokens
-            || hidden.shape.dim(1) != plan.hidden
-        {
-            return Err(Error::Config(format!(
-                "hidden is {:?}, [{tokens}, {}] expected",
-                hidden.shape.dims(),
-                plan.hidden
-            )));
-        }
-        self.forward_from(
-            f,
-            batch,
-            cache,
-            hidden,
-            Run {
-                start: 0,
-                last,
-                stage: None,
-            },
-        )
-    }
-
-    /// The router's choice at one layer, from that layer's **post-attention state**.
-    ///
-    /// `state` is `residual + attention` for that layer — the tensor the forward's
-    /// `post_attention_norm` is given, `[tokens, hidden]` — and `ids`/`weights` are the caller's
-    /// `[tokens, top]` i32 and F32. This method runs that norm, then the router: no attention, no
-    /// expert, no fold, no other layer.
-    ///
-    /// **The state is the layer's post-attention one, not its input.** The model's MoE reads
-    /// `post_attention_norm(residual + attention)`, so a caller that passes the layer's input rows
-    /// asks about a router the forward never runs, and nothing here can refuse it: both are
-    /// `[tokens, hidden]` states. A reference builds the same vector from its hooks as
-    /// `hidden_{layer} + hidden_{layer+1}_attended`; with `--from`, that sum is what the harness
-    /// hands in. Above layer 0 the state exists only after the prefix.
-    ///
-    /// The ids are the checkpoint's expert indices, before the expert map, and a layer whose MLP is
-    /// dense has no router to answer from.
-    pub fn route(
-        &self,
-        f: &Forward,
-        state: TensorView,
-        layer: usize,
-        ids: TensorView,
-        weights: TensorView,
-    ) -> Result<()> {
-        let (tokens, plan) = self.state_shape(state, layer)?;
-        let normalized = f
-            .arena()
-            .tensor(state.dtype, Shape::new(&[tokens, plan.hidden]))?;
-        self.layers[layer].route(f, state, normalized, ids, weights)
-    }
-
-    /// The rows and plan a routing cut's `state` implies, refusing a layer the model does not have
-    /// and rows that are not `[tokens, hidden]` of the model's dtype.
-    fn state_shape(&self, state: TensorView, layer: usize) -> Result<(u64, Plan)> {
-        if layer >= self.layers.len() {
-            return Err(Error::Config(format!(
-                "layer {layer} was asked for but the model has {}",
-                self.layers.len()
-            )));
-        }
-        let tokens = state.rows();
-        let plan = self.plan(tokens)?;
-        if state.shape.rank() != 2
-            || state.shape.dim(0) != tokens
-            || state.shape.dim(1) != plan.hidden
-        {
-            return Err(Error::Config(format!(
-                "state is {:?}, [{tokens}, {}] expected",
-                state.shape.dims(),
-                plan.hidden
-            )));
-        }
-        if state.dtype != self.dtype {
-            return Err(Error::Config(format!(
-                "state is {}, the model is {}",
-                state.dtype, self.dtype
-            )));
-        }
-        Ok((tokens, plan))
-    }
-
-    /// The router's raw scores at one layer, from that layer's **post-attention state**.
-    ///
-    /// `state` is `residual + attention` for that layer — the tensor the forward's
-    /// `post_attention_norm` is given, `[tokens, hidden]`. This method runs that norm, then the
-    /// gate, and nothing else, so its scores are the forward's own router operand's. A reference
-    /// computes the same state from its own hooks as `hidden_{layer} + hidden_{layer+1}_attended`,
-    /// and with `--from` that is what the harness must hand in.
-    ///
-    /// **It is not the layer's input rows.** The router the model runs is fed the post-attention
-    /// normalization; a cut that normalized the layer's input would answer about a router no forward
-    /// executes, and its ids would agree with a reference's only as far as two correlated vectors do.
-    ///
-    /// `scores` receives `[tokens, experts]` of the state's dtype. One difference from the forward's
-    /// own path, and it is a rounding: the forward fuses the residual add into the norm, so its
-    /// normalized row is computed from the unrounded sum, while a caller that materializes
-    /// `residual + attention` first hands the norm the sum rounded to the model's dtype. That is one
-    /// rounding of a value both sides compute the same way, and it is the same one a reference
-    /// computing `hidden_{layer} + hidden_{layer+1}_attended` in its own dtype makes.
-    pub fn gate(
-        &self,
-        f: &Forward,
-        state: TensorView,
-        layer: usize,
-        scores: TensorView,
-    ) -> Result<()> {
-        let (tokens, plan) = self.state_shape(state, layer)?;
-        let normalized = f
-            .arena()
-            .tensor(state.dtype, Shape::new(&[tokens, plan.hidden]))?;
-        self.layers[layer].gate(f, state, normalized, scores)
-    }
-
-    /// Run layers `start..=last` on the caller's rows, and answer the state after `last` (with
-    /// `stage = None`) or that cut inside it.
-    ///
-    /// This is the clean-input measurement: the rows handed in become the run's residual stream, so
-    /// the first layer of the run normalizes them alone instead of adding a previous layer's output,
-    /// and nothing of `0..start` enters the answer's error. It is how a reference's own
-    /// `hidden_start` measures one layer or a range of them without inheriting a prefix's divergence.
-    ///
-    /// Two facts a caller needs. **The cache planes are per layer**, and a run touches only the
-    /// planes of the layers it runs: the keys and values the attention reads are the ones those
-    /// layers write from these rows, so a prefill needs a cache whose pages hold no other sequence's
-    /// rows and a decode needs the prefix already written into those same planes by an earlier run.
-    /// And **the answer carries the layers' own roundings, no more**: the state after `last` is the
-    /// fold of its block's update into the stream, computed by the same launch the next layer's input
-    /// norm runs, so a cut inside a layer and the state above it differ by one such fold.
-    pub fn forward_from(
-        &self,
-        f: &Forward,
-        batch: &TokenBatch,
-        cache: &KvView<'_>,
-        hidden: TensorView,
-        run: Run,
-    ) -> Result<TensorView> {
-        let (update, residual, buffers) = self.walk(f, batch, cache, hidden, run)?;
-        match run.stage {
-            Some(_) => Ok(update),
-            None => self.fold(f, update, residual, buffers.normalized),
-        }
-    }
-
-    /// The state after a layer: its block's update folded into the residual stream.
-    ///
-    /// This is the tensor the reference calls `hidden_{layer+1}` — the whole state a layer hands
-    /// the next one — and not the block's update, which is an order of magnitude smaller and on its
-    /// own is not a state at all. Comparing one against the other would read as a collapse at every
-    /// layer.
-    ///
-    /// The fold is the layer boundary's own operator, `add_rms_norm`, whose residual output is the
-    /// sum: a boundary has no separate add, and the run accumulates the stream with exactly this
-    /// launch at the next layer's input norm, so the state answered here is bit-identical to the
-    /// one the run produces. The normalization the operator fuses is computed and discarded; its
-    /// weights do not touch the sum.
-    /// The sum lands in `update` itself, which the operator may alias, and the normalization it
-    /// fuses is discarded into `scratch` — the last layer's dead `normalized` buffer — so the fold
-    /// costs no arena beyond the step the walk already reserved.
-    fn fold(
-        &self,
-        f: &Forward,
-        update: TensorView,
-        residual: TensorView,
-        scratch: TensorView,
-    ) -> Result<TensorView> {
-        self.layers[0]
-            .input_norm
-            .forward_with_residual(f, update, residual, update, scratch)
-            .map_err(Error::from)?;
-        Ok(update)
-    }
-
-    /// Run layers `0..=layer` and stop inside `layer` after `stage`, answering what it wrote there.
-    ///
-    /// The prefix is run in full, so the layer's residual stream and every operand are the ones the
-    /// whole run hands it: an in-layer walk whose prefix differed from the model's would answer a
-    /// question about a model nobody runs. The cuts sit *inside* the layer, so `MlpOut` is the
-    /// block's update and [`Self::forward_through`] is that update folded into the stream: the two
-    /// differ by the boundary's residual add. The cuts are one operator each, which is what lets a
-    /// reference post-hook on `input_layernorm`, on `self_attn`, on `post_attention_layernorm` and
-    /// on `mlp` be their counterparts.
-    ///
-    /// The prefix's error is the cut's error floor: what the cut shows is a divergence *on top of*
-    /// the state layers `0..layer` already produced, which is the walk's `hidden_{layer}` row. A cut
-    /// that looks clean at layer 30 therefore means "layer 30 adds nothing to a prefix that is
-    /// already off by the walk's error at 29", and never "layers 0..29 are right".
-    pub fn forward_substage(
-        &self,
-        f: &Forward,
-        batch: &TokenBatch,
-        cache: &KvView<'_>,
-        hidden: TensorView,
-        layer: usize,
-        stage: Substage,
-    ) -> Result<TensorView> {
-        self.forward_from(
-            f,
-            batch,
-            cache,
-            hidden,
-            Run {
-                start: 0,
-                last: layer,
-                stage: Some(stage),
-            },
-        )
-    }
-
-    /// Run layers `0..=last`, or `0..last` and then `last` up to `tail`, and answer the rows the
-    /// last run wrote together with the residual stream as it then stands.
-    ///
-    /// One loop serves the whole run, the layer walk and the in-layer walk. Three loops that
-    /// reserve the same buffers and add the residual in the same order are three chances to
-    /// disagree about the layer equations, and a bisection whose prefix differs from the model it
-    /// bisects answers nothing.
-    fn walk(
-        &self,
-        f: &Forward,
-        batch: &TokenBatch,
-        cache: &KvView<'_>,
-        hidden: TensorView,
-        run: Run,
-    ) -> Result<(TensorView, TensorView, Buffers)> {
-        let Run { start, last, stage } = run;
-        let tokens = batch.tokens();
-        let plan = self.plan(tokens)?;
-        if start > last || last >= self.layers.len() {
-            return Err(Error::Config(format!(
-                "layers {start}..={last} were asked for and the model has {}",
-                self.layers.len()
-            )));
-        }
-        if hidden.shape.rank() != 2
-            || hidden.shape.dim(0) != tokens
-            || hidden.shape.dim(1) != plan.hidden
-        {
-            return Err(Error::Config(format!(
-                "hidden is {:?}, [{tokens}, {}] expected",
-                hidden.shape.dims(),
-                plan.hidden
-            )));
-        }
-        if hidden.dtype != self.dtype {
-            return Err(Error::Config(format!(
-                "hidden is {}, the model is {}",
-                hidden.dtype, self.dtype
-            )));
-        }
 
         // The two rotary factor tables are one forward's worth of trigonometry, shared by every
         // layer: the positions and the head geometry do not change between them.
@@ -929,7 +660,7 @@ impl Qwen3Moe {
             .arena
             .tensor(DType::F32, Shape::new(&[tokens, plan.factors]))?;
         self.factors(f, batch.positions, cosine, sine)?;
-        let buffers = Buffers::reserve(f.arena, &plan, self.dtype)?;
+        let buffers = Buffers::reserve(f.arena, plan, self.dtype)?;
         // The decode kernel splits a row's keys over CTAs and counts their arrivals in the head of
         // this workspace, and it needs that count at zero on entry and resets it itself. The arena
         // is not zero here: every bucket's extents share one range, so another bucket's tensors
@@ -939,10 +670,10 @@ impl Qwen3Moe {
             buffers.workspace,
             plan.workspace.min(ATTENTION_COUNTER_BYTES),
         )?;
+
         let mut residual = hidden;
         let mut input = hidden;
-        for (offset, layer) in self.layers[start..=last].iter().enumerate() {
-            let index = start + offset;
+        for (index, layer) in self.layers.iter().enumerate() {
             // One layer's scratch is dead once its launches are enqueued: the plan is one layer
             // deep and the next layer is handed the same addresses, which is what a replayed graph
             // expects. The layer-independent buffers above were reserved before this mark.
@@ -953,14 +684,12 @@ impl Qwen3Moe {
                     batch,
                     cache,
                     index,
-                    offset == 0,
                     &buffers,
                     residual,
                     buffers.residual,
                     cosine,
                     sine,
                     input,
-                    if index == last { stage } else { None },
                 )
             })?;
             f.arena.release(mark);
@@ -970,14 +699,7 @@ impl Qwen3Moe {
             input = out;
             residual = buffers.residual;
         }
-        Ok((input, residual, buffers))
-    }
-
-
-    /// The number of tokens one page of the prefix cache holds.
-    /// The tokens one prefix-cache page holds, which the deployment's cache chose.
-    pub const fn cache_page_tokens(&self) -> u32 {
-        self.options.page_tokens
+        Ok((input, residual))
     }
 
     /// Whether the checkpoint's expert stacks were read as calibrated NVFP4.
@@ -985,23 +707,7 @@ impl Qwen3Moe {
         self.options.experts_encoded
     }
 
-    /// Which of a layer's four attention projections the checkpoint stored packed, in `q, k, v, o`
-    /// order.
-    ///
-    /// The loading boundary decides each projection on its own, per tensor, so a checkpoint can hold
-    /// three packed and one dense. A cache whose values are wrong is bisected here first: a dense
-    /// projection is read from a BF16 matrix and a packed one from E2M1 bytes, and a checkpoint whose
-    /// bytes and whose index disagree about which is which answers zeros rather than refusing.
-    pub fn attention_encoded(&self, layer: usize) -> Option<[bool; 4]> {
-        let layer = self.layers.get(layer)?;
-        Some([
-            layer.attention.q_proj.is_encoded(),
-            layer.attention.k_proj.is_encoded(),
-            layer.attention.v_proj.is_encoded(),
-            layer.attention.o_proj.is_encoded(),
-        ])
-    }
-
+    /// The tokens one prefix-cache page holds, which the deployment's cache chose.
     pub const fn page_tokens(&self) -> u32 {
         self.options.page_tokens
     }
@@ -1030,45 +736,8 @@ impl DecoderLayer {
     /// caller's `hidden` — the embedding — while its output must land in the plan's residual
     /// region, where every later layer accumulates in place.
     ///
-    /// `stop` cuts the layer short for an in-layer walk and answers the tensor that cut produces;
-    /// the sublayers it skips are not launched at all. With `stop = None` the answer is `update`,
-    /// the layer's output.
-    /// The router's raw scores at this layer: its post-attention norm, then its gate, and nothing
-    /// else.
-    ///
-    /// `state` is the layer's **post-attention state** — its residual plus its attention's output,
-    /// the tensor `post_attention_norm` is given in [`Self::forward`] — and not the layer's input.
-    /// The forward's MoE reads `post_attention_norm(state)`, so a cut that normalized the layer's
-    /// input instead would answer a question about a router the model never runs.
-    fn gate(
-        &self,
-        f: &Forward,
-        state: TensorView,
-        normalized: TensorView,
-        scores: TensorView,
-    ) -> Result<()> {
-        self.post_attention_norm.forward(f, state, normalized)?;
-        self.mlp.gate(f, normalized, scores)
-    }
-
-    /// The router's choice at this layer: its post-attention norm, then its router, and nothing
-    /// else.
-    ///
-    /// `state` is the layer's **post-attention state**, as in [`Self::gate`]: the same tensor the
-    /// forward's `post_attention_norm` is given, so the ids come from the same rows through the same
-    /// norm as the forward's and a reference's `layer.mlp.gate` output compares with them directly.
-    fn route(
-        &self,
-        f: &Forward,
-        state: TensorView,
-        normalized: TensorView,
-        ids: TensorView,
-        weights: TensorView,
-    ) -> Result<()> {
-        self.post_attention_norm.forward(f, state, normalized)?;
-        self.mlp.route(f, normalized, ids, weights)
-    }
-
+    /// `layer` is the model's own index of this layer: it names the cache plane the attention
+    /// writes and reads, and layer 0 is the one whose input residual is the embedding.
     #[allow(
         clippy::too_many_arguments,
         reason = "the layer runs the reference's tuple through the plan's buffers"
@@ -1079,54 +748,35 @@ impl DecoderLayer {
         batch: &TokenBatch,
         cache: &KvView<'_>,
         layer: usize,
-        first: bool,
         buffers: &Buffers,
         residual: TensorView,
         residual_out: TensorView,
         cosine: TensorView,
         sine: TensorView,
         hidden: TensorView,
-        stop: Option<Substage>,
     ) -> Result<TensorView> {
         let normalized = buffers.normalized;
         let update = buffers.update;
 
-        // `first` is the first layer *of this run*, which is layer 0 for the whole model and layer
-        // `start` for a run that begins part way up: its input residual is the caller's rows, so it
-        // normalizes alone and the addition starts at the next layer. `layer` is the cache plane this
-        // layer writes and reads, and it is always the model's own index: the one index a layer takes
-        // from anything but itself would be a plane, a page or a buffer named for another layer. The
-        // rotary tables are not one of those: `walk` reserves one pair per call and every layer of the
-        // run reads it, so no layer selects a table.
-        if first {
+        // Layer 0's input residual is the embedding itself, so it normalizes alone and the
+        // addition starts at the next layer.
+        if layer == 0 {
             self.input_norm.forward(f, hidden, normalized)?;
         } else {
             self.input_norm
                 .forward_with_residual(f, hidden, residual, residual, normalized)
                 .map_err(Error::from)?;
         }
-        if stop == Some(Substage::Normalized) {
-            return Ok(normalized);
-        }
 
-        let projected = f.fenced(ATTENTION, format_args!("layers.{layer}.self_attn"), || {
+        f.fenced(ATTENTION, format_args!("layers.{layer}.self_attn"), || {
             self.attention.forward(
-                f, batch, cache, layer, buffers, normalized, cosine, sine, update, stop,
+                f, batch, cache, layer, buffers, normalized, cosine, sine, update,
             )
         })?;
-        if stop == Some(Substage::Projected) {
-            return Ok(projected);
-        }
-        if stop == Some(Substage::Attended) {
-            return Ok(update);
-        }
 
         self.post_attention_norm
             .forward_with_residual(f, update, residual, residual_out, normalized)
             .map_err(Error::from)?;
-        if stop == Some(Substage::GateIn) {
-            return Ok(normalized);
-        }
 
         f.fenced(MOE, format_args!("layers.{layer}.mlp"), || {
             match &self.mlp {
@@ -1165,14 +815,10 @@ impl AttentionLayer {
         cosine: TensorView,
         sine: TensorView,
         out: TensorView,
-        stop: Option<Substage>,
-    ) -> Result<TensorView> {
+    ) -> Result<()> {
         self.q_proj.forward(f, normalized, buffers.query)?;
         self.k_proj.forward(f, normalized, buffers.key)?;
         self.v_proj.forward(f, normalized, buffers.value)?;
-        if stop == Some(Substage::Projected) {
-            return Ok(buffers.value);
-        }
 
         let query = buffers.query.reshape(headed(buffers.query, &self.q_norm)?);
         let key = buffers.key.reshape(headed(buffers.key, &self.k_norm)?);
@@ -1218,41 +864,7 @@ impl AttentionLayer {
                 .all_reduce_sum(out, f.stream()?)
                 .map_err(Error::from)?;
         }
-        Ok(out)
-    }
-}
-
-impl Mlp {
-    /// The router's choice for this sublayer, on rows the layer's input norm already produced.
-    ///
-    /// A dense MLP has no router: the checkpoint's `mlp_only_layers` give such a layer a plain
-    /// gated MLP, so there are no expert ids to answer and this refuses rather than inventing them.
-    fn route(
-        &self,
-        f: &Forward,
-        normalized: TensorView,
-        ids: TensorView,
-        weights: TensorView,
-    ) -> Result<()> {
-        match self {
-            Mlp::Experts(moe) => moe.route(f, normalized, ids, weights).map_err(Error::from),
-            Mlp::Dense(_) => Err(Error::Config(
-                "this layer's MLP is dense: it chooses no experts, so it has no routing to answer"
-                    .to_owned(),
-            )),
-        }
-    }
-}
-
-impl Mlp {
-    /// The router's raw scores for this sublayer, on rows the layer's input norm already produced.
-    fn gate(&self, f: &Forward, normalized: TensorView, scores: TensorView) -> Result<()> {
-        match self {
-            Mlp::Experts(moe) => moe.gate(f, normalized, scores).map_err(Error::from),
-            Mlp::Dense(_) => Err(Error::Config(
-                "this layer's MLP is dense: it has no gate to answer scores from".to_owned(),
-            )),
-        }
+        Ok(())
     }
 }
 
@@ -1292,92 +904,6 @@ fn headed(projection: TensorView, norm: &Weight) -> Result<Shape> {
         )));
     }
     Ok(Shape::new(&[rows, columns / head_dim, head_dim]))
-}
-
-/// Which layers a walk runs, and whether it stops inside the last of them.
-///
-/// The two ends are named rather than passed side by side: `forward_from(start, last)` with adjacent
-/// `usize`s is a transposition waiting for a busy afternoon, and a run that silently executed
-/// `last..=start` would answer a question nobody asked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Run {
-    /// The first layer the run executes.
-    pub start: usize,
-    /// The last layer it executes.
-    pub last: usize,
-    /// Where inside `last` it stops, or `None` to run that layer whole.
-    pub stage: Option<Substage>,
-}
-
-/// How far through one layer an in-layer walk goes.
-///
-/// A whole-run bisection answers which *layer* diverges; a layer is five operators deep and its
-/// output alone cannot say which of them. These are the cuts a layer can be stopped at, in the order
-/// the layer runs them, each naming the tensor the reference's module holds at that point:
-///
-/// - [`Substage::Normalized`] is `input_layernorm`'s output, residual add included for every layer
-///   after the first (the first's input residual is the embedding itself);
-/// - [`Substage::Attended`] is `self_attn`'s output, projected out and **before** the residual add;
-/// - [`Substage::GateIn`] is `post_attention_layernorm`'s output — the routing gate's operand, with
-///   the attention's residual add folded in — which is the tensor the reference's post-hook on that
-///   module holds and the one the router's weight is multiplied by;
-/// - [`Substage::MlpOut`] is the routed (or dense) block's output, **before** its residual add —
-///   transformers' `mlp` post-hook — and one fold short of the layer's output state, which is what
-///   `forward_through` answers and which no cut names because the layer walk already shows it.
-///
-/// Each cut is named after the reference tensor that answers it, and a cut exists only where such a
-/// tensor exists: a name ambiguous about the residual would produce a number that looks like
-/// evidence and is off by a vector the size of the stream (rms ~7.3 in this model).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Substage {
-    /// The residual add and the input normalization.
-    Normalized,
-    /// The attention block's three projections, before the cache write and the attention.
-    ///
-    /// This is the cut a cache whose values are wrong is bisected at: the projections' answer is the
-    /// only tensor between the normalized input and the cache write, so a value that is finite here
-    /// and wrong in the page is the write's, and one already wrong here is the product's. The view
-    /// is the value projection's buffer, which is the last of the three launches and the one a
-    /// zeroed cache is usually blamed on.
-    Projected,
-    /// The attention block's projection out, before the residual add.
-    Attended,
-    /// The post-attention normalization: the gate's operand (`post_attention_layernorm`).
-    GateIn,
-    /// The routed (or dense) block's output, before its residual add (`mlp`).
-    MlpOut,
-}
-
-impl Substage {
-    /// Every arm with its spelling, in the order a layer runs them.
-    ///
-    /// The spellings are the contract with a command line that names a stage: the model refuses
-    /// anything else, so a mistyped stage cannot silently run a different cut.
-    pub const NAMES: [&'static str; 5] =
-        ["normalized", "projected", "attended", "gate_in", "mlp_out"];
-
-    /// The stage `name` asks for, or `None` when it names no cut.
-    pub fn parse(name: &str) -> Option<Self> {
-        match name {
-            "normalized" => Some(Self::Normalized),
-            "projected" => Some(Self::Projected),
-            "attended" => Some(Self::Attended),
-            "gate_in" => Some(Self::GateIn),
-            "mlp_out" => Some(Self::MlpOut),
-            _ => None,
-        }
-    }
-
-    /// The spelling of this stage, one of [`Self::NAMES`].
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Normalized => "normalized",
-            Self::Projected => "projected",
-            Self::Attended => "attended",
-            Self::GateIn => "gate_in",
-            Self::MlpOut => "mlp_out",
-        }
-    }
 }
 
 impl CausalLm for Qwen3Moe {
@@ -1426,25 +952,9 @@ impl CausalLm for Qwen3Moe {
             ))));
         }
 
-        // The rotary tables, the buffers and the residual stream are `walk`'s to reserve: the whole
-        // run and a bisection must share one loop, or the bisection measures a different model.
-        let last =
-            self.layers.len().checked_sub(1).ok_or_else(|| {
-                capability(Error::Config("the model has no decoder layer".into()))
-            })?;
         f.fenced(TRANSFORMER, format_args!("model"), || {
-            let (input, residual, _) = self
-                .walk(
-                    f,
-                    batch,
-                    cache,
-                    hidden,
-                    Run {
-                        start: 0,
-                        last,
-                        stage: None,
-                    },
-                )
+            let (input, residual) = self
+                .layers(f, batch, cache, hidden, &plan)
                 .map_err(capability)?;
 
             // The output norm: the last layer's output added into the residual stream and
@@ -1521,35 +1031,6 @@ impl std::fmt::Debug for Qwen3Moe {
 
 #[cfg(test)]
 mod tests {
-    /// The stage spellings are the contract with a command line: every name parses back to the
-    /// stage it names, in the layer's own order, and a name that is not one of them answers nothing
-    /// rather than a default. A bisection that silently ran a different cut would report the wrong
-    /// operator with full confidence.
-    #[test]
-    fn a_substage_name_round_trips_and_anything_else_is_refused() {
-        for (index, name) in Substage::NAMES.iter().enumerate() {
-            let stage = Substage::parse(name).expect("a declared name parses");
-            assert_eq!(stage.name(), *name);
-            assert_eq!(Substage::NAMES[index], stage.name());
-        }
-        assert_eq!(Substage::parse("normalized"), Some(Substage::Normalized));
-        assert_eq!(Substage::parse("attended"), Some(Substage::Attended));
-        assert_eq!(Substage::parse("gate_in"), Some(Substage::GateIn));
-        assert_eq!(Substage::parse("mlp_out"), Some(Substage::MlpOut));
-        for refused in [
-            "",
-            "norm",
-            "Normalized",
-            "attention",
-            "attn",
-            "moe",
-            "mlp",
-            "mlpout",
-        ] {
-            assert_eq!(Substage::parse(refused), None, "{refused:?} named no cut");
-        }
-    }
-
     use super::*;
     use crate::Activation;
 

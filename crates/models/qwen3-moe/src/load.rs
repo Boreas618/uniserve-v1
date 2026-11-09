@@ -5,8 +5,8 @@
 //!
 //! `config.json` is read and normalized here, once, into [`Config`]; the checkpoint's tensor names
 //! are resolved to model paths by [`crate::weights`]; the rotary frequency table, which no
-//! checkpoint stores, is computed here and published to retained storage as a constant
-//! (specs/worker.md 9: "YaRN 的 inv_freq 在加载边界由 Rust 按同样的公式算一次"). Everything below
+//! checkpoint stores, is computed here once, by the same formula the reference uses, and published
+//! to retained storage as a constant. Everything below
 //! this module consumes typed fields and borrowed views: no layer parses a dictionary or applies a
 //! default.
 //!
@@ -51,33 +51,6 @@ use crate::{Activation, Config, Error, Partition, Result};
 ///
 /// The shard stores the plain form, so the loader builds this table once at load.
 pub const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
-
-/// Load a `Qwen3MoeForCausalLM` checkpoint from `root`.
-///
-/// `root` holds `config.json` and the safetensors shards (an index or a directory of shards); the
-/// `loader` reads the tensors and publishes the converted weights to retained storage.
-pub fn load(
-    root: &Path,
-    partition: Partition,
-    loader: &mut WeightLoader<'_>,
-    options: LoadOptions,
-) -> Result<Qwen3Moe> {
-    // The experts' encoding is a property of this entry point, not of the caller's options: `load`
-    // reads dense stacks, so the plan reserves no encoded step whatever the options said.
-    load_with(
-        root,
-        partition,
-        loader,
-        LoadOptions {
-            experts_encoded: false,
-            ..options
-        },
-        Quantization::Bf16,
-        &Representation::Dense,
-        &ExpertOrder::new(),
-    )
-}
-
 
 /// Load a checkpoint in the representation it declares about itself.
 ///
@@ -195,6 +168,10 @@ fn slot_row(module: &str, order: &[u32], experts: usize) -> Result<Vec<u32>> {
     Ok(row)
 }
 
+/// Each routed layer's logical experts in slot order, keyed by layer index, and the published slot
+/// table with the routed layers whose rows it holds, in row order (`None` without a routed layer).
+type ExpertSlots = (HashMap<usize, Vec<u32>>, Option<(nn::Weight, Vec<usize>)>);
+
 /// The experts of each routed layer in slot order, checked, with the table a route reads its slot
 /// from: `[routed layers, experts]` i32, row by row in layer order.
 ///
@@ -204,7 +181,7 @@ fn expert_slots(
     config: &Config,
     order: &ExpertOrder,
     loader: &mut WeightLoader<'_>,
-) -> Result<(HashMap<usize, Vec<u32>>, Option<(nn::Weight, Vec<usize>)>)> {
+) -> Result<ExpertSlots> {
     let experts = config.num_experts;
     let layers: Vec<usize> = (0..config.num_hidden_layers)
         .filter(|&layer| config.sparse(layer))
@@ -300,8 +277,7 @@ fn load_with(
     order: &ExpertOrder,
 ) -> Result<Qwen3Moe> {
     // The layout a packed projection's programs read, which is the deployment's choice and the same
-    // one the expert stacks use. A dense deployment never builds one, so the value is unreachable
-    // there and states the slice's choice rather than inventing one per checkpoint.
+    // one the expert stacks use.
     let layout = match quantization {
         Quantization::Nvfp4(layout) => layout,
         // A dense deployment builds no packed projection, so the value is unreachable there; it is
@@ -1279,7 +1255,7 @@ pub(crate) fn activation(activation: Activation) -> Result<MoeActivation> {
 /// `factor` is only consulted by recipes that do not carry that field, so for a yarn checkpoint
 /// that carries it the ratio is what the table is built from. The multiplier is 1 for the plain
 /// recipe and the recipe's attention factor squared for yarn: the reference multiplies the cosine
-/// and sine factors by it (`uniserve/nn/rope.py`), so a product of two rotated vectors carries the
+/// and sine factors by it, so a product of two rotated vectors carries the
 /// square.
 pub fn rotary_recipe(config: &Config) -> Result<(Vec<f32>, f32)> {
     let dim = config.head_dim;

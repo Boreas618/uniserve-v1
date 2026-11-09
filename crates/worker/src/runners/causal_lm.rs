@@ -4070,10 +4070,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
 
     /// One digest per layer of the keys and values the replay just wrote into the batch's pages.
     ///
-    /// The slice prints the same numbers for the same tokens (`crates/models/qwen3-moe/examples/
-    /// qwen3_moe_slice.rs`, `kv layer<n>: k=… v=…`): `platform::fnv1a` over the bytes of the row's
-    /// first page that hold this batch's tokens, so the first layer whose numbers differ is the
-    /// layer where the served path stopped computing the slice's arithmetic. Unlike the call
+    /// Each digest is `platform::fnv1a` over the bytes of the row's first page that hold this
+    /// batch's tokens, so between two runs over the same tokens the first layer whose numbers
+    /// differ is the layer where their arithmetic diverged. Unlike the call
     /// readback this needs nothing from the launch - the planes are this runner's resident cache
     /// and the page is the one it installed - so it is printed even when the launch's arguments are
     /// not addresses this runner may read.

@@ -2,8 +2,7 @@
 //! mathematical partition of a deployment, and the causal-LM model itself, composed of `nn`
 //! layers and implementing [`nn::CausalLm`].
 //!
-//! The model follows specs/worker.md 9's `Qwen3MoeForCausalLM` rows and the layer equations of
-//! `uniserve/models/qwen3/transformer.py`:
+//! The model follows the layer equations of Hugging Face `Qwen3MoeForCausalLM`:
 //!
 //! - the embedding is vocabulary-parallel over the tensor ranks, zero-filled outside a rank's shard
 //!   and summed with an all-reduce;
@@ -25,13 +24,11 @@ pub mod load;
 pub mod model;
 pub mod partition;
 pub mod processing;
-pub mod reference;
 pub mod representation;
 pub mod weights;
 
 pub use config::{Activation, Config, RopeScaling, YaRn};
-pub use load::load;
-pub use model::{LoadOptions, Plan, Qwen3Moe, Run, Substage};
+pub use model::{LoadOptions, Plan, Qwen3Moe};
 pub use partition::Partition;
 pub use representation::{Adopted, Representation, Role};
 

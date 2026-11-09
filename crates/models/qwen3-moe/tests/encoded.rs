@@ -10,12 +10,8 @@
 use std::path::Path;
 
 use nn::weights::{Nvfp4Names, RetainedWeights, WeightKey};
-use nn::{
-    Backing, Checkpoint, DType, DevicePtr, Shape, WeightLayout, WeightLoader,
-    weights::WeightRequest,
-};
+use nn::{Backing, Checkpoint, DType, DevicePtr, Shape, WeightLoader};
 use ops::fp4::ScaleLayout;
-use qwen3_moe::weights::ExpertSource;
 use tempfile::TempDir;
 
 /// Two experts, a `32 × 32` contraction: two E2M1 codes a byte along the contraction (a 16-byte
@@ -335,38 +331,6 @@ fn a_projection_the_shard_does_not_hold_is_refused_by_name() {
         )
         .unwrap_err();
     assert!(format!("{error}").contains("down"), "{error}");
-}
-
-#[test]
-fn the_dense_request_names_one_tensor_and_the_encoded_one_names_three() {
-    // The sentence this test exists for: both paths read the same stem, so a quantized checkpoint
-    // read through the dense request would take the packed field for BF16 weights. That is why the
-    // encoded path exists and why the dense one must never be pointed at it.
-    let module = ExpertSource {
-        module: "layers.0.mlp.experts".to_owned(),
-        checkpoint_prefix: "model.layers.0.mlp.experts".to_owned(),
-    };
-    let dense = WeightRequest::parts(
-        "layers.0.mlp.experts.up".to_owned(),
-        vec![module.tensors(0).up],
-        Shape::new(&[1, ROWS, CONTRACTION]),
-        WeightLayout::UP_GATE,
-    );
-    let nn::weights::WeightSource::Parts { parts, .. } = &dense.source else {
-        panic!("the dense request fuses the experts' projections");
-    };
-    assert_eq!(parts.len(), 1);
-
-    let encoded = module.encoded(0);
-    assert_eq!(&encoded.up.values, parts.first().unwrap());
-    assert_eq!(
-        encoded.up.scales,
-        "model.layers.0.mlp.experts.0.up_proj.weight_scale"
-    );
-    assert_eq!(
-        encoded.up.global_scale,
-        "model.layers.0.mlp.experts.0.up_proj.weight_scale_2"
-    );
 }
 
 /// A whole tiny model whose **attention projections are packed** and whose router, norms and
