@@ -61,9 +61,12 @@ pub use embedding::Embedding;
 pub use exchange::UlyssesExchange;
 pub use frame::{FrameMoments, FrameNormPad, FramePad};
 pub use head::{ParallelLMHead, gather_rows};
-pub use linear::{Linear, Nvfp4Linear, PACKED_M_CLASSES, packed_rows};
+pub use linear::{
+    Bias, ENCODE_CHUNK, Linear, MergedColumnLinear, PACKED_M_CLASSES, Parallel, QkvBias, QkvLinear,
+    QkvNames, QkvSpec, encode_block, packed_rows,
+};
 pub use modulation::{GatedResidual, ModulatedRmsNorm};
-pub use moe::{ENCODE_CHUNK, FusedTables, Moe};
+pub use moe::{FusedTables, Moe};
 pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
 pub use ops::activation::Activation;

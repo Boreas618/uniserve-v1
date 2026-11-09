@@ -22,10 +22,13 @@
 //! Sharding two blocks over a thousand rows would save nothing and put two exchanges on the first
 //! step of every request.
 
-use nn::layers::{Attention, GatedActivation, Linear, RmsNorm, ScaledResidual};
+use nn::family::Split;
+use nn::layers::{
+    Attention, Bias, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames, QkvSpec,
+    RmsNorm, ScaledResidual,
+};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
-use ops::gemm::WeightOrder;
 
 use crate::config::TransformerConfig;
 use crate::{Error, Result};
@@ -49,9 +52,8 @@ pub struct RefinerBlock {
     norm2: RmsNorm,
     query_norm: RmsNorm,
     key_norm: RmsNorm,
-    query: Linear,
-    key: Linear,
-    value: Linear,
+    /// The attention's query, key and value projections.
+    qkv: QkvLinear,
     output: Linear,
     gate_up: Linear,
     down: Linear,
@@ -78,27 +80,35 @@ impl RefinerBlock {
     ) -> Result<Self> {
         let prefix = format!("token_refiner.refiner_blocks.{index}");
         let hidden = u64::from(config.hidden_size);
-        let inner = u64::from(config.num_attention_heads) * u64::from(config.head_dim);
-        let ffn = u64::from(config.intermediate_size);
+        let inner = config.num_attention_heads * config.head_dim;
+        let ffn = config.intermediate_size;
 
-        let query = projection(loader, &format!("{prefix}.attn.to_q.weight"), inner, hidden)?;
-        let query_dtype = query.view().dtype;
-        let key = projection(loader, &format!("{prefix}.attn.to_k.weight"), inner, hidden)?;
-        let value = projection(loader, &format!("{prefix}.attn.to_v.weight"), inner, hidden)?;
-        let output = projection(
-            loader,
-            &format!("{prefix}.attn.to_out.0.weight"),
-            hidden,
-            inner,
+        let qkv = QkvLinear::load(
+            &mut loader.scope(format!("{prefix}.attn")),
+            QkvSpec {
+                hidden: config.hidden_size,
+                heads: config.num_attention_heads,
+                kv_heads: config.num_attention_heads,
+                head_dim: config.head_dim,
+            },
+            QkvNames::Separate(["to_q", "to_k", "to_v"]),
+            QkvBias::Absent,
+            Split::WHOLE,
         )?;
+        let query_dtype = qkv.query().weight().dtype;
+        let projection = |loader: &mut WeightLoader<'_>, module: &str, inputs, outputs| {
+            Linear::load(
+                &mut loader.scope(format!("{prefix}.{module}")),
+                inputs,
+                outputs,
+                Bias::Absent,
+                Parallel::None,
+            )
+        };
+        let output = projection(loader, "attn.to_out.0", inner, config.hidden_size)?;
         // The checkpoint fuses the feed-forward's value half first and its gate half second.
-        let gate_up = projection(
-            loader,
-            &format!("{prefix}.ff.net.0.proj.weight"),
-            2 * ffn,
-            hidden,
-        )?;
-        let down = projection(loader, &format!("{prefix}.ff.net.2.weight"), hidden, ffn)?;
+        let gate_up = projection(loader, "ff.net.0.proj", config.hidden_size, 2 * ffn)?;
+        let down = projection(loader, "ff.net.2", ffn, config.hidden_size)?;
 
         let attention = Attention::dense(
             config.head_dim,
@@ -110,7 +120,7 @@ impl RefinerBlock {
             scaling(config.head_dim),
         )?;
 
-        let stream = query.dtype();
+        let stream = query_dtype;
         Ok(Self {
             dtype: query_dtype,
             intermediate_size: config.intermediate_size,
@@ -138,12 +148,10 @@ impl RefinerBlock {
                 u64::from(config.head_dim),
                 config.qk_norm_eps,
             )?,
-            query: Linear::new(query, None, WeightOrder::NxK)?,
-            key: Linear::new(key, None, WeightOrder::NxK)?,
-            value: Linear::new(value, None, WeightOrder::NxK)?,
-            output: Linear::new(output, None, WeightOrder::NxK)?,
-            gate_up: Linear::new(gate_up, None, WeightOrder::NxK)?,
-            down: Linear::new(down, None, WeightOrder::NxK)?,
+            qkv,
+            output,
+            gate_up,
+            down,
             gated: GatedActivation::new(ops::activation::Activation::Silu).with_stepwise(),
             attention,
             residual: identity(loader, u64::from(config.hidden_size), stream)?,
@@ -161,9 +169,8 @@ impl RefinerBlock {
 
         // Attention: normalize, project every head, normalize each head's query and key, attend.
         self.norm1.forward(f, hidden, rows.normed)?;
-        self.query.forward(f, rows.normed, rows.query)?;
-        self.key.forward(f, rows.normed, rows.key)?;
-        self.value.forward(f, rows.normed, rows.value)?;
+        self.qkv
+            .forward(f, rows.normed, rows.query, rows.key, rows.value)?;
         // The query and key norms are **per head**: a projection writes `[rows, heads · head]` and
         // the normalization is over one head's channels, so it reads the same buffer as
         // `[rows · heads, head]`. Handing it the flat projection is a width the norm refuses
@@ -237,10 +244,13 @@ impl TokenRefiner {
             ));
         }
         let hidden = u64::from(config.hidden_size);
-        let text = u64::from(config.text_dim);
-        let weight = matrix(loader, "context_embedder.weight", hidden, text)?;
-        let bias = vector(loader, "context_embedder.bias", hidden)?;
-        let input = Linear::new(weight, Some(bias), WeightOrder::NxK)?;
+        let input = Linear::load(
+            &mut loader.scope("context_embedder"),
+            config.text_dim,
+            config.hidden_size,
+            Bias::Present,
+            Parallel::None,
+        )?;
         let blocks = (0..config.num_refiner_layers)
             .map(|index| RefinerBlock::load(index, config, rows, loader))
             .collect::<Result<Vec<_>>>()?;
@@ -392,28 +402,9 @@ fn identity(
     Ok(ScaledResidual::new(scale, None)?)
 }
 
-/// A `[rows, columns]` weight of the checkpoint.
-fn matrix(loader: &mut WeightLoader<'_>, name: &str, rows: u64, columns: u64) -> Result<Weight> {
-    Ok(loader.load(&WeightRequest::region(
-        name,
-        0,
-        Shape::new(&[rows, columns]),
-    ))?)
-}
-
 /// A `[rows]` weight of the checkpoint.
 fn vector(loader: &mut WeightLoader<'_>, name: &str, rows: u64) -> Result<Weight> {
     Ok(loader.load(&WeightRequest::region(name, 0, Shape::new(&[rows])))?)
-}
-
-/// A projection of the checkpoint: `[out, in]`.
-fn projection(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    rows: u64,
-    columns: u64,
-) -> Result<Weight> {
-    matrix(loader, name, rows, columns)
 }
 
 /// A normalization's learned gain.

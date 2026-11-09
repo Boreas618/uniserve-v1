@@ -3,9 +3,8 @@ use nn::layers::{
 };
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
-use ops::gemm::WeightOrder;
 
-use crate::attention::{Factors, HeadProjection, HeadsToRows};
+use crate::attention::{Factors, HeadProjection, HeadsToRows, projection};
 use crate::config::TransformerConfig;
 use crate::partition::Partition;
 use crate::{Error, Result};
@@ -116,22 +115,8 @@ impl Sparse {
                 partition,
             )
         };
-        let query = head_projection(loader, "to_q.weight")?;
+        let query = head_projection(loader, "to_q")?;
         let stack = query.dtype();
-        // One line, once per process: the type the walk read for the weight that decides the fine
-        // attention's output, named with the weight it came from. A launch key states this type, and
-        // a key that says `f32` is either a deployment converted to FP32 or a lookup that answered
-        // with something other than the checkpoint; the second is invisible without this print,
-        // because both produce a valid key.
-        {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            let name = format!("{prefix}.to_q.weight");
-            ONCE.call_once(|| {
-                eprintln!(
-                    "# attention_sparse: {name} is {stack:?}, so the fine attention writes {stack:?}"
-                );
-            });
-        }
         let fine = SegmentAttention::new(
             u64::from(tile_rows),
             u64::from(local_heads),
@@ -141,10 +126,10 @@ impl Sparse {
         )?;
         Ok(Self {
             query,
-            key: head_projection(loader, "to_k.weight")?,
-            value: head_projection(loader, "to_v.weight")?,
-            gate: head_projection(loader, "to_gate_compress.weight")?,
-            output: projection(loader, &format!("{prefix}.to_out.0.weight"), hidden, inner)?,
+            key: head_projection(loader, "to_k")?,
+            value: head_projection(loader, "to_v")?,
+            gate: head_projection(loader, "to_gate_compress")?,
+            output: projection(loader, &format!("{prefix}.to_out.0"), inner, hidden)?,
             query_gain,
             key_gain,
             rotary,
@@ -646,20 +631,6 @@ fn frequencies(
         &bytes,
         "minimax-h3",
     )?)
-}
-
-fn projection(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    out_features: u64,
-    in_features: u64,
-) -> Result<Linear> {
-    let weight = loader.load(&WeightRequest::region(
-        name,
-        0,
-        Shape::new(&[out_features, in_features]),
-    ))?;
-    Ok(Linear::new(weight, None, WeightOrder::NxK)?)
 }
 
 fn gain(loader: &mut WeightLoader<'_>, name: &str, width: u64) -> Result<Weight> {

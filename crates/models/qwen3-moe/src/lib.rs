@@ -23,13 +23,11 @@ pub mod load;
 pub mod model;
 pub mod partition;
 pub mod processing;
-pub mod representation;
 pub mod weights;
 
 pub use config::{Config, RopeScaling, YaRn};
 pub use model::{LoadOptions, Qwen3Moe};
 pub use partition::Partition;
-pub use representation::{Adopted, Representation, Role};
 
 /// What this crate can fail with.
 #[derive(Debug, thiserror::Error)]

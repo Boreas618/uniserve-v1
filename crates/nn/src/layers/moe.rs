@@ -21,7 +21,7 @@
 //! program selects the transport. A `Moe` layer built for a layout that does not hold every
 //! expert refuses the forward rather than computing a routing the weights do not have.
 
-use ops::fp4::{BLOCK_ELEMENTS, Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
+use ops::fp4::{Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
 use ops::moe::exchange::{self, ExchangeArgs, ExpertExchange, Mode};
 use ops::moe::grouped::{
@@ -35,7 +35,7 @@ use ops::{DType, DevicePtr, Op, Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::layers::Linear;
+use crate::layers::linear::{ENCODE_CHUNK, Linear, encode_block};
 use crate::weights::{QuantizedStack, Weight};
 
 /// The scratch one grouped product of `routes` permuted rows and `width` columns needs, in bytes.
@@ -102,21 +102,6 @@ const MMA_CLUSTER: (u32, u32) = (1, 1);
 /// Rows per permutation tile: the row extent of `MMA_TILE`, which is what a sort's permutation
 /// buffer is padded to.
 const TILE_ROWS: u32 = MMA_TILE.0;
-
-/// Elements of a row one activation-encoding program holds at a time.
-///
-/// A whole number of sixteen-element scale blocks, as the layout requires, and small enough that a
-/// 2048-element row is walked in a handful of passes rather than materialized in one block.
-/// Elements one activation-encoding program covers.
-///
-/// It is the encoder's block and therefore a key field of `nvfp4_quantize`, so a model that builds an
-/// [`crate::layers::Nvfp4Linear`] states it rather than choosing one: two deployments that disagreed
-/// would compile two programs for one launch site.
-pub const ENCODE_CHUNK: u32 = 1024;
-
-/// The encoder's chunk is a whole number of scale blocks; a chunk that were not would have a partial
-/// block with no scale to name it.
-const _: () = assert!(ENCODE_CHUNK.is_multiple_of(BLOCK_ELEMENTS));
 
 /// The per-expert scalars a fused exchange's kernel multiplies in, one table per use.
 #[derive(Clone)]
@@ -881,7 +866,7 @@ impl Moe {
             input,
             columns,
             layout,
-            block: crate::layers::linear::Nvfp4Linear::encode_block(columns, ENCODE_CHUNK),
+            block: encode_block(columns, ENCODE_CHUNK),
             pdl: crate::layers::launch::PDL,
         }
     }

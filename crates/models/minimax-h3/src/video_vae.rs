@@ -473,10 +473,10 @@ pub fn sources(config: &VideoVaeConfig) -> crate::Result<Vec<crate::audio_vae::S
 
 use nn::Forward;
 use nn::layers::{
-    Attention, Linear, PackedSwiGlu, Rotary, Rows, ScaledAdd, ScaledResidualLayerNorm,
-    ScaledResidualRmsNorm, Sections, WeightedRmsNorm,
+    Attention, Bias, Linear, MergedColumnLinear, PackedSwiGlu, Parallel, Rotary, Rows, ScaledAdd,
+    ScaledResidualLayerNorm, ScaledResidualRmsNorm, Sections, WeightedRmsNorm,
 };
-use nn::weights::{Weight, WeightLayout, WeightLoader, WeightRequest};
+use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
 use ops::gemm::WeightOrder;
 
@@ -497,7 +497,7 @@ pub const STREAM: DType = DType::F32;
 struct Layer {
     /// The query, key and value projections as one `[3 · width, width]` product: one read of the
     /// normalized rows, and the three outputs are column ranges of one buffer.
-    query_key_value: Linear,
+    query_key_value: MergedColumnLinear,
     output: Linear,
     /// `scale1`, then the second normalization.
     attended: ScaledResidualRmsNorm,
@@ -748,17 +748,14 @@ impl VideoDecoder {
             )?),
             WeightOrder::NxK,
         )?;
-        let post_quant = Linear::new(
-            loader.load(
-                &WeightRequest::region(
-                    "post_quant_conv.weight",
-                    0,
-                    Shape::new(&[channels, channels]),
-                )
-                .pinned(ACTIVATION),
-            )?,
-            None,
-            WeightOrder::NxK,
+        // The post-quantization convolution is 1x1x1: its `[channels, channels, 1, 1, 1]` weight is
+        // the matrix of a projection, whose bias the next product adds (see `post_quant_bias`).
+        let post_quant = Linear::load(
+            &mut loader.scope("post_quant_conv").pinned(ACTIVATION),
+            width_of(channels)?,
+            width_of(channels)?,
+            Bias::Absent,
+            Parallel::None,
         )?;
         let identity: Vec<u8> = (0..channels * channels)
             .flat_map(|index| {
@@ -850,33 +847,13 @@ impl VideoDecoder {
             } else {
                 None
             };
-            let parts = |name: &str| {
-                ["to_q", "to_k", "to_v"]
-                    .map(|projection| format!("{base}.attn.{projection}.{name}"))
-                    .to_vec()
-            };
-            let query_key_value = Linear::new(
-                loader.load(
-                    &WeightRequest::parts(
-                        format!("{base}.attn.qkv.weight"),
-                        parts("weight"),
-                        Shape::new(&[3 * u64::from(width), u64::from(width)]),
-                        WeightLayout::ROW_MAJOR,
-                    )
-                    .pinned(ACTIVATION),
-                )?,
-                Some(
-                    loader.load(
-                        &WeightRequest::parts(
-                            format!("{base}.attn.qkv.bias"),
-                            parts("bias"),
-                            Shape::new(&[3 * u64::from(width)]),
-                            WeightLayout::ROW_MAJOR,
-                        )
-                        .pinned(ACTIVATION),
-                    )?,
-                ),
-                WeightOrder::NxK,
+            // The three projections are one product: their matrices stacked query, key, value.
+            let query_key_value = MergedColumnLinear::load(
+                &mut loader.scope(format!("{base}.attn")).pinned(ACTIVATION),
+                &["to_q", "to_k", "to_v"],
+                width,
+                &[width, width, width],
+                Bias::Present,
             )?;
             layers.push(Layer {
                 query_key_value,
@@ -979,14 +956,19 @@ impl VideoDecoder {
 
 /// Read a projection of the checkpoint at [`ACTIVATION`]: `[out, in]` row-major, with its bias.
 fn linear(loader: &mut WeightLoader, name: &str, from: u64, to: u64) -> Result<Linear> {
-    let weight = loader.load(
-        &WeightRequest::region(format!("{name}.weight"), 0, Shape::new(&[to, from]))
-            .pinned(ACTIVATION),
-    )?;
-    let bias = loader.load(
-        &WeightRequest::region(format!("{name}.bias"), 0, Shape::new(&[to])).pinned(ACTIVATION),
-    )?;
-    Ok(Linear::new(weight, Some(bias), WeightOrder::NxK)?)
+    Ok(Linear::load(
+        &mut loader.scope(name).pinned(ACTIVATION),
+        width_of(from)?,
+        width_of(to)?,
+        Bias::Present,
+        Parallel::None,
+    )?)
+}
+
+/// A channel count as a projection's width.
+fn width_of(channels: u64) -> Result<u32> {
+    u32::try_from(channels)
+        .map_err(|_| Error::config(format!("{channels} channels exceed a projection's width")))
 }
 
 /// The restore's weight and bias: the diagonal of the latent deviations, and the means.

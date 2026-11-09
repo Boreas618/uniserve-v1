@@ -26,7 +26,9 @@ use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
-use nn::layers::{GatedActivation, GatedResidual, Linear, ModulatedRmsNorm, RmsNorm};
+use nn::layers::{
+    Bias, GatedActivation, GatedResidual, Linear, ModulatedRmsNorm, Parallel, RmsNorm,
+};
 use nn::tensor::Backing;
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
@@ -788,19 +790,13 @@ impl Transformer {
             // `audio_output` are pinned at FP32 whatever the attention, MLP and VAE tiers are. So
             // the widening `wide` performs meets an FP32 weight and the product is FP32 on both
             // sides, which is what makes the released BF16 stack run a FP32 sample at all.
-            proj_in: projection_with_bias(
-                loader,
-                "proj_in",
-                hidden,
-                video_in,
-                Some(nn::DType::F32),
-            )?,
+            proj_in: projection_with_bias(loader, "proj_in", hidden, video_in, nn::DType::F32)?,
             audio_proj_in: Some(projection_with_bias(
                 loader,
                 "audio_proj_in",
                 hidden,
                 audio_in,
-                Some(nn::DType::F32),
+                nn::DType::F32,
             )?),
             layers,
             norm_out: RmsNorm::new(
@@ -816,7 +812,7 @@ impl Transformer {
                     "proj_out",
                     video_in,
                     hidden,
-                    Some(nn::DType::F32),
+                    nn::DType::F32,
                 )?),
             },
             audio_out: match heads {
@@ -826,7 +822,7 @@ impl Transformer {
                     "audio_proj_out",
                     audio_in,
                     hidden,
-                    Some(nn::DType::F32),
+                    nn::DType::F32,
                 )?),
             },
             heads,
@@ -1037,34 +1033,30 @@ fn projection(
     rows: u64,
     columns: u64,
 ) -> Result<Linear> {
-    let weight = loader.load(&WeightRequest::region(
-        format!("{name}.weight"),
-        0,
-        Shape::new(&[rows, columns]),
-    ))?;
-    Ok(Linear::new(weight, None, WeightOrder::NxK)?)
+    Ok(Linear::load(
+        &mut loader.scope(name),
+        attention::width(columns)?,
+        attention::width(rows)?,
+        Bias::Absent,
+        Parallel::None,
+    )?)
 }
 
-/// A `[out, in]` projection of the checkpoint with its bias.
+/// A `[out, in]` projection of the checkpoint with its bias, read as `dtype`.
 fn projection_with_bias(
     loader: &mut WeightLoader<'_>,
     name: &str,
     rows: u64,
     columns: u64,
-    dtype: Option<nn::DType>,
+    dtype: nn::DType,
 ) -> Result<Linear> {
-    let mut request =
-        WeightRequest::region(format!("{name}.weight"), 0, Shape::new(&[rows, columns]));
-    if let Some(dtype) = dtype {
-        request = request.pinned(dtype);
-    }
-    let weight = loader.load(&request)?;
-    let mut request = WeightRequest::region(format!("{name}.bias"), 0, Shape::new(&[rows]));
-    if let Some(dtype) = dtype {
-        request = request.pinned(dtype);
-    }
-    let bias = loader.load(&request)?;
-    Ok(Linear::new(weight, Some(bias), WeightOrder::NxK)?)
+    Ok(Linear::load(
+        &mut loader.scope(name).pinned(dtype),
+        attention::width(columns)?,
+        attention::width(rows)?,
+        Bias::Present,
+        Parallel::None,
+    )?)
 }
 
 /// A normalization's or projection's learned gain.

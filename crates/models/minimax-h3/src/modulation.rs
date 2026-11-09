@@ -31,8 +31,8 @@
 //! layers of [`crate::transformer`] index with it.
 
 use nn::Shape;
-use nn::layers::gather_rows;
-use nn::weights::{Weight, WeightLoader, WeightRequest};
+use nn::layers::{Bias, Linear, Parallel, gather_rows};
+use nn::weights::{Weight, WeightLoader};
 use nn::{DType, Forward, TensorView};
 
 use crate::{Error, Result};
@@ -255,13 +255,13 @@ pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>
 /// evaluation, so they are held only until `Projections::fill` has produced the tables once.
 pub struct Projections {
     /// `time_embedder.linear_1`: `[time_hidden, frequency]`, FP32, with its bias.
-    first: (Weight, Weight),
+    first: Linear,
     /// `time_embedder.linear_2`: `[time_dim, time_hidden]`, FP32, with its bias.
-    second: (Weight, Weight),
+    second: Linear,
     /// One `adaln_proj.linear` per layer: `[18 * hidden, time_dim]`, with its bias.
-    layers: Vec<(Weight, Weight)>,
+    layers: Vec<Linear>,
     /// `norm_out.linear`: `[2 * hidden, time_dim]`, with its bias.
-    output: (Weight, Weight),
+    output: Linear,
     frequency_dim: u32,
     time_hidden_dim: u32,
     time_dim: u32,
@@ -287,66 +287,56 @@ impl Projections {
         // activation into the modulation type; the tables follow the projections, so a block's
         // modulation and its activation are one type, and at a deployment that states FP32 the two
         // halves coincide and the crossing is skipped.
-        let hidden = u64::from(config.hidden_size);
-        let time_dim = u64::from(config.time_dim);
-        let time_hidden = u64::from(config.time_hidden_dim);
-        let frequency = u64::from(config.frequency_dim);
+        let hidden = config.hidden_size;
+        let rows = VECTORS as u32 * hidden * TAGS;
+        // A module read at the deployment's type, or pinned to `dtype`.
+        let projection = |loader: &mut WeightLoader<'_>,
+                          name: &str,
+                          inputs: u32,
+                          outputs: u32,
+                          dtype: Option<DType>|
+         -> Result<Linear> {
+            let mut module = loader.scope(name);
+            let linear = match dtype {
+                Some(dtype) => Linear::load(
+                    &mut module.pinned(dtype),
+                    inputs,
+                    outputs,
+                    Bias::Present,
+                    Parallel::None,
+                ),
+                None => Linear::load(&mut module, inputs, outputs, Bias::Present, Parallel::None),
+            };
+            Ok(linear?)
+        };
         let layers = (0..config.num_hidden_layers)
             .map(|index| {
-                let prefix = format!("transformer_blocks.{index}.adaln_proj.linear");
-                Ok((
-                    matrix(
-                        loader,
-                        &format!("{prefix}.weight"),
-                        VECTORS as u64 * hidden * u64::from(TAGS),
-                        time_dim,
-                        None,
-                    )?,
-                    vector(
-                        loader,
-                        &format!("{prefix}.bias"),
-                        VECTORS as u64 * hidden * u64::from(TAGS),
-                        None,
-                    )?,
-                ))
+                projection(
+                    loader,
+                    &format!("transformer_blocks.{index}.adaln_proj.linear"),
+                    config.time_dim,
+                    rows,
+                    None,
+                )
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
-            first: (
-                matrix(
-                    loader,
-                    "time_embedder.linear_1.weight",
-                    time_hidden,
-                    frequency,
-                    Some(DType::F32),
-                )?,
-                vector(
-                    loader,
-                    "time_embedder.linear_1.bias",
-                    time_hidden,
-                    Some(DType::F32),
-                )?,
-            ),
-            second: (
-                matrix(
-                    loader,
-                    "time_embedder.linear_2.weight",
-                    time_dim,
-                    time_hidden,
-                    Some(DType::F32),
-                )?,
-                vector(
-                    loader,
-                    "time_embedder.linear_2.bias",
-                    time_dim,
-                    Some(DType::F32),
-                )?,
-            ),
+            first: projection(
+                loader,
+                "time_embedder.linear_1",
+                config.frequency_dim,
+                config.time_hidden_dim,
+                Some(DType::F32),
+            )?,
+            second: projection(
+                loader,
+                "time_embedder.linear_2",
+                config.time_hidden_dim,
+                config.time_dim,
+                Some(DType::F32),
+            )?,
             layers,
-            output: (
-                matrix(loader, "norm_out.linear.weight", 2 * hidden, time_dim, None)?,
-                vector(loader, "norm_out.linear.bias", 2 * hidden, None)?,
-            ),
+            output: projection(loader, "norm_out.linear", config.time_dim, 2 * hidden, None)?,
             frequency_dim: config.frequency_dim,
             time_hidden_dim: config.time_hidden_dim,
             time_dim: config.time_dim,
@@ -399,8 +389,8 @@ impl Projections {
         // projections read the deployment's type - **one narrowing between them**, which is the
         // reference's `.to(weight.dtype)` and the only crossing in this cache. At an FP32
         // deployment the two types coincide and the narrowing is skipped.
-        let time_type = self.first.0.dtype();
-        let dtype = self.layers[0].0.dtype();
+        let time_type = self.first.weight().dtype;
+        let dtype = self.layers[0].weight().dtype;
         if time_type != DType::F32 {
             return Err(Error::config(format!(
                 "the AdaLN timestep pair is {time_type} and the reference pins it to FP32 at every \
@@ -438,12 +428,9 @@ impl Projections {
             Shape::new(&[groups, u64::from(self.time_hidden_dim)]),
         )?;
         let time = arena.tensor(time_type, Shape::new(&[groups, u64::from(self.time_dim)]))?;
-        let linear = |weights: &(Weight, Weight)| {
-            nn::layers::Linear::new(weights.0, Some(weights.1), nn::layers::WeightOrder::NxK)
-        };
-        linear(&self.first)?.forward(f, embedding, hidden)?;
+        self.first.forward(f, embedding, hidden)?;
         nn::layers::Silu.forward(f, hidden, activated)?;
-        linear(&self.second)?.forward(f, activated, time)?;
+        self.second.forward(f, activated, time)?;
         // The projections read `silu(embedding)`: the
         // pair's output is activated once more before any modulation reads it.
         let activated_time = arena.tensor(time_type, time.shape)?;
@@ -459,10 +446,10 @@ impl Projections {
             nn::layers::ScaledAdd.forward(f, out, time, 1.0, 0.0)?;
             out
         };
-        for (weights, out) in self.layers.iter().zip(layers_out) {
-            linear(weights)?.forward(f, narrow, *out)?;
+        for (layer, out) in self.layers.iter().zip(layers_out) {
+            layer.forward(f, narrow, *out)?;
         }
-        Ok(linear(&self.output)?.forward(f, narrow, output_out)?)
+        Ok(self.output.forward(f, narrow, output_out)?)
     }
 
     /// The sinusoidal embedding a step's network times need: `[groups, frequency_dim]` FP32.
@@ -476,7 +463,7 @@ impl Projections {
 
     /// The element type the modulation projections read: the tables' type, and the cache's.
     pub fn dtype(&self) -> DType {
-        self.layers[0].0.dtype()
+        self.layers[0].weight().dtype
     }
 }
 
@@ -519,34 +506,6 @@ fn embedding(times: &[f32], frequency_dim: u32) -> Result<Vec<u8>> {
         }
     }
     Ok(bytes)
-}
-
-/// A `[rows, columns]` checkpoint weight.
-fn matrix(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    rows: u64,
-    columns: u64,
-    dtype: Option<DType>,
-) -> Result<Weight> {
-    let mut request = WeightRequest::region(name, 0, Shape::new(&[rows, columns]));
-    if let Some(dtype) = dtype {
-        request = request.pinned(dtype);
-    }
-    Ok(loader.load(&request)?)
-}
-
-fn vector(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    rows: u64,
-    dtype: Option<DType>,
-) -> Result<Weight> {
-    let mut request = WeightRequest::region(name, 0, Shape::new(&[rows]));
-    if let Some(dtype) = dtype {
-        request = request.pinned(dtype);
-    }
-    Ok(loader.load(&request)?)
 }
 
 #[cfg(test)]

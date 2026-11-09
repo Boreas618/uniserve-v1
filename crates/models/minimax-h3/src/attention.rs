@@ -39,10 +39,12 @@
 //! FP32 when it lands - in its layer's dtype and in this doc - while the fine sparse attention over
 //! the prepared rows stays in the checkpoint's dtype like the dense one.
 
-use nn::layers::{Attention as Flash, CopyBlock, Linear, Rotary, Sections, UlyssesExchange};
+use nn::family::Split;
+use nn::layers::{
+    Attention as Flash, Bias, CopyBlock, Linear, Parallel, Rotary, Sections, UlyssesExchange,
+};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
-use ops::gemm::WeightOrder;
 
 use crate::config::TransformerConfig;
 use crate::partition::Partition;
@@ -58,7 +60,10 @@ pub(crate) struct HeadProjection {
 }
 
 impl HeadProjection {
-    /// Reads the checkpoint's `[inner, hidden]` projection `name` for `partition`.
+    /// Reads the checkpoint's `[inner, hidden]` projection module `name` for `partition`.
+    ///
+    /// Each member's projection is its block of the module's heads: a column-parallel split of the
+    /// output channels over the sequence group's members.
     pub(crate) fn load(
         loader: &mut WeightLoader<'_>,
         name: &str,
@@ -66,26 +71,32 @@ impl HeadProjection {
         hidden: u64,
         partition: &Partition,
     ) -> Result<Self> {
-        let degree = partition.ulysses_degree as u64;
-        let local = inner / degree;
-        let mut region = |member: u64, rows: u64| -> Result<Linear> {
-            let weight = loader.load(&WeightRequest::region(
-                name,
-                member * local * hidden,
-                Shape::new(&[rows, hidden]),
-            ))?;
-            Ok(Linear::new(weight, None, WeightOrder::NxK)?)
+        let (inner, hidden) = (width(inner)?, width(hidden)?);
+        let degree = u32::try_from(partition.ulysses_degree)
+            .map_err(|_| Error::config("a sequence degree wider than a u32".to_owned()))?;
+        let mut scope = loader.scope(name);
+        let mut member = |rank: u32| -> Result<Linear> {
+            let parallel = if degree == 1 {
+                Parallel::None
+            } else {
+                Parallel::Column(Split { size: degree, rank })
+            };
+            Ok(Linear::load(
+                &mut scope,
+                hidden,
+                inner,
+                Bias::Absent,
+                parallel,
+            )?)
         };
         let members = match (degree, partition.projection) {
-            (1, _) => vec![region(0, inner)?],
-            (_, Projection::Gather) => vec![region(partition.sequence_rank as u64, local)?],
-            (_, Projection::Exchange) => {
-                let mut members = Vec::with_capacity(partition.ulysses_degree);
-                for member in 0..degree {
-                    members.push(region(member, local)?);
-                }
-                members
+            (1, _) => vec![member(0)?],
+            (_, Projection::Gather) => {
+                let rank = u32::try_from(partition.sequence_rank)
+                    .map_err(|_| Error::config("a sequence rank wider than a u32".to_owned()))?;
+                vec![member(rank)?]
             }
+            (_, Projection::Exchange) => (0..degree).map(member).collect::<Result<Vec<_>>>()?,
         };
         Ok(Self { members })
     }
@@ -440,10 +451,10 @@ impl Dense {
             )
         };
         Ok(Self {
-            query: head_projection(loader, "to_q.weight")?,
-            key: head_projection(loader, "to_k.weight")?,
-            value: head_projection(loader, "to_v.weight")?,
-            output: projection(loader, &format!("{prefix}.to_out.0.weight"), hidden, inner)?,
+            query: head_projection(loader, "to_q")?,
+            key: head_projection(loader, "to_k")?,
+            value: head_projection(loader, "to_v")?,
+            output: projection(loader, &format!("{prefix}.to_out.0"), inner, hidden)?,
             rotary,
             query_gain,
             key_gain,
@@ -731,18 +742,25 @@ fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
 }
 
 /// A projection of the checkpoint: `[out, in]`, without bias.
-fn projection(
+pub(crate) fn projection(
     loader: &mut WeightLoader<'_>,
     name: &str,
-    rows: u64,
-    columns: u64,
+    inputs: u64,
+    outputs: u64,
 ) -> Result<Linear> {
-    let weight = loader.load(&WeightRequest::region(
-        name,
-        0,
-        Shape::new(&[rows, columns]),
-    ))?;
-    Ok(Linear::new(weight, None, WeightOrder::NxK)?)
+    Ok(Linear::load(
+        &mut loader.scope(name),
+        width(inputs)?,
+        width(outputs)?,
+        Bias::Absent,
+        Parallel::None,
+    )?)
+}
+
+/// A channel count as a projection's width.
+pub(crate) fn width(channels: u64) -> Result<u32> {
+    u32::try_from(channels)
+        .map_err(|_| Error::config(format!("{channels} channels exceed a projection's width")))
 }
 
 /// A normalization's learned gain.

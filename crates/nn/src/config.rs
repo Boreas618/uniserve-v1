@@ -48,6 +48,11 @@ impl<'a> Fields<'a> {
         !matches!(self.values.get(key), None | Some(Value::Null))
     }
 
+    /// The keys the object states, in the document's order.
+    pub fn keys(&self) -> impl Iterator<Item = &'a str> + use<'a> {
+        self.values.keys().map(String::as_str)
+    }
+
     /// The raw value of `key`, for a field whose shape a family interprets itself.
     pub fn get(&self, key: &str) -> Option<&'a Value> {
         self.values.get(key).filter(|value| !value.is_null())

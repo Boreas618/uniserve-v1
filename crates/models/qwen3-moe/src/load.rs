@@ -1,33 +1,26 @@
-//! The loading boundary of `Qwen3MoeForCausalLM`: checkpoint metadata, the rotary frequency table,
-//! and one [`WeightRequest`] per parameter of the model.
+//! The loading boundary of `Qwen3MoeForCausalLM`: the model's modules, read through the checkpoint's
+//! own module paths, and the rotary frequency table.
 //!
 //! ## What the boundary owns
 //!
-//! `config.json` is read and normalized here, once, into [`Config`]; the checkpoint's tensor names
-//! are resolved to model paths by [`crate::weights`]; the rotary frequency table, which no
-//! checkpoint stores, is computed here once, by the same formula the reference uses, and published
-//! to retained storage as a constant. Everything below
-//! this module consumes typed fields and borrowed views: no layer parses a dictionary or applies a
-//! default.
-//!
-//! ## Partitioning
-//!
-//! A regional shard of a checkpoint tensor is row-major, so a shard along the *first* axis is
-//! `start = rank × rows × width`, and a shard along the *last* axis is a gather of rows that start
-//! `full_width` elements apart — `WeightSource::Strided`, one row block per rank. The vocabulary,
-//! the query/key/value projections and the router are sharded on their rows; `o_proj` and a dense
-//! `down_proj` are sharded on their reduction axis, whose region is strided. Both go through one
-//! loader, and a rank that owns the whole axis reads the same region either way.
+//! The family reads `config.json` and the quantization declaration once, when it opens the
+//! checkpoint; this module builds the model from them. Every module is read through a
+//! [`nn::weights::Scope`] named as the checkpoint names it (`model.layers.<i>.self_attn.q_proj`),
+//! and each `nn` layer reads its own tensors, shards itself by the deployment's split and chooses its
+//! representation from the declaration. The rotary frequency table, which no checkpoint stores, is
+//! computed here once and published to retained storage as a constant.
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
 
+use nn::family::Split;
 use nn::layers::{
-    Attention, ENCODE_CHUNK, Embedding, Linear, Moe, Nvfp4Linear, ParallelLMHead, RmsNorm, Rotary,
-    SwiGlu,
+    Attention, Bias, Embedding, Linear, Moe, Parallel, ParallelLMHead, QkvBias, QkvLinear,
+    QkvNames, QkvSpec, RmsNorm, Rotary, SwiGlu,
 };
+use nn::quantization::Declaration;
 use nn::weights::{
-    Nvfp4Names, PartBlock, QuantizedStack, Weight, WeightLayout, WeightLoader, WeightRequest,
+    Nvfp4Names, PartBlock, QuantizedStack, Scope, WeightLayout, WeightLoader, WeightRequest,
 };
 use nn::{DType, Shape};
 use ops::fp4::ScaleLayout;
@@ -35,10 +28,7 @@ use ops::gemm::WeightOrder;
 use ops::moe::grouped::Activation as MoeActivation;
 use ops::rope::Rotation;
 
-use crate::model::{
-    AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Projection, Qwen3Moe,
-};
-use crate::representation::{self, Adopted, Representation, Role};
+use crate::model::{AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Qwen3Moe};
 use crate::{Config, Error, Partition, Result};
 
 /// The block-scale layout the expert products read the **weights** in: the 128x4 swizzled form.
@@ -51,10 +41,6 @@ use crate::{Config, Error, Partition, Result};
 /// The shard stores the plain form, so the loader builds this table once at load.
 pub const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 
-/// The block-scale layout a calibrated ModelOpt export stores its scales in: linear, one E4M3
-/// scale per sixteen elements, row-major. The published tables are built from it at load.
-const FILE_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
-
 /// Each routed layer's logical expert ids in physical slot order, by the module path
 /// [`crate::weights::ExpertSource::module`] states. A layer this map does not name keeps the
 /// checkpoint's order.
@@ -64,10 +50,10 @@ pub type ExpertOrder = std::collections::BTreeMap<String, Vec<u32>>;
 /// in the slots `order` states (`docs/admin.md`, Expert redistribution).
 ///
 /// `config` and `declaration` are what the family read from the checkpoint when it opened it;
-/// nothing here reads a configuration file again. The declaration is resolved against the shards
-/// once, and the resolved statement is the one every projection is read by. A parameter the
-/// declaration quantizes whose *role* this model still builds dense is refused before a tensor is
-/// opened: reading it as dense would read packed E2M1 as a matrix.
+/// nothing here reads a configuration file again. The loader resolves the declaration against the
+/// shards once, and every layer is read by that one resolved statement: a projection the shards
+/// store packed is read as NVFP4, and a packed weight reaching a layer with no encoded form is
+/// refused by name.
 ///
 /// The stacks hold the experts in slot order, and one table maps every layer's logical ids to its
 /// slots. A deployment that never redistributes reads an identity table, so the graphs it captures
@@ -75,34 +61,224 @@ pub type ExpertOrder = std::collections::BTreeMap<String, Vec<u32>>;
 /// and the stacks' addresses map, and no capture.
 pub fn load(
     config: &Config,
-    declaration: &Representation,
-    checkpoint: &nn::Checkpoint,
+    declaration: &Declaration,
     partition: Partition,
     loader: &mut WeightLoader<'_>,
     options: LoadOptions,
     order: &ExpertOrder,
 ) -> Result<Qwen3Moe> {
-    // The shards are the fact and the declaration is a claim about them, so a load resolves each
-    // parameter's representation from what the checkpoint stores: its tensor names, which a meta
-    // loader's checkpoint holds as a device loader's does.
-    let representation = declaration.resolved(checkpoint);
-    refuse_dense_parameters(config, &representation)?;
-    let (quantization, experts_encoded) = match representation {
-        Representation::Dense => (Quantization::Bf16, false),
-        Representation::Nvfp4 { .. } => (Quantization::Nvfp4, true),
+    partition.validate(config)?;
+    loader.declare(declaration);
+    // The model reports this option to execution as its experts' encoding, so the declaration
+    // decides it once here.
+    let experts_encoded = declaration.is_encoded() && config.has_sparse_layers();
+    let options = LoadOptions {
+        experts_encoded,
+        ..options
     };
-    load_with(
-        config,
-        partition,
-        loader,
-        LoadOptions {
-            experts_encoded,
-            ..options
-        },
-        quantization,
-        &representation,
-        order,
+    let config = config.clone();
+    let tensor = Split {
+        size: partition.tensor_parallel,
+        rank: partition.tensor_rank,
+    };
+
+    let hidden = u64::from(config.hidden_size);
+    let head_dim = u64::from(config.head_dim);
+    let q_heads = partition.local_attention_heads(&config);
+    let kv_heads = partition.local_key_value_heads(&config);
+
+    // The vocabulary shard: rows are contiguous in a `[vocabulary, hidden]` table.
+    let (first, rows) = partition.vocabulary_shard(config.vocab_size);
+    let padded = partition.padded_vocabulary_shard(config.vocab_size);
+    if padded != rows {
+        return Err(Error::Unsupported(format!(
+            "a vocabulary shard of {rows} rows needs {padded} padded rows; the checkpoint's rows \
+             are contiguous, so a rank whose shard is not its padded width is not loadable yet"
+        )));
+    }
+    let mut root = loader.scope("");
+    let embedding_weight = root.scope("model.embed_tokens").rows(
+        "weight",
+        u64::from(first),
+        &[u64::from(rows), hidden],
+    )?;
+    let embedding = Embedding::new(embedding_weight, first, rows, config.vocab_size)?;
+    let dtype = embedding_weight.view().dtype;
+
+    // A tied head reads the embedding's own matrix.
+    let head_module = if config.tie_word_embeddings {
+        "model.embed_tokens"
+    } else {
+        "lm_head"
+    };
+    let lm_head_weight =
+        root.scope(head_module)
+            .rows("weight", u64::from(first), &[u64::from(rows), hidden])?;
+    let head = ParallelLMHead::new(lm_head_weight, first, rows, config.vocab_size, padded)?;
+
+    let norm = RmsNorm::new(
+        root.scope("model.norm").tensor("weight", &[hidden])?,
+        config.rms_norm_eps,
+    )?;
+
+    // The rotary recipe: one frequency table and the score multiplier the recipe adds.
+    let (frequencies, score_scale) = rotary_recipe(&config)?;
+    let table = loader.constant(
+        "qwen3-moe.rotary.inv_freq",
+        DType::F32,
+        Shape::new(&[head_dim / 2]),
+        &frequency_bytes(&frequencies),
+        "qwen3-moe",
+    )?;
+
+    let (slots, slot_table) = expert_slots(&config, order, loader)?;
+    let experts_source: HashMap<u32, crate::weights::ExpertSource> =
+        crate::weights::expert_sources(&config)
+            .into_iter()
+            .filter_map(|source| {
+                let layer = source
+                    .module
+                    .strip_prefix("layers.")?
+                    .split('.')
+                    .next()?
+                    .parse()
+                    .ok()?;
+                Some((layer, source))
+            })
+            .collect();
+
+    let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
+    for layer in 0..config.num_hidden_layers {
+        let parameter = format!("layers.{layer}");
+        let mut scope = loader.scope(format!("model.layers.{layer}"));
+        let input_norm = RmsNorm::new(
+            scope.scope("input_layernorm").tensor("weight", &[hidden])?,
+            config.rms_norm_eps,
+        )?;
+        let post_attention_norm = RmsNorm::new(
+            scope
+                .scope("post_attention_layernorm")
+                .tensor("weight", &[hidden])?,
+            config.rms_norm_eps,
+        )?;
+
+        let mut attention = scope.scope("self_attn");
+        let bias = if config.attention_bias {
+            (Bias::Present, QkvBias::Present)
+        } else {
+            (Bias::Absent, QkvBias::Absent)
+        };
+        let attention = AttentionLayer {
+            qkv: QkvLinear::load(
+                &mut attention,
+                QkvSpec {
+                    hidden: config.hidden_size,
+                    heads: config.num_attention_heads,
+                    kv_heads: config.num_key_value_heads,
+                    head_dim: config.head_dim,
+                },
+                QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
+                bias.1,
+                tensor,
+            )?,
+            o_proj: Linear::load(
+                &mut attention.scope("o_proj"),
+                config.num_attention_heads * config.head_dim,
+                config.hidden_size,
+                bias.0,
+                Parallel::Row(tensor),
+            )?,
+            q_norm: attention.scope("q_norm").tensor("weight", &[head_dim])?,
+            k_norm: attention.scope("k_norm").tensor("weight", &[head_dim])?,
+            rotary: Rotary::new(
+                table,
+                config.head_dim,
+                q_heads,
+                kv_heads,
+                config.rms_norm_eps,
+                Rotation::Half,
+                1.0,
+            )?,
+            attention: Attention::paged(
+                config.head_dim,
+                q_heads,
+                kv_heads,
+                options.page_tokens,
+                config.max_position_embeddings,
+                None,
+                score_scale,
+            )?,
+        };
+
+        let mlp = if config.sparse(layer) {
+            let map = match &slot_table {
+                Some((table, layers)) => {
+                    let row = layers.iter().position(|routed| *routed == layer);
+                    let row = row.ok_or_else(|| {
+                        Error::Config(format!("layer {layer} has no row of the expert table"))
+                    })?;
+                    table.row(as_u64(row, "an expert table row")?)?
+                }
+                None => {
+                    return Err(Error::Config(format!(
+                        "layer {layer} routes and no routed layer has a table"
+                    )));
+                }
+            };
+            // The router is replicated: every rank routes a token the same way.
+            let router = Linear::new(
+                scope
+                    .scope("mlp.gate")
+                    .tensor("weight", &[u64::from(config.num_experts), hidden])?,
+                None,
+                WeightOrder::NxK,
+            )?;
+
+            Mlp::Experts(expert_block(
+                loader,
+                router,
+                &experts_source[&layer],
+                &partition,
+                &config,
+                &parameter,
+                hidden,
+                experts_encoded,
+                &slots[&layer],
+                map,
+            )?)
+        } else {
+            Mlp::Dense(Box::new(dense_block(
+                &mut scope.scope("mlp"),
+                tensor,
+                &config,
+            )?))
+        };
+
+        layers.push(DecoderLayer {
+            input_norm,
+            post_attention_norm,
+            attention,
+            mlp,
+        });
+    }
+
+    Qwen3Moe::new(
+        config, partition, dtype, embedding, layers, norm, head, options,
     )
+}
+
+/// A count as an element count.
+fn as_u64(count: impl TryInto<u64>, what: &str) -> Result<u64> {
+    count
+        .try_into()
+        .map_err(|_| Error::Config(format!("{what} does not fit an element count")))
+}
+
+/// A count as a `u32` extent.
+fn as_u32(count: impl TryInto<u32>, what: &str) -> Result<u32> {
+    count
+        .try_into()
+        .map_err(|_| Error::Config(format!("{what} exceeds u32::MAX")))
 }
 
 /// The slot of each logical expert, from `order`, the logical expert of each slot.
@@ -166,7 +342,7 @@ fn expert_slots(
         let module = format!("layers.{layer}.mlp.experts");
         let order: Vec<u32> = match order.get(&module) {
             Some(order) => order.clone(),
-            None => (0..as_u32(experts, "num_experts")?).collect(),
+            None => (0..experts).collect(),
         };
         table.extend(
             slot_row(&module, &order, experts as usize)?
@@ -178,655 +354,18 @@ fn expert_slots(
     if layers.is_empty() {
         return Ok((slots, None));
     }
-    let weight = loader
-        .constant(
-            "qwen3-moe.experts.slots",
-            DType::I32,
-            Shape::new(&[
-                as_u64(layers.len(), "the routed layers")?,
-                as_u64(experts, "num_experts")?,
-            ]),
-            &table,
-            "qwen3-moe",
-        )
-        .map_err(Error::from)?;
-    Ok((slots, Some((weight, layers))))
-}
-
-/// Refuse a declaration that quantizes a parameter this model builds as a dense module.
-///
-/// Every parameter of the model is asked, layer by layer, because an exclusion list is matched by
-/// module pattern and a pattern can exclude layer 0's projection without excluding layer 3's: one
-/// representative per role would miss exactly the checkpoints worth refusing.
-fn refuse_dense_parameters(config: &Config, representation: &Representation) -> Result<()> {
-    if !representation.is_encoded() {
-        return Ok(());
-    }
-    for (parameter, role) in representation::parameters(config) {
-        let parameter = parameter.as_str();
-        // A packed *projection* is served: the loader builds it as an encoder and a product, so only
-        // a role this tree has no encoded form for is refused here.
-        match (representation.adopts(parameter, role)?, role) {
-            (Adopted::Source, _) | (Adopted::Quantized, Role::Projection) => {}
-            (Adopted::Quantized, _) => {
-                return Err(Error::Config(format!(
-                    "the checkpoint's calibration quantizes `{parameter}`, a parameter this model \
-                     has no encoded form for: reading it as dense would read packed E2M1 as a \
-                     matrix. Load a checkpoint whose calibration excludes it"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-/// How a checkpoint stores its expert stacks.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Quantization {
-    /// Dense tensors, one per expert, concatenated into a stack.
-    Bf16,
-    /// Packed E2M1 with linear block scales, as a calibrated export stores them.
-    Nvfp4,
-}
-
-fn load_with(
-    config: &Config,
-    partition: Partition,
-    loader: &mut WeightLoader<'_>,
-    options: LoadOptions,
-    quantization: Quantization,
-    declaration: &Representation,
-    order: &ExpertOrder,
-) -> Result<Qwen3Moe> {
-    // The arrangement the checkpoint stores its block scales in, which every packed read takes as
-    // the file's; the published arrangement is each product's own.
-    let layout = FILE_SCALE_LAYOUT;
-    partition.validate(config)?;
-    let config = config.clone();
-    // The model reports this option to execution as its experts' encoding, so a deployment that
-    // names the wrong one would be served as the other. The checkpoint decides it, and the loader
-    // is where the two meet.
-    let encoded = matches!(quantization, Quantization::Nvfp4)
-        && config.num_experts > 0
-        && config.has_sparse_layers();
-    if options.experts_encoded != encoded {
-        return Err(Error::Config(format!(
-            "the options say the experts are {} and the checkpoint's experts are {}",
-            if options.experts_encoded {
-                "encoded"
-            } else {
-                "dense"
-            },
-            if encoded { "encoded" } else { "dense" }
-        )));
-    }
-    let sources = sources(&config);
-
-    let hidden = as_u64(config.hidden_size, "hidden_size")?;
-    let head_dim = as_u64(config.head_dim, "head_dim")?;
-    let q_heads = partition.local_attention_heads(&config);
-    let kv_heads = partition.local_key_value_heads(&config);
-    let query = as_u64(q_heads * config.head_dim, "the query width")?;
-    let key_value = as_u64(kv_heads * config.head_dim, "the key/value width")?;
-
-    // The vocabulary shard: rows are contiguous in a `[vocabulary, hidden]` table.
-    let (first, rows) = partition.vocabulary_shard(config.vocab_size);
-    let padded = partition.padded_vocabulary_shard(config.vocab_size);
-    if padded != rows {
-        return Err(Error::Unsupported(format!(
-            "a vocabulary shard of {rows} rows needs {padded} padded rows; the checkpoint's rows \
-             are contiguous, so a rank whose shard is not its padded width is not loadable yet"
-        )));
-    }
-    let embedding_weight = region(
-        loader,
-        &sources,
-        "embedding.weight",
-        as_u64(first * config.hidden_size, "the embedding shard offset")?,
-        Shape::new(&[as_u64(rows, "the vocabulary shard")?, hidden]),
-    )?;
-    let embedding = Embedding::new(
-        embedding_weight,
-        as_u32(first, "the vocabulary shard")?,
-        as_u32(rows, "the vocabulary shard")?,
-        as_u32(config.vocab_size, "vocab_size")?,
-    )
-    .map_err(Error::from)?;
-    let dtype = embedding_weight.view().dtype;
-
-    let lm_head_weight = region(
-        loader,
-        &sources,
-        "lm_head.weight",
-        as_u64(first * config.hidden_size, "the head shard offset")?,
-        Shape::new(&[as_u64(rows, "the head shard")?, hidden]),
-    )?;
-    let head = ParallelLMHead::new(
-        lm_head_weight,
-        as_u32(first, "the head shard")?,
-        as_u32(rows, "the head shard")?,
-        as_u32(config.vocab_size, "vocab_size")?,
-        as_u32(padded, "the padded shard")?,
-    )
-    .map_err(Error::from)?;
-
-    let norm = RmsNorm::new(
-        region(loader, &sources, "norm.weight", 0, Shape::new(&[hidden]))?,
-        config.rms_norm_eps,
-    )
-    .map_err(Error::from)?;
-
-    // The rotary recipe: one frequency table and the score multiplier the recipe adds.
-    let (frequencies, score_scale) = rotary_recipe(&config)?;
-    let table = loader
-        .constant(
-            "qwen3-moe.rotary.inv_freq",
-            DType::F32,
-            Shape::new(&[as_u64(config.head_dim / 2, "head_dim / 2")?]),
-            &frequency_bytes(&frequencies),
-            "qwen3-moe",
-        )
-        .map_err(Error::from)?;
-    let _ = head_dim;
-
-    let (slots, slot_table) = expert_slots(&config, order, loader)?;
-    let experts_source: HashMap<u32, crate::weights::ExpertSource> =
-        crate::weights::expert_sources(&config)
-            .into_iter()
-            .filter_map(|source| {
-                let layer = source
-                    .module
-                    .strip_prefix("layers.")?
-                    .split('.')
-                    .next()?
-                    .parse()
-                    .ok()?;
-                Some((layer, source))
-            })
-            .collect();
-
-    let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
-    for layer in 0..config.num_hidden_layers {
-        let parameter = format!("layers.{layer}");
-        let input_norm = RmsNorm::new(
-            region(
-                loader,
-                &sources,
-                &format!("{parameter}.input_norm.weight"),
-                0,
-                Shape::new(&[hidden]),
-            )?,
-            config.rms_norm_eps,
-        )
-        .map_err(Error::from)?;
-        let post_attention_norm = RmsNorm::new(
-            region(
-                loader,
-                &sources,
-                &format!("{parameter}.post_attention_norm.weight"),
-                0,
-                Shape::new(&[hidden]),
-            )?,
-            config.rms_norm_eps,
-        )
-        .map_err(Error::from)?;
-
-        let attention = AttentionLayer {
-            q_proj: projection(
-                loader,
-                &sources,
-                &format!("{parameter}.attention.q_proj"),
-                &partition,
-                query,
-                hidden,
-                config.attention_bias,
-                declaration,
-                layout,
-            )?,
-            k_proj: projection(
-                loader,
-                &sources,
-                &format!("{parameter}.attention.k_proj"),
-                &partition,
-                key_value,
-                hidden,
-                config.attention_bias,
-                declaration,
-                layout,
-            )?,
-            v_proj: projection(
-                loader,
-                &sources,
-                &format!("{parameter}.attention.v_proj"),
-                &partition,
-                key_value,
-                hidden,
-                config.attention_bias,
-                declaration,
-                layout,
-            )?,
-            o_proj: output_projection(
-                loader,
-                &sources,
-                &format!("{parameter}.attention.o_proj"),
-                &partition,
-                hidden,
-                query,
-                config.attention_bias,
-                declaration,
-                layout,
-            )?,
-            q_norm: region(
-                loader,
-                &sources,
-                &format!("{parameter}.attention.q_norm.weight"),
-                0,
-                Shape::new(&[head_dim]),
-            )?,
-            k_norm: region(
-                loader,
-                &sources,
-                &format!("{parameter}.attention.k_norm.weight"),
-                0,
-                Shape::new(&[head_dim]),
-            )?,
-            rotary: Rotary::new(
-                table,
-                as_u32(config.head_dim, "head_dim")?,
-                as_u32(q_heads, "the query heads")?,
-                as_u32(kv_heads, "the key/value heads")?,
-                config.rms_norm_eps,
-                Rotation::Half,
-                1.0,
-            )
-            .map_err(Error::from)?,
-            attention: Attention::paged(
-                as_u32(config.head_dim, "head_dim")?,
-                as_u32(q_heads, "the query heads")?,
-                as_u32(kv_heads, "the key/value heads")?,
-                options.page_tokens,
-                as_u32(config.max_position_embeddings, "max_position_embeddings")?,
-                None,
-                score_scale,
-            )
-            .map_err(Error::from)?,
-        };
-
-        let mlp = if config.sparse(layer) {
-            let map = match &slot_table {
-                Some((table, layers)) => {
-                    let row = layers.iter().position(|routed| *routed == layer);
-                    let row = row.ok_or_else(|| {
-                        Error::Config(format!("layer {layer} has no row of the expert table"))
-                    })?;
-                    table
-                        .row(as_u64(row, "an expert table row")?)
-                        .map_err(Error::from)?
-                }
-                None => {
-                    return Err(Error::Config(format!(
-                        "layer {layer} routes and no routed layer has a table"
-                    )));
-                }
-            };
-            Mlp::Experts(expert_block(
-                loader,
-                &sources,
-                &experts_source[&layer],
-                &partition,
-                &config,
-                &parameter,
-                hidden,
-                quantization,
-                &slots[&layer],
-                map,
-            )?)
-        } else {
-            Mlp::Dense(Box::new(dense_block(
-                loader,
-                &sources,
-                &partition,
-                &config,
-                &parameter,
-                hidden,
-                declaration,
-                layout,
-            )?))
-        };
-
-        layers.push(DecoderLayer {
-            input_norm,
-            post_attention_norm,
-            attention,
-            mlp,
-        });
-    }
-
-    Qwen3Moe::new(
-        config, partition, dtype, embedding, layers, norm, head, options,
-    )
-}
-
-/// The activation's width of a `[rows, columns]` shard of a row-major matrix.
-fn as_u64(count: impl TryInto<u64>, what: &str) -> Result<u64> {
-    count
-        .try_into()
-        .map_err(|_| Error::Config(format!("{what} does not fit an element count")))
-}
-
-/// A count as a `u32` extent.
-fn as_u32(count: impl TryInto<u32>, what: &str) -> Result<u32> {
-    count
-        .try_into()
-        .map_err(|_| Error::Config(format!("{what} exceeds u32::MAX")))
-}
-
-/// The checkpoint tensor of every model parameter, by the model's path.
-fn sources(config: &Config) -> HashMap<String, String> {
-    crate::weights::parameter_sources(config)
-        .into_iter()
-        .map(|source| (source.parameter, source.checkpoint))
-        .collect()
-}
-
-/// The checkpoint tensor that fills `parameter`.
-fn checkpoint_name<'a>(sources: &'a HashMap<String, String>, parameter: &str) -> Result<&'a str> {
-    sources
-        .get(parameter)
-        .map(String::as_str)
-        .ok_or_else(|| Error::Config(format!("the checkpoint mapping has no {parameter}")))
-}
-
-/// The weight of `shape` elements starting at element `start` of `parameter`'s tensor.
-fn region(
-    loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
-    parameter: &str,
-    start: u64,
-    shape: Shape,
-) -> Result<Weight> {
-    let tensor = checkpoint_name(sources, parameter)?;
-    loader
-        .load(&WeightRequest::region(tensor, start, shape))
-        .map_err(Error::from)
-}
-
-/// One projection, in the representation the checkpoint declares for it.
-///
-/// The declaration is the checkpoint's own statement, so this is the one place a representation
-/// becomes a type: a projection the calibration left alone is the checkpoint's matrix, and one it
-/// packed is an activation encoder and a packed product with the weight's tensor scale as the
-/// product's alpha. Reading a packed tensor as dense would read E2M1 codes as a matrix, which is why
-/// the choice is made here and not left to a caller.
-#[allow(clippy::too_many_arguments)]
-fn projection(
-    loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
-    parameter: &str,
-    partition: &Partition,
-    rows: u64,
-    columns: u64,
-    bias: bool,
-    declaration: &Representation,
-    layout: ScaleLayout,
-) -> Result<Projection> {
-    let weight = format!("{parameter}.weight");
-    match declaration.adopts(checkpoint_name(sources, &weight)?, Role::Projection)? {
-        Adopted::Source => Ok(Projection::Dense(dense_projection(
-            loader, sources, parameter, partition, rows, columns, bias,
-        )?)),
-        Adopted::Quantized => encoded_projection(
-            loader, sources, parameter, partition, rows, columns, bias, layout,
-        ),
-    }
-}
-
-/// One row-sharded encoded projection: the packed pair `[rows, columns]` at this rank's row block.
-///
-/// The checkpoint stores two E2M1 codes a byte along the contraction, so a row is `columns / 2` bytes
-/// and the block scales are `columns / 16` of them; the row block is the same in both.
-#[allow(clippy::too_many_arguments)]
-fn encoded_projection(
-    loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
-    parameter: &str,
-    partition: &Partition,
-    rows: u64,
-    columns: u64,
-    bias: bool,
-    layout: ScaleLayout,
-) -> Result<Projection> {
-    let rank = as_u64(partition.tensor_rank, "the tensor rank")?;
-    let values = WeightRequest::region(
-        checkpoint_name(sources, &format!("{parameter}.weight"))?,
-        rank * rows * (columns / 2),
-        Shape::new(&[rows, columns / 2]),
-    );
-    let scales = WeightRequest::region(
-        &packed_field(&values, Nvfp4Names::vllm().block_scale)?,
-        rank * rows * (columns / 16),
-        Shape::new(&[rows, columns / 16]),
-    );
-    encoded(loader, parameter, values, scales, bias, layout)
-}
-
-/// One row-parallel encoded projection: this rank's `columns` of a `[rows, columns × ranks]` matrix.
-#[allow(clippy::too_many_arguments)]
-fn encoded_output_projection(
-    loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
-    parameter: &str,
-    partition: &Partition,
-    rows: u64,
-    columns: u64,
-    bias: bool,
-    layout: ScaleLayout,
-) -> Result<Projection> {
-    let rank = as_u64(partition.tensor_rank, "the tensor rank")?;
-    let ranks = as_u64(partition.tensor_parallel, "the tensor parallel width")?;
-    let values = WeightRequest::strided(
-        checkpoint_name(sources, &format!("{parameter}.weight"))?,
-        rank * (columns / 2),
-        Shape::new(&[rows, columns / 2]),
-        columns * ranks / 2,
-    );
-    let scales = WeightRequest::strided(
-        &packed_field(&values, Nvfp4Names::vllm().block_scale)?,
-        rank * (columns / 16),
-        Shape::new(&[rows, columns / 16]),
-        columns * ranks / 16,
-    );
-    encoded(loader, parameter, values, scales, bias, layout)
-}
-
-/// The packed weight and the product's alpha, from the checkpoint's four tensors.
-///
-/// The weight's `weight_scale_2` is one positive float and its reciprocal is what the product takes,
-/// so it is read once here and published as the layer's `[1]` F32 alpha; the activation's
-/// `input_scale` is the encoder's, which the loader keeps as its own operand. Neither is invented: a
-/// checkpoint that states no calibration cannot serve a packed projection and is refused where the
-/// tensor is asked for.
-#[allow(clippy::too_many_arguments)]
-fn encoded(
-    loader: &mut WeightLoader<'_>,
-    parameter: &str,
-    values: WeightRequest,
-    scales: WeightRequest,
-    bias: bool,
-    layout: ScaleLayout,
-) -> Result<Projection> {
-    if bias {
-        return Err(Error::Config(format!(
-            "{parameter} is packed and asks for a bias, and no calibrated NVFP4 export writes one"
-        )));
-    }
-    let tensor_scale = WeightRequest::region(
-        &packed_field(&values, Nvfp4Names::vllm().tensor_scale)?,
-        0,
-        Shape::new(&[1]),
-    );
-    let global_scale = loader.tensor_scale(&tensor_scale)?;
-    let input_scale = WeightRequest::region(
-        &packed_field(&values, Nvfp4Names::vllm().input_scale)?,
-        0,
-        Shape::new(&[1]),
-    );
-    // A dense product dequantizes `code * block_scale` on both sides, so its alpha is the two tensor
-    // scales' product: the weight's and the activation's.
-    let product_alpha = global_scale * loader.tensor_scale(&input_scale)?;
-    // `layout` is the **checkpoint's** arrangement — linear, one scale per sixteen elements — and
-    // not the product's, which the loader is given separately and states back in
-    // `QuantizedWeight::layout`, so the two cannot be confused for one another.
-    // The file's arrangement is the checkpoint's; the product's is the one `nvfp4_gemm`'s
-    // compilation serves, and the loader permutes between them.
-    let quantized = loader.nvfp4(
-        &values,
-        &scales,
-        Some(&input_scale),
-        Nvfp4Names::vllm(),
-        layout,
-        ScaleLayout::Swizzled128X4,
-        global_scale,
-    )?;
-    let alpha = loader.constant(
-        &format!("{parameter}.alpha"),
-        DType::F32,
-        Shape::new(&[1]),
-        &product_alpha.to_le_bytes(),
+    let weight = loader.constant(
+        "qwen3-moe.experts.slots",
+        DType::I32,
+        Shape::new(&[
+            as_u64(layers.len(), "the routed layers")?,
+            u64::from(experts),
+        ]),
+        &table,
         "qwen3-moe",
     )?;
-    let linear = Nvfp4Linear::new(
-        &quantized,
-        None,
-        quantized.layout,
-        DType::BF16,
-        ENCODE_CHUNK,
-    )?;
-    Ok(Projection::Encoded {
-        linear: Box::new(linear),
-        alpha,
-    })
+    Ok((slots, Some((weight, layers))))
 }
-
-/// The checkpoint field a packed projection's values name, beside them.
-///
-/// A calibrated export spells the encoded fields as suffixes of the parameter's own stem —
-/// `…q_proj.weight`, `…q_proj.weight_scale`, `…q_proj.weight_scale_2`, `…q_proj.input_scale` — and the
-/// mapping states only the first, because it is the only one a dense checkpoint has. The other three
-/// are derived here from the same spelling the loader is told to read them in.
-fn packed_field(values: &WeightRequest, suffix: &str) -> Result<String> {
-    let stem = values.tensor.strip_suffix(Nvfp4Names::vllm().values).ok_or_else(|| {
-        Error::Config(format!(
-            "the packed values of {} are not spelled `….{}`, so their block scales and tensor scale \
-             cannot be named beside them",
-            values.tensor,
-            Nvfp4Names::vllm().values
-        ))
-    })?;
-    // The spelling's suffixes are bare words, so the stem loses the dot that joined the values to
-    // their own name: `…q_proj.weight` + `weight_scale` is `…q_proj.weight_scale`, not `..`.
-    let stem = stem.strip_suffix('.').unwrap_or(stem);
-    Ok(format!("{stem}.{suffix}"))
-}
-
-/// One row-sharded projection: `[rows, columns]` starting at this rank's row block.
-fn dense_projection(
-    loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
-    parameter: &str,
-    partition: &Partition,
-    rows: u64,
-    columns: u64,
-    bias: bool,
-) -> Result<Linear> {
-    let start = as_u64(partition.tensor_rank, "the tensor rank")? * rows * columns;
-    // A dense projection is a matrix that multiplies the hidden state, so an all-zero one is a
-    // missing export and not a value: the packed path refuses the same defect from its codes and
-    // scales (`WeightLoader::nvfp4`), and this is the dense export's way to it.
-    let request = WeightRequest::region(
-        checkpoint_name(sources, &format!("{parameter}.weight"))?,
-        start,
-        Shape::new(&[rows, columns]),
-    )
-    .nonzero();
-    let weight = loader.load(&request).map_err(Error::from)?;
-    let bias = if bias {
-        Some(region(
-            loader,
-            sources,
-            &format!("{parameter}.bias"),
-            as_u64(partition.tensor_rank, "the tensor rank")? * rows,
-            Shape::new(&[rows]),
-        )?)
-    } else {
-        None
-    };
-    Linear::new(weight, bias, WeightOrder::NxK).map_err(Error::from)
-}
-
-/// The row-parallel output projection: `[hidden, reduction]`, this rank's block of the reduction.
-///
-/// The checkpoint stores the whole `[hidden, reduction × ranks]` matrix row-major, so this rank's
-/// block is every row's own `reduction` elements: a gather of rows `reduction × ranks` apart,
-/// which the loader converts into one contiguous retained weight. The bias is not sharded.
-/// One row-parallel projection, in the representation the checkpoint declares.
-#[allow(clippy::too_many_arguments)]
-fn output_projection(
-    loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
-    parameter: &str,
-    partition: &Partition,
-    hidden: u64,
-    reduction: u64,
-    bias: bool,
-    declaration: &Representation,
-    layout: ScaleLayout,
-) -> Result<Projection> {
-    let weight = format!("{parameter}.weight");
-    match declaration.adopts(checkpoint_name(sources, &weight)?, Role::Projection)? {
-        Adopted::Source => Ok(Projection::Dense(dense_output_projection(
-            loader, sources, parameter, partition, hidden, reduction, bias,
-        )?)),
-        Adopted::Quantized => encoded_output_projection(
-            loader, sources, parameter, partition, hidden, reduction, bias, layout,
-        ),
-    }
-}
-
-/// The dense row-parallel form, which the dispatcher above serves when the checkpoint is not packed.
-fn dense_output_projection(
-    loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
-    parameter: &str,
-    partition: &Partition,
-    hidden: u64,
-    reduction: u64,
-    bias: bool,
-) -> Result<Linear> {
-    // The same refusal as the row-sharded form: this matrix multiplies the hidden state, so an
-    // all-zero region is a missing export.
-    let request = row_parallel_region(
-        partition,
-        checkpoint_name(sources, &format!("{parameter}.weight"))?,
-        hidden,
-        reduction,
-    )?
-    .nonzero();
-    let weight = loader.load(&request).map_err(Error::from)?;
-    let bias = if bias {
-        Some(region(
-            loader,
-            sources,
-            &format!("{parameter}.bias"),
-            0,
-            Shape::new(&[hidden]),
-        )?)
-    } else {
-        None
-    };
-    Linear::new(weight, bias, WeightOrder::NxK).map_err(Error::from)
-}
-
 /// One sparse layer's expert block: the replicated router and the rank's experts.
 #[allow(
     clippy::too_many_arguments,
@@ -835,17 +374,16 @@ fn dense_output_projection(
 )]
 fn expert_block(
     loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
+    router: Linear,
     expert_source: &crate::weights::ExpertSource,
     partition: &Partition,
     config: &Config,
     parameter: &str,
     hidden: u64,
-    quantization: Quantization,
+    encoded: bool,
     slots: &[u32],
     map: nn::Weight,
 ) -> Result<Moe> {
-    let experts = as_u64(config.num_experts, "num_experts")?;
     let range = partition.expert_range(config);
     let range = range.start as usize..range.end as usize;
     let local = as_u64(range.len(), "the local experts")?;
@@ -867,23 +405,10 @@ fn expert_block(
     // The rank's block of every expert: the tensor group splits the intermediate width.
     let local_intermediate = intermediate / ranks;
 
-    let router = Linear::new(
-        region(
-            loader,
-            sources,
-            &format!("{parameter}.mlp.router.weight"),
-            0,
-            Shape::new(&[experts, hidden]),
-        )?,
-        None,
-        WeightOrder::NxK,
-    )
-    .map_err(Error::from)?;
-
     // The encoded checkpoint names the same three tensors per projection and carries three fields
     // each; the dense path names one tensor per projection. Both are fused expert-major, in the
     // reading order the layouts name: up before gate.
-    if let Quantization::Nvfp4 = quantization {
+    if encoded {
         // An encoded block over a group runs in the exchange's one fused launch, which reads its
         // own arrangement of the same bytes: each gate block before its up block, and the block
         // scales in the swizzled table.
@@ -1094,95 +619,34 @@ fn expert_block(
     }
 }
 
-/// The region of a row-parallel projection's checkpoint tensor this rank owns.
-///
-/// The checkpoint holds `[rows, columns × tensor_parallel]` row-major, so the rank's block is its
-/// own `columns` elements of every row: `Strided` with the first element at `rank × columns` and
-/// rows `columns × tensor_parallel` apart. One rank lays the same region out contiguously, so the
-/// two degrees share the one request form and nothing downstream can tell them apart.
-fn row_parallel_region(
-    partition: &Partition,
-    tensor: &str,
-    rows: u64,
-    columns: u64,
-) -> Result<WeightRequest> {
-    let rank = as_u64(partition.tensor_rank, "the tensor rank")?;
-    let ranks = as_u64(partition.tensor_parallel, "the tensor parallel width")?;
-    let full = columns.checked_mul(ranks).ok_or_else(|| {
-        Error::Config(format!(
-            "{tensor}: {columns} columns over {ranks} ranks overflows"
-        ))
-    })?;
-    let start = rank.checked_mul(columns).ok_or_else(|| {
-        Error::Config(format!(
-            "{tensor}: rank {rank} of {ranks} starts past the reduction axis"
-        ))
-    })?;
-    Ok(WeightRequest::strided(
-        tensor,
-        start,
-        Shape::new(&[rows, columns]),
-        full,
-    ))
-}
-
-/// One dense layer's feed-forward block.
-#[allow(clippy::too_many_arguments)]
-fn dense_block(
-    loader: &mut WeightLoader<'_>,
-    sources: &HashMap<String, String>,
-    partition: &Partition,
-    config: &Config,
-    parameter: &str,
-    hidden: u64,
-    declaration: &Representation,
-    layout: ScaleLayout,
-) -> Result<DenseMlp> {
-    // Each projection helper reads this rank's block of `rows`, so the width it is handed is the
-    // rank's share of the intermediate.
-    let intermediate = as_u64(partition.local_intermediate(config), "intermediate_size")?;
-    let gate_proj = projection(
-        loader,
-        sources,
-        &format!("{parameter}.mlp.gate_proj"),
-        partition,
+/// One dense layer's feed-forward block, the module at `scope`: the gate and up projections split
+/// by output channels, the down projection by its contraction, which its forward reduces.
+fn dense_block(scope: &mut Scope<'_, '_>, tensor: Split, config: &Config) -> Result<DenseMlp> {
+    let (hidden, intermediate) = (config.hidden_size, config.intermediate_size);
+    let mut column = |module: &str| {
+        Linear::load(
+            &mut scope.scope(module),
+            hidden,
+            intermediate,
+            Bias::Absent,
+            Parallel::Column(tensor),
+        )
+    };
+    let gate_proj = column("gate_proj")?;
+    let up_proj = column("up_proj")?;
+    let down_proj = Linear::load(
+        &mut scope.scope("down_proj"),
         intermediate,
         hidden,
-        false,
-        declaration,
-        layout,
+        Bias::Absent,
+        Parallel::Row(tensor),
     )?;
-    let up_proj = projection(
-        loader,
-        sources,
-        &format!("{parameter}.mlp.up_proj"),
-        partition,
-        intermediate,
-        hidden,
-        false,
-        declaration,
-        layout,
-    )?;
-    let down_proj = output_projection(
-        loader,
-        sources,
-        &format!("{parameter}.mlp.down_proj"),
-        partition,
-        hidden,
-        intermediate,
-        false,
-        declaration,
-        layout,
-    )?;
+    let activation = SwiGlu::new(gate_proj.n())?;
     Ok(DenseMlp {
         gate_proj,
         up_proj,
         down_proj,
-        activation: SwiGlu::new(as_u32(
-            partition.local_intermediate(config),
-            "intermediate_size",
-        )?)
-        .map_err(Error::from)?,
+        activation,
     })
 }
 
@@ -1348,7 +812,6 @@ mod tests {
 
     use super::*;
     use crate::{Config, YaRn};
-    use nn::weights::WeightSource;
 
     fn config() -> Config {
         Config {
@@ -1373,64 +836,6 @@ mod tests {
             decoder_sparse_step: 1,
             mlp_only_layers: Vec::new(),
         }
-    }
-
-    #[test]
-    fn a_row_parallel_projection_reads_its_own_column_block_of_every_row() {
-        // Two ranks over a `[2048, 1536]` matrix: rank 1 owns columns 768..1536, which in the
-        // checkpoint's row-major order is every row's second half.
-        let sharded = Partition {
-            tensor_parallel: 2,
-            tensor_rank: 1,
-            expert_parallel: 1,
-            expert_rank: 0,
-        };
-        let request = row_parallel_region(&sharded, "o_proj.weight", 2048, 768).unwrap();
-        assert_eq!(request.shape, Shape::new(&[2048, 768]));
-        match &request.source {
-            WeightSource::Strided {
-                tensor,
-                start,
-                shape,
-                row_stride,
-            } => {
-                assert_eq!(tensor, "o_proj.weight");
-                assert_eq!(*start, 768);
-                assert_eq!(*shape, Shape::new(&[2048, 768]));
-                assert_eq!(*row_stride, 1536);
-            }
-            source => panic!("rank 1 of 2 read {source:?} instead of its column block"),
-        }
-
-        // Rank 0 reads the first block, and one rank reads the whole axis: the same form, the
-        // region then being every row's own columns.
-        let first = row_parallel_region(
-            &Partition {
-                tensor_rank: 0,
-                ..sharded
-            },
-            "o_proj.weight",
-            2048,
-            768,
-        )
-        .unwrap();
-        assert!(matches!(
-            first.source,
-            WeightSource::Strided {
-                start: 0,
-                row_stride: 1536,
-                ..
-            }
-        ));
-        let whole = row_parallel_region(&Partition::single(), "o_proj.weight", 2048, 768).unwrap();
-        assert!(matches!(
-            whole.source,
-            WeightSource::Strided {
-                start: 0,
-                row_stride: 768,
-                ..
-            }
-        ));
     }
 
     #[test]

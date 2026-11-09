@@ -50,10 +50,13 @@
 //! the exact `erf` form. [`Gelu`] takes the approximation, and the tower holds one of each.
 
 use nn::capability::ImageInput;
-use nn::layers::{Attention, Gelu, LayerNorm, Linear, PositionInterpolate, Rotate, ScaledResidual};
-use nn::weights::{WeightLoader, WeightRequest};
+use nn::family::Split;
+use nn::layers::{
+    Attention, Bias, Gelu, LayerNorm, Linear, Parallel, PositionInterpolate, QkvBias, QkvLinear,
+    QkvNames, QkvSpec, Rotate, ScaledResidual,
+};
+use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
-use ops::gemm::WeightOrder;
 
 use crate::config::VisionConfig;
 use crate::positions::invalid;
@@ -400,9 +403,8 @@ pub struct Outputs<'a> {
 /// One pre-norm block: attention and an ungated MLP, each added to the residual stream.
 struct Block {
     input_norm: LayerNorm,
-    query: Linear,
-    key: Linear,
-    value: Linear,
+    /// The query, key and value windows of the checkpoint's fused `attn.qkv`.
+    qkv: QkvLinear,
     output: Linear,
     output_norm: LayerNorm,
     first: Linear,
@@ -410,29 +412,38 @@ struct Block {
 }
 
 impl Block {
-    fn load(loader: &mut WeightLoader<'_>, config: &VisionConfig, index: u32) -> Result<Self> {
-        let hidden = u64::from(config.hidden_size);
-        let intermediate = u64::from(config.intermediate_size);
-        let block = format!("{PREFIX}.blocks.{index}");
+    /// The block the module at `scope` states.
+    fn load(scope: &mut Scope<'_, '_>, config: &VisionConfig) -> Result<Self> {
+        let hidden = config.hidden_size;
+        let intermediate = config.intermediate_size;
+        let head_dim = BlockRows::head_dim(config)?;
+        let mut attention = scope.scope("attn");
+        // The checkpoint fuses the three `[hidden, hidden]` matrices into one `qkv` module, query
+        // first; each projection is its own window of it, so three products read the same bytes
+        // as the reference's one fused product.
+        let qkv = QkvLinear::load(
+            &mut attention,
+            QkvSpec {
+                hidden,
+                heads: config.num_heads,
+                kv_heads: config.num_heads,
+                head_dim,
+            },
+            QkvNames::Fused("qkv"),
+            QkvBias::Present,
+            Split::WHOLE,
+        )?;
+        let output = projection(&mut attention.scope("proj"), hidden, hidden)?;
+        let mut mlp = scope.scope("mlp");
+        let first = projection(&mut mlp.scope("linear_fc1"), hidden, intermediate)?;
+        let second = projection(&mut mlp.scope("linear_fc2"), intermediate, hidden)?;
         Ok(Self {
-            input_norm: normalization(loader, &format!("{block}.norm1"), hidden)?,
-            query: fused_projection(loader, &format!("{block}.attn.qkv"), 0, hidden)?,
-            key: fused_projection(loader, &format!("{block}.attn.qkv"), 1, hidden)?,
-            value: fused_projection(loader, &format!("{block}.attn.qkv"), 2, hidden)?,
-            output: projection(loader, &format!("{block}.attn.proj"), hidden, hidden)?,
-            output_norm: normalization(loader, &format!("{block}.norm2"), hidden)?,
-            first: projection(
-                loader,
-                &format!("{block}.mlp.linear_fc1"),
-                intermediate,
-                hidden,
-            )?,
-            second: projection(
-                loader,
-                &format!("{block}.mlp.linear_fc2"),
-                hidden,
-                intermediate,
-            )?,
+            input_norm: normalization(&mut scope.scope("norm1"), u64::from(hidden))?,
+            qkv,
+            output,
+            output_norm: normalization(&mut scope.scope("norm2"), u64::from(hidden))?,
+            first,
+            second,
         })
     }
 
@@ -453,15 +464,13 @@ impl Block {
         self.input_norm
             .forward(f, hidden, buffers.normalized)
             .map_err(Error::from)?;
-        self.query
-            .forward(f, buffers.normalized, buffers.query)
-            .map_err(Error::from)?;
-        self.key
-            .forward(f, buffers.normalized, buffers.key)
-            .map_err(Error::from)?;
-        self.value
-            .forward(f, buffers.normalized, buffers.value)
-            .map_err(Error::from)?;
+        self.qkv.forward(
+            f,
+            buffers.normalized,
+            buffers.query,
+            buffers.key,
+            buffers.value,
+        )?;
 
         // Both projections rotate by the patch's own 2-D factors; nothing normalizes them.
         for (unrotated, rotated) in [
@@ -533,28 +542,26 @@ struct Merger {
 }
 
 impl Merger {
+    /// The merger the module at `scope` states.
     fn load(
-        loader: &mut WeightLoader<'_>,
-        name: &str,
+        scope: &mut Scope<'_, '_>,
         config: &VisionConfig,
         normalizes_merged: bool,
     ) -> Result<Self> {
-        let width = u64::from(BlockRows::merged_width(config));
-        let out_hidden = u64::from(config.out_hidden_size);
+        let width = BlockRows::merged_width(config);
+        let out_hidden = config.out_hidden_size;
         let norm_width = if normalizes_merged {
             width
         } else {
-            u64::from(config.hidden_size)
+            config.hidden_size
         };
         Ok(Self {
-            norm: normalization(loader, &format!("{name}.norm"), norm_width)?,
-            first: projection(loader, &format!("{name}.linear_fc1"), width, width)?,
-            second: projection(loader, &format!("{name}.linear_fc2"), out_hidden, width)?,
+            norm: normalization(&mut scope.scope("norm"), u64::from(norm_width))?,
+            first: projection(&mut scope.scope("linear_fc1"), width, width)?,
+            second: projection(&mut scope.scope("linear_fc2"), width, out_hidden)?,
             merge: config.spatial_merge_size,
-            width: u32::try_from(width)
-                .map_err(|_| invalid("VisionTower", "a merged row wider than a u32"))?,
-            out_hidden: u32::try_from(out_hidden)
-                .map_err(|_| invalid("VisionTower", "an out_hidden wider than a u32"))?,
+            width,
+            out_hidden,
             normalizes_merged,
         })
     }
@@ -670,39 +677,43 @@ impl VisionTower {
         let head_dim = BlockRows::head_dim(config)?;
         // The position table must be a square grid: its rows are indexed by `row · side + column`.
         let position_grid = BlockRows::position_grid(config)?;
+        let mut tower = loader.scope(PREFIX);
         let layers = (0..config.depth)
-            .map(|index| Block::load(loader, config, index))
+            .map(|index| Block::load(&mut tower.scope(format!("blocks.{index}")), config))
             .collect::<Result<Vec<_>>>()?;
         let deepstack = (0..config.deepstack_visual_indexes.len())
             .map(|index| {
                 Merger::load(
-                    loader,
-                    &format!("{PREFIX}.deepstack_merger_list.{index}"),
+                    &mut tower.scope(format!("deepstack_merger_list.{index}")),
                     config,
                     true,
                 )
             })
             .collect::<Result<Vec<_>>>()?;
+        // The patch embedding is a kernel-equals-stride convolution: its `[hidden, C, T, P, P]`
+        // weight is read as the `[hidden, tubelet]` matrix of the product it is.
+        let patch = projection(
+            &mut tower.scope("patch_embed.proj"),
+            u32::try_from(tubelet)
+                .map_err(|_| invalid("VisionTower", "a tubelet wider than a u32"))?,
+            config.hidden_size,
+        )?;
+        let position = tower.scope("pos_embed").tensor(
+            "weight",
+            &[u64::from(config.num_position_embeddings), hidden],
+        )?;
+        let merger = Merger::load(&mut tower.scope("merger"), config, false)?;
         Ok(Self {
             deepstack_layers: deepstack_layers(config)?,
-            patch: projection(
-                loader,
-                &format!("{PREFIX}.patch_embed.proj"),
-                hidden,
-                tubelet,
-            )?,
-            position: region(
-                loader,
-                &format!("{PREFIX}.pos_embed.weight"),
-                Shape::new(&[u64::from(config.num_position_embeddings), hidden]),
-            )?,
+            patch,
+            position,
             position_grid,
             heads,
             head_dim,
             rotate: Rotate::new(u64::from(head_dim), u64::from(heads), crate::SPLIT_HALF)
                 .map_err(Error::from)?,
             layers,
-            merger: Merger::load(loader, &format!("{PREFIX}.merger"), config, false)?,
+            merger,
             deepstack,
             blocks_gelu,
             merger_gelu: Gelu::exact(),
@@ -918,61 +929,21 @@ impl VisionTower {
     }
 }
 
-/// A region of one checkpoint tensor, in the operator's NxK order.
-fn region(loader: &mut WeightLoader<'_>, name: &str, shape: Shape) -> Result<Weight> {
-    loader
-        .load(&WeightRequest::region(name, 0, shape))
-        .map_err(Error::from)
+/// The biased projection module at `scope`, `inputs` to `outputs` channels.
+fn projection(scope: &mut Scope<'_, '_>, inputs: u32, outputs: u32) -> Result<Linear> {
+    Ok(Linear::load(
+        scope,
+        inputs,
+        outputs,
+        Bias::Present,
+        Parallel::None,
+    )?)
 }
 
-/// A projection whose checkpoint tensor is `[outputs, inputs]` (`n · k`).
-fn projection(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    outputs: u64,
-    inputs: u64,
-) -> Result<Linear> {
-    let weight = region(
-        loader,
-        &format!("{name}.weight"),
-        Shape::new(&[outputs, inputs]),
-    )?;
-    let bias = region(loader, &format!("{name}.bias"), Shape::new(&[outputs]))?;
-    Linear::new(weight, Some(bias), WeightOrder::NxK).map_err(Error::from)
-}
-
-/// One branch of a fused `qkv` projection: branch 0, 1 and 2 are `q`, `k` and `v`.
-///
-/// The checkpoint fuses the three `[hidden, hidden]` matrices into one `[3 · hidden, hidden]`
-/// tensor, `q` first, so each branch is a contiguous region of it: three calls read the same bytes
-/// as the reference's one fused product.
-fn fused_projection(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    branch: u64,
-    hidden: u64,
-) -> Result<Linear> {
-    let weight = loader
-        .load(&WeightRequest::region(
-            format!("{name}.weight"),
-            branch * hidden * hidden,
-            Shape::new(&[hidden, hidden]),
-        ))
-        .map_err(Error::from)?;
-    let bias = loader
-        .load(&WeightRequest::region(
-            format!("{name}.bias"),
-            branch * hidden,
-            Shape::new(&[hidden]),
-        ))
-        .map_err(Error::from)?;
-    Linear::new(weight, Some(bias), WeightOrder::NxK).map_err(Error::from)
-}
-
-/// A LayerNorm of `width` channels, with the tower's one variance floor.
-fn normalization(loader: &mut WeightLoader<'_>, name: &str, width: u64) -> Result<LayerNorm> {
-    let weight = region(loader, &format!("{name}.weight"), Shape::new(&[width]))?;
-    let bias = region(loader, &format!("{name}.bias"), Shape::new(&[width]))?;
+/// The LayerNorm module at `scope`: `width` channels, with the tower's one variance floor.
+fn normalization(scope: &mut Scope<'_, '_>, width: u64) -> Result<LayerNorm> {
+    let weight = scope.tensor("weight", &[width])?;
+    let bias = scope.tensor("bias", &[width])?;
     LayerNorm::new(weight, Some(bias), LAYER_NORM_EPS).map_err(Error::from)
 }
 

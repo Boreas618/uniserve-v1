@@ -38,13 +38,14 @@ use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape, StateTable,
     TableValues,
 };
+use nn::family::Split;
 use nn::layers::{
-    Attention, Embedding, GatedActivation, Linear, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
+    Attention, Bias, Embedding, GatedActivation, Linear, Parallel, QkvBias, QkvLinear, QkvNames,
+    QkvSpec, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
-use nn::weights::{WeightLoader, WeightRequest};
+use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
 use ops::activation::Activation;
-use ops::gemm::WeightOrder;
 
 use crate::config::TextEncoderConfig;
 use crate::partition::Partition;
@@ -240,16 +241,6 @@ impl Rank {
             vocabulary: (first, stop),
         })
     }
-
-    /// The element offset of this rank's shard of a `[rows, columns]` matrix split along `rows`.
-    fn row_start(&self, local_rows: u32, columns: u32) -> u64 {
-        u64::from(self.index) * u64::from(local_rows) * u64::from(columns)
-    }
-
-    /// The element offset of this rank's shard of a `[rows, columns]` matrix split along `columns`.
-    fn column_start(&self, local_columns: u32) -> u64 {
-        u64::from(self.index) * u64::from(local_columns)
-    }
 }
 
 /// The device buffers one encode call reads and writes.
@@ -359,9 +350,10 @@ impl Buffers {
 /// One decoder layer: pre-norm attention, then the gated MLP.
 struct Layer {
     input_norm: RmsNorm,
-    query: Linear,
-    key: Linear,
-    value: Linear,
+    /// The query, key and value projections, split over the tensor-parallel ranks by heads.
+    qkv: QkvLinear,
+    /// The output projection, row parallel over the query heads: its forward sums the ranks'
+    /// partial outputs.
     output: Linear,
     /// The queries' per-head normalization.
     query_norm: Weight,
@@ -371,72 +363,73 @@ struct Layer {
     post_norm: RmsNorm,
     gate: Linear,
     up: Linear,
+    /// The down projection, row parallel over the intermediate channels.
     down: Linear,
 }
 
 impl Layer {
-    /// The layer at `index` of the checkpoint's stack.
+    /// The layer the module at `scope` states, at `split`'s rank of the tensor-parallel group.
+    ///
+    /// `frequencies` is the stack's one rotary frequency table, which every layer rotates by.
     fn load(
-        loader: &mut WeightLoader<'_>,
+        scope: &mut Scope<'_, '_>,
         config: &TextEncoderConfig,
         rank: &Rank,
-        index: u32,
+        split: Split,
+        frequencies: Weight,
     ) -> Result<Self> {
         let hidden = u64::from(config.hidden_size);
         let head_dim = u64::from(config.head_dim);
-        let name = format!("{PREFIX}.layers.{index}");
-        let attention = format!("{name}.self_attn");
-        // Query, key and value heads split over the ranks; the checkpoint stores each projection
-        // as `[outputs, inputs]`, so a rank's heads are a contiguous block of rows.
-        let query = sharded(
-            loader,
-            &format!("{attention}.q_proj.weight"),
-            rank.row_start(rank.query, config.hidden_size),
-            u64::from(rank.query),
-            hidden,
-        )?;
-        let key = sharded(
-            loader,
-            &format!("{attention}.k_proj.weight"),
-            rank.row_start(rank.key_value, config.hidden_size),
-            u64::from(rank.key_value),
-            hidden,
-        )?;
-        let value = sharded(
-            loader,
-            &format!("{attention}.v_proj.weight"),
-            rank.row_start(rank.key_value, config.hidden_size),
-            u64::from(rank.key_value),
-            hidden,
-        )?;
-        // The output projection is row parallel: the contraction is over the query heads, so this
-        // rank reads the columns of the heads it holds.
-        let output = strided(
-            loader,
-            &format!("{attention}.o_proj.weight"),
-            rank.column_start(rank.query),
-            Shape::new(&[hidden, u64::from(rank.query)]),
-            u64::from(config.query_width()),
-        )?;
         let sections = sections_of(config)?;
+        let mut attention = scope.scope("self_attn");
+        let qkv = QkvLinear::load(
+            &mut attention,
+            QkvSpec {
+                hidden: config.hidden_size,
+                heads: config.num_attention_heads,
+                kv_heads: config.num_key_value_heads,
+                head_dim: config.head_dim,
+            },
+            QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
+            QkvBias::Absent,
+            split,
+        )?;
+        let output = Linear::load(
+            &mut attention.scope("o_proj"),
+            config.query_width(),
+            config.hidden_size,
+            Bias::Absent,
+            Parallel::Row(split),
+        )?;
+        let query_norm = attention.scope("q_norm").tensor("weight", &[head_dim])?;
+        let key_norm = attention.scope("k_norm").tensor("weight", &[head_dim])?;
+        let mut mlp = scope.scope("mlp");
+        let mut column = |module: &str| {
+            Linear::load(
+                &mut mlp.scope(module),
+                config.hidden_size,
+                config.intermediate_size,
+                Bias::Absent,
+                Parallel::Column(split),
+            )
+        };
+        let gate = column("gate_proj")?;
+        let up = column("up_proj")?;
+        let down = Linear::load(
+            &mut mlp.scope("down_proj"),
+            config.intermediate_size,
+            config.hidden_size,
+            Bias::Absent,
+            Parallel::Row(split),
+        )?;
         Ok(Self {
-            input_norm: normalization(loader, &format!("{name}.input_layernorm"), hidden, config)?,
-            query: Linear::new(query, None, WeightOrder::NxK).map_err(Error::from)?,
-            key: Linear::new(key, None, WeightOrder::NxK).map_err(Error::from)?,
-            value: Linear::new(value, None, WeightOrder::NxK).map_err(Error::from)?,
-            output: Linear::new(output, None, WeightOrder::NxK).map_err(Error::from)?,
-            query_norm: region(
-                loader,
-                &format!("{attention}.q_norm.weight"),
-                Shape::new(&[head_dim]),
-            )?,
-            key_norm: region(
-                loader,
-                &format!("{attention}.k_norm.weight"),
-                Shape::new(&[head_dim]),
-            )?,
+            input_norm: normalization(&mut scope.scope("input_layernorm"), hidden, config)?,
+            qkv,
+            output,
+            query_norm,
+            key_norm,
             rotary: Rotary::new(
-                frequencies(loader, config)?,
+                frequencies,
                 config.head_dim,
                 rank.query_heads,
                 rank.key_value_heads,
@@ -447,38 +440,10 @@ impl Layer {
             .map_err(Error::from)?
             .sectioned(sections)
             .map_err(Error::from)?,
-            post_norm: normalization(
-                loader,
-                &format!("{name}.post_attention_layernorm"),
-                hidden,
-                config,
-            )?,
-            gate: sharded_projection(
-                loader,
-                &format!("{name}.mlp.gate_proj.weight"),
-                rank.row_start(rank.intermediate, config.hidden_size),
-                u64::from(rank.intermediate),
-                hidden,
-            )?,
-            up: sharded_projection(
-                loader,
-                &format!("{name}.mlp.up_proj.weight"),
-                rank.row_start(rank.intermediate, config.hidden_size),
-                u64::from(rank.intermediate),
-                hidden,
-            )?,
-            down: Linear::new(
-                strided(
-                    loader,
-                    &format!("{name}.mlp.down_proj.weight"),
-                    rank.column_start(rank.intermediate),
-                    Shape::new(&[hidden, u64::from(rank.intermediate)]),
-                    u64::from(config.intermediate_size),
-                )?,
-                None,
-                WeightOrder::NxK,
-            )
-            .map_err(Error::from)?,
+            post_norm: normalization(&mut scope.scope("post_attention_layernorm"), hidden, config)?,
+            gate,
+            up,
+            down,
         })
     }
 
@@ -521,15 +486,13 @@ impl Layer {
         }
 
         let heads = (encoder.rank.query_heads, encoder.rank.key_value_heads);
-        self.query
-            .forward(f, buffers.normalized, buffers.query)
-            .map_err(Error::from)?;
-        self.key
-            .forward(f, buffers.normalized, buffers.key)
-            .map_err(Error::from)?;
-        self.value
-            .forward(f, buffers.normalized, buffers.value)
-            .map_err(Error::from)?;
+        self.qkv.forward(
+            f,
+            buffers.normalized,
+            buffers.query,
+            buffers.key,
+            buffers.value,
+        )?;
         self.rotary
             .apply(
                 f,
@@ -557,10 +520,10 @@ impl Layer {
                 buffers.as_heads(buffers.attended, heads.0, encoder.config.head_dim)?,
             )
             .map_err(Error::from)?;
+        // Row parallel: the projection sums the ranks' partial outputs itself.
         self.output
             .forward(f, buffers.attended, buffers.projected)
             .map_err(Error::from)?;
-        encoder.reduce(f, buffers.projected)?;
 
         self.post_norm
             .forward_with_residual(f, buffers.projected, residual, residual, buffers.normalized)
@@ -575,10 +538,7 @@ impl Layer {
         encoder
             .activation
             .forward(f, buffers.gate, buffers.up, buffers.activated)?;
-        self.down
-            .forward(f, buffers.activated, buffers.down)
-            .map_err(Error::from)?;
-        encoder.reduce(f, buffers.down)
+        Ok(self.down.forward(f, buffers.activated, buffers.down)?)
     }
 }
 
@@ -627,23 +587,33 @@ impl TextEncoder {
         let embedding = Embedding::new(
             // A rank's vocabulary rows start at its first id: read from the table's start, every
             // rank past the first would hold the first shard's rows under its own ids.
-            sharded(
-                loader,
-                &format!("{PREFIX}.embed_tokens.weight"),
-                u64::from(first) * hidden,
-                u64::from(rows),
-                hidden,
-            )
-            .map_err(|error| {
-                Error::config(format!("the embedding shard {first}..{stop}: {error}"))
-            })?,
+            loader
+                .scope(format!("{PREFIX}.embed_tokens"))
+                .rows("weight", u64::from(first), &[u64::from(rows), hidden])
+                .map_err(|error| {
+                    Error::config(format!("the embedding shard {first}..{stop}: {error}"))
+                })?,
             first,
             rows,
             config.vocab_size,
         )
         .map_err(Error::from)?;
+        // One frequency table rotates the prompt's factors and every layer's.
+        let frequencies = frequencies(loader, config)?;
+        let split = Split {
+            size: rank.degree,
+            rank: rank.index,
+        };
         let layers = (0..retained)
-            .map(|index| Layer::load(loader, config, &rank, index))
+            .map(|index| {
+                Layer::load(
+                    &mut loader.scope(format!("{PREFIX}.layers.{index}")),
+                    config,
+                    &rank,
+                    split,
+                    frequencies,
+                )
+            })
             .collect::<Result<Vec<_>>>()?;
         // The checkpoint's `deepstack_visual_indexes` name the *tower's* blocks; the language model
         // adds the features in that order after its own first layers.
@@ -661,7 +631,7 @@ impl TextEncoder {
             dtype,
             embedding,
             rotary: Rotary::new(
-                frequencies(loader, config)?,
+                frequencies,
                 config.head_dim,
                 rank.query_heads,
                 rank.key_value_heads,
@@ -745,21 +715,6 @@ impl TextEncoder {
         out: &mut [TableValues],
     ) -> Result<()> {
         write_state(&self.config, prompt.ids, layout, out)
-    }
-
-    /// Sum a row-parallel projection's partial product over the group.
-    fn reduce(&self, f: &Forward, view: TensorView) -> Result<()> {
-        if f.split().is_none() {
-            return if self.rank.degree == 1 {
-                Ok(())
-            } else {
-                Err(Error::config(format!(
-                    "the text encoder is split over {} ranks and the forward carries no group",
-                    self.rank.degree
-                )))
-            };
-        }
-        f.all_reduce(view).map_err(Error::from)
     }
 
     /// Refuse a call whose batch, layout or outputs do not agree.
@@ -1314,71 +1269,13 @@ fn invalid_input(problem: String) -> Error {
     ))))
 }
 
-/// A region of one checkpoint tensor, in the operator's NxK order.
-fn region(loader: &mut WeightLoader<'_>, name: &str, shape: Shape) -> Result<Weight> {
-    loader
-        .load(&WeightRequest::region(name, 0, shape))
-        .map_err(Error::from)
-}
-
-/// A region of one checkpoint tensor starting at element `start`.
-fn sharded(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    start: u64,
-    rows: u64,
-    columns: u64,
-) -> Result<Weight> {
-    loader
-        .load(&WeightRequest::region(
-            name,
-            start,
-            Shape::new(&[rows, columns]),
-        ))
-        .map_err(Error::from)
-}
-
-/// A sub-matrix of one checkpoint tensor whose rows are `stride` elements apart.
-fn strided(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    start: u64,
-    shape: Shape,
-    stride: u64,
-) -> Result<Weight> {
-    loader
-        .load(&WeightRequest::strided(name, start, shape, stride))
-        .map_err(Error::from)
-}
-
-/// A projection of a sharded `[rows, columns]` weight: the checkpoint's tensors carry no bias.
-fn sharded_projection(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
-    start: u64,
-    rows: u64,
-    columns: u64,
-) -> Result<Linear> {
-    Linear::new(
-        sharded(loader, name, start, rows, columns)?,
-        None,
-        WeightOrder::NxK,
-    )
-    .map_err(Error::from)
-}
-
-/// A normalization of `width` channels with the checkpoint's epsilon.
+/// The normalization module at `scope`: `width` channels with the checkpoint's epsilon.
 fn normalization(
-    loader: &mut WeightLoader<'_>,
-    name: &str,
+    scope: &mut Scope<'_, '_>,
     width: u64,
     config: &TextEncoderConfig,
 ) -> Result<RmsNorm> {
-    RmsNorm::new(
-        region(loader, &format!("{name}.weight"), Shape::new(&[width]))?,
-        config.rms_norm_eps,
-    )
-    .map_err(Error::from)
+    RmsNorm::new(scope.tensor("weight", &[width])?, config.rms_norm_eps).map_err(Error::from)
 }
 
 /// The rotary frequency table: `theta^(-2j/head_dim)` for every rotated frequency, in FP32.
@@ -1467,13 +1364,6 @@ mod tests {
         assert_eq!(rank.query, 16 * 128);
         assert_eq!(rank.key_value, 2 * 128);
         assert_eq!(rank.intermediate, 6_400);
-        // The third rank's rows of the query projection start after two whole shards.
-        assert_eq!(
-            rank.row_start(rank.query, config.hidden_size),
-            2 * 2048 * 5120
-        );
-        // Its columns of the output projection start after two shards of the head split.
-        assert_eq!(rank.column_start(rank.query), 2 * 2048);
         let (first, stop) = rank.vocabulary;
         assert_eq!(first, 2 * config.vocab_size.div_ceil(4));
         assert!(stop <= config.vocab_size);

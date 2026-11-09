@@ -55,6 +55,7 @@ pub mod family;
 pub mod forward;
 pub mod group;
 pub mod layers;
+pub mod quantization;
 pub mod tensor;
 pub mod weights;
 
@@ -84,6 +85,6 @@ pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 pub use tensor::Backing;
 pub use weights::{
-    Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, ValueLayout, Weight, WeightKey,
-    WeightLayout, WeightLoader,
+    Quantization, QuantizedStack, QuantizedWeight, RetainedWeights, Scope, ValueLayout, Weight,
+    WeightKey, WeightLayout, WeightLoader,
 };

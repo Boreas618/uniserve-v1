@@ -38,7 +38,7 @@
 
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::layers::{
-    Attention, Embedding, Linear, Moe, Nvfp4Linear, ParallelLMHead, RmsNorm, Rotary, SwiGlu,
+    Attention, Embedding, Linear, Moe, ParallelLMHead, QkvLinear, RmsNorm, Rotary, SwiGlu,
     TRTLLM_WORKSPACE_BYTES,
 };
 use nn::weights::Weight;
@@ -101,62 +101,14 @@ pub(crate) struct DecoderLayer {
     pub(crate) mlp: Mlp,
 }
 
-/// The attention sublayer: four projections, the fused Q/K normalization and rotation, and the
-/// paged attention layer.
-/// One linear projection, in whichever representation the checkpoint stores it.
+/// The attention sublayer: the query, key and value projections, the row-parallel output
+/// projection, the fused Q/K normalization and rotation, and the paged attention layer.
 ///
-/// The two are one type because a layer's code must not branch on the checkpoint's representation:
-/// the loader decides once, per projection, and every forward then calls the same method. A dense
-/// projection is the checkpoint's matrix; an encoded one is an activation encoder and a packed
-/// product in the deployment's scale layout, with the activation's tensor scale as an operand.
-pub(crate) enum Projection {
-    /// The checkpoint's own matrix, in the model's dtype.
-    Dense(Linear),
-    /// A calibrated NVFP4 matrix, with the product's `[1]` F32 alpha beside it.
-    Encoded {
-        /// The encoder and the packed product, which carry the checkpoint's scales. Boxed because it
-        /// is several times the dense layer's size and a layer holds seven projections.
-        linear: Box<Nvfp4Linear>,
-        /// The product of the weight's and the activation's tensor scales.
-        alpha: Weight,
-    },
-}
-
-impl Projection {
-    /// `out = projection(input)`.
-    fn forward(&self, f: &Forward, input: TensorView, out: TensorView) -> Result<()> {
-        match self {
-            Self::Dense(linear) => linear.forward(f, input, out).map_err(Error::from),
-            Self::Encoded { linear, alpha } => {
-                // The packed product's grid is a compiled row class, so it writes whole tiles: the
-                // buffer holds the class (the forward reserved it so) and the request's rows are its
-                // prefix, which is what every later op reads. Passing the request's height here is
-                // how a 128-row launch would write past the region.
-                let counted = u32::try_from(out.rows())
-                    .map_err(|_| Error::Config(format!("{} activation rows", out.rows())))?;
-                let class = u64::from(nn::layers::packed_rows(counted)?);
-                let width = out.last();
-                let shape = Shape::new(&[class, width]);
-                let product =
-                    TensorView::with_strides(out.ptr, out.dtype, shape, Strides::row_major(shape));
-                linear
-                    .forward(f, input, alpha.view(), product)
-                    .map_err(Error::from)
-            }
-        }
-    }
-
-    /// Whether the checkpoint stored this projection packed.
-    fn is_encoded(&self) -> bool {
-        matches!(self, Self::Encoded { .. })
-    }
-}
-
+/// Each projection is held in the representation its checkpoint stores, which the loader decided;
+/// the forward calls the same methods either way.
 pub(crate) struct AttentionLayer {
-    pub(crate) q_proj: Projection,
-    pub(crate) k_proj: Projection,
-    pub(crate) v_proj: Projection,
-    pub(crate) o_proj: Projection,
+    pub(crate) qkv: QkvLinear,
+    pub(crate) o_proj: Linear,
     pub(crate) q_norm: Weight,
     pub(crate) k_norm: Weight,
     pub(crate) rotary: Rotary,
@@ -181,9 +133,9 @@ pub(crate) enum Mlp {
 
 /// A dense feed-forward block.
 pub(crate) struct DenseMlp {
-    pub(crate) gate_proj: Projection,
-    pub(crate) up_proj: Projection,
-    pub(crate) down_proj: Projection,
+    pub(crate) gate_proj: Linear,
+    pub(crate) up_proj: Linear,
+    pub(crate) down_proj: Linear,
     pub(crate) activation: SwiGlu,
 }
 
@@ -427,7 +379,7 @@ impl Qwen3Moe {
     fn projections_packed(&self) -> bool {
         self.layers
             .first()
-            .is_some_and(|layer| layer.attention.q_proj.is_encoded())
+            .is_some_and(|layer| layer.attention.qkv.query().is_packed())
     }
 
     /// Run every decoder layer over `hidden`, answering the last layer's update together with the
@@ -576,15 +528,17 @@ impl DecoderLayer {
 
         f.fenced(MOE, format_args!("layers.{layer}.mlp"), || {
             match &self.mlp {
-                Mlp::Experts(moe) => moe.forward(f, normalized, update).map_err(Error::from)?,
+                Mlp::Experts(moe) => {
+                    moe.forward(f, normalized, update).map_err(Error::from)?;
+                    // A tensor group holds every rank's block of the intermediate width, so each
+                    // rank's update is a partial sum, summed once after the experts. An expert
+                    // group's exchange returns the whole sum and runs with no tensor group.
+                    if f.split().is_some() {
+                        f.all_reduce(update).map_err(Error::from)?;
+                    }
+                }
+                // The dense block's down projection is row-parallel and reduces its own output.
                 Mlp::Dense(dense) => dense.forward(f, normalized, buffers, update)?,
-            }
-            // A tensor group holds every rank's block of the intermediate width, so each rank's
-            // update is a partial sum, summed once after the experts as after the attention's
-            // output projection. An expert group's exchange returns the whole sum and runs with no
-            // tensor group.
-            if f.split().is_some() {
-                f.all_reduce(update).map_err(Error::from)?;
             }
             Ok::<(), Error>(())
         })?;
@@ -610,9 +564,8 @@ impl AttentionLayer {
         sine: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        self.q_proj.forward(f, normalized, buffers.query)?;
-        self.k_proj.forward(f, normalized, buffers.key)?;
-        self.v_proj.forward(f, normalized, buffers.value)?;
+        self.qkv
+            .forward(f, normalized, buffers.query, buffers.key, buffers.value)?;
 
         let query = buffers.query.reshape(headed(buffers.query, &self.q_norm)?);
         let key = buffers.key.reshape(headed(buffers.key, &self.k_norm)?);
@@ -650,12 +603,9 @@ impl AttentionLayer {
             )
             .map_err(Error::from)?;
 
+        // Row parallel: the projection sums each rank's partial output over the query-head split.
         self.o_proj
             .forward(f, attended.reshape(buffers.attended.shape), out)?;
-        // Row parallel: each rank's partial output is summed over the query-head split.
-        if f.split().is_some() {
-            f.all_reduce(out).map_err(Error::from)?;
-        }
         Ok(())
     }
 }
@@ -680,7 +630,7 @@ impl DenseMlp {
         // named `gate`, so the argument order is `(f, gate, value, out)` as in every gated layer.
         self.activation
             .forward(f, dense.gate, dense.up, dense.gate)?;
-        self.down_proj.forward(f, dense.gate, out)
+        Ok(self.down_proj.forward(f, dense.gate, out)?)
     }
 }
 

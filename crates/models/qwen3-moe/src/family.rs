@@ -13,8 +13,8 @@ use nn::family::{
 };
 use nn::{Checkpoint, DType, WeightLoader};
 
-use crate::representation::Representation;
 use crate::{Config, LoadOptions, Partition, Qwen3Moe};
+use nn::quantization::Declaration;
 
 /// The Qwen3-MoE family.
 pub const FAMILY: Family = Family::Text(&Qwen3MoeFamily);
@@ -29,7 +29,7 @@ impl TextFamily for Qwen3MoeFamily {
 
     fn open(&self, checkpoint: &Checkpoint) -> nn::Result<Box<dyn TextCheckpoint>> {
         let config = Config::open(checkpoint)?;
-        let declaration = Representation::read(checkpoint.root())?;
+        let declaration = Declaration::read(checkpoint)?;
         Ok(Box::new(Qwen3MoeCheckpoint {
             config,
             declaration,
@@ -40,7 +40,7 @@ impl TextFamily for Qwen3MoeFamily {
 /// A Qwen3-MoE checkpoint: the configuration and the quantization declaration read from it.
 struct Qwen3MoeCheckpoint {
     config: Config,
-    declaration: Representation,
+    declaration: Declaration,
 }
 
 impl TextCheckpoint for Qwen3MoeCheckpoint {
@@ -60,7 +60,7 @@ impl TextCheckpoint for Qwen3MoeCheckpoint {
 
     fn load(
         &self,
-        checkpoint: &Checkpoint,
+        _checkpoint: &Checkpoint,
         loader: &mut WeightLoader<'_>,
         placement: &TextPlacement,
         experts: &ExpertOrder,
@@ -81,7 +81,6 @@ impl TextCheckpoint for Qwen3MoeCheckpoint {
         let model = crate::load::load(
             &self.config,
             &self.declaration,
-            checkpoint,
             partition,
             loader,
             options,

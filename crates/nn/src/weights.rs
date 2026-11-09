@@ -44,6 +44,7 @@ use sha2::{Digest, Sha256};
 use crate::checkpoint::{Checkpoint, FileIdentity, TensorLocation};
 use crate::error::{Error, Result};
 use crate::forward::ALIGNMENT;
+use crate::quantization::{Declaration, Scheme};
 use crate::tensor::{Backing, DevicePtr};
 
 /// The suffix one export spells each field of a calibrated NVFP4 projection with.
@@ -969,6 +970,9 @@ pub struct WeightLoader<'a> {
     retention: Retention<'a>,
     dtype: Option<DType>,
     quantization: Option<Quantization>,
+    /// What the checkpoint declares about its packed weights, resolved against its shards; dense
+    /// until a model [`declares`](WeightLoader::declare) one.
+    declaration: Declaration,
 }
 
 impl<'a> WeightLoader<'a> {
@@ -987,6 +991,7 @@ impl<'a> WeightLoader<'a> {
             retention: Retention::Store(store),
             dtype,
             quantization,
+            declaration: Declaration::dense(),
         }
     }
 
@@ -1017,12 +1022,38 @@ impl<'a> WeightLoader<'a> {
             retention: Retention::Meta(MetaRegions::default()),
             dtype,
             quantization,
+            declaration: Declaration::dense(),
         }
     }
 
     /// The checkpoint this loader reads.
     pub fn checkpoint(&self) -> &'a Checkpoint {
         self.checkpoint
+    }
+
+    /// Read every later weight by `declaration`, resolved against this loader's checkpoint.
+    ///
+    /// The resolution reads the shard headers once: a weight is packed when its shard stores a
+    /// block scale beside it, whatever the declaration's exclusion list says. A meta loader's
+    /// checkpoint holds the same headers, so it resolves the same way.
+    pub fn declare(&mut self, declaration: &Declaration) {
+        self.declaration = declaration.resolve(self.checkpoint);
+    }
+
+    /// How the checkpoint stores the weight named `weight`, by the resolved declaration.
+    pub fn scheme(&self, weight: &str) -> Scheme {
+        self.declaration.scheme(weight)
+    }
+
+    /// The scope of the module at `prefix`: its tensors are named `prefix.<leaf>`, and its
+    /// children's `prefix.<child>.<leaf>`, as `named_parameters()` composes them. An empty prefix
+    /// is the checkpoint's root.
+    pub fn scope(&mut self, prefix: impl Into<String>) -> Scope<'_, 'a> {
+        Scope {
+            loader: self,
+            path: prefix.into(),
+            pinned: None,
+        }
     }
 
     /// Whether this loader answers synthetic regions instead of reading and publishing.
@@ -1337,6 +1368,7 @@ impl<'a> WeightLoader<'a> {
             retention,
             dtype: self.dtype,
             quantization: self.quantization,
+            declaration: self.declaration.clone(),
         })
     }
 
@@ -2524,6 +2556,139 @@ impl<'a> WeightLoader<'a> {
             gathered.extend_from_slice(range);
         }
         Ok(gathered)
+    }
+}
+
+/// One module's view of a loader: the module's path, and the tensors named under it.
+///
+/// A layer loads itself through the scope its parent hands it: [`Scope::tensor`] reads
+/// `<path>.<leaf>`, and [`Scope::scope`] gives a child the path `<path>.<child>`, so a checkpoint
+/// name is composed exactly as `named_parameters()` composes it and no model writes a name out.
+/// A scope may pin its tensors to one element type ([`Scope::pinned`]), which its children inherit.
+///
+/// A scope reads dense weights. A weight the checkpoint stores packed has a layer that can read it
+/// ([`crate::layers::Linear`], which loads its packed fields itself); any other layer that asks
+/// for one is refused by name, because reading packed E2M1 as a matrix makes a model that runs and
+/// computes nothing.
+pub struct Scope<'s, 'a> {
+    loader: &'s mut WeightLoader<'a>,
+    path: String,
+    pinned: Option<DType>,
+}
+
+impl<'s, 'a> Scope<'s, 'a> {
+    /// The module path this scope names its tensors under.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
+    /// The full checkpoint name of this module's `leaf`.
+    pub fn name(&self, leaf: &str) -> String {
+        if self.path.is_empty() {
+            leaf.to_owned()
+        } else {
+            format!("{}.{leaf}", self.path)
+        }
+    }
+
+    /// The scope of the child module `child`, which inherits this scope's pin.
+    pub fn scope(&mut self, child: impl fmt::Display) -> Scope<'_, 'a> {
+        let path = self.name(&child.to_string());
+        Scope {
+            loader: &mut *self.loader,
+            path,
+            pinned: self.pinned,
+        }
+    }
+
+    /// This scope with every tensor read as `dtype`, whatever the loader's policy states.
+    ///
+    /// A representation a model pins per module — the reference keeps a timestep embedding in
+    /// FP32 and a VAE decoder's projections in FP16 at every preset — is the module's statement, and
+    /// the pin is part of each weight's retained key.
+    pub fn pinned(&mut self, dtype: DType) -> Scope<'_, 'a> {
+        Scope {
+            loader: &mut *self.loader,
+            path: self.path.clone(),
+            pinned: Some(dtype),
+        }
+    }
+
+    /// Whether the checkpoint holds this module's `leaf`.
+    pub fn contains(&self, leaf: &str) -> bool {
+        self.loader.checkpoint.tensor(&self.name(leaf)).is_some()
+    }
+
+    /// The whole of this module's `leaf`, `shape` elements read from its first.
+    ///
+    /// # Errors
+    ///
+    /// When the checkpoint lacks the tensor, holds another extent, stores it packed, or cannot
+    /// convert it to the pinned type.
+    pub fn tensor(&mut self, leaf: &str, shape: &[u64]) -> Result<Weight> {
+        self.rows(leaf, 0, shape)
+    }
+
+    /// The `shape.dim(0)` rows of this module's `leaf` that start at row `first`: a contiguous
+    /// window of a tensor whose rows are `shape[1..]`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::tensor`], and when the window reaches past the tensor.
+    pub fn rows(&mut self, leaf: &str, first: u64, shape: &[u64]) -> Result<Weight> {
+        let row: u64 = shape.iter().skip(1).product();
+        let request = WeightRequest::region(self.name(leaf), first * row, Shape::new(shape));
+        self.load(request)
+    }
+
+    /// Fold this module's weight-normalized `leaf`, stored as `<leaf>_v` and `<leaf>_g`, into one
+    /// weight ([`WeightLoader::weight_norm`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`WeightLoader::weight_norm`].
+    pub fn weight_norm(&mut self, leaf: &str) -> Result<Weight> {
+        let name = self.name(leaf);
+        self.refuse_packed(std::slice::from_ref(&name))?;
+        let (value, gain) = (format!("{name}_v"), format!("{name}_g"));
+        self.loader.weight_norm(&name, &value, &gain)
+    }
+
+    /// Load `request` at this scope's pin, refusing a packed source.
+    pub(crate) fn load(&mut self, request: WeightRequest) -> Result<Weight> {
+        let names = match &request.source {
+            WeightSource::Region { tensor, .. } | WeightSource::Strided { tensor, .. } => {
+                vec![tensor.clone()]
+            }
+            WeightSource::Parts { parts, .. } => parts.clone(),
+        };
+        self.refuse_packed(&names)?;
+        let request = match self.pinned {
+            Some(dtype) => request.pinned(dtype),
+            None => request,
+        };
+        self.loader.load(&request)
+    }
+
+    /// The loader, for a layer that reads its own packed fields.
+    pub(crate) fn loader(&mut self) -> &mut WeightLoader<'a> {
+        self.loader
+    }
+
+    /// Refuse a dense read of a weight the checkpoint stores packed.
+    fn refuse_packed(&self, names: &[String]) -> Result<()> {
+        match names
+            .iter()
+            .find(|name| self.loader.scheme(name) != Scheme::Dense)
+        {
+            None => Ok(()),
+            Some(name) => Err(Error::weight(
+                name,
+                "the checkpoint stores this weight packed, and the layer reading it has no \
+                 encoded form: reading it as dense would read packed E2M1 as a matrix. Load a \
+                 checkpoint whose calibration excludes it",
+            )),
+        }
     }
 }
 
