@@ -37,7 +37,6 @@ mod residual;
 mod rgb;
 mod rope;
 mod rows;
-mod sampler;
 mod transpose;
 mod ulysses;
 mod vsa;
@@ -74,7 +73,6 @@ pub use rope::{
     grid_positions,
 };
 pub use rows::IndexRows;
-pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use transpose::Transpose;
 pub use ulysses::{Interval, UlyssesAttention, UlyssesSpec};
 pub use vsa::{VsaAttention, VsaScratch, VsaSpec, VsaTables};

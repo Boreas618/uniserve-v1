@@ -2,9 +2,9 @@
 //! and refuses one that does not.
 //!
 //! The mechanism this file drives is the worker's, end to end and without a mock: a `Generation`
-//! of kernels (`ops::Generation`, one entry per operator and descriptor), `nn::forward::Forward`'s
-//! shadow branch (`Forward::operate` runs the new program into `ops::Twins` and the old one into the
-//! real output), and the worker's harness (`worker::shadow::Shadow`) which compares the pairs
+//! of kernels (`ops::Generation`, one entry per operator and descriptor), the worker's pairing route
+//! on `nn::forward::Forward` (`worker::shadow::Pairing` runs the new program into `ops::Twins` and
+//! the old one into the real output), and the worker's harness (`worker::shadow::Shadow`) which compares the pairs
 //! with the tolerance the operator recorded.
 //!
 //! Three properties, each of which the test reads off the device:
@@ -50,7 +50,7 @@ use platform::{
     Allocator, Budget, Buffer, Device, DeviceId, PinnedBuffer, PoolKind, Stream, memcpy_async,
     memset_d32,
 };
-use worker::shadow::Shadow;
+use worker::shadow::{Pairing, Shadow};
 
 const DEVICE: DeviceId = DeviceId(0);
 /// The words the probe operates on, and the value the test adds to each of them.
@@ -260,8 +260,8 @@ fn a_paired_forward_accepts_agreement_and_refuses_a_wrong_kernel() {
     // output is the old kernel's, because the new one wrote only the twins.
     harness.reset();
     {
-        let shadow = nn::forward::Shadow::new(Probe::NAME, key.clone(), &serving, harness.twins());
-        let forward = Forward::new(&stream, &equivalent, &arena).with_shadow(shadow);
+        let pairing = Pairing::new(Probe::NAME, key.clone(), &serving, harness.twins());
+        let forward = Forward::new(&stream, &equivalent, &arena).with_route(&pairing);
         forward
             .operate::<Probe>(&descriptor, args)
             .expect("the paired forward runs");
@@ -287,8 +287,8 @@ fn a_paired_forward_accepts_agreement_and_refuses_a_wrong_kernel() {
     // element with both values, which are the fixture's arithmetic (7 + 7 and 7 + 7 + 1).
     harness.reset();
     {
-        let shadow = nn::forward::Shadow::new(Probe::NAME, key.clone(), &serving, harness.twins());
-        let forward = Forward::new(&stream, &wrong, &arena).with_shadow(shadow);
+        let pairing = Pairing::new(Probe::NAME, key.clone(), &serving, harness.twins());
+        let forward = Forward::new(&stream, &wrong, &arena).with_route(&pairing);
         forward
             .operate::<Probe>(&descriptor, args)
             .expect("the paired forward runs");

@@ -337,16 +337,7 @@ impl PagedAttention {
         let planes = cache.planes(group, layer)?;
         let group_view = cache.group(group)?;
         self.write(f, batch, planes, key, value)?;
-        self.attend(f, batch, group_view, planes, query, out, workspace)?;
-        // Read the query and the output after the launch: the output buffer is the forward's and the
-        // next layer overwrites it, so this is the only moment it holds this layer's bytes under this
-        // layer's name.
-        if let Some(probe) = f.attention_probe
-            && let Ok(stream) = f.stream()
-        {
-            probe.attention(layer, query, out, stream);
-        }
-        Ok(())
+        self.attend(f, batch, group_view, planes, query, out, workspace)
     }
 
     /// Write the batch's keys and values into `planes`; slots of `-1` write nothing.

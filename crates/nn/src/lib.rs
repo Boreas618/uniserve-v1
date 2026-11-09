@@ -24,7 +24,7 @@
 //! [`PagedAttention`](layers::PagedAttention), [`Moe`],
 //! [`Conv3d`], [`Conv1d`],
 //! [`ConvTranspose1d`], [`UlyssesAttention`](layers::UlyssesAttention),
-//! [`Sampler`] and [`ParallelLMHead`]; the diffusion and
+//! and [`ParallelLMHead`]; the diffusion and
 //! video models add [`Patchify`](layers::Patchify), [`Copy`](layers::Copy), [`RgbBytes`],
 //! [`Transpose`](layers::Transpose) and [`VsaAttention`](layers::VsaAttention), and the
 //! audio path adds
@@ -76,14 +76,14 @@ pub use capability::{
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};
-pub use forward::{Arena, AttentionProbe, Fence, Forward, Split};
+pub use forward::{Arena, Fence, Forward, Split};
 pub use group::{Group, Transfer};
 pub use layers::{
-    Activation, AdaptiveAvgPool2d, Axpby, Candidates, Cast, CausalPad, Conv1d, Conv3d, ConvSpec,
+    Activation, AdaptiveAvgPool2d, Axpby, Cast, CausalPad, Conv1d, Conv3d, ConvSpec,
     ConvTranspose1d, Epilogue, GateBias, GatedActivation, Gelu, GroupNorm, Halves, IndexRows,
     LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey, Padding, ParallelLMHead, PcmInterleave,
-    Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding, Sampler, SamplerState, Samples,
-    Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES,
+    Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding, Scale, Silu, Snake,
+    TRTLLM_WORKSPACE_BYTES,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

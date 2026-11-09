@@ -33,6 +33,86 @@ use platform::{DeviceId, PinnedBuffer, Stream};
 
 use crate::{Error, Result};
 
+/// The route of one paired forward: the one operator it launches twice.
+///
+/// Installed on the paired forward ([`nn::Forward::with_route`]), it takes every call of
+/// `operator` and declines the rest, which launch once with the current program as a serving
+/// forward's do. A taken call launches the new program into the twins first, then the previous
+/// program into the real outputs, so the forward continues on the outputs it was going to compute
+/// anyway and the difference of one operator does not accumulate through the next.
+pub struct Pairing<'a> {
+    /// The operator whose programs are being compared, by `Op::NAME`.
+    operator: &'static str,
+    /// The descriptor key of the program the previous generation served this operator with.
+    ///
+    /// The comparison pairs by operator, not by descriptor: an update may replace an operator by
+    /// another compilation of the same mathematics, whose descriptor text differs (7.3 step 2).
+    /// The old program is resolved by this key, because that is the one it was stored under; a
+    /// launch whose own key the previous generation still holds is paired with that one instead,
+    /// so an operator that appears under several descriptors is never compared against a program
+    /// compiled for another.
+    previous_key: String,
+    /// The generation the previous program is resolved from.
+    previous: &'a ops::Generation,
+    /// The twin buffers the new program writes into. The forward borrows the route immutably for
+    /// its whole length, and one worker thread issues every launch of it, so the twins are borrowed
+    /// mutably one call at a time.
+    twins: std::cell::RefCell<&'a mut Twins>,
+}
+
+impl<'a> Pairing<'a> {
+    /// The pairing of `operator`'s calls, against the program the previous generation served it
+    /// with under `previous_key`.
+    pub fn new(
+        operator: &'static str,
+        previous_key: impl Into<String>,
+        previous: &'a ops::Generation,
+        twins: &'a mut Twins,
+    ) -> Self {
+        Self {
+            operator,
+            previous_key: previous_key.into(),
+            previous,
+            twins: std::cell::RefCell::new(twins),
+        }
+    }
+}
+
+impl ops::Route for Pairing<'_> {
+    fn launch(
+        &self,
+        call: &dyn ops::Call,
+        current: &ops::Generation,
+        stream: &Stream,
+    ) -> ops::Result<bool> {
+        // Paired by operator: a program replaced by another compilation of the same mathematics
+        // may carry a different descriptor text, and that is the update 7.3 step 2 exists for.
+        if call.operator() != self.operator {
+            return Ok(false);
+        }
+        // Record the bound the pair is compared with before resolving either kernel, so the harness
+        // reads it even when one of the two generations lacks this descriptor.
+        let mut twins = self.twins.borrow_mut();
+        twins.set_tolerance(call.tolerance());
+        let key = call.key();
+        let new = current.kernel(self.operator, &key)?;
+        // The previous program is resolved by the key its generation stored it under, and by the
+        // launch's own key when that generation still has one: an operator served under several
+        // descriptors is compared program for program, never against a neighbour's compilation.
+        let previous = if self.previous.contains(self.operator, &key) {
+            self.previous.kernel(self.operator, &key)?
+        } else {
+            self.previous.kernel(self.operator, &self.previous_key)?
+        };
+        // The new program writes the twins; the previous program then writes the real outputs,
+        // which the forward continues on.
+        call.launch_redirected(new, &mut twins, stream)?;
+        call.launch(previous, stream)?;
+        twins.freeze(stream);
+        Ok(true)
+    }
+}
+
 /// What one paired forward compared.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Summary {
@@ -82,8 +162,8 @@ impl Shadow {
 
     /// The tolerance the paired forward's operator recorded when it was shadowed, if it was.
     ///
-    /// `Op::shadow` is where the operator's type is known, so `Forward::operate` records
-    /// `O::tolerance(descriptor)` in the region there; the harness compares with it.
+    /// The call is where the operator's descriptor is known, so [`Pairing`] records its
+    /// `Op::tolerance` in the region there; the harness compares with it.
     pub fn tolerance(&self) -> Option<Tolerance> {
         self.twins.tolerance()
     }

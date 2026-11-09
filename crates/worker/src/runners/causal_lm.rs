@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ipc::{PhaseId, TimingCounters};
-use nn::{CausalLm, Forward, KvView, SamplerState, Samples, TokenBatch};
+use nn::{CausalLm, Forward, KvView, TokenBatch};
 use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
 
@@ -55,6 +55,7 @@ use crate::runner::{Binding, Runner, RunnerId};
 use crate::runners::columns::{Column, encode_f32, encode_i32};
 use crate::runners::lifecycle::{Lifecycle, walk_capture};
 use crate::runners::recording::{Footprint, Walk};
+use crate::runners::sampler::{Sampler, SamplerState, Samples};
 
 /// The capture sink, at the path the device tests of the rebind mechanism import it from.
 pub use crate::runners::lifecycle::Recording;
@@ -567,7 +568,7 @@ fn inert_commit(rows: usize) -> Vec<i64> {
 /// without a device and the runner cannot drift from it.
 fn commit_descriptor(capacity: u64, block: u32, vocabulary: u32) -> ops::commit::CommitDescriptor {
     ops::commit::CommitDescriptor {
-        // The table and the sampled ids are i32 end to end: `nn::Sampler` emits i32 tokens, and the
+        // The table and the sampled ids are i32 end to end: `Sampler` emits i32 tokens, and the
         // operator checks `tokens` against `index`.
         index: DType::I32,
         verified: DType::I32,
@@ -997,77 +998,6 @@ fn runner_dump() -> bool {
 /// launched? Both are answered by the same run, because the walk uses the same columns, the same arena
 /// and the same programs. It is never a serving path: an eager walk is what capture does, and a
 /// deployment that ran it would launch every operator again on every batch.
-/// Every layer's attention output, digested at the launch that wrote it.
-///
-/// The buffer a layer is attended into is the forward's and the next layer overwrites it, so a digest
-/// read after the graph has run answers for the last layer whichever name it carries. This reads one
-/// layer's bytes while they exist, which is the only reading that can say whether a layer's own
-/// attention program wrote anything.
-#[derive(Default)]
-struct AttentionOutputs {
-    written: std::cell::RefCell<Vec<(usize, String, usize)>>,
-}
-
-impl AttentionOutputs {
-    /// One digest of a view, read on the launching stream: `None` when the copy cannot be made.
-    fn digest(view: nn::TensorView, stream: &platform::Stream) -> Option<(String, usize)> {
-        let bytes = usize::try_from(view.shape.numel())
-            .ok()
-            .zip(view.dtype.bytes())
-            .map(|(elements, width)| elements.saturating_mul(width as usize))?;
-        if bytes == 0 {
-            return None;
-        }
-        let mut raw = vec![0_u8; bytes];
-        // SAFETY: the buffer is this call's own and of `bytes`, and the source is an address a launch
-        // was just given. The copy is issued on the launching stream, so it is ordered after the write.
-        let copied = unsafe {
-            platform::memcpy_async(raw.as_mut_ptr() as u64, view.ptr.address(), bytes, stream)
-        };
-        if copied.is_err() || stream.synchronize().is_err() {
-            return None;
-        }
-        let nonzero = raw.iter().filter(|byte| **byte != 0).count();
-        Some((format!("{:016x}", platform::fnv1a(&raw)), nonzero))
-    }
-}
-
-impl nn::AttentionProbe for AttentionOutputs {
-    fn attention(
-        &self,
-        layer: usize,
-        query: nn::TensorView,
-        out: nn::TensorView,
-        stream: &platform::Stream,
-    ) {
-        let (Some((query_digest, query_nz)), Some((out_digest, out_nz))) =
-            (Self::digest(query, stream), Self::digest(out, stream))
-        else {
-            return;
-        };
-        self.written.borrow_mut().push((
-            layer,
-            format!("{query_digest} qnz={query_nz} o={out_digest} onz={out_nz}"),
-            0,
-        ));
-    }
-}
-
-impl AttentionOutputs {
-    /// `l<n>=<digest> nz=<bytes>` per layer, in the order the layers ran.
-    fn spelled(&self) -> String {
-        let written = self.written.borrow();
-        if written.is_empty() {
-            return "none".to_owned();
-        }
-        written
-            .iter()
-            .map(|(layer, digest, _)| format!("l{layer}:{digest}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    }
-}
-
 fn eager_replay() -> bool {
     static EAGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *EAGER.get_or_init(|| {
@@ -1342,7 +1272,7 @@ fn argmax(values: &[f32]) -> usize {
 
 /// The sampling step's own device state: the slot histories its penalties read.
 struct Sampling {
-    sampler: nn::Sampler,
+    sampler: Sampler,
     /// `[slots, vocabulary]` i32 counts of the tokens each slot has already seen, which the
     /// penalties subtract; zeroed once when the runner binds and advanced by `ops::commit`.
     counts: TensorView,
@@ -1352,7 +1282,7 @@ struct Sampling {
 impl Sampling {
     /// The sampler and its zeroed count table for `geometry`.
     fn new(device: DeviceId, stream: &platform::Stream, geometry: Geometry) -> Result<Self> {
-        let sampler = nn::Sampler::new(
+        let sampler = Sampler::new(
             geometry.vocabulary,
             geometry.slots,
             geometry.width.min(geometry.vocabulary),
@@ -3071,12 +3001,12 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 .scratch_slots
                 .extent(0..u64::from(bucket.tokens)),
         )?;
-        let shadow = nn::forward::Shadow::new(operator, key, previous, twins);
+        let pairing = crate::shadow::Pairing::new(operator, key, previous, twins);
         // The count bounds the MoE sort's padded rows: the paired forward gets the same column as
         // the served one, so the comparison sees one count (7.3).
         let tensor = self.tensor.clone();
         let mut forward = Forward::new(&stream, next, &arena)
-            .with_shadow(shadow)
+            .with_route(&pairing)
             .with_live_tokens(self.columns.live_tokens.device);
         if let Some(group) = tensor.as_deref() {
             forward = forward.with_group(group);
@@ -4957,9 +4887,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let base = self.pool()?.base(self.stream_id())?;
         let reserved = self.pool()?.reserved_on(self.stream_id());
         let arena = nn::Arena::new(ops::DevicePtr::new(base.address()), reserved);
-        // Under the dump, every layer's attended output is read at its own launch: the buffer is
-        // reused by the next layer, so any later reading is the last layer's whichever name it has.
-        let probe = AttentionOutputs::default();
         let probes = crate::profiling::fences::capturing(&stream);
         let tensor = self.tensor.clone();
         let mut forward = Forward::new(&stream, generation, &arena)
@@ -4967,12 +4894,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .with_fence(probes.as_ref().map(|probes| probes as &dyn nn::Fence));
         if let Some(group) = tensor.as_deref() {
             forward = forward.with_group(group);
-        }
-        // Never inside a recording: the probe copies and synchronises per layer, and a synchronise
-        // inside a capture is refused by the driver - which is a measurement that breaks what it
-        // measures, and one that no line of its own would ever explain.
-        if runner_dump() && !self.capturing {
-            forward = forward.with_attention_probe(&probe);
         }
         let shaped = self
             .experts
@@ -4983,13 +4904,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
             forward = forward.with_dispatch(views);
         }
         self.step(&forward, bucket)?;
-        if runner_dump() {
-            tracing::info!(
-                bucket = %bucket,
-                outputs = %probe.spelled(),
-                "attention outputs, each read at its own layer's launch"
-            );
-        }
         if first {
             self.pool()?
                 .record(self.stream_id(), bucket, arena.peak())?;
@@ -5212,8 +5126,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         if bucket.variant.greedy() {
             sampling
                 .sampler
-                .greedy(forward, logits, &state, &samples)
-                .map_err(Error::from)?;
+                .greedy(forward, logits, &state, &samples)?;
         } else {
             sampling
                 .sampler
@@ -5223,8 +5136,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                     &state,
                     self.columns.draws.shaped(&[rows]),
                     &samples,
-                )
-                .map_err(Error::from)?;
+                )?;
         }
         // A bucket that draws may end a greedy request's prompt, whose first token is the argmax of
         // the row - a decision the graph cannot make for one row of a bucket that draws. The view

@@ -10,11 +10,12 @@
 use std::fmt::Display;
 use std::hash::Hash;
 
-use crate::Result;
+use crate::generation::Generation;
 use crate::kernel::Kernel;
 use crate::platform::Stream;
 use crate::tolerance::Tolerance;
 use crate::twins::Twins;
+use crate::{Result, capture, descriptor};
 
 /// One operator.
 ///
@@ -78,4 +79,103 @@ pub trait Op {
     /// [`Tolerance`] and each operator's documentation for the reduction length and the dtype it is
     /// written with.
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance;
+}
+
+/// One checked call of an operator, with the operator's type erased.
+///
+/// A launching forward hands its calls to a [`Route`] as this, so a route chosen at runtime can
+/// launch a call, or launch it with its outputs redirected, without naming the operator. Every
+/// launch through it reports itself to the installed capture sink ([`crate::capture`]), as a
+/// forward's own launches do.
+pub trait Call {
+    /// The operator's [`Op::NAME`].
+    fn operator(&self) -> &'static str;
+
+    /// The descriptor's key: the text the program is stored under.
+    fn key(&self) -> String;
+
+    /// The bound two implementations of this call may differ by ([`Op::tolerance`]).
+    fn tolerance(&self) -> Tolerance;
+
+    /// Launches `kernel` with the call's own arguments.
+    ///
+    /// # Errors
+    ///
+    /// The launch's failure.
+    fn launch(&self, kernel: &Kernel, stream: &Stream) -> Result<()>;
+
+    /// Launches `kernel` with the call's outputs redirected into `twins` ([`Op::shadow`]); the
+    /// redirected arguments are checked first, because the twins are other views than the call's.
+    ///
+    /// # Errors
+    ///
+    /// The redirected arguments' refusal, or the launch's failure.
+    fn launch_redirected(&self, kernel: &Kernel, twins: &mut Twins, stream: &Stream) -> Result<()>;
+}
+
+/// Where a launching forward sends its calls, when the runtime routes them itself.
+///
+/// The runtime installs a route on a forward to launch some calls otherwise than once with the
+/// current generation's program: a program update's paired execution launches a replaced
+/// operator's new and previous programs over the same inputs. A forward without a route, and every
+/// call a route declines, launches the current program once.
+pub trait Route {
+    /// Launches `call` on `stream`, resolving programs from `current` or elsewhere, and answers
+    /// whether it did; `false` leaves the call to the forward's own launch.
+    ///
+    /// # Errors
+    ///
+    /// A program the route cannot resolve, or a launch's failure.
+    fn launch(&self, call: &dyn Call, current: &Generation, stream: &Stream) -> Result<bool>;
+}
+
+/// `O`'s call: its descriptor and its arguments, already checked against it ([`Op::check`]).
+pub struct Checked<'d, 't, O: Op> {
+    descriptor: &'d O::Descriptor,
+    args: O::Args<'t>,
+}
+
+impl<'d, 't, O: Op> Checked<'d, 't, O> {
+    /// The call of `O` with `args` under `descriptor`; the caller has checked them.
+    pub const fn new(descriptor: &'d O::Descriptor, args: O::Args<'t>) -> Self {
+        Self { descriptor, args }
+    }
+
+    /// Tells the capture sink, when one is installed, that the call's program launched.
+    fn launched(&self) {
+        if capture::installed() {
+            capture::launched(O::NAME, &descriptor::key(self.descriptor));
+        }
+    }
+}
+
+impl<'t, O: Op> Call for Checked<'_, 't, O>
+where
+    O::Args<'t>: Copy,
+{
+    fn operator(&self) -> &'static str {
+        O::NAME
+    }
+
+    fn key(&self) -> String {
+        descriptor::key(self.descriptor)
+    }
+
+    fn tolerance(&self) -> Tolerance {
+        O::tolerance(self.descriptor)
+    }
+
+    fn launch(&self, kernel: &Kernel, stream: &Stream) -> Result<()> {
+        O::launch(kernel, self.descriptor, self.args, stream)?;
+        self.launched();
+        Ok(())
+    }
+
+    fn launch_redirected(&self, kernel: &Kernel, twins: &mut Twins, stream: &Stream) -> Result<()> {
+        let redirected = O::shadow(self.args, twins, stream);
+        O::check(self.descriptor, &redirected)?;
+        O::launch(kernel, self.descriptor, redirected, stream)?;
+        self.launched();
+        Ok(())
+    }
 }

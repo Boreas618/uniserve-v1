@@ -36,7 +36,7 @@ use ops::moe::grouped::{
 };
 use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
-use ops::{DType, DevicePtr, Op, Shape, TensorView};
+use ops::{DType, DevicePtr, Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::family::Split;
@@ -1961,26 +1961,6 @@ impl Moe {
         f.operate::<ExpertExchange>(&descriptor, args)?;
         f.settled()
     }
-
-    /// The bound the combined rows' implementations may differ by.
-    ///
-    /// A dense block combines its own element type; an encoded one combines BF16, the element type
-    /// a calibrated NVFP4 checkpoint's consumers run in.
-    pub fn tolerance(&self) -> ops::Tolerance {
-        let dtype = match &self.stacks {
-            ExpertStacks::Dense { up_gate, .. } => up_gate.dtype(),
-            ExpertStacks::Encoded { .. } => DType::BF16,
-        };
-        MoeUnpermute::tolerance(&combine::Descriptor {
-            layout: combine::Layout::Permuted,
-            hidden: self.hidden,
-            top: self.top,
-            experts: self.experts,
-            input: dtype,
-            scales: DType::F32,
-            output: dtype,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -2155,12 +2135,6 @@ pub(super) mod tests {
         assert_eq!(quantized.experts(), 128);
         assert_eq!(quantized.local_experts(), 128);
         assert_eq!(quantized.top(), 8);
-        // The combine bound is BF16's, because that is what a calibrated checkpoint multiplies.
-        assert_eq!(
-            quantized.tolerance().atol,
-            block(128, 8, 2048, 768).unwrap().tolerance().atol,
-            "the dense BF16 block and the encoded block share a combine bound"
-        );
     }
 
     /// The packed stacks must describe the geometry the router and the block were built for: a
@@ -2277,23 +2251,6 @@ pub(super) mod tests {
             )
             .is_err(),
             "a map of four entries cannot route eight experts"
-        );
-    }
-
-    #[test]
-    fn the_combine_bound_is_the_route_count() {
-        let block = block(128, 8, 2048, 768).unwrap();
-        assert_eq!(
-            block.tolerance(),
-            MoeUnpermute::tolerance(&combine::Descriptor {
-                layout: combine::Layout::Permuted,
-                hidden: 2048,
-                top: 8,
-                experts: 128,
-                input: DType::BF16,
-                scales: DType::F32,
-                output: DType::BF16,
-            })
         );
     }
 }

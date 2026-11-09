@@ -20,10 +20,9 @@
 //! A single-threaded worker is what makes the interior cursor sound: one worker thread issues
 //! every job of its device, so two forwards never share an arena at one time.
 
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 
-use ops::twins::Twins;
-use ops::{Generation, Op, Stream};
+use ops::{Generation, Op, Route, Stream};
 
 use crate::error::{Error, Result};
 use crate::group::{self, Group, Transfer};
@@ -182,43 +181,6 @@ impl Arena {
     }
 }
 
-/// The one operator a shadow forward runs twice.
-pub struct Shadow<'a> {
-    /// The operator whose programs are being compared, by `Op::NAME`.
-    pub operator: &'static str,
-    /// The descriptor key of the program the previous generation served this operator with.
-    ///
-    /// The comparison pairs by operator, not by descriptor: an update may replace an operator by
-    /// another compilation of the same mathematics, whose descriptor text differs (7.3 step 2).
-    /// The old program is resolved by this key, because that is the one it was stored under; a
-    /// launch whose own key the previous generation still holds is paired with that one instead,
-    /// so an operator that appears under several descriptors is never compared against a program
-    /// compiled for another.
-    pub previous_key: String,
-    /// The generation the previous program is resolved from.
-    pub previous: &'a Generation,
-    /// The twin buffers the new program writes into.
-    pub twins: RefCell<&'a mut Twins>,
-}
-
-impl<'a> Shadow<'a> {
-    /// The comparison of `operator`'s calls, against the program the previous generation served it
-    /// with under `previous_key`.
-    pub fn new(
-        operator: &'static str,
-        previous_key: impl Into<String>,
-        previous: &'a Generation,
-        twins: &'a mut Twins,
-    ) -> Self {
-        Self {
-            operator,
-            previous_key: previous_key.into(),
-            previous,
-            twins: RefCell::new(twins),
-        }
-    }
-}
-
 /// The borrowed execution resources of one forward.
 pub struct Forward<'a> {
     /// The stream this forward's work is issued on and the generation of loaded kernels the
@@ -245,8 +207,9 @@ pub struct Forward<'a> {
     split: Option<Split>,
     /// The expert-parallel dispatch's received views, when the block's experts are split across ranks.
     pub dispatch: Option<&'a DispatchViews>,
-    /// The operator this forward shadows, when it is a 7.3 comparison pass.
-    pub shadow: Option<Shadow<'a>>,
+    /// Where this forward's launches go when the runtime routes them itself ([`Route`]), or `None`
+    /// to launch every call once with the current generation's program.
+    route: Option<&'a dyn Route>,
     /// `[1]` i32: the token rows of this batch that are live, when the caller states them.
     ///
     /// A captured bucket is wider than the batch that fills it. A layer that partitions work by
@@ -254,13 +217,6 @@ pub struct Forward<'a> {
     /// arena is the bucket's. The value is device-resident because it changes per replay of one
     /// captured graph, and the buffer must outlive the bucket - a layer reads it on every replay.
     pub live_tokens: Option<TensorView>,
-    /// Observes every layer's attention output as this forward produces it, or `None`.
-    ///
-    /// A layer's attended output is written into a buffer the forward reuses for the next layer, so a
-    /// reader that digests it after the graph has run reads the last layer's bytes with every layer's
-    /// name. This is the only seam at which one layer's own output can be read while it exists, and it
-    /// is a diagnosis: nothing a forward computes depends on a probe being present.
-    pub attention_probe: Option<&'a dyn AttentionProbe>,
     /// Times the model's components on the device, or `None`.
     ///
     /// A forward captured into a graph captures its probes, and every replay then runs them. Nothing
@@ -318,20 +274,6 @@ pub trait Fence {
     fn exit(&self, instance: u32, stream: &Stream) -> Result<()>;
 }
 
-/// Observes one layer's attention output, at the launch that wrote it.
-///
-/// The forward calls it after the layer's attention program launched and before the projection that
-/// consumes it, on the stream that launched it, so an implementation that copies the bytes is ordered
-/// after the write.
-pub trait AttentionProbe {
-    /// Read one layer's query and its attended output, as they stand around its own launch.
-    ///
-    /// Both are read in one call because both are answered by one copy each: a zero output is either
-    /// what the program computed or a program that was handed nothing to read, and only the query
-    /// beside it can tell the two apart.
-    fn attention(&self, layer: usize, query: TensorView, out: TensorView, stream: &Stream);
-}
-
 impl<'a> Forward<'a> {
     /// A forward with the resources every block needs and no partitioning.
     pub fn new(stream: &'a Stream, kernels: &'a Generation, arena: &'a Arena) -> Self {
@@ -342,9 +284,8 @@ impl<'a> Forward<'a> {
             group: None,
             split: None,
             dispatch: None,
-            shadow: None,
+            route: None,
             live_tokens: None,
-            attention_probe: None,
             fence: None,
         }
     }
@@ -366,9 +307,8 @@ impl<'a> Forward<'a> {
             group: None,
             split: None,
             dispatch: None,
-            shadow: None,
+            route: None,
             live_tokens: None,
-            attention_probe: None,
             fence: None,
         }
     }
@@ -595,7 +535,12 @@ impl<'a> Forward<'a> {
         self
     }
 
-    /// The same forward as a shadow comparison of one operator's call.
+    /// The same forward with its launches sent through `route` ([`Route`]).
+    pub fn with_route(mut self, route: &'a dyn Route) -> Self {
+        self.route = Some(route);
+        self
+    }
+
     /// State which token rows of this batch are live, for the layers that partition by row.
     ///
     /// The buffer is `[1]` i32 on the device and must outlive the bucket: a captured graph reads it
@@ -635,20 +580,9 @@ impl<'a> Forward<'a> {
         Ok(answer)
     }
 
-    /// Observes every layer's attention output (see [`Self::attention_probe`]).
-    pub fn with_attention_probe(mut self, probe: &'a dyn AttentionProbe) -> Self {
-        self.attention_probe = Some(probe);
-        self
-    }
-
     /// The token rows of this batch that are live, when the caller stated them.
     pub fn live_of(&self) -> Option<TensorView> {
         self.live_tokens
-    }
-
-    pub fn with_shadow(mut self, shadow: Shadow<'a>) -> Self {
-        self.shadow = Some(shadow);
-        self
     }
 
     /// Check the call against `O`'s rules ([`Op::check`]), then resolve `O`'s kernel for this
@@ -657,10 +591,8 @@ impl<'a> Forward<'a> {
     /// A recording forward checks the call the same way and then only reports the descriptor key
     /// to the capture sink, so a recorded key always comes from a call the device would accept.
     ///
-    /// When this forward shadows `O` at this descriptor key, the launch is
-    /// paired: the new kernel writes the twins and the previous generation's kernel writes the real
-    /// outputs last, so the forward continues on the outputs it was going to compute anyway.
-    /// Otherwise it is one launch of the current generation's kernel.
+    /// A forward with a [`Route`] offers the checked call to it first; a call the route declines,
+    /// and every call of a forward without one, is one launch of the current generation's kernel.
     pub fn operate<'t, O: Op>(&self, descriptor: &O::Descriptor, args: O::Args<'t>) -> Result<()>
     where
         O::Args<'t>: Copy,
@@ -675,43 +607,14 @@ impl<'a> Forward<'a> {
             }
             return Ok(());
         };
-        // Paired by operator: a program replaced by another compilation of the same mathematics
-        // may carry a different descriptor text, and that is the update 7.3 step 2 exists for.
-        let shadow = self
-            .shadow
-            .as_ref()
-            .filter(|shadow| shadow.operator == O::NAME);
-        let Some(shadow) = shadow else {
-            let kernel = kernels.op::<O>(descriptor)?;
-            O::launch(kernel, descriptor, args, stream).map_err(refused)?;
-            Self::record::<O>(descriptor);
+        if let Some(route) = self.route
+            && route.launch(&ops::Checked::<O>::new(descriptor, args), kernels, stream)?
+        {
             return Ok(());
-        };
-        // Record the bound the pair is compared with before resolving either kernel, so a harness
-        // reads it even when one of the two generations lacks this descriptor.
-        let mut twins = shadow.twins.borrow_mut();
-        twins.set_tolerance(O::tolerance(descriptor));
-        let current = kernels.op::<O>(descriptor)?;
-        // The previous program is resolved by the key its generation stored it under, and by the
-        // launch's own key when that generation still has one: an operator served under several
-        // descriptors is compared program for program, never against a neighbour's compilation.
-        let key = ops::descriptor::key(descriptor);
-        let previous = if shadow.previous.contains(O::NAME, &key) {
-            shadow.previous.kernel(O::NAME, &key)?
-        } else {
-            shadow.previous.kernel(O::NAME, &shadow.previous_key)?
-        };
-        // Redirect the call's outputs into the twins and let the new program write them; the
-        // previous program then writes the real outputs, which the forward continues on.
-        // The twins are other views than the call's, so the redirected call is checked on its own.
-        let redirected = O::shadow(args, &mut twins, stream);
-        O::check(descriptor, &redirected).map_err(refused)?;
-        O::launch(current, descriptor, redirected, stream).map_err(refused)?;
+        }
+        let kernel = kernels.op::<O>(descriptor)?;
+        O::launch(kernel, descriptor, args, stream).map_err(refused)?;
         Self::record::<O>(descriptor);
-        drop(twins);
-        O::launch(previous, descriptor, args, stream).map_err(refused)?;
-        Self::record::<O>(descriptor);
-        shadow.twins.borrow_mut().freeze(stream);
         Ok(())
     }
 

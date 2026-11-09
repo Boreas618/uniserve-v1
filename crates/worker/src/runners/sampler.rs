@@ -27,13 +27,13 @@
 //!
 //! ## The draws are inputs
 //!
-//! The layer never generates randomness. `draws` is `[rows]` f32 in `[0, 1)`, computed by the
-//! worker from the request's seed and the token position it is sampling (Philox, addressed per
+//! The sampler never generates randomness. `draws` is `[rows]` f32 in `[0, 1)`, computed by the
+//! runner from the request's seed and the token position it is sampling (Philox, addressed per
 //! element), so a restored or replayed step draws the same number.
 //!
 //! ## Greedy rows
 //!
-//! A row whose temperature is zero is **not** a draw: it is [`Self::argmax`]'s row. The shaper
+//! A row whose temperature is zero is **not** a draw: it is [`Sampler::greedy`]'s row. The shaper
 //! divides such a row by one rather than by zero (`ops::sampler`'s doc cites the rule), so the row's
 //! shaped logits keep the logits' order and its largest candidate is the temperature-zero token. The
 //! temperature of each row is a request parameter, so the worker knows which rows are greedy and
@@ -45,7 +45,7 @@
 //!
 //! `filter_candidates` reports, per row, whether the row's kept candidates form a usable
 //! distribution (a row can end up empty when a nucleus or min-p threshold and a top-k width leave
-//! nothing). The layer does not branch on it — the value is device data and the layer is inside a
+//! nothing). The sampler does not branch on it — the value is device data and the step is inside a
 //! captured graph — but leaves it in the candidate working set's `valid` row for the worker, and
 //! samples the row as its first candidate, which is deterministic and reproducible. Whether such a
 //! request continues, is retried with different parameters, or fails is the worker's decision, not
@@ -68,11 +68,17 @@ use ops::sampler::{
     LogSoftmaxDescriptor, LogitsShape, LogprobArgs, LogprobDescriptor, LogprobGather, OrderArgs,
     OrderDescriptor, PARAMETER_COLUMNS, ShapeArgs, ShapeDescriptor, TopK, TopKArgs, TopKDescriptor,
 };
-use ops::{DType, Op, Shape, TensorView};
+use ops::{DType, Shape, TensorView};
 
-use crate::error::{Error, Result};
-use crate::forward::{Arena, Forward};
-use crate::layers::launch;
+use nn::layers::launch;
+use nn::{Arena, Forward};
+
+use crate::{Error, Result};
+
+/// A view or a construction argument the sampling step cannot take, named by its owner.
+fn refused(owner: &'static str, problem: impl Into<String>) -> Error {
+    Error::Invalid(format!("{owner}: {}", problem.into()))
+}
 
 /// The request state a sampling step reads.
 ///
@@ -184,19 +190,19 @@ impl Sampler {
     /// changes the shaping operator's descriptor.
     pub fn new(vocabulary: u32, slots: u32, width: u32, extras: u32) -> Result<Self> {
         if vocabulary == 0 {
-            return Err(Error::shape(
+            return Err(refused(
                 "Sampler",
                 "a sampler needs a non-empty vocabulary".to_owned(),
             ));
         }
         if slots == 0 {
-            return Err(Error::shape(
+            return Err(refused(
                 "Sampler",
                 "a sampler needs at least one row".to_owned(),
             ));
         }
         if width == 0 || width > vocabulary {
-            return Err(Error::shape(
+            return Err(refused(
                 "Sampler",
                 format!("a candidate width of {width} is outside 1..={vocabulary}"),
             ));
@@ -253,7 +259,7 @@ impl Sampler {
             .require_shape("Sampler", Shape::new(&[rows]))
             .map_err(Error::from)?;
         if draws.dtype != DType::F32 {
-            return Err(Error::shape(
+            return Err(refused(
                 "Sampler",
                 format!("expected f32 draws, found {}", draws.dtype),
             ));
@@ -484,13 +490,13 @@ impl Sampler {
             .map_err(Error::from)?;
         let rows = logits.rows();
         if rows == 0 {
-            return Err(Error::shape(
+            return Err(refused(
                 "Sampler",
                 "a sampling step has at least one row".to_owned(),
             ));
         }
         if !matches!(logits.dtype, DType::F32 | DType::BF16 | DType::F16) {
-            return Err(Error::shape(
+            return Err(refused(
                 "Sampler",
                 format!(
                     "{} logits are not a shape the shaper reads: f32, bf16 or f16",
@@ -499,7 +505,7 @@ impl Sampler {
             ));
         }
         if samples.tokens.dtype != self.tokens {
-            return Err(Error::shape(
+            return Err(refused(
                 "Sampler",
                 format!(
                     "expected {} tokens, found {}",
@@ -516,7 +522,7 @@ impl Sampler {
                 .require_shape("Sampler", Shape::new(&[rows]))
                 .map_err(Error::from)?;
             if logprobabilities.dtype != DType::F32 {
-                return Err(Error::shape(
+                return Err(refused(
                     "Sampler",
                     format!(
                         "expected f32 log-probabilities, found {}",
@@ -530,7 +536,7 @@ impl Sampler {
             .require_shape("Sampler", Shape::new(&[rows, u64::from(PARAMETER_COLUMNS)]))
             .map_err(Error::from)?;
         if state.parameters.dtype != DType::F32 {
-            return Err(Error::shape(
+            return Err(refused(
                 "Sampler",
                 format!("expected f32 parameters, found {}", state.parameters.dtype),
             ));
@@ -544,7 +550,7 @@ impl Sampler {
             .require_row("Sampler", DType::I32, vocabulary)
             .map_err(Error::from)?;
         if state.counts.rows() != u64::from(self.slots) {
-            return Err(Error::shape(
+            return Err(refused(
                 "Sampler",
                 format!(
                     "{} count rows for {} slots",
@@ -556,14 +562,14 @@ impl Sampler {
         match (self.extras, state.extras) {
             (0, None) => {}
             (0, Some(_)) => {
-                return Err(Error::shape(
+                return Err(refused(
                     "Sampler",
                     "the sampler reads no extra tokens and the state carries some".to_owned(),
                 ));
             }
             (_, Some(_)) => {}
             (extras, None) => {
-                return Err(Error::shape(
+                return Err(refused(
                     "Sampler",
                     format!("the sampler reads {extras} extra tokens and the state has none"),
                 ));
@@ -574,7 +580,7 @@ impl Sampler {
                 .require_shape("Sampler", Shape::new(&[rows, u64::from(self.extras)]))
                 .map_err(Error::from)?;
             if extra.dtype != DType::I32 {
-                return Err(Error::shape(
+                return Err(refused(
                     "Sampler",
                     format!("expected i32 extra tokens, found {}", extra.dtype),
                 ));
@@ -647,19 +653,6 @@ impl Sampler {
 
         Ok(())
     }
-
-    /// The bound the sampled tokens' distributions are compared with: the shaping and filtering
-    /// steps round FP32 values a few times, while a chosen token is exact.
-    pub fn tolerance(&self) -> ops::Tolerance {
-        LogitsShape::tolerance(&ShapeDescriptor {
-            dtype: DType::F32,
-            vocabulary: self.vocabulary,
-            block: self.block,
-            extras: self.extras,
-            divide: true,
-            pdl: launch::PDL,
-        })
-    }
 }
 
 #[cfg(test)]
@@ -712,7 +705,7 @@ mod tests {
         let mut previous = 0;
         for view in order {
             assert!(view.ptr.address() > previous);
-            assert_eq!(view.ptr.address() % crate::forward::ALIGNMENT, 0);
+            assert_eq!(view.ptr.address() % nn::forward::ALIGNMENT, 0);
             previous = view.ptr.address();
         }
         assert_eq!(candidates.shaped.dtype, DType::F32);
@@ -729,19 +722,6 @@ mod tests {
         let _ = Candidates::reserve(&arena, rows, 1_024, 32).unwrap();
         let samples = Samples::reserve(&arena, DType::I32, rows, false).unwrap();
         assert!(samples.logprobabilities.is_none());
-    }
-
-    #[test]
-    fn the_bound_is_the_shaping_steps_own_roundings() {
-        let sampler = Sampler::new(1_024, 8, 64, 0).unwrap();
-        let bound = sampler.tolerance();
-        assert!(
-            bound.rtol > 0.0 && bound.rtol < 1.0e-6,
-            "rtol = {}",
-            bound.rtol
-        );
-        assert!(bound.allows(1.0, 1.0 + 1.0e-7));
-        assert!(!bound.allows(1.0, 1.0 + 1.0e-3));
     }
 
     /// The refusals a caller meets before either path launches. `check` is the one body both paths

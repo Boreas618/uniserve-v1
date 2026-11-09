@@ -137,7 +137,7 @@ pub use fp4::{Nvfp4Gemm, Nvfp4Quantize, ScaleLayout};
 pub use generation::{Generation, KernelEntry};
 pub use install::{Module, install, operator_name, operators};
 pub use kernel::{Arguments, CubinMetadata, Entry, Kernel, LaunchGrid, NativeCall, NativeEntry};
-pub use op::Op;
+pub use op::{Call, Checked, Op, Route};
 pub use phase::PhaseKind;
 pub use platform::zero_bytes;
 pub use platform::{
