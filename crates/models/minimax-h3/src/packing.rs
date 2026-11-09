@@ -547,9 +547,13 @@ impl DensePacking {
         self.video_rows + self.audio_rows
     }
 
-    /// Row of the prefix source that holds zeros.
-    pub fn zero_row(&self) -> u32 {
-        self.text_rows + self.condition_rows
+    /// Row of the prefix source that holds zeros ([`nn::capability::PrefixSource::zero_row`]).
+    pub const fn zero_row(&self) -> u32 {
+        nn::capability::PrefixSource {
+            text_rows: self.text_rows,
+            condition_rows: self.condition_rows,
+        }
+        .zero_row()
     }
 }
 
@@ -934,9 +938,13 @@ impl SegmentExtent {
         self.audio_start() + self.audio_rows.div_ceil(self.tile) * self.tile
     }
 
-    /// The prefix source's row of zeros.
-    pub fn zero_row(&self) -> u32 {
-        self.text_rows + self.condition_rows
+    /// The prefix source's row of zeros ([`nn::capability::PrefixSource::zero_row`]).
+    pub const fn zero_row(&self) -> u32 {
+        nn::capability::PrefixSource {
+            text_rows: self.text_rows,
+            condition_rows: self.condition_rows,
+        }
+        .zero_row()
     }
 
     /// Generated audio rows packed before packed row `row`.

@@ -93,15 +93,14 @@ struct ConditionRead {
 
 /// The rates one request's artifact is built at.
 ///
-/// They are the model's constants, restated here as a value the worker is handed rather than
-/// read: the frame rate and the clip length are the checkpoint's arithmetic
-/// (`minimax_h3::config::{FPS, CLIP_FRAMES}`), the audio rate the decoder's own (`PCM_RATE`), and a
-/// deployment that changed any of them would change the model's, not the muxer's.
+/// They are the model's, which the worker is handed rather than states: the engine reads them from
+/// the loaded pipeline (`nn::family::VideoModel::frame_rate` and `audio_rate`), and a deployment
+/// that changed either would change the model's, not the muxer's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Rates {
-    /// Frames per second of the artifact: `24` for MiniMax-H3.
+    /// Frames per second of the artifact.
     pub frame_rate: u32,
-    /// Samples per second of the track: `32000` for MiniMax-H3's BigVGAN.
+    /// Samples per second of the track.
     pub audio_rate: u32,
 }
 
@@ -533,8 +532,8 @@ fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> 
 
 /// One vision block's frames, `[frames, height, width, 3]` RGB at `raster`, as its patch rows.
 ///
-/// The tower reads a grid's own pixels, so each frame is resized to the grid first and packed
-/// second.
+/// The tower reads a grid's own pixels, so each frame is resized to the raster the processor sized
+/// the grid from ([`nn::capability::PatchFormat::raster`]) first and packed second.
 fn pack_block(
     format: &MediaFormat,
     rgb: &[u8],
@@ -544,8 +543,7 @@ fn pack_block(
     out: &mut [u8],
 ) -> Result<()> {
     let (height, width) = raster;
-    let side = format.patches.side;
-    let (rows, columns) = (grid[1] * side, grid[2] * side);
+    let (rows, columns) = format.patches.raster(grid);
     let planes = planes_of(rgb, frames as usize, height as usize, width as usize);
     let planes = if (rows, columns) == (height, width) {
         planes
@@ -884,7 +882,7 @@ impl MediaStage {
     ///
     /// `units_of` is the model's own schedule - the frames of each video unit of a `frames`-frame
     /// timeline - passed rather than restated: a video unit's length is the checkpoint's arithmetic
-    /// (`CLIP_FRAMES` and the seam), and a worker that computed it would be a second home for a
+    /// (its frame rule and the seam), and a worker that computed it would be a second home for a
     /// number the model already states.
     pub fn new(
         binding: Binding,

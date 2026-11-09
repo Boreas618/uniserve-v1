@@ -21,7 +21,7 @@
 //! padding row reads the source's **zero row**. That source is one buffer of `text_rows +
 //! condition_rows + 1` rows - the prompt's rows, then one row per packed condition row, then the
 //! zero row last - and [`Layouts::table_specs`]'s `prefix_index` addresses it directly
-//! ([`crate::packing::DensePacking::zero_row`]). The runner builds it, because the encoders produce
+//! ([`nn::capability::PrefixSource`]). The runner builds it, because the encoders produce
 //! the pieces and the packing decides the order; the DiT reads no other conditioning view, so a
 //! condition the source does not carry cannot reach the model.
 //!

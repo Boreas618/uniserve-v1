@@ -160,10 +160,10 @@ struct DenoiseColumns {
     /// The audio latents, in the same per-request blocks; one element when a bucket serves a task
     /// with no soundtrack, so the column is never empty.
     audio: Column,
-    /// `[requests x (text_rows + condition_rows + 1) x text_width]` conditioning rows: the prefix
-    /// source, whose last row is the zero row every generated and padding row gathers.
+    /// `[requests x prefix rows x text_width]` conditioning rows: the prefix source
+    /// ([`nn::capability::PrefixSource`]), whose zero row every generated and padding row gathers.
     text: Column,
-    /// `[requests x (text_rows + condition_rows + 1) x width]` the text encoder's own features.
+    /// `[requests x prefix rows x width]` the text encoder's own features.
     ///
     /// A model with a conditioner between the encoder and the denoiser reads these and folds them
     /// into `text` in place ([`nn::Denoiser::prepare_conditioning`]).
@@ -204,7 +204,7 @@ impl DenoiseColumns {
             if let Some(track) = layout.audio {
                 audio = audio.max(numel(&track)?);
             }
-            width = width.max(prefix_rows(layout));
+            width = width.max(u64::from(layout.prefix().rows()));
         }
         let (source_width, text_width) = conditioning_width(&shape);
         let mut text = Column::new(device, shape.stack, rows * width * text_width)?;
@@ -288,17 +288,12 @@ pub(crate) fn grouped<'a>(
     }
 }
 
-/// The rows of one request's prefix source: the prompt's, the conditions' and the zero row.
+/// The rows of one request's conditioning and the encoder's width: the layout's prefix source
+/// ([`nn::capability::PrefixSource::rows`]), the encoder writing `width` elements in each.
 ///
-/// The packing gathers every generated and padding row from the row past the text and condition
-/// capacities (`DensePacking::zero_row`), so that row is part of the column: a column that ended
-/// before it would hand every such row whatever follows the allocation.
-fn prefix_rows(layout: &Layout) -> u64 {
-    u64::from(layout.text_rows) + u64::from(layout.condition_rows) + 1
-}
-
-/// The rows of one request's conditioning and the encoder's width: [`prefix_rows`] rows, the
-/// encoder writing `width` elements in each.
+/// The packing gathers every generated and padding row from the source's zero row, so that row is
+/// part of the column: a column that ended before it would hand every such row whatever follows the
+/// allocation.
 ///
 /// One statement for the two readers that need it - the view a step hands the model
 /// ([`DenoiserRunner::conditioning`]) and the rows [`DenoiserRunner::seed`] gives their bytes to.
@@ -309,7 +304,7 @@ fn prefix_rows(layout: &Layout) -> u64 {
 /// width is the model's statement and the pair is resolved in [`conditioning_width`].
 fn conditioning_row(shape: &DenoiserShape, layout: &nn::capability::Layout) -> (u64, u64) {
     let width = u64::from(shape.width.max(1));
-    (prefix_rows(layout), width)
+    (u64::from(layout.prefix().rows()), width)
 }
 
 /// The two widths one request's conditioning columns hold: `(source, text)`.
@@ -970,11 +965,11 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
 
     /// Writes the zero row of each pending request's prefix source.
     ///
-    /// Every generated and padding row gathers it (`DensePacking::zero_row`), and it is the last row
-    /// of the layout's prefix, so it sits at another place in the column for each condition rung:
-    /// a request of a higher rung wrote a condition row where a lower rung reads its zeros. The
-    /// rest of a request's `text` is the refiner's and the encoders' to write, and no gather reads
-    /// a row they left.
+    /// Every generated and padding row gathers it ([`nn::capability::PrefixSource::zero_row`]), and
+    /// it follows the layout's text and condition rows, so it sits at another place in the column
+    /// for each condition rung: a request of a higher rung wrote a condition row where a lower rung
+    /// reads its zeros. The rest of a request's `text` is the refiner's and the encoders' to write,
+    /// and no gather reads a row they left.
     fn zero_rows(&mut self, bucket: Bucket) -> Result<()> {
         let layout = layout_of(bucket)?;
         let (rows, _, text_width) = self.conditioning_row(&layout);
@@ -983,8 +978,9 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
         })?;
         let stride = rows * text_width * element;
         let row = text_width * element;
+        let zero = u64::from(layout.prefix().zero_row()) * row;
         for pending in &self.pending {
-            let start = usize::try_from(u64::from(pending.index) * stride + stride - row)
+            let start = usize::try_from(u64::from(pending.index) * stride + zero)
                 .map_err(|_| Error::Invalid("a row is larger than memory".into()))?;
             let end = start + row as usize;
             // SAFETY: the row lies inside this request's block of the column, and `upload_step`

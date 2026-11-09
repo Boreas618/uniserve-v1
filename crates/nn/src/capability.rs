@@ -475,6 +475,43 @@ pub struct Layout {
     pub condition_elements: u32,
 }
 
+impl Layout {
+    /// The prefix source a request of this layout gathers its packed prefix from.
+    pub const fn prefix(&self) -> PrefixSource {
+        PrefixSource {
+            text_rows: self.text_rows,
+            condition_rows: self.condition_rows,
+        }
+    }
+}
+
+/// The rows one request's packed prefix is gathered from, which the runtime allocates and fills and
+/// the denoiser's packing addresses.
+///
+/// The source holds the prompt's `text_rows` rows, then `condition_rows` condition rows, then one
+/// row of zeros ([`Self::zero_row`]) that every generated and padding row of the packed sequence
+/// gathers. The text and condition rows are capacities a request fills from their start; the zero
+/// row is the runtime's to write, at the same place for every request of a layout.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PrefixSource {
+    /// The prompt rows it holds.
+    pub text_rows: u32,
+    /// The condition rows it holds after them.
+    pub condition_rows: u32,
+}
+
+impl PrefixSource {
+    /// The row of zeros: the row past the text and condition rows.
+    pub const fn zero_row(&self) -> u32 {
+        self.text_rows + self.condition_rows
+    }
+
+    /// The rows it holds: the text rows, the condition rows and the zero row.
+    pub const fn rows(&self) -> u32 {
+        self.zero_row() + 1
+    }
+}
+
 /// The extents of one latent tensor.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct LatentShape {
@@ -761,6 +798,13 @@ impl PatchFormat {
     /// The elements of one patch row: `channels · temporal · side²`.
     pub const fn width(&self) -> u32 {
         self.channels * self.temporal * self.side * self.side
+    }
+
+    /// The raster a block of `grid` (`[temporal, rows, columns]` patches) spans, `(height, width)`
+    /// in pixels: the size the processor resized the block's frames to when it planned the grid,
+    /// which the runtime resizes them to again before it lays out their patches.
+    pub const fn raster(&self, grid: [u32; 3]) -> (u32, u32) {
+        (grid[1] * self.side, grid[2] * self.side)
     }
 }
 
