@@ -177,6 +177,7 @@ impl VisionRotary {
     }
 
     /// The compact frequencies one axis repeats: `head_dim / 4`.
+    #[cfg(test)]
     pub const fn per_axis(self) -> u32 {
         self.head_dim / 4
     }
@@ -374,6 +375,7 @@ pub fn rope_index(
 /// prompt's placeholder run for a block holds exactly its merged tokens in that order
 /// (`uniserve/models/qwen3_vl/encoder.py`): the `k`-th placeholder of the prompt takes row `k` of
 /// the concatenated feature table.
+#[cfg(test)]
 pub fn placeholder_rows(ids: &[u32], image_token_id: u32, video_token_id: u32) -> Vec<i32> {
     let mut row: i32 = -1;
     ids.iter()
@@ -533,6 +535,7 @@ fn grid_samples(extent: u32, size: u32) -> Result<Vec<(i32, i32, f32)>> {
 }
 
 /// The number of merged rows one grid's patches form: `time * h * w / merge**2`.
+#[cfg(test)]
 pub fn merged_rows(time: u32, height: u32, width: u32, merge: u32) -> Result<u32> {
     let patches = (time as u64)
         .checked_mul(height as u64)

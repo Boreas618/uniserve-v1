@@ -203,11 +203,13 @@ impl<S: WeightStorage> WeightStore<S> {
     }
 
     /// How many weights this rank holds, for the metrics report and for tests.
+    #[cfg(test)]
     pub fn mapped(&self) -> usize {
         self.mapped.len()
     }
 
     /// How many weights this rank read back from the storage instead of converting them.
+    #[cfg(test)]
     pub fn from_store(&self) -> usize {
         self.from_store
     }
@@ -222,6 +224,7 @@ impl<S: WeightStorage> WeightStore<S> {
     }
 
     /// The storage behind the store.
+    #[cfg(test)]
     pub fn storage(&self) -> &S {
         &self.storage
     }

@@ -1342,7 +1342,6 @@ dependencies = [
 name = "frontend"
 version = "2.0.0"
 dependencies = [
- "anyhow",
  "axum",
  "fastokens",
  "frontend",

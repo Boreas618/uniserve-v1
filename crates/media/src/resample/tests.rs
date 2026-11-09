@@ -9,7 +9,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{bicubic_antialias_f32, bicubic_antialias_u8, lanczos_resize, sinc_resample};
+use super::{bicubic_antialias_u8, lanczos_resize, sinc_resample};
 
 /// The float32 samples of little-endian bytes.
 fn floats(bytes: &[u8]) -> Vec<f32> {
@@ -218,50 +218,4 @@ fn sinc_refuses_a_mismatched_extent() {
     let input = vec![0.0f32; 19];
     assert!(sinc_resample(&input, 2, 10, 16_000, 8_000).is_err());
     assert!(sinc_resample(&input, 1, 19, 0, 8_000).is_err());
-}
-
-#[test]
-fn bicubic_f32_matches_torch() {
-    if fixtures().is_none() {
-        return;
-    }
-    // torch accumulates the float32 convolution in its vectorized order; this
-    // module accumulates in tap order. The reference's weights are float32, so
-    // the values differ only by a few rounding steps.
-    const TOLERANCE: f32 = 1e-6;
-    for case in cases("bicubic_f32") {
-        let (channels, height, width, out_height, out_width) = (
-            case.fields[0],
-            case.fields[1],
-            case.fields[2],
-            case.fields[3],
-            case.fields[4],
-        );
-        let input = floats(&case.input);
-        let expected = floats(&case.expected);
-        let actual = bicubic_antialias_f32(
-            &input,
-            channels,
-            height as u32,
-            width as u32,
-            out_height as u32,
-            out_width as u32,
-        )
-        .unwrap();
-        assert_eq!(actual.len(), expected.len());
-        for (index, (value, reference)) in actual.iter().zip(&expected).enumerate() {
-            assert!(
-                (value - reference).abs() <= TOLERANCE,
-                "bicubic_f32 case {} sample {index}: {value} against {reference}",
-                case.name
-            );
-        }
-    }
-}
-
-#[test]
-fn bicubic_f32_resizes_to_the_same_size_as_a_copy() {
-    let source: Vec<f32> = (0..(2 * 3 * 4)).map(|value| value as f32 / 16.0).collect();
-    let actual = bicubic_antialias_f32(&source, 2, 3, 4, 3, 4).unwrap();
-    assert_eq!(actual, source);
 }

@@ -10,7 +10,6 @@ publish = false
 # in flight and their migration between epochs, and the metrics of the serving
 # address. It links no numerical code (`specs/worker.md` §2.1, §3).
 [dependencies]
-anyhow.workspace = true
 # The tokenizer's decoder chain, which the served tokenizer loads.
 fastokens.workspace = true
 # The checkpoint's own files and the Hub's cache layout.
@@ -22,8 +21,6 @@ serde_json.workspace = true
 serde_with.workspace = true
 thiserror.workspace = true
 thiserror-ext.workspace = true
-# The control link publishes the daemon's commands as a watch channel.
-tokio.workspace = true
 tracing.workspace = true
 # Builds the deterministic serving tokenizer of the test fixtures.
 tokenizers = { workspace = true, optional = true }

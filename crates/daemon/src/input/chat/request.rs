@@ -55,20 +55,12 @@ impl ChatContentPart {
     }
 
     /// Constructs one image URL content part with the given URL string.
+    #[cfg(test)]
     pub fn image_url(image_url: impl Into<String>) -> Self {
         Self::ImageUrl {
             image_url: image_url.into(),
             detail: None,
             uuid: None,
-        }
-    }
-
-    /// Returns the text content of this part when it is a text block, or an
-    /// "unsupported multimodal content" error otherwise.
-    pub fn as_text(&self) -> Result<&str> {
-        match self {
-            Self::Text { text } => Ok(text),
-            Self::ImageUrl { .. } => Err(Error::UnsupportedMultimodalContent("image_url")),
         }
     }
 
@@ -95,19 +87,6 @@ pub enum ChatContent {
 }
 
 impl ChatContent {
-    /// Concatenates text parts without separators, or returns
-    /// `Error::UnsupportedMultimodalContent` if any part is an image.
-    pub fn try_flatten_to_text(&self) -> Result<String> {
-        Ok(match self {
-            Self::Text(text) => text.clone(),
-            Self::Parts(parts) => parts
-                .iter()
-                .map(ChatContentPart::as_text)
-                .collect::<Result<Vec<_>>>()?
-                .concat(),
-        })
-    }
-
     /// Returns whether this content contains any multimodal parts.
     pub fn has_multimodal(&self) -> bool {
         match self {
@@ -251,28 +230,6 @@ impl ChatMessage {
             Self::User { .. } => ChatRole::User,
             Self::Assistant { .. } => ChatRole::Assistant,
             Self::ToolResponse { .. } => ChatRole::ToolResponse,
-        }
-    }
-
-    /// Concatenates the visible text carried by this message.
-    pub fn text_content(&self) -> Result<String> {
-        match self {
-            Self::System { content }
-            | Self::Developer { content, .. }
-            | Self::User { content }
-            | Self::ToolResponse { content, .. } => content.try_flatten_to_text(),
-            Self::Assistant { content } => Ok(content.text()),
-        }
-    }
-
-    /// Concatenates assistant reasoning text when present.
-    pub fn reasoning_content(&self) -> Option<String> {
-        match self {
-            Self::Assistant { content } => content.reasoning(),
-            Self::System { .. }
-            | Self::Developer { .. }
-            | Self::User { .. }
-            | Self::ToolResponse { .. } => None,
         }
     }
 
@@ -517,8 +474,7 @@ impl ChatRequest {
 mod tests {
     use serde_json::json;
 
-    use super::{ChatContent, ChatContentPart, ChatMessage, ChatRole};
-    use crate::output::chat::AssistantContentBlock;
+    use super::{ChatContent, ChatContentPart};
 
     #[test]
     fn chat_content_deserializes_from_raw_string() {
@@ -534,30 +490,5 @@ mod tests {
             content,
             ChatContent::Parts(vec![ChatContentPart::text("hello")])
         );
-    }
-
-    #[test]
-    fn chat_content_try_flattens_text_parts_without_separators() {
-        let content = ChatContent::Parts(vec![
-            ChatContentPart::text("hello"),
-            ChatContentPart::text(" world"),
-        ]);
-        assert_eq!(content.try_flatten_to_text().unwrap(), "hello world");
-    }
-
-    #[test]
-    fn assistant_message_collects_visible_and_reasoning_text() {
-        let message = ChatMessage::assistant_blocks(vec![
-            AssistantContentBlock::Reasoning {
-                text: "inner".to_string(),
-            },
-            AssistantContentBlock::Text {
-                text: "outer".to_string(),
-            },
-        ]);
-
-        assert_eq!(message.role(), ChatRole::Assistant);
-        assert_eq!(message.text_content().unwrap(), "outer");
-        assert_eq!(message.reasoning_content().as_deref(), Some("inner"));
     }
 }

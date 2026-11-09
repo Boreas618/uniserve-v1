@@ -34,6 +34,7 @@ use crate::forward::Forward;
 use crate::weights::Weight;
 
 /// The rows one tile holds: the block size VSA selects with.
+#[cfg(test)]
 const DEFAULT_TILE: u32 = 64;
 
 /// The fewest lanes a selection is compiled with, however few tiles a layout holds.
@@ -99,6 +100,7 @@ impl VsaTiles {
     }
 
     /// The default tile of a video sparse attention block.
+    #[cfg(test)]
     pub fn with_default_tile(heads: u32, width: u32, eps: f32) -> Result<Self> {
         Self::new(DEFAULT_TILE, heads, width, eps)
     }

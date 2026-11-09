@@ -154,6 +154,7 @@ impl AudioActivation {
     }
 
     /// The samples one channel has after the block, for an input of `length` samples.
+    #[cfg(test)]
     pub fn output_length(&self, length: u64) -> Result<u64> {
         let descriptor = self.descriptor();
         descriptor

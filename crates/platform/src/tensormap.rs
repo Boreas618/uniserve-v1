@@ -10,7 +10,7 @@
 use std::ffi::c_void;
 
 use crate::driver::{self, TensorMap as RawTensorMap};
-use crate::{DataType, Device, Error, Result};
+use crate::{Device, Error, Result};
 
 /// The largest tensor rank a tensor map describes.
 const MAX_RANK: usize = 5;
@@ -168,12 +168,12 @@ impl TensorMapSpec<'_> {
 
 /// `CUtensorMapDataType`: the element type of the described tensor.
 ///
-/// This is not a second element type of the crate — [`DataType`] is the one a
+/// This is not a second element type of the crate — [`crate::DataType`] is the one a
 /// buffer, kernel, collective or convolution is told its storage holds. A
-/// tensor map's code set is wider than [`DataType`]'s: it names TF32, an FP32 that
+/// tensor map's code set is wider than [`crate::DataType`]'s: it names TF32, an FP32 that
 /// flushes denormals, and packed 4- and 6-bit formats that no device buffer
 /// has an element size for, which is why the driver's codes are spelled out
-/// here. [`TensorDataType::from_dtype`] converts the types both name.
+/// here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(i32)]
 pub enum TensorDataType {
@@ -199,25 +199,6 @@ pub enum TensorDataType {
     Uint4Align16 = 14,
     /// Packed 6-bit unsigned values, 16 per 16-byte slot.
     Uint6Align16 = 15,
-}
-
-impl TensorDataType {
-    /// The tensor-map code for `dtype`, when the driver names that element
-    /// type; the signed narrow and packed formats of [`DataType`] have none.
-    pub fn from_dtype(dtype: DataType) -> Option<Self> {
-        Some(match dtype {
-            DataType::U8 => Self::Uint8,
-            DataType::I32 => Self::Int32,
-            DataType::U64 => Self::Uint64,
-            DataType::I64 => Self::Int64,
-            DataType::F16 => Self::Float16,
-            DataType::F32 => Self::Float32,
-            DataType::F64 => Self::Float64,
-            DataType::Bf16 => Self::BFloat16,
-            DataType::U32 => Self::Uint32,
-            DataType::I16 | DataType::I8 | DataType::F8E4M3 | DataType::F8E5M2 => return None,
-        })
-    }
 }
 
 /// `CUtensorMapInterleave`: the interleaved layout of the tensor in global
@@ -450,22 +431,5 @@ mod tests {
                 "{spec:?}"
             );
         }
-    }
-
-    #[test]
-    fn the_element_types_both_names_share_convert() {
-        use crate::DataType;
-
-        assert_eq!(
-            TensorDataType::from_dtype(DataType::F32),
-            Some(TensorDataType::Float32)
-        );
-        assert_eq!(
-            TensorDataType::from_dtype(DataType::Bf16),
-            Some(TensorDataType::BFloat16)
-        );
-        // No tensor-map code names a signed byte or an FP8 element.
-        assert_eq!(TensorDataType::from_dtype(DataType::I8), None);
-        assert_eq!(TensorDataType::from_dtype(DataType::F8E4M3), None);
     }
 }

@@ -267,6 +267,7 @@ impl ClipEncoder {
     }
 
     /// The raster's tile grid.
+    #[cfg(test)]
     pub const fn grid(&self) -> &Grid {
         &self.grid
     }
@@ -668,6 +669,7 @@ impl ClipEncoder {
     /// when `start` falls inside the cross-fade that row shares with it, because those rows read the
     /// row above. The crop is the band shifted by the run's origin, so a caller stitching bands
     /// writes each band's rows where the whole encoding would have them.
+    #[cfg(test)]
     pub fn band(&self, start: u32, stop: u32) -> Result<Plan> {
         if start >= stop || stop > self.latent.0 {
             return Err(Error::config(format!(

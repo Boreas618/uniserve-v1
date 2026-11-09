@@ -74,7 +74,7 @@ pub use crate::core::{SchedulerHandle, WorkerGroupConfig, WorkerGroupRole, Worke
 pub use crate::handle::{
     CacheChange, Command, CommandSender, CommandWaker, Counters, EVENT_BUFFER_CAPACITY, EventRx,
     EventSendError, EventTx, HookBarrier, PolicyPrograms, PolicySlotHandle, StageApplied,
-    StreamCancelCause, Submission, SubmitError, Wake, WeightsInFlight,
+    Submission, SubmitError, Wake, WeightsInFlight,
 };
 #[cfg(feature = "testing")]
 pub use crate::worker::{BatchResult, CallResult, Worker};
@@ -138,11 +138,13 @@ pub(crate) mod stats_report;
 pub use epoch::{GroupCache, ParkedCache};
 use ipc::{ForwardMode, TransferMode};
 #[cfg(feature = "testing")]
+pub use policy::RoutePolicy;
+#[cfg(feature = "testing")]
 pub(crate) use policy::process_engine;
 pub use policy::{
     Arrival, BatchCapacity, Candidate, Limits, PREFETCH_FLOOR_TOKENS, Parameters, PolicyBytes,
     PolicyProgram, PolicyReverted, PolicySlot, PolicySource, PolicyUsage, ProgramSource, Progress,
-    RoutePolicy, RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
+    RouteTrial, Stage, TrialState, Validators, arrival_view, ceilings_of,
 };
 pub use proto::config::{
     DEFAULT_CHUNKED_PREFILL_SIZE, DEFAULT_MAX_BATCH, DEFAULT_MAX_NUM_BATCHED_TOKENS,

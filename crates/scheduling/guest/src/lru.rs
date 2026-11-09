@@ -57,6 +57,7 @@ impl<I: Copy + Eq + Hash> Lru<I> {
 
     /// An order from the least recently used object to the most recently
     /// used, as a snapshot of the mechanism states it.
+    #[cfg(test)]
     pub fn from_least_recent(ids: impl IntoIterator<Item = I>) -> Self {
         let mut lru = Self::new();
         for id in ids {
@@ -101,6 +102,7 @@ impl<I: Copy + Eq + Hash> Lru<I> {
     }
 
     /// The object a shortage takes first: the least recently used.
+    #[cfg(test)]
     pub fn least(&self) -> Option<I> {
         self.head
     }
@@ -123,6 +125,7 @@ impl<I: Copy + Eq + Hash> Lru<I> {
     }
 
     /// Whether no object is in the order.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }

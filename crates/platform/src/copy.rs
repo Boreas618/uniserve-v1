@@ -189,6 +189,7 @@ impl CopyBatch {
         self.sizes.push(bytes);
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.sizes.len()
     }

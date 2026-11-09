@@ -127,16 +127,19 @@ impl<K: Order> Waiting<K> {
     }
 
     /// The request at the head of the queue.
+    #[cfg(test)]
     pub fn front(&self) -> Option<RequestId> {
         self.queued.first().map(|queued| queued.request)
     }
 
     /// How many requests wait.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.queued.len()
     }
 
     /// Whether nothing waits.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.queued.is_empty()
     }

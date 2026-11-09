@@ -64,6 +64,7 @@ pub fn npy_bytes(shape: &[u64], payload: &[u8]) -> Result<Vec<u8>, String> {
 }
 
 /// The `f32` bytes of a slice, which is the payload [`write_npy`] takes.
+#[cfg(test)]
 pub fn f32_bytes(values: &[f32]) -> Vec<u8> {
     values
         .iter()

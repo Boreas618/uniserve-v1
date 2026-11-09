@@ -351,6 +351,7 @@ impl ChatResponseContext {
 /// when the stream yields an error or a `Failed` event, closes without a
 /// terminal event, lacks output logprobs the response must include or prompt
 /// logprobs the request asked for, or fails to convert output logprobs.
+#[cfg(test)]
 pub async fn collect_chat_completion(
     stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
     context: ChatResponseContext,
@@ -799,6 +800,7 @@ fn decoded_prompt_logprobs(state: &handoff::DecodedPromptLogprobs) -> DecodedPro
 ///
 /// The closed content blocks and tool calls carry the complete message, so
 /// the deltas inside them are skipped.
+#[cfg(test)]
 async fn collect_chat_events(
     stream: impl Stream<Item = Result<RequestOutput, crate::output::OutputError>> + Send,
 ) -> Result<CollectedChatOutput, ApiError> {

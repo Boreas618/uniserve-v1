@@ -487,6 +487,7 @@ impl Partition {
     /// A builder rather than another positional `usize` on [`Self::new`] and [`Self::serving`]: those
     /// already take the text encoder's degree and rank, and two adjacent integers of the same type
     /// with different meanings is how a deployment ends up sharded one way and drawing the other.
+    #[cfg(test)]
     pub fn at_sequence_rank(self, rank: usize) -> Self {
         Self {
             sequence_rank: rank,
@@ -777,11 +778,13 @@ impl Partition {
     }
 
     /// The query heads one tensor-parallel rank of the text encoder holds.
+    #[cfg(test)]
     pub const fn text_query_heads(&self, config: &Config) -> u32 {
         config.text_encoder.num_attention_heads / self.tensor_parallel as u32
     }
 
     /// The key/value heads one tensor-parallel rank of the text encoder holds.
+    #[cfg(test)]
     pub const fn text_key_value_heads(&self, config: &Config) -> u32 {
         config.text_encoder.num_key_value_heads / self.tensor_parallel as u32
     }

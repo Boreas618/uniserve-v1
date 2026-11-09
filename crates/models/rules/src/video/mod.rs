@@ -74,13 +74,6 @@ pub enum ConditionRole {
     Reference,
 }
 
-impl ConditionRole {
-    /// Whether the condition anchors a generated frame.
-    pub const fn is_keyframe(self) -> bool {
-        matches!(self, Self::FirstFrame | Self::LastFrame)
-    }
-}
-
 /// Where a condition's fetched media bytes are: a POSIX shared-memory object
 /// on the host that runs the server and the media reader.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -326,99 +319,11 @@ pub struct VideoCondition {
 }
 
 impl VideoCondition {
-    /// Denoiser video rows of the condition.
-    pub fn video_rows(&self) -> u64 {
-        self.latent_units.iter().map(|rows| u64::from(*rows)).sum()
-    }
-
     /// Bytes of the RGB24 pixels the video encoder encodes.
     pub fn pixel_bytes(&self) -> u64 {
         self.media.pixels().map_or(0, |(frames, canvas)| {
             u64::from(frames) * u64::from(canvas.width) * u64::from(canvas.height) * 3
         })
-    }
-
-    /// Checks the condition's internal consistency: a keyframe is one still
-    /// image the conditioner may read; a condition with pixels encodes to
-    /// positive rows in at least one unit and one without has none; a
-    /// condition with an audio track encodes to positive audio rows and one
-    /// without has none; a video's conditioner view samples kept frames in
-    /// increasing order and an image's samples none; every extent is
-    /// positive.
-    pub fn validate(&self) -> Result<(), &'static str> {
-        if self.source.name.is_empty() || self.source.name.contains('/') || self.source.bytes == 0 {
-            return Err("a condition's media locator is invalid");
-        }
-        if self.role.is_keyframe() && !matches!(self.media, ConditionMedia::Image(_)) {
-            return Err("a keyframe is one still image");
-        }
-        let canvases_positive = |canvas: Canvas| canvas.width > 0 && canvas.height > 0;
-        match &self.media {
-            ConditionMedia::Image(fit) => {
-                if !canvases_positive(fit.size)
-                    || !canvases_positive(fit.resized)
-                    || u64::from(fit.left) + u64::from(fit.size.width)
-                        > u64::from(fit.resized.width)
-                    || u64::from(fit.top) + u64::from(fit.size.height)
-                        > u64::from(fit.resized.height)
-                {
-                    return Err("an image fit keeps a window outside its resized image");
-                }
-            }
-            ConditionMedia::Video { clip, .. } => {
-                if !canvases_positive(clip.canvas)
-                    || clip.vae_frames == 0
-                    || clip.vae_frames > clip.frames
-                {
-                    return Err("a video clip encodes frames it does not keep");
-                }
-            }
-            ConditionMedia::Audio(_) => {}
-        }
-        if let Some(track) = self.media.audio()
-            && (track.sample_rate == 0 || track.source_samples == 0 || track.samples == 0)
-        {
-            return Err("an audio track keeps no samples");
-        }
-        let has_pixels = self.media.pixels().is_some();
-        if has_pixels == self.latent_units.is_empty() || self.latent_units.contains(&0) {
-            return Err("a condition's latent units disagree with its pixels");
-        }
-        if self.media.audio().is_some() != (self.audio_rows > 0) {
-            return Err("a condition's audio rows disagree with its audio track");
-        }
-        if let Some(vision) = &self.vision {
-            let video = match &self.media {
-                ConditionMedia::Video { clip, .. } => Some(clip),
-                ConditionMedia::Image(_) => None,
-                ConditionMedia::Audio(_) => {
-                    return Err("the conditioner reads no audio reference");
-                }
-            };
-            if vision.grid.patches() == 0 || vision.tokens == 0 {
-                return Err("a conditioner view covers no patches");
-            }
-            match video {
-                None if !vision.frame_indices.is_empty() || vision.grid.t != 1 => {
-                    return Err("an image's conditioner view samples one frame");
-                }
-                Some(clip)
-                    if vision.frame_indices.is_empty()
-                        || !vision
-                            .frame_indices
-                            .windows(2)
-                            .all(|pair| pair[0] < pair[1])
-                        || vision
-                            .frame_indices
-                            .last()
-                            .is_some_and(|last| *last >= clip.frames) =>
-                {
-                    return Err("a video's conditioner view samples frames it does not keep");
-                }
-                _ => {}
-            }
-        }
-        Ok(())
     }
 }
 
@@ -459,28 +364,6 @@ impl Conditioning {
     /// Fails when `bytes` are not a conditioning.
     pub fn decode(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
-    }
-
-    /// Checks the conditioning of a request whose presentation holds
-    /// `prompt_tokens` tokens: every token has a tag; `t2va` has no
-    /// conditions, `fl2va` only keyframes and `ref2va` at least one
-    /// condition; every condition is consistent
-    /// ([`VideoCondition::validate`]).
-    pub fn validate(&self, prompt_tokens: usize) -> Result<(), &'static str> {
-        if self.text_tags.len() != prompt_tokens {
-            return Err("every video prompt token requires one tag");
-        }
-        let served = self.conditions.iter().all(|condition| match self.task {
-            VideoTask::T2va => false,
-            VideoTask::Fl2va => condition.role.is_keyframe(),
-            VideoTask::Ref2va => true,
-        });
-        if !served || (self.task != VideoTask::T2va && self.conditions.is_empty()) {
-            return Err("the conditions do not fit the task");
-        }
-        self.conditions
-            .iter()
-            .try_for_each(VideoCondition::validate)
     }
 }
 
@@ -750,33 +633,6 @@ mod tests {
         assert_eq!(decoded, conditioning);
     }
 
-    /// A conditioning whose tags do not cover its prompt, or whose `t2va`
-    /// task carries conditions, is refused.
-    #[test]
-    fn an_inconsistent_conditioning_is_refused() {
-        let conditioning = |task, text_tags: Vec<u8>, conditions| Conditioning {
-            task,
-            text_tags,
-            conditions,
-        };
-        assert!(
-            conditioning(VideoTask::T2va, vec![1, 1], Vec::new())
-                .validate(3)
-                .is_err()
-        );
-        assert!(
-            conditioning(VideoTask::T2va, vec![1, 1, 1], reference_conditions())
-                .validate(3)
-                .is_err()
-        );
-        // The first condition is a keyframe, which `ref2va` also takes.
-        assert!(
-            conditioning(VideoTask::Ref2va, vec![1, 1, 1], reference_conditions())
-                .validate(3)
-                .is_ok()
-        );
-    }
-
     fn image(role: ConditionRole) -> VideoCondition {
         let canvas = Canvas {
             width: 64,
@@ -804,54 +660,10 @@ mod tests {
         }
     }
 
-    /// A still image keyframe or reference is consistent, and its sizes
-    /// follow from its raster and units.
+    /// A still image's pixel bytes follow from its raster.
     #[test]
-    fn an_image_condition_is_consistent() {
+    fn an_image_condition_sizes_its_pixels() {
         let condition = image(ConditionRole::FirstFrame);
-        assert_eq!(condition.validate(), Ok(()));
-        assert_eq!(condition.video_rows(), 2);
         assert_eq!(condition.pixel_bytes(), 64 * 32 * 3);
-    }
-
-    /// Inconsistent conditions are refused: a keyframe that is not an image,
-    /// rows without pixels, and a video view sampling frames past the clip.
-    #[test]
-    fn inconsistent_conditions_are_refused() {
-        let mut audio = image(ConditionRole::FirstFrame);
-        audio.media = ConditionMedia::Audio(AudioClip {
-            sample_rate: 48_000,
-            start_sample: 0,
-            source_samples: 48_000,
-            samples: 32_000,
-        });
-        assert!(audio.validate().is_err());
-
-        audio.role = ConditionRole::Reference;
-        audio.vision = None;
-        assert!(audio.validate().is_err(), "rows without pixels");
-        audio.latent_units.clear();
-        audio.audio_rows = 80;
-        assert_eq!(audio.validate(), Ok(()));
-
-        let mut video = image(ConditionRole::Reference);
-        video.media = ConditionMedia::Video {
-            clip: VideoClip {
-                canvas: Canvas {
-                    width: 64,
-                    height: 32,
-                },
-                start_frame: 0,
-                frames: 24,
-                vae_frames: 22,
-            },
-            soundtrack: None,
-        };
-        video.vision = Some(ConditionVision {
-            grid: VisionGrid { t: 1, h: 2, w: 4 },
-            tokens: 2,
-            frame_indices: vec![0, 12, 24],
-        });
-        assert!(video.validate().is_err(), "frame 24 is not kept");
     }
 }

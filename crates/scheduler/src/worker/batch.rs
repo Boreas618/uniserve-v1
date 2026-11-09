@@ -6,9 +6,11 @@
 //! simulated one.
 
 use super::WorkerGroupId;
+#[cfg(feature = "testing")]
+use ipc::NewRequest;
 use ipc::{
     BatchCommand, BlockTable, BufferAllocation, CacheUnitAllocation, Call, DecodeRange,
-    ForwardBatch, LatentParams, NewRequest, RequestKey, TensorExport,
+    ForwardBatch, LatentParams, RequestKey, TensorExport,
 };
 use std::collections::BTreeMap;
 
@@ -166,6 +168,7 @@ impl ExecutionBatch {
     }
 
     /// Iterates over request admissions carried by batch commands.
+    #[cfg(feature = "testing")]
     pub fn admissions(&self) -> impl Iterator<Item = &NewRequest> {
         self.commands.iter().filter_map(|command| match command {
             BatchCommand::Start { request } => Some(request.as_ref()),
@@ -219,6 +222,7 @@ impl ExecutionBatch {
     /// identities are unique and belong to this batch, that each dispatch
     /// describes its own call, and that every `Start` is unique and names a
     /// request with a call in this batch.
+    #[cfg(feature = "testing")]
     pub fn validate(&self) -> anyhow::Result<()> {
         // A batch of page offloads alone writes the engine's last published
         // pages to the host KV cache before it closes its workers.

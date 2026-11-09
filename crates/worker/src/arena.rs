@@ -295,6 +295,7 @@ impl PoolTotals {
     }
 
     /// The last total booked for `pool`.
+    #[cfg(test)]
     pub fn total(&self, pool: PoolKind) -> u64 {
         let totals = self
             .totals
@@ -304,6 +305,7 @@ impl PoolTotals {
     }
 
     /// The three totals as the metrics report them, graph, scratch, resident.
+    #[cfg(test)]
     pub fn totals(&self) -> (u64, u64, u64) {
         let totals = self
             .totals

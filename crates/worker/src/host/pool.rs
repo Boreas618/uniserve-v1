@@ -63,6 +63,7 @@ impl<A: HostAction> HostTask<A> {
 
     /// Waits at most `timeout` for the task's outcome; `Duration::ZERO` is a
     /// poll, which is what a serve loop does between batches.
+    #[cfg(test)]
     pub fn wait_timeout(&self, timeout: std::time::Duration) -> Option<Outcome<Arc<A::Output>>> {
         self.completion.wait_timeout(timeout)
     }

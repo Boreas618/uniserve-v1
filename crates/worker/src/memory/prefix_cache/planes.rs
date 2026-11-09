@@ -907,45 +907,6 @@ impl CachePlanes {
         Ok(views)
     }
 
-    /// Tokens `[offset, offset + count)` of every column of `unit`, as group
-    /// `group` reads them: `[count, columns, heads, dim]` in the group's
-    /// stored dtype. Column `c` holds the page's layer `row * columns + c`
-    /// of the unit's page position `row`.
-    pub fn page(
-        &self,
-        field: usize,
-        group: usize,
-        unit: u32,
-        offset: u32,
-        count: u32,
-    ) -> Result<StorageView> {
-        self.require_unit(unit)?;
-        let plan = &self.plan.groups[group];
-        if offset + count > plan.block_size {
-            return Err(Error::Invalid("a page view exceeds its page".into()));
-        }
-        let element = plan.dtype.bytes() as u64;
-        let row = i64::from(plan.num_kv_heads) * i64::from(plan.head_dim);
-        let base = u64::from(unit) * self.plan.plane_bytes + u64::from(offset) * plan.row_bytes();
-        StorageView::strided(
-            Arc::clone(&self.values[field]) as Arc<dyn Backing>,
-            base as usize,
-            plan.dtype,
-            &[
-                i64::from(count),
-                i64::from(self.plan.columns),
-                i64::from(plan.num_kv_heads),
-                i64::from(plan.head_dim),
-            ],
-            &[
-                row,
-                (u64::from(self.num_units) * self.plan.plane_bytes / element) as i64,
-                i64::from(plan.head_dim),
-                1,
-            ],
-        )
-    }
-
     /// Tokens `[offset, offset + count)` of one layer: column `column` of
     /// `unit`, as a contiguous `[count, 1, heads, dim]` group-dtype view
     /// matching one layer of a transfer's `[tokens, layers, heads, dim]`.
@@ -986,6 +947,7 @@ impl CachePlanes {
     /// This is the `resident` side of the device's storage for the metrics
     /// report, so it counts mapped storage only: a sleeping rank's released
     /// segments are not in it.
+    #[cfg(test)]
     pub fn mapped_bytes(&self) -> u64 {
         // A sleeping rank gives segments back from `released_from` on, and the
         // storages keep their size while their segments are absent, so the
@@ -1084,6 +1046,7 @@ impl CachePlanes {
     /// every layer in the group and occupies `units_per_page = layers / columns`
     /// units; layer `k` of the group reads column `k % columns` of the page's
     /// `k / columns`-th unit, so a layer occupies exactly one cell of a page.
+    #[cfg(test)]
     pub fn columns(&self) -> u32 {
         self.plan.columns
     }

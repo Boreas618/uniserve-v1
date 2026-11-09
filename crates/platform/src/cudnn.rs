@@ -70,8 +70,8 @@
 //! it; a descriptor without one is refused at `cudnnBackendFinalize` with
 //! `CUDNN_STATUS_BAD_PARAM`. [`Tensor::contiguous`] declares 16 bytes — what
 //! every device allocation of this crate and every torch storage provide —
-//! and [`Tensor::with_alignment`] states a smaller one for a view into the
-//! middle of a row. [`Cudnn::run`] refuses an address that is not aligned the
+//! and a view into the middle of a row states a smaller one in
+//! [`Tensor::byte_alignment`]. [`Cudnn::run`] refuses an address that is not aligned the
 //! way the plan's tensors declare, so a wrong declaration is an error here
 //! rather than a misaligned read on the device.
 //!
@@ -432,7 +432,7 @@ pub struct Tensor {
     /// be aligned to it. Every device allocation this crate makes and every
     /// torch storage are at least 16-byte aligned, which is what
     /// [`Tensor::contiguous`] declares; a view into the middle of an element
-    /// boundary is not, and says so with [`Tensor::with_alignment`].
+    /// boundary is not, and says so here.
     pub byte_alignment: i64,
 }
 
@@ -450,14 +450,6 @@ impl Tensor {
             dtype,
             byte_alignment: DEFAULT_ALIGNMENT,
         }
-    }
-
-    /// The same tensor, with the alignment of its storage declared as
-    /// `bytes`: cuDNN uses it to choose engines that may vectorize, so it
-    /// must be what the address really is — never more.
-    pub fn with_alignment(mut self, bytes: i64) -> Self {
-        self.byte_alignment = bytes;
-        self
     }
 
     /// The number of dimensions: `N` and `C` plus the spatial ones.
@@ -2263,7 +2255,9 @@ mod tests {
 
         // A view at an element boundary declares the element's own alignment,
         // which an engine that vectorizes then knows it cannot use.
-        assert!(tensor.clone().with_alignment(4).check().is_ok());
+        let mut view = tensor.clone();
+        view.byte_alignment = 4;
+        assert!(view.check().is_ok());
 
         let mut wrong = tensor;
         wrong.byte_alignment = 3;

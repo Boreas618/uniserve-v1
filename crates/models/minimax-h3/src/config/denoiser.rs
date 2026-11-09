@@ -168,6 +168,7 @@ impl ScheduleSpec {
     /// The uniform grid evaluates its sigma points but the clean endpoint; both students evaluate
     /// one step per stated rung or block. The layer still reads the actual count from the computed
     /// schedule, which deduplicates collapsed FP32 values; this is the count a checkpoint states.
+    #[cfg(test)]
     pub fn steps(&self) -> u32 {
         match &self.grid {
             ScheduleGrid::Uniform { points } => points - 1,

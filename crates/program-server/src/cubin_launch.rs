@@ -447,6 +447,7 @@ impl Word {
     }
 
     /// The word's bytes.
+    #[cfg(test)]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
     }

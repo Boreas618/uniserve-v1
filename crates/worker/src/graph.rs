@@ -206,6 +206,7 @@ impl Graphs {
     }
 
     /// Every generation with at least one captured graph, in numeric order.
+    #[cfg(test)]
     pub fn generations(&self) -> Vec<u64> {
         let mut generations: Vec<u64> = self
             .captured
@@ -285,6 +286,7 @@ impl Graphs {
     }
 
     /// Whether the runner holds no graph.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.captured.is_empty()
     }

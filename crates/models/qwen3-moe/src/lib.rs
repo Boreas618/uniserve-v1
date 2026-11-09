@@ -23,7 +23,6 @@ pub mod keys;
 pub mod load;
 pub mod model;
 pub mod partition;
-pub mod reference;
 pub mod representation;
 pub mod weights;
 

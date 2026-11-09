@@ -49,13 +49,16 @@
 //! `gelu_pytorch_tanh` (`VisionConfig::hidden_act`), the patch mergers a plain `nn.GELU()`, which is
 //! the exact `erf` form. [`Gelu`] takes the approximation, and the tower holds one of each.
 
+#[cfg(test)]
+use nn::DevicePtr;
 use nn::capability::ImageInput;
 use nn::layers::{Attention, Gelu, LayerNorm, Linear, PositionInterpolate, Rotate, ScaledResidual};
 use nn::weights::{WeightLoader, WeightRequest};
-use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
+use nn::{Arena, Forward, Shape, TensorView, Weight};
 use ops::gemm::WeightOrder;
 
 use crate::config::{VisionActivation, VisionConfig};
+#[cfg(test)]
 use crate::decoding::Buffer;
 use crate::positions::invalid;
 use crate::{Error, Result};
@@ -344,6 +347,7 @@ impl Buffers {
     ///
     /// The reservations are made against a region of exactly that size, so the number is the one
     /// the worker plans a captured bucket with and cannot drift from the reservations.
+    #[cfg(test)]
     pub fn bytes(config: &VisionConfig, patches: u32, dtype: nn::DType) -> Result<u64> {
         let arena = Arena::new(DevicePtr::new(0), u64::MAX);
         Self::new(&arena, config, patches, dtype)?;
@@ -356,6 +360,7 @@ impl Buffers {
     /// arena read the same object. The caller prefixes each name with the image's index: the tower
     /// runs once per image, in prompt order, so these are `images.len()` sets and never one set
     /// multiplied by anything.
+    #[cfg(test)]
     pub fn plan(config: &VisionConfig, patches: u32, dtype: nn::DType) -> Vec<Buffer> {
         let rows = u64::from(patches);
         let hidden = u64::from(config.hidden_size);

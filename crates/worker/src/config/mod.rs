@@ -18,6 +18,7 @@ pub use device::Device;
 pub struct DescriptorError(String);
 
 impl DescriptorError {
+    #[cfg(test)]
     pub fn new(message: impl Into<String>) -> Self {
         Self(message.into())
     }

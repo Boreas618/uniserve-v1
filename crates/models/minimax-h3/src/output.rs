@@ -83,6 +83,7 @@ impl Rgb {
     }
 
     /// The bytes the raster occupies: one per channel per pixel.
+    #[cfg(test)]
     pub fn bytes(&self) -> u64 {
         u64::from(self.frames)
             * u64::from(self.height)
@@ -91,6 +92,7 @@ impl Rgb {
     }
 
     /// The frames the decoder's own workspace holds: the longest clip, the last, which keeps its tail.
+    #[cfg(test)]
     pub const fn workspace_frames() -> u32 {
         25
     }
@@ -110,6 +112,7 @@ impl Rgb {
     /// truncated to a byte. This is the reference of the operator the output stage runs; a kernel
     /// that computes it must agree with it on every input, including the ties a half-even round
     /// resolves away from zero.
+    #[cfg(test)]
     pub fn quantize(&self, normalized: [f32; 3]) -> [u8; 3] {
         let mut bytes = [0u8; 3];
         for (channel, value) in normalized.iter().enumerate() {
@@ -133,16 +136,19 @@ impl Pcm {
     pub const CHANNELS: u32 = 2;
 
     /// The raster of `samples` sample frames.
+    #[cfg(test)]
     pub const fn of(samples: u32) -> Self {
         Self { samples }
     }
 
     /// The integers the raster holds: one per channel per sample.
+    #[cfg(test)]
     pub fn elements(&self) -> u64 {
         u64::from(self.samples) * u64::from(Self::CHANNELS)
     }
 
     /// The bytes the raster occupies, two per integer.
+    #[cfg(test)]
     pub fn bytes(&self) -> u64 {
         self.elements() * 2
     }
@@ -151,6 +157,7 @@ impl Pcm {
     ///
     /// The same arithmetic [`crate::audio_vae::Pcm::quantize`] states for the decoder's output
     /// stage; the two must agree on every input.
+    #[cfg(test)]
     pub fn quantize(&self, sample: f32) -> i16 {
         (sample.clamp(-1.0, 1.0) * PCM_MAX).round_ties_even() as i16
     }
@@ -785,6 +792,7 @@ fn frames_of(out: TensorView, start: u32, stop: u32) -> Result<TensorView> {
 }
 
 /// The whole timeline of `clips` clips: how many frames it writes.
+#[cfg(test)]
 pub fn timeline_frames(clips: &[Splice]) -> Result<u32> {
     if clips.is_empty() {
         return Err(Error::config("a video timeline has a clip".to_owned()));

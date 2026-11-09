@@ -1,6 +1,7 @@
 //! Shared operation results, waits, and completion observers.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+#[cfg(test)]
 use std::time::{Duration, Instant};
 
 use crate::{Error, Result, lock};
@@ -91,6 +92,7 @@ impl<C, T: Clone> Completion<C, T> {
 
     /// Waits at most `timeout` for the outcome: what a serve loop does between
     /// batches, where `Duration::ZERO` is a poll.
+    #[cfg(test)]
     pub fn wait_timeout(&self, timeout: Duration) -> Option<Outcome<T>> {
         let deadline = Instant::now() + timeout;
         let mut state = self.state();
