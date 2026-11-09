@@ -18,7 +18,6 @@ cuBLASLt, which the module links and the deployment provides.
 
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
 
@@ -79,9 +78,13 @@ def main() -> int:
     output = pathlib.Path(os.environ["UNISERVE_OUT"]) / "module.so"
     output.parent.mkdir(parents=True, exist_ok=True)
 
-    nvcc = os.environ.get("UNISERVE_NVCC") or shutil.which("nvcc")
+    # The nvcc the Program Server checked against this package's declared version.
+    nvcc = os.environ.get("UNISERVE_NVCC")
     if not nvcc:
-        print("no nvcc on this host: the CUDA toolkit is required", file=sys.stderr)
+        print(
+            "UNISERVE_NVCC names no nvcc: the Program Server passes the one it checked",
+            file=sys.stderr,
+        )
         return 1
 
     command = [

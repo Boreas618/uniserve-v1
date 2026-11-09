@@ -1,28 +1,25 @@
 #!/bin/bash
 # Builds the shared FFmpeg 8.1.2 + libx264 runtime the media crate's shim
-# links (see README.md). The environment's FFmpeg installation at
-# /opt/uv/ffmpeg-8.1.2 is static and was configured --disable-autodetect, so
-# it carries no H.264 encoder; the crate needs a shared build of the same
-# FFmpeg version with libx264.
+# links (see README.md). A static FFmpeg configured --disable-autodetect
+# carries no H.264 encoder; the crate needs a shared build of FFmpeg 8.1.2
+# with libx264.
 #
 # Usage:
-#   crates/media/native/build.sh [PREFIX]
+#   FFMPEG_SOURCE=<FFmpeg 8.1.2 source> crates/media/native/build.sh <PREFIX>
 #
-# PREFIX defaults to <workspace>/artifacts/native/prefix, which is where
-# crates/media/build.rs looks when UNISERVE_FFMPEG_DIR is unset. The build is
-# idempotent: an existing PREFIX with both libraries is left alone.
+# PREFIX is the directory the runtime is installed into, which a build then
+# names with UNISERVE_FFMPEG_DIR. The build is idempotent: an existing PREFIX
+# with both libraries is left alone.
 #
-# Requirements: gcc, make, pkg-config, zlib and the FFmpeg 8.1.2 source at
-# /opt/uv/ffmpeg-8.1.2/src/ffmpeg-8.1.2 (the environment provides it). The
-# x264 tarball is pinned by its SHA-256; if upstream's master archive has
+# Requirements: gcc, make, pkg-config, zlib and the FFmpeg 8.1.2 source tree
+# FFMPEG_SOURCE names. The x264 tarball is pinned by its SHA-256; if upstream's master archive has
 # moved, download the archive, verify it is a working x264, and update
 # X264_SHA256 below.
 set -euo pipefail
 
-ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)
-PREFIX=${1:-${PREFIX:-$ROOT/artifacts/native/prefix}}
+PREFIX=${1:?usage: build.sh <PREFIX>, the directory the runtime is installed into}
 JOBS=${JOBS:-$(nproc)}
-FFMPEG_SOURCE=${FFMPEG_SOURCE:-/opt/uv/ffmpeg-8.1.2/src/ffmpeg-8.1.2}
+FFMPEG_SOURCE=${FFMPEG_SOURCE:?names the FFmpeg 8.1.2 source tree}
 
 # The x264 master archive the provisioned runtime was built from, x264 build
 # 165 (point version 0.165.x).

@@ -1,6 +1,6 @@
 //! The reference continuation a generation is compared against.
 //!
-//! `notes/reference/qwen3-greedy-32-margins.json` records the ids a reference stack generated from
+//! A reference file records the ids a reference stack generated from
 //! a fixed prompt and the margin of its choice at every step: the gap between the best logit and
 //! the runner-up, in logit units. The margin is what makes a difference readable - a margin of
 //! zero says the reference's own choice was a tie and a stack that picks the other token there is

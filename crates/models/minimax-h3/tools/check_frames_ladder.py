@@ -16,7 +16,7 @@ Both are computed from **the model's own frame rule**, read from `config/mod.rs`
 `DEPLOYMENT_FRAMES`, read from its source. A tool carrying a copy of `17n + 5`
 could agree with itself while disagreeing with the file, so it carries none.
 
-    python crates/models/minimax-h3/tools/check_frames_ladder.py
+    python crates/models/minimax-h3/tools/check_frames_ladder.py --keys <H3 key file>
     python crates/models/minimax-h3/tools/check_frames_ladder.py --self-test
 
 When every default rung is requestable the check goes on to the row comparison:
@@ -45,7 +45,7 @@ LADDER = re.compile(r"clip lengths: \[(?P<list>[^\]]*)\]")
 # The model's frame rule lives in three constants. They are read, never
 # restated: the rule is `CLIP_FRAMES n + CLIP_LATENTS`, at least one clip, up to
 # `MAX_FRAMES`.
-CONSTANTS = pathlib.Path("crates/models/minimax-h3/src/config/mod.rs")
+CONSTANTS = ROOT / "crates/models/minimax-h3/src/config/mod.rs"
 CONSTANT = re.compile(
     r"pub const (?P<name>CLIP_FRAMES|CLIP_LATENTS|MAX_FRAMES)"
     r": u32 = (?P<value>\d+);"
@@ -54,7 +54,6 @@ CONSTANT = re.compile(
 # The ladder the generator states when no `--frames` is given:
 # `const DEPLOYMENT_FRAMES: [u32; 6] = [5, 17, .., MAX_FRAMES];`. A rung written
 # as a constant's name is resolved from `config/mod.rs`, never typed here.
-FIXTURE = pathlib.Path("notes/programs/minimax-h3-keys.txt")
 AXES = re.compile(r"clip ladder \[(?P<list>[^\]]*)\]")
 
 # The deployment's own ladder is `Deployment::generated`, in the crate: the
@@ -62,7 +61,7 @@ AXES = re.compile(r"clip ladder \[(?P<list>[^\]]*)\]")
 # rule both obey. The step is read from the source, never typed here -
 # stepping by `CLIP_LATENTS` instead of `CLIP_FRAMES` printed 198 rungs where
 # the rule has 59.
-PROGRAMS = pathlib.Path("crates/models/minimax-h3/src/programs.rs")
+PROGRAMS = ROOT / "crates/models/minimax-h3/src/programs.rs"
 GENERATED = re.compile(r"pub fn generated\(\)")
 STEP = re.compile(r"frames \+= (?P<step>[A-Za-z_:]+);")
 
@@ -71,7 +70,7 @@ def constants() -> dict[str, int]:
     """The frame rule's three constants, as `config/mod.rs` states them."""
     values = {
         found["name"]: int(found["value"])
-        for found in CONSTANT.finditer((ROOT / CONSTANTS).read_text())
+        for found in CONSTANT.finditer(CONSTANTS.read_text())
     }
     missing = {"CLIP_FRAMES", "CLIP_LATENTS", "MAX_FRAMES"} - set(values)
     if missing:
@@ -234,9 +233,16 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="prove the comparisons on sets it makes itself, with no build",
     )
+    parser.add_argument(
+        "--keys",
+        type=pathlib.Path,
+        help="the H3 key file whose clip ladder is checked",
+    )
     arguments = parser.parse_args(argv)
     if arguments.self_test:
         return self_test()
+    if arguments.keys is None:
+        parser.error("name the H3 key file with --keys")
 
     clause = servable()
     if not clause:
@@ -248,12 +254,12 @@ def main(argv: list[str] | None = None) -> int:
     # The row set states a ladder in its own `axes:` line, and that statement is
     # what a store serves: a rung the model cannot produce is a row set for
     # clips no request can name, whatever the generator's default is.
-    file_rungs = served(FIXTURE)
+    file_rungs = served(arguments.keys)
     if file_rungs:
         file_refused, _ = requestable(file_rungs, clause)
         if file_refused:
             print(
-                f"{FIXTURE} serves {len(file_rungs)} clip(s) and "
+                f"{arguments.keys} serves {len(file_rungs)} clip(s) and "
                 f"{len(file_refused)} of them are not clips the model can "
                 "produce:"
             )
@@ -266,12 +272,12 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 1
         print(
-            f"{FIXTURE} serves {len(file_rungs)} clip(s), every one a clip "
+            f"{arguments.keys} serves {len(file_rungs)} clip(s), every one a clip "
             "the model can produce"
         )
 
     values = constants()
-    if report_step(generated_step((ROOT / PROGRAMS).read_text()), values):
+    if report_step(generated_step(PROGRAMS.read_text()), values):
         return 1
 
     header, default = generate()
@@ -312,7 +318,7 @@ def main(argv: list[str] | None = None) -> int:
     # by design; one ladder stated two ways must not.
     if not file_rungs:
         print(
-            f"{FIXTURE} states no clip ladder, so there is no second statement "
+            f"{arguments.keys} states no clip ladder, so there is no second statement "
             "of the deployment's own rungs to compare: the flag trial is run "
             "against the rule's ladder instead, which a delivery need not drive"
         )

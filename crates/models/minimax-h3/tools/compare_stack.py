@@ -4,7 +4,7 @@
 Design 10's diagnosis, never an acceptance gate. Both sides exist already:
 
 * **ours** - every run of `dit_layer --stage block` since `188b8b1d5` writes
-  `artifacts/h3-stage1/denoiser/stack_out.h3t`, one device pass of the case's layer count at step 0
+  `<its --out>/denoiser/stack_out.h3t`, one device pass of the case's layer count at step 0
   over the case's own input rows;
 * **the reference's** - one `dump_denoiser.py --probe stack_out` invocation on the same case.
 
@@ -27,12 +27,13 @@ What the table states, in the order it states it:
    been measured and is written rather than omitted.
 
     python crates/models/minimax-h3/tools/compare_stack.py \
-        --ours artifacts/h3-stage1/denoiser \
-        --ref artifacts/h3-stage1-reference/denoiser \
-        --out artifacts/diagnosis/minimax-h3/dit/stack
+        --ours <stage directory>/denoiser \
+        --ref <reference directory>/denoiser \
+        --out <report directory>
     python crates/models/minimax-h3/tools/compare_stack.py --self-test
 
-It needs NumPy only: the harness is proved without a device before any checkpoint is loaded.
+The comparison needs NumPy only. The self-test also needs torch, because it runs the reference
+writer to produce the bytes its reader is proved against. Neither needs a device or a checkpoint.
 """
 
 from __future__ import annotations
@@ -269,7 +270,7 @@ def compare(ours: pathlib.Path, ref: pathlib.Path) -> dict[str, object]:
     return table
 
 
-def markdown(table: dict[str, object], commit: str, checkpoint: str) -> str:
+def markdown(table: dict[str, object], commit: str, checkpoint: str, out: str) -> str:
     """The table as the page that goes under `artifacts/`."""
     rows, columns = table["shape"]
     segments = table["segments"]
@@ -318,18 +319,20 @@ def markdown(table: dict[str, object], commit: str, checkpoint: str) -> str:
         "```bash",
         "# this side: one device pass of the case's layer count at step 0",
         "cargo run -q -p minimax-h3 --example dit_layer -- --stage block \\",
-        "    --root /opt/uv/models/MiniMax-H3 --device 0 --out artifacts/h3-stage1",
+        f"    --root {checkpoint} --device 0 --out {pathlib.Path(str(table['ours'])).parent}",
         "",
         "# the reference's: its own stack on this side's input rows",
-        ".venv/bin/python crates/models/minimax-h3/tools/dump_denoiser.py --probe stack_out \\",
-        "    --checkpoint /opt/uv/models/MiniMax-H3 --stack artifacts/h3-stage1/denoiser \\",
-        "    --out artifacts/h3-stage1-reference",
+        "PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \\",
+        "    $UNISERVE_REFERENCE_TREE/.venv/bin/python \\",
+        "    crates/models/minimax-h3/tools/dump_denoiser.py --probe stack_out \\",
+        f"    --checkpoint {checkpoint} --stack {table['ours']} \\",
+        f"    --out {pathlib.Path(str(table['ref'])).parent}",
         "",
         "# the table",
         "python crates/models/minimax-h3/tools/compare_stack.py \\",
-        "    --ours artifacts/h3-stage1/denoiser \\",
-        "    --ref artifacts/h3-stage1-reference/denoiser \\",
-        "    --out artifacts/diagnosis/minimax-h3/dit/stack",
+        f"    --ours {table['ours']} \\",
+        f"    --ref {table['ref']} \\",
+        f"    --out {out}",
         "```",
         "",
         "Both producers state the checkpoint as their flag's value; the commit is the tree that ran"
@@ -368,24 +371,41 @@ def self_test() -> int:
         ).view(numpy.float32).reshape(values.shape)
         checks.append(("a BF16 tensor reads back as its own halves", name == "bf16" and numpy.array_equal(read, rounded)))
 
-        # 2. The reader against the **other** writer's bytes: the committed fixture is a BF16 H3D1 and
-        #    its `.npy` twin, both written by the reference producer (`dump_tables.dump`), so this
-        #    proves the widening against an implementation this crate does not own - the one thing a
-        #    reader tested only on its own output cannot show.
-        fixture = (
-            pathlib.Path(__file__).resolve().parents[1] / "tests" / "data" / "h3t-bf16" / "stack_out"
+        # 2. The reader against the **other** writer's bytes: the reference producer
+        #    (`dump_tables.dump`) writes a BF16 H3D1 and its `.npy` twin here, so this proves the
+        #    widening against an implementation this crate does not own - the one thing a reader
+        #    tested only on its own output cannot show. Every value is exact in BF16, so the
+        #    expected FP32 reading is the value itself, and a reader that shifts the halves wrongly
+        #    fails on 0.0625 first.
+        import importlib.util
+
+        import torch
+
+        spec = importlib.util.spec_from_file_location(
+            "dump_tables", pathlib.Path(__file__).resolve().parent / "dump_tables.py"
         )
-        if fixture.with_suffix(".h3t").is_file():
-            theirs, fixture_name = read_h3t(fixture.with_suffix(".h3t"))
-            twin = numpy.load(fixture.with_suffix(".npy"))
-            checks.append(
-                (
-                    "a BF16 container written by the reference producer reads as its own .npy twin",
-                    fixture_name == "bf16" and numpy.array_equal(theirs, twin),
-                )
+        dump_tables = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(dump_tables)
+        produced = root / "produced"
+        produced.mkdir()
+        dump_tables.dump(
+            produced,
+            "stack_out",
+            torch.tensor([[0.5, -2.25, 0.0], [3.0, 0.0625, -7.5]], dtype=torch.bfloat16),
+        )
+        theirs, produced_name = read_h3t(produced / "stack_out.h3t")
+        twin = numpy.load(produced / "stack_out.npy")
+        checks.append(
+            (
+                "a BF16 container written by the reference producer reads as its own .npy twin",
+                produced_name == "bf16"
+                and numpy.array_equal(theirs, twin)
+                and numpy.array_equal(
+                    twin,
+                    numpy.array([[0.5, -2.25, 0.0], [3.0, 0.0625, -7.5]], dtype=numpy.float32),
+                ),
             )
-        else:
-            checks.append((f"the reference producer's BF16 fixture is committed at {fixture}.h3t", False))
+        )
 
         # 3. The reference absent: every block says so, and no number is invented.
         table = compare(ours, ref)
@@ -474,7 +494,7 @@ def self_test() -> int:
         (ours / "case.json").write_text(json.dumps(stated) + "\n")
 
         # 9. The page renders, and it renders the four blocks.
-        page = markdown(compare(ours, ref), "self-test", "self-test")
+        page = markdown(compare(ours, ref), "self-test", "self-test", "self-test")
         checks.append(
             (
                 "the page renders a row per block",
@@ -506,15 +526,9 @@ def git_commit() -> str:
 
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--ours", type=pathlib.Path, default=pathlib.Path("artifacts/h3-stage1/denoiser"))
-    parser.add_argument(
-        "--ref", type=pathlib.Path, default=pathlib.Path("artifacts/h3-stage1-reference/denoiser")
-    )
-    parser.add_argument(
-        "--out",
-        type=pathlib.Path,
-        default=pathlib.Path("artifacts/diagnosis/minimax-h3/dit/stack"),
-    )
+    parser.add_argument("--ours", type=pathlib.Path, help="this side's denoiser directory")
+    parser.add_argument("--ref", type=pathlib.Path, help="the reference's denoiser directory")
+    parser.add_argument("--out", type=pathlib.Path, help="the directory the report is written to")
     parser.add_argument(
         "--checkpoint",
         default=None,
@@ -524,13 +538,16 @@ def main(argv: list[str]) -> int:
     arguments = parser.parse_args(argv)
     if arguments.self_test:
         return self_test()
+    if None in (arguments.ours, arguments.ref, arguments.out):
+        parser.error("--ours, --ref and --out name the two sides and the report directory")
     try:
         table = compare(arguments.ours, arguments.ref)
     except PairError as refusal:
         raise SystemExit(str(refusal)) from refusal
     arguments.out.mkdir(parents=True, exist_ok=True)
     (arguments.out / "stack.json").write_text(json.dumps(table, indent=2) + "\n")
-    page = markdown(table, git_commit(), arguments.checkpoint or table["checkpoint"])
+    checkpoint = arguments.checkpoint or table["checkpoint"]
+    page = markdown(table, git_commit(), checkpoint, str(arguments.out))
     (arguments.out / "stack.md").write_text(page)
     print(page)
     print(f"wrote {arguments.out / 'stack.md'} and {arguments.out / 'stack.json'}")

@@ -15,7 +15,7 @@ read from its `launch` in `crates/ops/src`, separating the words it always packs
 only under a condition (`rotary_factors` appends its section widths only for a sectioned rotation), so
 the comparison is a range rather than a number.
 
-    python3 tools/audit_parameters.py [--fixture notes/programs/qwen3-moe-keys.txt]
+    python3 tools/audit_parameters.py --fixture <key file>
 
 Rows whose package cannot be imported here (cutlass, cute and native packages, whose contract is a
 `#[repr(C)]` call structure) are reported as unchecked rather than as passing.
@@ -31,14 +31,21 @@ import tempfile
 import tomllib
 
 # The compiler picks `ptxas` off `PATH`, and the system one may not know this host's architecture;
-# the CUDA toolkit the store is built with does. The Triton cache goes outside the tree.
-os.environ["PATH"] = "/usr/local/cuda/bin:" + os.environ.get("PATH", "")
+# the CUDA toolkit `CUDA_HOME` names, which the store is built with, does. The Triton cache goes
+# outside the tree.
+if not os.environ.get("CUDA_HOME"):
+    sys.exit("CUDA_HOME names the CUDA toolkit whose ptxas the compiler runs")
+os.environ["PATH"] = (
+    os.path.join(os.environ["CUDA_HOME"], "bin") + os.pathsep + os.environ.get("PATH", "")
+)
 os.environ.setdefault(
     "TRITON_CACHE_DIR", str(pathlib.Path(tempfile.gettempdir()) / "uniserve-audit-cache")
 )
 
-OPS = pathlib.Path("crates/ops/src")
-KERNELS = pathlib.Path("crates/ops/kernels")
+#: This repository's operators and packages, found from this file's own place in it.
+REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
+OPS = REPOSITORY / "crates/ops/src"
+KERNELS = REPOSITORY / "crates/ops/kernels"
 
 #: The parameters the compiler's launcher appends to every Triton kernel.
 IMPLICIT = 2
@@ -220,7 +227,7 @@ def module_parameters(operator, key):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--fixture", default="notes/programs/qwen3-moe-keys.txt")
+    parser.add_argument("--fixture", required=True, help="the key file whose rows are audited")
     arguments = parser.parse_args()
 
     rows = [

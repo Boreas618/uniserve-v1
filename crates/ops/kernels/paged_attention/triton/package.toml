@@ -3,8 +3,7 @@
 # `fa4` and `trtllm` both refuse a plane carrying an f32 scale, by name, and both are right to: a
 # manifest field that made one of them declare `kv = f8e4m3` would be a cell that builds and then dies
 # inside a vendor library on the first launch. So the quantized cache needs a program of ours, and this
-# package is it: `notes/programs/paged_attention_fp8.md` states the operator's contract and
-# `notes/programs/paged_attention_fp8_program.md` where the launch plugs in.
+# package is it: `ops::attention::PagedAttention` states the operator's contract.
 #
 # **Two phases, two programs, one key field between them.** Decode is one query row per table row;
 # prefill is one program per (query row, head) of a batch row, causally masked, and it reads the

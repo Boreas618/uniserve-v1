@@ -10,7 +10,7 @@
 //! --stage embedding   one operator on a GPU: the vocabulary table's rows, against the checkpoint
 //! --stage block       one decoder layer end to end (`--layer <n>`), against the same rows
 //!                     (`--substage <cut>` stops inside the layer at one operator)
-//! --stage decode      the whole model's decode step, against notes/reference/qwen3-reference.json
+//! --stage decode      the whole model's decode step, against the continuation `--expect` names
 //! ```
 //!
 //! `--routing` on the block stage asks the router alone: which eight experts this layer chooses and
@@ -33,7 +33,7 @@
 //! beside it, because the cut inherits whatever the prefix already lost.
 //!
 //! All but `weights` need a program store: `--store <path>` or `UNISERVE_STORE`, holding the
-//! packages the fixture `notes/programs/qwen3-moe-keys.txt` names. Nothing here hard-codes a store
+//! packages the key file `--keys` names. Nothing here hard-codes a store
 //! root or a checkpoint, because the host that runs it is not the host that wrote it.
 //!
 //! `--generate N` on the decode stage continues the prompt: the prefill's own last row answers the
@@ -77,9 +77,6 @@ use nn::{
 };
 use ops::{Generation, KernelEntry, ScaleLayout};
 use qwen3_moe::{Config, LoadOptions, Partition, Plan, Representation, Run, Substage};
-
-/// The checkpoint the reference was captured from, when `--checkpoint` does not name another.
-const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/Qwen3-30B-A3B";
 
 /// The prompt whose first token the reference records, as token ids.
 ///
@@ -203,6 +200,9 @@ struct Args {
     stage: Stage,
     checkpoint: PathBuf,
     store: Option<PathBuf>,
+    /// The key file the store was built from (`--keys`): the stages that resolve programs read
+    /// the keys they install from it.
+    keys: Option<PathBuf>,
     device: u32,
     layer: usize,
     tokens: String,
@@ -332,8 +332,9 @@ enum Stage {
 impl Args {
     fn parse() -> Result<Self> {
         let mut stage = Stage::Weights;
-        let mut checkpoint = PathBuf::from(DEFAULT_CHECKPOINT);
+        let mut checkpoint = PathBuf::new();
         let mut store = std::env::var_os("UNISERVE_STORE").map(PathBuf::from);
+        let mut keys = None;
         let mut device = 0;
         let mut layer = 0;
         let mut tokens = String::new();
@@ -375,6 +376,7 @@ impl Args {
                 }
                 "--checkpoint" => checkpoint = PathBuf::from(value("--checkpoint")?),
                 "--store" => store = Some(PathBuf::from(value("--store")?)),
+                "--keys" => keys = Some(PathBuf::from(value("--keys")?)),
                 "--device" => {
                     let number = value("--device")?;
                     device = number.parse().map_err(|_| {
@@ -482,6 +484,14 @@ impl Args {
                 }
             }
         }
+        if checkpoint.as_os_str().is_empty() {
+            checkpoint = std::env::var_os("UNISERVE_QWEN3_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    eprintln!("name the checkpoint with --checkpoint or UNISERVE_QWEN3_MODEL");
+                    std::process::exit(2)
+                });
+        }
         if substage.is_some() && stage != Stage::Block {
             return Err(Failure::message(
                 "--substage cuts inside one layer, so it belongs to --stage block",
@@ -534,6 +544,7 @@ impl Args {
             stage,
             checkpoint,
             store,
+            keys,
             device,
             layer,
             tokens,
@@ -777,7 +788,11 @@ fn stage_embedding(args: &Args) -> Result<()> {
     //    missing package is reported as coverage rather than as the first operator to launch.
     // Only the operator this stage launches is required: a key the stage never calls must be
     // reported, not fatal, or a missing sampler program would read as a broken embedding.
+    let keys = args.keys.clone().ok_or_else(|| {
+        Failure::message("the stage resolves programs: pass --keys <the store's key file>")
+    })?;
     let needed = needed_keys(
+        &keys,
         &store_root,
         Stage::Embedding,
         false,
@@ -1007,7 +1022,11 @@ fn run_stack(args: &Args, last: Option<usize>) -> Result<()> {
     let _guard = device.enter()?;
     let stream = device.stream()?;
 
+    let keys = args.keys.clone().ok_or_else(|| {
+        Failure::message("the stage resolves programs: pass --keys <the store's key file>")
+    })?;
     let needed = needed_keys(
+        &keys,
         &store_root,
         Stage::Decode,
         args.generate.is_some(),
@@ -2087,74 +2106,6 @@ mod tests {
         assert_eq!(lines.concat(), long);
     }
 
-    /// An encoded deployment's install list holds its packed product, at the class its own rows
-    /// round to.
-    ///
-    /// `nvfp4_gemm` belongs to neither the model's operator list nor the three routed products, so
-    /// while it was absent from both every stage's list dropped it: the generation loaded, the first
-    /// packed product found no kernel, and the key had been in the fixture the whole time.
-    #[test]
-    fn an_encoded_deployment_installs_its_packed_product() {
-        let encoded = Encoded {
-            declared: true,
-            tokens: Some(16),
-            generated: Some(1),
-        };
-        let keys = needed_keys(
-            Path::new("a store root the pre-flight never reads"),
-            Stage::Decode,
-            true,
-            KvPages::Bf16,
-            encoded,
-        )
-        .expect("the deployment's list");
-
-        let packed: Vec<&str> = keys
-            .iter()
-            .filter(|(operator, _)| operator == "nvfp4_gemm")
-            .map(|(_, descriptor)| descriptor.as_str())
-            .collect();
-        // Sixteen rows round to the first class, and one continuation row to the same one, so the
-        // list holds the three projections at that class and no other.
-        assert_eq!(packed.len(), 3, "no packed product in {keys:?}");
-        for descriptor in &packed {
-            assert!(descriptor.contains("_m_128_"), "{descriptor}");
-        }
-    }
-
-    /// The store rows a run requires follow the deployment's page type: an fp8 cache asks for the
-    /// scale-deriving write and the fp8 reads, and a bf16 cache asks for neither, so neither
-    /// deployment is held up by the other one's program.
-    #[test]
-    fn the_required_rows_follow_the_page_type() {
-        let root = Path::new(".");
-        let bf16 = needed_keys(root, Stage::Decode, false, KvPages::Bf16).expect("the fixture");
-        let fp8 = needed_keys(root, Stage::Decode, false, KvPages::Fp8).expect("the fixture");
-        let names = |keys: &[(String, String)]| -> Vec<String> {
-            keys.iter().map(|(operator, _)| operator.clone()).collect()
-        };
-        let (bf16, fp8) = (names(&bf16), names(&fp8));
-        assert!(bf16.iter().any(|name| name == "kv_write"), "{bf16:?}");
-        assert!(
-            !bf16.iter().any(|name| name == "kv_write_scaled"),
-            "{bf16:?}"
-        );
-        assert!(fp8.iter().any(|name| name == "kv_write_scaled"), "{fp8:?}");
-        // The same operator twice: the fp8 deployment reads its own key/value type.
-        assert_eq!(
-            fp8.iter().filter(|name| *name == "paged_attention").count(),
-            2,
-            "{fp8:?}"
-        );
-        assert_eq!(
-            bf16.iter()
-                .filter(|name| *name == "paged_attention")
-                .count(),
-            2,
-            "{bf16:?}"
-        );
-    }
-
     /// The line a continuation's batch must satisfy, on the numbers a prompt of fifteen tokens
     /// produces: the first generated token is the one at position 15, its sequence length is 16, and
     /// the page table holds more than that.
@@ -2187,93 +2138,6 @@ mod tests {
         assert!(refused.to_string().contains("seq_len"), "{refused}");
     }
 
-    /// Every operator the harness declares as encoded reaches an encoded deployment's list.
-    ///
-    /// The defect this generalises was one omission: `nvfp4_gemm` was in no list, so every encoded
-    /// stage dropped it, the generation loaded, and the first packed product found no kernel
-    /// although the store held the key. A test naming one operator would not catch the next
-    /// omission, so this one walks the set the harness declares.
-    #[test]
-    fn an_encoded_deployment_installs_every_encoded_operator() {
-        let encoded = Encoded {
-            declared: true,
-            tokens: Some(16),
-            generated: Some(1),
-        };
-        let keys = needed_keys(
-            Path::new("a store root the pre-flight never reads"),
-            Stage::Decode,
-            true,
-            KvPages::Bf16,
-            encoded,
-        )
-        .expect("the deployment's list");
-        for operator in ENCODED_OPERATORS {
-            assert!(
-                keys.iter().any(|(named, _)| named == operator),
-                "`{operator}` is not in an encoded deployment's list"
-            );
-        }
-    }
-
-    /// The page type selects the cache's own rows and no others.
-    ///
-    /// `needed_keys` is the whole list a run installs, so a filter that applied the page type to
-    /// every row would leave an fp8 deployment with the three cache rows and no embedding, no
-    /// projections and no MoE - a list that loads and then refuses at the first operator it left
-    /// out, one stage away from the cause.
-    #[test]
-    fn a_page_type_selects_the_cache_rows_and_no_others() {
-        let store = Path::new("a store root the pre-flight never reads");
-        let encoded = Encoded {
-            declared: false,
-            tokens: Some(16),
-            generated: Some(1),
-        };
-        let bf16 = needed_keys(store, Stage::Decode, true, KvPages::Bf16, encoded)
-            .expect("the deployment's list");
-        let fp8 = needed_keys(store, Stage::Decode, true, KvPages::Fp8, encoded)
-            .expect("the deployment's list");
-
-        assert_eq!(
-            bf16.len(),
-            fp8.len(),
-            "the two pages launch the same number of programs"
-        );
-        // Every operator that is not the cache's appears in both lists.
-        for (operator, _) in &bf16 {
-            if matches!(
-                operator.as_str(),
-                "kv_write" | "kv_write_scaled" | "paged_attention"
-            ) {
-                continue;
-            }
-            assert!(
-                fp8.iter().any(|(other, _)| other == operator),
-                "`{operator}` left the fp8 list"
-            );
-        }
-        // And the cache's rows swapped: the scaled write and the f8e4m3 planes in, the bf16 out.
-        assert!(
-            fp8.iter()
-                .any(|(operator, _)| operator == "kv_write_scaled"),
-            "the fp8 list has no scaled cache write"
-        );
-        assert!(
-            !bf16
-                .iter()
-                .any(|(operator, _)| operator == "kv_write_scaled"),
-            "the bf16 list has an fp8 cache write"
-        );
-        assert!(
-            fp8.iter()
-                .filter(|(operator, key)| operator == "paged_attention" && key.contains("kv_f8e4m3"))
-                .count()
-                == 2,
-            "both attention phases read an fp8 plane"
-        );
-    }
-
     /// A position past the page table has no page to write, which is a refusal and not a launch.
     #[test]
     fn a_position_past_the_page_table_is_refused() {
@@ -2303,32 +2167,6 @@ mod tests {
         assert!(refused.to_string().contains("no cache"), "{refused}");
     }
 
-    /// The committed reference carries both halves a difference is read with: the ids and, beside
-    /// them, the margin each was chosen by. The reader takes the file as it is, and step 19's margin
-    /// of exactly zero is the tie this lane argued about for a night.
-    #[test]
-    fn the_reference_continuation_carries_its_margins() {
-        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/reference");
-        let file = dir.join("qwen3-greedy-32-margins.json");
-        let ids = super::read_expectation(&file, "").expect("the committed reference");
-        let margins = super::reference_margins(&file);
-        assert_eq!(ids.len(), 32, "{ids:?}");
-        assert_eq!(margins.len(), 32, "{margins:?}");
-        assert_eq!(ids[0], 151667);
-        assert_eq!(ids[19], 358);
-        assert_eq!(margins[19], 0.0, "the tie at step 19");
-        // A file with ids alone is a reference this run still compares against, and its margins read
-        // as absent rather than as zero.
-        let ids_only = dir.join("qwen3-greedy-32.json");
-        assert_eq!(
-            super::read_expectation(&ids_only, "")
-                .expect("its ids")
-                .len(),
-            32
-        );
-        assert!(super::reference_margins(&ids_only).is_empty());
-    }
-
     /// A load that brought nothing through the representation the checkpoint declares is the
     /// fallback, and it is refused rather than measured; a load that brought a representation the
     /// checkpoint did not state is refused too.
@@ -2350,121 +2188,6 @@ mod tests {
             super::check_representation(0, 200, 0, 0, 40_000).is_ok(),
             "a dense checkpoint"
         );
-    }
-
-    /// An encoded deployment asks the store for its own products, per row count; a dense one asks
-    /// for none of them, so neither representation's gap can block the other's run.
-    #[test]
-    fn an_encoded_deployment_requires_its_own_rows() {
-        let root = Path::new(".");
-        let dense = super::needed_keys(
-            root,
-            Stage::Decode,
-            false,
-            KvPages::Bf16,
-            super::Encoded::default(),
-        )
-        .expect("the fixture");
-        assert!(
-            !dense.iter().any(|(operator, _)| operator.contains("nvfp4")),
-            "{dense:?}"
-        );
-        let encoded = super::needed_keys(
-            root,
-            Stage::Decode,
-            false,
-            KvPages::Bf16,
-            super::Encoded {
-                declared: true,
-                tokens: Some(128),
-                generated: None,
-            },
-        )
-        .expect("the fixture");
-        let packed = encoded
-            .iter()
-            .filter(|(operator, _)| operator == "nvfp4_gemm")
-            .count();
-        // The product is compiled per row count: the rows the fixture names at the one count this
-        // run launches, and no row for a count it does not.
-        assert_eq!(packed, 3, "{encoded:?}");
-        for operator in ["nvfp4_quantize", "gather_gemm_nvfp4", "route_gemm_nvfp4"] {
-            assert!(
-                encoded.iter().any(|(name, _)| name == operator),
-                "{operator} missing"
-            );
-        }
-        // An encoded deployment launches the shared operators too: its embedding, norms, attention
-        // and sampler are the same programs a dense deployment launches. A list that dropped them
-        // let the NVFP4 run load 288 packed weights and then stop at its first launch, naming an
-        // operator its store held.
-        assert!(
-            encoded.iter().any(|(operator, _)| operator == "embedding"),
-            "the embedding is a shared program: {encoded:?}"
-        );
-        assert!(
-            !encoded
-                .iter()
-                .any(|(_, descriptor)| descriptor.contains("_m_7_")),
-            "a row count this run will not launch"
-        );
-        // A count the fixture names no row for is refused with both numbers, before any launch: the
-        // alternative is a run that installs nothing for its product and reports a missing kernel
-        // for a row its store never had.
-        // The launch states the smallest class that holds its rows, so a prompt of 16 rows is
-        // served by the `m_128` cells exactly as a prompt of 128 rows is.
-        let short = super::needed_keys(
-            root,
-            Stage::Decode,
-            false,
-            KvPages::Bf16,
-            super::Encoded {
-                declared: true,
-                tokens: Some(16),
-                generated: None,
-            },
-        )
-        .expect("a prompt of 16 rows is served by the m_128 class");
-        assert_eq!(
-            short
-                .iter()
-                .filter(|(operator, _)| operator == "nvfp4_gemm")
-                .count(),
-            3,
-            "{short:?}"
-        );
-        // A continuation's single row is the same class, so `--generate` is not refused either.
-        assert!(
-            super::needed_keys(
-                root,
-                Stage::Decode,
-                false,
-                KvPages::Bf16,
-                super::Encoded {
-                    declared: true,
-                    tokens: Some(16),
-                    generated: Some(1),
-                },
-            )
-            .is_ok(),
-            "a continuation launches the same class"
-        );
-        // A batch above the largest class has no row at all, and is refused naming both numbers.
-        let large = super::needed_keys(
-            root,
-            Stage::Decode,
-            false,
-            KvPages::Bf16,
-            super::Encoded {
-                declared: true,
-                tokens: Some(5000),
-                generated: None,
-            },
-        )
-        .expect_err("a batch above the largest class");
-        let message = format!("{large}");
-        assert!(message.contains("5000"), "{message}");
-        assert!(message.contains("4096"), "{message}");
     }
 
     /// The host tie rule: the first largest wins, which is the one the sampler's argmax takes.
@@ -3186,6 +2909,9 @@ fn prompt_ids(text: &str) -> Result<Vec<i32>> {
 /// because it filters the list and cannot see past it. That is `examples/keys_check.rs`'s question,
 /// which walks the model's own enumeration (`qwen3_moe::keys::keys`) against the same file.
 fn preflight(args: &Args) -> Result<()> {
+    let keys = args.keys.clone().ok_or_else(|| {
+        Failure::message("the preflight filters a key file: pass --keys <the store's key file>")
+    })?;
     stage("the checkpoint's declaration");
     let declared = Representation::read(&args.checkpoint)?;
     let count = u64::try_from(prompt_ids(&args.tokens)?.len()).unwrap_or(0);
@@ -3202,8 +2928,14 @@ fn preflight(args: &Args) -> Result<()> {
         (Stage::Embedding, false, Encoded::default()),
         (Stage::Decode, args.generate.is_some(), encoded),
     ] {
-        for (operator, key) in needed_keys(Path::new("."), stage, sampling, args.kv_pages, encoded)?
-        {
+        for (operator, key) in needed_keys(
+            &keys,
+            Path::new("."),
+            stage,
+            sampling,
+            args.kv_pages,
+            encoded,
+        )? {
             if printed.insert((operator.clone(), key.clone())) {
                 println!("{operator}\t{key}");
             }
@@ -3213,15 +2945,14 @@ fn preflight(args: &Args) -> Result<()> {
 }
 
 fn needed_keys(
+    fixture: &Path,
     store_root: &Path,
     stage: Stage,
     sampling: bool,
     kv_pages: KvPages,
     encoded: Encoded,
 ) -> Result<Vec<(String, String)>> {
-    let fixture =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../notes/programs/qwen3-moe-keys.txt");
-    let text = std::fs::read_to_string(&fixture).map_err(|error| {
+    let text = std::fs::read_to_string(fixture).map_err(|error| {
         Failure::message(format!(
             "reading the fixture {}: {error} (the store root given was {})",
             fixture.display(),
@@ -3340,7 +3071,7 @@ fn packed_rows_in(descriptor: &str) -> Option<u32> {
 /// Whether `stage` launches `operator`, which decides whether a missing key is fatal.
 ///
 /// A stage that needs one operator must not be blocked by a key the model uses elsewhere: the store
-/// coverage is the caller's report (`notes/programs/store-coverage.md`), and this harness's job is
+/// coverage is the caller's report, and this harness's job is
 /// to launch what it says it launches.
 fn required(stage: Stage, operator: &str, sampling: bool) -> bool {
     match stage {

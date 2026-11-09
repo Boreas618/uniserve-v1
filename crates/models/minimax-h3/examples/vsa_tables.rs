@@ -55,7 +55,7 @@ fn run() -> Result<(), String> {
         sparsity: 0.8,
         reference_keep: None,
         token_multiple: None,
-        out: PathBuf::from("artifacts/h3-vsa"),
+        out: PathBuf::new(),
     };
     let mut words = std::env::args().skip(1);
     while let Some(word) = words.next() {
@@ -96,6 +96,10 @@ fn run() -> Result<(), String> {
             }
             other => return Err(format!("unknown flag `{other}`")),
         }
+    }
+    if args.out.as_os_str().is_empty() {
+        eprintln!("name the output directory with --out");
+        std::process::exit(2);
     }
 
     // The canvas a request of these pixels names: whole multiples of the canvas grid, as the

@@ -5,7 +5,8 @@ This is a code generator, not a test: it runs the reference implementations
 fixed inputs and writes their outputs beside the inputs, for the Rust tests to
 compare against.
 
-Usage: `.venv/bin/python crates/media/tests/fixtures/resample/generate.py`
+Usage: `$UNISERVE_REFERENCE_PYTHON crates/media/tests/fixtures/resample/generate.py <directory>`,
+which the tests run.
 
 Each kind has a directory with a `cases.txt` (one case per line) and, per case,
 `<name>.in` and `<name>.out` raw files:
@@ -20,6 +21,7 @@ from __future__ import annotations
 
 import os
 import struct
+import sys
 
 import numpy as np
 import torch
@@ -28,7 +30,7 @@ import torchvision
 from PIL import Image
 from torchvision.transforms import v2 as vision
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
+ROOT = sys.argv[1]
 
 
 def pattern(channels: int, height: int, width: int) -> np.ndarray:

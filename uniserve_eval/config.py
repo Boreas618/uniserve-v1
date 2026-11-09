@@ -1,9 +1,10 @@
 """Loads and validates evaluator servers, benchmark points, and suites.
 
 An evaluator profile is a TOML file with optional `root` (default `.`) and
-`artifact_root` (default `artifacts/benchmark`) keys and up to three tables:
-`[servers.<name>]` describes how to launch a server, `[benchmarks.<name>]`
-describes one measured workload against a named server, and `[suites.<name>]`
+`artifact_root` (where `run` writes without `--output-root`) keys and up to
+three tables: `[servers.<name>]` describes how to launch a server,
+`[benchmarks.<name>]` describes one measured workload against a named
+server, and `[suites.<name>]`
 lists benchmark names in execution order. `load_config` turns the file into
 an `EvaluationConfig`, rejecting unknown keys at the top level and in every
 server, benchmark, and suite table. The adapters that
@@ -160,7 +161,7 @@ class EvaluationConfig:
     #: Default parent of per-point result directories; `artifact_root` in the
     #: file, relative to `root` unless absolute. `run --output-root` overrides
     #: it, and a relative override is taken from the current directory.
-    artifact_root: Path
+    artifact_root: Path | None
     servers: dict[str, ServerProfile]
     benchmarks: dict[str, BenchmarkPoint]
     suites: dict[str, SuiteProfile]
@@ -227,9 +228,11 @@ def load_config(path: Path = DEFAULT_CONFIG) -> EvaluationConfig:
         name: _suite_profile(name, value, benchmarks)
         for name, value in _table(raw, "suites").items()
     }
-    artifact_root = Path(str(raw.get("artifact_root", "artifacts/benchmark")))
-    if not artifact_root.is_absolute():
-        artifact_root = root / artifact_root
+    artifact_root = None
+    if "artifact_root" in raw:
+        artifact_root = Path(str(raw["artifact_root"]))
+        if not artifact_root.is_absolute():
+            artifact_root = root / artifact_root
     return EvaluationConfig(
         root=root,
         artifact_root=artifact_root,

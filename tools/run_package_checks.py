@@ -420,7 +420,11 @@ def run_one_invocation(root, name, arguments, timeout):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kernels", default="crates/ops/kernels", type=pathlib.Path)
+    parser.add_argument(
+        "--kernels",
+        default=pathlib.Path(__file__).resolve().parents[1] / "crates/ops/kernels",
+        type=pathlib.Path,
+    )
     parser.add_argument("--jobs", type=int, default=6, help="checks run at once")
     parser.add_argument("--timeout", type=int, default=120, help="seconds per check")
     parser.add_argument("--verbose", action="store_true", help="name every check, not only outcomes")

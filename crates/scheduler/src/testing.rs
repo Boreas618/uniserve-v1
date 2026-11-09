@@ -258,12 +258,11 @@ pub fn packaged_module() -> Vec<u8> {
 /// built with. A failure states the status and the end of the build's stderr,
 /// and names the export that skips the build.
 fn build_packaged_module() -> Vec<u8> {
-    let workspace = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .ancestors()
-        .nth(2)
-        .unwrap_or_else(|| panic!("crates/scheduler lives two levels below the workspace root"))
-        .to_path_buf();
-    let target_dir = workspace.join("target").join("it-policy");
+    let workspace = std::path::PathBuf::from(proto::WORKSPACE);
+    // The build's own target directory when the caller set one, else Cargo's default one.
+    let target_dir = std::env::var_os("CARGO_TARGET_DIR")
+        .map_or_else(|| workspace.join("target"), std::path::PathBuf::from)
+        .join("it-policy");
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     let output = std::process::Command::new(&cargo)
         .current_dir(&workspace)

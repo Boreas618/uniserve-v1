@@ -33,7 +33,7 @@ the export.
 ## Reading a checkpoint without a device
 
 ```sh
-cargo run -p minimax-h3 --example inspect_checkpoint -- /opt/uv/models/MiniMax-H3
+cargo run -p minimax-h3 --example inspect_checkpoint -- $UNISERVE_H3_MODEL
 ```
 
 It prints the contract, the DiT partitions and the tasks each serves, the text encoder's retained and
@@ -52,26 +52,25 @@ is a diagnosis rather than an acceptance gate (`specs/worker.md` 10). `dump_tabl
 of that tree, as its header states:
 
 ```sh
-PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \
-    /workspace/uniserve-v1/.venv/bin/python crates/models/minimax-h3/tools/dump_tables.py \
-    --case crates/models/minimax-h3/tools/cases/dense-fl2va.json --out /tmp/dump
-cargo run -p minimax-h3 --example compare_blocks -- --dumps /tmp/dump --out /tmp/report.md
+PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \
+    $UNISERVE_REFERENCE_TREE/.venv/bin/python crates/models/minimax-h3/tools/dump_tables.py \
+    --case crates/models/minimax-h3/tools/cases/dense-fl2va.json --out <dump directory>
+cargo run -p minimax-h3 --example compare_blocks -- --dumps <dump directory> --out <report file>
 ```
 
 The five committed cases cover a dense two-keyframe plan, both sparse contracts (`t2va` at tile 64,
 `ref2va` at tile 128 with a reference keep), the 480p DMD canvas, the frame rule's floor at 22
 frames, and a `ref2va` request whose references carry audio. Every integer table of all five agrees
 exactly; the coordinates differ only in the last places of FP64, which is the declared
-pairwise-versus-sequential sum of the rotary time series. What a correct report looks like, and how
-the dumper must be run for a *recorded* run (in a full environment, without stubbing imports), is in
-`notes/h3/numeric-diagnosis.md`.
+pairwise-versus-sequential sum of the rotary time series. A *recorded* run runs the dumper in a full
+environment, without stubbing imports.
 
 The same example compares **block tensors** in a second mode, file by file between two dump
 directories - one from the reference implementation's shadow pass and one from this crate's traced
 views:
 
 ```text
-cargo run -p minimax-h3 --example compare_blocks -- --reference /tmp/ref --candidate /tmp/ours
+cargo run -p minimax-h3 --example compare_blocks -- --reference <reference dumps> --candidate <our dumps>
 ```
 
 Integer tensors are compared exactly, floats by their largest absolute and relative difference, and

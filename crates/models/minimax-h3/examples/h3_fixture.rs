@@ -1,9 +1,9 @@
 //! One deployment's fixture, copied from that deployment's walk print.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example programs -- /opt/uv/models/MiniMax-H3 --dtype f16 ... > /tmp/walk.txt
-//! cargo run -q -p minimax-h3 --example h3_fixture -- --walk /tmp/walk.txt --commit <rev> \
-//!     [--blocked /tmp/blocked.txt] > notes/programs/minimax-h3-keys.txt
+//! cargo run -q -p minimax-h3 --example programs -- $UNISERVE_H3_MODEL --dtype f16 ... > <walk file>
+//! cargo run -q -p minimax-h3 --example h3_fixture -- --walk <walk file> --commit <rev> \
+//!     [--blocked <blocked file>] > <key file>
 //! ```
 //!
 //! ## Why copying and not restating

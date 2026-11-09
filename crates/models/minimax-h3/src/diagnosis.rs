@@ -1,6 +1,6 @@
 //! The container the block-by-block diagnosis writes: `.npy`, as `numpy.save` writes it.
 //!
-//! `notes/h3/diagnosis.md` states the protocol: both implementations write the tensors they computed
+//! The protocol: both implementations write the tensors they computed
 //! into their own tree, the reference's through `tools/dump_*.py` and this crate's through a
 //! harness's `--diag <dir>`, and `tools/diagnosis/compare.py` pairs the two trees by relative path.
 //! The two `.h3t` containers beside these files are this crate's own and are read by

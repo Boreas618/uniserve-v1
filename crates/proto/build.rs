@@ -13,8 +13,8 @@
 //! version cannot tell two builds of one version apart, the digest does.
 //!
 //! The digest covers what Cargo compiles those artifacts from: the
-//! workspace's manifest, lockfile, toolchain file and Cargo configuration,
-//! and of each member crate under `crates/` its manifest, its build script
+//! workspace's manifest, lockfile and toolchain file, and of each member
+//! crate under `crates/` its manifest, its build script
 //! and every file under its `src/`; the workspace's root package is the
 //! `uniserve` executable, whose manifest is the workspace manifest and whose
 //! sources are the root `src/`. A member's tests, benches and examples
@@ -24,29 +24,49 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
 /// Files at the workspace root that configure every build of it.
-const ROOT_FILES: [&str; 4] = [
-    "Cargo.toml",
-    "Cargo.lock",
-    "rust-toolchain.toml",
-    ".cargo/config.toml",
-];
+const ROOT_FILES: [&str; 3] = ["Cargo.toml", "Cargo.lock", "rust-toolchain.toml"];
 
 /// Hex digits of the digest the build version carries: its leading 64 bits,
 /// which tell builds apart as a short commit hash does.
 const DIGEST_HEX_DIGITS: usize = 16;
 
+/// The workspace root, as Cargo itself locates it: the directory of the
+/// workspace manifest. The Cargo that runs this script names itself in `CARGO`,
+/// and a build script runs in its package's directory.
+fn workspace_root() -> io::Result<PathBuf> {
+    let cargo =
+        std::env::var_os("CARGO").ok_or_else(|| io::Error::other("Cargo did not set CARGO"))?;
+    let located = Command::new(cargo)
+        .args(["locate-project", "--workspace", "--message-format", "plain"])
+        .output()?;
+    if !located.status.success() {
+        return Err(io::Error::other(format!(
+            "cargo locate-project failed: {}",
+            String::from_utf8_lossy(&located.stderr)
+        )));
+    }
+    let manifest = PathBuf::from(
+        String::from_utf8(located.stdout)
+            .map_err(io::Error::other)?
+            .trim(),
+    );
+    manifest
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| io::Error::other("the workspace manifest has no directory"))
+}
+
 /// Emits `UNISERVE_SOURCE_DIGEST`, the digest of the workspace sources every
-/// artifact of the build is compiled from.
+/// artifact of the build is compiled from, and `UNISERVE_WORKSPACE`, the
+/// workspace root it was computed over.
 fn emit_source_digest() -> io::Result<()> {
-    // This crate is a member directly under `crates/`.
-    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .ok_or_else(|| io::Error::other("Cargo did not set CARGO_MANIFEST_DIR"))?;
-    let root = manifest.join("../..");
+    let root = workspace_root()?;
+    println!("cargo:rustc-env=UNISERVE_WORKSPACE={}", root.display());
 
     // Every input as a path relative to the root, and the paths whose change
     // reruns this script: each existing input file and each member's `src/`

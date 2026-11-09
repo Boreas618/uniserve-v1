@@ -102,6 +102,11 @@ def run(args: argparse.Namespace) -> None:
     """
     config = load_config(args.config)
     output_root = args.output_root or config.artifact_root
+    if output_root is None:
+        raise SystemExit(
+            "name the output directory with --output-root, or state "
+            "artifact_root in the profile"
+        )
     points = config.selected_points(args.selection)
     invalid = 0
 

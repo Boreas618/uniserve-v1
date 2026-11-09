@@ -624,10 +624,8 @@ mod tests {
 
     /// The planning vectors the request rules are tested against.
     fn fixture() -> Value {
-        serde_json::from_str(include_str!(
-            "../../../../../tests/python/fixtures/minimax_h3_plan.json"
-        ))
-        .unwrap()
+        serde_json::from_str(&std::fs::read_to_string(models::video::plan::PLAN_VECTORS).unwrap())
+            .unwrap()
     }
 
     /// The MiniMax-H3 checkpoint's vision processor geometry.

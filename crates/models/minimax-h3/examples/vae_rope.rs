@@ -19,10 +19,10 @@
 //! found it.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example vae_rope -- --root /workspace/models/MiniMax-H3 \
+//! cargo run -q -p minimax-h3 --example vae_rope -- --root $UNISERVE_H3_MODEL \
 //!     --out artifacts/h3-vae-rope
 //! python crates/models/minimax-h3/tools/compare_rope_factors.py --vae artifacts/h3-vae-rope \
-//!     --checkpoint /workspace/models/MiniMax-H3
+//!     --checkpoint $UNISERVE_H3_MODEL
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -31,7 +31,7 @@ use minimax_h3::VideoVaeConfig;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut root = None;
-    let mut out = PathBuf::from("artifacts/h3-vae-rope");
+    let mut out = PathBuf::new();
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
@@ -45,6 +45,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
         }
+    }
+    if out.as_os_str().is_empty() {
+        eprintln!("name the output directory with --out");
+        std::process::exit(2);
     }
     let root = root.ok_or("--root is required")?;
     run(&root, &out).map_err(Into::into)

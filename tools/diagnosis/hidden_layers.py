@@ -13,7 +13,7 @@ numbers leave the reference's own rounding floor. `hidden_48` is the run's own l
 layer 47's output: the reference does not hold that one, so the last layer is read through its cuts.
 
     python tools/diagnosis/hidden_layers.py \
-        --reference notes/reference/qwen3-hidden --dump artifacts/qwen3-hidden-dump
+        --reference <reference dumps> --dump <run dumps>
 
 The reference holds `hidden_00` to `hidden_48` and a `meta.json` with the prompt's ids; it holds no
 `logits.npy`, so the logits are not compared here - the run prints its top-10 and the served

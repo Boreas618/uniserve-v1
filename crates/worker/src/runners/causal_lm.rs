@@ -1180,7 +1180,7 @@ fn baked_difference(
         let Some(blob) = params.parameters.first() else {
             continue;
         };
-        // `fmha::KernelParams`' offsets, as `notes/exec/attention-bound.md` records them.
+        // `fmha::KernelParams`' offsets.
         let integer = |at: usize| -> i64 {
             blob.get(at..at + 4)
                 .map(|bytes| i64::from(i32::from_ne_bytes(bytes.try_into().unwrap_or([0; 4]))))

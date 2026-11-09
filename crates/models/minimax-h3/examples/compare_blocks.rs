@@ -8,8 +8,8 @@
 //!
 //! `--out` writes the same table and its JSON block to one file. `<dir>` holds `case.json`, which
 //! describes the request whose layout is compared, and one `.h3t` file per tensor. `crates/models/minimax-h3/tools/dump_tables.py` writes both from
-//! `uniserve/models/minimax_h3/packing.py`, today's implementation; `notes/h3/numeric-diagnosis.md`
-//! holds the case format, the tensor container and what each name means.
+//! `uniserve/models/minimax_h3/packing.py`, today's implementation; its `dump` defines the tensor
+//! container.
 //!
 //! This is a **diagnosis, never an acceptance gate** (specs/worker.md 10): every tensor's numbers
 //! are reported and nothing is gated on them. A run fails only when the dump itself cannot be read,
@@ -458,7 +458,7 @@ impl CaseCondition {
     }
 }
 
-/// One dumped tensor, in the container `notes/h3/numeric-diagnosis.md` defines.
+/// One dumped tensor, in the H3D1 container `tools/dump_tables.py`'s `dump` writes.
 struct Dump {
     shape: Vec<u64>,
     values: Values,

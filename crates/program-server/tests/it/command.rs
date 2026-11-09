@@ -29,6 +29,8 @@ fn serve_takes_the_socket_the_roots_the_targets_and_the_limits() {
             "4",
             "--host-reserve",
             "8589934592",
+            "--python",
+            "/srv/program-server/bin/python",
         ])
         .expect("the daemon's command line parses");
     let parsed = options(&matches).expect("the options are read");
@@ -69,34 +71,45 @@ fn serve_takes_the_socket_the_roots_the_targets_and_the_limits() {
 }
 
 #[test]
-fn serve_defaults_to_the_standard_socket_and_the_bundled_python() {
+fn serve_defaults_to_the_standard_socket_and_requires_its_interpreter() {
+    let roots = [
+        "program-server",
+        "serve",
+        "--package-root",
+        "/var/lib/uniserve/packages",
+        "--store-root",
+        "/var/lib/uniserve/modules",
+    ];
+    // The interpreter is the caller's to name: nothing searches for one.
+    let unnamed = command()
+        .try_get_matches_from(roots)
+        .expect("the roots parse");
+    let refused = options(&unnamed).expect_err("a serve command without --python is refused");
+    assert!(
+        refused.to_string().contains("--python"),
+        "the refusal names the flag: {refused}"
+    );
+
     let matches = command()
-        .try_get_matches_from([
-            "program-server",
-            "serve",
-            "--package-root",
-            "/var/lib/uniserve/packages",
-            "--store-root",
-            "/var/lib/uniserve/modules",
-        ])
-        .expect("a serve command needs only its roots");
+        .try_get_matches_from(
+            roots
+                .into_iter()
+                .chain(["--python", "/srv/program-server/bin/python"]),
+        )
+        .expect("a serve command needs its roots and its interpreter");
     let parsed = options(&matches).unwrap();
 
     assert_eq!(parsed.socket, default_socket());
     let Action::Serve(serve) = parsed.action else {
         panic!("a serve command");
     };
-    // A CUDA toolkit is found on the host; the Python environment is the
-    // Program Server's own, beside the crate (design section 6.2), and every
-    // toolchain path is absolute by the time a build sees it: a relative one
-    // would be resolved against the copy a build runs in, not against the
-    // server's own directory.
+    // nvcc is named by --nvcc or CUDA_HOME when a build needs it, and the
+    // interpreter is the one named.
     assert!(serve.toolchains.nvcc.is_none());
     assert_eq!(
         serve.toolchains.python,
-        std::path::absolute("python/.venv/bin/python").expect("an absolute path")
+        PathBuf::from("/srv/program-server/bin/python")
     );
-    assert!(serve.toolchains.python.is_absolute());
     assert!(serve.toolchains.wasm.is_none());
     assert!(
         serve.devices.is_empty(),
@@ -118,6 +131,8 @@ fn a_second_server_of_one_host_names_its_upstream() {
             "/run/uniserve/leader.sock",
             "--nvcc",
             "/usr/local/cuda/bin/nvcc",
+            "--python",
+            "/srv/program-server/bin/python",
         ])
         .unwrap();
     let parsed = options(&matches).unwrap();

@@ -2340,6 +2340,7 @@ version = "2.0.0"
 dependencies = [
  "cc",
  "image",
+ "tempfile",
  "thiserror",
  "tracing",
 ]
@@ -2860,6 +2861,7 @@ version = "2.0.0"
 dependencies = [
  "libc",
  "libloading",
+ "tempfile",
  "thiserror",
 ]
 

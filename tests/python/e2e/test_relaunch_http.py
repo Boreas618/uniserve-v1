@@ -187,7 +187,7 @@ def _stream_through_a_kill(
     tokens and usage, the tokens and usage of the count asked again
     afterwards, and the server log's lines.
     """
-    runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
+    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     command = [

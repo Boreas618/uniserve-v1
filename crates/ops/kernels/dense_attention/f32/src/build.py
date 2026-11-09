@@ -30,7 +30,6 @@ import argparse
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
 import tomllib
@@ -198,7 +197,8 @@ def main():
             )
 
     out.mkdir(parents=True, exist_ok=True)
-    compiler = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    # The nvcc the Program Server checked against this package's declared version.
+    compiler = os.environ["UNISERVE_NVCC"]
     command = [
         compiler,
         "-O3",

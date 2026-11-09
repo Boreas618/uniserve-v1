@@ -31,9 +31,8 @@ takes it.
 
 The reference makes the kernel's rounds, in the kernel's order, at FP32 — `x³`, the `0.044715`
 product, `√(8/π)`'s product, the exponential, the logistic — and takes only `erf` and `exp`
-themselves exactly, in FP64, before rounding them back. See
-`notes/programs/kernel-arithmetic-checks.md`: a reference that keeps the whole formula in FP64
-measures the distance between two precisions instead.
+themselves exactly, in FP64, before rounding them back. A reference that keeps the whole formula in
+FP64 measures the distance between two precisions instead.
 """
 
 import argparse

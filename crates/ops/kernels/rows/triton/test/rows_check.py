@@ -43,8 +43,8 @@ def stored(element, exact):
     The interpreter casts F16 and F32 to nearest as the hardware does, and **truncates a BF16
     store**: it drops the low 16 bits of the FP32 mantissa instead of rounding them. That is
     measured, not assumed — a plain store of 4,096 FP32 values into BF16 matches the truncation of
-    all 4,096 and torch's nearest rounding of 2,038 of them
-    (`notes/programs/kernel-arithmetic-checks.md`). Reproducing the tool's own cast makes the
+    all 4,096 and torch's nearest rounding of 2,038 of them. Reproducing the tool's own cast makes
+    the
     comparison exact instead of leaving a two-ulp allowance, which would judge the interpreter
     rather than the kernel.
     """

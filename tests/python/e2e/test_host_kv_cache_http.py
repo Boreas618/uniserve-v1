@@ -148,7 +148,7 @@ def _runtime() -> Path:
 
     A socket path holds at most 107 bytes, so the directory is short.
     """
-    return Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
+    return Path(tempfile.mkdtemp(prefix="uniserve-"))
 
 
 def _checkpoint() -> str:

@@ -1,4 +1,4 @@
-//! The deployment sizes, printed from the rows `notes/h3/deployments.md` renders.
+//! The deployment sizes, printed row by row.
 //!
 //! The table is the model's own arithmetic and the measurements around it, held here in one place so
 //! the note and the tool cannot drift: every figure the note states for a stage is a field below,

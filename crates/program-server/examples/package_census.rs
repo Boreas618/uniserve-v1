@@ -10,8 +10,8 @@
 //!
 //! ```text
 //! cargo run -p program-server --example package_census -- \
-//!     --keys notes/programs/qwen3-moe-keys.txt \
-//!     --keys notes/programs/minimax-h3-keys.txt
+//!     --keys <qwen3-moe keys file> \
+//!     --keys <minimax-h3 keys file>
 //! ```
 //!
 //! It reads manifests only and builds nothing, so it runs in a second.
@@ -45,7 +45,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut packages_root = PathBuf::from("crates/ops/kernels");
+    let mut packages_root = None;
     let mut keys: Vec<PathBuf> = Vec::new();
     let mut arguments = std::env::args().skip(1);
     while let Some(flag) = arguments.next() {
@@ -55,15 +55,15 @@ fn run() -> Result<(), String> {
                 .ok_or_else(|| format!("{flag} takes a value"))
         };
         match flag.as_str() {
-            "--packages" => packages_root = PathBuf::from(value()?),
+            "--packages" => packages_root = Some(PathBuf::from(value()?)),
             "--keys" => keys.push(PathBuf::from(value()?)),
             other => return Err(format!("unknown flag {other}")),
         }
     }
     if keys.is_empty() {
-        keys.push(PathBuf::from("notes/programs/qwen3-moe-keys.txt"));
-        keys.push(PathBuf::from("notes/programs/minimax-h3-keys.txt"));
+        return Err("name the key files with --keys <file>, once per file".to_string());
     }
+    let packages_root = packages_root.ok_or("--packages names the package root")?;
 
     let fixtures = read_fixtures(&keys)?;
     let packages = read_packages(&packages_root, &fixtures)?;

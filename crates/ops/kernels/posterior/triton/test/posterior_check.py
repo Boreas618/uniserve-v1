@@ -8,7 +8,7 @@ Two comparisons, because the operator has two claims to defend:
    difference of one ulp is a failure and the message says which element.
 
 2. **The fixture.** h3 recorded ground truth for four elements of two channels, after the affine a
-   conditioner applies (`notes/h3/posterior-epilogue.md`): the *normalised* latents, as IEEE-754
+   conditioner applies: the *normalised* latents, as IEEE-754
    bits. This script applies that affine in torch to the kernel's output and compares with the
    recorded bits, which is what pins the two steps a fused kernel drops first: `0.25000014901161194`
    must become exactly `0.25` through the round trip, and `-44054.4296875` must become `-44064.0`.

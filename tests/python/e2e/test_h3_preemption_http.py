@@ -204,7 +204,7 @@ def _serve(
     """The deployment `deployment` writes, with a Storage Server of its own;
     its URL, log and runtime directory.
     """  # noqa: D205
-    runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
+    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     command = [

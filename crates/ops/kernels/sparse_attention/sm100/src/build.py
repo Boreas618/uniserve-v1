@@ -21,7 +21,6 @@ import json
 import os
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
 
@@ -75,7 +74,8 @@ def main():
     """Compile the kernel for one descriptor into ``module.so``."""
     package, descriptor, target, out = arguments()
     out.mkdir(parents=True, exist_ok=True)
-    compiler = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    # The nvcc the Program Server checked against this package's declared version.
+    compiler = os.environ["UNISERVE_NVCC"]
     block = block_of(descriptor)
 
     # The kernel's own two choices: which block size, and that the maps take strided rows

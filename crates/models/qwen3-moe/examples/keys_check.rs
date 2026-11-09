@@ -1,8 +1,8 @@
 //! The model's own key walk against the committed fixture, both page types, and the gap named.
 //!
 //! ```text
-//! cargo run -p qwen3-moe --example keys_check -- [--checkpoint /opt/uv/models/Qwen3-30B-A3B]
-//!     [--fixture notes/programs/qwen3-moe-keys.txt] [--capacity 0] [--page-tokens 64]
+//! cargo run -p qwen3-moe --example keys_check -- [--checkpoint $UNISERVE_QWEN3_MODEL]
+//!     --fixture <keys file> [--capacity 0] [--page-tokens 64]
 //! ```
 //!
 //! `keys()` is a pure function of the configuration, the partition and the deployment's values, so
@@ -55,9 +55,8 @@ const WORKER_OWNED: [&str; 10] = [
 ];
 
 fn main() -> ExitCode {
-    let mut checkpoint = PathBuf::from("/opt/uv/models/Qwen3-30B-A3B");
-    let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../notes/programs/qwen3-moe-keys.txt");
+    let mut checkpoint = PathBuf::new();
+    let mut fixture = PathBuf::new();
     let mut capacity = 0u32;
     let mut page_tokens = 64u32;
     let mut buckets: Vec<u32> = Vec::new();
@@ -97,6 +96,14 @@ fn main() -> ExitCode {
             other => return usage(&format!("unknown argument {other}")),
         }
     }
+    if checkpoint.as_os_str().is_empty() {
+        checkpoint = std::env::var_os("UNISERVE_QWEN3_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                eprintln!("name the checkpoint with --checkpoint or UNISERVE_QWEN3_MODEL");
+                std::process::exit(2)
+            });
+    }
 
     let config = match Config::read(&checkpoint) {
         Ok(config) => config,
@@ -105,6 +112,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if fixture.as_os_str().is_empty() {
+        return usage("--fixture names the key file to check");
+    }
     let present_rows = match fixture_rows(&fixture) {
         Ok(rows) => rows,
         Err(message) => {

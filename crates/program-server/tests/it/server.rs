@@ -63,6 +63,7 @@ fn config(temporary: &Path, upstream: Option<&Path>) -> ServerConfig {
             nvcc: None,
             python: PathBuf::from("/python/bin/python"),
             wasm: None,
+            cargo: None,
             max_jobs: 1,
         },
         devices: vec![Device {

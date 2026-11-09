@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p minimax-h3 --example audio_plan -- \
-//!     --root /opt/uv/models/MiniMax-H3 --extents artifacts/h3-reference/component-tensors.json
+//!     --root $UNISERVE_H3_MODEL --extents artifacts/h3-reference/component-tensors.json
 //! ```
 //!
 //! The same instrument the video encoder and the video decoder have: a recording forward launches
@@ -35,7 +35,7 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
-    let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
+    let mut root = PathBuf::new();
     let mut extents_path: Option<PathBuf> = None;
     let mut lengths: Vec<u32> = vec![582, 1164, 3492];
     let mut check = false;
@@ -61,6 +61,14 @@ fn run() -> Result<(), String> {
             }
             other => return Err(format!("`{other}` is not a flag of this tool")),
         }
+    }
+    if root.as_os_str().is_empty() {
+        root = std::env::var_os("UNISERVE_H3_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
+                std::process::exit(2)
+            });
     }
     let path = extents_path.ok_or_else(|| {
         format!(

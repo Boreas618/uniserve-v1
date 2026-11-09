@@ -756,10 +756,11 @@ mod tests {
         let (status, _, body) = send(&app, get_request("/admin/profile")).await;
         assert_eq!((status, &body["session"]), (StatusCode::OK, &json!(null)));
 
+        let output = tempfile::tempdir().expect("a profile directory");
         let request = json!({
             "collectors": ["timeline", "pm_sampling"],
             "stages": ["decode"],
-            "output_dir": "/tmp/uniserve-profile-test",
+            "output_dir": output.path(),
         });
         let (status, _, body) = send(&app, post_json("/admin/profile", &request)).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -796,11 +797,12 @@ mod tests {
     #[tokio::test]
     async fn a_session_ends_after_its_seconds_and_a_faulty_request_is_refused() {
         let app = router(sim_engine(ModelParameters::Qwen3));
+        let output = tempfile::tempdir().expect("a profile directory");
         let (status, _, body) = send(
             &app,
             post_json(
                 "/admin/profile",
-                &json!({"collectors": ["pm_sampling"], "seconds": 0.5, "output_dir": "/tmp/p"}),
+                &json!({"collectors": ["pm_sampling"], "seconds": 0.5, "output_dir": output.path()}),
             ),
         )
         .await;
@@ -817,8 +819,8 @@ mod tests {
         }
 
         for faulty in [
-            json!({"collectors": [], "output_dir": "/tmp/p"}),
-            json!({"collectors": ["timeline"], "output_dir": "/tmp/p", "window": 3}),
+            json!({"collectors": [], "output_dir": output.path()}),
+            json!({"collectors": ["timeline"], "output_dir": output.path(), "window": 3}),
         ] {
             let (status, _, body) = send(&app, post_json("/admin/profile", &faulty)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");

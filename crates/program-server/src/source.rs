@@ -456,14 +456,20 @@ impl Source for CudaSource {
                         .ok_or_else(|| Error::Toolchain {
                             kind: ToolchainKind::Nvcc,
                             message: format!(
-                                "no Python environment to run {}: create \
-                                 crates/program-server/python with `uv sync`",
+                                "no Python interpreter to run {}: pass --python",
                                 script.display()
                             ),
                         })?;
+                // The script compiles with the nvcc this toolchain checked against the
+                // package's declared version, never one it looks up itself.
+                let nvcc = toolchain.executable().ok_or_else(|| Error::Toolchain {
+                    kind: ToolchainKind::Nvcc,
+                    message: "no nvcc named: pass --nvcc <path> or set CUDA_HOME".into(),
+                })?;
                 let job = ToolJob::new(interpreter, &package.root, &log)
                     .argument(&script)
-                    .environment(package.environment(key, target, dir));
+                    .environment(package.environment(key, target, dir))
+                    .environment([("UNISERVE_NVCC".into(), nvcc.as_os_str().to_owned())]);
                 toolchain
                     .run(job)
                     .map_err(|error| package.failure_with_log(key, target, error, &log))?;
@@ -499,7 +505,7 @@ fn run_nvcc(
 ) -> Result<()> {
     let nvcc = toolchain.executable().ok_or_else(|| Error::Toolchain {
         kind: ToolchainKind::Nvcc,
-        message: "no nvcc on this host: install the CUDA toolkit".into(),
+        message: "no nvcc named: pass --nvcc <path> or set CUDA_HOME".into(),
     })?;
     let parameters = &package.manifest.parameters;
     let mut job = ToolJob::new(nvcc, &package.root, log).argument(format!("-arch={target}"));
@@ -697,7 +703,7 @@ impl Source for TritonSource {
         let interpreter = toolchain.script_interpreter().ok_or_else(|| Error::Toolchain {
             kind: ToolchainKind::Triton,
             message: format!(
-                "no Python environment to run {}: create crates/program-server/python with `uv sync`",
+                "no Python interpreter to run {}: pass --python",
                 script.display()
             ),
         })?;
@@ -774,8 +780,7 @@ impl Source for CuteDslSource {
             .ok_or_else(|| Error::Toolchain {
                 kind: ToolchainKind::CuteDsl,
                 message: format!(
-                    "no Python environment to run {}: create crates/program-server/python with \
-                 `uv sync`",
+                    "no Python interpreter to run {}: pass --python",
                     script.display()
                 ),
             })?;
@@ -959,8 +964,7 @@ impl Source for WasmSource {
                         .ok_or_else(|| Error::Toolchain {
                             kind: ToolchainKind::Wasm,
                             message: format!(
-                                "no Python environment to run {}: create \
-                                 crates/program-server/python with `uv sync`",
+                                "no Python interpreter to run {}: pass --python",
                                 script.display()
                             ),
                         })?;
@@ -972,7 +976,13 @@ impl Source for WasmSource {
                     .map_err(|error| package.failure_with_log(key, target, error, &log))?;
                 find_wasm(dir.path())?
             }
-            None => build_wasm_crate(package, key, target, dir, &log, toolchain.max_jobs())?,
+            None => {
+                let cargo = toolchain.cargo().ok_or_else(|| Error::Toolchain {
+                    kind: ToolchainKind::Wasm,
+                    message: "no cargo named: the wasm32 build of a policy crate needs --cargo".into(),
+                })?;
+                build_wasm_crate(cargo, package, key, target, dir, &log, toolchain.max_jobs())?
+            }
         };
 
         // Precompile it for this host's CPU: a policy is loaded into the
@@ -1020,6 +1030,7 @@ impl Source for WasmSource {
 /// --release` for wasm32, in the package root, with its own target directory
 /// in the build's workspace.
 fn build_wasm_crate(
+    cargo: &Path,
     package: &PackageSource,
     key: &str,
     target: &Target,
@@ -1027,13 +1038,8 @@ fn build_wasm_crate(
     log: &Path,
     max_jobs: usize,
 ) -> Result<PathBuf> {
-    let cargo = crate::toolchain::find_program("cargo").ok_or_else(|| Error::Toolchain {
-        kind: ToolchainKind::Wasm,
-        message: "no cargo on this host: the wasm32 build of a policy needs the Rust toolchain"
-            .into(),
-    })?;
     let target_directory = dir.path().join("cargo");
-    let job = ToolJob::new(&cargo, &package.root, log)
+    let job = ToolJob::new(cargo, &package.root, log)
         .argument("build")
         .argument("--release")
         .argument("--target")
@@ -1156,6 +1162,7 @@ mod tests {
             nvcc: None,
             python: PathBuf::from("/nonexistent/python"),
             wasm: None,
+            cargo: None,
             max_jobs: 1,
         }
     }

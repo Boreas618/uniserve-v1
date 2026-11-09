@@ -14,11 +14,11 @@
 //! own band - so its coordinates agreeing does not make its factors agree.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example encoder_rope -- --root /workspace/models/MiniMax-H3 \
+//! cargo run -q -p minimax-h3 --example encoder_rope -- --root $UNISERVE_H3_MODEL \
 //!     --prompt-ids 32,2518,38835,8473,3941,264,89773,2070,518,38393,11,8413,3100,11,6884 \
 //!     --out artifacts/h3-stage4/rope
 //! python crates/models/minimax-h3/tools/compare_rope_factors.py \
-//!     --case artifacts/h3-stage4/rope --checkpoint /workspace/models/MiniMax-H3
+//!     --case artifacts/h3-stage4/rope --checkpoint $UNISERVE_H3_MODEL
 //! ```
 //!
 //! The first writes `positions.h3t` (`[3, tokens]` int32), `cosine.h3t` and `sine.h3t`
@@ -42,7 +42,7 @@ const DEFAULT_IDS: [u32; 15] = [
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut root = None;
-    let mut out = PathBuf::from("artifacts/h3-stage4/rope");
+    let mut out = PathBuf::new();
     let mut ids: Option<Vec<u32>> = None;
     let mut grids: Vec<[u32; 3]> = Vec::new();
     let mut args = std::env::args().skip(1);
@@ -87,6 +87,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
         }
+    }
+    if out.as_os_str().is_empty() {
+        eprintln!("name the output directory with --out");
+        std::process::exit(2);
     }
     let root = root.ok_or("--root is required")?;
     let ids = ids.unwrap_or_else(|| DEFAULT_IDS.to_vec());

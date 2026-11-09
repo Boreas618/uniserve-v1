@@ -100,15 +100,20 @@ def find_free_port() -> int:
 
 
 def require_uniserve_binary() -> Path:
+    """The `uniserve` binary the tests serve with.
+
+    `UNISERVE_BINARY` names it.
+    """
     configured = os.environ.get("UNISERVE_BINARY")
-    path = (
-        Path(configured)
-        if configured
-        else Path.cwd() / "target" / "debug" / "uniserve"
-    )
+    if not configured:
+        raise FileNotFoundError(
+            "UNISERVE_BINARY must name the uniserve binary; "
+            "`cargo build -p uniserve` builds one"
+        )
+    path = Path(configured)
     if not path.exists():
         raise FileNotFoundError(
-            f"{path} does not exist; run `cargo build -p uniserve` first"
+            f"UNISERVE_BINARY names {path}, which does not exist"
         )
     return path
 
@@ -310,7 +315,10 @@ def second_host(
     closes, keeps the Storage Server's log beside `log` and stops that
     server. A daemon that outlives its leader fails the test.
     """  # noqa: D205
-    runtime = f"/tmp/uniserve-follower-{os.getpid()}-{find_free_port()}"
+    runtime = os.path.join(
+        tempfile.gettempdir(),
+        f"uniserve-follower-{os.getpid()}-{find_free_port()}",
+    )
     variables = {
         name: os.environ.get(name, "")
         for name in (

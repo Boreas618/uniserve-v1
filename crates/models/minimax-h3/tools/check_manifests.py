@@ -2,7 +2,10 @@
 """Check the DiT's descriptor values against the package manifests that must declare them.
 
     .venv/bin/python crates/models/minimax-h3/tools/check_manifests.py \
-        [--root /opt/uv/models/MiniMax-H3] [--kernels crates/ops/kernels]
+        [--root <checkpoint>] [--kernels <package root>]
+
+`--root` defaults to the checkpoint `UNISERVE_H3_MODEL` names, and `--kernels` to this repository's
+`crates/ops/kernels`.
 
 A descriptor outside a package's `dimensions` is a key with no compiled program: `_compile.py`
 accepts exactly the range the manifest declares, and `Generation::kernel` answers
@@ -33,9 +36,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import sys
+
+#: This repository, found from this file's own place in it.
+REPOSITORY = pathlib.Path(__file__).resolve().parents[4]
 
 # One `dimensions = { field = ["value", ...], ... }` line of a package manifest.
 DIMENSIONS = re.compile(r"^dimensions\s*=\s*\{(.*)\}\s*$")
@@ -164,8 +171,8 @@ def expectations(config: dict, degrees: list[int]) -> list[tuple[str, str, str, 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--root", default="/opt/uv/models/MiniMax-H3")
-    parser.add_argument("--kernels", default="crates/ops/kernels")
+    parser.add_argument("--root", default=os.environ.get("UNISERVE_H3_MODEL"))
+    parser.add_argument("--kernels", default=REPOSITORY / "crates/ops/kernels")
     parser.add_argument(
         "--ulysses",
         default="1,2",
@@ -174,6 +181,8 @@ def main() -> int:
     arguments = parser.parse_args()
     degrees = [int(value) for value in arguments.ulysses.split(",") if value.strip()]
 
+    if arguments.root is None:
+        parser.error("name the checkpoint with --root or UNISERVE_H3_MODEL")
     root = pathlib.Path(arguments.root)
     kernels = pathlib.Path(arguments.kernels)
     configs = sorted(root.glob("transformer*/config.json"))

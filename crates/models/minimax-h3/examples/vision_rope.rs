@@ -9,10 +9,10 @@
 //! which is why neither of those comparators can stand in for this one.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example vision_rope -- --root /workspace/models/MiniMax-H3 \
+//! cargo run -q -p minimax-h3 --example vision_rope -- --root $UNISERVE_H3_MODEL \
 //!     --height 4 --width 4 --merge 2 --out artifacts/h3-vision-rope
 //! python crates/models/minimax-h3/tools/compare_rope_factors.py --vision \
-//!     artifacts/h3-vision-rope --checkpoint /workspace/models/MiniMax-H3
+//!     artifacts/h3-vision-rope --checkpoint $UNISERVE_H3_MODEL
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -26,7 +26,7 @@ const I32: u8 = 3;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut root = None;
-    let mut out = PathBuf::from("artifacts/h3-vision-rope");
+    let mut out = PathBuf::new();
     let (mut height, mut width, mut merge) = (4_u32, 4, 2_u32);
     let mut args = std::env::args().skip(1);
     while let Some(flag) = args.next() {
@@ -45,6 +45,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
         }
+    }
+    if out.as_os_str().is_empty() {
+        eprintln!("name the output directory with --out");
+        std::process::exit(2);
     }
     let root = root.ok_or("--root is required")?;
     run(&root, height, width, merge, &out).map_err(Into::into)

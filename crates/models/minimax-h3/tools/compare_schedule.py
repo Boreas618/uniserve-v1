@@ -3,10 +3,10 @@
 **This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
 repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
 checkout of the last tree that held the package and that tree's interpreter, with the tree on the
-path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+path; `UNISERVE_REFERENCE_TREE` names that checkout:
 
-    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
-        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+    PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \\
+        $UNISERVE_REFERENCE_TREE/.venv/bin/python <this file> ...
 
 The diagnosis design 10 asks for, on the schedule component: for every sigma point and every network
 time, both implementations' value, the absolute difference, and - when anything differs - the index

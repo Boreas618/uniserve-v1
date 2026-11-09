@@ -31,8 +31,8 @@
 #   commit    cargo run -q -p executor --example runner_keys -- \
 #                 --rows 1,2,4,8 --tokens 128,512 --sampled true --vocabulary 151936
 #
-# The checked-in file is `notes/programs/qwen3-moe-runner-keys.txt`, whose header
-# states both commands and the deployment values it was generated with.
+# The file's header states both commands and the deployment values it was
+# generated with.
 set -eu
 
 root=${1:?usage: build_qwen3_fixture.sh <checkpoint root> <runner keys file> <out file> [<commit>]}

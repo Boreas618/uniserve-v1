@@ -237,8 +237,8 @@ mod tests {
     }
 
     fn check_shipped_deployments(family: &str) {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../configs")
+        let root = std::path::Path::new(proto::WORKSPACE)
+            .join("configs")
             .join(family);
         let mut checked = 0;
         for entry in std::fs::read_dir(&root).expect("the deployment directory exists") {

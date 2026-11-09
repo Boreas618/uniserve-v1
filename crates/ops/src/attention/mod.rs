@@ -966,7 +966,7 @@ impl PagedAttention {
     /// Launch this crate's own Triton program for an `E4M3` page.
     ///
     /// The vendor libraries refuse a plane carrying an f32 page scale, by name, so the quantized
-    /// cache needs a program of ours (`notes/programs/paged_attention_fp8.md`). **It serves both
+    /// cache needs a program of ours. **It serves both
     /// phases from two kernels of one module**: decode walks one program per (query row, query head)
     /// along the row's page table with a running maximum, normaliser and accumulator; prefill takes
     /// the packed query rows as its first grid dimension, masks each row at its own key count and

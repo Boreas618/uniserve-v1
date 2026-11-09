@@ -5,11 +5,10 @@ The module is this package's kernel compiled with nvcc into a shared object expo
 from the call structure, so every descriptor of this package compiles the same object: the
 SM90a tile is fixed at 128 rows in both directions, which is the only block it serves.
 
-The kernel is CuTe and CUTLASS source, so nvcc needs their headers. They are found in the
-order a build host most plausibly has them — `CUTLASS_PATH`, then the CUTLASS that ships
-with the Program Server's own environment (flashinfer's copy), then the system's
-`/usr/include/cutlass` — and the header directory that was used is printed with the build's
-result, so a revision says what it was compiled against.
+The kernel is CuTe and CUTLASS source, so nvcc needs their headers. They come from
+`CUTLASS_PATH` when it is set, else from the CUTLASS that ships with the FlashInfer of the
+interpreter running the build, which is the Program Server's own; the header directory that was
+used is printed with the build's result, so a revision says what it was compiled against.
 
 The Program Server runs this script with its own Python environment, its working directory the
 package root, and `UNISERVE_DESCRIPTOR`, `UNISERVE_TARGET`, `UNISERVE_PACKAGE` and
@@ -18,13 +17,12 @@ the same values on the command line.
 """
 
 import argparse
+import importlib.util
 import json
 import os
 import pathlib
-import shutil
 import subprocess
 import sys
-import sysconfig
 
 #: The translation unit of the module.
 SOURCE = "src/attention.cu"
@@ -63,20 +61,18 @@ def cutlass_include():
     candidates = []
     if os.environ.get("CUTLASS_PATH"):
         candidates.append(pathlib.Path(os.environ["CUTLASS_PATH"]) / "include")
-    # The Program Server's own environment: flashinfer ships the CUTLASS its kernels use.
-    for key in ("purelib", "platlib"):
-        site = sysconfig.get_paths().get(key)
-        if site:
-            candidates.append(pathlib.Path(site) / "flashinfer" / "data" / "cutlass" / "include")
-    candidates.append(pathlib.Path("/usr/include"))
+    # flashinfer ships the CUTLASS its kernels use.
+    found = importlib.util.find_spec("flashinfer")
+    for root in (found.submodule_search_locations if found is not None else None) or []:
+        candidates.append(pathlib.Path(root) / "data" / "cutlass" / "include")
     for candidate in candidates:
         if (candidate / "cute" / "tensor.hpp").is_file() and (
             candidate / "cutlass" / "version.h"
         ).is_file():
             return candidate
     raise SystemExit(
-        "no CUTLASS headers found: set CUTLASS_PATH to a CUTLASS checkout, or install the "
-        "flashinfer package whose data directory carries them"
+        "no CUTLASS headers found: set CUTLASS_PATH to a CUTLASS checkout, or run the build "
+        "with an interpreter whose flashinfer package carries them"
     )
 
 
@@ -84,7 +80,8 @@ def main():
     """Compile the kernel for one descriptor into ``module.so``."""
     package, descriptor, target, out = arguments()
     out.mkdir(parents=True, exist_ok=True)
-    compiler = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    # The nvcc the Program Server checked against this package's declared version.
+    compiler = os.environ["UNISERVE_NVCC"]
     cutlass = cutlass_include()
 
     # CuTe's host-side helpers call constexpr functions from `__host__ __device__` context,

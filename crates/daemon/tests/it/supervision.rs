@@ -266,7 +266,7 @@ fn a_killed_daemon_takes_its_processes_with_it() {
         "group",
         0,
         0,
-        "/usr/bin/python3",
+        "python3",
         &[
             "-c",
             "import os; os.read(int(os.environ['UNISERVE_LIFELINE']), 1)",

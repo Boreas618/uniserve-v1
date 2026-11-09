@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the E4M3 paged attention's prefill kernel under Triton's interpreter and compare what it wrote.
 
-The operator's contract is `notes/programs/paged_attention_fp8.md`; the prefill program differs from
+The operator's contract is `ops::attention::PagedAttention`'s; the prefill program differs from
 the decode one in exactly two ways, and each is a case here:
 
 * **the causal mask** — a query row at position `p` attends keys `0..=p` of its own batch row, so the

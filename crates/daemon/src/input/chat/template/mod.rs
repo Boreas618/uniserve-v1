@@ -560,7 +560,10 @@ mod tests {
     use crate::output::chat::{AssistantContentBlock, Error, Result};
     use crate::output::tools::Tool;
 
-    const QWEN3_TEMPLATE: &str = include_str!("../../../../tests/templates/qwen3.jinja");
+    const QWEN3_TEMPLATE: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/templates/qwen3.jinja"
+    ));
 
     fn sample_request(messages: Vec<ChatMessage>) -> ChatRequest {
         ChatRequest {

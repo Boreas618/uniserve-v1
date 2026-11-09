@@ -49,9 +49,6 @@ use nn::{
     WeightKey, WeightLoader,
 };
 
-/// The export root the caller's GPU host holds, when `--root` does not name another.
-const DEFAULT_ROOT: &str = "/workspace/models/MiniMax-H3";
-
 /// The `vae/` checkpoint directory inside the export.
 const VAE: &str = "vae";
 /// The audio VAE's directory in the checkpoint, which is also its component name: the video VAE and
@@ -162,7 +159,7 @@ impl Args {
     fn parse() -> Result<Self> {
         let mut args = Self {
             stage: Stage::Weights,
-            root: PathBuf::from(DEFAULT_ROOT),
+            root: PathBuf::new(),
             store: std::env::var_os("UNISERVE_STORE").map(PathBuf::from),
             device: 0,
             latent_height: 16,
@@ -174,7 +171,7 @@ impl Args {
             audio_frames: 20,
             timeline_frames: 107,
             arena_gib: 0,
-            out: PathBuf::from("artifacts/h3-vae-decode"),
+            out: PathBuf::new(),
         };
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
@@ -240,6 +237,18 @@ impl Args {
                     )));
                 }
             }
+        }
+        if args.out.as_os_str().is_empty() {
+            eprintln!("name the output directory with --out");
+            std::process::exit(2);
+        }
+        if args.root.as_os_str().is_empty() {
+            args.root = std::env::var_os("UNISERVE_H3_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
+                    std::process::exit(2)
+                });
         }
         if args.latent_height == 0 || args.latent_width == 0 {
             return Err(Failure::message(

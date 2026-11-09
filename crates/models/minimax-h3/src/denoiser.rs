@@ -1354,7 +1354,7 @@ pub struct ConditionLatents<'a> {
 /// company, not a verdict on either.
 pub struct ConditionTrace<'a> {
     /// `[condition rows, hidden]`: the prefix source's condition rows as the projection left them,
-    /// in packed order - audio before video within a segment (`notes/h3/conditioned-diagnosis.md`).
+    /// in packed order - audio before video within a segment.
     pub source: Option<TensorView>,
     /// `[prompt tokens, hidden]`: the refiner's rows the pack gathers. The source's rows above the
     /// prompt are never read (`prefix_index` sends every padding row to the zero row), so they are

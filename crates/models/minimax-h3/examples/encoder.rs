@@ -118,7 +118,7 @@ impl Args {
         let mut root = None;
         let mut device = 0;
         let mut store = None;
-        let mut out = PathBuf::from("artifacts/h3-stage4");
+        let mut out = PathBuf::new();
         let mut pool_mib = None;
         let mut prompt = None;
         let mut prompt_ids = None;
@@ -233,6 +233,10 @@ impl Args {
                     )));
                 }
             }
+        }
+        if out.as_os_str().is_empty() {
+            eprintln!("name the output directory with --out");
+            std::process::exit(2);
         }
         let root = root.ok_or_else(|| Failure("--root is required".into()))?;
         // The ids are the front end's answer, not this harness's: a prompt given without them would

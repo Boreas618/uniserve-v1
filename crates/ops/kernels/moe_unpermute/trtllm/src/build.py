@@ -68,19 +68,15 @@ def arguments():
 def distribution():
     """The FlashInfer `data` tree the kernels and their headers live in."""
     found = importlib.util.find_spec("flashinfer")
-    roots = []
-    if found is not None and found.submodule_search_locations:
-        roots.extend(pathlib.Path(one) for one in found.submodule_search_locations)
-    # The Program Server's own Python environment pins FlashInfer even when this
-    # script runs under another interpreter.
-    repository = pathlib.Path(__file__).resolve().parents[6]
-    roots.extend(repository.glob("crates/program-server/python/.venv/lib/python*/site-packages/flashinfer"))
-    roots.extend(repository.glob(".venv/lib/python*/site-packages/flashinfer"))
-    for root in roots:
-        data = root / "data"
+    roots = found.submodule_search_locations if found is not None else None
+    for root in roots or []:
+        data = pathlib.Path(root) / "data"
         if (data / "csrc").is_dir():
             return data
-    raise SystemExit("no FlashInfer distribution with its data tree was found")
+    raise SystemExit(
+        f"no FlashInfer distribution with its data tree was found in the interpreter "
+        f"running this build ({sys.executable})"
+    )
 
 
 def includes(data):
@@ -124,7 +120,8 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     staging = out / "objects"
     staging.mkdir(exist_ok=True)
-    compiler = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    # The nvcc the Program Server checked against this package's declared version.
+    compiler = os.environ["UNISERVE_NVCC"]
 
     objects = []
     for relative in SOURCES:
@@ -147,7 +144,6 @@ def main():
             "-shared",
             f"-arch={target}",
             *[str(one) for one in objects],
-            "-L/usr/local/cuda/lib64",
             "-lcudart",
             "-o",
             str(module),

@@ -45,9 +45,6 @@ use nn::DType;
 use nn::capability::{EncoderLayout, ImageShape};
 use serde::Deserialize;
 
-/// The released checkpoint's text encoder directory.
-const DEFAULT_CHECKPOINT: &str = "/opt/uv/models/MiniMax-H3/text_encoder";
-
 /// What a case describes: one prompt and the grids of its media.
 #[derive(Deserialize)]
 struct Case {
@@ -202,7 +199,7 @@ fn read_case(path: &Path) -> Result<Case, String> {
 fn arguments() -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let mut case = None;
     let mut out = None;
-    let mut checkpoint = PathBuf::from(DEFAULT_CHECKPOINT);
+    let mut checkpoint = PathBuf::new();
     let mut arguments = std::env::args().skip(1);
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
@@ -216,6 +213,11 @@ fn arguments() -> Result<(PathBuf, PathBuf, PathBuf), String> {
             }
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if checkpoint.as_os_str().is_empty() {
+        checkpoint = std::env::var_os("UNISERVE_H3_MODEL")
+            .map(|root| PathBuf::from(root).join("text_encoder"))
+            .ok_or("name the text encoder with --text-encoder or UNISERVE_H3_MODEL")?;
     }
     let case = case.ok_or("--case <case.json> is required")?;
     let out = out.ok_or("--out <dir> is required")?;
@@ -294,9 +296,10 @@ mod tests {
         assert!(header.contains("'descr': '<f4'"));
     }
 
-    /// The released checkpoint's own configuration, when the assets are present.
+    /// The released checkpoint's own configuration, when `UNISERVE_H3_MODEL` names it.
     fn released() -> Option<TextEncoderConfig> {
-        read_config(Path::new(DEFAULT_CHECKPOINT)).ok()
+        let root = std::env::var_os("UNISERVE_H3_MODEL")?;
+        read_config(&Path::new(&root).join("text_encoder")).ok()
     }
 
     #[test]

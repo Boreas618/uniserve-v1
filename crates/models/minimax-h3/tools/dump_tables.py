@@ -4,13 +4,13 @@
 **This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
 repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
 checkout of the last tree that held the package and that tree's interpreter, with the tree on the
-path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+path; `UNISERVE_REFERENCE_TREE` names that checkout:
 
-    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
-        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+    PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \\
+        $UNISERVE_REFERENCE_TREE/.venv/bin/python <this file> ...
 
-The Rust side of the comparison is `crates/models/minimax-h3/examples/compare_blocks.rs`; the case
-format, the tensor container and how to read the report are in `notes/h3/numeric-diagnosis.md`.
+The Rust side of the comparison is `crates/models/minimax-h3/examples/compare_blocks.rs`; the tensor
+container is this file's `dump` and `load`.
 
 Run it from the repository root:
 
@@ -30,8 +30,8 @@ from pathlib import Path
 import numpy as np
 import torch
 
-# The container's dtype codes: 0 f64, 1 f32, 2 i64, 3 i32, 4 bf16, 5 f16, 6 i16
-# (notes/h3/numeric-diagnosis.md). The comparators read a half-precision payload as the dtype its
+# The container's dtype codes: 0 f64, 1 f32, 2 i64, 3 i32, 4 bf16, 5 f16, 6 i16. The comparators
+# read a half-precision payload as the dtype its
 # producer computed in: a BF16 activation widened before writing is twice its width on disk and
 # changes none of the numbers, so the container keeps it narrow.
 CODES = {

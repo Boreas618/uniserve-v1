@@ -4,8 +4,7 @@
 //! The shim (`src/ffi/shim.c`) includes the real libav* headers, so this crate
 //! keeps up with the ABI instead of mirroring FFmpeg's structs in Rust. It is
 //! linked against the shared libraries of one installation, named by
-//! `UNISERVE_FFMPEG_DIR` or, when unset, the workspace's provisioned runtime
-//! under `artifacts/native/prefix` (see `crates/media/README.md`).
+//! `UNISERVE_FFMPEG_DIR` (see `crates/media/README.md`).
 //!
 //! The runtime path is recorded in every executable this package builds, so a
 //! test binary runs without a wrapper script.

@@ -4,6 +4,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     CUDA_HOME=/usr/local/cuda \
     UV_PROJECT_ENVIRONMENT=/opt/uniserve-venv \
     MAX_JOBS=2 \
+    PCRE2_SYS_STATIC=1 \
     PATH=/opt/uniserve-venv/bin:/root/.cargo/bin:/root/.local/bin:/usr/local/cuda/bin:${PATH}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

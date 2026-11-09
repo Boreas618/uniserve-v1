@@ -832,9 +832,9 @@ mod tests {
     /// Every deployment the repository publishes for `--worker-groups` places.
     #[test]
     fn published_deployments_place() {
-        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/../../configs");
+        let root = std::path::Path::new(crate::WORKSPACE).join("configs");
         let mut files = 0;
-        for model in std::fs::read_dir(root).unwrap() {
+        for model in std::fs::read_dir(&root).unwrap() {
             for entry in std::fs::read_dir(model.unwrap().path()).unwrap() {
                 let path = entry.unwrap().path();
                 let text = std::fs::read_to_string(&path).unwrap();

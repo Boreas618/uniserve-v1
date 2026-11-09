@@ -1,9 +1,9 @@
 //! A model's programs, recorded from the model's own `forward`.
 //!
 //! ```text
-//! cargo run -p minimax-h3 --example record -- --root /opt/uv/models/MiniMax-H3 --component all \
+//! cargo run -p minimax-h3 --example record -- --root $UNISERVE_H3_MODEL --component all \
 //!     --clip 260 --raster 672x1536 --extents h3-audio-extents.json \
-//!     --against notes/programs/minimax-h3-keys.txt
+//!     --against <key file>
 //! ```
 //!
 //! ## Why this exists beside `examples/programs.rs`
@@ -69,17 +69,16 @@ use nn::{DType, Forward, Shape};
 
 /// What the recorder takes, printed for `--help`.
 ///
-/// The recorder is the deployment check's engine (`tools/check_h3_deployment.sh` runs it at every
-/// point the file states), so the caller meets its arguments in a failure before reading this file:
-/// printing them where a caller looks first is the difference between a flag list and a guess.
+/// A caller meets the recorder's arguments in a failure before reading this file: printing them
+/// where a caller looks first is the difference between a flag list and a guess.
 fn usage() -> String {
     "record --root <checkpoint> [--names | --list | --extents <file>] [--component <name>] [--types <file>]\n\
      \x20      [--clip <frames>] [--raster <height>x<width>] [--track <samples>] [--rows <n>]\n\
      \x20      [--tokens <n>] [--elements <n>] [--conditioned true|false]\n\
      \x20      [--sparse <tile,sparsity[,reference_keep]>] [--against <path>]\n\
-     \x20      [--check-extents]\n\n\
+     \x20      [--check-extents <table>]\n\n\
      --names lists the components the checkpoint holds; --list the program keys one component\n\
-     launches; --check-extents states every row's extents without recording. Everything else\n\
+     launches; --check-extents diffs an extents table against the checkpoint. Everything else\n\
      records the deployment at the point the flags describe.\n"
         .to_owned()
 }
@@ -148,7 +147,7 @@ impl ops::capture::Sink for Recorded {
 
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
-    let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
+    let mut root = PathBuf::new();
     let mut component = String::from("all");
     // A clip is `17n + 5` frames (the packing's rule, enforced below) and its soundtrack follows from it:
     // 260 frames are 433 audio latent frames of 800 samples, so the two defaults are one deployment.
@@ -175,6 +174,7 @@ fn run() -> Result<(), String> {
     let mut track = 346_400u32;
     let mut elements = 0u64;
     let mut against: Option<PathBuf> = None;
+    let mut check: Option<PathBuf> = None;
     let mut extents: Option<PathBuf> = None;
     let mut types: Option<PathBuf> = None;
     let mut sparse: Option<(u32, f64, Option<f64>)> = None;
@@ -262,11 +262,20 @@ fn run() -> Result<(), String> {
             }
             "--list" => list = true,
             "--names" => names = true,
-            "--check-extents" => {
-                return check_extents(&root).map_err(|error| error.to_string());
-            }
+            "--check-extents" => check = Some(PathBuf::from(value()?)),
             other => return Err(format!("unknown argument {other}")),
         }
+    }
+    if root.as_os_str().is_empty() {
+        root = std::env::var_os("UNISERVE_H3_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
+                std::process::exit(2)
+            });
+    }
+    if let Some(table) = check {
+        return check_extents(&root, &table);
     }
 
     if names {
@@ -1658,9 +1667,8 @@ fn list_names(root: &Path, component: &str) -> Result<(), String> {
 /// Absent names and differing types or extents are both failures: the first is a row for a tensor
 /// that does not exist, the second is a row keyed from the wrong type. A checkpoint tensor the table
 /// does not name is not a failure - the table holds the tensors the harnesses touch, not every weight.
-fn check_extents(root: &Path) -> Result<(), String> {
-    let path = PathBuf::from("notes/programs/h3-extents.json");
-    let stated = read_extents(&path)?;
+fn check_extents(root: &Path, path: &Path) -> Result<(), String> {
+    let stated = read_extents(path)?;
     // `open` requires every shard the index names; a host holding some of them still has headers to
     // check against, which is what `unopened` gives - and a host holding none answers zero tensors,
     // which the summary states rather than pretending the table passed.

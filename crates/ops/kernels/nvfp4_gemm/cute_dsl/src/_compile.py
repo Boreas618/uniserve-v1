@@ -101,8 +101,11 @@ def cutlass_library():
 
 
 def cuda_home():
-    """The CUDA toolkit's directory: the runtime's headers and library."""
-    return Path(os.environ.get("CUDA_HOME") or "/usr/local/cuda")
+    """The CUDA toolkit's directory, which `CUDA_HOME` names: the runtime's headers and library."""
+    home = os.environ.get("CUDA_HOME")
+    if not home:
+        raise SystemExit("CUDA_HOME names the CUDA toolkit whose runtime the module links against")
+    return Path(home)
 
 
 def link(out, objects, header_dir, entry, archive):

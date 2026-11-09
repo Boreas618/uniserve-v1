@@ -4,10 +4,10 @@
 **This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
 repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
 checkout of the last tree that held the package and that tree's interpreter, with the tree on the
-path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+path; `UNISERVE_REFERENCE_TREE` names that checkout:
 
-    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
-        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+    PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \\
+        $UNISERVE_REFERENCE_TREE/.venv/bin/python <this file> ...
 
 ``dump_encoder_tables.py`` imports the reference's own modules, and two of those import
 ``uniserve_kernels`` unconditionally - ``uniserve/nn/rope.py`` imports ``rope`` before it ever
@@ -25,7 +25,7 @@ Usage::
 
     python crates/models/minimax-h3/tools/run_dump_encoder_tables.py \\
         --case case.json --out artifacts/diagnosis/<run>/ref \\
-        [--text-encoder /opt/uv/models/MiniMax-H3/text_encoder]
+        [--text-encoder <checkpoint>/text_encoder]
 
 Everything after this script's own name is passed through to ``dump_encoder_tables.py``.
 """

@@ -11,7 +11,6 @@ import json
 import os
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
 import sysconfig
@@ -92,7 +91,8 @@ def main():
     """Compile the exchange for one descriptor into ``module.so``."""
     package, descriptor, target, out = arguments()
     out.mkdir(parents=True, exist_ok=True)
-    compiler = shutil.which("nvcc") or "/usr/local/cuda/bin/nvcc"
+    # The nvcc the Program Server checked against this package's declared version.
+    compiler = os.environ["UNISERVE_NVCC"]
     defines = [f"-D{name}={value}" for name, value in constants(descriptor).items()]
     command = [
         compiler,

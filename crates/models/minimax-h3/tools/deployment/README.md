@@ -1,6 +1,6 @@
 # The deployment probes
 
-Two tools behind the text encoder's figures in `notes/h3/deployments.md`. Each builds the checkpoint's
+Two tools behind the text encoder's deployment figures. Each builds the checkpoint's
 Qwen3-VL text encoder on the meta device from `text_encoder/config.json` with Transformers, so no weight
 file is read and no device is needed. They are measurement tools, not deliverables: they print, they
 assert nothing, and no code path in the crate calls them.

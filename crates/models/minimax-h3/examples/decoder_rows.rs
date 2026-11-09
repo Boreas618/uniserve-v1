@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p minimax-h3 --example decoder_rows -- \
-//!     --root /opt/uv/models/MiniMax-H3 \
+//!     --root $UNISERVE_H3_MODEL \
 //!     --extents artifacts/h3-reference/component-tensors.json
 //! ```
 //!
@@ -84,7 +84,7 @@ fn main() {
 }
 
 fn run() -> Result<(), String> {
-    let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
+    let mut root = PathBuf::new();
     let mut extents_path = None;
     let mut canvases: Vec<(u32, u32)> = Vec::new();
     let mut arguments = std::env::args().skip(1);
@@ -103,6 +103,14 @@ fn run() -> Result<(), String> {
                 ));
             }
         }
+    }
+    if root.as_os_str().is_empty() {
+        root = std::env::var_os("UNISERVE_H3_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
+                std::process::exit(2)
+            });
     }
     if canvases.is_empty() {
         canvases = minimax_h3::config::offered_canvases()

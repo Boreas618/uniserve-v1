@@ -323,7 +323,7 @@ impl Buffers {
     /// The diagnosis of specs/worker.md 10 dumps the tower's residual stream after its last block,
     /// which lives in an arena reservation whose address the runner does not know. Handing the
     /// runner's own view in as the stream costs nothing and changes no number: the same kernels
-    /// write the same rows, at another address (`notes/h3/text-encoder-tables.md`).
+    /// write the same rows, at another address.
     pub fn with_stream(mut self, view: TensorView) -> Result<Self> {
         let rows = self.hidden.rows();
         let columns = self.hidden.last();

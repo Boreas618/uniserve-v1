@@ -6,14 +6,14 @@
 //! cargo run -p minimax-h3 --example minimax_h3_keys [-- --root <checkpoint>] [--rasters HxW,...]
 //! ```
 //!
-//! The output is `notes/programs/minimax-h3-keys.txt`: **the store's list** - every row
+//! The output is **the store's list** - every row
 //! every component this build loads states, over both element types - so no package has to guess a
 //! variant.
 //!
 //! ## The two flags, and why the canvases are one
 //!
 //! `--root` names the checkpoint every derived row comes from (`MINIMAX_H3_CHECKPOINT` when the flag
-//! is absent, else `/opt/uv/models/MiniMax-H3`); its `vae/config.json` is the geometry, and the
+//! is absent, else `$UNISERVE_H3_MODEL`); its `vae/config.json` is the geometry, and the
 //! header prints the fields that decided the rows. `--rasters` names the canvases those rows cover, in `HxW`, defaulting
 //! to `NAMED_CANVASES` - **the six the model offers**, because a store built for one canvas stops at
 //! `no kernel` on any other.
@@ -23,10 +23,10 @@
 //! canvas outside the offered set belongs to a list generated with `--rasters` naming it. The two
 //! lists are then two stores, and neither claims the other's canvases.
 //!
-//! It is not the fixture. `notes/programs/minimax-h3-keys.txt` is **one deployment's** rows, copied
+//! It is not a deployment's key file, which is **one deployment's** rows, copied
 //! from that deployment's walk (`examples/programs.rs` then `examples/h3_fixture.rs`), and it is a
 //! subset in the sense that matters: a store built from this file serves a deployment, and a fixture
-//! is what a walk bound. Two lists, two questions - `notes/h3/fixture-delta.md` is the two-way check
+//! is what a walk bound. Two lists, two questions - `ops --example keys_delta` is the two-way check
 //! between them, and the difference between them is the finding rather than the error.
 //!
 //! ## Regenerating the list, and its second opinion
@@ -36,9 +36,9 @@
 //!
 //! ```text
 //! cargo run -q -p minimax-h3 --example minimax_h3_keys -- \
-//!     --commit "$(git rev-parse --short HEAD)" > notes/programs/minimax-h3-keys.txt
+//!     --commit "$(git rev-parse --short HEAD)" > <store list>
 //! .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
-//!     --against notes/programs/minimax-h3-keys.txt
+//!     --against <store list>
 //! ```
 //!
 //! The second command is a host-side set difference in one direction only: it asks whether every key
@@ -50,7 +50,7 @@
 //! ## Where the numbers come from
 //!
 //! Every geometry below is the checkpoint's, read from
-//! `/opt/uv/models/MiniMax-H3/{transformer,audio_vae,vae}/config.json`, never inferred from prose:
+//! `$UNISERVE_H3_MODEL/{transformer,audio_vae,vae}/config.json`, never inferred from prose:
 //!
 //! - transformer: `hidden_size 5376`, `num_attention_heads 56`, `attention_head_dim 128` (so
 //!   attention is 56 heads of 128, not grouped), `ffn_dim 14336`, `num_layers 50`, `norm_eps` and
@@ -292,10 +292,9 @@ fn main() {
     // **One root.** Everything below that reads the checkpoint reads this value, so `--root` moves all
     // of it at once. `MINIMAX_H3_CHECKPOINT` is the same statement made by the environment, and the
     // flag overrides it.
-    let mut root = std::env::var_os("MINIMAX_H3_CHECKPOINT").map_or_else(
-        || "/opt/uv/models/MiniMax-H3".into(),
-        std::path::PathBuf::from,
-    );
+    let mut root = std::env::var_os("MINIMAX_H3_CHECKPOINT")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
     let mut rasters: Vec<(u32, u32)> = Vec::new();
     // The clip lengths the deployment serves, in video frames: the audio rows are stated once per
     // track length, so this is a deployment statement like `--rasters` and not a property of a model.
@@ -394,6 +393,10 @@ fn main() {
             }
             other => panic!("unknown flag {other}"),
         }
+    }
+    if root.as_os_str().is_empty() {
+        eprintln!("name the checkpoint with --root or MINIMAX_H3_CHECKPOINT");
+        std::process::exit(2);
     }
     if rasters.is_empty() {
         rasters = minimax_h3::NAMED_CANVASES
@@ -900,7 +903,7 @@ fn header(
     // cannot drift from the rows: both come from one read of `--root`.
     println!(
         "# derived: the video encoder's canvas-class rows, from `--root`'s own config (default \
-         /opt/uv/models/MiniMax-H3). block_out_channels {:?}, spatial_downsample_factors {:?}, \
+         $UNISERVE_H3_MODEL). block_out_channels {:?}, spatial_downsample_factors {:?}, \
          temporal_downsample_factors {:?}, latent_channels {}; rasters (height, width) {:?}.",
         video_vae.block_out_channels,
         video_vae.spatial_downsample_factors,
@@ -1051,7 +1054,7 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
     //
     // The deployment's crossings are a named gap, not a row: `auto`'s sample is FP32 and its stack
     // BF16, so a sampler run at `auto` needs an element-type crossing at `patch` and at
-    // `unpatchify_video` (one doc in `notes/h3/kernel-cells-audit.md` §5), and until those carry an
+    // `unpatchify_video`, and until those carry an
     // input and an output type, `auto` stops at the first crossing by name. A stated FP32 deployment
     // is complete.
 
@@ -1327,8 +1330,8 @@ fn rows(deployment: DType, bound: u32, sparse: bool) -> Vec<(String, String)> {
     // The VSA branch's own attention: one program per tile size, and the key extent (tiles per
     // segment per layout) is a declared bound outside the key.
     //
-    // The FP32 form is not listed, and the reason is a programs gap named in
-    // `notes/h3/kernel-cells-audit.md`: every `sparse_attention` backend refuses it at its entry -
+    // The FP32 form is not listed, and the reason is a programs gap: every `sparse_attention`
+    // backend refuses it at its entry -
     // `sm90` and `sm100` accept BF16 only (`sm100`'s `attention.cu` refuses and then casts its
     // operands to `__nv_bfloat16*`), and `sm120` accepts BF16 and FP16 - because the kernel is the
     // vendor's block-sparse pass, written for 16-bit operands. A row for it would build (the element

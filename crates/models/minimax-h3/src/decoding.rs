@@ -137,7 +137,7 @@ impl Track {
 /// One scratch buffer of a decoder's forward, with the element type it holds.
 ///
 /// The worker sizes the arena from these; the model never allocates. Names are the ones the arena
-/// plan in `notes/h3/decoders-interface.md` uses, so a mismatch is visible in one place - **and the order
+/// plan uses, so a mismatch is visible in one place - **and the order
 /// is the order the model reserves them in**, because the arena is one cursor: a buffer listed before
 /// another is also reserved before it, and anything the code reserves inside a loop is multiplied.
 #[derive(Clone, PartialEq, Eq, Debug)]

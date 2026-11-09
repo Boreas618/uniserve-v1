@@ -201,7 +201,7 @@ def _serve(
     With `storage`, a Storage Server started by hand with those options
     serves the deployment, which starts none of its own.
     """
-    runtime = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
+    runtime = Path(tempfile.mkdtemp(prefix="uniserve-"))
     port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     command = [

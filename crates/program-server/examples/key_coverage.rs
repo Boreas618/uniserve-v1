@@ -1,7 +1,7 @@
 //! Store coverage for a key fixture: can this host install a module for every key the fixture lists,
 //! and what must each module carry?
 //!
-//! A key fixture (such as `notes/programs/qwen3-moe-keys.txt`) names one descriptor key per line as
+//! A key fixture (such as the one `tools/build_qwen3_fixture.sh` writes) names one descriptor key per line as
 //! `<operator>\t<descriptor key>`. For the rewrite to launch that module, three facts must hold, and
 //! this program reports all three per key:
 //!
@@ -19,7 +19,7 @@
 //!
 //! ```text
 //! cargo run -p program-server --example key_coverage -- \
-//!     --fixture notes/programs/qwen3-moe-keys.txt --target sm_100a
+//!     --fixture <keys file> --target sm_100a
 //! ```
 //!
 //! The exit code is 1 when any key has no package that covers it for the target, so the example can
@@ -52,7 +52,7 @@ fn main() -> ExitCode {
     let mut fixture = None;
     let mut declared_blocked = false;
     let mut target = "sm_100a".to_owned();
-    let mut kernels = PathBuf::from("crates/ops/kernels");
+    let mut kernels = None;
 
     let mut argv = args.iter();
     while let Some(flag) = argv.next() {
@@ -63,9 +63,7 @@ fn main() -> ExitCode {
             // both the fixture and the store test read. One derivation, two consumers.
             "--declared-blocked" => declared_blocked = true,
             "--target" => target = value().unwrap_or(target),
-            "--kernels" => {
-                kernels = PathBuf::from(value().unwrap_or(kernels.display().to_string()))
-            }
+            "--kernels" => kernels = value().map(PathBuf::from),
             other => {
                 eprintln!("unknown argument {other}");
                 return ExitCode::from(2);
@@ -73,9 +71,9 @@ fn main() -> ExitCode {
         }
         argv.next();
     }
-    let Some(fixture) = fixture else {
+    let (Some(fixture), Some(kernels)) = (fixture, kernels) else {
         eprintln!(
-            "usage: key_coverage --fixture <path> [--target sm_100a] [--kernels crates/ops/kernels]"
+            "usage: key_coverage --fixture <path> --kernels <package root> [--target sm_100a]"
         );
         return ExitCode::from(2);
     };
