@@ -204,6 +204,10 @@ def _stream_through_a_kill(
         str(worker_executable()),
         "--set",
         "dtype=bfloat16",
+        # A deployment names the attention backend whose package fills
+        # `paged_attention` at the Program Server.
+        "--set",
+        "attention_backend=trtllm",
         "--set",
         "kv_cache_config.max_tokens=32768",
         "--set",
