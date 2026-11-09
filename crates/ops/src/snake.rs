@@ -10,8 +10,9 @@
 //! epsilon keeps the reciprocal finite for a zero frequency; it is part of the formula and not a
 //! guard a kernel may drop.
 //!
-//! This is the H3 decoder's activation and is **not** `snake_beta`: BigVGAN-style blocks store a
-//! frequency and a gain separately, in log space (`snake_beta`, `x + sin²(exp(α)·x)/(exp(β) + 1e-9)`),
+//! This is the H3 decoder's activation and is **not** SnakeBeta: BigVGAN-style blocks store a
+//! frequency and a gain separately, in log space (`x + sin²(exp(α)·x)/(exp(β) + 1e-9)`, which
+//! `audio_activation` applies inside its resample),
 //! while H3's audio VAE stores one linear parameter that serves as both. The two have different
 //! parameters, so folding them behind a flag would make one operator read a weight the other's
 //! checkpoint does not have.

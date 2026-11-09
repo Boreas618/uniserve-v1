@@ -123,7 +123,6 @@ pub mod rows;
 pub mod sampler;
 pub mod segments;
 pub mod snake;
-pub mod snake_beta;
 pub mod tensor;
 pub mod tile_stitch;
 pub mod tolerance;

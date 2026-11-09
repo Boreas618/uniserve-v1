@@ -108,7 +108,6 @@ const OPERATORS: &[&str] = &[
     <crate::moe::sort::MoeSort as Op>::NAME,
     <crate::fp4::Nvfp4Quantize as Op>::NAME,
     <crate::fp4::Nvfp4Gemm as Op>::NAME,
-    <crate::snake_beta::SnakeBeta as Op>::NAME,
     <crate::audio_resample::AudioResample as Op>::NAME,
     <crate::snake::Snake as Op>::NAME,
     <crate::bias::BiasAdd as Op>::NAME,

@@ -28,8 +28,6 @@ use crate::layers::launch::{PDL, kv_tile};
 pub enum AttentionBackend {
     /// FlashAttention-4's dense kernel through the CuTe DSL program.
     Dense,
-    /// The sparse attention of the H3 diffusion block (VSA).
-    Sparse,
     /// FP32 attention through a GEMM and a softmax program.
     Fp32,
     /// Paged attention over the prefix cache, read and written per token.
@@ -47,8 +45,6 @@ pub struct Attention {
     window: Option<u32>,
     max_kv_len: u32,
     causal: bool,
-    /// Rows of one query tile and of one key block, for the sparse backend.
-    block: u32,
 }
 
 impl Attention {
@@ -95,7 +91,6 @@ impl Attention {
             window,
             max_kv_len,
             causal: true,
-            block: 0,
         })
     }
 
@@ -224,49 +219,6 @@ impl Attention {
             window,
             max_kv_len: max_seq_len,
             causal,
-            block: 0,
-        })
-    }
-
-    /// Video Sparse Attention: query tiles of `block` rows read the key blocks the selection names.
-    ///
-    /// `max_keys` is the longest key extent the deployment serves.
-    pub fn sparse(
-        block: u32,
-        head_dim: u32,
-        heads: u32,
-        max_keys: u32,
-        scale: f32,
-    ) -> Result<Self> {
-        if block == 0 || head_dim == 0 || heads == 0 || max_keys == 0 {
-            return Err(Error::shape(
-                "Attention::sparse",
-                "a tile, a head, a key bound and a head count must be nonzero".to_owned(),
-            ));
-        }
-        if !max_keys.is_multiple_of(block) {
-            return Err(Error::shape(
-                "Attention::sparse",
-                format!("a {max_keys}-key bound is not whole {block}-row tiles"),
-            ));
-        }
-        if !scale.is_finite() || scale == 0.0 {
-            return Err(Error::shape(
-                "Attention::sparse",
-                format!("a softmax scale of {scale}"),
-            ));
-        }
-        Ok(Self {
-            backend: AttentionBackend::Sparse,
-            head_dim,
-            q_heads: heads,
-            kv_heads: heads,
-            page_size: 0,
-            scale,
-            window: None,
-            max_kv_len: max_keys,
-            causal: false,
-            block,
         })
     }
 
@@ -430,11 +382,6 @@ impl Attention {
         };
 
         f.operate::<DenseAttention>(&descriptor, args)
-    }
-
-    /// The elements between consecutive rows of the query a sparse call reads.
-    pub const fn block(&self) -> u32 {
-        self.block
     }
 
     /// Write `key` and `value` into `planes`, then attend.
@@ -1004,17 +951,6 @@ mod tests {
         assert!(Attention::dense(128, 32, 4, 8_192, false, Some(1_024), 0.088).is_err());
         assert!(Attention::dense(0, 32, 4, 8_192, true, None, 0.088).is_err());
         assert!(Attention::dense(128, 32, 4, 8_192, true, None, 0.0).is_err());
-    }
-
-    #[test]
-    fn a_sparse_layer_names_its_tile_and_its_key_bound() {
-        let vsa = Attention::sparse(64, 128, 12, 65_536, 0.088).unwrap();
-        assert_eq!(vsa.backend(), AttentionBackend::Sparse);
-        assert_eq!(vsa.block(), 64);
-        // The descriptor's key bound is whole tiles of the block size.
-        assert!(Attention::sparse(64, 128, 12, 1_000, 0.088).is_err());
-        assert!(Attention::sparse(0, 128, 12, 1_024, 0.088).is_err());
-        assert!(Attention::sparse(128, 128, 12, 1_024, 0.088).is_ok());
     }
 
     /// A page's scale is its own layer's, so two layers of one group carry different ones and the
