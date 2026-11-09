@@ -14,6 +14,8 @@ of the package parses the key (a manifest's answer, not a flag's), and `unknown`
 `spec` states no signature -- which is the only shape of answer this checker cannot give.
 A package's key reader ends an unusable key with `SystemExit`, so the parse is guarded at that
 width: one table or one backend that cannot place the key must not end the run.
+
+    python tools/pdl_convention.py <key file>...
 """
 
 import importlib.util
@@ -22,8 +24,10 @@ import re
 import sys
 import tomllib
 
-OPS = pathlib.Path('crates/ops/src')
-KERNELS = pathlib.Path('crates/ops/kernels')
+#: This repository's operators and packages, found from this file's own place in it.
+REPOSITORY = pathlib.Path(__file__).resolve().parents[1]
+OPS = REPOSITORY / 'crates/ops/src'
+KERNELS = REPOSITORY / 'crates/ops/kernels'
 
 
 def packs_pdl(operator):
@@ -103,10 +107,10 @@ def declares_pdl(operator, key):
 
 rows = []
 declared_blocked = set()
-# H3's dense rows are the deployment's own generator's file, which the coverage and store tools
-# certify. One name: the file it replaced held the same rows and nothing else.
-for fixture in ('notes/programs/qwen3-moe-keys.txt',
-                'notes/programs/minimax-h3-keys.txt'):
+# The key files are the caller's, one per deployment, named on the command line.
+if len(sys.argv) < 2:
+    sys.exit('usage: pdl_convention.py <key file>...')
+for fixture in sys.argv[1:]:
     for line in pathlib.Path(fixture).read_text().split('\n'):
         # A fixture is rows plus a header. `#` carries the deployment, the walk's revision and the
         # rows no package declares yet — those are `# blocked:`, a tab, then operator, key and the

@@ -163,7 +163,13 @@ pub fn command() -> Command {
                 )
                 .arg(Arg::new("wasm").long("wasm").value_name("PATH").help(
                     "the precompiler that turns a scheduling policy into a module for this host",
-                )),
+                ))
+                .arg(
+                    Arg::new("cargo")
+                        .long("cargo")
+                        .value_name("PATH")
+                        .help("cargo, which builds a policy crate for wasm32"),
+                ),
         )
         .subcommand(
             Command::new("install")
@@ -231,14 +237,13 @@ pub fn options(matches: &ArgMatches) -> Result<Options> {
                         .get_one::<String>("nvcc")
                         .map(PathBuf::from)
                         .map(absolute),
-                    python: absolute(
-                        matches
-                            .get_one::<String>("python")
-                            .map(PathBuf::from)
-                            .unwrap_or_else(|| PathBuf::from("python/.venv/bin/python")),
-                    ),
+                    python: required_path(matches, "python")?,
                     wasm: matches
                         .get_one::<String>("wasm")
+                        .map(PathBuf::from)
+                        .map(absolute),
+                    cargo: matches
+                        .get_one::<String>("cargo")
                         .map(PathBuf::from)
                         .map(absolute),
                     max_jobs: limits.max_jobs,

@@ -16,8 +16,7 @@
 //! frame counts from them through the worker library. The model's own
 //! facts, such as its output frame rate, are the rules' parameters
 //! ([`PlanLimits`]), as the denoiser declares them. The rules are tested
-//! against `tests/python/fixtures/minimax_h3_plan.json`, vectors generated
-//! from the reference pipeline.
+//! against [`PLAN_VECTORS`], vectors generated from the reference pipeline.
 //!
 //! The arithmetic reproduces the diffusers MiniMax-H3 pipeline and the
 //! checkpoint's Qwen3-VL processor operation for operation, in `f64` where
@@ -63,6 +62,11 @@ pub const MAX_ASPECT_RATIO: f64 = 4.0;
 const DEFAULT_ASPECT_RATIO: (u32, u32) = (16, 9);
 
 pub use proto::config::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
+
+/// The planning vectors the rules are tested against, generated from the
+/// reference pipeline: a file of this crate's, which the daemon's request tests
+/// read too.
+pub const PLAN_VECTORS: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/minimax_h3_plan.json");
 
 /// The audio VAE's sample rate and hop: 40 latents per second.
 pub const AUDIO_SAMPLE_RATE: u32 = 32_000;
@@ -2125,9 +2129,10 @@ pub(super) mod tests {
 
     /// The planning vectors, generated from the diffusers reference.
     pub(in crate::video) fn fixture() -> Value {
-        serde_json::from_str(include_str!(
-            "../../../../../tests/python/fixtures/minimax_h3_plan.json"
-        ))
+        serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/minimax_h3_plan.json"
+        )))
         .unwrap()
     }
 

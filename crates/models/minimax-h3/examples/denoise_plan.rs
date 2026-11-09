@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! cargo run -p minimax-h3 --example denoise_plan -- \
-//!     --root /opt/uv/models/MiniMax-H3 --extents artifacts/h3-reference/component-tensors.json
+//!     --root $UNISERVE_H3_MODEL --extents artifacts/h3-reference/component-tensors.json
 //! ```
 //!
 //! The same instrument the two video stages and the audio decoder have: a recording forward launches
@@ -49,7 +49,7 @@ struct Case {
 
 fn run() -> Result<(), String> {
     let mut arguments = std::env::args().skip(1);
-    let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
+    let mut root = PathBuf::new();
     let mut extents_path: Option<PathBuf> = None;
     // No `--case` prices the deployment: every canvas the network offers, at the request shape the
     // flags state. A literal raster here would be a second statement of a deployment, which is the
@@ -109,6 +109,14 @@ fn run() -> Result<(), String> {
             "--check" => check = true,
             other => return Err(format!("`{other}` is not a flag of this tool")),
         }
+    }
+    if root.as_os_str().is_empty() {
+        root = std::env::var_os("UNISERVE_H3_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
+                std::process::exit(2)
+            });
     }
     let path = extents_path.ok_or_else(|| {
         format!(

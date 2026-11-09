@@ -13,7 +13,10 @@ use daemon::input::chat::{
 use daemon::options::ChatTemplateContentFormat;
 use daemon::output::chat::{AssistantContentBlock, AssistantToolCall};
 
-const QWEN3_TEMPLATE: &str = include_str!("../templates/qwen3.jinja");
+const QWEN3_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/templates/qwen3.jinja"
+));
 
 fn hf_render(
     template: &str,

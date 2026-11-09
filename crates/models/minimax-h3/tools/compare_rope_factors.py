@@ -3,12 +3,10 @@
 **This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
 repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
 checkout of the last tree that held the package and that tree's interpreter, with the tree on the
-path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+path; `UNISERVE_REFERENCE_TREE` names that checkout:
 
-    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
-        /workspace/uniserve-v1/.venv/bin/python <this file> ...
-
-`UNISERVE_REFERENCE_TREE` names another checkout.
+    PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \\
+        $UNISERVE_REFERENCE_TREE/.venv/bin/python <this file> ...
 
 `examples/encoder_rope.rs` writes the encode's own host tables for a prompt - the interleaved
 coordinates, the cosine and the sine - and this recomputes them from the ids alone, with the
@@ -173,7 +171,7 @@ def install_kernel_stub() -> bool:
 
 def reference_factors(role: dict, case: Path, checkpoint: Path):
     """The reference's coordinates and factors for the case's prompt."""
-    python = Path(os.environ.get("UNISERVE_REFERENCE_TREE", "/workspace/uniserve-v1"))
+    python = Path(os.environ["UNISERVE_REFERENCE_TREE"])
     # `uniserve.nn.rope` reads one dataclass off `uniserve.tensors`, and importing the package
     # itself pulls in the compiled kernels; the reference tree goes on the path so that one import
     # resolves and nothing else is loaded.

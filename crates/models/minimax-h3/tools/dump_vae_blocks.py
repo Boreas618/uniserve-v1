@@ -4,15 +4,15 @@
 **This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
 repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
 checkout of the last tree that held the package and that tree's interpreter, with the tree on the
-path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+path; `UNISERVE_REFERENCE_TREE` names that checkout:
 
-    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
-        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+    PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \\
+        $UNISERVE_REFERENCE_TREE/.venv/bin/python <this file> ...
 
 The reference half of the block-by-block numeric comparison (`specs/worker.md` 10). The Rust half is the
 trace hook that writes `$UNISERVE_DIAG_DIR/<block>/<name>.npy` for the same request and seed, and
-`tools/diagnosis/compare.py` is the comparator that reads both trees and writes `report.json`
-(`notes/h3/diagnosis.md`). This script writes the reference tree, one tensor per probe, under the name
+`tools/diagnosis/compare.py` is the comparator that reads both trees and writes `report.json`.
+This script writes the reference tree, one tensor per probe, under the name
 the hook writes, so the two trees line up by name and not by position.
 
 It runs on the reference's own weight path - `loading.checkpoint.Source` opened through
@@ -24,7 +24,7 @@ One probe per invocation, so a failure costs one tensor and not the batch:
 
     python crates/models/minimax-h3/tools/dump_vae_blocks.py --list
     python crates/models/minimax-h3/tools/dump_vae_blocks.py \\
-        --checkpoint /opt/uv/models/MiniMax-H3 --probe video_decoder:decoder.decoder.layers.0.qkv \\
+        --checkpoint $UNISERVE_H3_MODEL --probe video_decoder:decoder.decoder.layers.0.qkv \\
         --out artifacts/diagnosis/vae-blocks/ref
 
 The plan is printed before anything is loaded, so a wrong module path or a missing weight shard is
@@ -33,7 +33,7 @@ fixed input, and runs the reference's module on the input a candidate's stage wr
 comparison is about the reference's arithmetic and not about who drew the clip's latents.
 
     python crates/models/minimax-h3/tools/dump_vae_blocks.py --probe decode_out \\
-        --stack artifacts/h3-stage2/video_decoder --checkpoint /opt/uv/models/MiniMax-H3 \\
+        --stack artifacts/h3-stage2/video_decoder --checkpoint $UNISERVE_H3_MODEL \\
         --out artifacts/h3-stage2-ref --device cuda A probe is a module path, relative to the component's root module, and the
 value written is that module's output for a fixed input the options below make reproducible.
 
@@ -826,7 +826,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"NO VALUE: {path} did not run; the input may be too small for this probe")
         return 1
     # The tree's convention is the Rust side's: one file per probe at `<block>/<name>.npy`, which is
-    # what `compare.py` matches on (`$UNISERVE_DIAG_DIR/<block>/<name>.npy`, notes/h3/diagnosis.md 3).
+    # what `compare.py` matches on (`$UNISERVE_DIAG_DIR/<block>/<name>.npy`).
     # A merged projection fills one name per branch, and each is a probe of its own.
     (options.out / component).mkdir(parents=True, exist_ok=True)
     for name, value in captured.items():

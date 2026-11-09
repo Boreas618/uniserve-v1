@@ -13,7 +13,6 @@ import json
 import os
 import pathlib
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -296,8 +295,11 @@ def cutlass_library():
 
 
 def cuda_home():
-    """The CUDA toolkit's directory."""
-    return pathlib.Path(os.environ.get("CUDA_HOME") or "/usr/local/cuda")
+    """The CUDA toolkit's directory, which `CUDA_HOME` names: the runtime's headers and library."""
+    home = os.environ.get("CUDA_HOME")
+    if not home:
+        raise SystemExit("CUDA_HOME names the CUDA toolkit whose runtime the module links against")
+    return pathlib.Path(home)
 
 
 def run(command, what):
@@ -329,7 +331,7 @@ def main():
             f"-DUNISERVE_OFFSETS={ranks}",
             f"-DUNISERVE_OFFSET_ARGUMENTS={offsets}",
         ]
-        nvcc = shutil.which("nvcc") or str(cuda_home() / "bin" / "nvcc")
+        nvcc = str(cuda_home() / "bin" / "nvcc")
         stage = staging / "stage.o"
         run(
             [

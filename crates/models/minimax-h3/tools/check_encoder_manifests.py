@@ -2,7 +2,10 @@
 """Check the encoders' descriptor values against the package manifests that declare them.
 
     .venv/bin/python crates/models/minimax-h3/tools/check_encoder_manifests.py \
-        [--root /opt/uv/models/MiniMax-H3] [--kernels crates/ops/kernels]
+        [--root <checkpoint>] [--kernels <package root>]
+
+`--root` defaults to the checkpoint `UNISERVE_H3_MODEL` names, and `--kernels` to this repository's
+`crates/ops/kernels`.
 
 A descriptor outside a package's `dimensions` is a key with no compiled program: `_compile.py`
 accepts exactly the range the manifest declares, and `Generation::kernel` answers `MissingKernel`
@@ -35,11 +38,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import pathlib
 import re
 import sys
 
 from check_manifests import DIMENSIONS
+
+#: This repository, found from this file's own place in it.
+REPOSITORY = pathlib.Path(__file__).resolve().parents[4]
 
 # The complete field set each operator's key carries, in the order the operator's `Display` writes
 # them. A call that carries all of them names one key exactly; `--keys` emits the fixture's lines
@@ -744,7 +751,7 @@ def main() -> int:
             "half's calls from the configs: the third question beside the walk and the file"
         ),
     )
-    parser.add_argument("--root", default="/opt/uv/models/MiniMax-H3")
+    parser.add_argument("--root", default=os.environ.get("UNISERVE_H3_MODEL"))
     parser.add_argument(
         "--dtype",
         default="auto",
@@ -754,7 +761,7 @@ def main() -> int:
             "with the assumption printed"
         ),
     )
-    parser.add_argument("--kernels", type=pathlib.Path, default=pathlib.Path("crates/ops/kernels"))
+    parser.add_argument("--kernels", type=pathlib.Path, default=REPOSITORY / "crates/ops/kernels")
     parser.add_argument(
         "--ulysses",
         type=int,
@@ -770,20 +777,22 @@ def main() -> int:
         type=pathlib.Path,
         default=None,
         help=(
-            "after the manifests, ask the store's list (`notes/programs/minimax-h3-keys.txt`) "
-            "whether it holds every program these calls name"
+            "after the manifests, ask the store's list whether it holds every program "
+            "these calls name"
         ),
     )
     parser.add_argument(
         "--keys",
         action="store_true",
         help=(
-            "print the operators' keys in the fixture's format "
-            "(`notes/programs/minimax-h3-keys.txt`) instead of checking the manifests"
+            "print the operators' keys in the key file's format instead of checking "
+            "the manifests"
         ),
     )
     arguments = parser.parse_args()
 
+    if arguments.root is None:
+        parser.error("name the checkpoint with --root or UNISERVE_H3_MODEL")
     root = pathlib.Path(arguments.root)
     kernels = pathlib.Path(arguments.kernels)
     text_path = root / "text_encoder" / "config.json"

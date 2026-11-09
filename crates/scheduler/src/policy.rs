@@ -2058,12 +2058,7 @@ mod shipped_packages {
 
     #[test]
     fn every_package_states_arguments_this_build_reads() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .ancestors()
-            .nth(2)
-            .unwrap_or_else(|| {
-                panic!("crates/scheduler lives two levels below the workspace root")
-            });
+        let root = std::path::Path::new(proto::WORKSPACE);
         for package in [
             "crates/scheduling/policies/fcfs/package.toml",
             "crates/scheduling/policies/priority/package.toml",

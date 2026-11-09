@@ -9,7 +9,7 @@ representation, without a device - which is the half a load-time refusal cannot 
 zeros are in the checkpoint or were made by the loader.
 
     # every tensor of a checkpoint, by name, with its shape and the count of zero elements
-    python tools/checkpoint_zeros.py /opt/uv/models/Qwen3-30B-A3B
+    python tools/checkpoint_zeros.py $UNISERVE_QWEN3_MODEL
 
     # one layer, or one kind of tensor
     python tools/checkpoint_zeros.py <root> --tensors 'model.layers.0.'

@@ -2,9 +2,8 @@
 //! mechanism reads them.
 //!
 //! Design §4.4's completion path is the mechanism's own: it is fed by whichever
-//! worker ran the batch. This module is that shape. `notes/sched/completion.md`
-//! states, field by field, whether the device produces a value or the mechanism
-//! already owns it; the short version is that the worker states *what
+//! worker ran the batch. This module is that shape. Field by field, the device
+//! produces a value or the mechanism already owns it; the short version is that the worker states *what
 //! execution did* — the tokens it accepted, the cache extent it initialized and
 //! what a successor may read, the log-probabilities a client asked for, the
 //! artifact and the cache export — and the mechanism keeps *its own rules*: the

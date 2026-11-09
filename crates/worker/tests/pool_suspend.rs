@@ -44,14 +44,20 @@ fn cubin() -> PathBuf {
     let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/generations.cu");
     let output = std::env::temp_dir().join(format!("suspend-{}.cubin", std::process::id()));
     let arch = std::env::var("UNISERVE_PROBE_ARCH").unwrap_or_else(|_| "sm_100a".to_owned());
-    let status = Command::new("nvcc")
-        .arg("-cubin")
-        .arg(format!("-arch={arch}"))
-        .arg("-o")
-        .arg(&output)
-        .arg(&source)
-        .status()
-        .expect("this probe compiles its kernel with nvcc, which must be on PATH");
+    let status = Command::new(
+        std::path::Path::new(
+            &std::env::var_os("CUDA_HOME")
+                .expect("CUDA_HOME names the toolkit whose nvcc compiles this probe's kernel"),
+        )
+        .join("bin/nvcc"),
+    )
+    .arg("-cubin")
+    .arg(format!("-arch={arch}"))
+    .arg("-o")
+    .arg(&output)
+    .arg(&source)
+    .status()
+    .expect("running nvcc");
     assert!(status.success(), "nvcc failed on {}", source.display());
     output
 }

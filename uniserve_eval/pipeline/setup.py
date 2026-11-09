@@ -11,6 +11,7 @@ from __future__ import annotations
 import fcntl
 import os
 import subprocess
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -30,15 +31,16 @@ from ..types import BenchmarkPoint
 def host_lock() -> Iterator[None]:
     """Acquire the host-wide lock that serializes benchmark servers.
 
-    The lock is an advisory `flock` on a fixed file, so it excludes only other
-    uniserve-eval drivers on the same host, not servers started by other
-    means. It is released when the file handle closes on exit.
+    The lock is an advisory `flock` on a file in the system's temporary
+    directory, so it excludes only other uniserve-eval drivers on the same
+    host, not servers started by other means. It is released when the file
+    handle closes on exit.
 
     Raises:
         RuntimeError: Immediately, without waiting, if another process holds
             the lock.
     """
-    path = Path("/tmp/uniserve-eval.lock")
+    path = Path(tempfile.gettempdir()) / "uniserve-eval.lock"
     with path.open("a+", encoding="utf-8") as handle:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -12,7 +12,7 @@
 //!
 //! ```text
 //! cargo run -p minimax-h3 --example denoise_shapes -- \
-//!     --root /opt/uv/models/MiniMax-H3 --width 768 --height 768 --frames 124 --text-tokens 1024
+//!     --root $UNISERVE_H3_MODEL --width 768 --height 768 --frames 124 --text-tokens 1024
 //! ```
 //!
 //! It is a diagnosis, never a gate (`specs/worker.md` 10): the numbers it prints are the model's own

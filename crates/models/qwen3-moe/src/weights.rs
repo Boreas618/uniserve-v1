@@ -364,7 +364,12 @@ mod tests {
     #[test]
     fn the_slice_checkpoint_maps_every_parameter() {
         // The local 30B-A3B metadata, when the machine has it: 48 sparse layers, untied head.
-        let path = std::path::Path::new("/opt/uv/models/Qwen3-30B-A3B/config.json");
+        // The local checkpoint's metadata, when `UNISERVE_QWEN3_MODEL` names one.
+        let Some(root) = std::env::var_os("UNISERVE_QWEN3_MODEL") else {
+            return;
+        };
+        let path = std::path::Path::new(&root).join("config.json");
+        let path = path.as_path();
         if !path.is_file() {
             return;
         }
@@ -396,7 +401,12 @@ mod tests {
         // The name mapping alone cannot catch a transposed or mis-shaped request; the checkpoint's
         // own headers can, before anything reaches a device. Shapes are derived from `config.json`
         // here rather than from the loader, so the two agree only if both read the design right.
-        let path = std::path::Path::new("/opt/uv/models/Qwen3-30B-A3B/config.json");
+        // The local checkpoint's metadata, when `UNISERVE_QWEN3_MODEL` names one.
+        let Some(root) = std::env::var_os("UNISERVE_QWEN3_MODEL") else {
+            return;
+        };
+        let path = std::path::Path::new(&root).join("config.json");
+        let path = path.as_path();
         if !path.is_file() {
             return;
         }

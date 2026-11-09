@@ -213,7 +213,7 @@ def runtime(tmp_path: Path) -> Iterator[Path]:
     """The runtime directory of the test's own Storage Server, whose log
     the test keeps beside its own.
     """  # noqa: D205
-    directory = Path(tempfile.mkdtemp(prefix="uniserve-", dir="/tmp"))
+    directory = Path(tempfile.mkdtemp(prefix="uniserve-"))
     try:
         yield directory
     finally:

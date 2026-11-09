@@ -353,7 +353,7 @@ pub fn rotary(config: &VideoVaeConfig) -> Result<(u32, [u32; 3])> {
 /// cell-centre grid times `2π` — so the raw inverse frequencies give the reference's angle.
 ///
 /// The table is a per-layout constant: the runner uploads it once per captured graph
-/// (`notes/h3/runner-interface.md` 2.1, `video_positions`).
+/// (`video_positions`).
 pub fn positions(canvas: &Canvas) -> Result<Vec<f32>> {
     if canvas.frames == 0 || canvas.height == 0 || canvas.width == 0 {
         return Err(Error::config(

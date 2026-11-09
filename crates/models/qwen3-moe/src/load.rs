@@ -1566,7 +1566,7 @@ mod tests {
     /// routed") — and the two families disagree about the second only.
     #[test]
     fn a_products_package_states_the_scale_layouts_nn_publishes() {
-        let kernels = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../ops/kernels");
+        let kernels = Path::new(ops::KERNELS).to_path_buf();
         let cases = [
             (
                 "gather_gemm_nvfp4",

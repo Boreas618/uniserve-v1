@@ -1,7 +1,7 @@
 # Shortcuts for local checks and tests. Build is `uv sync` / `cargo`;
 # serving is `uniserve serve <model> --served-model-name <name>`.
 
-python := env("PYTHON", ".venv/bin/python")
+python := env("PYTHON", "uv run python")
 cargo := env("CARGO", "cargo")
 
 # Format check (Rust)

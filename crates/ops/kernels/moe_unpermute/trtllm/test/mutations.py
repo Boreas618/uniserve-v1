@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """The two mutations `combine_check.py` exists to catch: build each one, require a red.
 
-    crates/program-server/python/.venv/bin/python mutations.py [--build-only] [--keep]
+    UNISERVE_NVCC=<nvcc> $UNISERVE_PROGRAM_SERVER_PYTHON mutations.py [--build-only] [--keep]
+
+`UNISERVE_NVCC` names the nvcc the mutants are compiled with, as the Program Server names it to a
+build, and the interpreter is the Program Server's own, which carries FlashInfer.
 
 `combine_check.py` says the combine it measures is correct. That green is evidence only if a
 *plausible-wrong* combine reads red through the same script, so this builds two of them and runs
@@ -77,19 +80,12 @@ def package() -> pathlib.Path:
 def distribution() -> pathlib.Path:
     """The FlashInfer `data` tree the build compiles from, resolved as the build resolves it."""
     found = importlib.util.find_spec("flashinfer")
-    roots = []
-    if found is not None and found.submodule_search_locations:
-        roots.extend(pathlib.Path(one) for one in found.submodule_search_locations)
-    repository = package().resolve().parents[4]
-    roots.extend(repository.glob(".venv/lib/python*/site-packages/flashinfer"))
-    roots.extend(
-        repository.glob("crates/program-server/python/.venv/lib/python*/site-packages/flashinfer")
-    )
-    for root in roots:
-        data = root / "data"
+    roots = found.submodule_search_locations if found is not None else None
+    for root in roots or []:
+        data = pathlib.Path(root) / "data"
         if (data / "csrc").is_dir():
             return data
-    raise SystemExit("no FlashInfer distribution with its data tree was found")
+    raise SystemExit(f"no FlashInfer distribution with its data tree was found in {sys.executable}")
 
 
 def mutant(name: str, old: str, new: str, root: pathlib.Path) -> pathlib.Path:
@@ -115,19 +111,7 @@ def mutant(name: str, old: str, new: str, root: pathlib.Path) -> pathlib.Path:
     build = script.read_text()
     if f'"{KERNEL}"' not in build:
         raise SystemExit(f"{script} does not name {KERNEL}, so a mutation has nowhere to go")
-    build = build.replace(f'"{KERNEL}"', f'"{edited}"')
-    # The build finds the distribution through the interpreter's FlashInfer first and through the
-    # checkout second; the second path is resolved from the script's own depth in the tree, which a
-    # copy outside it does not have. The first is enough here, so the fallback goes.
-    repository = """    repository = pathlib.Path(__file__).resolve().parents[6]\n"""
-    fallback = (
-        repository
-        + """    roots.extend(repository.glob("crates/program-server/python/.venv/lib/python*/site-packages/flashinfer"))\n"""
-        + """    roots.extend(repository.glob(".venv/lib/python*/site-packages/flashinfer"))\n"""
-    )
-    if fallback not in build:
-        raise SystemExit(f"{script} does not resolve the distribution as this mutation expects")
-    script.write_text(build.replace(fallback, ""))
+    script.write_text(build.replace(f'"{KERNEL}"', f'"{edited}"'))
     return copy
 
 

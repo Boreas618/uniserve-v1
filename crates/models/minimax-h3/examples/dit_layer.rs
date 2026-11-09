@@ -27,7 +27,7 @@
 //!
 //! **What it writes.** `<out>/denoiser/stack_in.h3t` is the input the run used and
 //! `<out>/denoiser/stack_out.h3t` what the stack produced, both in the container
-//! `notes/h3/numeric-diagnosis.md` defines and `compare_blocks` reads. A reference producer reads
+//! `tools/dump_tables.py` writes and `compare_blocks` reads. A reference producer reads
 //! `stack_in`, runs the same layer stack of today's implementation on it, and writes `stack_out` under
 //! the same name in its own tree; the two trees then pair cold.
 //!
@@ -60,9 +60,6 @@ use nn::{
     Arena, Backing, Checkpoint, DType, DevicePtr, Forward, RetainedWeights, Shape, TensorView,
     WeightKey, WeightLoader,
 };
-
-/// The export root the caller's GPU host holds, when `--root` does not name another.
-const DEFAULT_ROOT: &str = "/workspace/models/MiniMax-H3";
 
 /// The modulation table's width in `hidden_size` units: three tags of six vectors.
 const ADALN_COLUMNS: u64 = 18;
@@ -153,7 +150,7 @@ impl Args {
     fn parse() -> Result<Self> {
         let mut args = Self {
             stage: Stage::Weights,
-            root: PathBuf::from(DEFAULT_ROOT),
+            root: PathBuf::new(),
             store: std::env::var_os("UNISERVE_STORE").map(PathBuf::from),
             dit: Dit::Base,
             device: 0,
@@ -167,7 +164,7 @@ impl Args {
             dtype: None,
             attention: None,
             evaluations: None,
-            out: PathBuf::from("artifacts/h3-dit-layer0"),
+            out: PathBuf::new(),
         };
         let mut words = std::env::args().skip(1);
         while let Some(word) = words.next() {
@@ -308,6 +305,18 @@ impl Args {
                     )));
                 }
             }
+        }
+        if args.out.as_os_str().is_empty() {
+            eprintln!("name the output directory with --out");
+            std::process::exit(2);
+        }
+        if args.root.as_os_str().is_empty() {
+            args.root = std::env::var_os("UNISERVE_H3_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
+                    std::process::exit(2)
+                });
         }
         if args.layers < 2 || !args.layers.is_multiple_of(2) {
             return Err(Failure::message(format!(
@@ -2101,7 +2110,7 @@ const SPARSE_OPERATORS: [&str; 6] = [
 
 /// Print the sparse chain's cell counts, and refuse when the store holds none of one.
 ///
-/// The store is the deployment's: `notes/programs/minimax-h3-keys.txt` states the video-sparse
+/// The store is the deployment's: its key file states the video-sparse
 /// deployment's rows, which include the dense deployment's, so one store built from it serves
 /// either - while a store built from a dense-only list stops at the first sparse launch, with no
 /// kernel for it.

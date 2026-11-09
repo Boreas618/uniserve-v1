@@ -40,9 +40,6 @@ use std::process::ExitCode;
 
 use nn::Checkpoint;
 
-/// The deployment's own root, used when the command line names none.
-const DEFAULT_ROOT: &str = "/opt/uv/models/FastVideo-FastH3-8-Step-V2-NVFP4";
-
 /// The pipeline metadata that names components by role, which discovery by shard sets does not read:
 /// it is compared against, never trusted as the list of what a checkpoint holds.
 const MODEL_INDEX: &str = "modular_model_index.json";
@@ -64,13 +61,14 @@ struct Component {
 }
 
 fn main() -> ExitCode {
-    let mut roots: Vec<PathBuf> = std::env::args()
+    let roots: Vec<PathBuf> = std::env::args()
         .skip(1)
         .filter(|argument| !argument.starts_with('-'))
         .map(PathBuf::from)
         .collect();
     if roots.is_empty() {
-        roots.push(PathBuf::from(DEFAULT_ROOT));
+        eprintln!("name the deployment roots on the command line");
+        return ExitCode::from(2);
     }
     let borrowed: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
     let mut defects: Vec<String> = Vec::new();

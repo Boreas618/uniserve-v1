@@ -116,15 +116,15 @@ def test_a_usage_refusal_is_unrunnable_and_quotes_the_refusal(sweep, tmp_path):
 def test_each_invocation_carries_the_store_and_the_fixture_it_compares(sweep):
     """The store is passed on, never built here; every mode of the comparison reads the same one."""
     invocations = sweep.tree_arguments(
-        "kernel_arguments.py", "notes/programs/qwen3-moe-keys.txt", "/tmp/store", "sm_100a"
+        "kernel_arguments.py", "keys.txt", "store", "sm_100a"
     )
 
     assert len(invocations) == 2
     assert any("--native" in invocation for invocation in invocations)
     for invocation in invocations:
         assert invocation[0] == "--check"
-        assert invocation[invocation.index("--fixture") + 1] == "notes/programs/qwen3-moe-keys.txt"
-        assert invocation[invocation.index("--store") + 1] == "/tmp/store"
+        assert invocation[invocation.index("--fixture") + 1] == "keys.txt"
+        assert invocation[invocation.index("--store") + 1] == "store"
         assert invocation[invocation.index("--target") + 1] == "sm_100a"
 
 
@@ -132,7 +132,7 @@ def test_source_mode_is_never_run_because_it_reports_an_operators_arms_against_e
     """The check runs against a built artifact or not at all: its source mode over-reports."""
     assert sweep.tree_needs("kernel_arguments.py") == ["--fixture", "--store"]
     assert sweep.tree_needs("kernel_arguments.py", "keys.txt") == ["--store"]
-    assert sweep.tree_needs("kernel_arguments.py", "keys.txt", "/tmp/store") == []
+    assert sweep.tree_needs("kernel_arguments.py", "keys.txt", "store") == []
 
 
 def test_an_empty_store_is_not_a_green(sweep, tmp_path):

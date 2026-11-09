@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare two block-by-block dump trees (design 10's diagnosis, never a gate).
 
-The protocol is ``notes/h3/diagnosis.md``: both implementations write one
+The protocol: both implementations write one
 ``.npy`` per (block, tensor name) under their own directory, and this script
 matches them by relative path and reports, per tensor, the relative L2 error,
 the maximum absolute difference, the cosine similarity and whether the two are

@@ -3603,7 +3603,7 @@ mod tests {
         let config = crate::audio_vae::tests::audio_config();
         let mut ours = AudioEncoder::keys(&config).expect("the encoder's keys");
         ours.sort_unstable();
-        let fixture: Vec<&str> = include_str!("../tests/data/audio-encoder-names.txt")
+        let fixture: Vec<&str> = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/audio-encoder-names.txt"))
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))

@@ -65,6 +65,7 @@ fn config(temporary: &Path) -> ServerConfig {
             nvcc: None,
             python: std::path::PathBuf::from("/python/bin/python"),
             wasm: None,
+            cargo: None,
             max_jobs: 1,
         },
         devices: Vec::new(),

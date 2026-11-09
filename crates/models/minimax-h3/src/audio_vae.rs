@@ -1693,7 +1693,7 @@ pub(crate) mod tests {
         let config = audio_config();
         let mut ours = BigVgan::keys(&config).expect("the decoder's keys");
         ours.sort_unstable();
-        let fixture: Vec<&str> = include_str!("../tests/data/audio-decoder-names.txt")
+        let fixture: Vec<&str> = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/audio-decoder-names.txt"))
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))

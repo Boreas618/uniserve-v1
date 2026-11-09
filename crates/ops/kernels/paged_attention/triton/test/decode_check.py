@@ -2,7 +2,7 @@
 """Run the E4M3 paged attention's decode kernel under Triton's interpreter and compare what it wrote.
 
 The operator is one paged attention whose cache is a page of `E4M3` bytes and one f32 scale per page
-(`notes/programs/paged_attention_fp8.md`). The reference here is the composition that contract states,
+(`ops::attention::PagedAttention`). The reference here is the composition that contract states,
 written in torch from the same lines the kernel computes:
 
 ```text

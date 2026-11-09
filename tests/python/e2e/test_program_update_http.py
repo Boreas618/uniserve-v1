@@ -31,6 +31,10 @@ not exist:
   result is outside ``Op::tolerance``.
 - ``UNISERVE_PROGRAM_TARGET``: the Program Server's target (``sm_100a``).
 
+The Program Server's interpreter, its precompiler and the binary are named by
+``UNISERVE_PROGRAM_SERVER_PYTHON``, ``UNISERVE_SCHEDULING_PRECOMPILE`` and
+``UNISERVE_BINARY``.
+
 The admin surface is front's (M488): `POST /admin/config/commit` and
 `/admin/config/rollback`, events whose `data.phase` names the phase and whose
 `kind` is `deployment`, and `/admin/config`'s `epochs` array whose elements
@@ -43,7 +47,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -57,10 +60,11 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
-    start_server,
-    stop_server,
     wait_health,
     worker_executable,
+)
+from tests.python.e2e.program_server import (
+    program_server as running_program_server,
 )
 
 #: Options every deployment this file serves with. They are the live-update file's, deliberately:
@@ -132,204 +136,17 @@ def model() -> Path:
     return path
 
 
-#: The descriptor keys this deployment launches: the model's own ``keys()`` plus the executor's
-#: sampler launches (``notes/programs/qwen3-moe-keys.txt``). A main process resolves the kernels the
-#: model actually launches from this host's store, so the store must hold a module for every one.
-KEYS = "notes/programs/qwen3-moe-keys.txt"
-
-#: The rows of ``KEYS`` that belong to the file's other two deployments (NVFP4 weights and an fp8
-#: KV variant). This file serves the bf16 dense one; building another deployment's rows fails on
-#: packages that deployment's owner owes, which says nothing about whether this one can serve.
-FOREIGN_PRECISIONS = ("nvfp4", "f8e4m3")
-FOREIGN_OPERATORS = frozenset({"kv_write_scaled"})
-
-
-def _repository() -> Path:
-    """The repository root."""
-    return Path(__file__).resolve().parents[3]
-
-
-def _precompiler() -> Path:
-    """The wasm precompiler the Program Server turns a policy module into (design 5.3)."""
-    named = os.environ.get("UNISERVE_SCHEDULING_PRECOMPILE")
-    if named:
-        return Path(named)
-    found = shutil.which("scheduling-precompile")
-    if found:
-        return Path(found)
-    beside = Path(require_uniserve_binary()).with_name("scheduling-precompile")
-    if beside.exists():
-        return beside
-    root = _repository()
-    done = subprocess.run(
-        ["cargo", "build", "--package", "scheduling", "--bin", "scheduling-precompile"],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
-    if done.returncode != 0:
-        pytest.fail(f"scheduling-precompile did not build: {done.stderr[-2000:]}")
-    return root / "target" / "debug" / "scheduling-precompile"
-
-
-def _program_target() -> str:
-    """The target this host's modules are built for: the served device's own ``sm_{major}{minor}a``.
-
-    ``src/model_runner.rs`` derives the same string from the device it serves, and a store built for
-    another target describes nothing to overlay. ``UNISERVE_PROGRAM_TARGET`` names one instead, for
-    a host whose store is provisioned elsewhere.
-    """
-    named = os.environ.get("UNISERVE_PROGRAM_TARGET")
-    if named:
-        return named
-    device = os.environ.get("UNISERVE_LIVE_DEVICE", "0")
-    reported = subprocess.run(
-        ["nvidia-smi", f"--id={device}", "--query-gpu=compute_cap", "--format=csv,noheader"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    major, _, minor = reported.partition(".")
-    if not major.isdigit() or not minor.isdigit():
-        raise AssertionError(
-            f"nvidia-smi reported no compute capability for GPU {device}: {reported!r}"
-        )
-    return f"sm_{major}{minor}a"
-
-
-def _deployment_keys(store: Path) -> Path:
-    """This deployment's rows of ``KEYS``, written beside ``store``."""
-    kept = []
-    for line in (_repository() / KEYS).read_text().splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        operator, _, _key = stripped.partition("\t")
-        if operator in FOREIGN_OPERATORS:
-            continue
-        lowered = stripped.lower()
-        if any(precision in lowered for precision in FOREIGN_PRECISIONS):
-            continue
-        kept.append(stripped)
-    if not kept:
-        raise AssertionError(f"{KEYS} states no row for this deployment")
-    path = store.parent / "deployment-keys.txt"
-    path.write_text("\n".join(kept) + "\n")
-    return path
-
-
-def _build_store(store: Path, target: str, python: Path | None) -> None:
-    """Build a module for every kernel key this deployment launches.
-
-    ``build_fixtures`` is the store's own producer: for each ``operator<TAB>key`` row it installs
-    the operator's package, prepares that key for `target`, and resolves it to the module it names.
-    The builds are real — Triton, nvcc and CuTe DSL all run — so this takes minutes once per module.
-    """
-    command = [
-        "cargo",
-        "run",
-        "--package",
-        "program-server",
-        "--example",
-        "build_fixtures",
-        "--",
-        "--keys",
-        str(_deployment_keys(store)),
-        "--target",
-        target,
-        "--store",
-        str(store),
-    ]
-    if python is not None:
-        command += ["--python", str(python)]
-    built = subprocess.run(
-        command, cwd=_repository(), capture_output=True, text=True, timeout=3600
-    )
-    if built.returncode != 0:
-        missing = [
-            line.removeprefix("FAILED\t").replace("\t", " ")
-            for line in built.stdout.splitlines()
-            if line.startswith("FAILED\t")
-        ]
-        raise AssertionError(
-            "the deployment's own kernels did not build, so nothing can serve"
-            + (f": {', '.join(missing)}" if missing else "")
-            + f"\n{built.stdout[-4000:]}\n{built.stderr[-4000:]}"
-        )
-
-
 @pytest.fixture(scope="module")
-def program_server(tmp_path_factory: pytest.TempPathFactory):
+def program_server(model: Path, tmp_path_factory: pytest.TempPathFactory):
     """The host's Program Server, serving a store built for this deployment.
 
-    The server's package root and store are built here rather than left empty: an empty store
-    answers `no paged_attention program of backend trtllm is installed`, because a program's module
-    exists nowhere else. The kernels come from ``build_fixtures`` over this deployment's own rows,
-    and the scheduling policy is installed on top of them (a policy is a wasm package this host
-    precompiles rather than a kernel key).
-
-    The two directories live as long as the module and are not shared with another run: a store
-    entry is keyed by operator, backend, revision, target and descriptor, and a revision counts
-    from 1 in a fresh package root.
+    The kernels come from ``build_fixtures`` over the keys `model`'s own walk
+    states, and the scheduling policy is installed on top of them (a policy is
+    a wasm package this host precompiles rather than a kernel key); the shared
+    helper does both, so this file and the others serve one store the same way.
     """
-    binary = require_uniserve_binary()
-    work = tmp_path_factory.mktemp("program-server")
-    socket = work / "program-server.sock"
-    log = work / "program-server.log"
-    target = _program_target()
-    interpreter = _repository() / "crates/program-server/python/.venv/bin/python"
-    built = work / "programs"
-    _build_store(built, target, interpreter if interpreter.exists() else None)
-    command = [
-        str(binary),
-        "program-server",
-        "serve",
-        "--socket",
-        str(socket),
-        "--package-root",
-        str(built / "packages"),
-        "--store-root",
-        str(built / "modules"),
-        "--target",
-        target,
-        "--wasm",
-        str(_precompiler()),
-    ]
-    if interpreter.exists():
-        command += ["--python", str(interpreter)]
-    process = start_server(command, log)
-    deadline = time.monotonic() + 120.0
-    while time.monotonic() < deadline:
-        if process.poll() is not None:
-            raise RuntimeError(f"the Program Server exited: {log.read_text()}")
-        if socket.exists():
-            break
-        time.sleep(0.2)
-    else:
-        raise TimeoutError(f"the Program Server left no socket at {socket}")
-
-    installed = subprocess.run(
-        [
-            str(binary),
-            "program-server",
-            "install",
-            "--socket",
-            str(socket),
-            str(_repository() / "crates/ops/program-fixtures/policy"),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
-    if installed.returncode != 0:
-        raise AssertionError(
-            f"installing the policy package failed: {installed.stdout}\n{installed.stderr}"
-        )
-    try:
-        yield {"socket": socket, "binary": binary, "log": log}
-    finally:
-        stop_server(process)
+    with running_program_server(tmp_path_factory, checkpoint=model) as socket:
+        yield {"socket": socket, "binary": require_uniserve_binary()}
 
 
 @pytest.fixture(scope="module")

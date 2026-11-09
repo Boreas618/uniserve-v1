@@ -1155,6 +1155,28 @@ fn kernels(device: &Device) -> Library {
     Library::load(device, KERNELS.as_bytes()).unwrap()
 }
 
+/// `tests/fixtures/add_constant.cu` as a fatbin, compiled by the `nvcc` of the
+/// toolkit `CUDA_HOME` names into a directory of the test's own.
+fn add_constant_fatbin() -> Vec<u8> {
+    let home = std::env::var_os("CUDA_HOME")
+        .expect("CUDA_HOME names the toolkit whose nvcc compiles the test kernel");
+    let directory = tempfile::tempdir().expect("a directory for the fatbin");
+    let output = directory.path().join("add_constant.fatbin");
+    let status = Command::new(Path::new(&home).join("bin/nvcc"))
+        .args([
+            "-gencode",
+            "arch=compute_90,code=[sm_90,compute_90]",
+            "-fatbin",
+        ])
+        .arg(Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/add_constant.cu"))
+        .arg("-o")
+        .arg(&output)
+        .status()
+        .expect("running nvcc");
+    assert!(status.success(), "nvcc failed: {status}");
+    std::fs::read(output).expect("the fatbin nvcc wrote")
+}
+
 /// A binary library image (a fatbin, so it loads on any device the PTX was
 /// compiled for) contains NUL bytes, which the driver reads by the image's own
 /// headers; it loads and its kernel runs.
@@ -1168,8 +1190,7 @@ fn libraries_load_a_binary_image_and_launch_its_kernel() {
         Err(Error::InvalidArgument(_))
     ));
 
-    let library =
-        Library::load(&device, include_bytes!("../fixtures/add_constant.fatbin")).unwrap();
+    let library = Library::load(&device, &add_constant_fatbin()).unwrap();
     let add_constant = library.kernel("add_constant").unwrap();
     let stream = Stream::new(DEVICE).unwrap();
     let storage = DeviceAllocation::linear(DEVICE, 32).unwrap();
@@ -1236,7 +1257,7 @@ fn a_function_reports_the_parameters_of_its_signature() {
 
     // The declaration comes from the loaded image, not from the PTX text: a
     // kernel of a cubin image reports the same layout.
-    let fatbin = Library::load(&device, include_bytes!("../fixtures/add_constant.fatbin")).unwrap();
+    let fatbin = Library::load(&device, &add_constant_fatbin()).unwrap();
     let add_constant = fatbin.kernel("add_constant").unwrap();
     let layout: Vec<(usize, usize)> = add_constant
         .parameters()

@@ -76,7 +76,7 @@ enum Dispatch {
     /// Reading the view from here would mean parsing the request views inside
     /// hand-written WebAssembly; the follow-up is a test policy compiled the
     /// way `fcfs` is, so a fixture can decide admission the way a deployment
-    /// does (noted in `notes/pending/error-taxonomy-view-reading.md`).
+    /// does.
     PlanOnce,
     /// Runs until the fuel is gone, which §4.4 counts as a failed call.
     Burns,

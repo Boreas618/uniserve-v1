@@ -26,24 +26,17 @@ use media::{
 const FRAME_RATE: u32 = 24;
 const AUDIO_RATE: u32 = 32_000;
 
-/// The external probe these tests read media back with, in the order the
-/// deployment resolves it: its own name, the deployed runtime's `bin`, the
-/// environment's static FFmpeg, then the loader's path.
+/// The external tool these tests read media back with: `UNISERVE_<NAME>`, or the `bin` of the prefix
+/// `UNISERVE_FFMPEG_DIR` names.
 fn probe_binary(name: &str) -> PathBuf {
     let variable = format!("UNISERVE_{}", name.to_uppercase());
-    if let Some(path) = std::env::var_os(&variable) {
-        return PathBuf::from(path);
-    }
-    let mut candidates = Vec::new();
-    if let Some(directory) = std::env::var_os("UNISERVE_FFMPEG_DIR") {
-        candidates.push(PathBuf::from(directory).join("bin").join(name));
-    }
-    candidates.push(PathBuf::from("/opt/uv/ffmpeg-8.1.2/bin").join(name));
-    candidates.push(PathBuf::from(name));
-    candidates
-        .into_iter()
-        .find(|path| path.is_file() || path.components().count() == 1)
-        .expect("a media tool")
+    std::env::var_os(&variable)
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("UNISERVE_FFMPEG_DIR")
+                .map(|prefix| PathBuf::from(prefix).join("bin").join(name))
+        })
+        .unwrap_or_else(|| panic!("{variable} or UNISERVE_FFMPEG_DIR names {name}"))
 }
 
 fn ffprobe() -> PathBuf {

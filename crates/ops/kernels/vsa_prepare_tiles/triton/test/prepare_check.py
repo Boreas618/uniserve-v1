@@ -16,8 +16,7 @@ reading the key — one program reads seven caller strides at once:
 - the retired Python tree's Triton kernel, `uniserve_kernels.attention.vsa_segments._prepare_tiles_kernel`,
   which is the definition of the arithmetic (`prepare_tiles` itself refuses to run without Triton, so
   the check launches the kernel with the same constexpr wiring that function passes). This repository
-  no longer holds it: `UNISERVE_REFERENCE_TREE` names a checkout of the last tree that did, by default
-  `/workspace/uniserve-v1`;
+  no longer holds it: `UNISERVE_REFERENCE_TREE` names a checkout of the last tree that did;
 - that tree's `uniserve/nn/attention/vsa/segments.py`'s `pool` and `zero_padding`, copied verbatim, for the half
   of the operator the kernel need not be trusted about: the padding zeros and the FP32 mean, which
   must equal torch's own reduction bit for bit.
@@ -46,12 +45,12 @@ import torch
 #: `PrepareTilesDescriptor`'s epsilon, `0x3727c5ac` — the fixture's cell.
 EPSILON = 0x3727C5AC
 
-REFERENCE_TREE = pathlib.Path(os.environ.get("UNISERVE_REFERENCE_TREE", "/workspace/uniserve-v1"))
-
-
 def reference_kernel():
     """The retired tree's `_prepare_tiles_kernel`, which defines the arithmetic this package computes."""
-    source = REFERENCE_TREE / "uniserve_kernels" / "src"
+    tree = os.environ.get("UNISERVE_REFERENCE_TREE")
+    if not tree:
+        sys.exit("prepare_check: UNISERVE_REFERENCE_TREE names no checkout of the retired tree")
+    source = pathlib.Path(tree) / "uniserve_kernels" / "src"
     if not source.is_dir():
         sys.exit(f"prepare_check: {source} holds no reference kernels; set UNISERVE_REFERENCE_TREE")
     sys.path.insert(0, str(source))

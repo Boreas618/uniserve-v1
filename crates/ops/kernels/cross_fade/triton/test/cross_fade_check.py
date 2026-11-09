@@ -71,7 +71,7 @@ def truncate_to_bf16(values):
     4,096 — the low 16 mantissa bits dropped — and a round-to-nearest cast of only 2,038 of them.
     F16 and F32 stores round to nearest. So a BF16 kernel's own stores are reproduced exactly by
     truncating in the reference, which is why the blend can be compared bit for bit in BF16 and not
-    merely on a bound (`notes/programs/kernel-arithmetic-checks.md`).
+    merely on a bound.
     """
     bits = values.to(torch.float32).reshape(-1).numpy().view(np.uint32).copy()
     bits &= np.uint32(0xFFFF0000)
@@ -187,8 +187,8 @@ def compare(got, expected, dtype, label):
     """Compare a launch's output with the reference bit for bit.
 
     F16 and F32 round to nearest in the interpreter as the hardware does; BF16 is narrowed by
-    truncation, which the reference reproduces (`truncate_to_bf16`), and the measured rule is in
-    `notes/programs/kernel-arithmetic-checks.md`. What this proves about a BF16 blend is its
+    truncation, which the reference reproduces (`truncate_to_bf16`); that rule was measured on the
+    interpreter. What this proves about a BF16 blend is its
     arithmetic and its narrowing points, not a bound that could hide one of them.
     """
     element = DTYPES[dtype]

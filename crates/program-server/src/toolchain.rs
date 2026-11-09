@@ -137,23 +137,29 @@ pub trait Toolchain: Send + Sync {
     fn script_interpreter(&self) -> Option<&Path> {
         None
     }
+
+    /// cargo, which builds a policy crate for wasm32, when this toolchain has it.
+    fn cargo(&self) -> Option<&Path> {
+        None
+    }
 }
 
 /// Where each toolchain is on this host.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ToolchainConfig {
-    /// nvcc, when the host has a CUDA toolkit. `None` looks for `nvcc` on
-    /// `PATH` and in `/usr/local/cuda/bin`.
+    /// nvcc, which a CUDA package needs. `None` takes `$CUDA_HOME/bin/nvcc`, and refuses such a
+    /// package when `CUDA_HOME` is not set either.
     pub nvcc: Option<PathBuf>,
-    /// The Program Server's Python environment: the interpreter under
-    /// `python/.venv`, created from `python/pyproject.toml` and
-    /// `python/uv.lock`. Triton and CuTe DSL are the environment's two
-    /// toolchains.
+    /// The interpreter of the Program Server's Python environment, created from
+    /// `python/pyproject.toml` and `python/uv.lock`. Triton and CuTe DSL are the
+    /// environment's two toolchains.
     pub python: PathBuf,
-    /// The wasm precompiler, when the host can precompile wasm modules:
-    /// `scheduling-precompile`, which builds the policy module with the
-    /// schedule crate's own engine. `None` looks for it on `PATH`.
+    /// The wasm precompiler, `scheduling-precompile`, which builds a policy module with
+    /// the schedule crate's own engine. `None` refuses a policy package.
     pub wasm: Option<PathBuf>,
+    /// cargo, which builds a policy crate for wasm32 when its package carries no compile
+    /// script. `None` refuses such a package.
+    pub cargo: Option<PathBuf>,
     /// The number of compilers that may run at once (`limits.max_jobs`).
     pub max_jobs: usize,
 }
@@ -264,9 +270,8 @@ impl Nvcc {
         let path = config
             .nvcc
             .clone()
-            .or_else(|| find("nvcc"))
-            .or_else(|| existing("/usr/local/cuda/bin/nvcc"))
-            .ok_or_else(|| "no nvcc on this host: install the CUDA toolkit".to_owned())?;
+            .or_else(|| std::env::var_os("CUDA_HOME").map(|home| PathBuf::from(home).join("bin/nvcc")))
+            .ok_or_else(|| "no nvcc named: pass --nvcc <path> or set CUDA_HOME".to_owned())?;
         // A configured path may be relative to where the server was started; a build
         // runs elsewhere (the store's copy of a package), so it is made absolute once.
         let path = resolve(&path);
@@ -409,6 +414,8 @@ struct Wasm {
     precompiler: PathBuf,
     version: String,
     max_jobs: usize,
+    /// cargo, which builds a policy crate for wasm32.
+    cargo: Option<PathBuf>,
     /// The interpreter of the Program Server's Python environment, which runs
     /// a policy package's compile script when the package names one.
     interpreter: Option<PathBuf>,
@@ -419,18 +426,14 @@ impl Wasm {
         let precompiler = config
             .wasm
             .clone()
-            .or_else(|| find("scheduling-precompile"))
-            .ok_or_else(|| {
-                "no wasm precompiler on this host: crates/scheduling's scheduling-precompile \
-                 builds it"
-                    .to_owned()
-            })?;
+            .ok_or_else(|| "no wasm precompiler named: pass --wasm <scheduling-precompile>".to_owned())?;
         let precompiler = resolve(&precompiler);
         let version = wasmtime_version(&precompiler)?;
         Ok(Wasm {
             precompiler,
             version,
             max_jobs: config.max_jobs,
+            cargo: config.cargo.as_deref().map(resolve),
             interpreter: interpreter.is_file().then(|| interpreter.to_path_buf()),
         })
     }
@@ -459,6 +462,10 @@ impl Toolchain for Wasm {
 
     fn script_interpreter(&self) -> Option<&Path> {
         self.interpreter.as_deref()
+    }
+
+    fn cargo(&self) -> Option<&Path> {
+        self.cargo.as_deref()
     }
 }
 
@@ -502,7 +509,7 @@ impl Toolchain for Nothing {
 fn python_version(interpreter: &Path, module: &str) -> Discovered<String> {
     if !interpreter.is_file() {
         return Err(format!(
-            "no Python environment at {}: create it from crates/program-server/python/pyproject.toml",
+            "no Python interpreter at {}: pass --python <the Program Server's interpreter>",
             interpreter.display()
         ));
     }
@@ -542,15 +549,6 @@ fn wasmtime_version(precompiler: &Path) -> Discovered<String> {
             return Ok(version.to_owned());
         }
     }
-    if let Some(wasmtime) = find("wasmtime")
-        && let Ok(reported) = Command::new(wasmtime).arg("--version").output()
-        && reported.status.success()
-    {
-        let text = String::from_utf8_lossy(&reported.stdout);
-        if let Some(version) = text.split_whitespace().last() {
-            return Ok(version.to_owned());
-        }
-    }
     Err(format!(
         "{} does not report a wasmtime version; it must print one for `--version`",
         precompiler.display()
@@ -578,37 +576,10 @@ fn parse_nvcc_version(text: &str) -> Option<String> {
     }
 }
 
-/// The first `name` on `PATH`.
-fn find(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|directory| directory.join(name))
-        .find(|candidate| candidate.is_file())
-}
-
-/// A program this host has on `PATH`, such as `cargo` for a wasm32 build.
-pub fn find_program(name: &str) -> Option<PathBuf> {
-    find(name)
-}
-
-/// A path that exists, if the file is there.
-fn existing(path: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(path);
-    path.is_file().then_some(path)
-}
-
-/// Resolves a configured program the way a command started from the
-/// workspace root would: as given; and, when it is relative, from each
-/// directory above the current one, so the default `python/.venv/bin/python`
-/// is found whether the server was started at the repository root or inside
-/// `crates/program-server`.
+/// A configured program as an absolute path, against the directory the server runs in.
 ///
-/// It answers an **absolute** path whenever the host has the program, because a
-/// build runs with its working directory set to the store's copy of a package:
-/// a path left relative would name that copy instead of this host's toolchain and
-/// fail with `No such file or directory` from a directory the caller never named.
-/// A program that is nowhere returns its absolute form, so the failure says where
-/// it looked.
+/// A build runs with its working directory set to the store's copy of a package, so a path left
+/// relative would name that copy instead of the program the caller named.
 fn resolve(configured: &Path) -> PathBuf {
     match std::env::current_dir() {
         Ok(current) => resolve_in(configured, &current),
@@ -616,26 +587,14 @@ fn resolve(configured: &Path) -> PathBuf {
     }
 }
 
-/// [`resolve`] against an explicit starting directory, which is what makes it a
-/// function a test can call without moving the process's working directory.
+/// [`resolve`] against an explicit starting directory, which is what makes it a function a test
+/// can call without moving the process's working directory.
 fn resolve_in(configured: &Path, current: &Path) -> PathBuf {
     if configured.is_absolute() {
-        return configured.to_path_buf();
+        configured.to_path_buf()
+    } else {
+        current.join(configured)
     }
-    // `current` is absolute, so every ancestor's join is. The current directory is
-    // its own first ancestor.
-    for ancestor in current.ancestors() {
-        let candidate = ancestor.join(configured);
-        if candidate.is_file() {
-            return candidate;
-        }
-    }
-    if configured.is_file() {
-        // The starting directory is not absolute, so this is the best the host can
-        // say; `execute` reports the directory it runs in when the spawn fails.
-        return configured.to_path_buf();
-    }
-    std::path::absolute(configured).unwrap_or_else(|_| configured.to_path_buf())
 }
 
 /// The environment a compiler process runs with: the toolchain's own, with
@@ -718,42 +677,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&temporary);
     }
 
-    /// A relative toolchain path is answered absolute, and absolute *before* a build
-    /// uses it: a build runs with its working directory set to the store's copy of a
-    /// package, so a path that stayed relative would name that copy instead of this
-    /// host's compiler — which fails as `No such file or directory` from a directory
-    /// the caller never named.
+    /// A relative toolchain path is answered absolute, against the directory it is resolved in: a
+    /// build runs with its working directory set to the store's copy of a package, so a path that
+    /// stayed relative would name that copy instead of the program the caller named.
     #[test]
     fn a_relative_toolchain_path_is_answered_absolute() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(Path::parent)
-            .expect("the repository root above the crate");
-        let configured = Path::new("crates/program-server/python/.venv/bin/python");
-        if !root.join(configured).is_file() {
-            eprintln!("SKIPPED (provisioning): no Python environment in this tree");
-            return;
-        }
-        let resolved = resolve_in(configured, root);
-        assert!(
-            resolved.is_absolute(),
-            "{} was answered as {}",
-            configured.display(),
-            resolved.display()
-        );
-        assert!(
-            resolved.is_file(),
-            "{} is not a program",
-            resolved.display()
-        );
-        // The starting directory's own ancestors are searched, so a server started
-        // inside the crate still finds it.
-        let inside = resolve_in(configured, &root.join("crates/program-server"));
-        assert_eq!(inside, resolved);
-        // A program that is nowhere still answers an absolute path, so the failure
-        // that follows names a path rather than a bare name.
-        let missing = resolve_in(Path::new("no-such-toolchain/nvcc"), root);
-        assert!(missing.is_absolute(), "{}", missing.display());
+        let root = Path::new("/srv/host");
+        assert_eq!(resolve_in(Path::new("bin/nvcc"), root), root.join("bin/nvcc"));
+        assert_eq!(resolve_in(Path::new("/opt/nvcc"), root), Path::new("/opt/nvcc"));
     }
 
     #[test]

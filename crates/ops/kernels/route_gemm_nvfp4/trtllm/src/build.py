@@ -156,30 +156,26 @@ def fields_of(package, descriptor):
 def distribution():
     """The FlashInfer distribution's data tree: the launch code's headers and units."""
     found = importlib.util.find_spec("flashinfer")
-    roots = []
-    if found is not None and found.submodule_search_locations:
-        roots.extend(pathlib.Path(one) for one in found.submodule_search_locations)
-    repository = pathlib.Path(__file__).resolve().parents[6]
-    roots.extend(
-        repository.glob("crates/program-server/python/.venv/lib/python*/site-packages/flashinfer")
-    )
-    roots.extend(repository.glob(".venv/lib/python*/site-packages/flashinfer"))
-    for root in roots:
-        data = root / "data"
+    roots = found.submodule_search_locations if found is not None else None
+    for root in roots or []:
+        data = pathlib.Path(root) / "data"
         if (data / "include/flashinfer/trtllm/fused_moe/runner.h").is_file():
             return data
-    raise SystemExit("no FlashInfer distribution with the fused-MoE launch code was found")
+    raise SystemExit(
+        f"no FlashInfer distribution with the fused-MoE launch code was found in the interpreter "
+        f"running this build ({sys.executable})"
+    )
 
 
 def fetcher_python():
-    """The interpreter that carries the Program Server's artifact fetcher."""
-    if importlib.util.find_spec("uniserve_program_server") is not None:
-        return sys.executable
-    repository = pathlib.Path(__file__).resolve().parents[6]
-    for candidate in sorted(repository.glob("crates/program-server/python/.venv/bin/python*")):
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
-    raise SystemExit("no interpreter carries uniserve_program_server's artifact fetcher")
+    """The interpreter that carries the Program Server's artifact fetcher: the one running this
+    build, which is the Program Server's own."""
+    if importlib.util.find_spec("uniserve_program_server") is None:
+        raise SystemExit(
+            f"the interpreter running this build ({sys.executable}) carries no "
+            "uniserve_program_server artifact fetcher"
+        )
+    return sys.executable
 
 
 def fetch(staged, names):
@@ -370,20 +366,19 @@ def cubin_name(name):
 
 
 def compiler_and_version():
-    """The CUDA compiler this build names, and the version line it prints."""
-    candidates = [os.environ.get("CUDACXX"), shutil.which("nvcc"), "/usr/local/cuda/bin/nvcc"]
-    tried = []
-    for candidate in candidates:
-        if not candidate or not pathlib.Path(candidate).is_file():
-            continue
-        answered = subprocess.run([candidate, "--version"], capture_output=True, text=True)
-        if answered.returncode == 0 and "Cuda compilation tools" in answered.stdout:
-            return candidate, answered.stdout.strip().splitlines()[-1].strip()
-        tried.append(f"{candidate}: {answered.stdout[-300:]}{answered.stderr[-300:]}")
-    raise SystemExit(
-        "no CUDA compiler: name one with CUDACXX, or put nvcc on PATH"
-        + (f"\ntried:\n" + "\n".join(tried) if tried else "")
-    )
+    """The nvcc the Program Server checked against this package's declared version, and the
+    version line it prints.
+
+    A compiler that does not answer ``--version`` with CUDA's own line is refused here rather than
+    producing a module from the host compiler.
+    """
+    compiler = os.environ["UNISERVE_NVCC"]
+    answered = subprocess.run([compiler, "--version"], capture_output=True, text=True)
+    if answered.returncode != 0 or "Cuda compilation tools" not in answered.stdout:
+        raise SystemExit(
+            f"{compiler} is not CUDA's nvcc:\n{answered.stdout[-300:]}{answered.stderr[-300:]}"
+        )
+    return compiler, answered.stdout.strip().splitlines()[-1].strip()
 
 
 def headers(artifact, data):
@@ -538,10 +533,8 @@ def build(package, descriptor, fields, target, out, data, staging):
         objects.append(object_unit)
 
     # trtllm-gen's launcher calls the CUDA driver API directly, and the entry writes the
-    # padded route count through it; the toolkit's stub is a link-time input only.
-    stub = pathlib.Path("/usr/local/cuda/lib64/stubs")
-    if not (stub / "libcuda.so").is_file():
-        raise SystemExit(f"no libcuda to link against: the toolkit's stub is missing from {stub}")
+    # padded route count through it; the toolkit's stub is a link-time input only, and nvcc's own
+    # profile puts the toolkit's `lib/stubs` on the link line.
     module = out / "module.so"
     linked = subprocess.run(
         [
@@ -549,9 +542,7 @@ def build(package, descriptor, fields, target, out, data, staging):
             "-shared",
             f"-arch={target}",
             *[str(one) for one in objects],
-            f"-L{stub}",
             "-lcuda",
-            "-L/usr/local/cuda/lib64",
             "-lcudart",
             "-o",
             str(module),

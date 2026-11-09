@@ -12,7 +12,7 @@ What it does and does not decide:
 * It reports numbers. It has no threshold, because a tolerance chosen by looking at the
   failure is the one kind of comparison evidence that cannot be trusted. The page is read
   against the reference's own error floor (the video decoder's is 1.007e-3 relative, the
-  sampler's is set by the arithmetic - see ``notes/h3/stage3.md``).
+  sampler's is set by the arithmetic).
 * It refuses a pair it cannot interpret: an index on one side and not the other, a shape or
   element type that differs, a trajectory that did not move between two evaluations on
   either side, or two sides whose layout statements disagree. A draw is a valid tensor and a

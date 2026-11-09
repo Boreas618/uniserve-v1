@@ -1,13 +1,12 @@
 //! The programs this Qwen3-MoE deployment compiles, printed as fixture lines.
 //!
-//!     cargo run -p qwen3-moe --example keys -- [--checkpoint /opt/uv/models/Qwen3-30B-A3B] \
+//!     cargo run -p qwen3-moe --example keys -- [--checkpoint $UNISERVE_QWEN3_MODEL] \
 //!         [--cache bf16]
 //!
-//! Each line is `<operator>\t<key>`, the form `tools/build_store.py` consumes and
-//! `notes/programs/qwen3-moe-keys.txt` holds, so the note can be regenerated from the model rather
-//! than kept by hand:
+//! Each line is `<operator>\t<key>`, the form `tools/build_store.py` consumes, so a key file is
+//! generated from the model rather than kept by hand:
 //!
-//!     cargo run -q -p qwen3-moe --example keys > notes/programs/qwen3-moe-keys.txt
+//!     cargo run -q -p qwen3-moe --example keys > <key file>
 //!
 //! **The addresses an `nn::HostStore` answers are host addresses.** They are the right shape and
 //! element type, so every descriptor built over them is the one a device run would build, and this
@@ -17,7 +16,7 @@
 //! **Nothing here opens a shard or a device.** The walk reads the checkpoint's `config.json` and its
 //! declaration and states every program from geometry and element types alone, so a machine holding
 //! only a checkpoint's metadata prints the same lines a GPU host does — which is what makes the
-//! note's diff checkable on any machine.
+//! key file's diff checkable on any machine.
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -48,7 +47,7 @@ struct Deployment {
 }
 
 fn main() -> ExitCode {
-    let mut checkpoint = PathBuf::from("/opt/uv/models/Qwen3-30B-A3B");
+    let mut checkpoint = PathBuf::new();
     let mut deployment = Deployment {
         tensor_parallel: 1,
         tensor_rank: 0,
@@ -146,6 +145,14 @@ fn main() -> ExitCode {
             },
             other => return usage(&format!("unknown argument {other}")),
         }
+    }
+    if checkpoint.as_os_str().is_empty() {
+        checkpoint = std::env::var_os("UNISERVE_QWEN3_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                eprintln!("name the checkpoint with --checkpoint or UNISERVE_QWEN3_MODEL");
+                std::process::exit(2)
+            });
     }
 
     match run(&checkpoint, &deployment) {

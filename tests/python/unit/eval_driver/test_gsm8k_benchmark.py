@@ -58,7 +58,7 @@ SPLIT_ROWS = 1319
 
 @pytest.fixture(autouse=True)
 def confirmation_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set the checkpoint variables a confirmation run documents."""
+    """Set the binary and checkpoint variables a confirmation run documents."""
     monkeypatch.setenv(
         "UNISERVE_QWEN3_MOE_MODEL", "/workspace/models/Qwen3-30B-A3B"
     )
@@ -66,6 +66,7 @@ def confirmation_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "UNISERVE_QWEN3_MOE_NVFP4_MODEL",
         "/workspace/models/Qwen3-30B-A3B-NVFP4",
     )
+    monkeypatch.setenv("UNISERVE_EXECUTABLE", "/srv/uniserve/bin/uniserve")
     monkeypatch.delenv("UNISERVE_QWEN3_FP8_ATTENTION_BACKEND", raising=False)
 
 

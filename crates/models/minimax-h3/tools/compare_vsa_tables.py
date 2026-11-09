@@ -3,12 +3,10 @@
 **This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
 repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
 checkout of the last tree that held the package and that tree's interpreter, with the tree on the
-path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+path; `UNISERVE_REFERENCE_TREE` names that checkout:
 
-    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
-        /workspace/uniserve-v1/.venv/bin/python <this file> ...
-
-`UNISERVE_REFERENCE_TREE` names another checkout.
+    PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \\
+        $UNISERVE_REFERENCE_TREE/.venv/bin/python <this file> ...
 
 The sparse attention's arithmetic runs on a device, but which key tiles a query tile reads is
 decided by host tables: ``variable_block_sizes`` (valid rows of each tile), ``tile_segments``
@@ -92,7 +90,7 @@ def reference_modules():
     """
     import importlib.util
 
-    root = pathlib.Path(os.environ.get("UNISERVE_REFERENCE_TREE", "/workspace/uniserve-v1"))
+    root = pathlib.Path(os.environ["UNISERVE_REFERENCE_TREE"])
     if str(root) not in sys.path:
         sys.path.insert(0, str(root))
     from uniserve.media import image

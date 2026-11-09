@@ -11,7 +11,8 @@ The reference versions are Pillow 12.3.0, PyAV with libavcodec 8.1.2, torch
 port replaces), and the provisioned FFmpeg 8.1.2 with libx264 for the reference
 video and its expected frames.
 
-Usage: `.venv/bin/python crates/media/tests/fixtures/read/generate.py`
+Usage: `$UNISERVE_REFERENCE_PYTHON crates/media/tests/fixtures/read/generate.py <directory>`, which
+the tests run; `UNISERVE_FFMPEG` or `UNISERVE_FFMPEG_DIR` names the FFmpeg with libx264.
 
 Manifests (one case per line, one `<name>.out` per case beside the media):
 
@@ -28,6 +29,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import wave
 
 import numpy as np
@@ -35,33 +37,18 @@ import torch
 import torchaudio
 from PIL import Image, ImageOps
 
-ROOT = os.path.dirname(os.path.abspath(__file__))
-WORKSPACE = os.path.abspath(os.path.join(ROOT, "..", "..", "..", "..", ".."))
-def _ffmpeg() -> str:
-    """The provisioned 8.1.2 build, or the image's own 8.1.2 build."""
-    named = os.environ.get("UNISERVE_FFMPEG")
-    if named:
-        return named
-    directory = os.environ.get("UNISERVE_FFMPEG_DIR")
-    candidates = []
-    if directory:
-        candidates.append(os.path.join(directory, "bin", "ffmpeg"))
-    candidates.append(
-        os.path.join(WORKSPACE, "artifacts", "native", "prefix", "bin", "ffmpeg")
-    )
-    candidates.append("/opt/uv/ffmpeg-8.1.2/bin/ffmpeg")
-    for candidate in candidates:
-        if os.path.exists(candidate):
-            return candidate
-    return "ffmpeg"
-
-
-FFMPEG = _ffmpeg()
-# The provisioned FFmpeg links the shared runtime beside it.
+ROOT = sys.argv[1]
+# The FFmpeg with libx264 the reference video is encoded and decoded with.
+FFMPEG = os.environ.get("UNISERVE_FFMPEG") or os.path.join(
+    os.environ["UNISERVE_FFMPEG_DIR"], "bin", "ffmpeg"
+)
+# A shared FFmpeg links the runtime of its prefix.
 ENVIRONMENT = dict(os.environ)
-_LIBRARY = os.path.join(WORKSPACE, "artifacts", "native", "prefix", "lib")
-_PREVIOUS = ENVIRONMENT.get("LD_LIBRARY_PATH")
-ENVIRONMENT["LD_LIBRARY_PATH"] = _LIBRARY + (":" + _PREVIOUS if _PREVIOUS else "")
+if os.environ.get("UNISERVE_FFMPEG_DIR"):
+    _PREVIOUS = ENVIRONMENT.get("LD_LIBRARY_PATH")
+    ENVIRONMENT["LD_LIBRARY_PATH"] = os.path.join(os.environ["UNISERVE_FFMPEG_DIR"], "lib") + (
+        ":" + _PREVIOUS if _PREVIOUS else ""
+    )
 
 
 def pattern(channels: int, height: int, width: int) -> np.ndarray:

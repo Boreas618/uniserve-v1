@@ -12,8 +12,9 @@
 #   nccl=$(tools/check_nccl.sh) || exit 1
 #   export LD_LIBRARY_PATH=$nccl:$LD_LIBRARY_PATH
 #
-# `UNISERVE_NCCL_DIR` names the directory that holds `libnccl.so.2`. Unset, the project environment's
-# copy answers, which `uv sync --extra gpu` installs, and then the loader's own search. The directory
+# `UNISERVE_NCCL_DIR` names the directory that holds `libnccl.so.2`. Unset, the copy the active
+# Python environment imports answers, which `uv sync --extra gpu` installs, and then the loader's own
+# search. The directory
 # is the only thing written to standard output; a refusal goes to standard error with exit status 1.
 
 set -eu
@@ -24,9 +25,17 @@ pin=$(sed -n 's/.*"nvidia-nccl-cu13==\([0-9.]*\).*/\1/p' "$root/pyproject.toml" 
 
 directory=${UNISERVE_NCCL_DIR:-}
 if [ -z "$directory" ]; then
-    for candidate in "$root"/.venv/lib/python*/site-packages/nvidia/nccl/lib; do
-        [ -e "$candidate/libnccl.so.2" ] && directory=$candidate
-    done
+    directory=$(python3 - 2>/dev/null <<'P' || true
+import importlib.util
+import os
+
+found = importlib.util.find_spec("nvidia.nccl")
+for root in (found.submodule_search_locations if found else None) or []:
+    if os.path.exists(os.path.join(root, "lib", "libnccl.so.2")):
+        print(os.path.join(root, "lib"))
+        break
+P
+)
 fi
 if [ -z "$directory" ]; then
     library=$(ldconfig -p | sed -n 's/.*libnccl\.so\.2 .*=> //p' | head -n 1)

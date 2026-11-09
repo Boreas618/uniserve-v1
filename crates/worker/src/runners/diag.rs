@@ -1,6 +1,6 @@
 //! The served run's half of the block-by-block diagnosis (`specs/worker.md` 10).
 //!
-//! `notes/h3/diagnosis.md` is the protocol: both implementations write the named tensors they
+//! The protocol: both implementations write the named tensors they
 //! computed into their own tree at `<block>/<name>.npy`, and `tools/diagnosis/compare.py` pairs the
 //! two trees by that relative path. The reference half exists - `crates/models/minimax-h3/tools/`
 //! holds a dumper per block - and the served half did not: no crate read `UNISERVE_DIAG_DIR`, so a

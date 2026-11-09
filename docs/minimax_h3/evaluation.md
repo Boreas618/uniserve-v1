@@ -173,7 +173,7 @@ The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` f
 
 A run on a changed service moves `artifacts/minimax_h3/check/` and `artifacts/minimax_h3/check/results/` aside first: the evaluator refuses a non-empty result directory and never replaces a different MP4 at an existing fixed path.
 
-A plan asks the Rust rules through the `uniserve rules` subcommand, so the binary the commands run must be the one built from this tree: install it (`.venv/bin/uniserve`) or name it twice (`UNISERVE_EXECUTABLE` for the rules and `--executable` for the servers). A binary that predates the subcommand answers an unknown command and no JSON, and the failure reads as a missing command rather than a stale binary.
+A plan asks the Rust rules through the `uniserve rules` subcommand, so the binary the commands run must be the one built from this tree. `UNISERVE_EXECUTABLE` names it, for the rules and for every server the profiles start; `--executable` names another binary for the servers of one run. A binary that predates the subcommand answers an unknown command and no JSON, and the failure reads as a missing command rather than a stale binary.
 
 The page a person reviews is written by `uniserve_eval/h3_review_manifest.py`: per cell, the task, the checkpoint the cell confirms, the prompt, the seed, the input files the request conditions on, and the MP4. Given `--results` and `--candidate-results` it puts the candidate's MP4 on the same line as the baseline's, which is what makes the six videos reviewable side by side.
 

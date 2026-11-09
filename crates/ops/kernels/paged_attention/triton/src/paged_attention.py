@@ -2,8 +2,7 @@
 
 The operator, its descriptor and its refusals are `ops::attention::PagedAttention`'s
 (`crates/ops/src/attention/mod.rs`); what this program adds to an ordinary paged attention is the
-cache's encoding: a page of `E4M3` bytes and **one f32 scale for the whole page**
-(`notes/programs/paged_attention_fp8.md`).
+cache's encoding: a page of `E4M3` bytes and **one f32 scale for the whole page**.
 
 The order is the contract's:
 

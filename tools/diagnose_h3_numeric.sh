@@ -6,7 +6,7 @@
 # own layer does not explain. Nothing here fails a build; a non-zero exit means an artifact could
 # not be produced, never that a number is bad.
 #
-# The stages are the canon's (`notes/h3/diagnosis.md`), and a number is quoted with its name: stage 1
+# The stages are the canon's, and a number is quoted with its name: stage 1
 # is the text encoder (prompt -> hidden), stage 2 the video decoder, stage 3 the sampler (the sigma
 # ladder the denoiser steps along), stage 4 the video encoder and stage 5 the conditioned path
 # (`fl2va`) that binds it. **The denoiser's own blocks have no canon number**: stage 3 exercises them
@@ -15,18 +15,20 @@
 # cannot say whether the encoder or the projection made it.
 #
 # Usage:
-#   tools/diagnose_h3_numeric.sh <checkpoint root> [<out dir>]
+#   tools/diagnose_h3_numeric.sh <checkpoint root> <out dir>
 #
-#   <checkpoint root>  e.g. /opt/uv/models/MiniMax-H3
-#   <out dir>          default artifacts/h3-numeric
+#   <checkpoint root>  the MiniMax-H3 checkpoint
+#   <out dir>          the directory the artifacts are written under
+#
+# `UNISERVE_REFERENCE_TREE` names the checkout of the retired Python tree the reference half reads.
 #
 # Every artifact carries the commit and the checkpoint it was produced from: a sigma ladder with no
 # commit beside it is a number nobody can date.
 
 set -eu
 
-root=${1:?usage: diagnose_h3_numeric.sh <checkpoint root> [<out dir>]}
-out=${2:-artifacts/h3-numeric}
+root=${1:?usage: diagnose_h3_numeric.sh <checkpoint root> <out dir>}
+out=${2:?usage: diagnose_h3_numeric.sh <checkpoint root> <out dir>}
 
 here=$(cd "$(dirname "$0")/.." && pwd)
 cd "$here"
@@ -38,7 +40,7 @@ mkdir -p "$run"
 echo "commit $commit, checkpoint $root, out $run"
 
 # The reference half reads the retired Python tree; `UNISERVE_REFERENCE_TREE` names a checkout of it.
-reference=${UNISERVE_REFERENCE_TREE:-/workspace/uniserve-v1}
+reference=${UNISERVE_REFERENCE_TREE:?names the checkout of the retired Python tree}
 reference_python="env PYTHONPATH=$reference:$reference/uniserve_kernels/src $reference/.venv/bin/python"
 
 # 1. Stage 3: the sampler's schedule. Host arithmetic on the checkpoint's own statement, so this
@@ -74,7 +76,7 @@ device. They produce two dump trees that tools/diagnosis/compare.py compares by 
       --case <case.json> --probe prompt_hidden --out $run/ref
 
   # the comparison: per tensor relative L2, max abs, cosine, and whether the two are identical
-  .venv/bin/python tools/diagnosis/compare.py --ref $run/ref --got $run/rust \\
+  uv run python tools/diagnosis/compare.py --ref $run/ref --got $run/rust \\
       --out $run/report.json
 
 Recorded here rather than run because this host has the text encoder's index and none of its shards:

@@ -22,7 +22,7 @@
 //! cargo test -p worker --test shadow_update -- --ignored --test-threads=1
 //! ```
 //!
-//! It needs `nvcc` on `PATH`, and `UNISERVE_PROBE_ARCH` names the architecture it compiles for
+//! It needs `CUDA_HOME` to name the CUDA toolkit, and `UNISERVE_PROBE_ARCH` names the architecture it compiles for
 //! (default `sm_100a`).
 //!
 //! The update's other two paths are measured at the process level instead, by the delivery test of
@@ -143,14 +143,20 @@ fn cubin() -> PathBuf {
     let output =
         std::env::temp_dir().join(format!("probe-generation-{}.cubin", std::process::id()));
     let arch = std::env::var("UNISERVE_PROBE_ARCH").unwrap_or_else(|_| "sm_100a".to_owned());
-    let status = Command::new("nvcc")
-        .arg("-cubin")
-        .arg(format!("-arch={arch}"))
-        .arg("-o")
-        .arg(&output)
-        .arg(&source)
-        .status()
-        .expect("this probe compiles its kernels with nvcc, which must be on PATH");
+    let status = Command::new(
+        std::path::Path::new(
+            &std::env::var_os("CUDA_HOME")
+                .expect("CUDA_HOME names the toolkit whose nvcc compiles this probe's kernel"),
+        )
+        .join("bin/nvcc"),
+    )
+    .arg("-cubin")
+    .arg(format!("-arch={arch}"))
+    .arg("-o")
+    .arg(&output)
+    .arg(&source)
+    .status()
+    .expect("running nvcc");
     assert!(status.success(), "nvcc failed on {}", source.display());
     output
 }

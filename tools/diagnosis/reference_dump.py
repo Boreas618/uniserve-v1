@@ -4,12 +4,12 @@
 **This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
 repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
 checkout of the last tree that held the package and that tree's interpreter, with the tree on the
-path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+path; `UNISERVE_REFERENCE_TREE` names that checkout:
 
-    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
-        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+    PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \\
+        $UNISERVE_REFERENCE_TREE/.venv/bin/python <this file> ...
 
-This is the reference half of the served diagnosis in `notes/h3/diagnosis.md`. Run it with the
+This is the reference half of the served diagnosis. Run it with the
 Python tree's interpreter:
 
     OUT=<dir> INJECT_NOISE=<served dump> CUDA_VISIBLE_DEVICES=<gpu> python tools/diagnosis/reference_dump.py
@@ -36,7 +36,7 @@ from uniserve.models.minimax_h3 import generation, processing
 from uniserve.runner.denoiser import DenoiserRunner
 from uniserve.runner.encoder import EncoderRunner
 
-ROOT = Path(os.environ.get("MODEL", "/workspace/models/FastVideo-FastH3-8-Step-V2"))
+ROOT = Path(os.environ["MODEL"])
 OUT = Path(os.environ["OUT"])
 PROMPT = os.environ.get("PROMPT", "A red fox walks through falling snow at dusk")
 SECONDS = float(os.environ.get("SECONDS_", "4.0"))

@@ -77,7 +77,7 @@ pub(crate) fn transfer_server(socket: &Path, gpus: Gpus) -> Launch {
         .map(Into::into),
     );
     Launch {
-        program: "/usr/bin/env".into(),
+        program: "env".into(),
         arguments,
     }
 }

@@ -416,7 +416,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture", required=True)
     parser.add_argument("--root", required=True, help="the store root to assemble")
-    parser.add_argument("--kernels", default="crates/ops/kernels")
+    parser.add_argument(
+        "--kernels", default=str(Path(__file__).resolve().parents[1] / "crates/ops/kernels")
+    )
     parser.add_argument("--target", default="sm_100a")
     parser.add_argument(
         "--python",

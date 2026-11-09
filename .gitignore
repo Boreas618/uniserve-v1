@@ -49,8 +49,11 @@ AGENTS.md
 # Standalone applications are developed and versioned outside this repository.
 /apps/
 
-# A reference run's dumped rows: host artifacts, read by path, never committed.
-notes/reference/qwen3-hidden/
 
 # Run outputs (certification records, check dumps) are not source.
 .scratch/
+
+# Editor, agent and local Cargo settings are each developer's own.
+.cargo/
+.claude/
+.vscode/

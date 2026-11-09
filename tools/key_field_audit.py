@@ -26,15 +26,6 @@ import sys
 import tempfile
 
 HERE = pathlib.Path(__file__).resolve().parent
-#: The row sets to audit. H3's dense rows come from `minimax-h3-keys.txt`, which the deployment's own
-#: generator writes and `key_coverage`/`build_store` certify. The H3 file is **one** deployment's
-#: rows and states the video-sparse one, whose rows are a superset of the dense deployment's: a second
-#: file for the dense set was a second name for a subset, and a store built from the dense file lacked
-#: the rows a sparse run launches.
-FIXTURES = (
-    HERE.parent / 'notes/programs/qwen3-moe-keys.txt',
-    HERE.parent / 'notes/programs/minimax-h3-keys.txt',
-)
 
 #: Fields an extent is likely to be named by, most specific first.
 CANDIDATES = (
@@ -151,6 +142,8 @@ def main() -> int:
     parser.add_argument("--fields", default=",".join(CANDIDATES),
                         help="comma-separated field names to move, in priority order")
     parser.add_argument("--limit", type=int, default=0, help="stop after this many operators")
+    parser.add_argument("--fixture", action="append", required=True, type=pathlib.Path,
+                        help="a key file whose rows are audited; repeat it for each deployment")
     arguments = parser.parse_args()
 
     store = load_build_store()
@@ -163,7 +156,7 @@ def main() -> int:
     unbuilt = 0
     skipped = 0
     first_failure = None
-    for fixture in FIXTURES:
+    for fixture in arguments.fixture:
         for operator, key in rows_of(fixture):
             if arguments.operator and operator != arguments.operator:
                 continue

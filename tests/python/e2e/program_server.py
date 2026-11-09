@@ -8,14 +8,17 @@ from the kernels the bf16 dense Qwen3 deployment launches.
 The kernels build with the Program Server's own Python environment
 (``crates/program-server/python``), which holds the compilers and the packages
 kernel programs import (Triton, CuTe DSL, FlashInfer). The repository's
-``.venv`` holds the development tools and the evaluator, and none of those, so a
-build run with it stops at its first import.
+development environment holds the development tools and the evaluator, and none
+of those, so a build run with it stops at its first import.
+
+``UNISERVE_PROGRAM_SERVER_PYTHON`` names that environment's interpreter,
+``UNISERVE_SCHEDULING_PRECOMPILE`` the wasm precompiler, and ``UNISERVE_BINARY``
+the ``uniserve`` binary.
 """
 
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import time
 from collections.abc import Iterator
@@ -50,31 +53,6 @@ from tests.python.e2e.http_helpers import (
 # window, head_dim 128, 64-token pages, one rank: trtllm-gen.
 POLICY_PACKAGE = "crates/ops/program-fixtures/policy"
 
-#: The descriptor keys the deployment launches: the model's own ``keys()`` plus
-#: the executor's sampler launches, as ``crates/ops`` generators state them
-#: (``notes/programs/qwen3-moe-keys.txt``). The store the fixture serves holds a
-#: module for every one of them.
-#:
-#: This file used to install one kernel package, the attention one the daemon
-#: names. That is enough for the epoch to *resolve* — the daemon names one
-#: operator and the Program Server fills that slot — but not to serve: a main
-#: process installs the kernels the model actually launches, and it resolves
-#: them from this host's store (``listed_programs`` in ``src/engine_main.rs``).
-#: With two packages there, the listing described nothing to overlay and the
-#: precopy stood in ``this node's devices`` until its 300 s budget ended it.
-KEYS = "notes/programs/qwen3-moe-keys.txt"
-
-#: The precisions whose rows in ``KEYS`` belong to deployments other than this
-#: file's. The key file covers three deployments — bf16 dense weights, NVFP4
-#: weights, and an fp8 KV variant — in one store, as its own header states.
-#: This file serves the bf16 dense one, so a row that names an NVFP4 encoding or
-#: an ``f8e4m3`` scale or page is another deployment's, and one operator
-#: (``kv_write_scaled``) stands in ``kv_write``'s place there. Building those
-#: rows here fails on packages that deployment's owner owes, which says nothing
-#: about whether this deployment can serve.
-FOREIGN_PRECISIONS = ("nvfp4", "f8e4m3")
-FOREIGN_OPERATORS = frozenset({"kv_write_scaled"})
-
 def repository() -> Path:
     """The repository root: the workspace the policy package is built in."""
     return Path(__file__).resolve().parents[3]
@@ -84,17 +62,16 @@ def compiler() -> Path:
     """The interpreter of the Program Server's own environment.
 
     It compiles every kernel program, and nothing else provides what the
-    programs import, so a host without it is told how to make it.
+    programs import. ``UNISERVE_PROGRAM_SERVER_PYTHON`` names it.
     """
-    interpreter = (
-        repository() / "crates/program-server/python/.venv/bin/python"
-    )
-    if not interpreter.exists():
+    named = os.environ.get("UNISERVE_PROGRAM_SERVER_PYTHON")
+    if not named:
         pytest.fail(
-            f"no interpreter at {interpreter}: run `uv sync --project "
-            "crates/program-server/python --python /usr/bin/python3.12`"
+            "UNISERVE_PROGRAM_SERVER_PYTHON must name the Program Server's "
+            "interpreter: `uv sync --project crates/program-server/python` "
+            "makes one"
         )
-    return interpreter
+    return Path(named)
 
 
 def precompiler() -> Path:
@@ -102,38 +79,15 @@ def precompiler() -> Path:
 
     A policy is built for wasm32 and precompiled for this host's CPU, so the
     server needs the precompiler before it can install a policy (design 5.3).
-    It is named by the environment, found on the path, shipped beside the
-    ``uniserve`` binary, or built from this tree, in that order.
+    ``UNISERVE_SCHEDULING_PRECOMPILE`` names it.
     """
     named = os.environ.get("UNISERVE_SCHEDULING_PRECOMPILE")
-    if named:
-        return Path(named)
-    found = shutil.which("scheduling-precompile")
-    if found:
-        return Path(found)
-    beside = Path(require_uniserve_binary()).with_name("scheduling-precompile")
-    if beside.exists():
-        return beside
-    root = repository()
-    done = subprocess.run(
-        [
-            "cargo",
-            "build",
-            "--package",
-            "scheduling",
-            "--bin",
-            "scheduling-precompile",
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        timeout=3600,
-    )
-    if done.returncode != 0:
+    if not named:
         pytest.fail(
-            f"scheduling-precompile did not build: {done.stderr[-2000:]}"
+            "UNISERVE_SCHEDULING_PRECOMPILE must name the precompiler: "
+            "`cargo build -p scheduling --bin scheduling-precompile` builds it"
         )
-    return root / "target" / "debug" / "scheduling-precompile"
+    return Path(named)
 
 
 def program_target() -> str:
@@ -171,41 +125,78 @@ def program_target() -> str:
     return f"sm_{major}{minor}a"
 
 
-def deployment_keys(store: Path) -> Path:
-    """The key lines this file's deployment serves, written beside `store`.
+def deployment_keys(store: Path, checkpoint: Path) -> Path:
+    """The key lines this file's deployment serves, generated beside `store`.
 
-    ``KEYS`` is the union of three deployments' rows; ``build_fixtures`` fails
-    on any row that does not build, so handing it the union would let another
-    deployment's missing package stop this one from serving. The rows kept here
-    are the bf16 dense deployment's: everything whose key names none of
-    ``FOREIGN_PRECISIONS`` and whose operator is not ``FOREIGN_OPERATORS``.
-    Comments and blank lines are dropped — the store's build reads rows, and
-    the selection remains readable in the file it came from.
+    The model's own rows come from its walk over the checkpoint's metadata
+    (``qwen3-moe --example keys``, which opens no shard and no device), and the
+    worker's rows (the sampler's chain and the logits gathers) are merged in by
+    ``ops --example qwen3_moe_keys``. So the list is the code's own statement of
+    this bf16 deployment, and no stored file can drift from it.
     """
-    kept = []
-    for line in (repository() / KEYS).read_text().splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        operator, _, key = stripped.partition("\t")
-        if operator in FOREIGN_OPERATORS:
-            continue
-        lowered = stripped.lower()
-        if any(precision in lowered for precision in FOREIGN_PRECISIONS):
-            continue
-        kept.append(stripped)
-    if not kept:
+    model = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "--package",
+            "qwen3-moe",
+            "--example",
+            "keys",
+            "--",
+            "--checkpoint",
+            str(checkpoint),
+        ],
+        cwd=repository(),
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    if model.returncode != 0:
         raise AssertionError(
-            f"{KEYS} states no row for this deployment: "
-            f"{sorted(FOREIGN_PRECISIONS)} and "
-            f"{sorted(FOREIGN_OPERATORS)} excluded all of them"
+            f"the model's key walk failed: {model.stderr[-4000:]}"
+        )
+    walk = store.parent / "model-keys.txt"
+    walk.write_text(model.stdout)
+    merged = subprocess.run(
+        [
+            "cargo",
+            "run",
+            "-q",
+            "--package",
+            "ops",
+            "--example",
+            "qwen3_moe_keys",
+            "--",
+            "--model-keys",
+            str(walk),
+        ],
+        cwd=repository(),
+        capture_output=True,
+        text=True,
+        timeout=3600,
+    )
+    if merged.returncode != 0:
+        raise AssertionError(
+            f"merging the worker's keys failed: {merged.stderr[-4000:]}"
+        )
+    rows = [
+        line
+        for line in merged.stdout.splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    if not rows:
+        raise AssertionError(
+            "the key generators stated no row for this deployment"
         )
     path = store.parent / "deployment-keys.txt"
-    path.write_text("\n".join(kept) + "\n")
+    path.write_text("\n".join(rows) + "\n")
     return path
 
 
-def build_store(store: Path, target: str, python: Path) -> None:
+def build_store(
+    store: Path, target: str, python: Path, checkpoint: Path
+) -> None:
     """Builds a module for every kernel key this deployment launches.
 
     `store` is ``build_fixtures``'s store, which it fills in its own shape: the
@@ -217,9 +208,9 @@ def build_store(store: Path, target: str, python: Path) -> None:
     ``build_fixtures`` (``crates/program-server/examples``) is the store's own
     producer: for each ``operator<TAB>key`` line of the key file it installs the
     operator's package, prepares that key for `target`, and resolves it to the
-    module it names. It is given :func:`deployment_keys`, not ``KEYS``: this
-    deployment's rows only, so a package another deployment owes fails that
-    deployment's run and not this one. The builds are real — Triton, nvcc and
+    module it names. It is given :func:`deployment_keys`: this deployment's
+    rows only, so a package another deployment owes fails that deployment's run
+    and not this one. The builds are real — Triton, nvcc and
     CuTe DSL all run — so this takes minutes rather than seconds, once per
     module. The Program Server then
     serves the store as it stands, which is why ``--store-root`` below is this
@@ -239,7 +230,9 @@ def build_store(store: Path, target: str, python: Path) -> None:
         "build_fixtures",
         "--",
         "--keys",
-        str(deployment_keys(store)),
+        str(deployment_keys(store, checkpoint)),
+        "--packages",
+        str(repository() / "crates/ops/kernels"),
         "--target",
         target,
         "--store",
@@ -270,6 +263,7 @@ def build_store(store: Path, target: str, python: Path) -> None:
 @contextmanager
 def program_server(
     tmp_path_factory: pytest.TempPathFactory,
+    checkpoint: Path | None = None,
 ) -> Iterator[Path]:
     """The host's Program Server, with the deployment's programs installed.
 
@@ -279,7 +273,9 @@ def program_server(
     once for the module:
 
     * the kernels — a module for every descriptor key the deployment launches,
-      built into the store by ``build_fixtures`` (``KEYS``). The epoch is
+      built into the store by ``build_fixtures`` from :func:`deployment_keys`
+      over `checkpoint`, which defaults to the one ``UNISERVE_QWEN3_MODEL``
+      names. The epoch is
       refused by the first slot no installed program fills, and a main process
       serves nothing until it can install the kernels the model launches;
     * the policy — ``POLICY_PACKAGE``, installed below, because a policy is a
@@ -304,7 +300,14 @@ def program_server(
     named = os.environ.get("UNISERVE_PROGRAM_STORE")
     built = Path(named) if named else work / "programs"
     if not named:
-        build_store(built, target, interpreter)
+        if checkpoint is None:
+            stated = os.environ.get("UNISERVE_QWEN3_MODEL")
+            if not stated:
+                pytest.fail(
+                    "UNISERVE_QWEN3_MODEL must name the model checkpoint"
+                )
+            checkpoint = Path(stated)
+        build_store(built, target, interpreter, checkpoint)
     # The builder's two directories are the two the server is given: installed
     # sources for a rebuild, prepared modules for what it serves.
     packages = built / "packages"

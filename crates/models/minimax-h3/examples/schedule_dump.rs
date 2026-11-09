@@ -7,7 +7,7 @@
 //! implementations disagree about, and nothing about a build.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example schedule_dump -- --root /opt/uv/models/MiniMax-H3 \
+//! cargo run -q -p minimax-h3 --example schedule_dump -- --root $UNISERVE_H3_MODEL \
 //!     --out artifacts/diagnosis/minimax-h3/schedule --commit <sha>
 //! ```
 //!
@@ -44,7 +44,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         print!("{}", usage());
         return Ok(());
     }
-    let mut root = PathBuf::from("/opt/uv/models/MiniMax-H3");
+    let mut root = PathBuf::new();
     let mut out: Option<PathBuf> = None;
     let mut commit = String::from("unstated");
     let mut arguments = std::env::args().skip(1);
@@ -60,6 +60,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--commit" => commit = arguments.next().ok_or("--commit wants a revision")?,
             other => return Err(format!("unknown argument {other}").into()),
         }
+    }
+    if root.as_os_str().is_empty() {
+        root = std::env::var_os("UNISERVE_H3_MODEL")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
+                std::process::exit(2)
+            });
     }
 
     let layout = Layout::detect(&root)?;

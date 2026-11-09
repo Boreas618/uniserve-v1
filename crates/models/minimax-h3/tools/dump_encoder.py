@@ -4,10 +4,10 @@
 **This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
 repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
 checkout of the last tree that held the package and that tree's interpreter, with the tree on the
-path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+path; `UNISERVE_REFERENCE_TREE` names that checkout:
 
-    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \\
-        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+    PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \\
+        $UNISERVE_REFERENCE_TREE/.venv/bin/python <this file> ...
 
 The reference half of the encoder stage's comparison. The candidate's half is
 `crates/models/minimax-h3/examples/encoder.rs`, which writes its prompt's hidden rows for the same
@@ -15,7 +15,7 @@ case; this reads the candidate's case and writes the reference's rows for it, so
 about arithmetic rather than about which side built the prompt.
 
     python crates/models/minimax-h3/tools/dump_encoder.py --probe prompt_hidden \
-        --stack artifacts/h3-stage4/text_encoder --checkpoint /opt/uv/models/MiniMax-H3 \
+        --stack artifacts/h3-stage4/text_encoder --checkpoint $UNISERVE_H3_MODEL \
         --out artifacts/h3-stage4-ref --device cuda
 
 One file per invocation, so a failure costs one tensor:

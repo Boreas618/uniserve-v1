@@ -1,11 +1,11 @@
-// Source of add_constant.fatbin, which the library-load test loads: a binary
-// image contains NUL bytes and so could not pass the CString path the crate
-// used for PTX text.
+// The kernel of the library-load tests, which compile it to a fatbin with the
+// toolkit CUDA_HOME names: a binary image contains NUL bytes and so could not
+// pass the CString path the crate used for PTX text.
 //
-// Regenerate it with the CUDA toolkit of the branch's target (CUDA 13):
+// The tests compile it as
 //
-//     nvcc -gencode arch=compute_90,code=[sm_90,compute_90] \
-//         -fatbin add_constant.cu -o add_constant.fatbin
+//     $CUDA_HOME/bin/nvcc -gencode arch=compute_90,code=[sm_90,compute_90] \
+//         -fatbin add_constant.cu -o <their own directory>/add_constant.fatbin
 //
 // The embedded PTX makes the image load on every device from sm_90 on, and the
 // SASS section keeps it honest for sm_90 itself.

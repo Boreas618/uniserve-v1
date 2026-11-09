@@ -29,7 +29,7 @@ extents, and why a clip length of 256 does not excuse `head_dim_256`.
 The other half of the rule - rows no walk states but
 the construction requires - is `check_manifests.py`'s question, not this one's.
 
-The store a caller builds comes from a fixture under `notes/programs/`, one per deployment, and it is
+The store a caller builds comes from a key file, one per deployment, and it is
 a **walk's rows**: `cargo run -p minimax-h3 --example programs -- <root> --dtype <t> ...` prints them
 from the model's own layers, and `h3_fixture --walk <print> --commit <rev>` writes the file with the
 tree it came from. Three checks read that file, and they answer three different questions:
@@ -50,8 +50,7 @@ One line per launch, `operator<TAB>key`, in launch order - duplicates are fine a
 
 Usage:
 
-    walk_gaps.py --walk artifacts/h3-stage1/walk.txt \\
-                 --fixture notes/programs/minimax-h3-keys.txt [--unbound]
+    walk_gaps.py --walk <walk file> --fixture <key file> [--unbound]
 
 Exit status: 1 when a bound key has no fixture line (the run would stop with `no directory`/`no
 kernel`), 0 otherwise. Unbound fixture lines are printed but never failed on by default.
@@ -349,7 +348,8 @@ def families(args):
     print(f"{total} key(s) launched, {collapsed} with the field(s) removed")
 
 
-OPS = pathlib.Path("crates/ops/src")
+#: The operators' sources, found from this file's own place in the repository.
+OPS = pathlib.Path(__file__).resolve().parents[4] / "crates/ops/src"
 NAME = re.compile(r'const NAME: &\'static str = "([a-z0-9_]+)"')
 COUNT = re.compile(r"^# (\d+) data rows(?:, (\d+) operators)?")
 

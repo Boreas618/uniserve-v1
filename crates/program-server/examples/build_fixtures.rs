@@ -13,8 +13,8 @@
 //!
 //! ```text
 //! cargo run -p program-server --example build_fixtures -- \
-//!     --keys notes/programs/qwen3-moe-keys.txt \
-//!     --keys notes/programs/minimax-h3-keys.txt \
+//!     --keys <qwen3-moe keys file> \
+//!     --keys <minimax-h3 keys file> \
 //!     --target sm_100a
 //! ```
 //!
@@ -78,9 +78,10 @@ fn run_with(options: Options) -> Result<(), String> {
         upstream: None,
         limits: Limits::default(),
         toolchains: ToolchainConfig {
-            nvcc: None,
+            nvcc: options.nvcc.clone(),
             python,
             wasm: None,
+            cargo: None,
             max_jobs: options.jobs,
         },
         devices: vec![Device {
@@ -247,20 +248,22 @@ struct Options {
     target: Target,
     store: PathBuf,
     python: PathBuf,
+    nvcc: Option<PathBuf>,
     jobs: usize,
 }
 
 impl Options {
-    /// The defaults are this repository's: both fixtures of `crates/ops`'s
-    /// generators, the tree's kernel packages, and the Program Server's own
-    /// Python environment.
+    /// The key files, the package root, the store and the interpreter are the caller's; the target
+    /// defaults to `sm_100a` and the jobs to four.
     fn parse() -> Result<Self, String> {
+        let (mut packages, mut store, mut python) = (None, None, None);
         let mut options = Options {
             keys: Vec::new(),
-            packages: PathBuf::from("crates/ops/kernels"),
+            packages: PathBuf::new(),
             target: Target::new("sm_100a"),
-            store: std::env::temp_dir().join("uniserve-build-fixtures"),
-            python: PathBuf::from("crates/program-server/python/.venv/bin/python"),
+            store: PathBuf::new(),
+            python: PathBuf::new(),
+            nvcc: None,
             jobs: 4,
         };
         let mut arguments = std::env::args().skip(1);
@@ -272,10 +275,11 @@ impl Options {
             };
             match flag.as_str() {
                 "--keys" => options.keys.push(PathBuf::from(value()?)),
-                "--packages" => options.packages = PathBuf::from(value()?),
+                "--packages" => packages = Some(PathBuf::from(value()?)),
                 "--target" => options.target = Target::new(&value()?),
-                "--store" => options.store = PathBuf::from(value()?),
-                "--python" => options.python = PathBuf::from(value()?),
+                "--store" => store = Some(PathBuf::from(value()?)),
+                "--python" => python = Some(PathBuf::from(value()?)),
+                "--nvcc" => options.nvcc = Some(PathBuf::from(value()?)),
                 "--jobs" => {
                     options.jobs = value()?
                         .parse()
@@ -296,11 +300,11 @@ impl Options {
             }
         }
         if options.keys.is_empty() {
-            options.keys = vec![
-                PathBuf::from("notes/programs/qwen3-moe-keys.txt"),
-                PathBuf::from("notes/programs/minimax-h3-keys.txt"),
-            ];
+            return Err("name the key files with --keys <file>, once per file".to_string());
         }
+        options.packages = packages.ok_or("--packages names the package root")?;
+        options.store = store.ok_or("--store names the store to build into")?;
+        options.python = python.ok_or("--python names the Program Server's interpreter")?;
         if !options.python.is_file() {
             return Err(format!(
                 "no interpreter at {}: `uv sync --project crates/program-server/python` \

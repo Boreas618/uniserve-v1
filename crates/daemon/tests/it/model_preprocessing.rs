@@ -723,7 +723,10 @@ fn streamed_chat_does_not_request_undeliverable_prompt_logprobs() {
 
 /// Qwen3 chat template shipped by Qwen3 and Qwen3-MoE checkpoints; it asks for
 /// JSON tool calls inside `<tool_call>` lines.
-const QWEN3_TEMPLATE: &str = include_str!("../templates/qwen3.jinja");
+const QWEN3_TEMPLATE: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/templates/qwen3.jinja"
+));
 /// Tool instruction in the style of Qwen3-Coder templates, which ask for XML
 /// `<function=...>` calls instead of JSON objects.
 const XML_CALL_TEMPLATE: &str = "{%- if tools -%}<|im_start|>system\n# Tools\n<tools>{%- for tool in tools -%}{{ tool | tojson }}{%- endfor -%}</tools>\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter>\nvalue\n</parameter>\n</function>\n</tool_call><|im_end|>\n{%- endif -%}{%- for message in messages -%}<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{%- endfor -%}{%- if add_generation_prompt -%}<|im_start|>assistant\n{%- endif -%}";

@@ -47,9 +47,6 @@ use nn::{
     RetainedWeights, Shape, TensorView, VideoRequest, VideoTask, WeightKey, WeightLoader,
 };
 
-/// The export root the caller's GPU host holds, when `--root` does not name another.
-const DEFAULT_ROOT: &str = "/workspace/models/MiniMax-H3";
-
 /// The two checkpoint directories a conditioned deployment reads its media from.
 const VAE: &str = "vae";
 const AUDIO_VAE: &str = "audio_vae";
@@ -164,8 +161,8 @@ fn run() -> Result<(), String> {
 impl Args {
     fn parse() -> Result<Self, String> {
         let mut args = Args {
-            root: PathBuf::from(DEFAULT_ROOT),
-            out: PathBuf::from("artifacts/h3-stage5"),
+            root: PathBuf::new(),
+            out: PathBuf::new(),
             stage: "weights".to_owned(),
             task: VideoTask::FirstLastToVideoAudio,
             width: 1344,
@@ -286,6 +283,18 @@ impl Args {
                 }
                 other => return Err(format!("`{other}` is not a flag of this harness")),
             }
+        }
+        if args.out.as_os_str().is_empty() {
+            eprintln!("name the output directory with --out");
+            std::process::exit(2);
+        }
+        if args.root.as_os_str().is_empty() {
+            args.root = std::env::var_os("UNISERVE_H3_MODEL")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
+                    std::process::exit(2)
+                });
         }
         Ok(args)
     }

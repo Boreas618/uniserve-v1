@@ -2,7 +2,9 @@
 """Check the state tables the model declares against the operators that read them.
 
     .venv/bin/python crates/models/minimax-h3/tools/check_tables.py \
-        [--model crates/models/minimax-h3/src] [--kernels crates/ops/kernels]
+        [--model <model source>] [--kernels <package root>]
+
+Both default to this repository's own: the crate's `src` and `crates/ops/kernels`.
 
 A state table is the model's *declaration* of a buffer the runner fills, and its element type is
 part of a launch key: the operator's manifest declares which types it accepts for that field, and
@@ -35,6 +37,9 @@ import argparse
 import pathlib
 import re
 import sys
+
+#: This repository, found from this file's own place in it.
+REPOSITORY = pathlib.Path(__file__).resolve().parents[4]
 
 # `StateTable { name: "position_ids", dtype: DType::F32, shape: ... }` over a few lines.
 DECLARATION = re.compile(
@@ -127,13 +132,13 @@ def main(argv: list[str]) -> int:
     parser.add_argument(
         "--model",
         type=pathlib.Path,
-        default=pathlib.Path("crates/models/minimax-h3/src"),
+        default=REPOSITORY / "crates/models/minimax-h3/src",
         help="the model's source directory",
     )
     parser.add_argument(
         "--kernels",
         type=pathlib.Path,
-        default=pathlib.Path("crates/ops/kernels"),
+        default=REPOSITORY / "crates/ops/kernels",
         help="the operators' tree",
     )
     parser.add_argument(

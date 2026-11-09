@@ -149,7 +149,7 @@ impl Group {
     /// `recv` is what rank `j` sent here.
     ///
     /// `send` and `recv` are the whole buffers, `ranks` blocks each, and NCCL's `count` is one
-    /// block's elements (`notes/exec/nccl-alltoall-count.md`).
+    /// block's elements.
     pub fn all_to_all(&self, send: TensorView, recv: TensorView, stream: &Stream) -> Result<()> {
         let (elements, dtype) = self.collective(send, recv, "all_to_all")?;
         let ranks = usize::try_from(self.ranks).unwrap_or(usize::MAX);

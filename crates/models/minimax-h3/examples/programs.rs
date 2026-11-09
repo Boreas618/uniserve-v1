@@ -1,10 +1,10 @@
 //! The programs this deployment compiles, one `operator<TAB>key` line each.
 //!
 //! ```text
-//! cargo run -p minimax-h3 --example programs -- /opt/uv/models/MiniMax-H3 [samples ...]
+//! cargo run -p minimax-h3 --example programs -- $UNISERVE_H3_MODEL [samples ...]
 //! ```
 //!
-//! The rows are `notes/programs/minimax-h3-keys.txt`: what a kernel package must provide for
+//! The rows are a deployment's key file: what a kernel package must provide for
 //! `crates/models/minimax-h3`, stated by the model from its own configuration and the same
 //! construction its layers launch with, so no package and no fixture has to guess a variant.
 //!

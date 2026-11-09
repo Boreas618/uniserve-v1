@@ -15,7 +15,7 @@ not compile is a kernel. `slot_commit`'s rows were the first kind for weeks and 
 like the second.
 
 Usage:
-    tools/key_coverage.py --fixture notes/programs/qwen3-moe-keys.txt [--target sm_100a]
+    tools/key_coverage.py --fixture <key file> [--target sm_100a]
 """
 import argparse
 import sys
@@ -35,7 +35,9 @@ def declares(package, target):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixture", required=True)
-    parser.add_argument("--kernels", default="crates/ops/kernels")
+    parser.add_argument(
+        "--kernels", default=str(Path(__file__).resolve().parents[1] / "crates/ops/kernels")
+    )
     parser.add_argument("--target", default="sm_100a")
     args = parser.parse_args()
 

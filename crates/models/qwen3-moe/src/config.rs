@@ -525,7 +525,12 @@ mod tests {
     /// values the design's slice depends on.
     #[test]
     fn the_local_checkpoint_metadata_parses() {
-        let path = std::path::Path::new("/opt/uv/models/Qwen3-30B-A3B/config.json");
+        // The local checkpoint's metadata, when `UNISERVE_QWEN3_MODEL` names one.
+        let Some(root) = std::env::var_os("UNISERVE_QWEN3_MODEL") else {
+            return;
+        };
+        let path = std::path::Path::new(&root).join("config.json");
+        let path = path.as_path();
         if !path.is_file() {
             return;
         }

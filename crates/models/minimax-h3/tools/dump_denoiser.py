@@ -4,10 +4,10 @@ r"""Dump one probe of the MiniMax-H3 denoiser from the reference implementation.
 **This tool needs the retired Python tree.** It reads `uniserve`, the Python package that left this
 repository with the Python worker, as the reference half of design 10's diagnosis. Run it with a
 checkout of the last tree that held the package and that tree's interpreter, with the tree on the
-path; `/workspace/uniserve-v1` is the reference tree of this project's hosts:
+path; `UNISERVE_REFERENCE_TREE` names that checkout:
 
-    PYTHONPATH=/workspace/uniserve-v1:/workspace/uniserve-v1/uniserve_kernels/src \
-        /workspace/uniserve-v1/.venv/bin/python <this file> ...
+    PYTHONPATH=$UNISERVE_REFERENCE_TREE:$UNISERVE_REFERENCE_TREE/uniserve_kernels/src \
+        $UNISERVE_REFERENCE_TREE/.venv/bin/python <this file> ...
 
 The reference half of the block-by-block numeric comparison (`specs/worker.md` 10) for the block that
 the other dumpers do not reach: the two VAE dumpers cover the decoders, the encoder dumper covers the
@@ -15,12 +15,12 @@ text tower, `dump_tables.py` covers a request's packing tables, and this one cov
 noise** and the two attention boundaries that the packing computes but `dump_tables.py` does not
 write.
 
-Names are taken from the protocol's table (`notes/h3/diagnosis.md` §2), never re-derived here, so a
+Names are taken from the protocol's table, never re-derived here, so a
 tensor that changes shape changes in one place.
 
     python crates/models/minimax-h3/tools/dump_denoiser.py --list
     python crates/models/minimax-h3/tools/dump_denoiser.py \\
-        --checkpoint /opt/uv/models/MiniMax-H3 --case <case.json> --probe noise \\
+        --checkpoint $UNISERVE_H3_MODEL --case <case.json> --probe noise \\
         --out artifacts/diagnosis/denoiser/ref
 
 One probe per invocation, so a failure costs one tensor set and not the batch. The plan is printed
@@ -147,7 +147,7 @@ def dump(out: Path, name: str, values) -> None:
     The **relative path is the whole matching rule**: `tools/diagnosis/compare.py` keys each tree by
     `path.relative_to(root)` and pairs by that key, so a tensor written flat can never match a
     runner's `<block>/<name>.npy`. This writes `<out>/denoiser/<name>` for exactly that reason, and
-    the names are the protocol's (`notes/h3/diagnosis.md` 2), not this file's.
+    the names are the protocol's, not this file's.
     """
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     from dump_tables import dump as write
@@ -1046,7 +1046,7 @@ def main(argv: list[str] | None = None) -> int:
             "bindings' scratch), which the host half of this dumper cannot construct"
         )
         print(
-            "refused the tensors are real and named in notes/h3/diagnosis.md 2; producing them "
+            "refused the tensors are real and named by the protocol; producing them "
             "belongs with the runner's own diagnostics hook, not with a weight-free dumper"
         )
         return 1

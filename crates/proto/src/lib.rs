@@ -55,3 +55,9 @@ pub const BUILD: &str = concat!(
     "+",
     env!("UNISERVE_SOURCE_DIGEST")
 );
+
+/// The workspace this crate is compiled in, as Cargo locates it: the root the
+/// build's digest covers. Tests that read files another package of the
+/// workspace owns, such as the deployment files under `configs/`, join their
+/// paths to it.
+pub const WORKSPACE: &str = env!("UNISERVE_WORKSPACE");

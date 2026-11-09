@@ -17,17 +17,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-/// The directories a header is looked for in, in order, after the ones named
-/// by `UNISERVE_CUDA_HEADERS` (a colon-separated list).
-const DIRECTORIES: [&str; 6] = [
-    "/usr/local/cuda/include",
-    "/usr/include/aarch64-linux-gnu",
-    "/usr/include/x86_64-linux-gnu",
-    "/usr/include",
-    "/opt/nvidia/cuda/include",
-    "/usr/local/cuda-13.0/include",
-];
-
 /// The value of the enumerator `name` in `header`, when the header is found
 /// and defines it: from the header's enumerations (either explicitly, with
 /// `= value`, or implicitly, by position, as CUDA's headers mostly are) or
@@ -613,7 +602,9 @@ fn text(header: &str) -> Option<&'static str> {
     let mut directories: Vec<PathBuf> = std::env::var("UNISERVE_CUDA_HEADERS")
         .map(|paths| paths.split(':').map(PathBuf::from).collect())
         .unwrap_or_default();
-    directories.extend(DIRECTORIES.iter().map(PathBuf::from));
+    if let Some(home) = std::env::var_os("CUDA_HOME") {
+        directories.push(PathBuf::from(home).join("include"));
+    }
     let found = directories
         .iter()
         .map(|directory| directory.join(header))
