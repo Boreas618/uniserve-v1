@@ -273,6 +273,7 @@ impl VideoInputError {
     }
 
     /// The field a rejection names; `None` for a failure.
+    #[cfg(test)]
     pub const fn field(&self) -> Option<RequestField> {
         match self {
             Self::Invalid { field, .. } => Some(*field),
@@ -391,6 +392,7 @@ fn nearest_multiple(value: f64) -> u32 {
 /// Those crossings, the ends of the range and the ratio the cap starts at
 /// cut 1:4 to 4:1 into intervals of one canvas each, so the canvases at the
 /// cuts and at the midpoints between them are all of them.
+#[cfg(test)]
 pub fn rule_canvases() -> Vec<Canvas> {
     let short_edge = f64::from(CANVAS_SHORT_EDGE);
     let max_pixels = f64::from(CANVAS_MAX_PIXELS);
@@ -528,6 +530,7 @@ struct ReferenceOptions {
 impl ReferenceConfig {
     /// The default sizing of a deployment whose denoiser declares `limits`:
     /// images reduced to the declared edge, nothing enlarged.
+    #[cfg(test)]
     pub fn new(limits: &ReferenceLimits) -> Self {
         Self {
             image_short_edge: limits.image_short_edge,
@@ -537,6 +540,7 @@ impl ReferenceConfig {
 
     /// The released pipeline's sizing: every reference at its encoding size
     /// (images at the declared edge), enlarged when smaller.
+    #[cfg(test)]
     pub fn released(limits: &ReferenceLimits) -> Self {
         Self {
             enlarge: true,
@@ -1417,6 +1421,7 @@ pub fn video_reference(
 
 /// The largest references a request generating a given frame count may
 /// bring, as [`reference_bounds`] states them.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReferenceBounds {
     /// The two largest rasters an image reference is encoded at: the
@@ -1449,6 +1454,7 @@ pub struct ReferenceBounds {
 /// samples whatever the source rate, `frame_rate` being the output frame
 /// rate the frames are counted at. A model sizes these shapes with its own
 /// packing to provision the largest condition set it admits.
+#[cfg(test)]
 pub fn reference_bounds(
     frames: u32,
     frame_rate: u32,

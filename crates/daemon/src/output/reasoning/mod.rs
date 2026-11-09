@@ -61,6 +61,7 @@ pub struct ReasoningDelta {
 
 impl ReasoningDelta {
     /// Returns `true` when this delta carries neither reasoning nor content text.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.reasoning.is_none() && self.content.is_none()
     }

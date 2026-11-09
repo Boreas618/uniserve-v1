@@ -380,13 +380,6 @@ impl<M: Decoder + Send + Sync + ?Sized> DecoderRunner<M> {
         Ok(())
     }
 
-    /// The bytes `bucket`'s tables need, as the plan books them before admission (4.3).
-    pub fn table_bytes(model: &M, bucket: Bucket) -> Result<u64> {
-        let layout = Self::layout_of(model, bucket)?;
-        let tables = model.layout_tables(&layout).map_err(Error::from)?;
-        Tables::plan_bytes(&tables)
-    }
-
     fn stream_id(&self) -> StreamId {
         StreamId(self.stream.raw())
     }
@@ -1513,46 +1506,6 @@ mod tests {
         ) -> nn::Result<()> {
             Ok(())
         }
-    }
-
-    #[test]
-    fn the_plan_is_told_what_every_bucket_of_a_canvas_needs() {
-        // The two tables are six f32 and six i32: one number the mechanism books before admission,
-        // derived from the model's declaration rather than from a runner's own constant.
-        let bytes =
-            DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::clip(SERVED.0, SERVED.1, SERVED.2))
-                .expect("the tables' bytes");
-        assert_eq!(bytes, 6 * 4 + 6 * 4);
-    }
-
-    #[test]
-    fn a_bucket_that_is_not_a_decode_states_what_it_is() {
-        // A prefill bucket has no clip, and a decoder asked for its layout must say so by name rather
-        // than answer with a layout that reads as one.
-        let error =
-            DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::prefill(1, 16, Variant::Encode))
-                .expect_err("a prefill bucket is not a decode");
-        assert!(
-            format!("{error}").contains("is not a decode bucket"),
-            "the refusal names the bucket's kind: {error}"
-        );
-    }
-
-    #[test]
-    fn a_canvas_the_decoder_cannot_serve_is_refused_by_name() {
-        // The bound is the decoder's, not the plan's: a canvas it was not built for is refused where
-        // the plan asks for its tables - before a capture, and never mid-clip.
-        let error = DecoderRunner::<Fixed>::table_bytes(&Fixed, Bucket::clip(2, 3, 5))
-            .expect_err("a canvas the decoder does not serve");
-        let message = format!("{error}");
-        assert!(
-            message.contains("serves no clip of 2 frame(s) at 3x5"),
-            "the refusal names the clip: {message}"
-        );
-        assert!(
-            message.contains("it serves 2x3x4 only"),
-            "and it carries the decoder's own reason: {message}"
-        );
     }
 
     #[test]

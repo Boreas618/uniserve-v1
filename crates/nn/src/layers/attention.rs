@@ -28,10 +28,6 @@ use crate::layers::launch::{PDL, kv_tile};
 pub enum AttentionBackend {
     /// FlashAttention-4's dense kernel through the CuTe DSL program.
     Dense,
-    /// The sparse attention of the H3 diffusion block (VSA).
-    Sparse,
-    /// FP32 attention through a GEMM and a softmax program.
-    Fp32,
     /// Paged attention over the prefix cache, read and written per token.
     Paged,
 }
@@ -47,8 +43,6 @@ pub struct Attention {
     window: Option<u32>,
     max_kv_len: u32,
     causal: bool,
-    /// Rows of one query tile and of one key block, for the sparse backend.
-    block: u32,
 }
 
 impl Attention {
@@ -95,11 +89,11 @@ impl Attention {
             window,
             max_kv_len,
             causal: true,
-            block: 0,
         })
     }
 
     /// The backend this layer expects.
+    #[cfg(test)]
     pub const fn backend(&self) -> AttentionBackend {
         self.backend
     }
@@ -110,6 +104,7 @@ impl Attention {
     }
 
     /// The longest key reduction the descriptor serves.
+    #[cfg(test)]
     pub const fn max_kv_len(&self) -> u32 {
         self.max_kv_len
     }
@@ -118,6 +113,7 @@ impl Attention {
     ///
     /// The paged backend is always causal; the dense and FP32 backends state it at construction
     /// and it is part of their descriptor, because a causal mask and a dense one are two programs.
+    #[cfg(test)]
     pub const fn causal(&self) -> bool {
         self.causal
     }
@@ -146,32 +142,6 @@ impl Attention {
             max_seq_len,
             causal,
             window,
-            scale,
-        )
-    }
-
-    /// The FP32 dense attention of the `ref2va` audio encoder and the sparse compression branch:
-    /// the same call, with cuBLASLt SGEMM and a softmax kernel inside the package.
-    ///
-    /// The FP32 paths read a whole sequence at once, so their mask is dense and carries no history
-    /// window; `causal` states the mask the model's attention declares, and the two are different
-    /// programs. The audio encoder's attention is causal.
-    pub fn fp32(
-        head_dim: u32,
-        q_heads: u32,
-        kv_heads: u32,
-        max_seq_len: u32,
-        causal: bool,
-        scale: f32,
-    ) -> Result<Self> {
-        Self::dense_of(
-            AttentionBackend::Fp32,
-            head_dim,
-            q_heads,
-            kv_heads,
-            max_seq_len,
-            causal,
-            None,
             scale,
         )
     }
@@ -224,49 +194,6 @@ impl Attention {
             window,
             max_kv_len: max_seq_len,
             causal,
-            block: 0,
-        })
-    }
-
-    /// Video Sparse Attention: query tiles of `block` rows read the key blocks the selection names.
-    ///
-    /// `max_keys` is the longest key extent the deployment serves.
-    pub fn sparse(
-        block: u32,
-        head_dim: u32,
-        heads: u32,
-        max_keys: u32,
-        scale: f32,
-    ) -> Result<Self> {
-        if block == 0 || head_dim == 0 || heads == 0 || max_keys == 0 {
-            return Err(Error::shape(
-                "Attention::sparse",
-                "a tile, a head, a key bound and a head count must be nonzero".to_owned(),
-            ));
-        }
-        if !max_keys.is_multiple_of(block) {
-            return Err(Error::shape(
-                "Attention::sparse",
-                format!("a {max_keys}-key bound is not whole {block}-row tiles"),
-            ));
-        }
-        if !scale.is_finite() || scale == 0.0 {
-            return Err(Error::shape(
-                "Attention::sparse",
-                format!("a softmax scale of {scale}"),
-            ));
-        }
-        Ok(Self {
-            backend: AttentionBackend::Sparse,
-            head_dim,
-            q_heads: heads,
-            kv_heads: heads,
-            page_size: 0,
-            scale,
-            window: None,
-            max_kv_len: max_keys,
-            causal: false,
-            block,
         })
     }
 
@@ -286,8 +213,8 @@ impl Attention {
     /// passes and stay within the deployment's declared ceiling ([`Self::paged`]'s `max_kv_len`),
     /// which is the bound the operator was accepted for.
     ///
-    /// Serves both the `Dense` and the `Fp32` backend; the element types the views carry decide the
-    /// descriptor, and the package behind it decides the tile and split heuristics.
+    /// Serves the `Dense` backend; the element types the views carry decide the descriptor, and the
+    /// package behind it decides the tile and split heuristics.
     /// The descriptor one dense attention launch takes, for a walk that asks a model which programs
     /// it launches with no device.
     ///
@@ -384,10 +311,7 @@ impl Attention {
         longest: Option<u64>,
         out: TensorView,
     ) -> Result<()> {
-        if !matches!(
-            self.backend,
-            AttentionBackend::Dense | AttentionBackend::Fp32
-        ) {
+        if !matches!(self.backend, AttentionBackend::Dense) {
             return Err(Error::Unsupported(format!(
                 "Attention::attend_dense: the {:?} backend is not a dense attention",
                 self.backend
@@ -430,11 +354,6 @@ impl Attention {
         };
 
         f.operate::<DenseAttention>(&descriptor, args)
-    }
-
-    /// The elements between consecutive rows of the query a sparse call reads.
-    pub const fn block(&self) -> u32 {
-        self.block
     }
 
     /// Write `key` and `value` into `planes`, then attend.
@@ -989,32 +908,10 @@ mod tests {
         assert_eq!(encoder.backend(), AttentionBackend::Dense);
         assert_eq!(encoder.max_kv_len(), 8_192);
         assert!(encoder.causal());
-        // The FP32 paths read a whole sequence at once: dense mask, no window. The audio encoder's
-        // attention is causal and the sparse compression branch's is not, so the flag is the
-        // model's to state, and the two are different descriptors.
-        let audio = Attention::fp32(64, 8, 8, 4_096, true, 0.125).unwrap();
-        assert_eq!(audio.backend(), AttentionBackend::Fp32);
-        assert!(audio.causal());
-        assert!(
-            !Attention::fp32(64, 8, 8, 4_096, false, 0.125)
-                .unwrap()
-                .causal()
-        );
         // A history window reads the causal mask only.
         assert!(Attention::dense(128, 32, 4, 8_192, false, Some(1_024), 0.088).is_err());
         assert!(Attention::dense(0, 32, 4, 8_192, true, None, 0.088).is_err());
         assert!(Attention::dense(128, 32, 4, 8_192, true, None, 0.0).is_err());
-    }
-
-    #[test]
-    fn a_sparse_layer_names_its_tile_and_its_key_bound() {
-        let vsa = Attention::sparse(64, 128, 12, 65_536, 0.088).unwrap();
-        assert_eq!(vsa.backend(), AttentionBackend::Sparse);
-        assert_eq!(vsa.block(), 64);
-        // The descriptor's key bound is whole tiles of the block size.
-        assert!(Attention::sparse(64, 128, 12, 1_000, 0.088).is_err());
-        assert!(Attention::sparse(0, 128, 12, 1_024, 0.088).is_err());
-        assert!(Attention::sparse(128, 128, 12, 1_024, 0.088).is_ok());
     }
 
     /// A page's scale is its own layer's, so two layers of one group carry different ones and the

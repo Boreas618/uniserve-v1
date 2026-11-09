@@ -68,6 +68,7 @@ impl NativeLibrary {
     }
 
     /// The file the library was opened from.
+    #[cfg(test)]
     pub fn path(&self) -> &Path {
         &self.path
     }

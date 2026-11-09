@@ -488,6 +488,7 @@ impl Field {
     /// The local positions of the outermost dimension a cut may fall
     /// between: the field's bounds, its segments' bounds, and where a
     /// degree of `degrees` divides the dimension's partition units.
+    #[cfg(test)]
     fn cuts(&self, degrees: &[u64]) -> Vec<u64> {
         let Some(order) = self.nested_order() else {
             return Vec::new();
@@ -614,12 +615,14 @@ impl StorageLayout {
     }
 
     /// The storage's storage: its bytes rounded up to `granularity`.
+    #[cfg(test)]
     pub fn padded(&self, granularity: u64) -> u64 {
         self.bytes.div_ceil(granularity).max(1) * granularity
     }
 
     /// The chunks the storage's storage is allocated in, in address order,
     /// for the parallel `degrees` in use (module documentation).
+    #[cfg(test)]
     pub fn chunks(&self, granularity: u64, degrees: &[u64]) -> Vec<Range<u64>> {
         let padded = self.padded(granularity);
         let mut bounds = vec![0, padded];

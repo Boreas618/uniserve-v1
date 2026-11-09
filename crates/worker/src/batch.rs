@@ -369,6 +369,7 @@ impl MediaColumns {
     }
 
     /// The bytes of every request's every buffer: what the staging path allocates for.
+    #[cfg(test)]
     pub fn bytes(&self) -> usize {
         self.inputs
             .iter()

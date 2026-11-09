@@ -8,7 +8,9 @@ use super::{BlockTableUpdate, GroupShape};
 use crate::memory::allocation::Backing;
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::{Storage, StorageView};
-use crate::stream::{Fill, Issue};
+#[cfg(test)]
+use crate::stream::Fill;
+use crate::stream::Issue;
 use crate::{Error, Result};
 
 /// Byte alignment of each carved table inside the shared allocation.
@@ -39,21 +41,18 @@ pub struct BlockTableStorage {
     alloced_lens: StorageView,
     verified_lengths: StorageView,
     table_shapes: StorageView,
-    /// `width` zero words: the source of slot clears.
-    zeros: StorageView,
 }
 
 /// Byte offsets of the carved tables and the total length.
-fn layout(rows: usize, tables: usize, groups: usize, width: usize) -> ([usize; 6], usize) {
+fn layout(rows: usize, tables: usize, groups: usize, width: usize) -> ([usize; 5], usize) {
     let sizes = [
         tables * rows * width * 4,
         groups * rows * 4,
         rows * 4,
         rows * 4,
         tables * 3 * 4,
-        width * 4,
     ];
-    let mut offsets = [0; 6];
+    let mut offsets = [0; 5];
     let mut cursor = 0;
     for (offset, size) in offsets.iter_mut().zip(sizes) {
         *offset = cursor;
@@ -117,7 +116,6 @@ impl BlockTableStorage {
             alloced_lens: view(2, &[rows_i])?,
             verified_lengths: view(3, &[rows_i])?,
             table_shapes: view(4, &[tables_i, 3])?,
-            zeros: view(5, &[width_i])?,
             storage,
         };
 
@@ -286,49 +284,9 @@ impl BlockTableStorage {
         unsafe { stream.copy(&batch) }
     }
 
-    /// Zero released slots' rows, start pages and lengths on `stream`, which
-    /// must be ordered after every batch that reads those rows.
-    pub fn clear(&self, slots: &[u32], stream: impl Issue) -> Result<()> {
-        let mut entries: Vec<(u64, u64, usize)> = Vec::new();
-        for &slot in slots {
-            self.require_slot(slot)?;
-            for table in 0..self.tables {
-                entries.push((
-                    self.row_address(table, slot),
-                    self.zeros.address(),
-                    self.width as usize * 4,
-                ));
-            }
-            for group in 0..self.groups {
-                let index = u64::from(group) * u64::from(self.rows) + u64::from(slot);
-                entries.push((
-                    self.entry(&self.start_pages, index),
-                    self.zeros.address(),
-                    4,
-                ));
-            }
-            entries.push((
-                self.entry(&self.alloced_lens, u64::from(slot)),
-                self.zeros.address(),
-                4,
-            ));
-            entries.push((
-                self.entry(&self.verified_lengths, u64::from(slot)),
-                self.zeros.address(),
-                4,
-            ));
-        }
-        let mut batch = CopyBatch::new(SourceOrder::Stream);
-        for &(destination, source, bytes) in &entries {
-            batch.push(destination, source, bytes);
-        }
-        // SAFETY: destinations are distinct entries of this allocation
-        // (callers deduplicate slots) and the zero row is never written.
-        unsafe { stream.copy(&batch) }
-    }
-
     /// Set a slot's verified cache length after an import installed `extent`
     /// tokens. The caller checked `extent` against the slot's allocation.
+    #[cfg(test)]
     pub fn set_verified(&self, slot: u32, extent: u32, stream: impl Issue) -> Result<()> {
         self.require_slot(slot)?;
         let address = self.entry(&self.verified_lengths, u64::from(slot));
@@ -400,19 +358,6 @@ mod tests {
 
         storage.set_verified(2, 7, None)?;
         assert_eq!(read(&storage.verified_lengths), vec![0, 0, 7]);
-        storage.clear(&[2], None)?;
-        assert!(read(&storage.unit_tables).iter().all(|&unit| unit == 0));
-        assert!(
-            read(&storage.alloced_lens)
-                .iter()
-                .all(|&length| length == 0)
-        );
-        assert!(
-            read(&storage.verified_lengths)
-                .iter()
-                .all(|&length| length == 0)
-        );
-        assert!(storage.clear(&[3], None).is_err());
         Ok(())
     }
 }

@@ -87,6 +87,7 @@ pub const NAMED_CANVASES: [Canvas; 6] = [
 
 impl Canvas {
     /// Whether this canvas's raster is the ruled one for its class and ratio.
+    #[cfg(test)]
     pub fn is_ruled(&self) -> bool {
         // Both sides on the VAE's 32-pixel grid, and the raster's ratio the one the request names
         // within the one 32-pixel step the rule rounds: the short edge starts at the class's and

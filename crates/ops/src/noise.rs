@@ -226,17 +226,6 @@ impl Op for PhiloxNoise {
     }
 }
 
-/// The Philox word an element of a draw falls in, and which half of it: element `index` of a draw
-/// that starts at `offset` is element `offset + index` of the request's stream.
-///
-/// One program indexes one element by this, so an odd offset draws the high half of a word first and
-/// two draws at adjacent offsets reproduce one longer draw. It is the host statement of the rule the
-/// kernel program applies, and the tests below pin it to the chained-stream property.
-pub const fn word_and_half(offset: u64, index: u64) -> (u64, u32) {
-    let element = offset + index;
-    (element / 2, (element % 2) as u32)
-}
-
 /// How one launch addresses the draw: where the keys are, how many elements it covers and the grid.
 struct Plan {
     /// The `keys` view's address under [`KeySource::Rows`], zero under [`KeySource::Scalar`].
@@ -335,48 +324,6 @@ mod tests {
             draw: 0,
             offset: 0,
         }
-    }
-
-    #[test]
-    fn an_element_offset_zeroes_the_addressing_it_already_had() {
-        // A draw with no offset addresses the stream exactly as before: element i is the low half of
-        // word i/2 for even i and the high half for odd i.
-        for index in 0..8_u64 {
-            assert_eq!(word_and_half(0, index), (index / 2, (index % 2) as u32));
-        }
-    }
-
-    #[test]
-    fn a_draw_at_an_offset_is_the_slice_of_one_longer_draw() {
-        // The chained-stream property, for an even and an odd start: element i of a draw at offset k
-        // addresses the same word and half as element k + i of a draw at zero.
-        for offset in [6_u64, 7] {
-            for index in 0..5_u64 {
-                assert_eq!(
-                    word_and_half(offset, index),
-                    word_and_half(0, offset + index),
-                    "offset {offset}, element {index}"
-                );
-            }
-        }
-        // And an odd offset really does start mid-word rather than rounding down.
-        assert_eq!(word_and_half(7, 0), (3, 1));
-        assert_eq!(word_and_half(6, 0), (3, 0));
-    }
-
-    #[test]
-    fn two_draws_at_adjacent_offsets_are_one_draw() {
-        // A rank draws its own slice of one stream: video at 0..n, then audio at n.., equals the
-        // concatenated draw element for element.
-        let video = 5_u64;
-        let drawn: Vec<(u64, u32)> = (0..video)
-            .map(|index| word_and_half(0, index))
-            .chain((0..4).map(|index| word_and_half(video, index)))
-            .collect();
-        let one: Vec<(u64, u32)> = (0..video + 4)
-            .map(|index| word_and_half(0, index))
-            .collect();
-        assert_eq!(drawn, one);
     }
 
     #[test]

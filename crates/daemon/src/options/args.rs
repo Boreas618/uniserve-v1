@@ -57,14 +57,6 @@ impl Stated {
     pub fn contains(&self, path: &str) -> bool {
         self.0.contains(path)
     }
-
-    /// Whether `path` or anything inside it was stated.
-    pub fn contains_within(&self, path: &str) -> bool {
-        let prefix = format!("{path}.");
-        self.0
-            .iter()
-            .any(|stated| stated == path || stated.starts_with(&prefix))
-    }
 }
 
 impl ServerArgs {
@@ -471,9 +463,7 @@ mod tests {
         ] {
             assert!(stated.contains(path), "{path} was stated");
         }
-        assert!(stated.contains_within("video_config"));
         assert!(!stated.contains("server_config.host"));
-        assert!(!stated.contains_within("cuda_graph_config"));
     }
 
     /// Every flag is a shortcut for the path it names, and the printed

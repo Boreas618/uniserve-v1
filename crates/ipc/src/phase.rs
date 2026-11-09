@@ -26,18 +26,6 @@ use serde::{Deserialize, Serialize};
 #[serde(transparent)]
 pub struct PhaseId(pub u16);
 
-impl PhaseId {
-    /// The phase's number.
-    pub const fn get(self) -> u16 {
-        self.0
-    }
-
-    /// The phase with `number` in the epoch's assignment.
-    pub const fn new(number: u16) -> Self {
-        Self(number)
-    }
-}
-
 impl fmt::Display for PhaseId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "phase:{}", self.0)
@@ -49,16 +37,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_phase_id_carries_its_number() {
-        let phase = PhaseId::new(3);
-        assert_eq!(phase.get(), 3);
-        assert_eq!(phase.to_string(), "phase:3");
-        assert_eq!(PhaseId(3), phase);
+    fn a_phase_id_displays_its_number() {
+        assert_eq!(PhaseId(3).to_string(), "phase:3");
     }
 
     #[test]
     fn a_phase_id_survives_the_peer_encoding() {
-        let phase = PhaseId::new(9);
+        let phase = PhaseId(9);
         let encoded = rmp_serde::to_vec(&phase).expect("a phase id encodes");
         let decoded: PhaseId = rmp_serde::from_slice(&encoded).expect("and decodes");
         assert_eq!(decoded, phase);

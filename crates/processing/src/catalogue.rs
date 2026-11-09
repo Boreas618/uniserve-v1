@@ -113,11 +113,6 @@ impl Catalogue {
             .copied()
             .find(|family| family.pipeline_classes.contains(&class_name))
     }
-
-    /// Every family, in registration order.
-    pub fn families(&self) -> &[Family] {
-        &self.families
-    }
 }
 
 #[cfg(test)]

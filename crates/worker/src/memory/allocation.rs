@@ -149,28 +149,6 @@ impl ElementType {
             Self::Bool | Self::I8 | Self::U32 | Self::F64 | Self::F8E5M2 => None,
         }
     }
-
-    /// The storage element a kernel operand type is stored as, when a storage
-    /// plane can hold it.
-    ///
-    /// `None` for [`ops::DType::F4E2M1`]: a packed 4-bit operand exists only as
-    /// a kernel operand. Screen storage counts bytes as elements times a whole
-    /// element size, so a plane of packed nibbles would silently halve every
-    /// byte count it feeds; such a plane is declared as its container bytes
-    /// with the packed dtype named in the descriptor instead.
-    pub fn from_kernel(dtype: ops::DType) -> Option<Self> {
-        Some(match dtype {
-            ops::DType::U8 => Self::U8,
-            ops::DType::I32 => Self::I32,
-            ops::DType::I64 => Self::I64,
-            ops::DType::F16 => Self::F16,
-            ops::DType::BF16 => Self::BF16,
-            ops::DType::F32 => Self::F32,
-            ops::DType::F8E4M3 => Self::F8E4M3,
-            ops::DType::I16 => Self::I16,
-            ops::DType::F4E2M1 => return None,
-        })
-    }
 }
 
 /// The message dtype of a storage element type, for the element types messages
@@ -1132,25 +1110,5 @@ mod element_type_tests {
                 "{element:?} has no kernel operand type and must not become one"
             );
         }
-    }
-
-    #[test]
-    fn every_storable_kernel_element_type_round_trips_and_packed_fp4_has_no_plane() {
-        let storable = [
-            ops::DType::U8,
-            ops::DType::I32,
-            ops::DType::I64,
-            ops::DType::F16,
-            ops::DType::BF16,
-            ops::DType::F32,
-            ops::DType::F8E4M3,
-        ];
-        for dtype in storable {
-            let element = ElementType::from_kernel(dtype)
-                .unwrap_or_else(|| panic!("{dtype:?} is a storage element too"));
-            assert_eq!(element.to_ops(), Some(dtype), "{dtype:?} must round-trip");
-        }
-        // A packed 4-bit operand is a kernel operand only: no plane of it exists.
-        assert_eq!(ElementType::from_kernel(ops::DType::F4E2M1), None);
     }
 }

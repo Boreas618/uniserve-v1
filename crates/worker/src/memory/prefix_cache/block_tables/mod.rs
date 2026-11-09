@@ -205,6 +205,7 @@ impl BlockTables {
 
     /// Borrow a slot's tables before a batch installs its assignments.
     /// Supplied groups replace resident groups only in this returned view.
+    #[cfg(test)]
     pub fn for_batch(&self, slot: u32, assignments: &[BlockTable]) -> Result<Vec<Arc<GroupTable>>> {
         self.groups
             .iter()
@@ -325,16 +326,6 @@ impl BlockTables {
             .get(&(slot, group))
             .cloned()
             .ok_or_else(|| Error::Invalid("request slot has no installed block table".into()))
-    }
-
-    /// Commit a release after its device clears have been submitted.
-    pub fn release(&mut self, slots: &[u32]) {
-        for &slot in slots {
-            for group in 0..self.groups.len() as u32 {
-                self.tables.remove(&(slot, group));
-            }
-            self.lengths.remove(&slot);
-        }
     }
 
     pub(crate) fn clear(&mut self) {

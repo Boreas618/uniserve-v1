@@ -69,6 +69,7 @@ pub type RequestOutputStream =
 ///
 /// `started` is when the request entered the server and `compile_us` how
 /// long it took to reach the engine; both reach the terminal usage.
+#[cfg(test)]
 pub(crate) fn generation_output(
     request_id: String,
     started: Instant,

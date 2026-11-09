@@ -677,6 +677,7 @@ impl Scheduler {
     /// Returns the first worker group with a prefix cache, whose units the
     /// pool allocates and whose identity names its index for a successor
     /// epoch.
+    #[cfg(feature = "testing")]
     pub fn cache_group(&self) -> Option<String> {
         self.worker
             .info()

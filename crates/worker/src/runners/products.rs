@@ -606,11 +606,13 @@ impl Held {
     }
 
     /// How many products the store holds, for a reader checking that a request ended cleanly.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         crate::lock(&self.entries).len()
     }
 
     /// Whether the store holds no product.
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         crate::lock(&self.entries).is_empty()
     }

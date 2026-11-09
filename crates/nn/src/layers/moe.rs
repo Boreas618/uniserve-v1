@@ -22,6 +22,8 @@
 //! program selects the transport. A `Moe` layer built for a layout that does not hold every
 //! expert refuses the forward rather than computing a routing the weights do not have.
 
+#[cfg(test)]
+use ops::Op;
 use ops::fp4::{BLOCK_ELEMENTS, Nvfp4Quantize, QuantizeArgs, QuantizeDescriptor, ScaleLayout};
 use ops::moe::combine::{self, MoeUnpermute, UnpermuteArgs};
 use ops::moe::exchange::{self, ExchangeArgs, ExpertExchange, Mode};
@@ -32,7 +34,7 @@ use ops::moe::grouped::{
 };
 use ops::moe::routing::{TopkArgs, TopkDescriptor, TopkSoftmax};
 use ops::moe::sort::{self, MoeSort, SortArgs};
-use ops::{DType, DevicePtr, Op, Shape, TensorView};
+use ops::{DType, DevicePtr, Shape, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::{ALIGNMENT, Forward};
@@ -1135,16 +1137,19 @@ impl Moe {
     }
 
     /// The experts this rank holds.
+    #[cfg(test)]
     pub const fn local_experts(&self) -> u32 {
         self.local
     }
 
     /// The experts each token routes to.
+    #[cfg(test)]
     pub const fn top(&self) -> u32 {
         self.top
     }
 
     /// The number of experts the block routes over.
+    #[cfg(test)]
     pub const fn experts(&self) -> u32 {
         self.experts
     }
@@ -1435,6 +1440,7 @@ impl Moe {
     /// `2 · intermediate` columns, the second `hidden`. At the caller's geometry (15 360 rows, 768
     /// intermediate, 2 048 hidden) that is 6 160 + 740 356 for the first and 8 208 + 987 140 for the
     /// second, so 995 348 bytes.
+    #[cfg(test)]
     pub fn workspace_bytes(&self, routes: u64) -> u64 {
         encoded_scratch_bytes(routes, u64::from(self.hidden), u64::from(self.intermediate))
     }
@@ -2164,6 +2170,7 @@ impl Moe {
     ///
     /// A dense block combines its own element type; an encoded one combines BF16, the element type
     /// a calibrated NVFP4 checkpoint's consumers run in.
+    #[cfg(test)]
     pub fn tolerance(&self) -> ops::Tolerance {
         let dtype = match &self.stacks {
             ExpertStacks::Dense { up_gate, .. } => up_gate.dtype(),

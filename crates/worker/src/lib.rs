@@ -2,9 +2,8 @@
 //!
 //! The worker is the only thread that issues work to a device's streams, and
 //! its owners hold everything a step borrows: the resident memory (`memory`),
-//! the transfers that move state in and out of it, capacity, host groups, and
-//! the keys of the state the Storage Server keeps (`keys`, `specs/worker.md`
-//! §8). The runners, graphs, arenas and the program-layer update live in this
+//! the transfers that move state in and out of it, capacity and host groups.
+//! The runners, graphs, arenas and the program-layer update live in this
 //! crate too, beside these modules.
 //!
 //! Ownership rules this crate keeps from the design:
@@ -41,7 +40,6 @@ pub mod data_plane;
 pub mod error;
 pub mod host;
 pub mod hot_update;
-pub mod keys;
 pub mod memory;
 pub mod parallel;
 pub mod stream;

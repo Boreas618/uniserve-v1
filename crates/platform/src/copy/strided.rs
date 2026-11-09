@@ -72,6 +72,7 @@ impl StridedCopy {
         &self.pitched
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.linear.is_empty() && self.pitched.is_empty()
     }

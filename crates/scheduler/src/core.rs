@@ -35,6 +35,7 @@ use crate::{Scheduler, SpecialTokenIds};
 use crate::{SchedulerConfig, SchedulerStats};
 use anyhow::Context as _;
 use ipc::MainProcessInfo;
+#[cfg(feature = "testing")]
 use ipc::RequestId;
 use proto::config::EngineArgs;
 #[cfg(feature = "testing")]
@@ -161,6 +162,7 @@ pub struct SchedulerHandle {
     /// The worker group whose KV cache the scheduler's pool allocates, by
     /// which a successor epoch matches the scheduler's prefix cache index;
     /// `None` without a prefix cache.
+    #[cfg(feature = "testing")]
     cache_group: Option<String>,
     /// The latent seed of what the scheduler's denoising computes, which
     /// keys the trajectories it stores (`Scheduler::latent_seed`).
@@ -421,6 +423,7 @@ impl SchedulerHandle {
         let media_units = scheduler.media_units()?;
         let info = scheduler.info().clone();
         let generation_limits = scheduler.generation_limits().clone();
+        #[cfg(feature = "testing")]
         let cache_group = scheduler.cache_group();
         let latent_seed = scheduler.latent_seed();
         let stats = scheduler.stats_handle();
@@ -449,6 +452,7 @@ impl SchedulerHandle {
             media_units,
             stats,
             generation_limits,
+            #[cfg(feature = "testing")]
             cache_group,
             latent_seed,
             model: model.into(),
@@ -584,6 +588,7 @@ impl SchedulerHandle {
     /// Returns the worker group whose KV cache the scheduler's pool
     /// allocates, which names its prefix cache index for a successor epoch;
     /// `None` without a prefix cache.
+    #[cfg(feature = "testing")]
     pub fn cache_group(&self) -> Option<String> {
         self.cache_group.clone()
     }
@@ -672,6 +677,7 @@ impl SchedulerHandle {
     /// # Errors
     ///
     /// As [`Self::submit`].
+    #[cfg(feature = "testing")]
     pub fn submit_all(&self, requests: Vec<Request>) -> Result<Vec<EventRx>, SubmitError> {
         if self.is_dead() {
             return Err(SubmitError::Dead);
@@ -680,24 +686,28 @@ impl SchedulerHandle {
     }
 
     /// Cancels a request.
+    #[cfg(feature = "testing")]
     pub fn cancel(&self, id: RequestId) {
         self.commands.cancel(id);
     }
 
     /// Finishes a request successfully, as when its decoder matched a stop
     /// string.
+    #[cfg(feature = "testing")]
     pub fn stop(&self, id: RequestId) {
         self.commands.stop(id);
     }
 
     /// Acknowledges that the first `output_token_count` public tokens of a
     /// request with stop strings complete none of them.
+    #[cfg(feature = "testing")]
     pub fn acknowledge_at(&self, id: RequestId, output_token_count: usize) {
         self.commands.acknowledge_at(id, output_token_count);
     }
 
     /// Aborts a request immediately without applying client cancellation
     /// semantics.
+    #[cfg(feature = "testing")]
     pub fn abort(&self, id: RequestId) {
         self.commands.abort(id);
     }
@@ -727,6 +737,7 @@ impl SchedulerHandle {
     }
 
     /// Accepted cache lengths of requests that can move to a successor.
+    #[cfg(feature = "testing")]
     pub fn describe_requests(
         &self,
     ) -> crossbeam_channel::Receiver<Vec<proto::request::wire::RequestPrefix>> {
@@ -788,6 +799,7 @@ impl SchedulerHandle {
     /// The control thread instantiates its route instance on it and reverts
     /// there after a `route` failure, so a failure costs one boundary, not the
     /// epoch.
+    #[cfg(feature = "testing")]
     pub fn policy_state(
         &self,
         ranks: Vec<scheduling::guest::view::RankView>,
@@ -803,6 +815,7 @@ impl SchedulerHandle {
     }
 
     /// Publishes the committed epoch's immutable pages on every claimed node.
+    #[cfg(feature = "testing")]
     pub fn publish_epoch(&self) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.publish_epoch()
     }
@@ -818,6 +831,7 @@ impl SchedulerHandle {
 
     /// Ends the storage of `epochs` on the nodes of the scheduler's workers,
     /// which the deployment's claims cover; the receiver gets whether it did.
+    #[cfg(feature = "testing")]
     pub fn retire(&self, epochs: Vec<u64>) -> crossbeam_channel::Receiver<Result<(), String>> {
         self.commands.retire(epochs)
     }
@@ -825,6 +839,7 @@ impl SchedulerHandle {
     /// Keeps the weights alone of `epochs` on the nodes of the scheduler's
     /// workers, which the deployment's claims cover, in host storage when
     /// `to_host`; the receiver gets each node's report.
+    #[cfg(feature = "testing")]
     pub fn keep_weights(
         &self,
         epochs: Vec<u64>,
@@ -837,6 +852,7 @@ impl SchedulerHandle {
     /// Reads the storage ledgers of the nodes of the scheduler's workers,
     /// which the deployment's claims cover; the receiver gets each node's
     /// as JSON.
+    #[cfg(feature = "testing")]
     pub fn ledgers(&self) -> crossbeam_channel::Receiver<Result<Vec<String>, String>> {
         self.commands.ledgers()
     }
@@ -845,6 +861,7 @@ impl SchedulerHandle {
     /// the deployment's transfers use on the nodes of the scheduler's
     /// workers, which the deployment's claims cover; the receiver gets the
     /// hosts it throttled.
+    #[cfg(feature = "testing")]
     pub fn throttle(
         &self,
         halve: bool,
@@ -875,6 +892,7 @@ impl SchedulerHandle {
     /// once the batches in flight complete, together with the other
     /// schedulers of `together` (`HookBarrier`); the receiver gets each
     /// worker's result, or why the hook failed.
+    #[cfg(feature = "testing")]
     pub fn hook(
         &self,
         name: String,
@@ -886,6 +904,7 @@ impl SchedulerHandle {
 
     /// Takes other scheduling limits and policy from the next step on; the
     /// receiver gets whether the scheduler did.
+    #[cfg(feature = "testing")]
     pub fn configure(
         &self,
         limits: SchedulerConfig,
@@ -949,6 +968,7 @@ impl SchedulerHandle {
     /// before any is joined. Schedulers whose workers share an expert world
     /// must close those workers at once, since a closing expert rank waits
     /// for every peer to leave the union.
+    #[cfg(feature = "testing")]
     pub fn shutdown_all<'a, I>(schedulers: I)
     where
         I: IntoIterator<Item = &'a SchedulerHandle>,
