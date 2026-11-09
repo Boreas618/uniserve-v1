@@ -627,7 +627,6 @@ impl Worker {
         self.media.select_media(computation)
     }
 
-
     /// The device's mapped bytes per pool kind, from the one allocator that books them (4.1).
     ///
     /// The figures are one booking's totals rather than a sum over owners - one `Pools` is shared
@@ -713,7 +712,6 @@ impl Watchdog {
     pub fn longest(&self) -> Option<&Watch> {
         self.jobs.iter().max_by_key(|watch| watch.elapsed)
     }
-
 }
 
 /// What one turn of the device thread finished (4.5's interleaving).

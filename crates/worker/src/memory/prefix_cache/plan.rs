@@ -313,12 +313,9 @@ impl CachePlan {
         last.div_ceil(capacity)
     }
 
-
-
     pub(crate) fn group_shapes(&self) -> Result<Vec<GroupShape>> {
         self.groups.iter().map(CacheGroupPlan::shape).collect()
     }
-
 
     /// The pool description reported to the engine.
     pub fn info(&self, num_units: u32) -> PrefixCacheInfo {
@@ -487,5 +484,4 @@ mod tests {
         assert_eq!(plan.unit_bytes, u64::from(layers) * (2 * column + 2));
         Ok(())
     }
-
 }

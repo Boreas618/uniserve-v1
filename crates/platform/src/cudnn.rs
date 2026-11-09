@@ -1174,7 +1174,6 @@ impl ConvolutionPlan {
     pub fn bytes(&self) -> ConvolutionBytes {
         self.bytes
     }
-
 }
 
 /// The device storage one execution of a convolution reads and writes: the
@@ -1308,7 +1307,6 @@ impl Cudnn {
             handle,
         })
     }
-
 
     /// The cuDNN version this process loaded (`cudnnGetVersion`).
     pub fn version(&self) -> usize {

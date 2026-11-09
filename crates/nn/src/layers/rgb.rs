@@ -88,7 +88,6 @@ impl RgbBytes {
         })
     }
 
-
     /// Map `input [channels, frames, rows, columns]` into `out [frames, rows, columns, channels]`.
     ///
     /// Every extent is the views': the two shapes must describe one raster, and the output's element

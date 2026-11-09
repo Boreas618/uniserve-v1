@@ -77,7 +77,6 @@ impl Container {
         }
         Ok(bytes)
     }
-
 }
 
 /// One request's MP4 under assembly.

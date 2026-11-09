@@ -46,7 +46,6 @@ impl<A: HostAction> Lane<A> {
         task.submit()?;
         Ok(task)
     }
-
 }
 
 #[cfg(test)]

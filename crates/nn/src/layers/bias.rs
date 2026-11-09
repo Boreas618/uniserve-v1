@@ -14,8 +14,6 @@
 //! its own bias is the common case; a residual bias without a residual is refused, because there
 //! would be nothing for it to bias.
 
-
-
 /// Elements one bias program adds.
 pub const BLOCK: u32 = 1024;
 
@@ -23,6 +21,4 @@ pub const BLOCK: u32 = 1024;
 #[derive(Clone, Copy, Default)]
 pub struct BiasAdd;
 
-impl BiasAdd {
-}
-
+impl BiasAdd {}

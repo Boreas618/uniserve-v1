@@ -335,9 +335,9 @@ impl<G: Unpin> HttpBody for GuardedBody<G> {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
     use crate::options::ServerConfig;
     use crate::test_support::{SERVED_MODEL, post_json, router_with, send, sim_engine};
+    use axum::http::StatusCode;
 
     /// Sends a two-token chat completion with `request_id` as its
     /// `X-Request-Id` and returns the response header and the body's

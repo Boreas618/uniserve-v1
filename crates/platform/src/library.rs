@@ -105,8 +105,6 @@ impl Library {
         )?;
         Ok(Function::new(function, self.device.clone()))
     }
-
-
 }
 
 impl Drop for Library {

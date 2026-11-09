@@ -133,7 +133,6 @@ impl PackageSource {
         Self { root, manifest }
     }
 
-
     /// A file of the package, by the manifest's relative path.
     pub fn file(&self, relative: &str) -> PathBuf {
         self.root.join(relative)
@@ -700,13 +699,15 @@ impl Source for TritonSource {
                 ),
             ));
         }
-        let interpreter = toolchain.script_interpreter().ok_or_else(|| Error::Toolchain {
-            kind: ToolchainKind::Triton,
-            message: format!(
-                "no Python interpreter to run {}: pass --python",
-                script.display()
-            ),
-        })?;
+        let interpreter = toolchain
+            .script_interpreter()
+            .ok_or_else(|| Error::Toolchain {
+                kind: ToolchainKind::Triton,
+                message: format!(
+                    "no Python interpreter to run {}: pass --python",
+                    script.display()
+                ),
+            })?;
         let job = ToolJob::new(interpreter, &package.root, &log)
             .argument(&script)
             .environment(package.environment(key, target, dir));
@@ -979,7 +980,8 @@ impl Source for WasmSource {
             None => {
                 let cargo = toolchain.cargo().ok_or_else(|| Error::Toolchain {
                     kind: ToolchainKind::Wasm,
-                    message: "no cargo named: the wasm32 build of a policy crate needs --cargo".into(),
+                    message: "no cargo named: the wasm32 build of a policy crate needs --cargo"
+                        .into(),
                 })?;
                 build_wasm_crate(cargo, package, key, target, dir, &log, toolchain.max_jobs())?
             }

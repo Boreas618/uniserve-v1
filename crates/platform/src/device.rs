@@ -114,14 +114,10 @@ impl Device {
         self.architecture
     }
 
-
-
     /// Free and total storage now, queried in this device's primary context.
     pub fn memory_info(&self) -> Result<MemoryInfo> {
         self.id.memory_info()
     }
-
-
 
     /// Makes this device's primary context current on the calling thread until
     /// the guard drops, for driver calls that need a current context on a fresh
@@ -217,7 +213,6 @@ impl DeviceId {
         )?;
         Ok(accessible != 0)
     }
-
 
     /// Free and total device storage, queried in the device's primary context.
     pub fn memory_info(self) -> Result<MemoryInfo> {

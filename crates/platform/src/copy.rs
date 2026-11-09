@@ -189,7 +189,6 @@ impl CopyBatch {
         self.sizes.push(bytes);
     }
 
-
     pub fn len(&self) -> usize {
         self.sizes.len()
     }
@@ -197,7 +196,6 @@ impl CopyBatch {
     pub fn is_empty(&self) -> bool {
         self.sizes.is_empty()
     }
-
 
     /// The `(destination, source, bytes)` entries in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (u64, u64, usize)> + '_ {

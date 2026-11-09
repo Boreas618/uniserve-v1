@@ -147,7 +147,6 @@ pub struct CheckpointFile {
 }
 
 impl CheckpointFile {
-
     /// The shard's identity.
     pub fn identity(&self) -> &FileIdentity {
         &self.identity

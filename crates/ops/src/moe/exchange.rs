@@ -522,7 +522,6 @@ impl Transport {
         unsafe { ExchangeTransport::from_handle(self.call.transport) }
     }
 
-
     /// The transport's views, as the package laid them out.
     pub fn views(&self) -> Result<TransportViews> {
         let mut info = Info {
@@ -580,9 +579,6 @@ impl Transport {
         let status = unsafe { (self.step)(&mut self.call, handle) };
         check(status, "step", &self.call.error)
     }
-
-
-
 }
 
 /// A lifecycle entry's status, with the message it left.

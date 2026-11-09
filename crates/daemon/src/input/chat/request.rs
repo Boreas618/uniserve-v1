@@ -72,7 +72,6 @@ impl ChatContentPart {
         }
     }
 
-
     /// Returns whether this part contains any multimodal content.
     pub fn is_multimodal(&self) -> bool {
         match self {
@@ -108,7 +107,6 @@ impl ChatContent {
                 .concat(),
         })
     }
-
 
     /// Returns whether this content contains any multimodal parts.
     pub fn has_multimodal(&self) -> bool {

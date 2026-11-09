@@ -276,8 +276,7 @@ pub enum Launch {
     SecondProduct,
 }
 
-impl Launch {
-}
+impl Launch {}
 
 /// One buffer of the encoded step: its extent, its element type, and the launch that writes it.
 ///
@@ -1148,9 +1147,6 @@ impl Moe {
     pub const fn experts(&self) -> u32 {
         self.experts
     }
-
-
-
 
     /// The routing prefix: the router, its top-k, the expert map, and the sort that groups the
     /// routes into the tiles a grouped product reads.

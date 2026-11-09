@@ -53,7 +53,6 @@ mod tasks;
 mod tests;
 pub mod weights;
 
-
 use serde::{Deserialize, Serialize};
 
 pub use layout::{Canonical, Encoding, Field, Logical, Piece, Segment, StorageLayout};
@@ -513,7 +512,6 @@ impl Manifest {
         self.copies.iter().map(Copy::bytes).sum()
     }
 
-
     /// Peak conversion scratch on a receiver. Groups execute serially:
     /// one destination canonical form, one source's gathered fields and
     /// canonical form. Numerical conversion writes these borrowed buffers
@@ -552,8 +550,6 @@ impl Manifest {
 
 /// Computes each request's manifest once.
 #[derive(Default)]
-pub struct Planner {
-}
+pub struct Planner {}
 
-impl Planner {
-}
+impl Planner {}

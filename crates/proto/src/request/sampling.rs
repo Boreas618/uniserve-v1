@@ -115,8 +115,6 @@ pub enum SamplingParamsError {
 }
 
 impl SamplingParams {
-
-
     /// Returns whether generated-token logprobs are enabled.
     pub fn generated_logprobs_requested(&self) -> bool {
         self.return_logprobs || self.n_logprobs > 0

@@ -253,7 +253,6 @@ impl Toolchains {
             ToolchainKind::None => Ok(""),
         }
     }
-
 }
 
 /// nvcc, the CUDA toolkit's compiler.
@@ -272,7 +271,9 @@ impl Nvcc {
         let path = config
             .nvcc
             .clone()
-            .or_else(|| std::env::var_os("CUDA_HOME").map(|home| PathBuf::from(home).join("bin/nvcc")))
+            .or_else(|| {
+                std::env::var_os("CUDA_HOME").map(|home| PathBuf::from(home).join("bin/nvcc"))
+            })
             .ok_or_else(|| "no nvcc named: pass --nvcc <path> or set CUDA_HOME".to_owned())?;
         // A configured path may be relative to where the server was started; a build
         // runs elsewhere (the store's copy of a package), so it is made absolute once.
@@ -430,10 +431,9 @@ struct Wasm {
 
 impl Wasm {
     fn discover(config: &ToolchainConfig, interpreter: Option<&Path>) -> Discovered<Wasm> {
-        let precompiler = config
-            .wasm
-            .clone()
-            .ok_or_else(|| "no wasm precompiler named: pass --wasm <scheduling-precompile>".to_owned())?;
+        let precompiler = config.wasm.clone().ok_or_else(|| {
+            "no wasm precompiler named: pass --wasm <scheduling-precompile>".to_owned()
+        })?;
         let precompiler = resolve(&precompiler);
         let version = wasmtime_version(&precompiler)?;
         Ok(Wasm {
@@ -700,8 +700,14 @@ mod tests {
     #[test]
     fn a_relative_toolchain_path_is_answered_absolute() {
         let root = Path::new("/srv/host");
-        assert_eq!(resolve_in(Path::new("bin/nvcc"), root), root.join("bin/nvcc"));
-        assert_eq!(resolve_in(Path::new("/opt/nvcc"), root), Path::new("/opt/nvcc"));
+        assert_eq!(
+            resolve_in(Path::new("bin/nvcc"), root),
+            root.join("bin/nvcc")
+        );
+        assert_eq!(
+            resolve_in(Path::new("/opt/nvcc"), root),
+            Path::new("/opt/nvcc")
+        );
     }
 
     #[test]

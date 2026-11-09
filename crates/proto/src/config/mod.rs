@@ -34,7 +34,6 @@ pub use worker_group::{
     WorkerGroupRole, WorkerRank,
 };
 
-
 /// A positive count, for the defaults of non-zero options.
 pub const fn positive(count: usize) -> NonZeroUsize {
     match NonZeroUsize::new(count) {

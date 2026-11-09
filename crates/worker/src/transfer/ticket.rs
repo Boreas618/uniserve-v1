@@ -83,11 +83,9 @@ impl TransferTicket {
         Ok(self.retired())
     }
 
-
     pub(crate) fn undrained(&self) -> bool {
         self.undrained
     }
-
 
     pub(crate) fn add_done_callback(&mut self, callback: Notify) -> Option<Notify> {
         if self.ready() {

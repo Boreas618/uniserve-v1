@@ -210,7 +210,6 @@ impl JobQueue {
         })
     }
 
-
     /// The event pool deferred work is completed through.
     pub(crate) fn events(&self) -> &Arc<EventPool> {
         &self.events

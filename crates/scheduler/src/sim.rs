@@ -464,7 +464,6 @@ impl SimWorker {
         receiver
     }
 
-
     /// Has the worker report, as the deployment's nodes' storage reports
     /// (`Worker::ledgers`), whatever the returned list holds when the
     /// engine reads them: a test writes each node's JSON (`{"host",

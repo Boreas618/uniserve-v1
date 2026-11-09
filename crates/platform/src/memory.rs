@@ -185,7 +185,6 @@ impl DeviceAllocation {
         self.bytes
     }
 
-
     /// The handle type of an exportable allocation; `None` for linear storage.
     pub fn handle_type(&self) -> Option<HandleType> {
         match &self.kind {
@@ -314,7 +313,6 @@ impl PinnedBuffer {
         self.bytes
     }
 
-
     /// Views the buffer on the host.
     ///
     /// # Safety
@@ -435,8 +433,6 @@ impl HostRegistration {
     pub fn address(&self) -> u64 {
         self.pointer.as_ptr() as u64
     }
-
-
 
     /// Unregisters the range, reporting failure.
     pub fn unregister(mut self) -> Result<()> {

@@ -249,7 +249,6 @@ impl Group {
             .map_err(Error::Platform)
     }
 
-
     /// Waits for a collective issued outside a capture, so the walk goes on with none in flight.
     ///
     /// NCCL's kernel spins on its device until every member reaches the collective. The first

@@ -76,7 +76,6 @@ impl Linear {
         })
     }
 
-
     /// The contraction length.
     pub const fn k(&self) -> u32 {
         self.k
@@ -382,7 +381,6 @@ impl Nvfp4Linear {
     pub fn weight(&self) -> TensorView {
         self.packed.view()
     }
-
 
     /// The tile one encoding of a `columns`-wide row runs in.
     ///

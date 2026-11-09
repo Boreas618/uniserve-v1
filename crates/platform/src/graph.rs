@@ -182,7 +182,6 @@ impl Graph {
         Ok(copies)
     }
 
-
     /// The nodes that depend directly on `node`, each with what its edge says.
     ///
     /// An edge is normally "after the producer completed", and a **programmatic** edge says the
@@ -537,7 +536,6 @@ impl OwnedKernelNodeParams {
             .map(|value| value.as_ptr().cast_mut().cast())
             .collect()
     }
-
 }
 
 /// A captured graph instantiated for replay (`CUgraphExec`).
@@ -559,7 +557,6 @@ unsafe impl Send for GraphExec {}
 unsafe impl Sync for GraphExec {}
 
 impl GraphExec {
-
     /// Submits one execution of the graph to `stream` and returns without
     /// waiting for it. The graph may have been captured on another stream of
     /// the same device.

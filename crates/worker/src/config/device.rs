@@ -39,7 +39,6 @@ impl Device {
     pub(crate) fn is_cuda(self) -> bool {
         matches!(self, Self::Cuda(_))
     }
-
 }
 
 impl std::fmt::Display for Device {
@@ -69,5 +68,4 @@ mod tests {
         assert!(Device::parse("tpu", "rank device").is_err());
         assert!(Device::parse("cuda:-1", "rank device").is_err());
     }
-
 }

@@ -390,7 +390,6 @@ impl Connection {
         }
     }
 
-
     /// Sends one frame with the descriptors that belong to it.
     ///
     /// Descriptors ride on the frame's first byte, so a receiver that reads a

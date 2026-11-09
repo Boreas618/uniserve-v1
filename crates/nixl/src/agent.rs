@@ -168,7 +168,6 @@ impl Agent {
         created.map(|()| backend)
     }
 
-
     /// Registers `region` with the UCX backend for `access`, so that this
     /// agent's READs can write it (with [`Access::ReadWrite`]) and peers
     /// that load metadata taken from now on can read it.

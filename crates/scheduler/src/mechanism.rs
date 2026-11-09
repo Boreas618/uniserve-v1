@@ -1349,7 +1349,7 @@ impl Watchdog {
 mod tests {
     use super::*;
     use crate::policy::{PolicyReverted, TrialState};
-    
+
     use scheduling::guest::{ComponentId, RequestClass, Room, Storage, Warming};
 
     fn request(id: u64, state: RequestState) -> RequestView {
@@ -1379,7 +1379,11 @@ mod tests {
         }
     }
 
-    fn live(requests: Vec<RequestView>, queue: Vec<RequestId>, kinds: &[(u32, PhaseKind)]) -> Live<'_> {
+    fn live(
+        requests: Vec<RequestView>,
+        queue: Vec<RequestId>,
+        kinds: &[(u32, PhaseKind)],
+    ) -> Live<'_> {
         let mut live = Live {
             requests: requests.into_iter().map(|r| (r.id, r)).collect(),
             queue,
@@ -2059,10 +2063,7 @@ mod tests {
             tokens: 1,
         }]);
         plan.admit = vec![RequestId(1)];
-        let mut policy = Static {
-            plan,
-            failures: 0,
-        };
+        let mut policy = Static { plan, failures: 0 };
 
         // A good answer validates and executes; the failed one is the policy's.
         let decision = policy.dispatch(&room()).expect("the fixed plan");

@@ -280,7 +280,6 @@ impl MemoryConfig {
             .as_ref()
             .map_or(0, |cache| cache.state_snapshot_bytes())
     }
-
 }
 
 /// What a rank's process maps after its plan and beside its pools: the modules a precopy loads and

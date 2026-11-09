@@ -286,8 +286,6 @@ impl ForwardBatch {
         self.write_cache.push(write_cache);
     }
 
-
-
     /// Validate column alignment and numerical ranges before indexing model inputs.
     pub fn validate(&self, call_count: usize) -> ValidationResult<()> {
         let rows = self.call_indices.len();

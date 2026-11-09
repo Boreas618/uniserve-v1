@@ -122,8 +122,14 @@ impl ClaimHolder {
         if self.remote_pages {
             arguments.extend(["--tcp".to_owned(), "0.0.0.0:0".to_owned()]);
         }
-        service::ensure(&self.executable, "storage-server", &socket, &arguments, START_TIMEOUT)
-            .context("starting this node's storage server")?;
+        service::ensure(
+            &self.executable,
+            "storage-server",
+            &socket,
+            &arguments,
+            START_TIMEOUT,
+        )
+        .context("starting this node's storage server")?;
         let mut client = storage::Client::connect(
             &socket,
             storage::Role::Head {

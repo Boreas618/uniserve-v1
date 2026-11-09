@@ -145,7 +145,6 @@ impl EngineControl {
         deployment: String,
         program_server: PathBuf,
     ) -> anyhow::Result<Self> {
-
         // A socket a stopped daemon left behind is replaced.
         let _ = std::fs::remove_file(socket);
         let address = if processes.starts_with("unix:") {
@@ -462,7 +461,6 @@ impl EngineControl {
 
         Ok((control, welcome.nodes))
     }
-
 
     /// The storage ledgers every node's Storage Server keeps for the deployment, one JSON report
     /// per node: `{"host": ..., "ledgers": [...], "host_storage": {...}, "transfers": [...]}`.

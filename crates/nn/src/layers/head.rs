@@ -70,7 +70,6 @@ impl ParallelLMHead {
         self.padded
     }
 
-
     /// Project `hidden` into `out`, gathering the ranks' shards.
     ///
     /// `hidden` is `[rows, hidden]` (the rows the batch asks logits for), `projected` is this rank's
@@ -172,7 +171,6 @@ impl ParallelLMHead {
         f.operate::<VocabUnpad>(&descriptor, args)
     }
 
-
     /// The descriptor the vocabulary unpad launches with, for a gathered matrix of `gathered_width`
     /// columns.
     ///
@@ -219,8 +217,6 @@ impl ParallelLMHead {
             pdl: crate::layers::launch::PDL,
         }
     }
-
-
 }
 
 /// Gather `rows` of `hidden` into a `[rows, hidden]` view, for the head.

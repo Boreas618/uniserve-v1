@@ -135,7 +135,6 @@ impl ProgramServer {
         })
     }
 
-
     /// Serves until the process ends: binds the socket, answers every client
     /// on its own thread, and drives the compile queue.
     ///

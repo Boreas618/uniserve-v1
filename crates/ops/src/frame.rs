@@ -246,7 +246,6 @@ impl Op for FramePad {
 /// The largest message an entry writes into a call structure.
 const MESSAGE: usize = 512;
 
-
 /// The reduction class a frame of `channels_per_group` channels and `pixels` pixels falls in.
 ///
 /// A class is the reduction padded to a power of two, because that is what a compiled program's

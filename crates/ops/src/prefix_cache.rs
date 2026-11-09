@@ -70,7 +70,6 @@ impl Field {
             Self::Value => "value",
         }
     }
-
 }
 
 impl fmt::Display for Field {

@@ -80,7 +80,6 @@ pub fn program_to_wire(program: &Program) -> proto::process::Program {
     }
 }
 
-
 /// One operator's program as the `Precopy` command states it (§7.3 step 2).
 pub fn kernel_to_wire(slot: &KernelKey, program: &Program) -> proto::process::KernelProgram {
     proto::process::KernelProgram {
@@ -557,7 +556,6 @@ impl Epochs {
         record.previous_policy = None;
         record.status = Status::Serving;
     }
-
 
     /// Ends a probation by putting the previous generation back: what the
     /// epoch executed before the update is what it executes again (§7.3
@@ -2648,17 +2646,15 @@ mod tests {
     #[test]
     fn the_process_table_reports_what_the_daemon_manages() {
         let epochs = Epochs::new();
-        epochs.set_processes(vec![
-            ManagedProcess {
-                group: "engine".to_owned(),
-                rank: 0,
-                pid: Some(42),
-                epoch: Some(7),
-                build: "2.0.0+0123456789abcdef".to_owned(),
-                generation: 4,
-                state: ProcessState::Parked,
-            },
-        ]);
+        epochs.set_processes(vec![ManagedProcess {
+            group: "engine".to_owned(),
+            rank: 0,
+            pid: Some(42),
+            epoch: Some(7),
+            build: "2.0.0+0123456789abcdef".to_owned(),
+            generation: 4,
+            state: ProcessState::Parked,
+        }]);
         let report = epochs.report();
         assert_eq!(report["processes"][0]["epoch"], Value::from(7));
         assert_eq!(report["processes"][0]["state"], Value::from("parked"));

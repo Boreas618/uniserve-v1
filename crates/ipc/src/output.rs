@@ -296,7 +296,6 @@ impl BatchOutput {
         self.completions.iter()
     }
 
-
     /// Validates completion and product identities for this batch.
     pub fn validate(&self) -> ValidationResult<()> {
         let mut identities = HashSet::with_capacity(self.completions.len());
