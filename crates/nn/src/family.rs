@@ -15,9 +15,15 @@
 //! deployment's mathematical partition ([`Split`], [`SequenceSplit`]) and the deployment's serving
 //! bounds ([`VideoServing`]), and it holds no runtime object: execution owns the devices, streams,
 //! memory, graphs and scheduling.
+//!
+//! ## One shape for every family
+//!
+//! Execution opens a [`Checkpoint`] and hands it to the family: `open` reads and normalizes the
+//! configuration once, from the checkpoint's own sidecars, into the opened checkpoint value that
+//! holds it; `load` builds the deployment's share from that configuration, the same checkpoint and
+//! a loader, and takes no path. Nothing between the two reads a configuration file again.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::capability::{
@@ -74,12 +80,12 @@ pub trait TextFamily: Send + Sync {
     /// The `architectures` classes this family loads.
     fn classes(&self) -> &'static [&'static str];
 
-    /// Reads the checkpoint at `checkpoint`'s configuration.
+    /// Reads and normalizes `checkpoint`'s configuration, once, from its sidecars.
     ///
     /// # Errors
     ///
     /// Fails when the configuration cannot be read or states a model this family cannot build.
-    fn open(&self, checkpoint: &Path) -> Result<Box<dyn TextCheckpoint>>;
+    fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn TextCheckpoint>>;
 }
 
 /// A causal language model checkpoint, read but not loaded.
@@ -94,14 +100,16 @@ pub trait TextCheckpoint: Send + Sync {
     /// stops generation on it.
     fn end_of_text(&self) -> Option<&'static str>;
 
-    /// Loads the model's share of the checkpoint for `placement`, its weights reached through
-    /// `loader`, its routed experts in the slots `experts` states.
+    /// Loads the model's share of `checkpoint`, the checkpoint [`TextFamily::open`] read, for
+    /// `placement`, its weights reached through `loader`, its routed experts in the slots
+    /// `experts` states.
     ///
     /// # Errors
     ///
     /// Fails when the placement does not divide the model or a weight cannot be loaded.
     fn load(
         &self,
+        checkpoint: &Checkpoint,
         loader: &mut WeightLoader<'_>,
         placement: &TextPlacement,
         experts: &ExpertOrder,
@@ -170,13 +178,16 @@ pub trait VideoFamily: Send + Sync {
     /// The diffusers pipeline classes this family loads.
     fn classes(&self) -> &'static [&'static str];
 
-    /// Reads the checkpoint whose directories `roots` hold, first root first: a checkpoint and
-    /// the base release it pins, when it pins one.
+    /// Reads and normalizes `checkpoint`'s configuration, once, from its sidecars.
+    ///
+    /// `checkpoint` may span several roots, an export first and the base release it continues
+    /// after it ([`Checkpoint::open_roots`]); each sidecar is read from the first root that holds
+    /// it.
     ///
     /// # Errors
     ///
     /// Fails when the configuration cannot be read or states a pipeline this family cannot build.
-    fn open(&self, roots: &[PathBuf]) -> Result<Box<dyn VideoCheckpoint>>;
+    fn open(&self, checkpoint: &Checkpoint) -> Result<Box<dyn VideoCheckpoint>>;
 }
 
 /// A video generation checkpoint, read but not loaded.
@@ -188,8 +199,8 @@ pub trait VideoCheckpoint: Send + Sync {
     /// The deployment component that holds the text encoder.
     fn text_encoder(&self) -> &'static str;
 
-    /// Loads the pipeline's share of `checkpoint`, the checkpoint opened over the roots
-    /// [`VideoFamily::open`] read, for `placement`, its weights reached through `loader`.
+    /// Loads the pipeline's share of `checkpoint`, the checkpoint [`VideoFamily::open`] read, for
+    /// `placement`, its weights reached through `loader`.
     ///
     /// # Errors
     ///

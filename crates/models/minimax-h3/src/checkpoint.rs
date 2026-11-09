@@ -16,10 +16,11 @@
 //! [`crate::config::Config`] is the typed architecture the layers consume.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+
+use nn::config::Fields;
+use serde_json::Value;
 
 use crate::VideoTask;
-use serde_json::{Map, Value};
 
 use crate::{Error, Result};
 
@@ -139,109 +140,87 @@ pub struct SparseContract {
 }
 
 /// One recognized checkpoint: the DiT partitions it holds with the tasks each serves, the contract
-/// an export states, and whether its weights are a packed ModelOpt manifest.
+/// an export states.
 #[derive(Clone, PartialEq, Debug)]
 pub struct Layout {
     /// Each DiT partition the checkpoint holds, with the tasks it serves in canonical order.
     pub dits: Vec<(Dit, Vec<VideoTask>)>,
     /// The FastH3 contract, for an export that states one.
     pub contract: Option<Contract>,
-    /// Whether the checkpoint holds a `modelopt_manifest.json`, whose roots name the packed
-    /// modules the weight loader reads at the checkpoint's own representation.
-    pub packed: bool,
 }
 
 impl Layout {
-    /// Classify the checkpoint at `root`.
+    /// Classify `checkpoint`.
     ///
     /// A FastH3 export is recognized by its contract; anything else by a pipeline index and the
-    /// DiT directories it names and the root holds.
-    pub fn detect(root: &Path) -> Result<Self> {
-        let contract = Contract::read(root)?;
-        let packed = root.join("modelopt_manifest.json").is_file();
-        if let Some(contract) = contract {
+    /// DiT directories it names and the checkpoint holds.
+    pub fn detect(checkpoint: &nn::Checkpoint) -> Result<Self> {
+        let root = checkpoint.root().display();
+        if let Some(contract) = Contract::read(checkpoint)? {
             let dits = vec![(contract.dit, tasks_of(contract.dit))];
             return Ok(Self {
                 dits,
                 contract: Some(contract),
-                packed,
             });
         }
 
-        let index = read_json(&root.join("model_index.json")).map_err(|error| match error {
-            Error::Io { .. } => Error::checkpoint(format!(
-                "{} holds neither fastvideo_inference.json nor model_index.json",
-                root.display()
-            )),
-            other => other,
-        })?;
-        let index = index.as_object().ok_or_else(|| {
+        let index = checkpoint.sidecar("model_index.json")?.ok_or_else(|| {
             Error::checkpoint(format!(
-                "{}/model_index.json must hold a JSON object",
-                root.display()
+                "{root} holds neither fastvideo_inference.json nor model_index.json"
             ))
         })?;
-        if let Some(class) = index.get("_class_name").and_then(Value::as_str)
+        let index = Fields::of("model_index.json", &index)?;
+        if let Some(class) = index.optional_text("_class_name")?
             && class != PIPELINE_CLASS
         {
             return Err(Error::checkpoint(format!(
-                "{} is a {class} checkpoint, not a {PIPELINE_CLASS} pipeline root; the task \
-                     exports under FL2VA/ are not pipeline roots",
-                root.display()
+                "{root} is a {class} checkpoint, not a {PIPELINE_CLASS} pipeline root; the task \
+                 exports under FL2VA/ are not pipeline roots"
             )));
         }
         let mut dits = Vec::new();
         for dit in Dit::ALL {
-            if index.contains_key(dit.directory())
-                && root.join(dit.directory()).join("config.json").is_file()
+            if index.contains(dit.directory())
+                && checkpoint
+                    .sidecar(&format!("{}/config.json", dit.directory()))?
+                    .is_some()
             {
                 dits.push((dit, tasks_of(dit)));
             }
         }
         if dits.is_empty() {
             return Err(Error::checkpoint(format!(
-                "{}/model_index.json names no DiT partition the root holds",
-                root.display()
+                "{root}/model_index.json names no DiT partition the checkpoint holds"
             )));
         }
         Ok(Self {
             dits,
             contract: None,
-            packed,
         })
     }
 }
 
 impl Contract {
-    /// Read the contract at `root`, or `None` when the checkpoint states none.
-    pub fn read(root: &Path) -> Result<Option<Self>> {
-        let path = root.join("fastvideo_inference.json");
-        if !path.is_file() {
-            return Ok(None);
+    /// Read `checkpoint`'s contract, or `None` when it states none.
+    pub fn read(checkpoint: &nn::Checkpoint) -> Result<Option<Self>> {
+        match checkpoint.sidecar("fastvideo_inference.json")? {
+            None => Ok(None),
+            Some(value) => Self::parse(&Fields::of("fastvideo_inference.json", &value)?).map(Some),
         }
-        let value = read_json(&path)?;
-        let object = value.as_object().ok_or_else(|| {
-            Error::checkpoint(format!(
-                "{}/fastvideo_inference.json must hold a JSON object",
-                root.display()
-            ))
-        })?;
-        Self::parse(object).map(Some)
     }
 
     /// Parse a contract's JSON object.
-    pub fn parse(object: &Map<String, Value>) -> Result<Self> {
+    pub fn parse(object: &Fields<'_>) -> Result<Self> {
         // A student states its task as `task` (`t2av` for text-to-video-and-audio) or, in the
         // OmniRef exports, as `model_type`; a task no partition serves is refused.
-        let stated = object
-            .get("task")
-            .or_else(|| object.get("model_type"))
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
+        let stated = match object.optional_text("task")? {
+            Some(task) => task,
+            None => object.optional_text("model_type")?.ok_or_else(|| {
                 Error::checkpoint(
                     "fastvideo_inference.json states no task or model_type".to_owned(),
                 )
-            })?;
+            })?,
+        };
         let task = match stated {
             "t2av" => VideoTask::TextToVideoAudio,
             "ref2va" => VideoTask::ReferenceToVideoAudio,
@@ -257,52 +236,34 @@ impl Contract {
             .ok_or_else(|| {
                 Error::checkpoint(format!("no DiT partition serves the task {stated:?}"))
             })?;
-        let base_revision = match object.get("base_model_revision") {
-            None | Some(Value::Null) => None,
-            Some(Value::String(value)) => Some(value.clone()),
-            Some(_) => {
-                return Err(Error::checkpoint(
-                    "fastvideo_inference.json base_model_revision must be a string".to_owned(),
-                ));
-            }
-        };
-        let video_shift = single(object, "video_scheduler_shift")?;
-        let audio_shift = single(object, "audio_scheduler_shift")?;
+        let base_revision = object
+            .optional_text("base_model_revision")?
+            .map(str::to_owned);
+        // The shifts are FP32 quantities of the schedule, read in the FP64 the sidecar writes.
+        let video_shift = object.number("video_scheduler_shift")? as f32;
+        let audio_shift = object.number("audio_scheduler_shift")? as f32;
         let schedule = Self::schedule(object)?;
         // The backend is the export's own statement. A contract that names none attends densely: the
         // sparse knobs are the distillation's, and a dense student need carry none of them.
-        let backend = match object.get("attention_backend") {
-            None | Some(Value::Null) => AttentionBackend::Dense,
-            Some(Value::String(name)) => match name.as_str() {
-                "VIDEO_SPARSE_ATTN_H3" => AttentionBackend::VideoSparseH3,
-                "DENSE" => AttentionBackend::Dense,
-                other => {
-                    return Err(Error::checkpoint(format!(
-                        "fastvideo_inference.json states the attention backend {other:?}, which this \
-                         build does not serve: it serves DENSE and VIDEO_SPARSE_ATTN_H3"
-                    )));
-                }
-            },
-            Some(_) => {
-                return Err(Error::checkpoint(
-                    "fastvideo_inference.json attention_backend must be a string".to_owned(),
-                ));
+        let backend = match object.optional_text("attention_backend")? {
+            None | Some("DENSE") => AttentionBackend::Dense,
+            Some("VIDEO_SPARSE_ATTN_H3") => AttentionBackend::VideoSparseH3,
+            Some(other) => {
+                return Err(Error::checkpoint(format!(
+                    "fastvideo_inference.json states the attention backend {other:?}, which this \
+                     build does not serve: it serves DENSE and VIDEO_SPARSE_ATTN_H3"
+                )));
             }
         };
+        // The sparsity stays in the FP64 the sidecar writes: its `ceil((1 - sparsity) * tiles)` is
+        // a tile count, and FP32 0.9 widened back is greater than 0.9, so a ten-tile segment would
+        // keep two tiles instead of one.
         let attention = match backend {
             AttentionBackend::Dense => None,
             AttentionBackend::VideoSparseH3 => Some(SparseContract {
-                tile: integer(object, "vsa_tile_size")?,
-                sparsity: number(object, "vsa_sparsity")?,
-                reference_keep: match object.get("vsa_ref_keep_rate") {
-                    None | Some(Value::Null) => None,
-                    Some(value) => Some(value.as_f64().ok_or_else(|| {
-                        Error::checkpoint(
-                            "fastvideo_inference.json vsa_ref_keep_rate must be a number"
-                                .to_owned(),
-                        )
-                    })?),
-                },
+                tile: object.index("vsa_tile_size")?,
+                sparsity: object.number("vsa_sparsity")?,
+                reference_keep: object.optional_number("vsa_ref_keep_rate")?,
             }),
         };
         Ok(Self {
@@ -318,60 +279,16 @@ impl Contract {
     }
 
     /// The schedule the contract states: a DMD ladder or a parallel-decoding block grid.
-    fn schedule(object: &Map<String, Value>) -> Result<ContractSchedule> {
+    fn schedule(object: &Fields<'_>) -> Result<ContractSchedule> {
         match (
-            object.get("dmd_denoising_steps"),
-            object.get("pdd_step_indices"),
+            object.optional_indices("dmd_denoising_steps")?,
+            object.optional_indices("pdd_step_indices")?,
         ) {
-            (Some(steps), None) => {
-                let rungs = steps
-                    .as_array()
-                    .ok_or_else(|| {
-                        Error::checkpoint(
-                            "fastvideo_inference.json dmd_denoising_steps must be a list"
-                                .to_owned(),
-                        )
-                    })?
-                    .iter()
-                    .map(|rung| {
-                        rung.as_u64()
-                            .and_then(|value| u32::try_from(value).ok())
-                            .ok_or_else(|| {
-                                Error::checkpoint(
-                                    "fastvideo_inference.json dmd_denoising_steps must hold \
-                                     integers"
-                                        .to_owned(),
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(ContractSchedule::Rungs(rungs))
-            }
-            (None, Some(indices)) => {
-                let nodes = indices
-                    .as_array()
-                    .ok_or_else(|| {
-                        Error::checkpoint(
-                            "fastvideo_inference.json pdd_step_indices must be a list".to_owned(),
-                        )
-                    })?
-                    .iter()
-                    .map(|node| {
-                        node.as_u64()
-                            .and_then(|value| u32::try_from(value).ok())
-                            .ok_or_else(|| {
-                                Error::checkpoint(
-                                    "fastvideo_inference.json pdd_step_indices must hold integers"
-                                        .to_owned(),
-                                )
-                            })
-                    })
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(ContractSchedule::Nodes {
-                    nodes,
-                    max_t: single(object, "grid_max_t")?,
-                })
-            }
+            (Some(rungs), None) => Ok(ContractSchedule::Rungs(rungs)),
+            (None, Some(nodes)) => Ok(ContractSchedule::Nodes {
+                nodes,
+                max_t: object.number("grid_max_t")? as f32,
+            }),
             (Some(_), Some(_)) => Err(Error::checkpoint(
                 "fastvideo_inference.json states both dmd_denoising_steps and pdd_step_indices"
                     .to_owned(),
@@ -410,46 +327,25 @@ pub struct Sidecars {
 }
 
 impl Sidecars {
-    /// Read every sidecar of the checkpoint at `root`.
-    ///
-    /// A sidecar the root omits is read from `base`, the snapshot of the base revision a FastH3
-    /// export pins (`Contract::base_revision`), which is how an export that holds only its DiT
-    /// partition and schedulers reaches the text encoder, processor and VAEs it uses. `base` is
-    /// `None` for a checkpoint that holds every directory, and a sidecar both roots lack is an
-    /// error naming it.
-    pub fn read(root: &Path, base: Option<&Path>, layout: &Layout) -> Result<Self> {
-        Self::read_through(
-            |relative| read_sidecar(root, base, relative),
-            |relative| optional_sidecar(root, base, relative),
-            layout,
-        )
-    }
-
-    /// Read every sidecar from the roots a loaded checkpoint holds.
+    /// Read every sidecar `layout` needs from `checkpoint`.
     ///
     /// A pipeline's components do not have to lie in one directory: an export that continues a base
     /// release holds its own DiT partition and schedulers, and the base holds the text encoder, the
-    /// processor and the VAEs, which the engine opens as one checkpoint. Each sidecar is therefore
-    /// read from the first root that holds it, the export's before the base's: a processor has no
-    /// shards, so no component of the checkpoint could answer for it.
-    pub fn read_components(checkpoint: &nn::Checkpoint, layout: &Layout) -> Result<Self> {
-        let roots = checkpoint.roots();
-        Self::read_through(
-            |relative| read_any(roots, relative),
-            |relative| optional_any(roots, relative),
-            layout,
-        )
-    }
-
-    /// The body every reader shares: eight named sidecars and each DiT partition's own.
-    fn read_through(
-        read: impl Fn(&str) -> Result<Value>,
-        optional: impl Fn(&str) -> Result<Option<Value>>,
-        layout: &Layout,
-    ) -> Result<Self> {
+    /// processor and the VAEs, which the engine opens as one checkpoint. Each sidecar is read from
+    /// the first root that holds it, the export's before the base's, and a sidecar no root holds is
+    /// an error naming it.
+    pub fn read(checkpoint: &nn::Checkpoint, layout: &Layout) -> Result<Self> {
+        let read = |relative: &str| -> Result<Value> {
+            checkpoint.sidecar(relative)?.ok_or_else(|| {
+                Error::checkpoint(format!(
+                    "no root of the checkpoint at {} holds {relative}",
+                    checkpoint.root().display()
+                ))
+            })
+        };
         let text_encoder = read("text_encoder/config.json")?;
         let processor = read("processor/preprocessor_config.json")?;
-        let video_processor = optional("processor/video_preprocessor_config.json")?;
+        let video_processor = checkpoint.sidecar("processor/video_preprocessor_config.json")?;
         let video_vae = read("vae/config.json")?;
         let audio_vae = read("audio_vae/config.json")?;
         let scheduler = read("scheduler/scheduler_config.json")?;
@@ -472,115 +368,10 @@ impl Sidecars {
     }
 }
 
-/// Read one sidecar of the checkpoint at `root`, falling back to `base` when the root omits it.
-fn read_sidecar(root: &Path, base: Option<&Path>, relative: &str) -> Result<Value> {
-    let own = root.join(relative);
-    if own.is_file() {
-        return read_json(&own);
-    }
-    if let Some(base) = base {
-        let inherited = base.join(relative);
-        if inherited.is_file() {
-            return read_json(&inherited);
-        }
-    }
-    Err(Error::checkpoint(format!(
-        "the checkpoint at {} holds no {relative}",
-        root.display()
-    )))
-}
-
-/// Read one sidecar that a checkpoint may omit, from the root or from `base`.
-fn optional_sidecar(root: &Path, base: Option<&Path>, relative: &str) -> Result<Option<Value>> {
-    let own = root.join(relative);
-    if own.is_file() {
-        return read_json(&own).map(Some);
-    }
-    match base {
-        Some(base) if base.join(relative).is_file() => read_json(&base.join(relative)).map(Some),
-        _ => Ok(None),
-    }
-}
-
-/// Read one sidecar from the first of `roots` that holds it.
-fn read_any(roots: &[PathBuf], relative: &str) -> Result<Value> {
-    for root in roots {
-        let path = root.join(relative);
-        if path.is_file() {
-            return read_json(&path);
-        }
-    }
-    Err(Error::checkpoint(format!(
-        "neither {} holds {relative}",
-        roots
-            .iter()
-            .map(|root| root.display().to_string())
-            .collect::<Vec<_>>()
-            .join(" nor ")
-    )))
-}
-
-/// Read one sidecar that a checkpoint may omit, from the first of `roots` that holds it.
-fn optional_any(roots: &[PathBuf], relative: &str) -> Result<Option<Value>> {
-    for root in roots {
-        let path = root.join(relative);
-        if path.is_file() {
-            return read_json(&path).map(Some);
-        }
-    }
-    Ok(None)
-}
-
-/// Read and parse one JSON file.
-fn read_json(path: &Path) -> Result<Value> {
-    let text = std::fs::read_to_string(path).map_err(|source| Error::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    serde_json::from_str(&text).map_err(|source| Error::Json {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
-/// A JSON object's `key` as an integer, refusing a value that is absent or not an integer.
-///
-/// The contract's fields are counts and indices, so a negative or fractional value is refused
-/// rather than truncated.
-fn integer(object: &Map<String, Value>, key: &str) -> Result<u32> {
-    object
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| {
-            Error::checkpoint(format!("fastvideo_inference.json states no integer {key}"))
-        })
-}
-
-/// A JSON object's `key` as a finite number.
-/// One number a contract states, in the FP64 the sidecar writes and the reference computes in.
-///
-/// The sparsity's `ceil((1 - sparsity) * tiles)` is a tile count, so narrowing to FP32 would
-/// change it: FP32 0.9 widened back is greater than 0.9, and a ten-tile segment then keeps two
-/// tiles instead of one.
-fn number(object: &Map<String, Value>, key: &str) -> Result<f64> {
-    object
-        .get(key)
-        .and_then(Value::as_f64)
-        .filter(|value| value.is_finite())
-        .ok_or_else(|| {
-            Error::checkpoint(format!("fastvideo_inference.json states no number {key}"))
-        })
-}
-
-/// One number a contract states as an FP32 quantity (the schedule's shifts).
-fn single(object: &Map<String, Value>, key: &str) -> Result<f32> {
-    Ok(number(object, key)? as f32)
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::path::Path;
 
     use crate::VideoTask;
 
@@ -590,6 +381,23 @@ mod tests {
         let path = root.join(relative);
         fs::create_dir_all(path.parent().expect("a sidecar has a parent")).expect("create");
         fs::write(&path, body).expect("write");
+    }
+
+    /// The checkpoint `roots` hold, first root first.
+    ///
+    /// A layout is read from sidecars alone, so each root is given one empty shard set of its own,
+    /// under a directory no sidecar names, which is what makes it a checkpoint to open.
+    fn open(roots: &[&Path]) -> nn::Checkpoint {
+        for root in roots {
+            let shards = root.join("weights");
+            fs::create_dir_all(&shards).expect("a shard directory");
+            // A safetensors file is its header's length, the header, and no payload.
+            let header = b"{}      ";
+            let mut file = (header.len() as u64).to_le_bytes().to_vec();
+            file.extend_from_slice(header);
+            fs::write(shards.join("model.safetensors"), file).expect("an empty shard");
+        }
+        nn::Checkpoint::open_roots(roots).expect("the roots open")
     }
 
     fn base_index(dits: &[&str]) -> String {
@@ -613,7 +421,7 @@ mod tests {
         );
         write(root.path(), "transformer/config.json", "{}");
         write(root.path(), "video_vae/config.json", "{}");
-        let error = Layout::detect(root.path()).expect_err("a task export is refused");
+        let error = Layout::detect(&open(&[root.path()])).expect_err("a task export is refused");
         assert!(
             matches!(error, Error::Checkpoint(ref problem)
                 if problem.contains("MiniMaxH3Pipeline") && problem.contains("pipeline root")),
@@ -629,7 +437,7 @@ mod tests {
                 r#"{{"_class_name": "{PIPELINE_CLASS}", "transformer": ["diffusers", "Model"]}}"#
             ),
         );
-        assert!(Layout::detect(root.path()).is_ok());
+        assert!(Layout::detect(&open(&[root.path()])).is_ok());
     }
 
     #[test]
@@ -647,7 +455,7 @@ mod tests {
                 "{}",
             );
         }
-        let layout = Layout::detect(root.path()).expect("a base release is recognized");
+        let layout = Layout::detect(&open(&[root.path()])).expect("a base release is recognized");
         assert_eq!(
             layout.dits,
             vec![
@@ -662,7 +470,6 @@ mod tests {
             ]
         );
         assert!(layout.contract.is_none());
-        assert!(!layout.packed);
     }
 
     #[test]
@@ -674,7 +481,7 @@ mod tests {
             &base_index(&["transformer", "transformer_ref"]),
         );
         write(root.path(), "transformer/config.json", "{}");
-        let layout = Layout::detect(root.path()).expect("the base DiT is present");
+        let layout = Layout::detect(&open(&[root.path()])).expect("the base DiT is present");
         assert_eq!(layout.dits.len(), 1);
 
         let empty = tempfile::tempdir().expect("tempdir");
@@ -683,7 +490,7 @@ mod tests {
             "model_index.json",
             &base_index(&["transformer"]),
         );
-        let error = Layout::detect(empty.path()).expect_err("no DiT is present");
+        let error = Layout::detect(&open(&[empty.path()])).expect_err("no DiT is present");
         assert!(
             matches!(error, Error::Checkpoint(ref problem) if problem.contains("no DiT partition"))
         );
@@ -692,7 +499,8 @@ mod tests {
     #[test]
     fn a_root_with_neither_contract_nor_index_is_refused_by_name() {
         let root = tempfile::tempdir().expect("tempdir");
-        let error = Layout::detect(root.path()).expect_err("an empty root is not a checkpoint");
+        let error =
+            Layout::detect(&open(&[root.path()])).expect_err("an empty root is not a checkpoint");
         assert!(
             matches!(error, Error::Checkpoint(ref problem) if problem.contains("model_index.json")),
             "{error}"
@@ -715,7 +523,7 @@ mod tests {
                 "vsa_sparsity": 0.8
             }"#,
         );
-        let layout = Layout::detect(root.path()).expect("an export is recognized");
+        let layout = Layout::detect(&open(&[root.path()])).expect("an export is recognized");
         assert_eq!(
             layout.dits,
             vec![(
@@ -761,7 +569,9 @@ mod tests {
             }"#,
         )
         .expect("json");
-        let contract = Contract::parse(dense.as_object().expect("object")).expect("a dense export");
+        let contract =
+            Contract::parse(&Fields::of("fastvideo_inference.json", &dense).expect("object"))
+                .expect("a dense export");
         assert_eq!(contract.backend, AttentionBackend::Dense);
         // The knobs are the distillation's, not the backend's: a dense student carries none.
         assert_eq!(contract.attention, None);
@@ -777,7 +587,8 @@ mod tests {
         )
         .expect("json");
         let contract =
-            Contract::parse(silent.as_object().expect("object")).expect("a base release");
+            Contract::parse(&Fields::of("fastvideo_inference.json", &silent).expect("object"))
+                .expect("a base release");
         assert_eq!(contract.backend, AttentionBackend::Dense);
         assert_eq!(contract.attention, None);
 
@@ -791,8 +602,9 @@ mod tests {
             }"#,
         )
         .expect("json");
-        let error = Contract::parse(unknown.as_object().expect("object"))
-            .expect_err("an unserved backend is refused by name");
+        let error =
+            Contract::parse(&Fields::of("fastvideo_inference.json", &unknown).expect("object"))
+                .expect_err("an unserved backend is refused by name");
         assert!(error.to_string().contains("FLEX_ATTENTION"), "{error}");
     }
 
@@ -815,7 +627,7 @@ mod tests {
                 "vsa_ref_keep_rate": 0.1
             }"#,
         );
-        let layout = Layout::detect(root.path()).expect("the export is recognized");
+        let layout = Layout::detect(&open(&[root.path()])).expect("the export is recognized");
         assert_eq!(
             layout.dits,
             vec![(Dit::Reference, vec![VideoTask::ReferenceToVideoAudio])]
@@ -852,7 +664,7 @@ mod tests {
             r#"{"task": "t2v", "video_scheduler_shift": 1.0, "audio_scheduler_shift": 1.0,
                 "dmd_denoising_steps": [10], "vsa_tile_size": 64, "vsa_sparsity": 0.0}"#,
         );
-        let error = Layout::detect(root.path()).expect_err("t2v is not served");
+        let error = Layout::detect(&open(&[root.path()])).expect_err("t2v is not served");
         assert!(
             matches!(error, Error::Checkpoint(ref problem) if problem.contains("t2v")),
             "{error}"
@@ -868,7 +680,7 @@ mod tests {
             r#"{"task": "t2av", "video_scheduler_shift": 1.0, "audio_scheduler_shift": 1.0,
                 "vsa_tile_size": 64, "vsa_sparsity": 0.0}"#,
         );
-        let error = Layout::detect(root.path()).expect_err("no schedule is stated");
+        let error = Layout::detect(&open(&[root.path()])).expect_err("no schedule is stated");
         assert!(
             matches!(error, Error::Checkpoint(ref problem) if problem.contains("dmd_denoising_steps")),
             "{error}"
@@ -897,17 +709,16 @@ mod tests {
         let layout = Layout {
             dits: vec![(Dit::Base, tasks_of(Dit::Base))],
             contract: None,
-            packed: false,
         };
-        let sidecars =
-            Sidecars::read(export.path(), Some(base.path()), &layout).expect("the base fills in");
+        let sidecars = Sidecars::read(&open(&[export.path(), base.path()]), &layout)
+            .expect("the base fills in");
         assert_eq!(sidecars.text_encoder["from"], "base");
         assert_eq!(sidecars.dits[&Dit::Base]["num_layers"], 50);
         assert!(sidecars.video_processor.is_none());
 
         // Without the base the export holds no text encoder: the reader says which sidecar it
         // looked for. `Sidecars` is not `Debug`, so the error is matched rather than unwrapped.
-        let error = match Sidecars::read(export.path(), None, &layout) {
+        let error = match Sidecars::read(&open(&[export.path()]), &layout) {
             Ok(_) => panic!("without the base the text encoder is missing"),
             Err(error) => error,
         };
@@ -915,55 +726,5 @@ mod tests {
             matches!(error, Error::Checkpoint(ref problem) if problem.contains("text_encoder/config.json")),
             "{error}"
         );
-    }
-
-    /// A scratch directory under the system temporary directory, removed when the test ends.
-    struct Scratch(PathBuf);
-
-    impl Scratch {
-        fn new(name: &str) -> Self {
-            let path =
-                std::env::temp_dir().join(format!("h3-sidecars-{}-{name}", std::process::id()));
-            std::fs::create_dir_all(&path).expect("a scratch directory");
-            Self(path)
-        }
-    }
-
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn a_sidecar_is_read_from_the_root_that_holds_it() {
-        // A checkpoint may span an export and the base release it continues, so a directory is
-        // looked up in the component that owns it and only then in the pipeline's own root.
-        let held = Scratch::new("held");
-        let pipeline = Scratch::new("pipeline");
-        std::fs::create_dir_all(held.0.join("text_encoder")).expect("a component directory");
-        std::fs::write(
-            held.0.join("text_encoder/config.json"),
-            "{\"hidden_size\": 5120}",
-        )
-        .expect("a component sidecar");
-        std::fs::write(pipeline.0.join("vae.json"), "{\"blocks\": 36}").expect("a root sidecar");
-
-        let roots = [held.0.clone(), pipeline.0.clone()];
-        let config = read_any(&roots, "text_encoder/config.json").expect("from the component");
-        assert_eq!(config["hidden_size"], 5120);
-        let config = read_any(&roots, "vae.json").expect("from the pipeline root");
-        assert_eq!(config["blocks"], 36);
-
-        // A sidecar neither root holds names both, so the error says where it looked.
-        let missing = read_any(&roots, "audio_vae/config.json").expect_err("neither holds it");
-        assert!(missing.to_string().contains("audio_vae"), "{missing}");
-        assert!(
-            missing.to_string().contains(&held.0.display().to_string()),
-            "{missing}"
-        );
-        let absent = optional_any(&roots, "processor/video_preprocessor_config.json")
-            .expect("an optional sidecar");
-        assert!(absent.is_none());
     }
 }

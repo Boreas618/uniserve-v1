@@ -6,9 +6,10 @@
 //! `clip_length` frames. The encoder is the piece `ref2va` uses to encode condition media. Both
 //! share one configuration, which the checkpoint's `vae/config.json` states.
 
-use serde_json::{Map, Value};
+use nn::config::Fields;
+use serde_json::Value;
 
-use super::field;
+use super::statistics;
 use crate::{Error, Result};
 
 /// How a convolution pads the spatial axes.
@@ -74,10 +75,9 @@ pub struct VideoVaeConfig {
 impl VideoVaeConfig {
     /// Read `vae/config.json`.
     pub fn parse(values: &Value) -> Result<Self> {
-        let values = field::object(values, "MiniMax-H3 vae/config.json")?;
-        let owner = "MiniMax-H3 video_vae";
-        let latent_channels = field::count(values, "latent_channels", owner)?;
-        let spatial_padding_mode = match field::text(values, "spatial_padding_mode", owner)? {
+        let values = Fields::of("vae/config.json", values)?;
+        let latent_channels = values.count("latent_channels")?;
+        let spatial_padding_mode = match values.text("spatial_padding_mode")? {
             "reflect" => SpatialPadding::Reflect,
             "replicate" => SpatialPadding::Replicate,
             "constant" => SpatialPadding::Constant,
@@ -88,41 +88,28 @@ impl VideoVaeConfig {
             }
         };
         let config = Self {
-            in_channels: field::count(values, "in_channels", owner)?,
-            out_channels: field::count(values, "out_channels", owner)?,
+            in_channels: values.count("in_channels")?,
+            out_channels: values.count("out_channels")?,
             latent_channels,
-            block_out_channels: field::counts(values, "block_out_channels", owner)?,
-            layers_per_block: field::count(values, "layers_per_block", owner)?,
-            spatial_downsample_factors: field::counts(values, "spatial_downsample_factors", owner)?,
-            temporal_downsample_factors: field::counts(
-                values,
-                "temporal_downsample_factors",
-                owner,
-            )?,
-            norm_num_groups: field::count(values, "norm_num_groups", owner)?,
-            norm_eps: field::positive(values, "norm_eps", owner)? as f32,
+            block_out_channels: values.counts("block_out_channels")?,
+            layers_per_block: values.count("layers_per_block")?,
+            spatial_downsample_factors: values.counts("spatial_downsample_factors")?,
+            temporal_downsample_factors: values.counts("temporal_downsample_factors")?,
+            norm_num_groups: values.count("norm_num_groups")?,
+            norm_eps: values.positive("norm_eps")? as f32,
             spatial_padding_mode,
-            decoder_num_layers: field::count(values, "decoder_num_layers", owner)?,
-            decoder_num_attention_heads: field::count(
-                values,
-                "decoder_num_attention_heads",
-                owner,
-            )?,
-            decoder_attention_head_dim: field::count(values, "decoder_attention_head_dim", owner)?,
-            decoder_num_register_tokens: field::count(
-                values,
-                "decoder_num_register_tokens",
-                owner,
-            )?,
-            decoder_ffn_mult: field::count(values, "decoder_ffn_mult", owner)?,
-            decoder_rope_theta: field::positive(values, "decoder_rope_theta", owner)? as f32,
-            decoder_rope_dim_ratio: field::positive(values, "decoder_rope_dim_ratio", owner)?
-                as f32,
-            decoder_norm_eps: field::positive(values, "decoder_norm_eps", owner)? as f32,
-            clip_length: field::count(values, "clip_length", owner)?,
-            token_drop: field::index(values, "token_drop", owner)?,
-            latents_mean: channel_statistics(values, "latents_mean", latent_channels)?,
-            latents_std: channel_statistics(values, "latents_std", latent_channels)?,
+            decoder_num_layers: values.count("decoder_num_layers")?,
+            decoder_num_attention_heads: values.count("decoder_num_attention_heads")?,
+            decoder_attention_head_dim: values.count("decoder_attention_head_dim")?,
+            decoder_num_register_tokens: values.count("decoder_num_register_tokens")?,
+            decoder_ffn_mult: values.count("decoder_ffn_mult")?,
+            decoder_rope_theta: values.positive("decoder_rope_theta")? as f32,
+            decoder_rope_dim_ratio: values.positive("decoder_rope_dim_ratio")? as f32,
+            decoder_norm_eps: values.positive("decoder_norm_eps")? as f32,
+            clip_length: values.count("clip_length")?,
+            token_drop: values.index("token_drop")?,
+            latents_mean: statistics(&values, "latents_mean", latent_channels)?,
+            latents_std: statistics(&values, "latents_std", latent_channels)?,
         };
         config.validate()?;
         Ok(config)
@@ -192,18 +179,6 @@ impl VideoVaeConfig {
     pub fn final_clip_latents(&self) -> u32 {
         self.clip_latents() - self.token_drop
     }
-}
-
-/// Read one per-channel latent statistic.
-fn channel_statistics(values: &Map<String, Value>, key: &str, channels: u32) -> Result<Vec<f32>> {
-    let numbers = field::numbers(values, key, "MiniMax-H3 video_vae")?;
-    if numbers.len() != channels as usize {
-        return Err(Error::config(format!(
-            "H3 video_vae.{key} must describe every one of {channels} latent channels, got {}",
-            numbers.len()
-        )));
-    }
-    Ok(numbers.into_iter().map(|value| value as f32).collect())
 }
 
 #[cfg(test)]

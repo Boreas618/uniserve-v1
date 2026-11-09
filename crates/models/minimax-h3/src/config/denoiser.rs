@@ -12,9 +12,8 @@
 //! from it by the schedule module, and the solver updates latents with it.
 
 use crate::VideoTask;
-use serde_json::{Map, Value};
+use nn::config::Fields;
 
-use super::field;
 use crate::encoding::Clip;
 use crate::{Error, Result};
 
@@ -291,8 +290,9 @@ impl TransformerConfig {
     ///
     /// `pdd_steps`, when the checkpoint states it, is the parallel-decoding student's interval
     /// count and so its output head count; an ordinary DiT has one output head.
-    pub fn parse(values: &Map<String, Value>, owner: &str) -> Result<Self> {
-        let output_heads = match field::optional_index(values, "pdd_steps", owner)? {
+    pub fn parse(values: &Fields<'_>) -> Result<Self> {
+        let owner = values.owner();
+        let output_heads = match values.optional_index("pdd_steps")? {
             None => 1,
             Some(0) => {
                 return Err(Error::config(format!(
@@ -310,36 +310,36 @@ impl TransformerConfig {
         };
         // The packing and the reconstruction hard-code the patch: 16x spatial and 4x temporal
         // compression applied to one latent frame at a time.
-        let patch = field::counts(values, "patch_size", owner)?;
+        let patch = values.counts("patch_size")?;
         if patch != [1, 2, 2] {
             return Err(Error::config(format!(
                 "MiniMax-H3 transformer patch_size must be [1, 2, 2], got {patch:?}"
             )));
         }
-        let norm_eps = field::positive(values, "norm_eps", owner)?;
-        let final_norm_eps = field::positive(values, "final_norm_eps", owner)?;
+        let norm_eps = values.positive("norm_eps")?;
+        let final_norm_eps = values.positive("final_norm_eps")?;
         if final_norm_eps != norm_eps {
             return Err(Error::config(
                 "MiniMax-H3 transformer final_norm_eps must equal norm_eps".to_owned(),
             ));
         }
         let config = Self {
-            hidden_size: field::count(values, "hidden_size", owner)?,
-            num_attention_heads: field::count(values, "num_attention_heads", owner)?,
-            head_dim: field::count(values, "attention_head_dim", owner)?,
-            num_hidden_layers: field::count(values, "num_layers", owner)?,
-            num_refiner_layers: field::count(values, "num_refiner_layers", owner)?,
-            intermediate_size: field::count(values, "ffn_dim", owner)?,
-            video_channels: field::count(values, "in_channels", owner)?,
-            audio_channels: field::count(values, "audio_in_channels", owner)?,
-            text_dim: field::count(values, "text_dim", owner)?,
-            frequency_dim: field::count(values, "freq_dim", owner)?,
-            time_hidden_dim: field::count(values, "time_embed_hidden_dim", owner)?,
-            time_dim: field::count(values, "time_embed_dim", owner)?,
-            rope_frequency_dim: field::count(values, "rope_freq_dim", owner)?,
-            rope_theta: field::positive(values, "rope_theta", owner)? as f32,
+            hidden_size: values.count("hidden_size")?,
+            num_attention_heads: values.count("num_attention_heads")?,
+            head_dim: values.count("attention_head_dim")?,
+            num_hidden_layers: values.count("num_layers")?,
+            num_refiner_layers: values.count("num_refiner_layers")?,
+            intermediate_size: values.count("ffn_dim")?,
+            video_channels: values.count("in_channels")?,
+            audio_channels: values.count("audio_in_channels")?,
+            text_dim: values.count("text_dim")?,
+            frequency_dim: values.count("freq_dim")?,
+            time_hidden_dim: values.count("time_embed_hidden_dim")?,
+            time_dim: values.count("time_embed_dim")?,
+            rope_frequency_dim: values.count("rope_freq_dim")?,
+            rope_theta: values.positive("rope_theta")? as f32,
             norm_eps: norm_eps as f32,
-            qk_norm_eps: field::positive(values, "qk_norm_eps", owner)? as f32,
+            qk_norm_eps: values.positive("qk_norm_eps")? as f32,
             output_heads,
         };
         // Each of the three rotary axes (time, height, width) rotates 2 * rope_frequency_dim
@@ -432,6 +432,15 @@ impl DenoiserConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::{Map, Value};
+
+    /// A transformer config parsed from `values`, as the loading boundary reads one.
+    fn parse(values: &Map<String, Value>) -> Result<TransformerConfig> {
+        TransformerConfig::parse(&Fields::of(
+            "transformer/config.json",
+            &Value::Object(values.clone()),
+        )?)
+    }
 
     fn transformer() -> Map<String, Value> {
         let values: Value = serde_json::from_str(
@@ -469,7 +478,7 @@ mod tests {
 
     #[test]
     fn a_transformer_reads_the_released_dimensions() {
-        let config = TransformerConfig::parse(&transformer(), "test transformer").expect("parsed");
+        let config = parse(&transformer()).expect("parsed");
         assert_eq!(config.hidden_size, 5376);
         assert_eq!(config.num_hidden_layers, 50);
         assert_eq!(config.head_dim, 128);
@@ -482,11 +491,11 @@ mod tests {
     fn a_transformer_refuses_an_unsupported_patch_or_a_mismatched_final_norm() {
         let mut patched = transformer();
         patched.insert("patch_size".into(), serde_json::json!([1, 4, 4]));
-        assert!(TransformerConfig::parse(&patched, "test").is_err());
+        assert!(parse(&patched).is_err());
 
         let mut norm = transformer();
         norm.insert("final_norm_eps".into(), serde_json::json!(1e-6));
-        let error = TransformerConfig::parse(&norm, "test").expect_err("mismatched epsilons");
+        let error = parse(&norm).expect_err("mismatched epsilons");
         assert!(
             matches!(error, Error::Config(ref problem) if problem.contains("final_norm_eps")),
             "{error}"
@@ -497,16 +506,16 @@ mod tests {
     fn a_transformer_refuses_rotary_dimensions_that_do_not_fit_a_head() {
         let mut values = transformer();
         values.insert("rope_freq_dim".into(), serde_json::json!(32));
-        assert!(TransformerConfig::parse(&values, "test").is_err());
+        assert!(parse(&values).is_err());
         values.insert("rope_freq_dim".into(), serde_json::json!(15));
-        assert!(TransformerConfig::parse(&values, "test").is_err());
+        assert!(parse(&values).is_err());
     }
 
     #[test]
     fn a_parallel_decoding_transformer_states_its_output_heads() {
         let mut values = transformer();
         values.insert("pdd_steps".into(), serde_json::json!(32));
-        let config = TransformerConfig::parse(&values, "test").expect("parsed");
+        let config = parse(&values).expect("parsed");
         assert_eq!(config.output_heads, 32);
     }
 
@@ -567,7 +576,7 @@ mod tests {
 
     #[test]
     fn a_denoiser_refuses_tasks_that_repeat_and_heads_that_disagree_with_its_grid() {
-        let transformer = TransformerConfig::parse(&transformer(), "test").expect("parsed");
+        let transformer = parse(&transformer()).expect("parsed");
         let error = DenoiserConfig::new(
             transformer,
             ScheduleSpec::uniform(50, shifts()).expect("grid"),

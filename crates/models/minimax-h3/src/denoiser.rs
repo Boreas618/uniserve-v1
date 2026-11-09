@@ -1464,14 +1464,6 @@ impl ConditionEncoders {
     }
 }
 
-/// A model error as the capability's.
-fn flattened(error: Error) -> nn::Error {
-    nn::Error::Weight {
-        tensor: "minimax-h3".to_owned(),
-        problem: error.to_string(),
-    }
-}
-
 /// The capability surface the worker binds: layouts, tables, and the step.
 ///
 /// Every method delegates to the inherent one, so the model's own API stays the one the tests and
@@ -1520,7 +1512,7 @@ impl nn::capability::Denoiser for Denoiser {
     /// task its own contract denies.
     fn schedule(&self, request: &VideoRequest<'_>) -> nn::Result<Vec<nn::Step>> {
         let task = crate::VideoTask::of(request);
-        schedule_for(&self.config, &self.schedule, task).map_err(flattened)
+        schedule_for(&self.config, &self.schedule, task).map_err(nn::Error::from)
     }
 
     /// The stack's width: the refiner projects the encoder's `text_dim` columns into it.
@@ -1548,12 +1540,12 @@ impl nn::capability::Denoiser for Denoiser {
         // the audio's undrawn, which is a silent disagreement rather than an absent stream.
         match (layout.audio, out.audio) {
             (Some(_), None) => {
-                return Err(flattened(Error::config(
+                return Err(nn::Error::from(Error::config(
                     "this layout draws audio noise and no audio latents were offered".to_owned(),
                 )));
             }
             (None, Some(_)) => {
-                return Err(flattened(Error::config(
+                return Err(nn::Error::from(Error::config(
                     "audio latents were offered to a layout with no audio stream".to_owned(),
                 )));
             }
@@ -1563,7 +1555,7 @@ impl nn::capability::Denoiser for Denoiser {
         // would launch a noise row the plan does not state, and `denoise` would refuse it one call
         // later with the launch already made.
         if out.video.dtype != SAMPLE_DTYPE {
-            return Err(flattened(Error::config(format!(
+            return Err(nn::Error::from(Error::config(format!(
                 "the video latents are {} and the draw writes {SAMPLE_DTYPE}",
                 out.video.dtype
             ))));
@@ -1571,7 +1563,7 @@ impl nn::capability::Denoiser for Denoiser {
         if let Some(audio) = out.audio
             && audio.dtype != SAMPLE_DTYPE
         {
-            return Err(flattened(Error::config(format!(
+            return Err(nn::Error::from(Error::config(format!(
                 "the audio latents are {} and the draw writes {SAMPLE_DTYPE}",
                 audio.dtype
             ))));
@@ -1593,7 +1585,7 @@ impl nn::capability::Denoiser for Denoiser {
             u64::from(video.width),
         ];
         if out.video.shape.dims() != &native[..] {
-            return Err(flattened(Error::config(format!(
+            return Err(nn::Error::from(Error::config(format!(
                 "the video latents are {:?} and this layout's draw is {native:?}: a sample is the \
                  native raster a step patchifies, not the rows it packs into",
                 out.video.shape.dims()
@@ -1627,7 +1619,7 @@ impl nn::capability::Denoiser for Denoiser {
         request: &VideoRequest<'_>,
     ) -> nn::Result<Vec<nn::capability::ConditionPiece>> {
         let hop = self.encoders.as_ref().map(|encoders| encoders.audio.hop());
-        pieces_of(&self.config, hop, request).map_err(flattened)
+        pieces_of(&self.config, hop, request).map_err(nn::Error::from)
     }
 
     fn draw_condition_noise(
@@ -1657,11 +1649,11 @@ impl nn::capability::Denoiser for Denoiser {
         // a parallel-decoding student.
         self.solver
             .start(f, Modality::Video, out.video)
-            .map_err(flattened)?;
+            .map_err(nn::Error::from)?;
         if let Some(audio) = out.audio {
             self.solver
                 .start(f, Modality::Audio, audio)
-                .map_err(flattened)?;
+                .map_err(nn::Error::from)?;
         }
         let _ = cond;
         Ok(())
@@ -1672,7 +1664,7 @@ impl nn::capability::Denoiser for Denoiser {
         f: &Forward,
         cond: nn::capability::Conditioning<'_>,
     ) -> nn::Result<()> {
-        Denoiser::prepare_conditioning(self, f, cond).map_err(flattened)
+        Denoiser::prepare_conditioning(self, f, cond).map_err(nn::Error::from)
     }
 
     fn denoise<'a>(
@@ -1682,7 +1674,7 @@ impl nn::capability::Denoiser for Denoiser {
         latents: nn::capability::Latents,
         cond: nn::capability::Conditioning<'a>,
     ) -> nn::Result<()> {
-        Denoiser::denoise(self, f, &step, latents, cond).map_err(flattened)
+        Denoiser::denoise(self, f, &step, latents, cond).map_err(nn::Error::from)
     }
 
     fn evaluations(&self) -> u32 {
@@ -1694,7 +1686,7 @@ impl nn::capability::Denoiser for Denoiser {
     }
 
     fn prepare_constants(&self, f: &Forward, out: &[TensorView]) -> nn::Result<()> {
-        Denoiser::prepare_constants(self, f, out).map_err(flattened)
+        Denoiser::prepare_constants(self, f, out).map_err(nn::Error::from)
     }
 
     fn layout_tables(&self, _layout: &Layout) -> nn::Result<Vec<StateTable>> {
@@ -1707,7 +1699,7 @@ impl nn::capability::Denoiser for Denoiser {
         if out.is_empty() {
             Ok(())
         } else {
-            Err(flattened(Error::config(format!(
+            Err(nn::Error::from(Error::config(format!(
                 "the H3 denoiser has no layout tables; {} buffers were offered",
                 out.len()
             ))))
@@ -1726,12 +1718,12 @@ impl nn::capability::Denoiser for Denoiser {
     ) -> nn::Result<()> {
         self.rules
             .write_state(request, layout, out)
-            .map_err(flattened)
+            .map_err(nn::Error::from)
     }
 
     fn prepare_evaluation(&self, index: u32, out: &mut [Vec<u8>]) -> nn::Result<()> {
         if index >= self.evaluations {
-            return Err(flattened(Error::config(format!(
+            return Err(nn::Error::from(Error::config(format!(
                 "evaluation {index} is outside the {} this schedule has",
                 self.evaluations
             ))));
@@ -1741,7 +1733,7 @@ impl nn::capability::Denoiser for Denoiser {
         // worker writes before each replay. A buffer offered here means the caller and
         // `constant_tables` disagree about what an evaluation owns.
         if !out.is_empty() {
-            return Err(flattened(Error::config(format!(
+            return Err(nn::Error::from(Error::config(format!(
                 "{} coefficient buffers offered, and this deployment declares none",
                 out.len()
             ))));

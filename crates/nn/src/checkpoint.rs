@@ -440,6 +440,91 @@ impl Checkpoint {
         dtypes
     }
 
+    /// The floating-point element types this checkpoint's own tensors are stored in, each once and
+    /// with the name of one tensor that carries it.
+    ///
+    /// Integer tensors (a table, an index) are not weights a precision describes and do not count.
+    /// A component answers for its own shards; a pipeline root with no shards of its own answers
+    /// none.
+    pub fn stored_types(&self) -> Vec<(DType, String)> {
+        let mut found: Vec<(DType, String)> = Vec::new();
+        for (name, location) in &self.tensors {
+            if location.dtype.is_float() && !found.iter().any(|(dtype, _)| *dtype == location.dtype)
+            {
+                found.push((location.dtype, name.clone()));
+            }
+        }
+        found
+    }
+
+    /// The one floating-point element type this checkpoint's weights are stored in.
+    ///
+    /// A loader that converts nothing keeps each weight in its stored type, so a consumer that
+    /// takes one element type for a whole component (a block whose activations follow its
+    /// weights) asks this. A checkpoint of several stored types is legal — each weight loads in its
+    /// own — and is refused here only because the caller asked for one, with every type named.
+    ///
+    /// # Errors
+    ///
+    /// When the checkpoint holds no floating-point tensor, or more than one floating-point type.
+    pub fn stored_dtype(&self) -> Result<DType> {
+        let found = self.stored_types();
+        match found.as_slice() {
+            [(dtype, _)] => Ok(*dtype),
+            [] => Err(Error::Checkpoint {
+                path: self.root.clone(),
+                problem: "holds no floating-point tensor, so no element type describes its weights"
+                    .to_owned(),
+            }),
+            several => Err(Error::Checkpoint {
+                path: self.root.clone(),
+                problem: format!(
+                    "stores {} floating-point types ({}), and the consumer that asked takes one \
+                     element type for the whole checkpoint; each weight still loads in its own \
+                     stored type, so this is a limit of that consumer, not of the export",
+                    several.len(),
+                    several
+                        .iter()
+                        .map(|(dtype, example)| format!("{dtype} (such as `{example}`)"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            }),
+        }
+    }
+
+    /// The JSON document `relative` names under the first of this checkpoint's roots that holds
+    /// it, or `None` when no root does.
+    ///
+    /// A checkpoint's configuration lives beside its shards rather than in them (`config.json`, a
+    /// pipeline's `model_index.json`, a component's `vae/config.json`, a quantization
+    /// declaration), and a checkpoint opened over an export and the base it continues reads each
+    /// document from the export first. Whether an absent document is a refusal is the reader's
+    /// question, so absence is answered as `None`.
+    ///
+    /// # Errors
+    ///
+    /// When a root holds the file and it cannot be read or is not JSON.
+    pub fn sidecar(&self, relative: &str) -> Result<Option<serde_json::Value>> {
+        for root in &self.roots {
+            let path = root.join(relative);
+            if !path.is_file() {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).map_err(|source| Error::Io {
+                path: path.clone(),
+                source,
+            })?;
+            return serde_json::from_str(&text)
+                .map(Some)
+                .map_err(|error| Error::Checkpoint {
+                    path,
+                    problem: format!("is not JSON: {error}"),
+                });
+        }
+        Ok(None)
+    }
+
     /// The checkpoint's shards.
     pub fn files(&self) -> &[CheckpointFile] {
         &self.files

@@ -87,10 +87,34 @@ pub enum Error {
     #[error("unsupported: {0}")]
     Unsupported(String),
 
-    /// A model family's own failure: its configuration, its partition or its load, with the
-    /// model's error as the source.
-    #[error(transparent)]
-    Model(Box<dyn std::error::Error + Send + Sync>),
+    /// A checkpoint configuration field that is absent, of the wrong JSON type, or outside the
+    /// values its reader accepts.
+    ///
+    /// `owner` is the document the field was read from (a sidecar's path, or the object within
+    /// it), `field` the key, and `problem` what the reader requires of it, so a refused checkpoint
+    /// says which value it would have to state.
+    #[error("{owner}{separator}{field} {problem}", separator = if .field.is_empty() { "" } else { "." })]
+    Config {
+        /// The document or object the field belongs to.
+        owner: String,
+        /// The field's key.
+        field: String,
+        /// What is wrong with the value.
+        problem: String,
+    },
+
+    /// A model family's own failure: its configuration, its partition or its load.
+    ///
+    /// Each model crate converts its error into this variant through `From`, so a refusal reaches
+    /// execution with the family that raised it and the family's own description as the source.
+    #[error("{model}: {source}")]
+    Model {
+        /// The family that raised the failure, as its crate names itself.
+        model: &'static str,
+        /// The family's own error.
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl Error {
@@ -115,6 +139,30 @@ impl Error {
             operator,
             descriptor,
             source,
+        }
+    }
+
+    /// A configuration field of `owner` that does not hold what its reader requires.
+    pub(crate) fn config(
+        owner: impl Into<String>,
+        field: impl Into<String>,
+        problem: impl Into<String>,
+    ) -> Self {
+        Self::Config {
+            owner: owner.into(),
+            field: field.into(),
+            problem: problem.into(),
+        }
+    }
+
+    /// A model family's failure, with the family's own error as the source.
+    pub fn model(
+        model: &'static str,
+        source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Self {
+        Self::Model {
+            model,
+            source: source.into(),
         }
     }
 

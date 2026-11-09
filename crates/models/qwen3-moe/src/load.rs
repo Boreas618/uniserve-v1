@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::f64::consts::PI;
-use std::path::Path;
 
 use nn::layers::{
     Attention, ENCODE_CHUNK, Embedding, Linear, Moe, Nvfp4Linear, ParallelLMHead, RmsNorm, Rotary,
@@ -40,7 +39,7 @@ use crate::model::{
     AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Projection, Qwen3Moe,
 };
 use crate::representation::{self, Adopted, Representation, Role};
-use crate::{Activation, Config, Error, Partition, Result};
+use crate::{Config, Error, Partition, Result};
 
 /// The block-scale layout the expert products read the **weights** in: the 128x4 swizzled form.
 ///
@@ -52,90 +51,58 @@ use crate::{Activation, Config, Error, Partition, Result};
 /// The shard stores the plain form, so the loader builds this table once at load.
 pub const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
 
-/// Load a checkpoint in the representation it declares about itself.
-///
-/// A calibrated export states its representation in its metadata (`quantization_config` in
-/// `config.json`, or a sibling `hf_quant_config.json`); this entry point reads that statement and
-/// dispatches, so the encoding is the checkpoint's fact rather than the caller's guess. Two
-/// refusals happen before a tensor is opened:
-///
-/// - a representation this tree cannot serve at all (an algorithm, a method, or two files that
-///   disagree) — [`Representation::read`] names it;
-/// - a parameter the declaration quantizes whose *role* this model still builds dense. Reading such
-///   a parameter as dense would read packed E2M1 as a matrix and produce a model that runs and
-///   measures nothing, so it is refused by name instead.
-///
-/// `layout` is the deployment's: the block-scale layout its programs are compiled for, which an
-/// encoded checkpoint's stored layout must equal (the expert stacks refuse a mismatch themselves).
-pub fn load_checkpoint(
-    root: &Path,
-    partition: Partition,
-    loader: &mut WeightLoader<'_>,
-    options: LoadOptions,
-    layout: ScaleLayout,
-) -> Result<Qwen3Moe> {
-    load_placed(
-        root,
-        partition,
-        loader,
-        options,
-        layout,
-        &ExpertOrder::new(),
-    )
-}
+/// The block-scale layout a calibrated ModelOpt export stores its scales in: linear, one E4M3
+/// scale per sixteen elements, row-major. The published tables are built from it at load.
+const FILE_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Linear;
 
 /// Each routed layer's logical expert ids in physical slot order, by the module path
 /// [`crate::weights::ExpertSource::module`] states. A layer this map does not name keeps the
 /// checkpoint's order.
 pub type ExpertOrder = std::collections::BTreeMap<String, Vec<u32>>;
 
-/// [`load_checkpoint`] with the routed experts in the slots `order` states (`docs/admin.md`, Expert
-/// redistribution).
+/// Load `checkpoint` in the representation `declaration` states about it, with the routed experts
+/// in the slots `order` states (`docs/admin.md`, Expert redistribution).
+///
+/// `config` and `declaration` are what the family read from the checkpoint when it opened it;
+/// nothing here reads a configuration file again. The declaration is resolved against the shards
+/// once, and the resolved statement is the one every projection is read by. A parameter the
+/// declaration quantizes whose *role* this model still builds dense is refused before a tensor is
+/// opened: reading it as dense would read packed E2M1 as a matrix.
 ///
 /// The stacks hold the experts in slot order, and one table maps every layer's logical ids to its
 /// slots. A deployment that never redistributes reads an identity table, so the graphs it captures
 /// are the graphs any later order replays over: a redistribution changes what the table's address
 /// and the stacks' addresses map, and no capture.
-pub fn load_placed(
-    root: &Path,
+pub fn load(
+    config: &Config,
+    declaration: &Representation,
+    checkpoint: &nn::Checkpoint,
     partition: Partition,
     loader: &mut WeightLoader<'_>,
     options: LoadOptions,
-    layout: ScaleLayout,
     order: &ExpertOrder,
 ) -> Result<Qwen3Moe> {
-    let representation = Representation::read(root)?;
     // The shards are the fact and the declaration is a claim about them, so a load resolves each
     // parameter's representation from what the checkpoint stores: its tensor names, which a meta
     // loader's checkpoint holds as a device loader's does.
-    let representation = representation.resolved(loader.checkpoint());
-    refuse_dense_parameters(root, &representation)?;
-    match representation {
-        Representation::Dense => load_with(
-            root,
-            partition,
-            loader,
-            LoadOptions {
-                experts_encoded: false,
-                ..options
-            },
-            Quantization::Bf16,
-            &Representation::Dense,
-            order,
-        ),
-        Representation::Nvfp4 { .. } => load_with(
-            root,
-            partition,
-            loader,
-            LoadOptions {
-                experts_encoded: true,
-                ..options
-            },
-            Quantization::Nvfp4(layout),
-            &Representation::read(root)?,
-            order,
-        ),
-    }
+    let representation = declaration.resolved(checkpoint);
+    refuse_dense_parameters(config, &representation)?;
+    let (quantization, experts_encoded) = match representation {
+        Representation::Dense => (Quantization::Bf16, false),
+        Representation::Nvfp4 { .. } => (Quantization::Nvfp4, true),
+    };
+    load_with(
+        config,
+        partition,
+        loader,
+        LoadOptions {
+            experts_encoded,
+            ..options
+        },
+        quantization,
+        &representation,
+        order,
+    )
 }
 
 /// The slot of each logical expert, from `order`, the logical expert of each slot.
@@ -167,7 +134,7 @@ fn slot_row(module: &str, order: &[u32], experts: usize) -> Result<Vec<u32>> {
 
 /// Each routed layer's logical experts in slot order, keyed by layer index, and the published slot
 /// table with the routed layers whose rows it holds, in row order (`None` without a routed layer).
-type ExpertSlots = (HashMap<usize, Vec<u32>>, Option<(nn::Weight, Vec<usize>)>);
+type ExpertSlots = (HashMap<u32, Vec<u32>>, Option<(nn::Weight, Vec<u32>)>);
 
 /// The experts of each routed layer in slot order, checked, with the table a route reads its slot
 /// from: `[routed layers, experts]` i32, row by row in layer order.
@@ -180,7 +147,7 @@ fn expert_slots(
     loader: &mut WeightLoader<'_>,
 ) -> Result<ExpertSlots> {
     let experts = config.num_experts;
-    let layers: Vec<usize> = (0..config.num_hidden_layers)
+    let layers: Vec<u32> = (0..config.num_hidden_layers)
         .filter(|&layer| config.sparse(layer))
         .collect();
     for module in order.keys() {
@@ -194,7 +161,7 @@ fn expert_slots(
         }
     }
     let mut slots = HashMap::with_capacity(layers.len());
-    let mut table = Vec::with_capacity(layers.len() * experts * 4);
+    let mut table = Vec::with_capacity(layers.len() * experts as usize * 4);
     for &layer in &layers {
         let module = format!("layers.{layer}.mlp.experts");
         let order: Vec<u32> = match order.get(&module) {
@@ -202,7 +169,7 @@ fn expert_slots(
             None => (0..as_u32(experts, "num_experts")?).collect(),
         };
         table.extend(
-            slot_row(&module, &order, experts)?
+            slot_row(&module, &order, experts as usize)?
                 .iter()
                 .flat_map(|slot| slot.to_le_bytes()),
         );
@@ -231,12 +198,11 @@ fn expert_slots(
 /// Every parameter of the model is asked, layer by layer, because an exclusion list is matched by
 /// module pattern and a pattern can exclude layer 0's projection without excluding layer 3's: one
 /// representative per role would miss exactly the checkpoints worth refusing.
-fn refuse_dense_parameters(root: &Path, representation: &Representation) -> Result<()> {
+fn refuse_dense_parameters(config: &Config, representation: &Representation) -> Result<()> {
     if !representation.is_encoded() {
         return Ok(());
     }
-    let config = Config::read(root)?;
-    for (parameter, role) in representation::parameters(&config) {
+    for (parameter, role) in representation::parameters(config) {
         let parameter = parameter.as_str();
         // A packed *projection* is served: the loader builds it as an encoder and a product, so only
         // a role this tree has no encoded form for is refused here.
@@ -259,12 +225,12 @@ fn refuse_dense_parameters(root: &Path, representation: &Representation) -> Resu
 pub enum Quantization {
     /// Dense tensors, one per expert, concatenated into a stack.
     Bf16,
-    /// Packed E2M1 with block scales in `ScaleLayout`.
-    Nvfp4(ScaleLayout),
+    /// Packed E2M1 with linear block scales, as a calibrated export stores them.
+    Nvfp4,
 }
 
 fn load_with(
-    root: &Path,
+    config: &Config,
     partition: Partition,
     loader: &mut WeightLoader<'_>,
     options: LoadOptions,
@@ -272,20 +238,15 @@ fn load_with(
     declaration: &Representation,
     order: &ExpertOrder,
 ) -> Result<Qwen3Moe> {
-    // The layout a packed projection's programs read, which is the deployment's choice and the same
-    // one the expert stacks use.
-    let layout = match quantization {
-        Quantization::Nvfp4(layout) => layout,
-        // A dense deployment builds no packed projection, so the value is unreachable there; it is
-        // the checkpoint's own arrangement, which is what every loader call takes.
-        Quantization::Bf16 => ops::fp4::ScaleLayout::Linear,
-    };
-    let config = Config::read(root)?;
-    partition.validate(&config)?;
+    // The arrangement the checkpoint stores its block scales in, which every packed read takes as
+    // the file's; the published arrangement is each product's own.
+    let layout = FILE_SCALE_LAYOUT;
+    partition.validate(config)?;
+    let config = config.clone();
     // The model reports this option to execution as its experts' encoding, so a deployment that
     // names the wrong one would be served as the other. The checkpoint decides it, and the loader
     // is where the two meet.
-    let encoded = matches!(quantization, Quantization::Nvfp4(_))
+    let encoded = matches!(quantization, Quantization::Nvfp4)
         && config.num_experts > 0
         && config.has_sparse_layers();
     if options.experts_encoded != encoded {
@@ -369,7 +330,7 @@ fn load_with(
     let _ = head_dim;
 
     let (slots, slot_table) = expert_slots(&config, order, loader)?;
-    let experts_source: HashMap<usize, crate::weights::ExpertSource> =
+    let experts_source: HashMap<u32, crate::weights::ExpertSource> =
         crate::weights::expert_sources(&config)
             .into_iter()
             .filter_map(|source| {
@@ -384,7 +345,7 @@ fn load_with(
             })
             .collect();
 
-    let mut layers = Vec::with_capacity(config.num_hidden_layers);
+    let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
     for layer in 0..config.num_hidden_layers {
         let parameter = format!("layers.{layer}");
         let input_norm = RmsNorm::new(
@@ -547,13 +508,17 @@ fn load_with(
 }
 
 /// The activation's width of a `[rows, columns]` shard of a row-major matrix.
-fn as_u64(count: usize, what: &str) -> Result<u64> {
-    u64::try_from(count).map_err(|_| Error::Config(format!("{what} does not fit an element count")))
+fn as_u64(count: impl TryInto<u64>, what: &str) -> Result<u64> {
+    count
+        .try_into()
+        .map_err(|_| Error::Config(format!("{what} does not fit an element count")))
 }
 
 /// A count as a `u32` extent.
-fn as_u32(count: usize, what: &str) -> Result<u32> {
-    u32::try_from(count).map_err(|_| Error::Config(format!("{what} exceeds u32::MAX")))
+fn as_u32(count: impl TryInto<u32>, what: &str) -> Result<u32> {
+    count
+        .try_into()
+        .map_err(|_| Error::Config(format!("{what} exceeds u32::MAX")))
 }
 
 /// The checkpoint tensor of every model parameter, by the model's path.
@@ -606,7 +571,7 @@ fn projection(
     layout: ScaleLayout,
 ) -> Result<Projection> {
     let weight = format!("{parameter}.weight");
-    match declaration.adopts(&weight, Role::Projection)? {
+    match declaration.adopts(checkpoint_name(sources, &weight)?, Role::Projection)? {
         Adopted::Source => Ok(Projection::Dense(dense_projection(
             loader, sources, parameter, partition, rows, columns, bias,
         )?)),
@@ -818,7 +783,7 @@ fn output_projection(
     layout: ScaleLayout,
 ) -> Result<Projection> {
     let weight = format!("{parameter}.weight");
-    match declaration.adopts(&weight, Role::Projection)? {
+    match declaration.adopts(checkpoint_name(sources, &weight)?, Role::Projection)? {
         Adopted::Source => Ok(Projection::Dense(dense_output_projection(
             loader, sources, parameter, partition, hidden, reduction, bias,
         )?)),
@@ -882,6 +847,7 @@ fn expert_block(
 ) -> Result<Moe> {
     let experts = as_u64(config.num_experts, "num_experts")?;
     let range = partition.expert_range(config);
+    let range = range.start as usize..range.end as usize;
     let local = as_u64(range.len(), "the local experts")?;
     if local == 0 {
         return Err(Error::Config(format!(
@@ -917,7 +883,7 @@ fn expert_block(
     // The encoded checkpoint names the same three tensors per projection and carries three fields
     // each; the dense path names one tensor per projection. Both are fused expert-major, in the
     // reading order the layouts name: up before gate.
-    if let Quantization::Nvfp4(layout) = quantization {
+    if let Quantization::Nvfp4 = quantization {
         // An encoded block over a group runs in the exchange's one fused launch, which reads its
         // own arrangement of the same bytes: each gate block before its up block, and the block
         // scales in the swizzled table.
@@ -1000,15 +966,6 @@ fn expert_block(
             .map_err(Error::from);
         }
         let vocabulary = as_u32(config.num_experts, "num_experts")?;
-        // The shard's block scales are the export's own — linear, one per sixteen elements — and a
-        // product that reads a swizzled table has it built once here. A checkpoint that already
-        // holds a converted table is refused rather than swizzled a second time.
-        if layout != ScaleLayout::Linear {
-            return Err(Error::Unsupported(format!(
-                "{parameter} declares {layout} block scales, and this loader builds the published \
-                 table from a linear shard: a converted checkpoint needs its own reader"
-            )));
-        }
         let up_gate: QuantizedStack = loader
             .nvfp4_stack_in_slots(
                 &format!("{parameter}.mlp.experts.up_gate"),
@@ -1230,11 +1187,8 @@ fn dense_block(
 }
 
 /// The operator's name for the checkpoint's activation.
-pub(crate) fn activation(activation: Activation) -> Result<MoeActivation> {
-    match activation {
-        Activation::Silu => Ok(MoeActivation::Silu),
-        Activation::GeluTanh => Ok(MoeActivation::GeluTanh),
-    }
+pub(crate) fn activation(activation: ops::activation::Activation) -> Result<MoeActivation> {
+    MoeActivation::try_from(activation).map_err(|error| Error::Nn(error.into()))
 }
 
 /// The rotary frequency table and the multiplier the recipe applies to the attention scores.
@@ -1254,7 +1208,7 @@ pub(crate) fn activation(activation: Activation) -> Result<MoeActivation> {
 /// and sine factors by it, so a product of two rotated vectors carries the
 /// square.
 pub fn rotary_recipe(config: &Config) -> Result<(Vec<f32>, f32)> {
-    let dim = config.head_dim;
+    let dim = config.head_dim as usize;
     if dim < 2 || !dim.is_multiple_of(2) {
         return Err(Error::Config(format!(
             "a rotary head of {dim} elements has no rotation pair"
@@ -1369,6 +1323,8 @@ fn frequency_bytes(frequencies: &[f32]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     #[test]
     fn a_slot_row_inverts_the_order_it_is_read_from() {
         // Slot 0 holds expert 2, so a route to expert 2 reads slot 0.
@@ -1403,7 +1359,7 @@ mod tests {
             num_attention_heads: 32,
             num_key_value_heads: 4,
             head_dim: 128,
-            hidden_act: Activation::Silu,
+            hidden_act: ops::activation::Activation::Silu,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
             rope_scaling: None,

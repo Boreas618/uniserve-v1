@@ -21,7 +21,8 @@ impl ModelRunner {
                 ..ParallelShape::default()
             });
         };
-        let (sequence, tensor) = self.video_split(&*self.open_video()?)?;
+        let opened = self.open_video_checkpoint()?;
+        let (sequence, tensor) = self.video_split(&*self.open_video_family(&opened)?)?;
         Ok(ParallelShape {
             sequence: sequence.split.size as usize,
             sequence_rank: sequence.split.rank as usize,
@@ -30,17 +31,26 @@ impl ModelRunner {
         })
     }
 
-    /// This rank's video checkpoint, read over its roots: the checkpoint the launch names and the
+    /// This rank's video checkpoint, opened over its roots: the checkpoint the launch names and the
     /// base release it continues.
-    pub(super) fn open_video(&self) -> Result<Box<dyn VideoCheckpoint>> {
-        let Family::Video(family) = self.family else {
-            bail!("a causal language model holds no video pipeline");
-        };
+    pub(super) fn open_video_checkpoint(&self) -> Result<nn::Checkpoint> {
         let mut roots = vec![self.checkpoint().to_path_buf()];
         if let Some(base) = &self.engine_config().model.base {
             roots.push(PathBuf::from(base));
         }
-        Ok(family.open(&roots)?)
+        let roots: Vec<&std::path::Path> = roots.iter().map(PathBuf::as_path).collect();
+        Ok(nn::Checkpoint::open_roots(&roots)?)
+    }
+
+    /// The video family's reading of `checkpoint`, which [`Self::open_video_checkpoint`] opened.
+    pub(super) fn open_video_family(
+        &self,
+        checkpoint: &nn::Checkpoint,
+    ) -> Result<Box<dyn VideoCheckpoint>> {
+        let Family::Video(family) = self.family else {
+            bail!("a causal language model holds no video pipeline");
+        };
+        Ok(family.open(checkpoint)?)
     }
 
     /// The denoiser's sequence split and the text encoder's tensor split of this rank, as the

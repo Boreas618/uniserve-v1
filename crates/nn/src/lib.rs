@@ -48,6 +48,7 @@
 
 pub mod capability;
 pub mod checkpoint;
+pub mod config;
 pub mod error;
 pub mod exchange;
 pub mod family;

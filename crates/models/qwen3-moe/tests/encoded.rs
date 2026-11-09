@@ -514,28 +514,37 @@ fn packed_model_shard() -> TempDir {
     dir
 }
 
+/// The checkpoint at `dir`, opened and loaded through the family as execution loads it, at rank
+/// `rank` of a tensor split of `ranks`, its weights published to `store`.
+fn load_model(
+    dir: &Path,
+    store: &mut Retaining,
+    rank: u32,
+    ranks: u32,
+) -> nn::Result<std::sync::Arc<dyn nn::family::TextModel>> {
+    let nn::family::Family::Text(family) = qwen3_moe::family::FAMILY else {
+        panic!("Qwen3-MoE is a text family");
+    };
+    let checkpoint = Checkpoint::open(dir)?;
+    let opened = family.open(&checkpoint)?;
+    let mut loader = WeightLoader::new(&checkpoint, store, None, None);
+    let placement = nn::family::TextPlacement {
+        tensor: nn::family::Split { size: ranks, rank },
+        experts: nn::family::Split::WHOLE,
+    };
+    opened.load(
+        &checkpoint,
+        &mut loader,
+        &placement,
+        &nn::family::ExpertOrder::new(),
+    )
+}
+
 #[test]
 fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_dense() {
     let dir = packed_model_shard();
-    let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
     let mut store = Retaining::default();
-    let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-    let partition = qwen3_moe::Partition::new(
-        &qwen3_moe::Config::read(dir.path()).expect("the config"),
-        1,
-        0,
-        1,
-        0,
-    )
-    .expect("one rank");
-    let model = qwen3_moe::load::load_checkpoint(
-        dir.path(),
-        partition,
-        &mut loader,
-        qwen3_moe::LoadOptions::default(),
-        ops::fp4::ScaleLayout::Linear,
-    )
-    .expect("the calibrated checkpoint loads");
+    let model = load_model(dir.path(), &mut store, 0, 1).expect("the calibrated checkpoint loads");
 
     // The forward launches both: the projections' product once per row class, and the experts'
     // products, which carry no row count. One row and two hundred lie in two classes
@@ -543,7 +552,7 @@ fn a_whole_calibrated_checkpoint_loads_its_projections_packed_and_its_router_den
     // many keys.
     let mut keys = std::collections::BTreeSet::new();
     for tokens in [1, 200] {
-        keys.extend(recorded_forward(&model, tokens));
+        keys.extend(recorded_forward(&*model, tokens));
     }
     let named: Vec<&str> = keys.iter().map(|(operator, _)| operator.as_str()).collect();
     // `q` is `[2 · head_dim, hidden]`, `o` is `[hidden, 2 · head_dim]`, and `k` and `v` are one
@@ -580,13 +589,13 @@ impl ops::capture::Sink for Launches {
 /// Every view addresses a counting arena that no memory backs: a recording forward reads nothing
 /// and launches nothing, and reports each launch's program to the capture sink.
 fn recorded_forward(
-    model: &qwen3_moe::Qwen3Moe,
+    model: &dyn nn::family::TextModel,
     tokens: u64,
 ) -> std::collections::BTreeSet<(String, String)> {
     use nn::PhaseKind;
-    use nn::capability::{CausalLm, KvGroup, KvPlanes, KvView, TokenBatch};
+    use nn::capability::{KvGroup, KvPlanes, KvView, TokenBatch};
 
-    let config = model.config();
+    let cache = model.cache();
     let arena = nn::Arena::counting();
     let f = nn::Forward::recording(&arena);
     let tensor = |dtype: DType, dims: &[u64]| {
@@ -617,10 +626,10 @@ fn recorded_forward(
     let planes_shape = [
         pages,
         u64::from(page_size),
-        config.num_key_value_heads as u64,
-        config.head_dim as u64,
+        u64::from(cache.kv_heads),
+        u64::from(cache.head_dim),
     ];
-    let layers: Vec<KvPlanes> = (0..config.num_hidden_layers)
+    let layers: Vec<KvPlanes> = (0..cache.layers)
         .map(|_| KvPlanes {
             key: tensor(DType::BF16, &planes_shape),
             value: tensor(DType::BF16, &planes_shape),
@@ -636,7 +645,7 @@ fn recorded_forward(
         dtype: DType::BF16,
         layers: &layers,
     }];
-    let hidden = tensor(DType::BF16, &[tokens, config.hidden_size as u64]);
+    let hidden = tensor(DType::BF16, &[tokens, u64::from(model.hidden())]);
 
     let mut launches = Launches::default();
     ops::capture::set_sink(Some(&mut launches));
@@ -672,21 +681,11 @@ fn published_scales(store: &Retaining, projection: &str) -> Vec<u8> {
 #[test]
 fn a_rank_one_packed_projection_reads_its_own_columns() {
     let dir = packed_model_shard();
-    let config = qwen3_moe::Config::read(dir.path()).expect("the fixture config");
     let mut tables = Vec::new();
-    for rank in [0_usize, 1] {
-        let checkpoint = Checkpoint::open(dir.path()).expect("the shard opens");
+    for rank in [0_u32, 1] {
         let mut store = Retaining::default();
-        let mut loader = WeightLoader::new(&checkpoint, &mut store, None, None);
-        let partition = qwen3_moe::Partition::new(&config, 2, rank, 1, 0).expect("a rank of two");
-        qwen3_moe::load::load_checkpoint(
-            dir.path(),
-            partition,
-            &mut loader,
-            qwen3_moe::LoadOptions::default(),
-            ops::fp4::ScaleLayout::Linear,
-        )
-        .expect("the calibrated checkpoint loads at this rank");
+        load_model(dir.path(), &mut store, rank, 2)
+            .expect("the calibrated checkpoint loads at this rank");
         // `o_proj` is row-parallel: the file is `[hidden, query]` and this rank takes `query / 2`
         // columns, so its scales are one block of every two in each row.
         tables.push(published_scales(&store, "o_proj"));

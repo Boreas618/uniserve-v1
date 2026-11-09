@@ -26,12 +26,12 @@
 mod audio_vae;
 mod canvas;
 mod denoiser;
-mod field;
 mod text;
 mod video_vae;
 
 use std::collections::BTreeMap;
-use std::path::Path;
+
+use nn::config::Fields;
 
 use crate::VideoTask;
 
@@ -43,7 +43,7 @@ pub use denoiser::{
     AttentionKind, DenoiserConfig, SPARSE_TILE_ROWS, ScheduleGrid, ScheduleSpec, Shifts,
     TransformerConfig,
 };
-pub use text::{PixelConfig, RETAINED_LAYERS, TextEncoderConfig, VisionActivation, VisionConfig};
+pub use text::{PixelConfig, RETAINED_LAYERS, TextEncoderConfig, VisionConfig};
 pub use video_vae::{SpatialPadding, VideoVaeConfig};
 
 use crate::checkpoint::{ContractSchedule, Dit, Layout, Sidecars};
@@ -111,14 +111,14 @@ pub struct Config {
 }
 
 impl Config {
-    /// Read the checkpoint at `root`.
+    /// Read and normalize the configuration of `checkpoint`, once.
     ///
-    /// `base` is the snapshot of the base revision a FastH3 export pins, from which the
-    /// directories the export omits are read ([`crate::checkpoint::Contract::base_revision`]);
-    /// it is `None` for a checkpoint that holds every directory.
-    pub fn read(root: &Path, base: Option<&Path>) -> Result<Self> {
-        let layout = Layout::detect(root)?;
-        let sidecars = Sidecars::read(root, base, &layout)?;
+    /// A FastH3 export is opened together with the base revision it pins
+    /// ([`crate::checkpoint::Contract::base_revision`]), and every sidecar the export omits is read
+    /// from the base: the checkpoint answers each document from the first root that holds it.
+    pub fn open(checkpoint: &nn::Checkpoint) -> Result<Self> {
+        let layout = Layout::detect(checkpoint)?;
+        let sidecars = Sidecars::read(checkpoint, &layout)?;
         Self::normalize(&layout, &sidecars)
     }
 
@@ -165,10 +165,10 @@ impl Config {
                     dit.directory()
                 ))
             })?;
-            let transformer = TransformerConfig::parse(
-                field::object(values, &format!("{}/config.json", dit.directory()))?,
-                &format!("{}/config.json", dit.directory()),
-            )?;
+            let transformer = TransformerConfig::parse(&Fields::of(
+                format!("{}/config.json", dit.directory()),
+                values,
+            )?)?;
             let (schedule, attention) = match &layout.contract {
                 None => (
                     ScheduleSpec::uniform(UNIFORM_GRID_POINTS, shifts)?,
@@ -316,8 +316,16 @@ impl Config {
 
 /// The noise level shift a scheduler sidecar states.
 fn shift(sidecar: &serde_json::Value, path: &str) -> Result<f32> {
-    let values = field::object(sidecar, path)?;
-    Ok(field::positive(values, "shift", path)? as f32)
+    Ok(Fields::of(path, sidecar)?.positive("shift")? as f32)
+}
+
+/// One per-channel latent statistic of a VAE sidecar: a number for every latent channel.
+fn statistics(values: &Fields<'_>, key: &str, channels: u32) -> Result<Vec<f32>> {
+    Ok(values
+        .fixed_numbers(key, channels as usize)?
+        .into_iter()
+        .map(|value| value as f32)
+        .collect())
 }
 
 /// The released checkpoint's sidecars, as the tests of this crate use them.
@@ -473,7 +481,6 @@ pub(crate) mod tests_support {
                 (Dit::Reference, vec![VideoTask::ReferenceToVideoAudio]),
             ],
             contract: None,
-            packed: false,
         }
     }
 
@@ -571,7 +578,6 @@ mod tests {
                 ],
             )],
             contract: Some(dmd_contract()),
-            packed: true,
         };
         let mut sidecars = sidecars(&layout);
         sidecars.scheduler = json(r#"{"shift": 10.0}"#);
@@ -602,7 +608,6 @@ mod tests {
                 ],
             )],
             contract: Some(contract),
-            packed: true,
         };
         let mut sidecars = sidecars(&layout);
         sidecars.scheduler = json(r#"{"shift": 10.0}"#);
@@ -671,7 +676,6 @@ mod tests {
         let layout = Layout {
             dits: vec![(Dit::Base, vec![VideoTask::TextToVideoAudio])],
             contract: Some(dmd_contract()),
-            packed: false,
         };
         // The sidecars state the base release's video shift of 12, not the student's 10.
         let error = Config::normalize(&layout, &sidecars(&layout)).expect_err("shift mismatch");

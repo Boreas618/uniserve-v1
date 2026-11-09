@@ -8,7 +8,7 @@
 //! plans requests against.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use nn::capability::{Decoder, Encoder, ImageShape, MediaFormat, WarmPrompt, WarmRequest};
@@ -52,29 +52,22 @@ impl VideoFamily for MinimaxH3Family {
         &["MiniMaxH3ModularPipeline"]
     }
 
-    fn open(&self, roots: &[PathBuf]) -> nn::Result<Box<dyn VideoCheckpoint>> {
-        let (root, base) = match roots {
-            [root] => (root, None),
-            [root, base] => (root, Some(base.as_path())),
-            _ => {
-                return Err(nn::Error::Unsupported(format!(
-                    "a MiniMax-H3 checkpoint is one directory and the base release it pins, not \
-                     {} directories",
-                    roots.len()
-                )));
-            }
-        };
-        let config = Config::read(root, base).map_err(model_error)?;
-        Ok(Box::new(H3Checkpoint {
-            root: root.clone(),
-            config,
-        }))
+    fn open(&self, checkpoint: &Checkpoint) -> nn::Result<Box<dyn VideoCheckpoint>> {
+        // A checkpoint is one directory, or an export and the base release it pins.
+        if checkpoint.roots().len() > 2 {
+            return Err(nn::Error::Unsupported(format!(
+                "a MiniMax-H3 checkpoint is one directory and the base release it pins, not {} \
+                 directories",
+                checkpoint.roots().len()
+            )));
+        }
+        let config = Config::open(checkpoint)?;
+        Ok(Box::new(H3Checkpoint { config }))
     }
 }
 
-/// A MiniMax-H3 checkpoint: its root and the configuration read from it and its base.
+/// A MiniMax-H3 checkpoint: the configuration read from it and its base, once.
 struct H3Checkpoint {
-    root: PathBuf,
     config: Config,
 }
 
@@ -99,7 +92,11 @@ impl VideoCheckpoint for H3Checkpoint {
         // **The partition serves the tasks of the network the deployment places.** One partition
         // carries one network's block set and condition capacity, so a deployment places one of
         // the release's two networks.
-        let tasks = served_tasks(&config.tasks(), placement.components.as_ref(), &self.root)?;
+        let tasks = served_tasks(
+            &config.tasks(),
+            placement.components.as_ref(),
+            checkpoint.root(),
+        )?;
 
         // **The prompt capacity is the deployment's, and the denoiser's packed prefix holds it.**
         // A layout reserves one row per prompt token, so the text capacity the model is built with
@@ -121,10 +118,9 @@ impl VideoCheckpoint for H3Checkpoint {
             placement.tensor.size as usize,
             placement.tensor.rank as usize,
             sequence.split.rank as usize,
-        )
-        .map_err(model_error)?;
+        )?;
         for task in &tasks[1..] {
-            partition = partition.also_serving(config, *task).map_err(model_error)?;
+            partition = partition.also_serving(config, *task)?;
         }
 
         // The condition capacity is the deployment's when it states one: the rows a request's
@@ -144,13 +140,13 @@ impl VideoCheckpoint for H3Checkpoint {
             .map(|canvas| (canvas.width, canvas.height))
             .collect::<Vec<_>>();
         let model = crate::load(
+            config,
             checkpoint,
             partition,
             Some(placement.dtype),
             &canvases,
             loader,
-        )
-        .map_err(model_error)?;
+        )?;
 
         // **One number, checked where both halves meet.** A model built for fewer text rows than
         // the deployment's longest prompt would refuse every longer prompt at the packed prefix,
@@ -259,8 +255,7 @@ impl VideoModel for H3Pipeline {
     }
 
     fn format(&self) -> nn::Result<Arc<dyn MediaFormat>> {
-        let format =
-            crate::encoding::ConditionFormat::new(&self.config, self.dtype).map_err(model_error)?;
+        let format = crate::encoding::ConditionFormat::new(&self.config, self.dtype)?;
         Ok(Arc::new(format))
     }
 
@@ -700,13 +695,13 @@ fn describe(pipeline: &H3Pipeline, serving: &VideoServing) -> nn::Result<Descrip
         .filter(|task| pipeline.tasks.contains(task))
         .collect();
 
-    let steps = denoiser.schedule().num_steps().map_err(model_error)?;
+    let steps = denoiser.schedule().num_steps()?;
     let shifts = &denoiser.config().schedule.shifts;
 
     // The timeline rule: the fewest frames are one whole clip and the tail, and the tail's latent
     // frames are what the timeline holds past the clip's.
     let min_frames = CLIP_FRAMES + CLIP_LATENTS;
-    let latent_frames = crate::packing::video_latent_frames(min_frames).map_err(model_error)?;
+    let latent_frames = crate::packing::video_latent_frames(min_frames)?;
     let frames = FrameClips {
         min_frames,
         clip_frames: CLIP_FRAMES,
@@ -760,11 +755,6 @@ fn describe(pipeline: &H3Pipeline, serving: &VideoServing) -> nn::Result<Descrip
             nn::Error::Unsupported(format!("encoding the description: {error}"))
         })?,
     })
-}
-
-/// The crate's error as the family contract states it.
-fn model_error(error: crate::Error) -> nn::Error {
-    nn::Error::Model(Box::new(error))
 }
 
 #[cfg(test)]

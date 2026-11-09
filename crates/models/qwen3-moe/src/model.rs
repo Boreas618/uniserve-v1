@@ -281,8 +281,8 @@ fn prefix_rows(buffer: TensorView, rows: u64, width: u64) -> TensorView {
 }
 
 /// A configuration count as an element count.
-fn element(count: usize, what: &str) -> Result<u64> {
-    u64::try_from(count).map_err(|_| Error::Config(format!("{what} does not fit an element count")))
+fn element(count: u32, _what: &str) -> Result<u64> {
+    Ok(u64::from(count))
 }
 
 /// One forward's activation views, reserved in a fixed order.
@@ -372,7 +372,7 @@ impl Qwen3Moe {
         head: ParallelLMHead,
         options: LoadOptions,
     ) -> Result<Self> {
-        if layers.len() != config.num_hidden_layers {
+        if layers.len() != config.num_hidden_layers as usize {
             return Err(Error::Config(format!(
                 "{} layers for {} blocks",
                 layers.len(),
@@ -712,10 +712,7 @@ impl CausalLm for Qwen3Moe {
     }
 
     fn embed_input_ids(&self, f: &Forward, ids: TensorView, out: TensorView) -> nn::Result<()> {
-        self.embedding
-            .forward(f, ids, out)
-            .map_err(Error::from)
-            .map_err(capability)
+        self.embedding.forward(f, ids, out)
     }
 
     fn forward(
@@ -726,19 +723,19 @@ impl CausalLm for Qwen3Moe {
         hidden: TensorView,
     ) -> nn::Result<()> {
         let tokens = batch.tokens();
-        let extents = self.extents(tokens).map_err(capability)?;
+        let extents = self.extents(tokens).map_err(nn::Error::from)?;
         if hidden.shape.rank() != 2
             || hidden.shape.dim(0) != tokens
             || hidden.shape.dim(1) != extents.hidden
         {
-            return Err(capability(Error::Config(format!(
+            return Err(nn::Error::from(Error::Config(format!(
                 "hidden is {:?}, [{tokens}, {}] expected",
                 hidden.shape.dims(),
                 extents.hidden
             ))));
         }
         if hidden.dtype != self.dtype {
-            return Err(capability(Error::Config(format!(
+            return Err(nn::Error::from(Error::Config(format!(
                 "hidden is {}, the model is {}",
                 hidden.dtype, self.dtype
             ))));
@@ -747,7 +744,7 @@ impl CausalLm for Qwen3Moe {
         f.fenced(TRANSFORMER, format_args!("model"), || {
             let (input, residual) = self
                 .layers(f, batch, cache, hidden, &extents)
-                .map_err(capability)?;
+                .map_err(nn::Error::from)?;
 
             // The output norm: the last layer's output added into the residual stream and
             // normalized. The sum lands back in the stream, which is the last thing this forward
@@ -755,19 +752,17 @@ impl CausalLm for Qwen3Moe {
             // alias is safe.
             self.norm
                 .forward_with_residual(f, input, residual, residual, hidden)
-                .map_err(Error::from)
-                .map_err(capability)
         })
     }
 
     fn logits(&self, f: &Forward, hidden: TensorView, out: TensorView) -> nn::Result<()> {
         let rows = hidden.rows();
-        let extents = self.extents(rows).map_err(capability)?;
+        let extents = self.extents(rows).map_err(nn::Error::from)?;
         // The extents' two widths are the model's, not the launch's: a loaded head whose shard width
         // disagrees with the partition would otherwise be given a buffer of the wrong width and
         // write past it.
         if extents.vocabulary != u64::from(self.head.padded()) {
-            return Err(capability(Error::Config(format!(
+            return Err(nn::Error::from(Error::Config(format!(
                 "the forward reserves {} columns for the vocabulary shard, the head projects {}",
                 extents.vocabulary,
                 self.head.padded()
@@ -775,37 +770,16 @@ impl CausalLm for Qwen3Moe {
         }
         let projected = f
             .arena
-            .tensor(self.dtype, Shape::new(&[rows, extents.vocabulary]))
-            .map_err(Error::from)
-            .map_err(capability)?;
+            .tensor(self.dtype, Shape::new(&[rows, extents.vocabulary]))?;
         let gathered = if extents.gathered == 0 {
             None
         } else {
             Some(
                 f.arena
-                    .tensor(self.dtype, Shape::new(&[rows, extents.gathered]))
-                    .map_err(Error::from)
-                    .map_err(capability)?,
+                    .tensor(self.dtype, Shape::new(&[rows, extents.gathered]))?,
             )
         };
-        self.head
-            .forward(f, hidden, projected, gathered, out)
-            .map_err(Error::from)
-            .map_err(capability)
-    }
-}
-
-/// A model refusal as the capability trait's error.
-///
-/// The layer calls already answer [`nn::Error`]; this crate's own refusals (a projection that no
-/// head divides, a hidden state of the wrong type) are shape disagreements of the model.
-fn capability(error: Error) -> nn::Error {
-    match error {
-        Error::Nn(error) => error,
-        other => nn::Error::Shape {
-            owner: "Qwen3Moe",
-            problem: other.to_string(),
-        },
+        self.head.forward(f, hidden, projected, gathered, out)
     }
 }
 

@@ -50,6 +50,18 @@ fn directory(declaration: &str) -> PathBuf {
     dir
 }
 
+/// The architecture `dir`'s `config.json` states, read as the family reads it.
+fn read_config(dir: &Path) -> Config {
+    let text = std::fs::read_to_string(dir.join("config.json"))
+        .unwrap_or_else(|error| panic!("the fixture config: {error}"));
+    let value: serde_json::Value =
+        serde_json::from_str(&text).unwrap_or_else(|error| panic!("the fixture is JSON: {error}"));
+    nn::config::Fields::of("config.json", &value)
+        .map_err(qwen3_moe::Error::from)
+        .and_then(|fields| Config::parse(&fields))
+        .unwrap_or_else(|error| panic!("the architecture: {error}"))
+}
+
 fn write_config(dir: &Path, declaration: &str) {
     std::fs::write(dir.join("config.json"), config_json(declaration))
         .unwrap_or_else(|error| panic!("the fixture config: {error}"));
@@ -75,7 +87,7 @@ const CALIBRATED: &str = r#""quantization_config": {
 #[test]
 fn a_calibrated_checkpoint_is_packed_exactly_at_its_linear_projections() {
     let dir = directory(CALIBRATED);
-    let config = Config::read(&dir).expect("the architecture");
+    let config = read_config(&dir);
     let representation = Representation::read(&dir).expect("the declaration");
     assert!(representation.is_encoded());
 
@@ -115,7 +127,7 @@ fn a_calibration_that_quantizes_the_router_is_refused_by_name() {
             "exclude_modules": ["lm_head"]
         },"#,
     );
-    let config = Config::read(&dir).expect("the architecture");
+    let config = read_config(&dir);
     let representation = Representation::read(&dir).expect("the declaration");
     let refused = representation
         .adopts("model.layers.0.mlp.gate.weight", Role::Router)

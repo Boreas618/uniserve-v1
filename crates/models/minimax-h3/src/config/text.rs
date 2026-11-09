@@ -6,9 +6,10 @@
 //! The language layers rotate by interleaved M-RoPE, whose three section widths the checkpoint
 //! states.
 
-use serde_json::{Map, Value};
+use nn::config::Fields;
+use ops::activation::Activation;
+use serde_json::Value;
 
-use super::field;
 use crate::{Error, Result};
 
 /// The decoder layers whose hidden state H3 conditions on.
@@ -30,9 +31,10 @@ pub struct PixelConfig {
 
 impl PixelConfig {
     /// Read a processor's `image_mean` and `image_std`.
-    pub fn parse(values: &Map<String, Value>, owner: &str) -> Result<Self> {
-        let mean = field::fixed_numbers(values, "image_mean", owner, 3)?;
-        let std = field::fixed_numbers(values, "image_std", owner, 3)?;
+    pub fn parse(values: &Fields<'_>) -> Result<Self> {
+        let owner = values.owner();
+        let mean = values.fixed_numbers("image_mean", 3)?;
+        let std = values.fixed_numbers("image_std", 3)?;
         let mean: [f32; 3] = [mean[0] as f32, mean[1] as f32, mean[2] as f32];
         let std: [f32; 3] = [std[0] as f32, std[1] as f32, std[2] as f32];
         if std.iter().any(|value| *value <= 0.0) {
@@ -42,13 +44,6 @@ impl PixelConfig {
         }
         Ok(Self { mean, std })
     }
-}
-
-/// The activation of the vision tower. H3's checkpoint states PyTorch's tanh-approximated GELU.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum VisionActivation {
-    /// `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`.
-    GeluTanh,
 }
 
 /// The dimensions of the Qwen3-VL vision encoder and its token mergers.
@@ -67,8 +62,9 @@ pub struct VisionConfig {
     pub intermediate_size: u32,
     /// Attention heads.
     pub num_heads: u32,
-    /// The tower's activation.
-    pub hidden_act: VisionActivation,
+    /// The tower's activation: H3's checkpoint states PyTorch's tanh-approximated GELU, the
+    /// one its blocks are served with.
+    pub hidden_act: Activation,
     /// Pixel channels of one tubelet voxel.
     pub in_channels: u32,
     /// Side of one square spatial patch, in pixels.
@@ -87,19 +83,18 @@ pub struct VisionConfig {
 
 impl VisionConfig {
     /// Read a text encoder checkpoint's `vision_config`.
-    pub fn parse(values: &Map<String, Value>, owner: &str) -> Result<Self> {
-        let hidden_act = match field::text(values, "hidden_act", owner)? {
-            "gelu_pytorch_tanh" => VisionActivation::GeluTanh,
-            other => {
-                return Err(Error::config(format!(
-                    "{owner}.hidden_act must be gelu_pytorch_tanh, got {other:?}"
-                )));
-            }
-        };
-        let depth = field::count(values, "depth", owner)?;
+    pub fn parse(values: &Fields<'_>) -> Result<Self> {
+        let owner = values.owner();
+        let hidden_act = values.activation("hidden_act")?;
+        if hidden_act != Activation::GeluTanh {
+            return Err(Error::config(format!(
+                "{owner}.hidden_act must be gelu_pytorch_tanh, got {hidden_act}"
+            )));
+        }
+        let depth = values.count("depth")?;
         // The DeepStack mergers join the language model after the blocks their indexes name, so an
         // index outside the tower, or two out of order, is refused here.
-        let deepstack_visual_indexes = field::indices(values, "deepstack_visual_indexes", owner)?;
+        let deepstack_visual_indexes = values.indices("deepstack_visual_indexes")?;
         if deepstack_visual_indexes
             .windows(2)
             .any(|pair| pair[0] >= pair[1])
@@ -119,16 +114,16 @@ impl VisionConfig {
         }
         let config = Self {
             depth,
-            hidden_size: field::count(values, "hidden_size", owner)?,
-            intermediate_size: field::count(values, "intermediate_size", owner)?,
-            num_heads: field::count(values, "num_heads", owner)?,
+            hidden_size: values.count("hidden_size")?,
+            intermediate_size: values.count("intermediate_size")?,
+            num_heads: values.count("num_heads")?,
             hidden_act,
-            in_channels: field::count(values, "in_channels", owner)?,
-            patch_size: field::count(values, "patch_size", owner)?,
-            temporal_patch_size: field::count(values, "temporal_patch_size", owner)?,
-            spatial_merge_size: field::count(values, "spatial_merge_size", owner)?,
-            out_hidden_size: field::count(values, "out_hidden_size", owner)?,
-            num_position_embeddings: field::count(values, "num_position_embeddings", owner)?,
+            in_channels: values.count("in_channels")?,
+            patch_size: values.count("patch_size")?,
+            temporal_patch_size: values.count("temporal_patch_size")?,
+            spatial_merge_size: values.count("spatial_merge_size")?,
+            out_hidden_size: values.count("out_hidden_size")?,
+            num_position_embeddings: values.count("num_position_embeddings")?,
             deepstack_visual_indexes,
         };
         if !config.hidden_size.is_multiple_of(config.num_heads) {
@@ -199,44 +194,34 @@ impl TextEncoderConfig {
     /// layers, its `vision_config` the tower, and its image and video token ids the placeholders a
     /// prompt's media are presented by.
     pub fn parse(metadata: &Value, processor: &Value) -> Result<Self> {
-        let values = field::object(metadata, "MiniMax-H3 text_encoder/config.json")?;
-        let text = field::nested(values, "text_config", "MiniMax-H3 text encoder")?;
+        let values = Fields::of("text_encoder/config.json", metadata)?;
+        let text = values.object("text_config")?;
         // The language layers are the Qwen3-VL dense text model H3 was trained against: SiLU, no
         // attention bias, an independent vocabulary head, and interleaved M-RoPE.
-        if field::text(text, "hidden_act", "MiniMax-H3 text encoder")? != "silu" {
+        if text.text("hidden_act")? != "silu" {
             return Err(Error::config(
                 "unsupported MiniMax-H3 text encoder hidden_act".to_owned(),
             ));
         }
-        if field::flag(text, "attention_bias", "MiniMax-H3 text encoder")? {
+        if text.flag("attention_bias")? {
             return Err(Error::config(
                 "unsupported MiniMax-H3 text encoder: it states an attention bias".to_owned(),
             ));
         }
-        if field::flag(values, "tie_word_embeddings", "MiniMax-H3 text encoder")? {
+        if values.flag("tie_word_embeddings")? {
             return Err(Error::config(
                 "MiniMax-H3 checkpoint requires an independent vocabulary head".to_owned(),
             ));
         }
-        let rope = field::nested(text, "rope_scaling", "MiniMax-H3 text encoder")?;
-        if field::text(rope, "rope_type", "MiniMax-H3 text encoder rope_scaling")? != "default"
-            || !field::flag(
-                rope,
-                "mrope_interleaved",
-                "MiniMax-H3 text encoder rope_scaling",
-            )?
-        {
+        let rope = text.object("rope_scaling")?;
+        if rope.text("rope_type")? != "default" || !rope.flag("mrope_interleaved")? {
             return Err(Error::config(
                 "unsupported MiniMax-H3 text encoder rope_scaling: the language layers rotate by \
                  interleaved M-RoPE"
                     .to_owned(),
             ));
         }
-        let sections = field::indices(
-            rope,
-            "mrope_section",
-            "MiniMax-H3 text encoder rope_scaling",
-        )?;
+        let sections = rope.indices("mrope_section")?;
         if sections.len() != 3 {
             return Err(Error::config(format!(
                 "MiniMax-H3 text encoder M-RoPE sections must split half the head over three \
@@ -244,44 +229,28 @@ impl TextEncoderConfig {
                 sections.len()
             )));
         }
-        let vision = field::nested(values, "vision_config", "MiniMax-H3 text encoder")?;
-        let vision = VisionConfig::parse(vision, "MiniMax-H3 vision_config")?;
+        let vision = values.object("vision_config")?;
+        let vision = VisionConfig::parse(&vision)?;
         let config = Self {
-            vocab_size: field::count(text, "vocab_size", "MiniMax-H3 text encoder")?,
-            hidden_size: field::count(text, "hidden_size", "MiniMax-H3 text encoder")?,
-            intermediate_size: field::count(text, "intermediate_size", "MiniMax-H3 text encoder")?,
-            num_checkpoint_layers: field::count(
-                text,
-                "num_hidden_layers",
-                "MiniMax-H3 text encoder",
-            )?,
+            vocab_size: text.count("vocab_size")?,
+            hidden_size: text.count("hidden_size")?,
+            intermediate_size: text.count("intermediate_size")?,
+            num_checkpoint_layers: text.count("num_hidden_layers")?,
             num_retained_layers: RETAINED_LAYERS,
-            num_attention_heads: field::count(
-                text,
-                "num_attention_heads",
-                "MiniMax-H3 text encoder",
-            )?,
-            num_key_value_heads: field::count(
-                text,
-                "num_key_value_heads",
-                "MiniMax-H3 text encoder",
-            )?,
-            head_dim: field::count(text, "head_dim", "MiniMax-H3 text encoder")?,
-            rope_theta: field::positive(text, "rope_theta", "MiniMax-H3 text encoder")? as f32,
-            rms_norm_eps: field::positive(text, "rms_norm_eps", "MiniMax-H3 text encoder")? as f32,
-            max_position_embeddings: field::count(
-                text,
-                "max_position_embeddings",
-                "MiniMax-H3 text encoder",
-            )?,
+            num_attention_heads: text.count("num_attention_heads")?,
+            num_key_value_heads: text.count("num_key_value_heads")?,
+            head_dim: text.count("head_dim")?,
+            rope_theta: text.positive("rope_theta")? as f32,
+            rms_norm_eps: text.positive("rms_norm_eps")? as f32,
+            max_position_embeddings: text.count("max_position_embeddings")?,
             mrope_sections: [sections[0], sections[1], sections[2]],
-            image_token_id: field::index(values, "image_token_id", "MiniMax-H3 text_encoder")?,
-            video_token_id: field::index(values, "video_token_id", "MiniMax-H3 text_encoder")?,
+            image_token_id: values.index("image_token_id")?,
+            video_token_id: values.index("video_token_id")?,
             vision,
-            pixels: PixelConfig::parse(
-                field::object(processor, "MiniMax-H3 processor/preprocessor_config.json")?,
-                "MiniMax-H3 processor",
-            )?,
+            pixels: PixelConfig::parse(&Fields::of(
+                "processor/preprocessor_config.json",
+                processor,
+            )?)?,
         };
         config.validate()?;
         Ok(config)
@@ -443,8 +412,7 @@ mod tests {
         let mut negative = processor();
         negative["image_std"] = serde_json::json!([0.5, 0.0, 0.5]);
         let error = PixelConfig::parse(
-            negative.as_object().expect("an object"),
-            "MiniMax-H3 processor",
+            &Fields::of("processor/preprocessor_config.json", &negative).expect("an object"),
         )
         .expect_err("a zero deviation is refused");
         assert!(

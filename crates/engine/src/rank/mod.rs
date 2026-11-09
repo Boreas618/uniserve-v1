@@ -29,7 +29,7 @@ mod tokens;
 mod video;
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -122,8 +122,8 @@ impl worker::data_plane::ModelLoad for RankModel {
         let Family::Text(family) = self.model_runner.family else {
             return BTreeMap::new();
         };
-        family
-            .open(self.model_runner.checkpoint())
+        nn::Checkpoint::open(self.model_runner.checkpoint())
+            .and_then(|checkpoint| family.open(&checkpoint))
             .map(|checkpoint| checkpoint.expert_layers())
             .unwrap_or_default()
     }
@@ -615,7 +615,9 @@ impl ModelRunner {
                 let Family::Text(family) = self.family else {
                     bail!("a text rank's family is a text family");
                 };
-                let end_of_text = family.open(self.checkpoint())?.end_of_text();
+                let end_of_text = family
+                    .open(&nn::Checkpoint::open(self.checkpoint())?)?
+                    .end_of_text();
                 let control = checkpoint_tokens(self.checkpoint(), end_of_text)?;
                 // What one request may be given to generate on this model; see
                 // `understanding_limits`.
@@ -699,8 +701,8 @@ impl ModelRunner {
             Family::Text(family) => {
                 // The checkpoint's own representation stands unless the deployment fixed another,
                 // which is the build config's `dtype` and `quantization`.
-                let checkpoint = family.open(self.checkpoint())?;
                 let opened = nn::Checkpoint::open(self.checkpoint())?;
+                let checkpoint = family.open(&opened)?;
                 let mut loader = weights.loader(&opened);
                 let placement = TextPlacement {
                     tensor: Split {
@@ -712,20 +714,15 @@ impl ModelRunner {
                         rank: mapping.expert_rank,
                     },
                 };
-                let model = checkpoint.load(&mut loader, &placement, experts)?;
+                let model = checkpoint.load(&opened, &mut loader, &placement, experts)?;
                 Ok(Loaded::Text(model))
             }
             Family::Video(_) => {
                 // The deployment's own representation, which the daemon resolved against the
                 // checkpoint before it wrote this build config (`dtype = "auto"` never reaches a
                 // main process as `auto`).
-                let checkpoint = self.open_video()?;
-                let mut roots = vec![self.checkpoint().to_path_buf()];
-                if let Some(base) = &self.engine_config().model.base {
-                    roots.push(PathBuf::from(base));
-                }
-                let roots: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
-                let opened = nn::Checkpoint::open_roots(&roots)?;
+                let opened = self.open_video_checkpoint()?;
+                let checkpoint = self.open_video_family(&opened)?;
                 let mut loader = weights.loader(&opened);
 
                 // **The video pipeline's parallel shape is the deployment's, and the deployment

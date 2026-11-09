@@ -13,13 +13,13 @@ use crate::{Error, Result};
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Partition {
     /// Tensor-parallel degree: vocabulary, attention heads and dense projections are sharded.
-    pub tensor_parallel: usize,
+    pub tensor_parallel: u32,
     /// This rank's position in the tensor-parallel group.
-    pub tensor_rank: usize,
+    pub tensor_rank: u32,
     /// Expert-parallel degree: each rank owns `num_experts / expert_parallel` experts.
-    pub expert_parallel: usize,
+    pub expert_parallel: u32,
     /// This rank's position in the expert-parallel group.
-    pub expert_rank: usize,
+    pub expert_rank: u32,
 }
 
 impl Partition {
@@ -37,10 +37,10 @@ impl Partition {
     /// model's head count and expert count.
     pub fn new(
         config: &crate::Config,
-        tensor_parallel: usize,
-        tensor_rank: usize,
-        expert_parallel: usize,
-        expert_rank: usize,
+        tensor_parallel: u32,
+        tensor_rank: u32,
+        expert_parallel: u32,
+        expert_rank: u32,
     ) -> Result<Self> {
         let partition = Self {
             tensor_parallel,
@@ -99,12 +99,12 @@ impl Partition {
     }
 
     /// Query heads this rank's attention computes.
-    pub const fn local_attention_heads(&self, config: &crate::Config) -> usize {
+    pub const fn local_attention_heads(&self, config: &crate::Config) -> u32 {
         config.num_attention_heads / self.tensor_parallel
     }
 
     /// Key/value heads this rank's attention reads.
-    pub const fn local_key_value_heads(&self, config: &crate::Config) -> usize {
+    pub const fn local_key_value_heads(&self, config: &crate::Config) -> u32 {
         config.num_key_value_heads / self.tensor_parallel
     }
 
@@ -112,7 +112,7 @@ impl Partition {
     ///
     /// The shard is `ceil(vocab / degree)` rows except the last, which is short when the
     /// vocabulary does not divide evenly.
-    pub fn vocabulary_shard(&self, vocab_size: usize) -> (usize, usize) {
+    pub fn vocabulary_shard(&self, vocab_size: u32) -> (u32, u32) {
         let rows = vocab_size.div_ceil(self.tensor_parallel);
         let first = self.tensor_rank * rows;
         let rows = rows.min(vocab_size.saturating_sub(first));
@@ -125,24 +125,24 @@ impl Partition {
     /// tile is stored padded; the vocabulary's own last rank can be short, and then the padding is
     /// what the shard's rows are rounded up to. The same width is the head's output width and the
     /// width of one rank's block in the gathered logits matrix.
-    pub fn padded_vocabulary_shard(&self, vocab_size: usize) -> usize {
+    pub fn padded_vocabulary_shard(&self, vocab_size: u32) -> u32 {
         self.vocabulary_shard(vocab_size).1.next_multiple_of(8)
     }
 
     /// The intermediate width of one routed expert on this rank: the tensor group splits every
     /// expert's `moe_intermediate_size` over its ranks and sums the partial outputs once after the
     /// experts.
-    pub const fn local_expert_intermediate(&self, config: &crate::Config) -> usize {
+    pub const fn local_expert_intermediate(&self, config: &crate::Config) -> u32 {
         config.moe_intermediate_size / self.tensor_parallel
     }
 
     /// The intermediate width of a dense feed-forward layer on this rank.
-    pub const fn local_intermediate(&self, config: &crate::Config) -> usize {
+    pub const fn local_intermediate(&self, config: &crate::Config) -> u32 {
         config.intermediate_size / self.tensor_parallel
     }
 
     /// The experts this rank owns, as a half-open range of the checkpoint's expert ids.
-    pub fn expert_range(&self, config: &crate::Config) -> std::ops::Range<usize> {
+    pub fn expert_range(&self, config: &crate::Config) -> std::ops::Range<u32> {
         let per_rank = config.num_experts / self.expert_parallel;
         let first = self.expert_rank * per_rank;
         first..first + per_rank
@@ -196,7 +196,7 @@ mod tests {
                 num_attention_heads: 1,
                 num_key_value_heads: 1,
                 head_dim: 2,
-                hidden_act: crate::Activation::Silu,
+                hidden_act: ops::activation::Activation::Silu,
                 rms_norm_eps: 1e-6,
                 rope_theta: 10_000.0,
                 rope_scaling: None,

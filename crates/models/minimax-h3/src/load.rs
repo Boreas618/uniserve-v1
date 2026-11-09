@@ -26,13 +26,13 @@
 //! representation the checkpoint stores it in, and each layer declares the precision it computes
 //! in. That representation is a fact about the export, not a preset: the released checkpoint is
 //! BF16 everywhere but its video VAE decoder, while an export of the same model can store FP32
-//! throughout, and `auto` must follow each of them. [`stored_dtype`] is the one place that reads
-//! it.
+//! throughout, and `auto` must follow each of them. [`nn::Checkpoint::stored_dtype`] is the one
+//! place that reads it.
 
 use std::sync::Arc;
 
 use crate::audio_vae::BigVgan;
-use crate::checkpoint::{Dit, Layout, Sidecars};
+use crate::checkpoint::Dit;
 use crate::config::Config;
 use crate::denoiser::{ConditionEncoders, Denoiser, Layouts};
 use crate::schedule::Schedule;
@@ -151,115 +151,41 @@ pub fn refiner_types(text_encoder: nn::DType, dit: nn::DType, dit_directory: &st
     )))
 }
 
-/// The one floating-point type a component's weights are stored in.
-///
-/// `dtype = "auto"` converts nothing at load, so this is the element type a block built from that
-/// component keeps and computes in. It is read from the checkpoint - the tensors' own headers, which
-/// `nn::Checkpoint` has without mapping a byte - because the export need not declare it: a diffusers
-/// sidecar that omits `torch_dtype` states nothing, and a preset in this crate would be a second
-/// statement of a number the files already hold.
-///
-/// This is the **one** type a consumer takes for a whole component - a module whose tables are
-/// published in a single dtype, or a container that must agree with its export. It is **not** the
-/// answer to "what does `auto` load": `auto` loads each weight in its own stored type, and a
-/// component may store several ([`stored_types`] lists them), because the reference pins a type per
-/// tensor. A component of two is therefore refused here by name - because *this caller* needs one
-/// type - and never as a statement that the checkpoint is wrong. Integer tensors - a table, an index
-/// - are not weights and do not count.
-pub fn stored_types(
-    checkpoint: &nn::Checkpoint,
-    component: &str,
-) -> Result<Vec<(nn::DType, String)>> {
-    let source = checkpoint.component(component)?;
-    // The element types present, with one tensor that carries each, so a question about them is
-    // answerable by name.
-    let mut found: Vec<(nn::DType, String)> = Vec::new();
-    for name in source.names() {
-        let Some(location) = source.tensor(name) else {
-            continue;
-        };
-        if !location.dtype.is_float() {
-            continue;
-        }
-        if !found.iter().any(|(dtype, _)| *dtype == location.dtype) {
-            found.push((location.dtype, name.to_owned()));
-        }
-    }
-    Ok(found)
-}
-
-/// The element type a consumer takes for a whole component, refusing one of two by name.
-pub fn stored_dtype(checkpoint: &nn::Checkpoint, component: &str) -> Result<nn::DType> {
-    let found = stored_types(checkpoint, component)?;
-    match found.len() {
-        1 => Ok(found[0].0),
-        0 => Err(Error::checkpoint(format!(
-            "the checkpoint's `{component}` component holds no floating-point tensor, so there is \
-             no representation to load its weights in"
-        ))),
-        _ => Err(Error::checkpoint(format!(
-            "the checkpoint's `{component}` component stores {} floating-point types ({}); the \
-             consumer that asked takes one element type for a whole component, and a component of \
-             several is legal under `dtype = \"auto\"` - each weight loads in its own stored type - \
-             so this is a limit of that consumer, not of the export",
-            found.len(),
-            found
-                .iter()
-                .map(|(dtype, example)| format!("{dtype} (such as `{example}`)"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))),
-    }
-}
-
-/// The element type of one tensor of a component.
-///
-/// A component may store several types (a release that keeps a loading derivation's operand in
-/// FP32, say), so a question about one weight must be asked of that weight. The name must be in the
-/// component's index; a name it lacks is refused here rather than defaulted.
-pub fn tensor_dtype(checkpoint: &nn::Checkpoint, component: &str, name: &str) -> Result<nn::DType> {
-    let source = checkpoint.component(component)?;
-    let location = source.tensor(name).ok_or_else(|| {
-        Error::checkpoint(format!(
-            "the checkpoint's `{component}` component has no tensor `{name}`, so its element type \
-             cannot be read"
-        ))
-    })?;
-    Ok(location.dtype)
-}
-
 /// Load the deployment this rank places.
 ///
-/// The place and the blocks are the `partition`'s: it names the degrees and the rank's position in
-/// them, the blocks this rank holds, and the row capacities those blocks are sized for. The
-/// checkpoint is one file set per pipeline: an export that continues a base release is opened by
-/// the engine as one checkpoint spanning both, so this function never learns about bases.
+/// `config` is the configuration the family read from `checkpoint` when it opened it; nothing here
+/// reads a sidecar again. The place and the blocks are the `partition`'s: it names the degrees and
+/// the rank's position in them, the blocks this rank holds, and the row capacities those blocks are
+/// sized for. The checkpoint is one file set per pipeline: an export that continues a base release
+/// is opened by the engine as one checkpoint spanning both, so this function never learns about
+/// bases.
 ///
 /// `dtype` is the deployment's element type: `Some` converts every weight once as it is published,
 /// and the retained key names the conversion, so a deployment over an export of another type is
 /// legal and its keys say what it did. `None` is the design's `auto`: each block keeps the
-/// representation its weights are stored in ([`stored_dtype`]), and each layer declares the
-/// precision it computes in. Under `auto` nothing converts, so a component of
-/// two floating-point types is refused here rather than mixed in a forward.
+/// representation its weights are stored in ([`nn::Checkpoint::stored_dtype`]), and each layer
+/// declares the precision it computes in. Under `auto` nothing converts, so a component of two
+/// floating-point types is refused here rather than mixed in a forward.
 ///
 /// A block this build cannot construct is refused with [`Error::Unsupported`], naming it, rather
 /// than omitted: a deployment that places one must fail at load, not on the device.
 pub fn load(
+    config: &Config,
     checkpoint: &nn::Checkpoint,
     partition: Partition,
     dtype: Option<nn::DType>,
     canvases: &[(u32, u32)],
     loader: &mut nn::weights::WeightLoader<'_>,
 ) -> Result<MinimaxH3> {
-    let (layout, sidecars) = sidecars(checkpoint)?;
-    let config = Config::normalize(&layout, &sidecars)?;
-    partition.validate(&config)?;
+    partition.validate(config)?;
     // The deployment's element type, for the parts this function builds itself: a stated type is
     // what every weight is converted to, and `None` is each component's own representation.
     let deployment = |component: Component| -> Result<nn::DType> {
         match dtype {
             Some(stated) => Ok(stated),
-            None => stored_dtype(checkpoint, component.directories()[0]),
+            None => Ok(checkpoint
+                .component(component.directories()[0])?
+                .stored_dtype()?),
         }
     };
     // A component that stores more than one floating-point type is legal under `auto`: the
@@ -283,11 +209,10 @@ pub fn load(
                 // the prefix the reference reads too.
                 refiner_types(
                     deployment(Component::TextEncoder)?,
-                    tensor_dtype(
-                        checkpoint,
-                        dit.directory(),
-                        "token_refiner.refiner_blocks.0.attn.to_q.weight",
-                    )?,
+                    checkpoint
+                        .component(dit.directory())?
+                        .locate("token_refiner.refiner_blocks.0.attn.to_q.weight")?
+                        .dtype,
                     dit.directory(),
                 )?;
             }
@@ -300,7 +225,7 @@ pub fn load(
     // `Block::Denoiser` and the concrete block that holds them is out of reach. A deployment whose
     // tasks carry no conditions places none.
     let mut encoders = if partition.blocks.contains(Component::LatentEncoder) {
-        Some(ConditionEncoders::load(&config, checkpoint, loader)?)
+        Some(ConditionEncoders::load(config, checkpoint, loader)?)
     } else {
         None
     };
@@ -469,16 +394,26 @@ pub fn load(
     })
 }
 
-/// The checkpoint's pipeline layout and its sidecar documents.
-///
-/// One function on purpose: a checkpoint that spans a base release is still read from the one root
-/// `Checkpoint` was opened at, and when the union form lands (a checkpoint whose components come
-/// from two roots) this is the only place that changes.
-fn sidecars(checkpoint: &nn::Checkpoint) -> Result<(Layout, Sidecars)> {
-    // The pipeline's own `model_index.json` names the components; each component's sidecars are
-    // read from the root that holds it, because a checkpoint may span an export and the base
-    // release it continues.
-    let layout = Layout::detect(checkpoint.root())?;
-    let sidecars = Sidecars::read_components(checkpoint, &layout)?;
-    Ok((layout, sidecars))
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The refiner spans two components, so a deployment whose text encoder and DiT disagree on
+    /// the element type is refused at the boundary and not inside a forward.
+    #[test]
+    fn a_mixed_text_and_dit_pair_is_refused() {
+        refiner_types(nn::DType::F32, nn::DType::F32, "transformer").expect("one type");
+        refiner_types(nn::DType::BF16, nn::DType::BF16, "transformer_ref").expect("one type");
+
+        let message = refiner_types(nn::DType::BF16, nn::DType::F32, "transformer")
+            .expect_err("a bf16 encoder over an f32 DiT is one mixed gemm")
+            .to_string();
+        let folded = message.to_lowercase();
+        for named in ["bf16", "f32", "transformer", "refiner", "gemm"] {
+            assert!(
+                folded.contains(named),
+                "the refusal must name {named}, and it says: {message}"
+            );
+        }
+    }
 }

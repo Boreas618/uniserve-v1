@@ -177,10 +177,11 @@ pub fn expert_sources(config: &Config) -> Vec<ExpertSource> {
 mod tests {
     use super::*;
 
-    use crate::{Activation, Config};
+    use crate::Config;
     use nn::Shape;
+    use ops::activation::Activation;
 
-    fn config(sparse_layers: &[usize], bias: bool, tied: bool) -> Config {
+    fn config(sparse_layers: &[u32], bias: bool, tied: bool) -> Config {
         Config {
             vocab_size: 151936,
             hidden_size: 2048,
@@ -219,7 +220,8 @@ mod tests {
     fn the_local_checkpoint_maps_every_parameter() {
         // Qwen3-30B-A3B: 48 sparse layers and an untied head.
         let config =
-            crate::Config::read(&local_checkpoint()).expect("the local Qwen3-30B-A3B metadata");
+            crate::Config::open(&nn::Checkpoint::open(&local_checkpoint()).expect("the shards"))
+                .expect("the local Qwen3-30B-A3B metadata");
         let sources = parameter_sources(&config);
         // embedding, norm and head; then per layer two norms, four projections (q, k, v, o), two
         // per-head norms and the router.
@@ -248,8 +250,8 @@ mod tests {
         // own headers can, before anything reaches a device. Shapes are derived from `config.json`
         // here rather than from the loader, so the two agree only if both read the design right.
         let root = local_checkpoint();
-        let config = crate::Config::read(&root).expect("the local Qwen3-30B-A3B metadata");
         let checkpoint = nn::Checkpoint::open(&root).expect("the local checkpoint's headers");
+        let config = crate::Config::open(&checkpoint).expect("the local Qwen3-30B-A3B metadata");
 
         let hidden = config.hidden_size as u64;
         let query = (config.num_attention_heads * config.head_dim) as u64;
@@ -306,7 +308,7 @@ mod tests {
         let experts = config.moe_intermediate_size as u64;
         for source in expert_sources(&config) {
             for expert in 0..config.num_experts {
-                let tensors = source.tensors(expert);
+                let tensors = source.tensors(expert as usize);
                 for (name, shape) in [
                     (tensors.up, Shape::new(&[experts, hidden])),
                     (tensors.gate, Shape::new(&[experts, hidden])),

@@ -3291,7 +3291,6 @@ dependencies = [
  "nn",
  "ops",
  "processing",
- "serde",
  "serde_json",
  "tempfile",
  "thiserror",

@@ -65,6 +65,22 @@ impl fmt::Display for Activation {
     }
 }
 
+impl TryFrom<crate::activation::Activation> for Activation {
+    type Error = Error;
+
+    /// The grouped products' gate for an activation, refusing the exact GELU no FC1 implements.
+    fn try_from(activation: crate::activation::Activation) -> Result<Self> {
+        match activation {
+            crate::activation::Activation::Silu => Ok(Self::Silu),
+            crate::activation::Activation::GeluTanh => Ok(Self::GeluTanh),
+            crate::activation::Activation::Gelu => Err(Error::Shape(
+                "a grouped expert product gates with silu or gelu_tanh, not the exact gelu"
+                    .to_owned(),
+            )),
+        }
+    }
+}
+
 /// One compilation of `gather_gemm`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GatherGemmDescriptor {

@@ -5,9 +5,10 @@
 //! hop and the decoder's output rate - and H3's timeline counts audio latents in those hops
 //! (`docs/minimax_h3/minimax_h3.md`).
 
-use serde_json::{Map, Value};
+use nn::config::Fields;
+use serde_json::Value;
 
-use super::field;
+use super::statistics;
 use crate::{Error, Result};
 
 /// The audio VAE's network geometry and latent statistics.
@@ -44,27 +45,22 @@ pub struct AudioVaeConfig {
 impl AudioVaeConfig {
     /// Read `audio_vae/config.json`.
     pub fn parse(values: &Value) -> Result<Self> {
-        let values = field::object(values, "MiniMax-H3 audio_vae/config.json")?;
-        let owner = "MiniMax-H3 audio_vae";
-        let latent_channels = field::count(values, "latent_channels", owner)?;
+        let values = Fields::of("audio_vae/config.json", values)?;
+        let latent_channels = values.count("latent_channels")?;
         let config = Self {
-            encoder_dim: field::count(values, "encoder_dim", owner)?,
-            encoder_rates: field::counts(values, "encoder_rates", owner)?,
-            latent_dim: field::count(values, "latent_dim", owner)?,
+            encoder_dim: values.count("encoder_dim")?,
+            encoder_rates: values.counts("encoder_rates")?,
+            latent_dim: values.count("latent_dim")?,
             latent_channels,
-            decoder_dim: field::count(values, "decoder_dim", owner)?,
-            decoder_rates: field::counts(values, "decoder_rates", owner)?,
-            decoder_kernel_sizes: field::counts(values, "decoder_kernel_sizes", owner)?,
-            num_attention_heads: field::count(values, "num_attention_heads", owner)?,
-            resblock_kernel_sizes: field::counts(values, "resblock_kernel_sizes", owner)?,
-            resblock_dilation_sizes: field::nested_counts(
-                values,
-                "resblock_dilation_sizes",
-                owner,
-            )?,
-            sampling_rate: field::count(values, "sampling_rate", owner)?,
-            latents_mean: channel_statistics(values, "latents_mean", latent_channels)?,
-            latents_std: channel_statistics(values, "latents_std", latent_channels)?,
+            decoder_dim: values.count("decoder_dim")?,
+            decoder_rates: values.counts("decoder_rates")?,
+            decoder_kernel_sizes: values.counts("decoder_kernel_sizes")?,
+            num_attention_heads: values.count("num_attention_heads")?,
+            resblock_kernel_sizes: values.counts("resblock_kernel_sizes")?,
+            resblock_dilation_sizes: values.nested_counts("resblock_dilation_sizes")?,
+            sampling_rate: values.count("sampling_rate")?,
+            latents_mean: statistics(&values, "latents_mean", latent_channels)?,
+            latents_std: statistics(&values, "latents_std", latent_channels)?,
         };
         config.validate()?;
         Ok(config)
@@ -110,18 +106,6 @@ impl AudioVaeConfig {
     pub fn decoder_hop(&self) -> u32 {
         self.decoder_rates.iter().product()
     }
-}
-
-/// Read one per-channel latent statistic.
-fn channel_statistics(values: &Map<String, Value>, key: &str, channels: u32) -> Result<Vec<f32>> {
-    let numbers = field::numbers(values, key, "MiniMax-H3 audio_vae")?;
-    if numbers.len() != channels as usize {
-        return Err(Error::config(format!(
-            "H3 audio_vae.{key} must describe every one of {channels} latent channels, got {}",
-            numbers.len()
-        )));
-    }
-    Ok(numbers.into_iter().map(|value| value as f32).collect())
 }
 
 #[cfg(test)]

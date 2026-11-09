@@ -116,11 +116,11 @@ impl nn::capability::MediaFormat for ConditionFormat {
         let frames = frames as usize;
         let channels = PIXEL_CHANNELS as usize;
         if rgb.len() != frames * area * channels || out.len() != rgb.len() {
-            return Err(refused(format!(
+            return Err(nn::Error::from(Error::Unsupported(format!(
                 "{} RGB bytes and {} elements for {frames} frames of {height}x{width}",
                 rgb.len(),
                 out.len()
-            )));
+            ))));
         }
         // `[frames, rows, columns, 3]` to `[3, frames, rows, columns]`, each byte through the
         // normalisation the reference applies in FP32. A byte has 256 values, so the normalisation
@@ -196,21 +196,21 @@ impl nn::capability::MediaFormat for ConditionFormat {
         let width_bytes = self.patch_width() as usize * 2;
         let patches = time as usize * rows as usize * columns as usize;
         if self.dtype != DType::BF16 {
-            return Err(refused(format!(
+            return Err(nn::Error::from(Error::Unsupported(format!(
                 "H3's vision tower reads BF16 patch rows, not {}",
                 self.dtype
-            )));
+            ))));
         }
         if planes.len() != frames as usize * channels * area
             || out.len() != patches * width_bytes
             || frames == 0
             || frames.div_ceil(temporal) != time
         {
-            return Err(refused(format!(
+            return Err(nn::Error::from(Error::Unsupported(format!(
                 "{} plane bytes and {} row bytes for {frames} frames on a {grid:?} grid",
                 planes.len(),
                 out.len()
-            )));
+            ))));
         }
         let mean = self.pixels.mean.map(|value| value * 255.0);
         let std = self.pixels.std.map(|value| value * 255.0);
@@ -264,7 +264,7 @@ impl nn::capability::MediaFormat for ConditionFormat {
     }
 
     fn track_samples(&self, samples: u64) -> nn::Result<u64> {
-        padded_samples(samples, self.hop).map_err(|error| refused(error.to_string()))
+        padded_samples(samples, self.hop).map_err(nn::Error::from)
     }
 
     /// `[samples, 2]` interleaved to `[2, 1, padded]`, each channel's tail zero.
@@ -272,11 +272,11 @@ impl nn::capability::MediaFormat for ConditionFormat {
         let padded = self.track_samples(samples)? as usize;
         let samples = samples as usize;
         if pcm.len() != 2 * samples || out.len() != 2 * padded {
-            return Err(refused(format!(
+            return Err(nn::Error::from(Error::Unsupported(format!(
                 "{} PCM values and {} elements for a track of {samples} samples",
                 pcm.len(),
                 out.len()
-            )));
+            ))));
         }
         out.fill(0.0);
         for sample in 0..samples {
@@ -284,14 +284,6 @@ impl nn::capability::MediaFormat for ConditionFormat {
             out[padded + sample] = pcm[2 * sample + 1];
         }
         Ok(())
-    }
-}
-
-/// A conversion of a request's media refused, as the capability reports it.
-fn refused(problem: String) -> nn::Error {
-    nn::Error::Weight {
-        tensor: "minimax-h3".to_owned(),
-        problem,
     }
 }
 
@@ -2641,7 +2633,7 @@ mod tests {
                 hidden_size: 8,
                 intermediate_size: 8,
                 num_heads: 1,
-                hidden_act: crate::config::VisionActivation::GeluTanh,
+                hidden_act: ops::activation::Activation::GeluTanh,
                 in_channels: 3,
                 patch_size: patch,
                 temporal_patch_size: 2,

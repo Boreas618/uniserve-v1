@@ -1906,3 +1906,160 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
     assert_eq!(refused.to_string(), expected.to_string());
     assert!(refused.to_string().contains("linear"), "{refused}");
 }
+
+/// One component of `dtype`-typed vectors, `elements` each, under `root/name`.
+fn component(root: &Path, name: &str, tensors: &[(&str, DType, u64)]) {
+    let directory = root.join(name);
+    std::fs::create_dir_all(&directory).unwrap();
+    let typed: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(tensor, dtype, elements)| {
+            let bytes = vec![0u8; (*elements * dtype.bytes().unwrap()) as usize];
+            (*tensor, *dtype, vec![*elements], bytes)
+        })
+        .collect();
+    shard_typed(&directory, "model.safetensors", &typed);
+}
+
+/// A checkpoint of one floating-point type answers with it, whichever it is: `auto` converts
+/// nothing, so that type is what its weights keep.
+#[test]
+fn a_checkpoint_of_one_float_type_is_stored_in_it() {
+    for dtype in [DType::BF16, DType::F16, DType::F32] {
+        let root = tempfile::tempdir().unwrap();
+        component(
+            root.path(),
+            "text_encoder",
+            &[("embed.weight", dtype, 7), ("norm.bias", dtype, 3)],
+        );
+        let checkpoint = Checkpoint::open(root.path()).unwrap();
+        let text_encoder = checkpoint.component("text_encoder").unwrap();
+        assert_eq!(text_encoder.stored_dtype().unwrap(), dtype);
+    }
+}
+
+/// An integer table is not a weight a precision describes, so it does not make the checkpoint
+/// ambiguous, and a checkpoint of integers alone has no stored type to answer.
+#[test]
+fn integer_tensors_are_not_a_stored_type() {
+    let root = tempfile::tempdir().unwrap();
+    component(
+        root.path(),
+        "transformer",
+        &[
+            ("proj_in.weight", DType::F32, 5),
+            ("positions", DType::I64, 5),
+            ("counts", DType::I32, 5),
+        ],
+    );
+    component(root.path(), "scheduler", &[("steps", DType::I64, 4)]);
+    let checkpoint = Checkpoint::open(root.path()).unwrap();
+    assert_eq!(
+        checkpoint
+            .component("transformer")
+            .unwrap()
+            .stored_dtype()
+            .unwrap(),
+        DType::F32
+    );
+    let error = checkpoint
+        .component("scheduler")
+        .unwrap()
+        .stored_dtype()
+        .expect_err("no float type to keep");
+    assert!(
+        error.to_string().contains("no floating-point tensor"),
+        "{error}"
+    );
+}
+
+/// A checkpoint of two float types lists each with a tensor that carries it, and a caller that asks
+/// for one type is refused with both named.
+#[test]
+fn two_stored_types_are_listed_and_refused_as_one() {
+    let root = tempfile::tempdir().unwrap();
+    component(
+        root.path(),
+        "transformer",
+        &[
+            ("audio_proj_in.bias", DType::F32, 3),
+            ("context_embedder.bias", DType::BF16, 3),
+            ("proj_in.weight", DType::BF16, 3),
+            ("positions", DType::I32, 3),
+        ],
+    );
+    let checkpoint = Checkpoint::open(root.path()).unwrap();
+    let transformer = checkpoint.component("transformer").unwrap();
+    let types = transformer.stored_types();
+    assert_eq!(
+        types.iter().map(|(dtype, _)| *dtype).collect::<Vec<_>>(),
+        vec![DType::F32, DType::BF16],
+        "two floating-point types, and the integer table is not one of them"
+    );
+    assert_eq!(types[0].1, "audio_proj_in.bias");
+
+    let message = transformer
+        .stored_dtype()
+        .expect_err("two float types are not one")
+        .to_string();
+    let folded = message.to_lowercase();
+    for named in [
+        "bf16",
+        "f32",
+        "audio_proj_in.bias",
+        "context_embedder.bias",
+        "transformer",
+    ] {
+        assert!(
+            folded.contains(named),
+            "the refusal names {named}: {message}"
+        );
+    }
+}
+
+/// A checkpoint's JSON documents are read from the first of its roots that holds each: an export's
+/// own before the base's, a document only the base holds from the base, and one no root holds is
+/// absent rather than an error.
+#[test]
+fn a_sidecar_is_read_from_the_first_root_that_holds_it() {
+    let export = tempfile::tempdir().unwrap();
+    let base = tempfile::tempdir().unwrap();
+    for root in [export.path(), base.path()] {
+        component(root, "transformer", &[("proj_in.weight", DType::BF16, 2)]);
+    }
+    std::fs::write(
+        export.path().join("transformer/config.json"),
+        r#"{"from": "export"}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        base.path().join("transformer/config.json"),
+        r#"{"from": "base"}"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(base.path().join("processor")).unwrap();
+    std::fs::write(
+        base.path().join("processor/preprocessor_config.json"),
+        r#"{"from": "base"}"#,
+    )
+    .unwrap();
+    std::fs::write(export.path().join("broken.json"), "{").unwrap();
+
+    let checkpoint = Checkpoint::open_roots(&[export.path(), base.path()]).unwrap();
+    let own = checkpoint.sidecar("transformer/config.json").unwrap();
+    assert_eq!(own.unwrap()["from"], "export");
+    let inherited = checkpoint
+        .sidecar("processor/preprocessor_config.json")
+        .unwrap();
+    assert_eq!(inherited.unwrap()["from"], "base");
+    assert!(
+        checkpoint
+            .sidecar("processor/video_preprocessor_config.json")
+            .unwrap()
+            .is_none()
+    );
+    let error = checkpoint
+        .sidecar("broken.json")
+        .expect_err("a document that is not JSON is refused");
+    assert!(error.to_string().contains("broken.json"), "{error}");
+}

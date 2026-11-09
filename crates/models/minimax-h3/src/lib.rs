@@ -104,24 +104,6 @@ pub enum Error {
     /// A component's checkpoint could not be opened, or a weight could not be read or converted.
     #[error(transparent)]
     Nn(#[from] nn::Error),
-
-    /// A checkpoint file could not be read.
-    #[error("reading {path}: {source}")]
-    Io {
-        /// The path that failed.
-        path: std::path::PathBuf,
-        /// The underlying filesystem error.
-        source: std::io::Error,
-    },
-
-    /// A checkpoint's JSON sidecar is not valid JSON.
-    #[error("parsing {path}: {source}")]
-    Json {
-        /// The path that failed.
-        path: std::path::PathBuf,
-        /// The underlying JSON error.
-        source: serde_json::Error,
-    },
 }
 
 impl Error {
@@ -138,3 +120,18 @@ impl Error {
 
 /// A result of this crate.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The family's name in a refusal it reports through the shared library.
+const MODEL: &str = "minimax-h3";
+
+impl From<Error> for nn::Error {
+    /// A failure as the capability and family contracts report it: a shared-library failure is
+    /// already one and passes through unchanged, and every refusal of this crate's own is
+    /// [`nn::Error::Model`] naming the family.
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Nn(error) => error,
+            other => nn::Error::model(MODEL, other),
+        }
+    }
+}

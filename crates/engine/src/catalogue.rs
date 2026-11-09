@@ -108,7 +108,6 @@ fn architectural_class(checkpoint: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
 
     use nn::family::{TextCheckpoint, TextFamily, VideoCheckpoint, VideoFamily};
 
@@ -122,7 +121,7 @@ mod tests {
             self.0
         }
 
-        fn open(&self, _: &Path) -> nn::Result<Box<dyn TextCheckpoint>> {
+        fn open(&self, _: &nn::Checkpoint) -> nn::Result<Box<dyn TextCheckpoint>> {
             Err(nn::Error::Unsupported("no checkpoint".to_owned()))
         }
     }
@@ -132,7 +131,7 @@ mod tests {
             self.0
         }
 
-        fn open(&self, _: &[PathBuf]) -> nn::Result<Box<dyn VideoCheckpoint>> {
+        fn open(&self, _: &nn::Checkpoint) -> nn::Result<Box<dyn VideoCheckpoint>> {
             Err(nn::Error::Unsupported("no checkpoint".to_owned()))
         }
     }

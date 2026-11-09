@@ -993,7 +993,7 @@ impl Encoder for TextEncoder {
         out: &mut [Vec<u8>],
     ) -> nn::Result<()> {
         self.prepare_state_bytes(prompt, layout, out)
-            .map_err(capability)
+            .map_err(nn::Error::from)
     }
 
     fn encode(
@@ -1002,7 +1002,7 @@ impl Encoder for TextEncoder {
         inputs: EncoderInputs<'_>,
         out: EncoderOutputs,
     ) -> nn::Result<()> {
-        self.encode_prompt(f, inputs, out).map_err(capability)
+        self.encode_prompt(f, inputs, out).map_err(nn::Error::from)
     }
 }
 
@@ -1358,18 +1358,6 @@ fn write_f32(buffer: &mut [u8], values: &[f32], name: &'static str) -> Result<()
         *chunk = value.to_le_bytes();
     }
     Ok(())
-}
-
-/// The capability boundary's view of this crate's failures: an `nn` failure is already one, and
-/// every other refusal names this block.
-fn capability(error: Error) -> nn::Error {
-    match error {
-        Error::Nn(error) => error,
-        other => nn::Error::Shape {
-            owner: "MiniMax-H3 text encoder",
-            problem: other.to_string(),
-        },
-    }
 }
 
 /// A refusal of a call whose inputs do not describe the plan.

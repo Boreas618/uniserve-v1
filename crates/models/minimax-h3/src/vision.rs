@@ -55,7 +55,7 @@ use nn::weights::{WeightLoader, WeightRequest};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
 use ops::gemm::WeightOrder;
 
-use crate::config::{VisionActivation, VisionConfig};
+use crate::config::VisionConfig;
 use crate::positions::invalid;
 use crate::{Error, Result};
 
@@ -659,7 +659,12 @@ impl VisionTower {
         let tubelet = u64::from(BlockRows::tubelet(config));
         // The checkpoint's activation, and the merger's exact form, are two different GELUs.
         let blocks_gelu = match config.hidden_act {
-            VisionActivation::GeluTanh => Gelu::tanh(),
+            ops::activation::Activation::GeluTanh => Gelu::tanh(),
+            other => {
+                return Err(Error::config(format!(
+                    "the vision tower gates with gelu_pytorch_tanh, not {other}"
+                )));
+            }
         };
         let heads = config.num_heads;
         let head_dim = BlockRows::head_dim(config)?;

@@ -26,7 +26,7 @@ pub mod processing;
 pub mod representation;
 pub mod weights;
 
-pub use config::{Activation, Config, RopeScaling, YaRn};
+pub use config::{Config, RopeScaling, YaRn};
 pub use model::{LoadOptions, Qwen3Moe};
 pub use partition::Partition;
 pub use representation::{Adopted, Representation, Role};
@@ -63,3 +63,18 @@ pub enum Error {
 
 /// The crate's result type.
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// The family's name in a refusal it reports through the shared library.
+const MODEL: &str = "qwen3-moe";
+
+impl From<Error> for nn::Error {
+    /// A failure as the capability and family contracts report it: a shared-library failure is
+    /// already one and passes through unchanged, and every refusal of this crate's own is
+    /// [`nn::Error::Model`] naming the family.
+    fn from(error: Error) -> Self {
+        match error {
+            Error::Nn(error) => error,
+            other => nn::Error::model(MODEL, other),
+        }
+    }
+}
