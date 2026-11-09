@@ -25,8 +25,7 @@
 //! [`Layer::Dense`] attends every used row of the packed sequence: the queries are this rank's rows
 //! and the keys are the request's used rows, both named by device boundary tables, so a padding row
 //! is no key. [`Layer::Sparse`] is FastH3's video sparse attention over the segment packing
-//! ([`crate::attention_sparse`]), composed from `nn::layers::VsaTiles` and
-//! `nn::layers::SegmentAttention`.
+//! ([`crate::attention_sparse`]), over `nn::layers::VsaAttention`.
 //!
 //! ## Precision
 //!

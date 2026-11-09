@@ -1,5 +1,5 @@
 use nn::layers::{
-    Bias, Linear, Parallel, Rotary, SegmentAttention, SegmentTables, UlyssesExchange, VsaTiles,
+    Bias, Linear, Parallel, Rotary, UlyssesExchange, VsaAttention, VsaScratch, VsaSpec, VsaTables,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
@@ -24,10 +24,8 @@ pub struct Sparse {
     /// Per-head normalization gains of the query and the key.
     pub query_gain: Weight,
     pub key_gain: Weight,
-    /// The tile preparation: normalization, rotation, padding and pooling.
-    pub tiles: VsaTiles,
-    /// The fine attention over the selected tiles of the rows, in the checkpoint's dtype.
-    pub fine: SegmentAttention,
+    /// The video sparse attention over this rank's heads of the whole sequence.
+    pub vsa: VsaAttention,
     /// Heads of the whole model, and the heads this rank holds.
     pub heads: u32,
     pub local_heads: u32,
@@ -75,15 +73,6 @@ impl Sparse {
         // The compression reduces over every key tile of the layout, so the layer states the
         // deployment's own tile bound once (`Layouts::tiles_bound`) and the score matrix is sized by
         // it rather than guessed from a layout at launch.
-        let tiles = VsaTiles::new(tile_rows, local_heads, config.head_dim, config.qk_norm_eps)?
-            .with_norm()
-            .with_rotation(rotated)?
-            .with_tile_bound(tile_bound)?;
-        // The fine attention writes the rows the projections produce, so its output type is the
-        // projection's own: the stack's, which is the checkpoint's representation at `auto`. Writing
-        // BF16 here was a constant that agreed with a BF16 deployment and disagreed with every other
-        // one - an FP16 stack would have had its attended rows narrowed to BF16 by a layer that never
-        // asked what the stack was.
         let head_projection = |loader: &mut WeightLoader<'_>, name: &str| {
             HeadProjection::load(
                 loader,
@@ -95,13 +84,20 @@ impl Sparse {
         };
         let query = head_projection(loader, "to_q")?;
         let stack = query.dtype();
-        let fine = SegmentAttention::new(
-            u64::from(tile_rows),
-            u64::from(local_heads),
-            head,
-            u64::from(rows),
-            stack,
-        )?;
+        // The compression reduces over every key tile of the layout, so the layer states the
+        // deployment's own tile bound once (`Layouts::tiles_bound`); the fine attention writes the
+        // rows the projections produce, in the stack's own type.
+        let vsa = VsaAttention::new(VsaSpec {
+            tile_rows,
+            heads: local_heads,
+            head_dim: config.head_dim,
+            qk_norm: true,
+            epsilon: config.qk_norm_eps,
+            rotated,
+            max_tiles: tile_bound,
+            max_keys: rows,
+            output: stack,
+        })?;
         Ok(Self {
             query,
             key: head_projection(loader, "to_k")?,
@@ -116,8 +112,7 @@ impl Sparse {
             )?,
             query_gain,
             key_gain,
-            tiles,
-            fine,
+            vsa,
             heads: config.num_attention_heads,
             local_heads,
             head_dim: config.head_dim,
@@ -163,13 +158,13 @@ impl Sparse {
         // ever saying so.
         let rows = scratch.query.shape.dim(0);
         let shape = Shape::new(&[rows, u64::from(self.local_heads), u64::from(self.head_dim)]);
-        self.tiles.add_gated(
+        self.vsa.add_gated(
             f,
-            scratch.fine.reshape(shape),
-            scratch.compressed,
+            scratch.vsa.fine.reshape(shape),
+            scratch.vsa.compressed,
             scratch.gate.reshape(shape),
         )?;
-        Ok(self.output.forward(f, scratch.fine, out)?)
+        Ok(self.output.forward(f, scratch.vsa.fine, out)?)
     }
 
     /// Whether this layer's rows return from the other members' heads: the layer then runs as
@@ -288,60 +283,20 @@ impl Sparse {
             scratch.key.reshape(shape),
             scratch.value.reshape(shape),
         );
-        self.tiles.prepare(
+        let tables = VsaTables {
+            sizes,
+            segments,
+            keep,
+        };
+        self.vsa.attend(
             f,
             query,
             key,
             value,
-            Some(&self.query_gain),
-            Some(&self.key_gain),
-            Some(factors.cosine),
-            Some(factors.sine),
-            sizes,
-            scratch.pooled_query,
-            scratch.pooled_key,
-            scratch.pooled_value,
-        )?;
-        // `prepare` already stored zeros past each tile's valid size, for all three of Q, K and V,
-        // before it pooled them, so the fine attention reads the
-        // same zeroed rows without a second pass: a `zero_padding` per tensor here would repeat
-        // three launches of every layer of every evaluation to write what is already written.
-        self.tiles
-            .scores(f, scratch.pooled_query, scratch.pooled_key, scratch.scores)?;
-        // `segment_keep` is over-allocated to the tile count and filled by segment index, as the
-        // reference builds it; `select` reads its entries by segment and ignores the rest.
-        self.tiles.select(
-            f,
-            scratch.scores,
-            segments,
-            sizes,
-            keep,
-            scratch.indices,
-            scratch.counts,
-            0,
-        )?;
-
-        // The fine branch reads the selected tiles of the rows in the checkpoint's dtype.
-        let tables = SegmentTables {
-            indices: scratch.indices,
-            counts: scratch.counts,
-            sizes,
-        };
-        // The fine rows are `[rows, heads, width]` for the attention and the fold, and the same
-        // bytes are `[rows, inner]` for the projection that reads them.
-        let fine = scratch.fine.reshape(shape);
-        self.fine.forward(f, query, key, value, &tables, fine)?;
-
-        // Branch 3: one compression per (head, query tile) from the pooled scores and values, a
-        // dense softmax over every *live* key tile in FP32 with one rounding to the rows' dtype. A
-        // tile whose rows are all invalid is masked out of the softmax rather than zeroed - a zeroed
-        // pooled value under a live score would still take weight and scale the others down.
-        self.tiles.compress(
-            f,
-            scratch.scores,
-            scratch.pooled_value,
-            sizes,
-            scratch.compressed,
+            Some((&self.query_gain, &self.key_gain)),
+            Some((factors.cosine, factors.sine)),
+            &tables,
+            &scratch.vsa,
         )?;
         Ok(gate)
     }
@@ -371,7 +326,7 @@ impl Sparse {
         let heads = u64::from(self.local_heads);
         let width = u64::from(self.head_dim);
         let shape = Shape::new(&[members * own, heads, width]);
-        let (fine, gate) = (scratch.fine.reshape(shape), scratch.gate.reshape(shape));
+        let (fine, gate) = (scratch.vsa.fine.reshape(shape), scratch.gate.reshape(shape));
         let slots: Vec<u32> = (0..members as u32).collect();
         let unit = (u64::from(self.tile_rows) / members).max(1);
         let total: u64 = RETURN_SHARES.iter().sum();
@@ -395,11 +350,11 @@ impl Sparse {
                 .returned
                 .at(scratch.returned.offset_elements(at))
                 .reshape(block);
-            self.tiles.compose(
+            self.vsa.compose(
                 f,
                 payload,
                 fine,
-                scratch.compressed,
+                scratch.vsa.compressed,
                 gate,
                 own,
                 first,
@@ -481,14 +436,8 @@ pub struct Scratch {
     pub key: TensorView,
     pub value: TensorView,
     pub gate: TensorView,
-    pub pooled_query: TensorView,
-    pub pooled_key: TensorView,
-    pub pooled_value: TensorView,
-    pub scores: TensorView,
-    pub indices: TensorView,
-    pub counts: TensorView,
-    pub fine: TensorView,
-    pub compressed: TensorView,
+    /// The sparse attention's stage views.
+    pub vsa: VsaScratch,
     /// The exchange's staging buffer, a member's block after another, for this rank's rows.
     pub staging: TensorView,
     /// The staging buffer's twin: a projection's block while the one before it travels, and the
@@ -512,9 +461,7 @@ impl Scratch {
         let dtype = normalized.dtype;
         let rows = u64::from(total_rows);
         let own = normalized.shape.dim(0);
-        let tiles64 = rows / u64::from(layer.tile_rows);
         let inner = u64::from(layer.local_heads) * u64::from(layer.head_dim);
-        let heads = u64::from(layer.local_heads);
         let every = u64::from(layer.heads) * u64::from(layer.head_dim);
         let arena = f.arena();
         // A layer that does not communicate reserves nothing for it: on one rank these views are
@@ -542,31 +489,7 @@ impl Scratch {
             key: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
             value: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
             gate: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            pooled_query: arena.tensor(
-                nn::DType::F32,
-                Shape::new(&[tiles64, heads, u64::from(layer.head_dim)]),
-            )?,
-            pooled_key: arena.tensor(
-                nn::DType::F32,
-                Shape::new(&[tiles64, heads, u64::from(layer.head_dim)]),
-            )?,
-            pooled_value: arena.tensor(
-                nn::DType::F32,
-                Shape::new(&[tiles64, heads, u64::from(layer.head_dim)]),
-            )?,
-            scores: arena.tensor(nn::DType::F32, Shape::new(&[heads, tiles64, tiles64]))?,
-            // The selection is as wide as the scores it comes from: `select` requires the index
-            // matrix to have the scores' shape, and the reference returns one entry per key tile
-            // with the kept ones first.
-            indices: arena.tensor(nn::DType::I32, Shape::new(&[heads, tiles64, tiles64]))?,
-            counts: arena.tensor(nn::DType::I32, Shape::new(&[heads, tiles64]))?,
-            fine: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            // `[heads, tiles, width]`: what `compress` writes and what the gate step reads, one row
-            // per (head, query tile) - every row of a query tile compresses to the same vector.
-            compressed: arena.tensor(
-                dtype,
-                Shape::new(&[heads, tiles64, u64::from(layer.head_dim)]),
-            )?,
+            vsa: VsaScratch::reserve(arena, &layer.vsa, rows, dtype)?,
         })
     }
 }

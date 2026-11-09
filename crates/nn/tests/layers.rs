@@ -10,7 +10,7 @@ use nn::{
     Activation, AdaptivePool, Arena, CausalPad, Conv3d, ConvGeometry, DType, DevicePtr, Epilogue,
     Forward, GateBias, GatedActivation, GroupNorm, Halves, KvGroup, KvPlanes, KvView, LayerNorm,
     Linear, Modulation, Residual, ResidualStream, RmsNorm, Rounding, Scale, Shape, Snake,
-    TensorView, VsaTiles, Weight,
+    TensorView, Weight,
 };
 use ops::gemm::WeightOrder;
 
@@ -339,39 +339,6 @@ fn a_group_normalization_writes_a_frame_no_smaller_than_its_source() {
     assert!(
         norm.forward(&f, values, mean, rstd, view(&[8, 5, 8, 8]))
             .is_err()
-    );
-}
-
-#[test]
-fn the_tile_selection_needs_a_whole_tile_and_a_pair_of_rotated_features() {
-    // The programmes handle BLOCK_ROWS rows at a time, so a tile must be a whole number of them.
-    assert!(VsaTiles::new(64, 8, 128, 1e-6).is_ok());
-    assert!(VsaTiles::new(40, 8, 128, 1e-6).is_err());
-    assert!(VsaTiles::new(64, 0, 128, 1e-6).is_err());
-
-    let layer = VsaTiles::new(64, 8, 128, 1e-6).unwrap();
-    assert_eq!(layer.tile_rows(), 64);
-    assert_eq!(layer.heads(), 8);
-    assert_eq!(layer.width(), 128);
-    assert!(
-        VsaTiles::new(64, 8, 128, 1e-6)
-            .unwrap()
-            .with_rotation(128)
-            .is_ok()
-    );
-    assert!(
-        VsaTiles::new(64, 8, 128, 1e-6)
-            .unwrap()
-            .with_rotation(127)
-            .is_err(),
-        "an odd rotation has no pair"
-    );
-    assert!(
-        VsaTiles::new(64, 8, 128, 1e-6)
-            .unwrap()
-            .with_rotation(256)
-            .is_err(),
-        "the rotation cannot be wider than the features"
     );
 }
 

@@ -27,7 +27,7 @@
 //! [`Sampler`] and [`ParallelLMHead`]; the diffusion and
 //! video models add [`Patchify`](layers::Patchify), [`Copy`](layers::Copy),
 //! [`CrossFade`], [`RgbBytes`],
-//! [`Transpose`](layers::Transpose) and [`SegmentAttention`], and the
+//! [`Transpose`](layers::Transpose) and [`VsaAttention`](layers::VsaAttention), and the
 //! audio path adds
 //! [`Snake`], [`AdaptivePool`] and
 //! [`ChannelAffine`](layers::ChannelAffine). Each holds weight views and geometry, and its forward calls
@@ -78,8 +78,7 @@ pub use layers::{
     ConvGeometry, ConvTranspose1d, CrossFade, Epilogue, FramePad, GateBias, GatedActivation, Gelu,
     GroupNorm, Halves, IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey,
     ParallelLMHead, PcmInterleave, Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding,
-    Sampler, SamplerState, Samples, Scale, SegmentAttention, SegmentTables, Silu, Snake,
-    TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles,
+    Sampler, SamplerState, Samples, Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES, UlyssesExchange,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

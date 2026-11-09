@@ -41,10 +41,9 @@ mod rgb;
 mod rope;
 mod rows;
 mod sampler;
-mod segment;
-mod segments;
 mod tile_stitch;
 mod transpose;
+mod vsa;
 
 pub use activation::{GateBias, GatedActivation, Gelu, Halves, Rounding, Silu, Snake};
 pub use affine::ChannelAffine;
@@ -77,10 +76,9 @@ pub use rgb::RgbBytes;
 pub use rope::{Gains, Precision, QkNorm, Rotary, RotarySpec, Sections, Spectrum, Yarn};
 pub use rows::IndexRows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
-pub use segment::{SegmentAttention, SegmentTables};
-pub use segments::{SELECT_FLOOR, VsaTiles};
 pub use tile_stitch::{TileGrid, TileStitch};
 pub use transpose::Transpose;
+pub use vsa::{VsaAttention, VsaScratch, VsaSpec, VsaTables};
 
 /// The constants a layer's operator descriptor carries and the program package owns.
 ///

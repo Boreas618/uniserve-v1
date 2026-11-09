@@ -722,7 +722,7 @@ impl Transformer {
     ) -> Result<Self> {
         // A sparse deployment's key-tile bound is a statement about the deployment (`Layouts::
         // tiles_bound`), and every layer that compresses reduces over it. Zero is legal only for a
-        // dense stack, where nothing reads it: a sparse stack holding zero would hand `VsaTiles` a
+        // dense stack, where nothing reads it: a sparse stack holding zero would hand `VsaAttention` a
         // bound of nothing, and the descriptor a plan reads would name a reduction over no tiles
         // rather than refuse. A caller that passes zero for a sparse deployment is refused here
         // instead of one layer later.
