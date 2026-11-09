@@ -39,7 +39,7 @@ pub enum ConfigError {
     Video(#[source] serde_json::Error),
     /// The image and video processors patch differently.
     #[error("the image and video processors disagree on the patch geometry")]
-    Geometry,
+    Patching,
 }
 
 /// Media the processor cannot size, named in request terms.
@@ -139,15 +139,16 @@ impl ProcessorConfig {
         )
     }
 
-    /// The geometry the image and video processor files state, which must patch alike.
+    /// The patching and pixel bounds the image and video processor files state, which must patch
+    /// alike.
     fn of_files(
         image: ProcessorFile,
         video: ProcessorFile,
     ) -> std::result::Result<Self, ConfigError> {
-        let geometry =
+        let patching =
             |file: &ProcessorFile| (file.patch_size, file.temporal_patch_size, file.merge_size);
-        if geometry(&image) != geometry(&video) {
-            return Err(ConfigError::Geometry);
+        if patching(&image) != patching(&video) {
+            return Err(ConfigError::Patching);
         }
         Ok(Self {
             patch_size: image.patch_size,
@@ -379,7 +380,7 @@ mod tests {
                 "size": {"shortest_edge": 1, "longest_edge": 2}}"#,
         )
         .expect_err("two patch sizes");
-        assert!(matches!(error, ConfigError::Geometry), "{error}");
+        assert!(matches!(error, ConfigError::Patching), "{error}");
     }
 
     #[test]

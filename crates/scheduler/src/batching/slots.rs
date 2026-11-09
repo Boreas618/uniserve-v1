@@ -23,24 +23,11 @@
 //! which shape the worker captures is its decision, and either reads the slot
 //! numbers this module computes.
 //!
-//! The mapping is a pure function of a table, the group's page geometry and the
+//! The mapping is a pure function of a table, the group's page size and the
 //! positions of the tokens a call evaluates, which is why it lives here rather
 //! than in the call-building code.
 
 use std::ops::Range;
-
-/// A cache group's page shape, as the worker reported it (`ipc::CacheGroup`).
-///
-/// Only `block_size` is needed to turn a position into a slot; `units_per_page`
-/// is carried so the mapping can refuse a page shape it cannot address (see
-/// [`slot_mapping`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct PageGeometry {
-    /// Tokens one logical page holds.
-    pub block_size: u32,
-    /// Physical units one logical page occupies.
-    pub units_per_page: u32,
-}
 
 /// The slot each position of `positions` writes through `table`.
 ///
@@ -55,18 +42,19 @@ pub(crate) struct PageGeometry {
 /// - a position lies before `start_page` or past the table's last page, which is
 ///   a planning fault rather than something to clamp: a batch must not write a
 ///   slot it does not hold;
-/// - the page geometry is unusable — `block_size == 0`, or `units_per_page != 1`.
-///   A page of several units holds different layers' columns in each unit, so
-///   one slot number per token addresses one of them; the kernels index one unit
-///   per page today, and a multi-unit page needs a column per unit, which is a
-///   decision for the worker rather than a guess here.
+/// - `block_size == 0`, a page that holds no token.
+///
+/// `block_size` is the tokens one logical page holds, and a page occupies one
+/// cache unit: the caller refuses a group of several units per page, whose
+/// units each hold different layers' columns, so one slot number per token
+/// cannot address them.
 #[cfg(test)]
 pub(crate) fn slot_mapping(
     table: &ipc::BlockTable,
-    page: PageGeometry,
+    block_size: u32,
     positions: Range<u32>,
 ) -> Option<Vec<i32>> {
-    slot_mapping_where(table, page, positions, |_| true)
+    slot_mapping_where(table, block_size, positions, |_| true)
 }
 
 /// The absolute positions of the query tokens a call evaluates: its first
@@ -123,14 +111,14 @@ pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Ve
 /// outside the table is still a fault rather than a `-1`.
 pub(crate) fn slot_mapping_where(
     table: &ipc::BlockTable,
-    page: PageGeometry,
+    block_size: u32,
     positions: Range<u32>,
     writes: impl Fn(u32) -> bool,
 ) -> Option<Vec<i32>> {
-    if page.block_size == 0 || page.units_per_page != 1 {
+    if block_size == 0 {
         return None;
     }
-    let block_size = u64::from(page.block_size);
+    let block_size = u64::from(block_size);
     let start_page = u64::from(table.start_page);
     // The table's end page is the first page it does not cover: its absolute
     // token extent over the page size.
@@ -240,14 +228,8 @@ pub(crate) fn logits_rows_of(
 mod tests {
     use super::*;
 
-    /// Four tokens per page, one unit per page: the geometry every token group
-    /// reports today.
-    fn page() -> PageGeometry {
-        PageGeometry {
-            block_size: 4,
-            units_per_page: 1,
-        }
-    }
+    /// Four tokens per page.
+    const BLOCK_SIZE: u32 = 4;
 
     /// A table covering pages 2..5 (positions 8..20) whose units are 7, 9 and
     /// 10 — not contiguous, because the pool assigns what it has.
@@ -266,41 +248,32 @@ mod tests {
         // Position 8 is page 2's first token, so unit 7's first slot; position
         // 11 is its last; position 12 opens unit 9.
         assert_eq!(
-            slot_mapping(&table(), page(), 8..14).unwrap(),
+            slot_mapping(&table(), BLOCK_SIZE, 8..14).unwrap(),
             vec![7 * 4, 7 * 4 + 1, 7 * 4 + 2, 7 * 4 + 3, 9 * 4, 9 * 4 + 1]
         );
         assert_eq!(
-            slot_mapping(&table(), page(), 19..20).unwrap(),
+            slot_mapping(&table(), BLOCK_SIZE, 19..20).unwrap(),
             vec![10 * 4 + 3],
             "the last token the table covers"
         );
-        assert!(slot_mapping(&table(), page(), 8..8).unwrap().is_empty());
+        assert!(slot_mapping(&table(), BLOCK_SIZE, 8..8).unwrap().is_empty());
     }
 
     #[test]
     fn a_position_outside_the_table_has_no_slot() {
         // Before the table's first page, and past its last.
-        assert_eq!(slot_mapping(&table(), page(), 7..9), None);
-        assert_eq!(slot_mapping(&table(), page(), 19..21), None);
+        assert_eq!(slot_mapping(&table(), BLOCK_SIZE, 7..9), None);
+        assert_eq!(slot_mapping(&table(), BLOCK_SIZE, 19..21), None);
     }
 
     #[test]
     fn a_page_shape_the_kernels_cannot_address_has_no_slot() {
-        let multi_unit = PageGeometry {
-            block_size: 4,
-            units_per_page: 2,
-        };
-        assert_eq!(slot_mapping(&table(), multi_unit, 8..9), None);
-        let no_tokens = PageGeometry {
-            block_size: 0,
-            units_per_page: 1,
-        };
-        assert_eq!(slot_mapping(&table(), no_tokens, 8..9), None);
+        assert_eq!(slot_mapping(&table(), 0, 8..9), None);
         let empty = ipc::BlockTable {
             unit_ids: Vec::new(),
             ..table()
         };
-        assert_eq!(slot_mapping(&empty, page(), 8..9), None);
+        assert_eq!(slot_mapping(&empty, BLOCK_SIZE, 8..9), None);
     }
 
     /// A call of `kind` with the consumer slots a sampling call has.
@@ -391,16 +364,16 @@ mod tests {
     fn a_token_the_mechanism_does_not_write_states_minus_one() {
         // Page 2's four tokens (8..12, unit 7), writing only the even positions.
         let slots =
-            slot_mapping_where(&table(), page(), 8..12, |position| position % 2 == 0).unwrap();
+            slot_mapping_where(&table(), BLOCK_SIZE, 8..12, |position| position % 2 == 0).unwrap();
         assert_eq!(slots, vec![7 * 4, -1, 7 * 4 + 2, -1]);
         // Writing nothing is still a slot decision, not a fault.
         assert_eq!(
-            slot_mapping_where(&table(), page(), 8..10, |_| false).unwrap(),
+            slot_mapping_where(&table(), BLOCK_SIZE, 8..10, |_| false).unwrap(),
             vec![-1, -1]
         );
         // A position outside the table stays a fault whatever the write flag.
         assert_eq!(
-            slot_mapping_where(&table(), page(), 19..21, |_| false),
+            slot_mapping_where(&table(), BLOCK_SIZE, 19..21, |_| false),
             None
         );
     }

@@ -21,6 +21,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ipc::{PhaseId, TimingCounters};
+use nn::family::TextModel;
 use nn::{CausalLm, Forward, KvView, TokenBatch};
 use ops::{DType, Generation, TensorView};
 use platform::DeviceId;
@@ -343,26 +344,11 @@ impl Staging {
     }
 }
 
-/// The model's geometry: what the runner sizes a bucket's plan and the sampler from.
-#[derive(Clone, Copy, Debug)]
-pub struct Geometry {
-    /// The width of a hidden-state row.
-    pub hidden: u32,
-    /// The element type the model's forward reads and writes hidden states in.
-    pub hidden_dtype: DType,
-    /// The element type the head writes logits in.
-    pub logits_dtype: DType,
-    /// The vocabulary width of a logit row.
-    pub vocabulary: u32,
-    /// How many request slots the deployment serves: the sampler's penalty-count table's height.
-    pub slots: u32,
-    /// The largest top-k width a request may ask for: the sampler's candidate width.
-    pub width: u32,
-    /// Tokens per KV page.
-    pub page_size: u32,
-    /// The bound on the keys a row reads: the attention descriptor's reduction length.
-    pub max_kv_len: u32,
-}
+/// The element type the head writes logits in.
+///
+/// A logit row is written in f32: the sampler and the read-back both read it, and the head's own
+/// precision would decide a token from the last bit.
+const LOGITS_DTYPE: DType = DType::F32;
 
 /// The batch columns of every bucket of one runner, sized for the largest bucket it serves.
 struct Columns {
@@ -561,7 +547,7 @@ fn inert_commit(rows: usize) -> Vec<i64> {
     table
 }
 
-/// The descriptor a plain decode step's commit uses, from the table's capacity and the geometry.
+/// The descriptor a plain decode step's commit uses, from the table's capacity and the vocabulary.
 ///
 /// `ops::commit` checks the table's leading stride against `stride`, every operand's type against
 /// `index`, and the block against `count`; the arithmetic is here, once, so a host test can state it
@@ -1285,15 +1271,18 @@ struct Sampling {
 }
 
 impl Sampling {
-    /// The sampler and its zeroed count table for `geometry`.
-    fn new(device: DeviceId, stream: &platform::Stream, geometry: Geometry) -> Result<Self> {
-        let sampler = Sampler::new(
-            geometry.vocabulary,
-            geometry.slots,
-            geometry.width.min(geometry.vocabulary),
-            0,
-        )?;
-        let bytes = u64::from(geometry.slots) * u64::from(geometry.vocabulary) * 4;
+    /// The sampler and its zeroed count table for `slots` request slots over `vocabulary` tokens.
+    ///
+    /// A request may ask for any top-k it likes, so the candidate width is the vocabulary: a
+    /// narrower buffer would silently sample a different set.
+    fn new(
+        device: DeviceId,
+        stream: &platform::Stream,
+        vocabulary: u32,
+        slots: u32,
+    ) -> Result<Self> {
+        let sampler = Sampler::new(vocabulary, slots, vocabulary, 0)?;
+        let bytes = u64::from(slots) * u64::from(vocabulary) * 4;
         let allocation = platform::DeviceAllocation::linear(
             device,
             usize::try_from(bytes).map_err(|_| {
@@ -1326,7 +1315,7 @@ impl Sampling {
         let counts = TensorView::new(
             ops::DevicePtr::new(allocation.address()),
             DType::I32,
-            ops::Shape::new(&[u64::from(geometry.slots), u64::from(geometry.vocabulary)]),
+            ops::Shape::new(&[u64::from(slots), u64::from(vocabulary)]),
         );
         Ok(Self {
             sampler,
@@ -1580,7 +1569,7 @@ struct PendingInstall {
 }
 
 /// A causal language model's runner: one block's decode and prefill phases.
-pub struct CausalLmRunner<M: CausalLm> {
+pub struct CausalLmRunner<M: TextModel> {
     /// The worker's name for this runner.
     id: RunnerId,
     /// The phases it serves, in scheduler order.
@@ -1614,8 +1603,12 @@ pub struct CausalLmRunner<M: CausalLm> {
     stream: platform::Stream,
     /// Where shadow execution's twins live, allocated at bind, before the first capture.
     shadow: Option<crate::shadow::Shadow>,
-    /// The model's geometry: hidden width, logits width, page size and the sampler's bounds.
-    geometry: Geometry,
+    /// How many request slots the deployment serves: the height of the sampler's penalty-count
+    /// table and of the token-state commit's table.
+    slots: u32,
+    /// The bound on the keys a row reads: the attention descriptor's reduction length, the
+    /// deployment's longest sequence.
+    max_kv_len: u32,
     /// Every bucket's per-step columns, whom the captured graphs address directly.
     columns: Columns,
     /// The token-state commit's operands, written per batch and launched inside the capture.
@@ -1702,7 +1695,7 @@ pub struct CausalLmRunner<M: CausalLm> {
 /// A rank's runners must all read the same weights, and a model is not copyable (it holds the
 /// checkpoint's mapped tensors), so the engine gives each device's runner a share of the one model
 /// it loaded. Delegation keeps the model type out of the worker: a runner is generic over
-/// `nn::CausalLm`, and this is that trait over a shared object.
+/// `nn::family::TextModel`, and this is that trait over a shared object.
 pub struct Shared<M: ?Sized>(Arc<M>);
 
 impl<M: ?Sized> Shared<M> {
@@ -1752,18 +1745,49 @@ impl<M: CausalLm + ?Sized> CausalLm for Shared<M> {
     }
 }
 
-impl<M: CausalLm> CausalLmRunner<M> {
+impl<M: TextModel + ?Sized> TextModel for Shared<M> {
+    fn hidden(&self) -> u32 {
+        self.0.hidden()
+    }
+
+    fn vocabulary(&self) -> u32 {
+        self.0.vocabulary()
+    }
+
+    fn dtype(&self) -> DType {
+        self.0.dtype()
+    }
+
+    fn cache(&self) -> nn::family::CacheShape {
+        self.0.cache()
+    }
+
+    fn experts(&self) -> Option<nn::family::ExpertShape> {
+        self.0.experts()
+    }
+}
+
+impl<M: TextModel> CausalLmRunner<M> {
     /// A runner for the block's phases on `device`, serving `generation`.
     ///
-    /// It captures nothing here: the device worker's warmup captures every bucket after the
-    /// runner is bound, largest first, so the pools' plans exist before serving starts.
+    /// The model states its hidden width, activation type and vocabulary, and `kv` its page size;
+    /// `slots` is the deployment's request slots and `max_kv_len` its longest sequence, the
+    /// attention descriptor's static key bound. It captures nothing here: the device worker's
+    /// warmup captures every bucket after the runner is bound, largest first, so the pools' plans
+    /// exist before serving starts.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the binding, the model, its generation and buckets, its cache, the deployment's \
+                  two bounds and the sampler's seed are independent inputs"
+    )]
     pub fn new(
         binding: Binding,
         model: M,
         generation: Arc<Generation>,
         buckets: Buckets,
-        geometry: Geometry,
         kv: Box<dyn KvProvider>,
+        slots: u32,
+        max_kv_len: u32,
         seed: u64,
     ) -> Result<Self> {
         let Binding {
@@ -1775,7 +1799,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let mut staging = Staging::new();
         staging.reserve(&buckets)?;
         let commit_rows = largest_rows(&buckets)?;
-        let columns = Columns::new(device, &buckets, geometry.vocabulary)?;
+        let columns = Columns::new(device, &buckets, model.vocabulary())?;
         // One contract, checked once, before any bucket is captured: the attention program states
         // how many pages a row of the block table holds (`ceil(max_kv_len / page_size)`), and the
         // cache allocates rows of its own width. A program that states more pages than a row holds
@@ -1788,27 +1812,27 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .tables()
                 .width();
-            let pages = usize::try_from(geometry.max_kv_len.div_ceil(kv.page_size().max(1)))
-                .unwrap_or(usize::MAX);
+            let pages =
+                usize::try_from(max_kv_len.div_ceil(kv.page_size().max(1))).unwrap_or(usize::MAX);
             if width < pages {
                 return Err(Error::Invariant(format!(
                     "the cache's block-table rows are {width} pages wide and the attention \
-                     program's geometry needs {pages} (max_kv_len {} over {} tokens per page): a row \
+                     program's key bound needs {pages} (max_kv_len {} over {} tokens per page): a row \
                      this program addresses reads pages it does not own",
-                    geometry.max_kv_len,
+                    max_kv_len,
                     kv.page_size()
                 )));
             }
             tracing::info!(
                 width,
                 pages,
-                max_kv_len = geometry.max_kv_len,
+                max_kv_len = max_kv_len,
                 page_size = kv.page_size(),
                 "the block table is wide enough for the pages the attention program addresses"
             );
         }
         let sampling = if buckets.iter().any(|bucket| bucket.variant.samples()) {
-            Some(Sampling::new(device, &stream, geometry)?)
+            Some(Sampling::new(device, &stream, model.vocabulary(), slots)?)
         } else {
             None
         };
@@ -1825,9 +1849,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
             device,
             stream,
             shadow: None,
-            geometry,
+            slots,
+            max_kv_len,
             columns,
-            commit: CommitColumns::new(device, commit_rows, geometry.slots)?,
+            commit: CommitColumns::new(device, commit_rows, slots)?,
             sampling,
             bucket_samples: std::cell::RefCell::new(HashMap::new()),
             cache_page: None,
@@ -1924,7 +1949,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
     }
 }
 
-impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
+impl<M: TextModel> Runner for CausalLmRunner<M> {
     fn cache(&self) -> Option<Arc<std::sync::Mutex<crate::memory::prefix_cache::PrefixCache>>> {
         self.kv.cache().cloned()
     }
@@ -2566,7 +2591,7 @@ impl<M: CausalLm + Send> Runner for CausalLmRunner<M> {
     }
 }
 
-impl<M: CausalLm> CausalLmRunner<M> {
+impl<M: TextModel> CausalLmRunner<M> {
     /// Captures one bucket of `generation` (4.5): the walk runs here, the lifecycle keeps the graph.
     ///
     /// The walk is this class's alone - it stages the bucket's columns, runs the model's forward and
@@ -2678,8 +2703,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // equal the last of `query_offsets` and the tokens the calls own, and a capture where
             // those three disagree is an operand no descriptor can match.
             live_tokens = self.staging.live_tokens(),
-            page_size = self.geometry.page_size,
-            max_kv_len = self.geometry.max_kv_len,
+            page_size = self.kv.page_size(),
+            max_kv_len = self.max_kv_len,
             "a bucket's warm pose"
         );
         if runner_dump() {
@@ -2800,9 +2825,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             .map(|word| u64::from_ne_bytes(word.try_into().unwrap_or([0; 8])))
             .unwrap_or(0);
         let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
-        let hidden = usize::try_from(self.geometry.hidden).unwrap_or(0);
-        let element =
-            usize::try_from(self.geometry.hidden_dtype.bytes().unwrap_or(2).max(1)).unwrap_or(2);
+        let hidden = usize::try_from(self.model.hidden()).unwrap_or(0);
+        let element = usize::try_from(self.model.dtype().bytes().unwrap_or(2).max(1)).unwrap_or(2);
         let read = self.read_device(wrote, live.saturating_mul(hidden).saturating_mul(element));
         match read {
             Some(raw) if wrote != 0 => tracing::warn!(
@@ -2987,7 +3011,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         };
         let pages = u32::try_from(reach)
             .unwrap_or(0)
-            .div_ceil(self.geometry.page_size.max(1))
+            .div_ceil(self.kv.page_size().max(1))
             .max(1);
         let capacity = self.kv.scratch_capacity();
         if bucket.rows.saturating_mul(pages) > capacity {
@@ -3017,8 +3041,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             forward = forward.with_group(group);
         }
         let hidden = arena.tensor(
-            self.geometry.hidden_dtype,
-            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
+            self.model.dtype(),
+            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.model.hidden())]),
         )?;
         let slots: Vec<i32> = self.staging.slots(rows).to_vec();
         let ids = self.input_ids(bucket);
@@ -3068,7 +3092,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 logits.dtype
             )));
         }
-        let width = u64::from(self.geometry.vocabulary);
+        let width = u64::from(self.model.vocabulary());
         let row_bytes = (width * 4) as usize;
         if row_bytes > self.columns.logits_row.len() {
             return Err(Error::Invariant(
@@ -3293,7 +3317,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             let id = *id;
             id < 0
                 || u64::try_from(id)
-                    .map(|id| id >= self.geometry.vocabulary as u64)
+                    .map(|id| id >= self.model.vocabulary() as u64)
                     .unwrap_or(true)
         }) {
             // `-1` is the sentinel the dump fills the sampler's buffer with, so it says which of the
@@ -3308,7 +3332,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             };
             return Err(Error::Invariant(format!(
                 "row {row} sampled token {} outside the vocabulary of {}: {why}",
-                ids[row], self.geometry.vocabulary
+                ids[row],
+                self.model.vocabulary()
             )));
         }
         let states = states_of(
@@ -3366,7 +3391,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let tokens = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
         let page_of_slot = |slot: i32| -> Option<u32> {
             let slot = u32::try_from(slot).ok()?;
-            (self.geometry.page_size > 0).then(|| slot / self.geometry.page_size)
+            (self.kv.page_size() > 0).then(|| slot / self.kv.page_size())
         };
         let spelled = |values: &[i32], count: usize| -> String {
             let take = values.len().min(count);
@@ -4145,9 +4170,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
         const LAYER_PROBE_NODES: usize = 64;
 
         let live = usize::try_from(self.staging.live_tokens()).unwrap_or(0);
-        let hidden = usize::try_from(self.geometry.hidden).unwrap_or(0);
-        let element =
-            usize::try_from(self.geometry.hidden_dtype.bytes().unwrap_or(2).max(1)).unwrap_or(2);
+        let hidden = usize::try_from(self.model.hidden()).unwrap_or(0);
+        let element = usize::try_from(self.model.dtype().bytes().unwrap_or(2).max(1)).unwrap_or(2);
         let width = live.saturating_mul(hidden).saturating_mul(element);
         if live == 0 || width == 0 {
             return " probes=none".to_owned();
@@ -4623,7 +4647,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
              live_tokens={} calls={calls} slots={slots:?} page_size={} max_kv_len={}",
             self.staging.live_tokens(),
             self.kv.page_size(),
-            self.geometry.max_kv_len,
+            self.max_kv_len,
         );
         // The page table's row, from the column the kernel addresses.
         match self.kv.block_table_view(0, &slots) {
@@ -4778,7 +4802,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             live,
             tokens,
             pages,
-            self.geometry.page_size,
+            self.kv.page_size(),
         )?;
         encode_i32(&mut self.encoded, &mapping);
         self.columns.scratch_slots.write(&self.encoded)?;
@@ -4811,9 +4835,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
                 true => ops::PhaseKind::Decode,
                 false => ops::PhaseKind::Prefill,
             },
-            page_size: self.geometry.page_size,
+            page_size: self.kv.page_size(),
             num_tokens: bucket.tokens,
-            max_kv_len: self.geometry.max_kv_len,
+            max_kv_len: self.max_kv_len,
             draft_lens: None,
         })
     }
@@ -4932,8 +4956,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
     fn step(&self, forward: &Forward<'_>, bucket: Bucket) -> Result<()> {
         let batch = self.token_batch(bucket)?;
         let hidden = forward.arena().tensor(
-            self.geometry.hidden_dtype,
-            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.geometry.hidden)]),
+            self.model.dtype(),
+            ops::Shape::new(&[u64::from(bucket.tokens), u64::from(self.model.hidden())]),
         )?;
         let slots: Vec<i32> = self.staging.slots(bucket.rows as usize).to_vec();
         let ids = self.input_ids(bucket);
@@ -5093,8 +5117,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
         // batch contents - its warm pose states a zeroed parameter column, which reads as a greedy
         // row - so the check here would refuse a sampled bucket its own capture.
         let gathered = arena.tensor(
-            self.geometry.hidden_dtype,
-            ops::Shape::new(&[rows, u64::from(self.geometry.hidden)]),
+            self.model.dtype(),
+            ops::Shape::new(&[rows, u64::from(self.model.hidden())]),
         )?;
         // The indices are the same defect one operator earlier: `IndexRows::gather` takes a flat `[count]`
         // view and derives `count` from the gathered rows, so the column's own extent - the largest
@@ -5108,8 +5132,8 @@ impl<M: CausalLm> CausalLmRunner<M> {
             )
             .map_err(Error::from)?;
         let logits = arena.tensor(
-            self.geometry.logits_dtype,
-            ops::Shape::new(&[rows, u64::from(self.geometry.vocabulary)]),
+            LOGITS_DTYPE,
+            ops::Shape::new(&[rows, u64::from(self.model.vocabulary())]),
         )?;
         self.model
             .logits(forward, gathered, logits)
@@ -5181,9 +5205,9 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let descriptor = commit_descriptor(
             self.commit.capacity,
             self.commit.block,
-            self.geometry.vocabulary,
+            self.model.vocabulary(),
         );
-        let slots = u64::from(self.geometry.slots.max(1));
+        let slots = u64::from(self.slots.max(1));
         let args = ops::commit::CommitArgs {
             columns: self.commit.table_view(),
             tokens: samples.tokens,
@@ -5245,14 +5269,14 @@ impl<M: CausalLm> CausalLmRunner<M> {
             // are `-1` commits nothing, and the launch is still recorded, so a serving replay of
             // this bucket runs the operator over the bucket's rows and advances nothing.
             commit: inert_commit(if bucket.variant.is_decode() { rows } else { 1 }),
-            // The geometry the upload hands the model, and the same two values the serving pose
-            // states (`token_batch_with`): a captured node's page size and key bound are its own,
-            // so a warm pose that stated its own would freeze a page of one token and a reduction
+            // The page size and key bound the upload hands the model, the same two values the
+            // serving pose states (`token_batch_with`): a captured node's page size and key bound
+            // are its own, so a warm pose that stated its own would freeze a page of one token and a reduction
             // of one key into the graph every served batch then replays. `page_size` is the
-            // cache's and `max_kv_len` the model's; neither is a property of a bucket, so no pose
+            // cache's and `max_kv_len` the deployment's; neither is a property of a bucket, so no pose
             // states one of its own.
-            page_size: self.geometry.page_size,
-            max_kv_len: self.geometry.max_kv_len,
+            page_size: self.kv.page_size(),
+            max_kv_len: self.max_kv_len,
         };
         self.staging
             .stage(&columns, &warm_call_ids(bucket), &bucket.shape(), bucket)

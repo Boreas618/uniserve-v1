@@ -14,7 +14,6 @@
 
 use ops::conv::{
     Args, Conv1d as Conv1dOp, Conv3d as Conv3dOp, ConvTranspose1d as ConvTranspose1dOp, Descriptor,
-    Geometry,
 };
 use ops::frame;
 use ops::{Shape, Strides, TensorView};
@@ -137,21 +136,12 @@ impl<const N: usize> ConvSpec<N> {
         }
     }
 
-    /// The operator's three-axis statement of the spec: a 1-d convolution's length is the first
-    /// spatial axis, and its other two axes are a filter of one with no padding.
-    fn geometry(&self) -> Geometry {
-        let lift = |values: &[u32; N], fill: u32| {
-            let mut axes = [fill; 3];
-            axes[..N].copy_from_slice(values);
-            axes
-        };
-        Geometry {
-            kernel: lift(&self.kernel, 1),
-            stride: lift(&self.stride, 1),
-            padding: lift(&self.padding, 0),
-            dilation: lift(&self.dilation, 1),
-            groups: self.groups,
-        }
+    /// `values` over the operator's three spatial axes: a 1-d convolution's length is the first
+    /// axis, and the axes past `N` take `fill` (a filter, stride and dilation of one, no padding).
+    fn axes(values: &[u32; N], fill: u32) -> [u32; 3] {
+        let mut axes = [fill; 3];
+        axes[..N].copy_from_slice(values);
+        axes
     }
 
     /// Refuse a spec no convolution has.
@@ -263,7 +253,11 @@ impl<const N: usize> Convolution<N> {
             input: input.dtype,
             weight: self.weight.dtype(),
             output: out.dtype,
-            geometry: self.spec.geometry(),
+            kernel: ConvSpec::axes(&self.spec.kernel, 1),
+            stride: ConvSpec::axes(&self.spec.stride, 1),
+            padding: ConvSpec::axes(&self.spec.padding, 0),
+            dilation: ConvSpec::axes(&self.spec.dilation, 1),
+            groups: self.spec.groups,
             bias: self.bias.is_some(),
             tf32: self.spec.tf32,
             channels_last: self.spec.channels_last,

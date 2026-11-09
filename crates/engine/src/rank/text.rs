@@ -3,12 +3,12 @@
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result, bail};
-use ops::{DType, Generation};
+use ops::Generation;
 use platform::DeviceId;
 use worker::memory::Memory;
 use worker::plan::Variant;
 use worker::runner::{Binding, NamedRunner, RunnerId};
-use worker::runners::causal_lm::{CausalLmRunner, Geometry, KvProvider, Shared};
+use worker::runners::causal_lm::{CausalLmRunner, KvProvider, Shared};
 use worker::runners::resident::ResidentCache;
 
 use super::buckets::served_phases;
@@ -66,22 +66,9 @@ impl ModelRunner {
         }
         {
             {
-                let geometry = Geometry {
-                    hidden: model.hidden(),
-                    hidden_dtype: model.dtype(),
-                    // A logit row is written in f32: the sampler and the read-back both read it,
-                    // and the head's own precision would decide a token from the last bit.
-                    logits_dtype: DType::F32,
-                    vocabulary: model.vocabulary(),
-                    slots: u32::try_from(self.engine_config().max_running_requests.get())
-                        .context("more request slots than the protocol addresses")?,
-                    // A request may ask for any top-k it likes, so the candidate width is the
-                    // vocabulary: a narrower buffer would silently sample a different set.
-                    width: model.vocabulary(),
-                    // The deployment's page, which the resident cache was planned with.
-                    page_size: super::memory::PAGE_TOKENS,
-                    max_kv_len: self.engine_config().model.max_model_len,
-                };
+                // The sampler's penalty table holds a row per request slot the deployment serves.
+                let slots = u32::try_from(self.engine_config().max_running_requests.get())
+                    .context("more request slots than the protocol addresses")?;
                 let stream = platform::Stream::new(device)
                     .with_context(|| format!("creating device {}'s stream", device.0))?;
                 let rows = self
@@ -104,8 +91,11 @@ impl ModelRunner {
                     Shared::new(Arc::clone(model)),
                     Arc::clone(generation),
                     self.buckets.clone(),
-                    geometry,
                     provider,
+                    slots,
+                    // The attention descriptor's static key bound: the deployment's longest
+                    // sequence, which the resident cache's block-table rows were sized for.
+                    self.engine_config().model.max_model_len,
                     // A seed that changes with the process, so two runs of one deployment are not
                     // the same run.
                     seed(),

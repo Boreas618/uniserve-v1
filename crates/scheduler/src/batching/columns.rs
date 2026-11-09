@@ -56,7 +56,7 @@ use ::worker::batch::{BatchColumns, BatchRow, BatchRows, RowKind, commit};
 use ipc::{Call, CallKind, ForwardMode};
 use proto::request::SamplingParams;
 
-use super::slots::{self, PageGeometry};
+use super::slots;
 use crate::worker::RequestDispatch;
 
 /// The kind of row a call occupies in a token batch, or `None` for a call a
@@ -125,7 +125,7 @@ const TEMPERATURE_COLUMN: usize = 0;
 /// draws it has made, which an explicit or a verification row installs as the
 /// device state's sampling position.
 ///
-/// `page` is the cache's page geometry and `max_kv_len` the attention
+/// `block_size` is the tokens one cache page holds and `max_kv_len` the attention
 /// descriptor's static bound on a sequence, both of which the mechanism states
 /// to the worker rather than letting each side derive them.
 ///
@@ -134,14 +134,14 @@ const TEMPERATURE_COLUMN: usize = 0;
 /// model's several KV kinds) would need the batch to name its group before this
 /// could address the others. Until then the first group is the only one, and
 /// `None` says so rather than mapping through a group the batch does not own.
-/// The same holds of the page geometry the caller passes.
+/// The same holds of the page size the caller passes.
 pub(crate) fn columns(
     requests: &[(Call, RequestDispatch)],
     tables: &[Vec<crate::IpcBlockTable>],
     inputs: &[Vec<i32>],
     sampling: &[&SamplingParams],
     draws: &[u32],
-    page: PageGeometry,
+    block_size: u32,
     max_kv_len: u32,
 ) -> Option<BatchColumns> {
     if requests.len() != inputs.len()
@@ -210,7 +210,7 @@ pub(crate) fn columns(
             .find(|table| table.group_id == 0)?;
         let mapped = slots::slot_mapping_where(
             table,
-            page,
+            block_size,
             first..first.checked_add(tokens_of_call)?,
             |position| {
                 let offset = usize::try_from(position - first).unwrap_or(usize::MAX);
@@ -357,7 +357,7 @@ pub(crate) fn columns(
         slots,
         parameters,
         commit,
-        page_size: page.block_size,
+        page_size: block_size,
         max_kv_len,
     })
 }
@@ -430,14 +430,8 @@ mod tests {
     use super::*;
     use crate::worker::WorkerGroupId;
 
-    /// Four tokens per page, one unit per page: the geometry every token group
-    /// reports today.
-    fn page() -> PageGeometry {
-        PageGeometry {
-            block_size: 4,
-            units_per_page: 1,
-        }
-    }
+    /// Four tokens per page.
+    const BLOCK_SIZE: u32 = 4;
 
     /// A table covering pages 2..5 (positions 8..20) whose units are 7, 9 and
     /// 10.
@@ -557,7 +551,7 @@ mod tests {
             &[vec![42]],
             &[&sampling()],
             &[5],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a decode batch");
@@ -614,7 +608,7 @@ mod tests {
             &[vec![1, 2, 3, 4]],
             &[&sampling()],
             &[2],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a prefill batch");
@@ -659,7 +653,7 @@ mod tests {
             &[vec![5, 6]],
             &[&neutral],
             &[7],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a chunked prefill batch");
@@ -699,7 +693,7 @@ mod tests {
             &[vec![7, 8, 9]],
             &[&sampling()],
             &[4],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a verify batch");
@@ -753,7 +747,7 @@ mod tests {
             &[vec![1, 2], vec![3], vec![4, 5]],
             &[&sampling(), &sampling(), &sampling()],
             &[0, 0, 0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a mixed batch");
@@ -786,7 +780,7 @@ mod tests {
                 &[vec![1]],
                 &[&sampling()],
                 &[0],
-                page(),
+                BLOCK_SIZE,
                 2048,
             )
             .is_none()
@@ -803,7 +797,7 @@ mod tests {
                 &[vec![1, 2, 3, 4]],
                 &[&sampling()],
                 &[0],
-                page(),
+                BLOCK_SIZE,
                 2048,
             )
             .is_none()
@@ -813,7 +807,7 @@ mod tests {
     #[test]
     fn an_empty_batch_states_its_geometry_and_nothing_else() {
         let columns =
-            columns(&[], &[], &[], &[], &[], page(), 2048).expect("an empty batch is a batch");
+            columns(&[], &[], &[], &[], &[], BLOCK_SIZE, 2048).expect("an empty batch is a batch");
         assert_eq!(columns.rows(), 0);
         assert_eq!(columns.tokens(), 0);
         assert!(columns.rows.query_offsets.is_empty() || columns.rows.query_offsets == vec![0]);
@@ -836,7 +830,7 @@ mod tests {
             &inputs,
             &[&sampling(), &sampling()],
             &[0, 0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a prefill batch");
@@ -896,7 +890,7 @@ mod tests {
             &[vec![1, 2, 3], vec![4, 5]],
             &[&sampling(), &sampling()],
             &[0, 0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a chunk and the chunk that ends a prompt");
@@ -924,7 +918,7 @@ mod tests {
             &[vec![1, 2, 3, 4]],
             &[&sampling()],
             &[0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a prefill batch");
@@ -955,7 +949,7 @@ mod tests {
             &[vec![1, 2, 3, 4]],
             &[&sampling()],
             &[0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a sampling prefill");
@@ -979,7 +973,7 @@ mod tests {
             &[vec![1, 2, 3, 4]],
             &[&sampling()],
             &[0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a chunked prefill");
@@ -1004,7 +998,7 @@ mod tests {
             &[vec![9]],
             &[&greedy],
             &[0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a greedy decode");
@@ -1020,7 +1014,7 @@ mod tests {
             &[vec![9]],
             &[&sampling()],
             &[0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a sampling decode");
@@ -1044,7 +1038,7 @@ mod tests {
             &[vec![9], vec![9]],
             &[&greedy, &sampling()],
             &[0, 0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a mixed decode");
@@ -1067,7 +1061,7 @@ mod tests {
             &[vec![7, 8]],
             &[&greedy],
             &[0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a greedy verification");
@@ -1081,7 +1075,7 @@ mod tests {
             &[vec![7, 8]],
             &[&sampling()],
             &[0],
-            page(),
+            BLOCK_SIZE,
             2048,
         )
         .expect("a sampling verification");
@@ -1100,7 +1094,7 @@ mod tests {
             &[vec![1, 2]],
             &[&sampling()],
             &[0],
-            page(),
+            BLOCK_SIZE,
             64,
         )
         .expect("a prefill batch");
@@ -1120,7 +1114,7 @@ mod tests {
             &[vec![7, 8, 9]],
             &[&sampling()],
             &[0],
-            page(),
+            BLOCK_SIZE,
             64,
         )
         .expect("a verify batch");
@@ -1163,7 +1157,7 @@ mod tests {
                 &[vec![0]],
                 &[&sampling()],
                 &[0],
-                page(),
+                BLOCK_SIZE,
                 64
             )
             .is_none(),
@@ -1185,7 +1179,7 @@ mod tests {
                 &[Vec::new()],
                 &[&sampling()],
                 &[0],
-                page(),
+                BLOCK_SIZE,
                 64
             )
             .is_none()
@@ -1203,7 +1197,7 @@ mod tests {
                 &[vec![1]],
                 &[&sampling()],
                 &[0],
-                page(),
+                BLOCK_SIZE,
                 64
             )
             .is_none()
@@ -1222,7 +1216,7 @@ mod tests {
                 &[vec![1, 2]],
                 &[&sampling()],
                 &[0],
-                page(),
+                BLOCK_SIZE,
                 64
             )
             .is_none()
@@ -1239,7 +1233,7 @@ mod tests {
                 &[vec![1]],
                 &[&sampling()],
                 &[0],
-                page(),
+                BLOCK_SIZE,
                 64
             )
             .is_none()
@@ -1251,7 +1245,7 @@ mod tests {
                 &[vec![1, 2, 3]],
                 &[&sampling()],
                 &[0],
-                page(),
+                BLOCK_SIZE,
                 64
             )
             .is_none()
@@ -1263,7 +1257,7 @@ mod tests {
                 &[vec![1, 2], vec![3]],
                 &[&sampling(), &sampling()],
                 &[0, 0],
-                page(),
+                BLOCK_SIZE,
                 64
             )
             .is_none(),

@@ -682,7 +682,7 @@ impl Scheduler {
     /// because a KV view's shape must not move between steps.
     ///
     /// A fact the mechanism cannot state leaves the batch without columns: an
-    /// unusable page geometry, a worker group the mechanism has no info for, or
+    /// unusable page shape, a worker group the mechanism has no info for, or
     /// a call whose request state is gone. Such a batch is not servable, which
     /// is what its `None` says; it is never filled with plausible values.
     fn attach_columns(&self, batch: &mut ExecutionBatch) {
@@ -704,16 +704,22 @@ impl Scheduler {
             u32::try_from(group.units_per_page),
         ) else {
             tracing::debug!(
-                "a batch is dropped: the page geometry {}, {} does not fit u32",
+                "a batch is dropped: the page shape {}, {} does not fit u32",
                 group.block_size,
                 group.units_per_page
             );
             return;
         };
-        let page = slots::PageGeometry {
-            block_size,
-            units_per_page,
-        };
+        // A page of several units holds different layers' columns in each unit, so one slot
+        // number per token addresses only one of them: the kernels index one unit per page, and a
+        // multi-unit page would need a slot column per unit.
+        if units_per_page != 1 {
+            tracing::debug!(
+                "a batch is dropped: a page of {units_per_page} cache units has no single slot per \
+                 token"
+            );
+            return;
+        }
         // The attention descriptor's static bound: the worker states it once,
         // since a KV view's shape must not move per batch.
         let max_kv_len = self.worker.info().max_model_len;
@@ -797,7 +803,7 @@ impl Scheduler {
             &inputs,
             &sampling,
             &draws,
-            page,
+            block_size,
             max_kv_len,
         );
 

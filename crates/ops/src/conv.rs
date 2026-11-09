@@ -23,51 +23,6 @@ use crate::tensor::{DType, Shape, Strides, TensorView};
 use crate::tolerance::Tolerance;
 use crate::{Error, Op, Result, Twins};
 
-/// The geometry a convolution module is compiled for.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Geometry {
-    /// The filter's extent along each spatial axis.
-    pub kernel: [u32; 3],
-    /// The step between output positions along each spatial axis.
-    pub stride: [u32; 3],
-    /// The padding before the first input position along each spatial axis.
-    pub padding: [u32; 3],
-    /// The spacing between filter taps along each spatial axis.
-    pub dilation: [u32; 3],
-    /// How many input channels each output channel's filter reads.
-    pub groups: u32,
-}
-
-impl fmt::Display for Geometry {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        Key::new()
-            .field(
-                "kernel",
-                format_args!("{}x{}x{}", self.kernel[0], self.kernel[1], self.kernel[2]),
-            )
-            .field(
-                "stride",
-                format_args!("{}x{}x{}", self.stride[0], self.stride[1], self.stride[2]),
-            )
-            .field(
-                "padding",
-                format_args!(
-                    "{}x{}x{}",
-                    self.padding[0], self.padding[1], self.padding[2]
-                ),
-            )
-            .field(
-                "dilation",
-                format_args!(
-                    "{}x{}x{}",
-                    self.dilation[0], self.dilation[1], self.dilation[2]
-                ),
-            )
-            .field("groups", self.groups)
-            .finish(formatter)
-    }
-}
-
 /// One compilation of a convolution.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Descriptor {
@@ -77,8 +32,16 @@ pub struct Descriptor {
     pub weight: DType,
     /// Element type of the output.
     pub output: DType,
-    /// The convolution's geometry.
-    pub geometry: Geometry,
+    /// The filter's extent along each spatial axis; an axis the operator's rank leaves unused is 1.
+    pub kernel: [u32; 3],
+    /// The step between output positions along each spatial axis.
+    pub stride: [u32; 3],
+    /// The zero padding before (and after) the input along each spatial axis.
+    pub padding: [u32; 3],
+    /// The spacing between filter taps along each spatial axis.
+    pub dilation: [u32; 3],
+    /// How many channel groups the filter is split into.
+    pub groups: u32,
     /// Whether the operation has a bias term.
     pub bias: bool,
     /// Whether the library may use TF32 for FP32 inputs.
@@ -86,8 +49,8 @@ pub struct Descriptor {
     /// Whether the tensors are channels-last (NDHWC) rather than channels-first (NCDHW).
     ///
     /// The shapes in the call stay logical (`[n, c, d, h, w]`); the order is the strides the entry
-    /// derives and the plan it selects, not a different compiled module - so, like the geometry and
-    /// `tf32`, it travels in the call and is not part of the key.
+    /// derives and the plan it selects, not a different compiled module - so, like the filter's window
+    /// and `tf32`, it travels in the call and is not part of the key.
     pub channels_last: bool,
     /// The spatial rank: 3 for `conv3d`, 1 for the one-dimensional pair.
     pub rank: u32,
@@ -97,9 +60,10 @@ pub struct Descriptor {
 
 impl fmt::Display for Descriptor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // Only what selects a compiled module is in the key. The geometry, the bias, the TF32 choice
-        // and the rank travel in the call structure (`Call`), which the entry reads: a convolution of a
-        // different window, or with a bias, or in the transposed direction, launches the same module.
+        // Only what selects a compiled module is in the key. The filter's window (kernel, stride,
+        // padding, dilation, groups), the bias, the TF32 choice and the rank travel in the call
+        // structure (`Call`), which the entry reads: a convolution of a different window, or with a
+        // bias, or in the transposed direction, launches the same module.
         // A key that named them would compile one module per clip length and per filter shape.
         Key::new()
             .field("input", self.input)
@@ -227,7 +191,7 @@ pub struct Conv;
 
 impl Conv {
     /// The argument rules shared by the three operators, which differ only in their descriptor's
-    /// geometry.
+    /// rank and direction.
     fn check(operator: &'static str, descriptor: &Descriptor, args: &Args) -> Result<()> {
         let rank = descriptor.rank;
         if !(1..=3).contains(&rank) {
@@ -256,17 +220,17 @@ impl Conv {
             ));
         }
         let channels = args.input.shape.dim(1);
-        let channels_per_group = channels / u64::from(descriptor.geometry.groups);
+        let channels_per_group = channels / u64::from(descriptor.groups);
         // A filter holds one kernel axis per spatial axis: a 1-d one is `[out, in, k]`, as a checkpoint
         // stores it, and the call structure's five slots pad it with ones below.
         let (first, second) = match descriptor.transposed {
             false => (args.out.shape.dim(1), channels_per_group),
             true => (
                 channels,
-                args.out.shape.dim(1) / u64::from(descriptor.geometry.groups),
+                args.out.shape.dim(1) / u64::from(descriptor.groups),
             ),
         };
-        let taps = descriptor.geometry.kernel;
+        let taps = descriptor.kernel;
         let filter = [
             first,
             second,
@@ -333,7 +297,6 @@ impl Conv {
             *extent = to_i64(args.weight.shape.dim(axis))?;
         }
 
-        let geometry = descriptor.geometry;
         let mut call = Call {
             out: platform::address(args.out.ptr) as usize as *mut c_void,
             input: platform::address(args.input.ptr) as usize as *const c_void,
@@ -343,26 +306,26 @@ impl Conv {
             weight_shape,
             out_shape,
             kernel: [
-                geometry.kernel[0] as i32,
-                geometry.kernel[1] as i32,
-                geometry.kernel[2] as i32,
+                descriptor.kernel[0] as i32,
+                descriptor.kernel[1] as i32,
+                descriptor.kernel[2] as i32,
             ],
             stride: [
-                geometry.stride[0] as i32,
-                geometry.stride[1] as i32,
-                geometry.stride[2] as i32,
+                descriptor.stride[0] as i32,
+                descriptor.stride[1] as i32,
+                descriptor.stride[2] as i32,
             ],
             padding: [
-                geometry.padding[0] as i32,
-                geometry.padding[1] as i32,
-                geometry.padding[2] as i32,
+                descriptor.padding[0] as i32,
+                descriptor.padding[1] as i32,
+                descriptor.padding[2] as i32,
             ],
             dilation: [
-                geometry.dilation[0] as i32,
-                geometry.dilation[1] as i32,
-                geometry.dilation[2] as i32,
+                descriptor.dilation[0] as i32,
+                descriptor.dilation[1] as i32,
+                descriptor.dilation[2] as i32,
             ],
-            groups: geometry.groups as i32,
+            groups: descriptor.groups as i32,
             transposed: i32::from(descriptor.transposed),
             tf32: i32::from(descriptor.tf32),
             channels_last: i32::from(descriptor.channels_last),
@@ -418,7 +381,6 @@ impl Op for Conv3d {
         // The contraction is over the filter's taps times its input channels; the bound is the
         // statistical one for a sum of mixed-sign products.
         let taps: u64 = descriptor
-            .geometry
             .kernel
             .iter()
             .take(descriptor.rank as usize)
@@ -468,7 +430,7 @@ impl Op for Conv1d {
         // A non-transposed convolution: each output sums exactly `kernel` taps of its input channel
         // in FP32 — the stride changes which taps, not how many — rounded once into the output.
         Tolerance::dot(
-            u64::from(descriptor.geometry.kernel[0]),
+            u64::from(descriptor.kernel[0]),
             DType::F32,
             descriptor.output,
         )
@@ -513,8 +475,8 @@ impl Op for ConvTranspose1d {
 
     fn tolerance(descriptor: &Self::Descriptor) -> Tolerance {
         // Each output sums the taps that overlap it: `kernel / stride` contributions.
-        let stride = u64::from(descriptor.geometry.stride[0].max(1));
-        let taps = u64::from(descriptor.geometry.kernel[0]);
+        let stride = u64::from(descriptor.stride[0].max(1));
+        let taps = u64::from(descriptor.kernel[0]);
         Tolerance::dot(taps.div_ceil(stride), DType::F32, descriptor.output)
     }
 }
@@ -538,13 +500,11 @@ mod tests {
             input: DType::BF16,
             weight: DType::BF16,
             output: DType::BF16,
-            geometry: Geometry {
-                kernel: [3, 3, 3],
-                stride: [1, 1, 1],
-                padding: [1, 1, 1],
-                dilation: [1, 1, 1],
-                groups: 1,
-            },
+            kernel: [3, 3, 3],
+            stride: [1, 1, 1],
+            padding: [1, 1, 1],
+            dilation: [1, 1, 1],
+            groups: 1,
             bias: false,
             tf32: false,
             channels_last,
