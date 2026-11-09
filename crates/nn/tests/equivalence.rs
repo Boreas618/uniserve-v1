@@ -20,12 +20,11 @@
 //! | `device::channel_affine` | the diagonal-matrix products vs `x·s+m` and `(x-m)/s` on the host | `gemm`, `conv1d`, `conv3d` |
 //! | `device::frame_blend` | the `Axpby` frame loop vs `CrossFade` | `scaled_add`, `cross_fade` |
 //! | `device::tile_stitch_corners` | `TileStitch` vs `CrossFade` vertical then horizontal, neighbours blended in place | `tile_stitch`, `cross_fade` |
-//! | `device::bias_after_identity_gemm` | the identity-matrix product with a bias vs `bias_add` | `gemm`, `bias_add` |
 //! | `host::refiner_final_norm_eps` | `final_norm_eps` vs `norm_eps` in each shipped H3 transformer config | none |
 //!
 //! Shapes, element types and parameters are the ones the shipped forwards call with
-//! (`/workspace/models/Qwen3-30B-A3B`, `MiniMax-H3`, `FastVideo-FastH3-8-Step-V2`); the norm gains and
-//! the post-quant bias are read from those checkpoints, and every activation is drawn from a
+//! (`/workspace/models/Qwen3-30B-A3B`, `MiniMax-H3`, `FastVideo-FastH3-8-Step-V2`); the norm gains are
+//! read from those checkpoints, and every activation is drawn from a
 //! fixed-seed distribution over the activation's range.
 //!
 //! ## Running
@@ -1288,70 +1287,5 @@ mod device {
             )?;
         }
         Ok(())
-    }
-
-    // ---- Case 6 -------------------------------------------------------------------------------
-
-    /// Case 6: the video decoder's post-quant bias, added today as an FP16 product with the
-    /// identity matrix whose epilogue adds the checkpoint's bias, against `bias_add` launched
-    /// through `ops` with the descriptor the decoder's 24 latent channels need. The input is the
-    /// post-quant product of the 28 tiles of a 720 x 1280 clip, rounded to FP16.
-    #[test]
-    #[ignore = "requires a CUDA device and a Program Server (UNISERVE_PROGRAM_SERVER_SOCKET)"]
-    fn bias_after_identity_gemm() -> Outcome {
-        let directory = models().join(H3).join("vae");
-        let bias = tensor(&directory, "post_quant_conv.bias")?;
-        let mut bench = Bench::open()?;
-        let mut draw = Draw::new(61);
-        let dtype = DType::F16;
-        let channels = bias.len() as u64;
-        let voxels = 28 * 7 * 16 * 16_u64;
-
-        let identity = diagonal(&vec![1.0; channels as usize]);
-        let bias = bench.weight(dtype, &[channels], &bias)?;
-        let gemm = Linear::new(
-            bench.weight(dtype, &[channels, channels], &identity)?,
-            Some(bias),
-            WeightOrder::NxK,
-        )?;
-        let input = bench.values(
-            dtype,
-            &[voxels, channels],
-            &draw.normals((voxels * channels) as usize, 1.0),
-        )?;
-        let multiplied = bench.tensor(dtype, &[voxels, channels])?;
-        let added = bench.tensor(dtype, &[voxels, channels])?;
-        // `[voxels, channels, 1]`: the rows as a batch of channel-first values of one position.
-        let channel_first = |view: TensorView| view.reshape(Shape::new(&[voxels, channels, 1]));
-        let descriptor = ops::bias::Descriptor {
-            dtype,
-            channels: channels as u32,
-            block: 1024,
-            residual: false,
-            residual_bias: false,
-            pdl: nn::layers::launch::PDL,
-        };
-
-        bench.run(&|f| {
-            gemm.forward(f, input, multiplied)?;
-            f.operate::<ops::bias::BiasAdd>(
-                &descriptor,
-                ops::bias::Args {
-                    values: channel_first(input),
-                    bias: bias.view,
-                    // An absent residual carries the values and the bias (`ops::bias::Args`).
-                    residual: channel_first(input),
-                    residual_bias: bias.view,
-                    out: channel_first(added),
-                },
-            )
-        })?;
-
-        measure(
-            "bias_identity_gemm_vs_bias_add_video_decoder_post_quant",
-            dtype,
-            &bench.download(multiplied)?,
-            &bench.download(added)?,
-        )
     }
 }

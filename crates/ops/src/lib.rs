@@ -82,7 +82,6 @@ pub mod adaptive_pool;
 pub mod attention;
 pub mod audio_activation;
 pub mod audio_resample;
-pub mod bias;
 pub mod block_copy;
 // Test-only: the package headers' mirrors checked against the layouts this crate passes.
 #[cfg(test)]
