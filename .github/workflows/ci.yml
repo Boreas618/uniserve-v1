@@ -11,10 +11,12 @@ jobs:
     env:
       # The tokenizer's PCRE2 is linked statically, as the shipped image links it.
       PCRE2_SYS_STATIC: "1"
-      # The shared FFmpeg 8.1.2 with libx264 the media crate links, built below.
-      UNISERVE_FFMPEG_DIR: ${{ github.workspace }}/../ffmpeg-prefix
     steps:
       - uses: actions/checkout@v4
+      # The shared FFmpeg 8.1.2 with libx264 the media crate links, built below. The cache takes no
+      # path with `..`, and the binary records this path as its run path, so both jobs place the
+      # prefix at the same absolute path.
+      - run: echo "UNISERVE_FFMPEG_DIR=$RUNNER_TEMP/ffmpeg-prefix" >> "$GITHUB_ENV"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -24,7 +26,7 @@ jobs:
       - id: ffmpeg
         uses: actions/cache@v4
         with:
-          path: ${{ github.workspace }}/../ffmpeg-prefix
+          path: ${{ runner.temp }}/ffmpeg-prefix
           key: ffmpeg-8.1.2-${{ runner.os }}-${{ hashFiles('crates/media/native/build.sh') }}
       - if: steps.ffmpeg.outputs.cache-hit != 'true'
         run: |
