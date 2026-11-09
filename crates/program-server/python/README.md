@@ -1,8 +1,8 @@
 # The Program Server's Python environment
 
-Python appears in UniServe in one place: here, as the compiler of kernel programs (design section 6.2). The Program Server runs every program package's compile script with this environment's interpreter; it never imports it, and the environment never runs in the main process or on the serving path.
+No serving process carries a Python interpreter: in a deployment, Python appears here alone, as the compiler of kernel programs. The Program Server runs every program package's compile script with this environment's interpreter; it never imports it, and the environment never runs in the main process or on the serving path.
 
-It is **not** the repository's `.venv`. The serving environment holds the full Python runtime for the models; this one holds only what compiles a kernel, so a package's compile script cannot depend by accident on a package the serving environment happens to have.
+It is **not** the repository's `.venv`, which holds the `uniserve` executable with the development, test and evaluation tools; this one holds only what compiles a kernel, so a package's compile script cannot depend by accident on a package another environment happens to have.
 
 ## Creating it
 
@@ -18,13 +18,13 @@ A server without the interpreter is not an error: the Triton and CuTe DSL toolch
 
 | distribution | version | used by |
 |---|---|---|
-| `triton` | 3.7.1 | `TritonSource`: `triton.compile` writes the cubin and its metadata JSON (design 5.3) |
+| `triton` | 3.7.1 | `TritonSource`: `triton.compile` writes the cubin and its metadata JSON |
 | `nvidia-cutlass-dsl[cu13]` | 4.6.2 | `CuteDslSource`: `cute.compile` and `export_to_c` write the host launcher that is linked into a native module |
 | `flashinfer-python` | 0.6.18 | the CuTe DSL kernels a package imports (`moe_sort`, `moe_unpermute`, the grouped GEMM) |
 | `flash-attn-4[cu13]` | 4.0.0b30 | the FlashAttention-4 package |
 | `torch` | 2.13.0 | required by the two above; it is never imported by the Program Server itself |
 
-A package names the distributions it imports and their versions in its `[toolchain] packages`; changing any of them is a new installation and a new revision (design 5.2).
+A package names the distributions it imports and their versions in its `[toolchain] packages`; changing any of them is a new installation and a new revision.
 
 ## How a package's compile script is run
 
@@ -43,7 +43,7 @@ The script reads the descriptor's parameter values out of its own manifest, so t
 
 ## The trtllm-gen artifact
 
-The attention package that launches TensorRT-LLM's FMHA kernels (design section 9, the native decode attention) compiles against a generated header and loads cubins that no Python distribution carries: FlashInfer pins them as a directory in NVIDIA's kernel artifact repository (`flashinfer.artifacts.ArtifactPath.TRTLLM_GEN_FMHA`, `CheckSumHash.TRTLLM_GEN_FMHA`). `uniserve_program_server.trtllm_gen` fetches that artifact, verifies it and caches it:
+The attention package that launches TensorRT-LLM's FMHA kernels (the native decode attention) compiles against a generated header and loads cubins that no Python distribution carries: FlashInfer pins them as a directory in NVIDIA's kernel artifact repository (`flashinfer.artifacts.ArtifactPath.TRTLLM_GEN_FMHA`, `CheckSumHash.TRTLLM_GEN_FMHA`). `uniserve_program_server.trtllm_gen` fetches that artifact, verifies it and caches it:
 
 ```text
 .venv/bin/python -m uniserve_program_server.trtllm_gen --out DIR [--all | --cubin NAME] [--offline] [--verify]
@@ -54,7 +54,7 @@ The attention package that launches TensorRT-LLM's FMHA kernels (design section 
 - `--out DIR` stages the generated header (`include/flashInferMetaInfo.h`) and the checksums into `DIR` as symbolic links; `--all` stages all 35 324 cubins, `--cubin NAME` one of them. The command prints a JSON description: the cache, the include directory, every cubin's name, what it staged.
 - A package's build script runs this against `$UNISERVE_OUT` to get the harness it compiles against, and copies the cubins its launch code needs into `$UNISERVE_OUT` so they are published with the module.
 
-Compiling the launch code against the artifact was proved on this host with nvcc 13.0.48, no GPU:
+The launch code compiles against the staged artifact with nvcc alone, without a GPU:
 
 ```text
 nvcc -c -std=c++20 -arch=sm_100a \

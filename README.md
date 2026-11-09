@@ -182,7 +182,7 @@ For decision-session replay, give every row of a JSON Lines workload a non-empty
 The [architecture guide](docs/architecture.md) describes how the daemons, the engine process and the executors divide the work, how a main process's threads divide it, and how a request travels through them.
 
 ```text
-src/                    The root package, `uniserve`: the command line, logging, the `serve` command, and `main.rs`, which dispatches every command and registers the model families
+src/                    The root package, `uniserve`: the command line, logging, the `serve` and `programs` commands, and `main.rs`, which dispatches every command and registers the model families
 crates/engine/          The main process of a node and epoch: its control thread, schedulers, executors and blocking pool, and the catalogue that resolves a checkpoint to its model family
 crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf), and the video condition vocabulary
 crates/ipc/             Scheduler-to-main-process messages, rank channels and the launch descriptor
@@ -191,9 +191,9 @@ crates/storage/         The Storage Server's protocol and client
 crates/storage-server/  The Storage Server, its Mooncake connector and its Transfer Server
 crates/nixl/            NIXL agents with the UCX backend, loaded at runtime
 crates/platform/        The CUDA boundary: driver, virtual memory, device memory and allocator, streams, events, graphs, kernels and NCCL
-crates/ops/             The interface between Rust and kernel programs: operators, launch code and every kernel, one package per operator and backend under `kernels/`
-crates/nn/              The shared computation library: tensor views, numerical layers, capability traits and the model family contract execution loads models through
-crates/processing/      The request-side model contract: a family's chat profile or video processor, which checks and plans model-agnostic video requests
+crates/ops/             The interface between Rust and kernel programs: operators, their descriptors and descriptor keys, launch code and every kernel, one package per operator and backend under `kernels/`
+crates/nn/              The shared computation library: tensor views, the borrowed forward, numerical layers and blocks, diffusion, tiling and vocoder computation, weight loading, the capability traits models implement and the model family contract execution loads models through
+crates/processing/      The request-side model contract: a family's chat profile or video processor, which checks and plans model-agnostic video requests, and the family-neutral frame, canvas, cover-crop and resampling rules
 crates/models/          The concrete models, each a crate that implements both contracts
   qwen3/                The Qwen3 family: configurations, the decoder layer and stack, `Qwen3MoeForCausalLM`, the Qwen3-VL model, vision tower and processor, and the Qwen3 chat profile
   minimax-h3/           MiniMax-H3 and FastH3: checkpoint configuration, mathematical partition, components and request processing (`src/processing/`)

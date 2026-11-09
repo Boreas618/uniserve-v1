@@ -1,6 +1,6 @@
 # Admin API, nodes and the manager
 
-A deployment's leader daemon serves an admin API under `/admin` on its HTTP address, with the same API key as the OpenAI API. Everything a deployment can do while it serves goes through it: `uniserve serve` alone needs nothing else, and the optional `uniserve-manager` is one client of it among others. The designs are `specs/live-updates.md` and, for configuration changes and epochs, `specs/online-operations.md`.
+A deployment's leader daemon serves an admin API under `/admin` on its HTTP address, with the same API key as the OpenAI API. Everything a deployment can do while it serves goes through it: `uniserve serve` alone needs nothing else, and the optional `uniserve-manager` is one client of it among others.
 
 ## Endpoints
 
@@ -92,7 +92,7 @@ A device KV cache is split along its units into eight segments, each of every la
 
 ## Expert redistribution
 
-`POST /admin/rebalance_experts` changes the distribution of routed expert weights while preserving the number of physical slots on each rank. Module paths are the names of `FusedMoE` modules in the loaded model. Layers omitted from `order` keep their distribution. An invalid permutation or unknown layer is rejected before copying starts.
+`POST /admin/rebalance_experts` changes the distribution of routed expert weights while preserving the number of physical slots on each rank. Module paths are the routed expert layers the served model family states for its checkpoint (`nn::family::TextCheckpoint::expert_layers`). Layers omitted from `order` keep their distribution. An invalid permutation or unknown layer is rejected before copying starts.
 
 A module path is `layers.N.mlp.experts`. Every rank's model is loaded with one logical-to-physical table for all its routed layers, and the router's top-k writes each route's physical slot through it, in the launch that selects the experts: selecting over logical ids keeps which experts a token picks, and the order of equal scores, independent of where the experts lie, and a deployment that never redistributes pays no launch for it.
 
