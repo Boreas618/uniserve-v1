@@ -28,14 +28,13 @@
 //! weights `i / 5`, and emits those five blended frames before the successor's body; the first blended
 //! frame is entirely the predecessor's and the fifth one fifth the successor's.
 
-use crate::programs::Programs;
 use nn::Shape;
 use nn::capability::StateTable;
 use nn::layers::{RgbBytes, ScaledAdd};
 use nn::{DType, Forward, TensorView, Weight};
 
 use crate::config::CLIP_FRAMES;
-use crate::decoding::{Buffer, CLIP_OUTPUT_FRAMES, OVERLAP_FRAMES};
+use crate::decoding::{CLIP_OUTPUT_FRAMES, OVERLAP_FRAMES};
 use crate::{Error, Result};
 
 /// The per-channel standard deviations the video decoder's RGB is normalized by, in red, green, blue
@@ -85,15 +84,6 @@ impl Rgb {
             * u64::from(self.height)
             * u64::from(self.width)
             * u64::from(Self::CHANNELS)
-    }
-
-    /// The extent of one overlap block, `[channels, OVERLAP_FRAMES, height, width]` as the decoder
-    /// keeps it between clips.
-    pub fn overlap_elements(&self) -> u64 {
-        u64::from(Self::CHANNELS)
-            * u64::from(Self::OVERLAP_FRAMES)
-            * u64::from(self.height)
-            * u64::from(self.width)
     }
 }
 
@@ -176,23 +166,6 @@ impl VideoPostprocessor {
             bytes: RgbBytes::new(dtype, Rgb::CHANNELS, mean, std)?,
             dtype,
         })
-    }
-
-    /// The programs a post-processor of `dtype` launches for rasters of these pixel extents.
-    ///
-    /// The byte packing is one program whatever the raster: the constants are weights and the extents
-    /// are launch values. The seam blend's rows are per pixel count, so the sizes the deployment
-    /// serves are the caller's, as with every other row program.
-    pub fn programs(dtype: DType, rasters: &[(u32, u32)]) -> Vec<(String, String)> {
-        use ops::residual::ScaledAdd as ScaledAddOp;
-
-        let mut programs = Programs::default();
-        programs.launch::<ops::rgb::RgbBytes>(&RgbBytes::descriptor_of(dtype, Rgb::CHANNELS));
-        // One descriptor for every raster: the width is the operand's and changes no compiled code.
-        if !rasters.is_empty() {
-            programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(dtype, dtype));
-        }
-        programs.finish()
     }
 
     /// The frames one clip of `splice` writes, which is what [`Self::forward`]'s `out` must hold.
@@ -662,42 +635,6 @@ impl Raster {
     }
 }
 
-/// The fade's scratch for one clip: the overlap frames of a raster in the decoded element type.
-///
-/// [`VideoPostprocessor::forward`] fades the head of a clip's body against its predecessor's tail into a
-/// buffer of the tail's shape, because the clip's own raster stays the runner's to keep the tail from;
-/// that buffer and one frame for the second product are all the splice reserves, and they are named
-/// here so the worker sizes the arena from arithmetic rather than from the module's own guess. A clip
-/// with no predecessor reserves nothing.
-pub fn splice_arena(
-    config: &crate::VideoVaeConfig,
-    canvas: &crate::video_vae::Canvas,
-    dtype: DType,
-) -> Result<Vec<Buffer>> {
-    let element = match dtype {
-        DType::F16 => "f16",
-        DType::F32 => "f32",
-        other => {
-            return Err(Error::config(format!(
-                "the splice blends in f16 or f32 decoded precision, not {other}"
-            )));
-        }
-    };
-    let (height, width) = canvas.pixels(config);
-    Ok(vec![
-        Buffer {
-            name: "faded".to_owned(),
-            element,
-            elements: Rgb::of(0, height, width).overlap_elements(),
-        },
-        Buffer {
-            name: "term".to_owned(),
-            element,
-            elements: u64::from(height) * u64::from(width),
-        },
-    ])
-}
-
 /// The frames `start..stop` of an output raster: `[frames, rows, columns, channels]` bytes.
 ///
 /// The last axis is dense, so a frame slice is that frame's own element address and a narrowed first
@@ -846,30 +783,6 @@ mod tests {
             .expect("the interior clip's destination");
         assert_eq!(body.shape.dims()[0], 17);
         assert!(tail.is_none());
-    }
-
-    #[test]
-    fn the_splices_scratch_is_the_overlap_frames_of_one_raster() {
-        let config = crate::video_vae::tests::video_config();
-        let canvas = crate::video_vae::Canvas::clip(&config, 48, 84);
-        let (height, width) = canvas.pixels(&config);
-        let buffers = splice_arena(&config, &canvas, DType::F16).expect("the scratch");
-        assert_eq!(
-            buffers.len(),
-            2,
-            "the fade's destination and one frame for its second product"
-        );
-        // The fade writes the overlap frames and nothing else, so the scratch is those frames of the
-        // canvas's pixels - the same extent `forward` reserves.
-        assert_eq!(
-            buffers[0].elements,
-            u64::from(Rgb::CHANNELS)
-                * u64::from(OVERLAP_FRAMES)
-                * u64::from(height)
-                * u64::from(width)
-        );
-        assert_eq!(buffers[0].element, "f16");
-        assert!(splice_arena(&config, &canvas, DType::BF16).is_err());
     }
 
     /// The operators a splice launches, in order.
@@ -1095,7 +1008,6 @@ mod tests {
     fn the_raster_sizes_follow_the_layout() {
         let rgb = Rgb::of(107, 768, 1344);
         assert_eq!(rgb.bytes(), 107 * 768 * 1344 * 3);
-        assert_eq!(rgb.overlap_elements(), 3 * 5 * 768 * 1344);
         // A clip writes its body and shares a tail; the last writes its body **and** its tail, and the
         // three padding frames between them are dropped, which is what makes the timeline `17n + 5`.
         assert_eq!(Splice::CLIP.frames(), CLIP_FRAMES);
@@ -1110,27 +1022,6 @@ mod tests {
         // The padding frames are neither kept nor shared: `LAST`'s two ranges leave them out.
         let (start, stop) = Splice::LAST.overlap;
         assert!(Splice::LAST.body.1 < start && stop - start == OVERLAP_FRAMES);
-    }
-
-    /// The post-processor's programs follow from the raster sizes alone: the byte packing is one
-    /// program whatever the extents (its constants are weights), and the seam blend's row program
-    /// carries its pixel count, so two rasters of one size share one and two of different sizes do not.
-    #[test]
-    fn the_postprocessor_states_its_programs_from_the_raster_sizes() {
-        let rasters = [(480_u32, 832_u32), (720, 1280), (480, 832)];
-        let programs = VideoPostprocessor::programs(DType::F16, &rasters);
-
-        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
-        assert_eq!(count("rgb_bytes"), 1);
-        // One blend row whatever the raster: the width is the operand's, and two rasters of
-        // different sizes state one row.
-        assert_eq!(count("scaled_add"), 1, "{programs:?}");
-        assert!(
-            programs
-                .iter()
-                .any(|(_, key)| key.contains("dtype_f16_channels_3")),
-            "the packing states its element type and channel count: {programs:?}"
-        );
     }
 
     /// A timeline's clips, where they start and how many frames each writes.

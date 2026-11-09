@@ -47,7 +47,6 @@ use crate::attention::{Factors, Visible};
 use crate::config::{Canvas, DenoiserConfig, MAX_FRAMES};
 use crate::modulation::{AdaLnCache, Groups, Projections};
 use crate::packing::{self, DensePacking};
-use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::solver::Solver;
 use crate::transformer::Transformer;
@@ -109,18 +108,15 @@ impl Arrangement {
     }
 }
 
-/// The deployment's layout rule: how a request snaps, and what its tables are.
 /// The element type of the sample the trajectory accumulates, and of its noise.
 ///
 /// The trajectory is kept in FP32 and any other type is refused at the denoiser's entry (the video
 /// and audio latents' input and output are pinned there), so the draw, the patch and the unpatchify
-/// all read and write this one type - **not the stack's**, which is the checkpoint's. Both sites
-/// read this constant: the forward refuses a latent of another type by name
-/// ([`Denoiser::denoise`]), and [`Denoiser::programs`] states the rows the launch will ask for.
-/// Keying those rows from the stack's type instead was a real store gap - a BF16 `unpatchify_video`
-/// row for a launch that asks for `dtype_f32`.
+/// all read and write this one type - **not the stack's**, which is the checkpoint's. The forward
+/// refuses a latent of another type by name ([`Denoiser::denoise`]).
 pub const SAMPLE_DTYPE: DType = DType::F32;
 
+/// The deployment's layout rule: how a request snaps, and what its tables are.
 pub struct Layouts {
     config: DenoiserConfig,
     arrangement: Arrangement,
@@ -1847,454 +1843,7 @@ impl<'a> Tables<'a> {
     }
 }
 
-/// This layout's packed row count, as the forward's own packing computes it.
-///
-/// A dense deployment's rows are the packing's padded token count and a sparse deployment's are the
-/// segment packing's, which rounds to whole tiles. Both come from the same functions the loader builds
-/// layouts from, so a plan and a forward cannot disagree about a row. The capacities are the
-/// layout's own: a layout of a low rung is fewer rows than the deployment's bound.
-pub fn packed_rows(
-    config: &DenoiserConfig,
-    arrangement: &Arrangement,
-    layout: &Layout,
-) -> Result<u32> {
-    let frames = frame_count(layout.video.frames)?;
-    let canvas = canvas_of_latents(layout)?;
-    match config.attention {
-        crate::config::AttentionKind::Sparse { tile, .. } => Ok(packing::segment_packing(
-            frames,
-            &canvas,
-            layout.text_rows,
-            layout.condition_rows,
-            tile,
-            tile,
-        )?
-        .extent
-        .padded_tokens),
-        crate::config::AttentionKind::Dense => Ok(packing::dense_packing(
-            frames,
-            &canvas,
-            layout.text_rows,
-            layout.condition_rows,
-            arrangement.shard,
-        )?
-        .padded_tokens),
-    }
-}
-
-/// Every buffer one evaluation reserves at `layout`, in the order the forward reserves them.
-///
-/// The worker sizes the denoiser's arena by the sum of this plan and keys its storage by the names,
-/// as it does for the decoder's two plans and the splice's. The list is the forward's own reservation
-/// order - `Denoiser::denoise`, then the transformer's forward, then each modality's head in
-/// the order the forward reaches them - because the arena is one cursor: a buffer listed before
-/// another is reserved before it.
-///
-/// Nothing here is multiplied by the layer count. The stack reserves its scratch once and its
-/// attention's once, which is what makes a 52-layer stack affordable; a per-layer reservation would
-/// multiply every entry below by the number of layers. A parallel-decoding student's fused head is
-/// the one repeated entry, gathered once per modality.
-///
-/// The rows are this layout's own packed count, so a plan is exact for a canvas rather than a bound,
-/// and the worker takes the largest layout it will serve.
-///
-/// This is the plan itself, with every value the deployment supplies passed in, so a host tool that
-/// has a configuration and no checkpoint can size a stage from it.
-pub fn denoise_arena(
-    config: &DenoiserConfig,
-    arrangement: &Arrangement,
-    groups: u32,
-    dtype: DType,
-    layout: &Layout,
-) -> Result<Vec<crate::decoding::Buffer>> {
-    let element = match dtype {
-        DType::BF16 => "bf16",
-        DType::F16 => "f16",
-        DType::F32 => "f32",
-        other => {
-            return Err(Error::config(format!(
-                "the denoiser's activations are {other}, which has no arena element"
-            )));
-        }
-    };
-    let transformer = &config.transformer;
-    let hidden = u64::from(transformer.hidden_size);
-    let ffn = u64::from(transformer.intermediate_size);
-    let heads = u64::from(transformer.num_attention_heads);
-    let head_dim = u64::from(transformer.head_dim);
-    // One rank's share of the heads; the exchange's buffers are per rank, as the layers are.
-    let local_heads = heads / u64::from(arrangement.shard);
-    let groups = u64::from(groups);
-    let total = u64::from(packed_rows(config, arrangement, layout)?);
-    // The rows a rank owns: everything before the attention's exchange, and everything after it.
-    let tokens = total / u64::from(arrangement.shard.max(1));
-    let channels = u64::from(layout.video.channels);
-    let frames = u64::from(layout.video.frames);
-    let height = u64::from(layout.video.height);
-    let columns = u64::from(layout.video.width);
-    // The `1x2x2` patch: one row per latent frame and each pair of rows and columns.
-    let video_rows = frames * (height / 2) * (columns / 2);
-    // A rank's share of them, at most its whole interval.
-    let own_video = video_rows.min(tokens);
-    let patches = channels * 4;
-    let rotated = u64::from(transformer.rope_frequency_dim) * 3;
-    let audio = layout.audio.map(|audio| {
-        let rows = u64::from(crate::config::AUDIO_CHANNELS) * u64::from(audio.frames);
-        (rows, u64::from(transformer.audio_channels))
-    });
-
-    /// One line of the plan.
-    fn push(
-        plan: &mut Vec<crate::decoding::Buffer>,
-        name: &str,
-        element: &'static str,
-        elements: u64,
-    ) {
-        plan.push(crate::decoding::Buffer {
-            name: name.to_owned(),
-            element,
-            elements,
-        });
-    }
-
-    // One modality's head: the norm every deployment runs, then the weight and bias a student
-    // gathers out of its fused tables.
-    fn head(
-        plan: &mut Vec<crate::decoding::Buffer>,
-        element: &'static str,
-        hidden: u64,
-        student: bool,
-        name: &str,
-        rows: u64,
-        out: u64,
-    ) {
-        push(plan, &format!("{name}.normed"), element, rows * hidden);
-        // The floor of the head is FP32, so the normalised rows are
-        // widened before the projection reads them. A stack whose own element type is already FP32
-        // reads them in place and leaves this buffer untouched; the plan sizes for the widening.
-        push(plan, &format!("{name}.wide"), "f32", rows * hidden);
-        // The fused heads are FP32 tables, as the projection they replace is, so the row a step
-        // gathers out of them is FP32 whatever the stack's type is.
-        if student {
-            push(plan, &format!("{name}.head"), "f32", out * hidden);
-            push(plan, &format!("{name}.head_bias"), "f32", out);
-        }
-    }
-
-    let mut plan = Vec::new();
-
-    // The packed rows, the two projections that fill them, and the rotary tables of the one
-    // sequence.
-    push(&mut plan, "packed", element, tokens * hidden);
-    // The sample's own type is FP32 - the draw writes it, the solver updates it, and the reference
-    // refuses anything else - so the patch's input and output are FP32 and so is nothing else here
-    // that the stack reads. The input projections are FP32 parameters at every preset (pinned at
-    // load) and read the widened FP32 rows, and the one rounding
-    // into the packed rows is the narrowing that follows them.
-    push(&mut plan, "patched", "f32", video_rows * patches);
-    push(&mut plan, "video.owned", "f32", own_video * patches);
-    push(&mut plan, "video.projected", "f32", own_video * hidden);
-    push(
-        &mut plan,
-        "video.projected.stack",
-        element,
-        own_video * hidden,
-    );
-    if let Some((audio_rows, audio_features)) = audio {
-        let audio_rows = audio_rows.min(tokens);
-        push(&mut plan, "audio.owned", "f32", audio_rows * audio_features);
-        push(&mut plan, "audio.projected", "f32", audio_rows * hidden);
-        push(
-            &mut plan,
-            "audio.projected.stack",
-            element,
-            audio_rows * hidden,
-        );
-    }
-    push(&mut plan, "cosine", "f32", total * rotated);
-    push(&mut plan, "sine", "f32", total * rotated);
-
-    // The stack: the step's gathered modulation, one alternate residual buffer, and the scratch
-    // every layer shares.
-    push(&mut plan, "step.entries", "i32", groups);
-    push(
-        &mut plan,
-        "step.modulation",
-        element,
-        groups * 3 * 6 * hidden,
-    );
-    push(
-        &mut plan,
-        "step.following",
-        element,
-        groups * 3 * 6 * hidden,
-    );
-    push(&mut plan, "alternate", element, tokens * hidden);
-    push(&mut plan, "normalized", element, tokens * hidden);
-    push(&mut plan, "update", element, tokens * hidden);
-    push(&mut plan, "mlp.packed", element, tokens * 2 * ffn);
-    push(&mut plan, "mlp", element, tokens * ffn);
-    let local = local_heads * head_dim;
-    match config.attention {
-        crate::config::AttentionKind::Dense => {
-            for name in [
-                "query",
-                "key",
-                "value",
-                "rotated_query",
-                "rotated_key",
-                "attended",
-            ] {
-                push(
-                    &mut plan,
-                    &format!("attention.{name}"),
-                    element,
-                    total * local,
-                );
-            }
-        }
-        crate::config::AttentionKind::Sparse { .. } => {
-            // The segment packing rounds the rows to whole tiles, so this divides exactly.
-            let tiles = total / u64::from(config.attention.capacity_rows());
-            for name in ["query", "key", "value", "gate", "fine"] {
-                push(
-                    &mut plan,
-                    &format!("attention.{name}"),
-                    element,
-                    total * local,
-                );
-            }
-            for name in ["pooled_query", "pooled_key", "pooled_value"] {
-                push(
-                    &mut plan,
-                    &format!("attention.{name}"),
-                    "f32",
-                    tiles * local_heads * head_dim,
-                );
-            }
-            push(
-                &mut plan,
-                "attention.scores",
-                "f32",
-                local_heads * tiles * tiles,
-            );
-            push(
-                &mut plan,
-                "attention.indices",
-                "i32",
-                local_heads * tiles * tiles,
-            );
-            push(&mut plan, "attention.counts", "i32", local_heads * tiles);
-            push(
-                &mut plan,
-                "attention.compressed",
-                element,
-                tiles * local_heads * head_dim,
-            );
-        }
-    }
-    // A layer that does not communicate reserves nothing for it: the exchange's staging and the
-    // merged rows are views of buffers a rank of one already holds. The gather mode adds the whole
-    // sequence's normalized rows.
-    if arrangement.shard > 1 {
-        let inner = heads * head_dim;
-        push(&mut plan, "attention.staging", element, tokens * inner);
-        push(&mut plan, "attention.returned", element, tokens * inner);
-        push(&mut plan, "attention.merged", element, tokens * inner);
-        push(&mut plan, "attention.gathered", element, total * hidden);
-    }
-
-    // Each modality's head, in the order the forward reaches them: the norm, then a student's
-    // gathered weight and bias.
-    let student = u64::from(transformer.output_heads) > 1;
-    head(
-        &mut plan, element, hidden, student, "video", own_video, patches,
-    );
-
-    // The output's modulation and the solver's one staging word.
-    push(&mut plan, "output.entries", "i32", groups);
-    push(&mut plan, "output.modulation", element, groups * 2 * hidden);
-    push(&mut plan, "coefficient", "f32", 1);
-
-    // The video step: the rows gathered out of the packed sequence, their groups, the velocity
-    // at the patch width, and the velocity the solver writes into the latents from.
-    push(&mut plan, "video.hidden", element, own_video * hidden);
-    push(&mut plan, "video.groups", "i32", own_video);
-    // The prediction is FP32 from the head and the solver reads one type
-    // for the sample and the velocity, so neither of these is the stack's element type.
-    push(&mut plan, "video.velocity_rows", "f32", own_video * patches);
-    if arrangement.shard > 1 {
-        // The rows every member predicted, collected: a rank's in its own interval, then the whole
-        // sequence's, then the modality's in raster order.
-        push(&mut plan, "video.velocity_owned", "f32", tokens * patches);
-        push(&mut plan, "video.velocity_packed", "f32", total * patches);
-        push(&mut plan, "video.velocity_all", "f32", video_rows * patches);
-    }
-    push(
-        &mut plan,
-        "video.velocity",
-        "f32",
-        channels * frames * height * columns,
-    );
-    if let Some((audio_rows, audio_features)) = audio {
-        let own_audio = audio_rows.min(tokens);
-        head(
-            &mut plan,
-            element,
-            hidden,
-            student,
-            "audio",
-            own_audio,
-            audio_features,
-        );
-        push(&mut plan, "audio.hidden", element, own_audio * hidden);
-        push(&mut plan, "audio.groups", "i32", own_audio);
-        push(
-            &mut plan,
-            "audio.velocity",
-            "f32",
-            own_audio * audio_features,
-        );
-        if arrangement.shard > 1 {
-            push(
-                &mut plan,
-                "audio.velocity_owned",
-                "f32",
-                tokens * audio_features,
-            );
-            push(
-                &mut plan,
-                "audio.velocity_packed",
-                "f32",
-                total * audio_features,
-            );
-            push(
-                &mut plan,
-                "audio.velocity_all",
-                "f32",
-                audio_rows * audio_features,
-            );
-        }
-    }
-    Ok(plan)
-}
-
 impl Denoiser {
-    /// The programs one denoiser launches, from its configuration, its partition and the deployment's
-    /// largest canvas.
-    ///
-    /// The two stacks are their own functions ([`Transformer::programs`],
-    /// [`crate::conditioning::TokenRefiner::programs`]); this adds the orchestration around them — the
-    /// pack and its inverse, the draw, the strided copies, the coefficient gather, and the blends the
-    /// solver and the conditioner issue. `elements` is the element count of the largest trajectory a
-    /// modality steps: the solver's residual is one operator over the whole sample, so its width is a
-    /// deployment statement and not a constant.
-    #[allow(clippy::too_many_arguments)]
-    pub fn programs(
-        config: &crate::config::TransformerConfig,
-        attention: crate::config::AttentionKind,
-        dtype: nn::DType,
-        boundary: nn::DType,
-        rows: u32,
-        groups: Groups,
-        partition: &Partition,
-        elements: &[u64],
-        tiles: u32,
-    ) -> Result<Vec<(String, String)>> {
-        use crate::programs::Programs;
-        use nn::layers::gather_rows_descriptor;
-        use ops::noise::NoiseKind;
-        use ops::noise::PhiloxNoise as NoiseOp;
-        use ops::patch::Patch as PatchOp;
-        use ops::residual::{ScaledAdd as ScaledAddOp, ScaledResidual as ResidualOp};
-        use ops::unpatchify::Unpatchify;
-
-        let mut programs = Programs::default();
-        programs.extend(Transformer::programs(
-            config, attention, dtype, boundary, rows, groups, partition, tiles,
-        )?);
-        // The refiner's stream is the boundary's type, not the stack's: it is handed the prompt's
-        // features where they are widened into the network, and every row it launches is keyed from
-        // the tensors it reads. Keyed from the stack it states four rows the forward never makes -
-        // its per-head norms, its two modulation gathers and its attention - and lacks the four it
-        // does.
-        programs.extend(crate::conditioning::TokenRefiner::programs(
-            config, boundary,
-        )?);
-
-        let video = config.video_channels;
-
-        // The pack and its inverse, the draw, and the strided copy the conditioner reads through.
-        // The first three read or write the **sample**, not the stack: the trajectory is FP32
-        // (`SAMPLE_DTYPE`, and the forward refuses any other), so a row keyed from `dtype` would name
-        // a program the launch never asks for.
-        programs.launch::<PatchOp>(&nn::layers::Patch::descriptor_of(SAMPLE_DTYPE));
-        programs.launch::<Unpatchify>(
-            &nn::layers::UnpatchifyVideo::new(SAMPLE_DTYPE, u64::from(video), 1, 2)?.descriptor(),
-        );
-        programs.launch::<NoiseOp>(&nn::layers::Noise::descriptor_of(
-            SAMPLE_DTYPE,
-            NoiseKind::Normal,
-            ops::noise::KeySource::Scalar,
-        ));
-        programs.launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::descriptor_of(
-            nn::DType::F32,
-        ));
-
-        // The three gathers outside the modulation: the prefix rows of the packed stream, the solver's
-        // step coefficient, and the trace's row copy the diagnosis takes. The wide one gathers the
-        // stack's packed rows; the one-column one gathers the **solver's coefficient**, which is an
-        // FP32 constant (`Solver::load` publishes the two tables as F32), so its row is the sample's
-        // type and not the stack's.
-        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(
-            dtype,
-            u64::from(config.hidden_size),
-        )?);
-        programs.launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(SAMPLE_DTYPE, 1)?);
-        // The rows of each modality's sample this rank owns, gathered at the sample's own widths;
-        // under Ulysses the predicted rows are placed in the rank's interval and gathered back the
-        // same way once every member's have arrived.
-        let widths = [4 * u64::from(video), u64::from(config.audio_channels)];
-        for width in widths {
-            programs
-                .launch::<ops::logits::LogitsGather>(&gather_rows_descriptor(SAMPLE_DTYPE, width)?);
-            if partition.ulysses_degree > 1 {
-                programs.launch::<ops::rows::Rows>(&nn::layers::Rows::descriptor_of(
-                    SAMPLE_DTYPE,
-                    ops::rows::Mode::Replace,
-                    width as u32,
-                ));
-            }
-        }
-
-        // The conditioner's anchor mix over a patch's own columns, and the refine-in-place copy over a
-        // text row's.
-        // One descriptor: the anchors' widths are the operands', and neither reaches the key.
-        for _columns in [4 * u64::from(video), u64::from(config.hidden_size)] {
-            programs.launch::<ScaledAddOp>(
-                &nn::layers::ScaledAdd.descriptor(nn::DType::F32, nn::DType::F32),
-            );
-        }
-
-        // The solver's step: one gated residual over the whole trajectory of each modality. The
-        // trajectory is the sample (`Solver::step` reads the sample and the velocity in one type,
-        // and the forward refuses a sample that is not `SAMPLE_DTYPE`), so these rows are the
-        // sample's type - keyed from the stack they would name a row no step ever launches.
-        programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
-            SAMPLE_DTYPE,
-            u64::from(video) * 4,
-            false,
-        )?);
-        for count in elements {
-            programs.launch::<ResidualOp>(&nn::layers::ScaledResidual::descriptor_of(
-                SAMPLE_DTYPE,
-                *count,
-                false,
-            )?);
-        }
-        Ok(programs.finish())
-    }
-
     /// Attach the condition encoders this deployment places.
     ///
     /// `load.rs` builds them from their own checkpoint directories (`vae` and `audio_vae`) and calls
@@ -2942,8 +2491,7 @@ impl Denoiser {
         let groups = self.cache.groups().count() as u64;
         let entries = arena.tensor(DType::I32, Shape::new(&[1, groups]))?;
         self.cache.entries_of(f, step_index, entries)?;
-        // The plan states this buffer's element as the stack's (`element`, `output.modulation`), and
-        // so does this line: one number, two guards. The cache then refuses a table of another type
+        // This buffer's element is the stack's. The cache refuses a table of another type
         // (`AdaLnCache::output` compares the destination with its own weights), so a cache whose
         // projections drifted away from the stack's type is a named refusal and not a mixed gather.
         let modulation = arena.tensor(hidden.dtype, Shape::new(&[groups, 2 * hidden_size]))?;
@@ -3265,20 +2813,6 @@ impl Denoiser {
         })
     }
 
-    /// Every checkpoint tensor this block's partition reads, as complete names.
-    ///
-    /// The refiner's, the stack's and the AdaLN cache's, in the order `load` reads them. The
-    /// condition encoders are **not** here: they are the `latent_encoder` component's, loaded from
-    /// their own checkpoint directories (`vae`, `audio_vae`) and answered by their own `keys`, even
-    /// though this block holds them once a deployment places them.
-    pub fn keys(config: &DenoiserConfig) -> Vec<String> {
-        let transformer = &config.transformer;
-        let mut keys = crate::conditioning::TokenRefiner::keys(transformer);
-        keys.extend(Transformer::keys(transformer, config.attention));
-        keys.extend(crate::modulation::AdaLnCache::keys(transformer));
-        keys
-    }
-
     /// The checkpoint this denoiser evaluates.
     pub const fn config(&self) -> &DenoiserConfig {
         &self.config
@@ -3318,54 +2852,6 @@ impl Denoiser {
 #[cfg(test)]
 mod tests {
 
-    /// The denoiser states the two stacks and the orchestration around them: the pack and its
-    /// inverse, the draw, the strided copy, the gathers outside the modulation, and the blends the
-    /// conditioner and the solver issue. The trajectory's width is a deployment fact and the only one.
-    #[test]
-    fn the_denoiser_states_its_orchestration_beside_its_stacks() {
-        let config = crate::config::tests_support::released_config();
-        let (_, denoiser) = config
-            .denoisers
-            .iter()
-            .next()
-            .expect("a released DiT partition");
-        let programs = Denoiser::programs(
-            &denoiser.transformer,
-            denoiser.attention,
-            nn::DType::BF16,
-            nn::DType::F32,
-            32_000,
-            Groups::of(true),
-            &crate::partition::Partition::single(),
-            &[1_000_000],
-            0,
-        )
-        .expect("the denoiser's programs");
-        let has = |operator: &str| programs.iter().any(|(name, _)| name == operator);
-
-        for operator in [
-            "patch",
-            "philox_noise",
-            "copy_block",
-            "unpatchify_video",
-            "scaled_add",
-            "scaled_residual",
-            "logits_gather",
-        ] {
-            assert!(has(operator), "{operator} is missing: {programs:?}");
-        }
-        // The solver's residual over the whole trajectory is a second program from the patch-column
-        // one, because the width is in the key.
-        let residuals = programs
-            .iter()
-            .filter(|(name, _)| name == "scaled_residual")
-            .map(|(_, key)| key.clone())
-            .collect::<Vec<_>>();
-        assert!(
-            residuals.iter().any(|key| key.contains("columns_1000000")),
-            "{residuals:?}"
-        );
-    }
     use super::*;
     use crate::config::{AttentionKind, DenoiserConfig, ScheduleSpec, Shifts, TransformerConfig};
 
@@ -3535,12 +3021,8 @@ mod tests {
             ..conditioned()
         });
         assert_eq!(rung.condition_rows, 1024);
-        rules.segment_of(&rung).unwrap();
-        assert_eq!(
-            packed_rows(&rules.config, &rules.arrangement, &widest).unwrap()
-                - packed_rows(&rules.config, &rules.arrangement, &rung).unwrap(),
-            1024
-        );
+        let rows = |layout| rules.segment_of(layout).unwrap().extent.padded_tokens;
+        assert_eq!(rows(&widest) - rows(&rung), 1024);
         // A request of no anchor and no reference is `t2va`, whatever rung it states.
         let plain = rules.cover(&VideoRequest {
             condition_rows: Some(1024),
@@ -3639,71 +3121,6 @@ mod tests {
             u64::from(rule.condition_elements(&conditions, &canvas)),
             "the offsets partition the block `condition_elements` sizes"
         );
-    }
-
-    #[test]
-    fn an_arena_plan_names_every_buffer_once_and_declares_a_known_element() {
-        // The worker keys the arena's storage by these names and sizes it by the sum of the element
-        // counts, so a repeated name aliases two buffers and a letter outside the plan vocabulary is
-        // charged four bytes an element (`Buffer::width`'s fallback) - both silent at a canvas, both
-        // wrong for the whole deployment. The group count is an input: the plan scales two entries by
-        // it and nothing else.
-        // One rank has no exchange to reserve for, two do: the plan follows the layer, which reserves
-        // its exchange destinations only when it communicates.
-        let two_ranks = Layouts::new(
-            layouts().config,
-            Arrangement {
-                text_rows: 128,
-                condition_rows: 64,
-                shard: 2,
-                rank: 0,
-            },
-        )
-        .unwrap();
-        for rule in [layouts(), sparse_layouts(), two_ranks] {
-            let layout = rule.cover(&request(121, 1344, 768));
-            let plan = denoise_arena(&rule.config, &rule.arrangement, 22, DType::BF16, &layout)
-                .expect("a plan for the released canvas");
-            let mut names = std::collections::HashSet::new();
-            for buffer in &plan {
-                assert!(
-                    names.insert(buffer.name.as_str()),
-                    "{} is listed twice",
-                    buffer.name
-                );
-                assert!(buffer.elements > 0, "{} holds no elements", buffer.name);
-                assert!(
-                    ["bf16", "f16", "f32", "i32"].contains(&buffer.element),
-                    "{} declares {}, which no plan element names",
-                    buffer.name,
-                    buffer.element
-                );
-            }
-            // Every H3 TODO produces a soundtrack, so the stream's own buffers are in every plan: the
-            // rows gathered from the packed sequence, and the head they are projected and solved with.
-            for name in [
-                "audio.hidden",
-                "audio.groups",
-                "audio.normed",
-                "audio.velocity",
-            ] {
-                assert!(names.contains(name), "{name} is not in the plan");
-            }
-            // A layer that does not communicate reserves nothing for the exchange: at one rank these
-            // entries must be absent, because they cost a row of every head each and are never read.
-            for name in [
-                "attention.staging",
-                "attention.returned",
-                "attention.merged",
-                "attention.gathered",
-            ] {
-                assert!(
-                    names.contains(name) == (rule.arrangement.shard > 1),
-                    "{name} at shard {}",
-                    rule.arrangement.shard
-                );
-            }
-        }
     }
 
     #[test]

@@ -41,7 +41,7 @@ use nn::layers::{
     Attention, Embedding, GatedActivation, Linear, RmsNorm, Rotary, Rows, ScaledResidual, Sections,
 };
 use nn::weights::{WeightLoader, WeightRequest};
-use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
+use nn::{Arena, Forward, Shape, TensorView, Weight};
 use ops::activation::Activation;
 use ops::gemm::WeightOrder;
 
@@ -63,9 +63,8 @@ const PREFIX: &str = "model.language_model";
 
 /// What one encode call of a layout covers.
 ///
-/// The runner plans a bucket from these numbers: the prompt's rows, the images of the request (one
-/// patch grid each) and the widths this rank holds. [`Plan::bytes`] then states the arena region one
-/// such call reserves, which the worker keeps for as long as a captured graph addresses it.
+/// An encode call reads these numbers: the prompt's rows, the images of the request (one patch grid
+/// each) and the widths this rank holds. They shape the call's tables and its arena reservations.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Plan {
     /// Rows the call writes: the packed prompt tokens, placeholders included.
@@ -161,31 +160,6 @@ impl Plan {
             )));
         }
         Ok(plan)
-    }
-
-    /// The bytes one encode call of this plan reserves in the arena.
-    pub fn bytes(&self, config: &TextEncoderConfig, dtype: nn::DType) -> Result<u64> {
-        let bytes = Buffers::bytes(self, dtype)?;
-        let Some(&patches) = self.images.iter().max() else {
-            return Ok(bytes);
-        };
-        bytes
-            .checked_add(Buffers::tower_bytes(&config.vision, patches, dtype)?)
-            .ok_or_else(|| Error::config("an encoder plan larger than a u64".to_owned()))
-    }
-}
-
-/// The plan names' element for `dtype`: the vocabulary `crate::decoding::Buffer` holds.
-///
-/// Public because a plan's element type is the caller's to state and a harness must print the one it
-/// reserved by: `video_arena` takes the decode's type, so the line that prints the plan has to spell
-/// the same type it was stated in, or a short plan reads as an allocator fault.
-pub fn element_of(dtype: nn::DType) -> &'static str {
-    match dtype {
-        nn::DType::BF16 => "bf16",
-        nn::DType::F16 => "f16",
-        nn::DType::F32 => "f32",
-        _ => "bf16",
     }
 }
 
@@ -353,22 +327,6 @@ impl Buffers {
                 out_hidden,
             ]))?,
         })
-    }
-
-    /// The bytes [`Buffers::new`] reserves.
-    fn bytes(plan: &Plan, dtype: nn::DType) -> Result<u64> {
-        let arena = Arena::new(DevicePtr::new(0), u64::MAX);
-        Self::new(&arena, plan, dtype)?;
-        Ok(arena.used())
-    }
-
-    /// The bytes one image's tower reservations take.
-    fn tower_bytes(
-        config: &crate::config::VisionConfig,
-        patches: u32,
-        dtype: nn::DType,
-    ) -> Result<u64> {
-        crate::vision::Buffers::bytes(config, patches, dtype)
     }
 
     /// `view`'s rows as `[rows, heads, head_dim]` for the rotation and attention operators.
@@ -644,152 +602,6 @@ pub struct TextEncoder {
 }
 
 impl TextEncoder {
-    /// Every checkpoint tensor the **language stack** reads, by name.
-    ///
-    /// The names are the sharded reads' own: a tensor-parallel degree splits a tensor's rows and
-    /// never renames it, so one list answers for every rank of a deployment and needs no partition.
-    /// `load` asks for these and only these, so a checkpoint that lacks one is refused by name
-    /// before a byte is read rather than surfacing as a read error inside a layer.
-    ///
-    /// This is not the whole component: `load` builds the vision tower inside the encoder
-    /// (`tower: VisionTower::load(...)`), unconditionally, because a prompt may carry images. A
-    /// caller checking a checkpoint for this block checks `VisionTower::keys(&config.vision)`
-    /// beside this list - the two halves fail for different reasons and are reported apart.
-    pub fn keys(config: &TextEncoderConfig) -> Vec<String> {
-        let mut keys = vec![format!("{PREFIX}.embed_tokens.weight")];
-        for index in 0..config.num_retained_layers {
-            let name = format!("{PREFIX}.layers.{index}");
-            let attention = format!("{name}.self_attn");
-            for projection in ["q_proj", "k_proj", "v_proj", "o_proj"] {
-                keys.push(format!("{attention}.{projection}.weight"));
-            }
-            for norm in ["q_norm", "k_norm"] {
-                keys.push(format!("{attention}.{norm}.weight"));
-            }
-            keys.push(format!("{name}.input_layernorm.weight"));
-            keys.push(format!("{name}.post_attention_layernorm.weight"));
-            for projection in ["gate_proj", "up_proj", "down_proj"] {
-                keys.push(format!("{name}.mlp.{projection}.weight"));
-            }
-        }
-        keys
-    }
-
-    /// The programs the retained layers and the prompt splice of this encoder launch.
-    ///
-    /// Stated from the configuration and the tensor-parallel position alone, because a deployment
-    /// compiles its store before it opens the checkpoint: the shard widths are `Rank`'s, the geometry is
-    /// the config's, and the element type is the deployment's. `tokens` is the largest prompt the
-    /// deployment serves, which states the two things a key carries from it — the dense attention's key
-    /// bound and whether the gated activation's `wide` form is the program.
-    ///
-    /// The vision tower is [`VisionTower::programs`]: it launches programs of its own.
-    pub fn programs(
-        config: &TextEncoderConfig,
-        partition: &Partition,
-        dtype: nn::DType,
-        tokens: u32,
-    ) -> Result<Vec<(String, String)>> {
-        use crate::programs::Programs;
-        use ops::activation::ActAndMul as ActAndMulOp;
-        use ops::attention::dense::DenseAttention;
-        use ops::gemm::Gemm;
-        use ops::norm::{AddRmsNorm, RmsNorm as RmsNormOp};
-        use ops::residual::ScaledResidual as ResidualOp;
-        use ops::rope::{QkNormRope, RotaryFactors, Rotation};
-        use ops::rows::{self, Rows as RowsOp};
-
-        let rank = Rank::new(config, partition)?;
-        let hidden = config.hidden_size;
-        let head = config.head_dim;
-        let sections = sections_of(config)?;
-        let mut programs = Programs::default();
-
-        // The prompt's embedding: this rank's vocabulary shard, gathered by I32 ids.
-        programs.launch::<ops::embedding::Embedding>(&Embedding::descriptor_of(
-            rank.vocabulary.1 - rank.vocabulary.0,
-            hidden,
-            rank.vocabulary.0,
-            dtype,
-            nn::DType::I32,
-        ));
-
-        // One dense product for the whole stack: no projection carries a bias, and the contraction
-        // length, the row count and the width are launch values.
-        programs.launch::<Gemm>(&Linear::descriptor_of(
-            hidden,
-            dtype,
-            dtype,
-            WeightOrder::NxK,
-            false,
-            dtype,
-        ));
-
-        // The two normalizations: the first layer's plain one and the residual-folding one every layer
-        // after it uses.
-        programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(hidden, dtype));
-        programs.launch::<AddRmsNorm>(&RmsNorm::add_descriptor_of(hidden, dtype));
-
-        // The M-RoPE table once, then the per-layer application with its learned per-head gains.
-        programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_of(
-            head,
-            1.0,
-            Some(sections),
-            nn::DType::I32,
-        ));
-        programs.launch::<QkNormRope>(&Rotary::apply_descriptor_of(
-            head,
-            rank.query_heads,
-            rank.key_value_heads,
-            Rotation::Half,
-            config.rms_norm_eps,
-            head,
-            dtype,
-            dtype,
-            // The checkpoint stores `q_norm.weight` and `k_norm.weight`.
-            true,
-        ));
-
-        // The prompt attends within its own sequence: the offsets select the varlen program.
-        let attention = Attention::dense(
-            head,
-            rank.query_heads,
-            rank.key_value_heads,
-            tokens,
-            true,
-            None,
-            (head as f32).sqrt().recip(),
-        )
-        .map_err(Error::from)?;
-        programs.launch::<DenseAttention>(
-            &attention.dense_descriptor(dtype, dtype, dtype, tokens, true),
-        );
-
-        // The gated feed-forward over two separate projections, and the residual that folds each
-        // layer's output back into the stream.
-        programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
-            dtype,
-            u64::from(rank.intermediate),
-            ACTIVATION,
-            u64::from(rank.intermediate),
-            u64::from(rank.intermediate),
-            u64::from(tokens) * u64::from(rank.intermediate),
-            false,
-        )?);
-        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
-            dtype,
-            u64::from(hidden),
-            false,
-        )?);
-
-        // The prompt's rows: the vision features replace the placeholders, and each DeepStack table
-        // adds into the rows the layout names.
-        programs.launch::<RowsOp>(&Rows::descriptor_of(dtype, rows::Mode::Replace, hidden));
-        programs.launch::<RowsOp>(&Rows::descriptor_of(dtype, rows::Mode::Add, hidden));
-
-        Ok(programs.finish())
-    }
-
     /// The encoder of `config`, reading the checkpoint through `loader`.
     ///
     /// `dtype` is the activation element type the loading boundary chose. The stack is built for
@@ -1343,44 +1155,6 @@ fn write_state(
     write_i32(&mut out[6], &lengths, "vision_lengths")
 }
 
-/// The bytes of every host table one prompt of `ids` and `layout` needs, with its declaration.
-///
-/// This is the whole of [`Encoder::prepare_state`] without an encoder: the arithmetic depends on the
-/// configuration and the prompt, not on the weights, so the block-by-block diagnosis can compare the
-/// tables against the reference without loading a checkpoint. Serving does not
-/// call it: the worker owns the buffers there, and `prepare_state` writes into them in place.
-pub fn table_bytes(
-    config: &TextEncoderConfig,
-    ids: &[u32],
-    layout: &EncoderLayout,
-) -> Result<Vec<(StateTable, Vec<u8>)>> {
-    let grids = layout
-        .images
-        .iter()
-        .map(|image| image.grid)
-        .collect::<Vec<_>>();
-    let plan = Plan::new(config, &Partition::single(), layout.tokens, &grids)?;
-    if plan.rows != layout.rows {
-        return Err(Error::config(format!(
-            "the layout reserves {} output rows for a {} token prompt",
-            layout.rows, plan.rows
-        )));
-    }
-    let tables = table_specs(config, layout.rows, &plan.images, &plan.time, plan.merged);
-    let bytes = tables
-        .iter()
-        .map(|table| {
-            let width = table.dtype.bits().div_ceil(8) as u64;
-            usize::try_from(table.shape.numel() * width)
-                .map(|bytes| vec![0_u8; bytes])
-                .map_err(|_| Error::config("a table larger than a host allocation".to_owned()))
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let mut buffers = bytes;
-    write_state(config, ids, layout, &mut buffers)?;
-    Ok(tables.into_iter().zip(buffers).collect())
-}
-
 /// The grids [`positions::rope_index`] reads: one list per placeholder kind, in prompt order.
 type GridRuns = (Vec<[u32; 3]>, Vec<[u32; 3]>);
 
@@ -1697,100 +1471,14 @@ fn frequencies(loader: &mut WeightLoader<'_>, config: &TextEncoderConfig) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::decoding::Buffer;
 
     /// The checkpoint's placeholder token ids.
     const IMAGE: u32 = 151_655;
     const VIDEO: u32 = 151_656;
 
-    /// Every tensor the encoder reads is named once, and under the language stack's prefix.
-    ///
-    /// A name asked twice is read twice and reported twice by a missing-name check; a name outside
-    /// the prefix would collide with the vision tower's tensors in the same export.
-    #[test]
-    fn keys_are_unique_and_inside_the_language_model() {
-        let config = crate::config::tests_support::released_config().text_encoder;
-        let keys = TextEncoder::keys(&config);
-        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
-        assert_eq!(distinct.len(), keys.len(), "a tensor is asked for twice");
-        assert!(
-            keys.iter()
-                .all(|key| key.starts_with(&format!("{PREFIX}."))),
-            "a key lies outside {PREFIX}"
-        );
-        // One embedding, then eleven tensors per retained layer: four projections, two per-head
-        // norms, two layer norms and the gated MLP's three.
-        assert_eq!(keys.len(), 11 * config.num_retained_layers as usize + 1);
-    }
-
-    /// The tower's named plan is its byte plan, for a block of patches.
-    #[test]
-    fn the_tower_named_plan_sums_to_its_byte_plan() {
-        let config = config();
-        let patches = 16 * 16;
-        let named = crate::vision::Buffers::plan(&config.vision, patches, nn::DType::BF16);
-        let sum: u64 = named.iter().map(Buffer::bytes).sum();
-        assert_eq!(
-            sum,
-            crate::vision::Buffers::bytes(&config.vision, patches, nn::DType::BF16)
-                .expect("the tower's byte plan"),
-            "the tower's named plan disagrees with its byte plan"
-        );
-        let names: std::collections::BTreeSet<&String> =
-            named.iter().map(|buffer| &buffer.name).collect();
-        assert_eq!(names.len(), named.len(), "a buffer is named twice");
-    }
-
     /// The released text encoder's configuration.
     fn config() -> TextEncoderConfig {
         crate::config::tests_support::released_config().text_encoder
-    }
-
-    /// The encoder states its own programs from its configuration and the deployment's partition: the
-    /// shard widths are the rank's, and neither a prompt length nor a raster can add a row.
-    #[test]
-    fn the_encoder_states_its_programs_from_its_config_and_partition() {
-        let config = config();
-        let programs = TextEncoder::programs(&config, &Partition::single(), nn::DType::BF16, 4096)
-            .expect("the encoder's programs");
-        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
-
-        assert_eq!(count("embedding"), 1);
-        // One dense product whatever the contraction, one normalization pair, one rotation, one
-        // attention, one gated activation and one residual: the stack's geometry is the config's.
-        assert_eq!(count("gemm"), 1);
-        assert_eq!(count("rms_norm"), 1);
-        assert_eq!(count("add_rms_norm"), 1);
-        assert_eq!(count("rotary_factors"), 1);
-        assert_eq!(count("qk_norm_rope"), 1);
-        assert_eq!(count("dense_attention"), 1);
-        assert_eq!(count("act_and_mul"), 1);
-        assert_eq!(count("scaled_residual"), 1);
-        // The prompt's rows: the vision features replace placeholders and the DeepStack taps add.
-        assert_eq!(count("rows"), 2);
-
-        // A second prompt length states the same programs: the key bound is a launch value, and the
-        // gated activation's `wide` form is nowhere near its threshold at these sizes.
-        let wider = TextEncoder::programs(&config, &Partition::single(), nn::DType::BF16, 8192)
-            .expect("the encoder's programs");
-        assert_eq!(wider, programs);
-
-        // A sharded rank states a different rotation, because the head count is the shard's.
-        let sharded = Partition {
-            tensor_parallel: 8,
-            tensor_rank: 0,
-            ..Partition::single()
-        };
-        let rank = TextEncoder::programs(&config, &sharded, nn::DType::BF16, 4096)
-            .expect("a sharded rank's programs");
-        let rotation = |set: &[(String, String)]| {
-            set.iter()
-                .find(|(name, _)| name == "qk_norm_rope")
-                .map(|(_, key)| key.clone())
-                .expect("a rotation")
-        };
-        assert_ne!(rotation(&rank), rotation(&programs));
-        assert!(rotation(&rank).contains(&format!("q_heads_{}", config.num_attention_heads / 8)));
     }
 
     #[test]
@@ -2237,21 +1925,6 @@ mod tests {
         assert!(plan.images.is_empty());
         assert_eq!(plan.merged, 0);
         assert_eq!(plan.rows, 128);
-    }
-
-    #[test]
-    fn the_plan_reserves_more_with_images_and_more_rows() {
-        let config = config();
-        let single = Partition::single();
-        let text = Plan::new(&config, &single, 512, &[]).expect("a text prompt");
-        let prompt = Plan::new(&config, &single, 512, &[[1, 24, 24]]).expect("one image");
-        let longer = Plan::new(&config, &single, 1024, &[]).expect("a longer prompt");
-        let dtype = nn::DType::BF16;
-        let text_bytes = text.bytes(&config, dtype).expect("bytes");
-        let prompt_bytes = prompt.bytes(&config, dtype).expect("bytes");
-        let longer_bytes = longer.bytes(&config, dtype).expect("bytes");
-        assert!(prompt_bytes > text_bytes);
-        assert!(longer_bytes > text_bytes);
     }
 
     #[test]

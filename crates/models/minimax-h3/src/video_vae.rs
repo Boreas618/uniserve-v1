@@ -658,146 +658,6 @@ fn tile_count(config: &VideoVaeConfig, canvas: &Canvas) -> Result<u64> {
 }
 
 impl VideoDecoder {
-    /// Every checkpoint tensor the video decoder reads, by name.
-    ///
-    /// The decoder is a component whose names were already data ([`sources`] maps each parameter to
-    /// the checkpoint key that fills it), so this list is that mapping's other column rather than a
-    /// second spelling of it: the 585 names are the export's 583 `decoder.*` and the two
-    /// `post_quant_conv.*`. A checkpoint that lacks one is refused by block and name before a byte is
-    /// read.
-    pub fn keys(config: &VideoVaeConfig) -> crate::Result<Vec<String>> {
-        Ok(crate::audio_vae::tensor_keys(&sources(config)?))
-    }
-
-    /// The programs one clip's decode of `config` launches.
-    ///
-    /// Stated from the configuration alone, because a deployment compiles its store before it opens
-    /// the checkpoint, and each row's element types are this module's declaration. **No extent enters a
-    /// key**: a clip's token count is a launch value the attention and the normalizations read
-    /// position by position, so one program serves every raster — which is why this takes no bucket
-    /// set while the post-processor, whose blend is keyed by its pixel count, does.
-    pub fn programs(config: &VideoVaeConfig) -> Result<Vec<(String, String)>> {
-        use crate::programs::Programs;
-        use ops::activation::ValueFirstSwiglu as SwigluOp;
-        use ops::attention::dense::DenseAttention;
-        use ops::gemm::Gemm;
-        use ops::residual::{
-            ScaledAdd as ScaledAddOp, ScaledResidualLayerNorm as LayerNormOp,
-            ScaledResidualRmsNorm as RmsNormOp, WeightedRmsNorm as FirstNormOp,
-        };
-        use ops::rope::{QkNormRope, RotaryFactors, Rotation};
-        use ops::rows::{self, Rows as RowsOp};
-        use ops::tile_stitch::TileStitch as TileStitchOp;
-
-        let (head, heads) = (
-            config.decoder_attention_head_dim,
-            config.decoder_num_attention_heads,
-        );
-        let width = heads * head;
-        let ffn = width * config.decoder_ffn_mult;
-        let (rotated, sections) = rotary(config)?;
-        let sections = nn::layers::Sections::new(&sections)?;
-
-        let mut programs = Programs::default();
-
-        // The restore in FP32, then every projection: all of them carry a bias in their epilogue, as
-        // the reference's dense layers do, so the contraction length is the only thing that differs
-        // and it is no part of the key.
-        programs.launch::<Gemm>(&Linear::descriptor_of(
-            config.latent_channels,
-            STREAM,
-            STREAM,
-            WeightOrder::NxK,
-            true,
-            STREAM,
-        ));
-        for k in [config.latent_channels, width, ffn] {
-            programs.launch::<Gemm>(&Linear::descriptor_of(
-                k,
-                ACTIVATION,
-                ACTIVATION,
-                WeightOrder::NxK,
-                true,
-                ACTIVATION,
-            ));
-        }
-        // `post_quant_conv`'s product, which rounds before its bias joins it.
-        programs.launch::<Gemm>(&Linear::descriptor_of(
-            config.latent_channels,
-            ACTIVATION,
-            ACTIVATION,
-            WeightOrder::NxK,
-            false,
-            ACTIVATION,
-        ));
-
-        // The gather of a clip's rows out of the trajectory, one strided copy per tile.
-        programs
-            .launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::descriptor_of(STREAM));
-        // The tail a clip leaves its successor, out of the clip's raster.
-        programs.launch::<ops::copy_block::CopyBlock>(&nn::layers::CopyBlock::wide_descriptor_of(
-            ACTIVATION,
-        ));
-
-        // The two crossings between the stream's type and the activation's: the restored latents
-        // round down, and the projected voxels widen into the stream.
-        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(ACTIVATION, STREAM));
-        programs.launch::<ScaledAddOp>(&ScaledAdd.descriptor(STREAM, ACTIVATION));
-
-        // The two row writes into the token stream, the register rows and the zero row: every
-        // row-major gather is one program.
-        programs.launch::<RowsOp>(&Rows::descriptor_of(STREAM, rows::Mode::Replace, width));
-
-        // The rotation's table once, then its application in every layer.
-        programs.launch::<RotaryFactors>(&Rotary::factors_descriptor_at(
-            rotated,
-            1.0,
-            Some(sections),
-            DType::F32,
-            ACTIVATION,
-        ));
-        programs.launch::<QkNormRope>(&Rotary::strided_descriptor_of(
-            head,
-            heads,
-            Rotation::Half,
-            config.decoder_norm_eps,
-            rotated,
-            ACTIVATION,
-            ACTIVATION,
-        ));
-
-        // The stream's three normalizations and the gated feed-forward's packed activation.
-        programs.launch::<FirstNormOp>(&WeightedRmsNorm::descriptor_of(width, STREAM, ACTIVATION));
-        programs.launch::<RmsNormOp>(&ScaledResidualRmsNorm::descriptor_of(
-            width, STREAM, ACTIVATION, false,
-        ));
-        programs.launch::<LayerNormOp>(&ScaledResidualLayerNorm::descriptor_of(
-            width, STREAM, ACTIVATION, false,
-        ));
-        programs.launch::<SwigluOp>(&PackedSwiGlu::descriptor_of(
-            ACTIVATION,
-            u64::from(ffn),
-            2 * u64::from(ffn),
-            false,
-            false,
-        )?);
-
-        // The output path: the one stitch.
-        programs.launch::<TileStitchOp>(
-            &crate::decoding::ClipDecoder::new(config)?
-                .stitch()
-                .descriptor(),
-        );
-
-        // One attention for the whole decoder: the sequences and their rows are launch values.
-        let attention = block_attention(head, heads, width)?;
-        programs.launch::<DenseAttention>(
-            &attention.dense_descriptor(ACTIVATION, ACTIVATION, ACTIVATION, width, true),
-        );
-
-        Ok(programs.finish())
-    }
-
     /// Read the 36 layers and the head of the checkpoint's decoder.
     /// Load one decoder for **every raster the deployment serves**.
     ///
@@ -1359,7 +1219,7 @@ impl VideoDecoder {
     }
 
     /// The transformer's scratch for one clip: every tile's rows at once, because every tile runs in
-    /// the same launches. [`crate::decoding::video_arena`] states the same buffers.
+    /// the same launches.
     pub fn scratch(&self, f: &Forward, canvas: &Canvas) -> Result<ClipScratch> {
         let tile = self.largest_tile(canvas)?;
         let tiles = tile_count(&self.config, canvas)?;
@@ -1779,7 +1639,7 @@ impl Decoder for VideoDecoder {
     /// checkpoint; the clips are the runner's loop, and so is the splice.
     ///
     /// **A caller owes this call one clip at a time.** The transformer scratch is *reserved once per
-    /// clip* ([`Self::scratch`], `decoding::video_arena`), so two decodes in flight on one decoder object
+    /// clip* ([`Self::scratch`]), so two decodes in flight on one decoder object
     /// write the same buffers of the same arena - the second clip corrupts the first silently rather
     /// than costing another column. A warmup of one clip beside a served clip of another is the same
     /// defect, and it looks identical from outside because the arena is the same size either way.
@@ -1928,42 +1788,6 @@ pub(crate) mod tests {
         );
     }
 
-    /// A clip's transformer scratch holds every tile's rows, and the plan states the same: the two must
-    /// agree, or a device run stops inside the arena naming a buffer while the plan is the thing that
-    /// is wrong.
-    #[test]
-    fn a_clips_scratch_fits_the_plan_its_canvas_states() {
-        let config = video_config();
-        // A canvas one tile wide and two tall, so a tile's row count and the clip's differ: on a
-        // single-tile canvas the two are the same number and this test would see nothing.
-        let canvas = Canvas::clip(&config, 3 * config.spatial_compression(), 17);
-        let grid = Tiles::of(&config, &canvas)
-            .expect("a grid")
-            .tiles(&config, &canvas);
-        assert!(
-            grid.len() > 1,
-            "the canvas must need more than one tile, or this test proves nothing: {} tile(s)",
-            grid.len()
-        );
-        assert!(
-            grid[0].canvas.voxels() < canvas.voxels(),
-            "and a tile must be smaller than the clip: {} against {}",
-            grid[0].canvas.voxels(),
-            canvas.voxels()
-        );
-
-        let decoder = stated_decoder(&config, canvas);
-        let plan = crate::decoding::video_arena(&config, &canvas).expect("a plan");
-        let need = crate::decoding::arena_reservation(&plan);
-        // Exactly the plan and not one byte more: the scratch a clip reserves has to fit inside the
-        // number its decoder states to the runner.
-        let arena = nn::Arena::new(nn::DevicePtr::new(0), need);
-        let forward = nn::Forward::recording(&arena);
-        decoder
-            .scratch(&forward, &canvas)
-            .expect("one clip's transformer scratch fits the plan its decoder states");
-    }
-
     /// A denoiser publishes its trajectory in FP32 and this decoder restores it in FP32. Reading the
     /// bytes in another type would reinterpret the trajectory silently, so the mismatch is refused and
     /// both types are named.
@@ -1973,11 +1797,7 @@ pub(crate) mod tests {
         let canvas = Canvas::clip(&config, 48, 48);
         let decoder = stated_decoder(&config, canvas);
         let clip = clip_of(&config, canvas);
-        let plan = crate::decoding::video_arena(&config, &canvas).expect("a plan");
-        let arena = nn::Arena::new(
-            nn::DevicePtr::new(0),
-            crate::decoding::arena_reservation(&plan),
-        );
+        let arena = nn::Arena::counting();
         let forward = nn::Forward::recording(&arena);
         let latents = arena
             .tensor(
@@ -2538,39 +2358,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_video_decoders_keys_ask_the_export_and_nothing_else() {
-        let config = video_config();
-        let keys = VideoDecoder::keys(&config).expect("the decoder's keys");
-        // The export's own number: `vae/` holds 703 names, the decoder's 585 are the 583 under
-        // `decoder.` plus the two `post_quant_conv.` tensors, and the encoder reads the remaining 118.
-        // A checkpoint that lacks one is refused by block and name.
-        assert_eq!(keys.len(), 585);
-        let mut unique = keys.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), keys.len(), "no tensor is named twice");
-        assert!(
-            keys.iter()
-                .any(|key| key == "decoder.transformer_blocks.35.ff.net.0.proj.weight"),
-            "the last layer's projection is asked for"
-        );
-        assert!(
-            keys.iter().any(|key| key == "post_quant_conv.weight"),
-            "the post-quantization convolution's tensor is asked for"
-        );
-        let encoder = crate::encoding::VideoEncoder::keys(&config).expect("the encoder's keys");
-        assert!(
-            encoder.iter().all(|key| !keys.contains(key)),
-            "the two halves read disjoint tensors, or one block would be binding another's weight"
-        );
-        assert_eq!(
-            keys.len() + encoder.len(),
-            703,
-            "together they are every name in `vae/`, with none unread"
-        );
-    }
-
-    #[test]
     fn the_weight_table_names_every_parameter_of_the_checkpoint() {
         let table = sources(&video_config()).expect("the decoder's parameters");
         // 36 layers of sixteen parameters, plus the post-quantization pair, the input pair, the
@@ -2635,83 +2422,5 @@ pub(crate) mod tests {
             "latents_std": vec![1.0; 24],
         });
         VideoVaeConfig::parse(&sidecar).expect("the checkpoint's video VAE sidecar")
-    }
-
-    /// The decoder's programs follow from its configuration: one key per operator, because nothing
-    /// that varies with a launch is in a key.
-    #[test]
-    fn the_decoder_states_its_programs_from_its_own_config() {
-        let config = video_config();
-        let programs = VideoDecoder::programs(&config).expect("the decoder's programs");
-        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
-
-        // The contraction length is a descriptor field of one program, so the projections are three
-        // keys: the FP32 restore, every biased FP16 product, and `post_quant_conv`'s bias-free one.
-        assert_eq!(count("gemm"), 3);
-        assert_eq!(count("rows"), 1, "two row writes, one program");
-        assert_eq!(count("rotary_factors"), 1);
-        assert_eq!(count("qk_norm_rope"), 1);
-        assert_eq!(count("weighted_rms_norm"), 1);
-        assert_eq!(count("scaled_residual_rms_norm"), 1);
-        assert_eq!(count("scaled_residual_layer_norm"), 1);
-        assert_eq!(count("value_first_swiglu"), 1);
-        assert_eq!(
-            count("scaled_add"),
-            2,
-            "the two crossings of the stream's type"
-        );
-        assert_eq!(count("tile_stitch"), 1, "the whole output path");
-        assert_eq!(
-            count("copy_block"),
-            2,
-            "the gather out of the trajectory and the tail a clip leaves"
-        );
-
-        // One attention whatever the clip: the sequences and their rows are launch values, so the
-        // decoder's programs do not depend on the raster a request asks for.
-        assert_eq!(count("dense_attention"), 1, "{programs:?}");
-    }
-
-    /// The precision table replaces `torch.autocast` with a declaration per layer, and these rows
-    /// are that declaration: the stream and everything that reads or writes it wide says so in its key,
-    /// and everything else is the activation's type. A row in a type nobody declared would be a layer
-    /// silently computing in it, which is the behaviour the design removed.
-    #[test]
-    fn the_rows_state_the_precision_the_module_declares() {
-        let config = video_config();
-        let rows = VideoDecoder::programs(&config).expect("the decoder's programs");
-        let key = |operator: &str, part: &str| {
-            rows.iter()
-                .find(|(name, key)| name == operator && key.contains(part))
-                .map(|(_, key)| key.clone())
-                .unwrap_or_else(|| panic!("no {operator} row holds {part}: {rows:?}"))
-        };
-        // The normalizations read the wide stream and write the narrow rows.
-        for operator in [
-            "weighted_rms_norm",
-            "scaled_residual_rms_norm",
-            "scaled_residual_layer_norm",
-        ] {
-            let row = key(operator, "dtype_f32");
-            assert!(row.ends_with("activation_f16"), "{row}");
-        }
-        // The projections are FP16 with FP32 accumulation, and only the restore is wide.
-        key("gemm", "input_f16_weight_f16_accumulate_f32_output_f16");
-        key("gemm", "input_f32_weight_f32_accumulate_f32_output_f32");
-        // The two crossings, and the rotary factors in the rows' type.
-        key("scaled_add", "target_f16_source_f32");
-        key("scaled_add", "target_f32_source_f16");
-        key("rotary_factors", "dtype_f16_positions_f32");
-        let rotation = key("qk_norm_rope", "dtype_f16_output_f16");
-        assert!(rotation.contains("factors_f16"), "{rotation}");
-        assert!(rotation.ends_with("strided_true"), "{rotation}");
-        // The attention is the packed FlashAttention form, which names no offsets in its key.
-        let attention = key("dense_attention", "dtype_f16_kv_f16_out_f16");
-        assert!(
-            attention.ends_with("mask_dense_window_false"),
-            "{attention}"
-        );
-        key("value_first_swiglu", "dtype_f16");
-        key("tile_stitch", "dtype_f16");
     }
 }

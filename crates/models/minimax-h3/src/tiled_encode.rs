@@ -150,44 +150,6 @@ pub struct ClipRun {
     share: usize,
 }
 
-/// The stitcher's blocks and hand-off: the buffers `Scene::encode` takes after the encoder's set,
-/// on one rank.
-///
-/// Every tile's decoded block, in plan order, and one more block that a tile whose fade is both ways
-/// hands to its second blend. The blocks are held until the stitch because a group's tiles are
-/// encoded on all of its ranks and reach each of them at once. A block is the caller's raster's
-/// channel and frame extent by the tile's latent extent, because the stitcher blends the raster the
-/// caller funds and not a shape of its own; `latent_frames` is therefore the raster's frame extent,
-/// not the request's. Under a group of `ranks` the tiles are this plan's rounded up to a whole share
-/// each, and a rank also holds its own share before the gather.
-///
-/// A run sized from the encoder's own set alone stops at the first of these buffers, which is why
-/// they are stated by name: a plan is what a caller allocates, and bytes it does not name are bytes
-/// the forward takes past its arena.
-pub fn stitch_arena(
-    config: &crate::VideoVaeConfig,
-    tiles: usize,
-    latent_frames: u64,
-    tile_rows: u64,
-    tile_columns: u64,
-) -> Result<Vec<crate::decoding::Buffer>> {
-    // The raster's channel extent, `2 * latent_channels`: the encoder writes a mean and a deviation
-    // per latent channel and the clip's plan splits them.
-    let block = 2 * u64::from(config.latent_channels) * latent_frames * tile_rows * tile_columns;
-    Ok(vec![
-        crate::decoding::Buffer {
-            name: "stitch.tiles".to_owned(),
-            element: "f32",
-            elements: block * tiles as u64,
-        },
-        crate::decoding::Buffer {
-            name: "stitch.handed".to_owned(),
-            element: "f32",
-            elements: block,
-        },
-    ])
-}
-
 /// Copies a tile's block of a wider raster into `buffer` and answers it as the encoder reads it.
 fn pack_tile(f: &Forward, block: TensorView, buffer: TensorView) -> Result<TensorView> {
     let (channels, frames, height, width) = (
@@ -285,58 +247,6 @@ impl ClipEncoder {
         }
         extents.sort_unstable();
         extents
-    }
-
-    /// The programs one tiled encoding of `rasters` launches.
-    ///
-    /// The walk states the whole-frame encoder through [`VideoEncoder::programs`]; a condition's
-    /// pixels go through this path instead, because a raster larger than one tile becomes its latent
-    /// by tiles that cross-fade where they meet. Two families are this path's own and no other
-    /// enumeration reaches them: **the seam blends**, one program per `(extent, axis)` the grid
-    /// states, and **the encoder's rows at each tile's extent** rather than at the raster's, which
-    /// is where its residual adds and pads run at tile widths.
-    ///
-    /// `frames` is the piece's own (one for a still); the encoder's rows are stated for both a still
-    /// and a generated clip by [`VideoEncoder::programs`], so only the tiles' extents are taken here.
-    pub fn programs(
-        config: &crate::VideoVaeConfig,
-        rasters: &[(u32, u32)],
-        frames: u32,
-    ) -> Result<Vec<(String, String)>> {
-        use crate::programs::Programs;
-        use ops::cross_fade::CrossFade as CrossFadeOp;
-        let mut programs = Programs::default();
-        let mut extents: Vec<(u32, u32)> = Vec::new();
-        for (height, width) in rasters {
-            let encoder = Self::new(*height, *width)?;
-            // The pass-through blend `encode` places a run's first tile through: one position on the
-            // rows axis, given the same block twice, so it is exact. It is a launch of its own and no
-            // seam width states it.
-            let place = CrossFade::new(DType::F32, 1, 2).map_err(Error::from)?;
-            programs.launch::<CrossFadeOp>(&place.descriptor());
-            for (extent, axis) in encoder.blend_extents() {
-                let blend = CrossFade::new(DType::F32, extent, axis).map_err(Error::from)?;
-                programs.launch::<CrossFadeOp>(&blend.descriptor());
-            }
-            // A grid's tiles are uniform and a raster inside one tile is one tile of its own size, so
-            // the extents below are that raster's single tile class.
-            for extent in encoder.plan().tile_extents(frames) {
-                let tile = (extent.height, extent.width);
-                if !extents.contains(&tile) {
-                    extents.push(tile);
-                }
-            }
-        }
-        // The tiles' own extents, each stated as a raster of that size: the encoder's frame
-        // operators key on the extent they reduce over, and a tile is a smaller raster, not a
-        // different operator.
-        for (height, width) in extents {
-            programs.extend(crate::encoding::VideoEncoder::programs(
-                config,
-                &[(height, width)],
-            )?);
-        }
-        Ok(programs.finish())
     }
 
     /// One reservation for clips of `frames` frames each, whose blocks are at most `raster`'s.
@@ -708,31 +618,6 @@ mod tests {
 
     use super::*;
     use crate::config::CLIP_FRAMES;
-
-    /// The stitcher's plan is every tile's block and a hand-off block, by name.
-    ///
-    /// `Scene::encode` reserves exactly these, in this order, after the encoder's own set: two rows of
-    /// a two-row ring, one block per tile column of the grid, then the block a two-way fade hands to
-    /// its second blend. Each block is the caller's raster extent - its channels and its frames - by
-    /// the tile's latent extent, which is why the plan takes the frames as an argument rather than
-    /// reading them from the request: the stitcher blends the raster the caller funds.
-    #[test]
-    fn the_stitch_plan_is_every_tile_and_one_handed_block() {
-        let config = crate::video_vae::tests::video_config();
-        let plan = stitch_arena(&config, 3, 2, 16, 16).expect("the stitcher's plan");
-        let block = 2 * u64::from(config.latent_channels) * 2 * 16 * 16;
-        let names: Vec<&str> = plan.iter().map(|buffer| buffer.name.as_str()).collect();
-        assert_eq!(names, ["stitch.tiles", "stitch.handed"]);
-        assert_eq!(plan[0].elements, 3 * block);
-        assert_eq!(plan[1].elements, block);
-        for buffer in &plan {
-            assert_eq!(buffer.element, "f32");
-        }
-
-        // A wider raster's grid is more blocks, not bigger ones.
-        let wider = stitch_arena(&config, 7, 2, 16, 16).expect("the wider plan");
-        assert_eq!(wider[0].elements, 7 * block);
-    }
 
     /// The 768 by 1344 canvas the fixtures use: 48 by 84 latents, four tile rows and seven columns.
     fn canvas() -> ClipEncoder {

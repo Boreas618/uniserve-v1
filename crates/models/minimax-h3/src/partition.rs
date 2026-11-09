@@ -533,8 +533,8 @@ impl Partition {
     /// deployment that sharded the denoiser's sequence and named only the text encoder's rank would
     /// have every rank draw the same noise.
     ///
-    /// The capacity is the released table's, as in [`Self::single`]: a caller that states programs
-    /// wants [`Self::serving`], which derives it from the task.
+    /// The capacity is the released table's, as in [`Self::single`]: a serving caller wants
+    /// [`Self::serving`], which derives it from the task.
     ///
     /// **A partition built here is an exchange one**, because this constructor takes the degree and
     /// holds no projection; a deployment that has a projection to state goes through

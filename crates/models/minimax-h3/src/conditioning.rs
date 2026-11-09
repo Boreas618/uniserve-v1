@@ -22,7 +22,7 @@
 //! Sharding two blocks over a thousand rows would save nothing and put two exchanges on the first
 //! step of every request.
 
-use nn::layers::{Activation, Attention, GatedActivation, Linear, RmsNorm, ScaledResidual};
+use nn::layers::{Attention, GatedActivation, Linear, RmsNorm, ScaledResidual};
 use nn::weights::{Weight, WeightLoader, WeightRequest};
 use nn::{Forward, Shape, TensorView};
 use ops::gemm::WeightOrder;
@@ -222,121 +222,6 @@ pub struct TokenRefiner {
 }
 
 impl TokenRefiner {
-    /// The programs the prompt's refinement launches, from the configuration alone.
-    ///
-    /// The refiner is a stack of its own: per-head RMS normalizations with learned weights (no
-    /// rotation — the prompt's refinement has no positional table), one dense product, the stepwise
-    /// gated activation, and the residual each block folds its two updates through.
-    /// `boundary` is the type the refiner's stream carries.
-    pub fn programs(
-        config: &TransformerConfig,
-        boundary: nn::DType,
-    ) -> Result<Vec<(String, String)>> {
-        use crate::programs::Programs;
-        use ops::activation::ActAndMul as ActAndMulOp;
-        use ops::attention::dense::DenseAttention;
-        use ops::gemm::Gemm;
-        use ops::norm::RmsNorm as RmsNormOp;
-        use ops::residual::ScaledResidual as ResidualOp;
-
-        let hidden = config.hidden_size;
-        let inner = config.num_attention_heads * config.head_dim;
-        let head = config.head_dim;
-        let heads = config.num_attention_heads;
-        // The refiner's stream is the boundary's type: it is handed the prompt's features where
-        // they are widened into the network. The identity scale is the one exception - it is
-        // applied at the type the blocks' output has, which is the stack's.
-        let stream = boundary;
-        let mut programs = Programs::default();
-
-        // Every projection: the input one, the four of each block's attention and its feed-forward
-        // pair. None carries a bias.
-        programs.launch::<Gemm>(&Linear::descriptor_of(
-            hidden,
-            stream,
-            stream,
-            WeightOrder::NxK,
-            false,
-            stream,
-        ));
-
-        // Two normalization widths: the hidden state's and one head's, which the query and the key
-        // normalize over.
-        for columns in [hidden, head] {
-            programs.launch::<RmsNormOp>(&RmsNorm::descriptor_of(columns, stream));
-        }
-
-        // The identity residual each block folds both of its updates through.
-        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
-            stream,
-            u64::from(hidden),
-            false,
-        )?);
-
-        // The attention over the request's document, and the stepwise gated activation.
-        let attention = Attention::dense(
-            head,
-            heads,
-            heads,
-            hidden,
-            false,
-            None,
-            1.0 / (head as f32).sqrt(),
-        )
-        .map_err(Error::from)?;
-        programs.launch::<DenseAttention>(
-            &attention.dense_descriptor(stream, stream, stream, hidden, true),
-        );
-        // **Both row strides are twice the width**: the refiner reads its two halves through the
-        // same packed projection the transformer does, so each half's row stride is `2 *
-        // intermediate` - the launch record states `gate_stride_28672` where this stated 14336.
-        // And both width classes are reachable, as at the transformer's packed site.
-        let packed_stride = 2 * u64::from(config.intermediate_size);
-        for elements in [u64::from(inner), 1] {
-            programs.launch::<ActAndMulOp>(&GatedActivation::descriptor_of(
-                stream,
-                u64::from(config.intermediate_size),
-                Activation::Silu,
-                packed_stride,
-                packed_stride,
-                elements,
-                true,
-            )?);
-        }
-
-        Ok(programs.finish())
-    }
-
-    /// Every checkpoint tensor the refiner reads, as complete names.
-    ///
-    /// [`TokenRefiner::load`]'s requests, in its order: the input projection, each block's ten
-    /// weights, and the final norm.
-    pub fn keys(config: &TransformerConfig) -> Vec<String> {
-        let mut keys = vec![
-            "context_embedder.weight".to_owned(),
-            "context_embedder.bias".to_owned(),
-        ];
-        for index in 0..config.num_refiner_layers {
-            let prefix = format!("token_refiner.refiner_blocks.{index}");
-            for name in [
-                "norm1.weight",
-                "norm2.weight",
-                "attn.norm_q.weight",
-                "attn.norm_k.weight",
-                "attn.to_q.weight",
-                "attn.to_k.weight",
-                "attn.to_v.weight",
-                "attn.to_out.0.weight",
-                "ff.net.0.proj.weight",
-                "ff.net.2.weight",
-            ] {
-                keys.push(format!("{prefix}.{name}"));
-            }
-        }
-        keys.push("token_refiner.final_norm.weight".to_owned());
-        keys
-    }
-
     /// Read the checkpoint's token refiner, bounded to `rows` packed rows per request.
     ///
     /// `rows` is the deployment layout's padded row count: the attention's key extent and the width
@@ -430,90 +315,29 @@ struct Rows {
     ffn: TensorView,
 }
 
-/// The extents one refiner block's scratch holds, in the order the block reserves them.
-///
-/// **One statement for the two readers.** The fold reserves these from the denoiser's arena
-/// ([`Rows::reserve`]) and the same arena is sized by the denoiser's plan before any request arrives
-/// (`crate::denoiser::denoise_arena`), so a buffer added here is priced there without a second edit.
-#[derive(Clone, Copy, Debug)]
-pub struct Scratch {
-    /// `[rows, hidden]` the normalized rows.
-    normed: Shape,
-    query: Shape,
-    key: Shape,
-    value: Shape,
-    query_normed: Shape,
-    key_normed: Shape,
-    attended: Shape,
-    update: Shape,
-    packed: Shape,
-    ffn: Shape,
-}
-
-impl Scratch {
-    /// The scratch of a block that is `hidden` wide, with `heads` heads of `head_dim` and
-    /// `intermediate` feed-forward columns.
-    pub fn new(hidden: u32, head_dim: u32, heads: u32, intermediate: u32, rows: u32) -> Self {
-        let hidden = u64::from(hidden);
-        let head = u64::from(head_dim);
-        let inner = u64::from(heads) * head;
-        // The gate projection's rows hold the checkpoint's two fused halves of one width.
-        let packed_width = 2 * u64::from(intermediate);
-        let ffn = u64::from(intermediate);
-        let rows = u64::from(rows);
-        Self {
-            normed: Shape::new(&[rows, hidden]),
-            query: Shape::new(&[rows, inner]),
-            key: Shape::new(&[rows, inner]),
-            value: Shape::new(&[rows, inner]),
-            query_normed: Shape::new(&[rows, inner]),
-            key_normed: Shape::new(&[rows, inner]),
-            attended: Shape::new(&[rows, inner]),
-            update: Shape::new(&[rows, hidden]),
-            packed: Shape::new(&[rows, packed_width]),
-            ffn: Shape::new(&[rows, ffn]),
-        }
-    }
-
-    /// Every buffer in reservation order, named as a plan names it.
-    pub fn entries(&self) -> [(&'static str, Shape); 10] {
-        [
-            ("normed", self.normed),
-            ("query", self.query),
-            ("key", self.key),
-            ("value", self.value),
-            ("query_normed", self.query_normed),
-            ("key_normed", self.key_normed),
-            ("attended", self.attended),
-            ("update", self.update),
-            ("packed", self.packed),
-            ("ffn", self.ffn),
-        ]
-    }
-}
-
 impl Rows {
+    /// Reserve one refiner block's scratch from the forward's arena, in the order the block uses it.
     fn reserve(block: &RefinerBlock, f: &Forward, rows: u32) -> Result<Self> {
         let dtype = block.dtype;
-        let scratch = Scratch::new(
-            block.hidden_size,
-            block.head_dim,
-            block.heads,
-            block.intermediate_size,
-            rows,
-        );
+        let rows = u64::from(rows);
+        let hidden = u64::from(block.hidden_size);
+        let inner = u64::from(block.heads) * u64::from(block.head_dim);
+        // The gate projection's rows hold the checkpoint's two fused halves of one width.
+        let packed = 2 * u64::from(block.intermediate_size);
+        let ffn = u64::from(block.intermediate_size);
         let arena = f.arena();
+        let reserve = |columns: u64| arena.tensor(dtype, Shape::new(&[rows, columns]));
         Ok(Self {
-            normed: arena.tensor(dtype, scratch.normed)?,
-            query: arena.tensor(dtype, scratch.query)?,
-            key: arena.tensor(dtype, scratch.key)?,
-            value: arena.tensor(dtype, scratch.value)?,
-            query_normed: arena.tensor(dtype, scratch.query_normed)?,
-            key_normed: arena.tensor(dtype, scratch.key_normed)?,
-            attended: arena.tensor(dtype, scratch.attended)?,
-            update: arena.tensor(dtype, scratch.update)?,
-            packed: arena.tensor(dtype, scratch.packed)?,
-            ffn: arena.tensor(dtype, scratch.ffn)?,
+            normed: reserve(hidden)?,
+            query: reserve(inner)?,
+            key: reserve(inner)?,
+            value: reserve(inner)?,
+            query_normed: reserve(inner)?,
+            key_normed: reserve(inner)?,
+            attended: reserve(inner)?,
+            update: reserve(hidden)?,
+            packed: reserve(packed)?,
+            ffn: reserve(ffn)?,
         })
     }
 }

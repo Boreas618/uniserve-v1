@@ -52,11 +52,10 @@
 use nn::capability::ImageInput;
 use nn::layers::{Attention, Gelu, LayerNorm, Linear, PositionInterpolate, Rotate, ScaledResidual};
 use nn::weights::{WeightLoader, WeightRequest};
-use nn::{Arena, DevicePtr, Forward, Shape, TensorView, Weight};
+use nn::{Arena, Forward, Shape, TensorView, Weight};
 use ops::gemm::WeightOrder;
 
 use crate::config::{VisionActivation, VisionConfig};
-use crate::decoding::Buffer;
 use crate::positions::invalid;
 use crate::{Error, Result};
 
@@ -316,55 +315,6 @@ impl Buffers {
             merged: reserve(Shape::new(&[blocks, width]))?,
             merged_activated: reserve(Shape::new(&[blocks, width]))?,
         })
-    }
-
-    /// The bytes [`Buffers::new`] reserves for a grid of `patches` patches.
-    ///
-    /// The reservations are made against a region of exactly that size, so the number is the one
-    /// the worker plans a captured bucket with and cannot drift from the reservations.
-    pub fn bytes(config: &VisionConfig, patches: u32, dtype: nn::DType) -> Result<u64> {
-        let arena = Arena::new(DevicePtr::new(0), u64::MAX);
-        Self::new(&arena, config, patches, dtype)?;
-        Ok(arena.used())
-    }
-
-    /// The named plan of exactly the buffers [`Self::new`] reserves for one image.
-    ///
-    /// One line per reservation, in the same order, so a deployment row and a worker's name-keyed
-    /// arena read the same object. The caller prefixes each name with the image's index: the tower
-    /// runs once per image, in prompt order, so these are `images.len()` sets and never one set
-    /// multiplied by anything.
-    pub fn plan(config: &VisionConfig, patches: u32, dtype: nn::DType) -> Vec<Buffer> {
-        let rows = u64::from(patches);
-        let hidden = u64::from(config.hidden_size);
-        let intermediate = u64::from(config.intermediate_size);
-        let merge = u64::from(config.spatial_merge_size);
-        let blocks = rows / (merge * merge);
-        let width = u64::from(BlockRows::merged_width(config));
-        let element = crate::text_encoder::element_of(dtype);
-        let mut plan = Vec::with_capacity(14);
-        let mut push = |name: &str, elements: u64| {
-            plan.push(Buffer {
-                name: name.to_owned(),
-                element,
-                elements,
-            });
-        };
-        push("hidden", rows * hidden);
-        push("normalized", rows * hidden);
-        push("query", rows * hidden);
-        push("key", rows * hidden);
-        push("value", rows * hidden);
-        push("rotated_query", rows * hidden);
-        push("rotated_key", rows * hidden);
-        push("attended", rows * hidden);
-        push("projected", rows * hidden);
-        push("gate", rows * intermediate);
-        push("activated", rows * intermediate);
-        push("down", rows * hidden);
-        push("merged", blocks * width);
-        push("merged_activated", blocks * width);
-        plan
     }
 
     /// `view`'s rows as `[patches, heads, head_dim]` for the attention and rotation operators.
@@ -696,131 +646,6 @@ pub struct VisionTower {
 }
 
 impl VisionTower {
-    /// Every checkpoint tensor this tower reads, by name.
-    ///
-    /// The tower is replicated over tensor-parallel ranks - every rank reads the whole of each
-    /// tensor - so the list depends on the configuration alone. `load` asks for these and only
-    /// these: a checkpoint that lacks one is refused by name before a byte is read.
-    pub fn keys(config: &VisionConfig) -> Vec<String> {
-        let mut keys = Vec::new();
-        for index in 0..config.depth {
-            let block = format!("{PREFIX}.blocks.{index}");
-            for norm in ["norm1", "norm2"] {
-                keys.push(format!("{block}.{norm}.weight"));
-                keys.push(format!("{block}.{norm}.bias"));
-            }
-            for projection in ["attn.qkv", "attn.proj", "mlp.linear_fc1", "mlp.linear_fc2"] {
-                keys.push(format!("{block}.{projection}.weight"));
-                keys.push(format!("{block}.{projection}.bias"));
-            }
-        }
-        keys.push(format!("{PREFIX}.patch_embed.proj.weight"));
-        keys.push(format!("{PREFIX}.patch_embed.proj.bias"));
-        keys.push(format!("{PREFIX}.pos_embed.weight"));
-        let mergers = std::iter::once(format!("{PREFIX}.merger")).chain(
-            (0..config.deepstack_visual_indexes.len())
-                .map(|index| format!("{PREFIX}.deepstack_merger_list.{index}")),
-        );
-        for merger in mergers {
-            for tensor in ["norm", "linear_fc1", "linear_fc2"] {
-                keys.push(format!("{merger}.{tensor}.weight"));
-                keys.push(format!("{merger}.{tensor}.bias"));
-            }
-        }
-        keys
-    }
-
-    /// The programs one tower call launches, from the configuration and the deployment's element type.
-    ///
-    /// `sequence` is the largest patch grid the deployment serves: it is the dense attention's key
-    /// bound, which every call of one grid shares. Everything else is the config's — including the two
-    /// GELUs, which are two programs because the tower's blocks approximate and its merger does not.
-    pub fn programs(
-        config: &VisionConfig,
-        dtype: nn::DType,
-        sequence: u32,
-    ) -> Result<Vec<(String, String)>> {
-        use crate::programs::Programs;
-        use ops::attention::dense::DenseAttention;
-        use ops::gelu::Gelu as GeluOp;
-        use ops::gemm::Gemm;
-        use ops::norm::LayerNorm as LayerNormOp;
-        use ops::position::PositionInterpolate as PositionOp;
-        use ops::residual::ScaledResidual as ResidualOp;
-        use ops::rope::{RopeApply, Rotation};
-
-        let hidden = config.hidden_size;
-        let head_dim = BlockRows::head_dim(config)?;
-        let heads = config.num_heads;
-        let merged = BlockRows::merged_width(config);
-        let mut programs = Programs::default();
-
-        // Every projection of the tower — the patch embedding, the four of each block, the two of each
-        // merger — carries a bias, which is its own epilogue.
-        programs.launch::<Gemm>(&Linear::descriptor_of(
-            hidden,
-            dtype,
-            dtype,
-            WeightOrder::NxK,
-            true,
-            dtype,
-        ));
-
-        // The two layer normalizations: the blocks' at the tower's width and the mergers' at a merged
-        // row's.
-        programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, hidden, true));
-        programs.launch::<LayerNormOp>(&LayerNorm::descriptor_of(dtype, merged, true));
-
-        // The learned table resampled onto the request's grid, and the residual that adds it.
-        programs.launch::<PositionOp>(
-            &PositionInterpolate::new(dtype, u64::from(hidden), BlockRows::position_grid(config)?)?
-                .descriptor(),
-        );
-        programs.launch::<ResidualOp>(&ScaledResidual::descriptor_of(
-            dtype,
-            u64::from(hidden),
-            false,
-        )?);
-
-        // The patch rotation, then one bidirectional attention per grid.
-        programs.launch::<RopeApply>(
-            &Rotate::new(u64::from(head_dim), u64::from(heads), Rotation::Half)?
-                .descriptor(dtype, dtype),
-        );
-        let attention = Attention::dense(
-            head_dim,
-            heads,
-            heads,
-            sequence,
-            false,
-            None,
-            (head_dim as f32).sqrt().recip(),
-        )
-        .map_err(Error::from)?;
-        programs.launch::<DenseAttention>(
-            &attention.dense_descriptor(dtype, dtype, dtype, sequence, true),
-        );
-
-        // The blocks' approximated GELU over the feed-forward's rows, and the merger's exact one over a
-        // merged row.
-        programs.launch::<GeluOp>(&Gelu::descriptor_of(
-            dtype,
-            config.intermediate_size,
-            // The checkpoint states one activation for the blocks; the merger's is the exact GELU by
-            // construction, which is why the tower loads two different layers.
-            match config.hidden_act {
-                VisionActivation::GeluTanh => ops::gelu::Approximation::Tanh,
-            },
-        ));
-        programs.launch::<GeluOp>(&Gelu::descriptor_of(
-            dtype,
-            merged,
-            ops::gelu::Approximation::Exact,
-        ));
-
-        Ok(programs.finish())
-    }
-
     /// The tower of `config`, reading the checkpoint through `loader`.
     ///
     /// `dtype` is the activation element type the loading boundary chose: the checkpoint's own
@@ -1205,32 +1030,6 @@ fn half_bits(value: f32) -> u16 {
 #[cfg(test)]
 mod tests {
 
-    /// The tower's programs are its config's: one product (every projection carries a bias), two
-    /// layer normalizations (the blocks' width and a merged row's), the resample of its learned table,
-    /// one residual, the patch rotation, one bidirectional attention, and two GELUs — the blocks'
-    /// approximation and the merger's exact form are two programs.
-    #[test]
-    fn the_tower_states_its_programs_from_its_config() {
-        let config = crate::config::tests_support::released_config()
-            .text_encoder
-            .vision;
-        let programs =
-            VisionTower::programs(&config, nn::DType::BF16, 4096).expect("the tower's programs");
-        let count = |operator: &str| programs.iter().filter(|(name, _)| name == operator).count();
-        assert_eq!(count("gemm"), 1);
-        assert_eq!(count("layer_norm"), 2);
-        assert_eq!(count("position_interpolate"), 1);
-        assert_eq!(count("scaled_residual"), 1);
-        assert_eq!(count("rope_apply"), 1);
-        assert_eq!(count("dense_attention"), 1);
-        assert_eq!(count("gelu"), 2);
-        assert!(
-            programs
-                .iter()
-                .any(|(name, key)| name == "gemm" && key.contains("epilogue_bias")),
-            "the tower's projections carry biases: {programs:?}"
-        );
-    }
     use super::*;
 
     /// The released vision tower's configuration.
@@ -1261,29 +1060,6 @@ mod tests {
         );
         assert_eq!(one_element(nn::DType::BF16).expect("bf16"), [0x80, 0x3f]);
         assert_eq!(one_element(nn::DType::F16).expect("f16"), [0x00, 0x3c]);
-    }
-
-    /// Every tensor the tower reads is named once, and under the tower's own prefix.
-    ///
-    /// Two properties the checkpoint makes a load depend on: a name asked twice would be read twice
-    /// and reported twice by a missing-name check, and a name outside the prefix would collide with
-    /// the language stack's tensors in the same export.
-    #[test]
-    fn keys_are_unique_and_inside_the_tower() {
-        let keys = VisionTower::keys(&config());
-        let distinct: std::collections::BTreeSet<&String> = keys.iter().collect();
-        assert_eq!(distinct.len(), keys.len(), "a tensor is asked for twice");
-        assert!(
-            keys.iter()
-                .all(|key| key.starts_with(&format!("{PREFIX}."))),
-            "a key lies outside {PREFIX}"
-        );
-        // The tower is one patch embed (weight and bias), one position table, `depth` blocks of six
-        // projections and two norms — twelve tensors each — and the merger with its DeepStack copies at
-        // three tensors apiece. The count is stated from the config rather than as a constant, because a
-        // constant here is a claim about one checkpoint's depth and merger count.
-        let mergers = 1 + config().deepstack_visual_indexes.len();
-        assert_eq!(keys.len(), 12 * config().depth as usize + 3 + 6 * mergers);
     }
 
     #[test]
@@ -1375,15 +1151,6 @@ mod tests {
         let mut late = config.clone();
         late.deepstack_visual_indexes = vec![config.depth];
         assert!(deepstack_layers(&late).is_err());
-    }
-
-    #[test]
-    fn the_buffers_of_a_block_grow_with_its_patches() {
-        let config = config();
-        let dtype = nn::DType::BF16;
-        let small = Buffers::bytes(&config, 576, dtype).expect("a 24x24 block");
-        let large = Buffers::bytes(&config, 1024, dtype).expect("a 4x16x16 block");
-        assert!(large > small);
     }
 
     #[test]

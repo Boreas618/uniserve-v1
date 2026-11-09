@@ -49,7 +49,6 @@ pub mod packing;
 pub mod partition;
 pub mod positions;
 pub mod processing;
-pub mod programs;
 pub mod schedule;
 pub mod solver;
 pub mod task;
@@ -75,7 +74,7 @@ pub use config::{
 /// The model rotates **split-half**: coordinate `i` of a rotated span pairs with `i + span / 2`,
 /// and the DiT's rotated span is each head's leading 96 channels. The neox pairing - adjacent
 /// coordinates - is a different arithmetic from the same factor table, so the convention is stated
-/// once here and read by every call site and by the store's key list.
+/// once here and read by every call site.
 pub const SPLIT_HALF: ops::rope::Rotation = ops::rope::Rotation::Half;
 
 pub use load::load;
