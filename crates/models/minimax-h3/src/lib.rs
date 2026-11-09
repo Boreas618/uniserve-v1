@@ -109,6 +109,13 @@ impl Error {
     }
 }
 
+impl From<ops::Error> for Error {
+    /// An operator-level refusal of a view (a narrow, a decode) as the shared library reports it.
+    fn from(error: ops::Error) -> Self {
+        Self::Nn(error.into())
+    }
+}
+
 /// A result of this crate.
 pub type Result<T> = std::result::Result<T, Error>;
 

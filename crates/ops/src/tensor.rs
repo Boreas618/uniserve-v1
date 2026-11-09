@@ -549,6 +549,30 @@ impl TensorView {
         self.offset_elements(element)
     }
 
+    /// The `length` entries of `axis` starting at `start`, at the view's own strides: torch's
+    /// `narrow`. Only that axis's extent and the address change, so the result names a subset of
+    /// the same elements.
+    ///
+    /// # Errors
+    ///
+    /// An axis past the view's rank, or entries past the axis's extent.
+    pub fn narrow(&self, axis: usize, start: u64, length: u64) -> Result<Self> {
+        if axis >= self.shape.rank() || start + length > self.shape.dim(axis) {
+            return Err(Error::Shape(format!(
+                "entries {start}..{} of axis {axis} lie outside the view {:?}",
+                start + length,
+                self.shape
+            )));
+        }
+        let mut dims = self.shape.dims().to_vec();
+        dims[axis] = length;
+        Ok(Self {
+            ptr: self.offset_elements(start * self.strides.get(axis)),
+            shape: Shape::new(&dims),
+            ..*self
+        })
+    }
+
     /// The address `elements` elements further, when the element type has a whole-byte size.
     pub fn offset_elements(&self, elements: u64) -> DevicePtr {
         match self.dtype.bytes() {
@@ -658,6 +682,21 @@ mod tests {
         assert_eq!(refined.strides.get(0), 512);
         assert_eq!(refined.strides.get(1), 128);
         assert_eq!(refined.strides.last(), 1);
+    }
+
+    #[test]
+    fn a_narrowed_view_moves_its_address_and_keeps_its_strides() {
+        // Frames 1..3 of a `[3, 4, 8, 16]` raster: one frame is 128 BF16 elements, 256 bytes.
+        let raster = view(&[3, 4, 8, 16], &[512, 128, 16, 1]);
+        let frames = raster.narrow(1, 1, 2).unwrap();
+        assert_eq!(frames.shape.dims(), &[3, 2, 8, 16]);
+        assert_eq!(frames.strides, raster.strides);
+        assert_eq!(frames.ptr.address(), 0x1000 + 256);
+        // Rows of a matrix are the leading axis.
+        let rows = view(&[6, 4], &[4, 1]).narrow(0, 5, 1).unwrap();
+        assert_eq!(rows.ptr.address(), 0x1000 + 40);
+        assert!(raster.narrow(1, 3, 2).is_err());
+        assert!(raster.narrow(4, 0, 1).is_err());
     }
 
     #[test]

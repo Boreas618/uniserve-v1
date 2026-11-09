@@ -825,23 +825,11 @@ impl VideoDecoder {
         // that `cat` is what promotes the stream to FP32.
         let stream = scratch.stream;
         for index in 0..tiles {
-            let tile_stream = TensorView::new(
-                stream.offset_elements(index * tile_rows * width),
-                stream.dtype,
-                Shape::new(&[tile_rows, width]),
-            );
-            let voxel_rows = TensorView::new(
-                stream.offset_elements(index * tile_rows * width),
-                stream.dtype,
-                Shape::new(&[tile_voxels, width]),
-            );
-            let projected = TensorView::new(
-                scratch
-                    .projected
-                    .offset_elements(index * tile_voxels * width),
-                scratch.projected.dtype,
-                Shape::new(&[tile_voxels, width]),
-            );
+            let tile_stream = stream.narrow(0, index * tile_rows, tile_rows)?;
+            let voxel_rows = stream.narrow(0, index * tile_rows, tile_voxels)?;
+            let projected = scratch
+                .projected
+                .narrow(0, index * tile_voxels, tile_voxels)?;
             Cast.forward(f, projected, voxel_rows)?;
             IndexRows.scatter(
                 f,

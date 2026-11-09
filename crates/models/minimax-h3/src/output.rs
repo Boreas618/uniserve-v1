@@ -228,17 +228,7 @@ impl Raster {
             )));
         }
         let leading = clip.shape.dim(1) - native;
-        Ok(TensorView::with_strides(
-            clip.element(&[0, leading, 0, 0]),
-            clip.dtype,
-            Shape::new(&[
-                clip.shape.dim(0),
-                native,
-                clip.shape.dim(2),
-                clip.shape.dim(3),
-            ]),
-            nn::Strides::new(clip.strides.as_slice()),
-        ))
+        Ok(clip.narrow(1, leading, native)?)
     }
 
     /// The raster `[channels, native, rows, columns]` a `clip` view describes.
@@ -276,17 +266,7 @@ impl Raster {
                 self.frames
             )));
         }
-        Ok(TensorView::with_strides(
-            raster.element(&[0, u64::from(start), 0, 0]),
-            raster.dtype,
-            Shape::new(&[
-                u64::from(RGB_CHANNELS),
-                u64::from(stop - start),
-                u64::from(self.height),
-                u64::from(self.width),
-            ]),
-            nn::Strides::new(raster.strides.as_slice()),
-        ))
+        Ok(raster.narrow(1, u64::from(start), u64::from(stop - start))?)
     }
 
     /// The output view of one clip: `[kept, rows, columns, channels]` bytes.
@@ -336,17 +316,7 @@ fn frames_of(out: TensorView, start: u32, stop: u32) -> Result<TensorView> {
             shape.dim(0)
         )));
     }
-    Ok(TensorView::with_strides(
-        out.element(&[u64::from(start), 0, 0, 0]),
-        out.dtype,
-        Shape::new(&[
-            u64::from(stop - start),
-            shape.dim(1),
-            shape.dim(2),
-            shape.dim(3),
-        ]),
-        nn::Strides::new(out.strides.as_slice()),
-    ))
+    Ok(out.narrow(0, u64::from(start), u64::from(stop - start))?)
 }
 
 #[cfg(test)]

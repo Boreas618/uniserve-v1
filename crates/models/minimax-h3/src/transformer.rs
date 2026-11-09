@@ -163,19 +163,19 @@ impl Layer {
             let mut gathering = Vec::new();
             for interval in sparse.deliver(f, gate, views, own)? {
                 let (first, count) = (interval.first, interval.count);
-                let part = |view: TensorView| row_interval(view, first, count);
+                let part = |view: TensorView| view.narrow(0, first, count);
                 let selected = rows
                     .at(rows.offset_elements(first))
                     .reshape(nn::Shape::new(&[count]));
-                sparse.receive(f, interval, views, part(update))?;
+                sparse.receive(f, interval, views, part(update)?)?;
                 self.block.feed_forward(
                     f,
                     modulation,
                     selected,
-                    part(hidden),
-                    part(update),
-                    part(out),
-                    part(normalized),
+                    part(hidden)?,
+                    part(update)?,
+                    part(out)?,
+                    part(normalized)?,
                 )?;
                 // These rows are the next layer's input, and its attention reads the whole
                 // sequence, so they leave now, beside the rest of this layer.
@@ -185,7 +185,7 @@ impl Layer {
                         f,
                         modulation,
                         selected,
-                        part(hidden),
+                        part(hidden)?,
                         rows_here,
                     )?;
                     gathering.push(sparse.start_gather(f, views, own, first, count)?);
@@ -215,13 +215,6 @@ impl Layer {
         )?;
         Ok(Vec::new())
     }
-}
-
-/// Rows `first..first + count` of a `[rows, width]` view.
-fn row_interval(view: TensorView, first: u64, count: u64) -> TensorView {
-    let width = view.shape.last();
-    view.at(view.offset_elements(first * width))
-        .reshape(nn::Shape::new(&[count, width]))
 }
 
 /// A parallel-decoding student's output heads, fused per evaluation block at load.

@@ -1283,23 +1283,6 @@ fn condition_ranges(
     Ok((text_rows, ranges))
 }
 
-fn row_range(source: TensorView, start: u32, rows: u64) -> Result<TensorView> {
-    let columns = source.shape.dim(1);
-    if u64::from(start) + rows > source.shape.dim(0) {
-        return Err(Error::config(format!(
-            "rows {start}..{} past the prefix source's {}",
-            u64::from(start) + rows,
-            source.shape.dim(0)
-        )));
-    }
-    Ok(TensorView::with_strides(
-        source.offset_elements(u64::from(start) * columns),
-        source.dtype,
-        Shape::new(&[rows, columns]),
-        nn::Strides::new(&[columns, 1]),
-    ))
-}
-
 /// Round `value` up to the next multiple of `unit`.
 fn round_up(value: u32, unit: u32) -> u32 {
     value.div_ceil(unit) * unit
@@ -1924,7 +1907,7 @@ impl Denoiser {
                 let projected = f.arena().tensor(DType::F32, Shape::new(&[rows, hidden]))?;
                 self.transformer.project_audio(f, encoded, projected)?;
                 nn::layers::Cast
-                    .forward(f, projected, row_range(text, start, rows)?)
+                    .forward(f, projected, text.narrow(0, u64::from(start), rows)?)
                     .map_err(Error::from)?;
             }
             if piece.rows > 0 {
@@ -2141,7 +2124,7 @@ impl Denoiser {
         let projected = f.arena().tensor(DType::F32, Shape::new(&[rows, hidden]))?;
         self.transformer.project(f, clean, projected)?;
         nn::layers::Cast
-            .forward(f, projected, row_range(text, start, rows)?)
+            .forward(f, projected, text.narrow(0, u64::from(start), rows)?)
             .map_err(Error::from)?;
         Ok(())
     }
@@ -2174,8 +2157,8 @@ impl Denoiser {
         // the encoders' to write: the refiner's bound is the text capacity, and it reads and writes
         // that many rows.
         let rows = text.shape.dim(0).min(u64::from(self.refiner.rows()));
-        let source = row_range(source, 0, rows)?;
-        let text = row_range(text, 0, rows)?;
+        let source = source.narrow(0, 0, rows)?;
+        let text = text.narrow(0, 0, rows)?;
         self.refiner.forward(f, source, &documents, text)?;
         Ok(())
     }
