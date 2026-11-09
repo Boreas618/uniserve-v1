@@ -497,6 +497,32 @@ impl Linear {
         Ok(())
     }
 
+    /// [`Self::forward`] into an output of `dtype` reserved from the forward's arena.
+    ///
+    /// A packed product writes whole row classes ([`packed_rows`]), so the reservation holds the
+    /// class's rows and the answer is the view of its first `m` rows; a dense product's
+    /// reservation is exactly `[m, n]`.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::forward`], a row count above the largest packed class, or an arena that cannot
+    /// hold the output.
+    pub fn apply(&self, f: &Forward, input: TensorView, dtype: DType) -> Result<TensorView> {
+        let rows = input.rows();
+        let held = if self.is_packed() {
+            let counted = u32::try_from(rows)
+                .map_err(|_| Error::shape("Linear", format!("{rows} activation rows")))?;
+            u64::from(packed_rows(counted)?)
+        } else {
+            rows
+        };
+        let n = u64::from(self.n);
+        let region = f.arena().tensor(dtype, Shape::new(&[held, n]))?;
+        let out = TensorView::new(region.ptr, dtype, Shape::new(&[rows, n]));
+        self.forward(f, input, out)?;
+        Ok(out)
+    }
+
     /// The epilogue the bias asks for.
     fn epilogue(&self) -> Epilogue {
         if self.bias.is_some() {

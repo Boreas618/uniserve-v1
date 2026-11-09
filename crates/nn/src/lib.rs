@@ -47,6 +47,7 @@
 //! to retained storage, keyed by the identity of the files it was read from, its converted element
 //! type, its layout and its region.
 
+pub mod blocks;
 pub mod capability;
 pub mod checkpoint;
 pub mod config;

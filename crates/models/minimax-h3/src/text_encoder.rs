@@ -34,15 +34,16 @@
 //! *replicated* on every rank: it is small, every rank needs its features, and its row-parallel
 //! projections would otherwise need a bias added once after the reduction.
 
+use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
 use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape, StateTable,
     TableValues,
 };
 use nn::family::Split;
 use nn::layers::{
-    Bias, DenseAttention, DenseSpec, Gains, GateBias, GatedActivation, Halves, IndexRows, Linear,
-    Parallel, Precision, QkNorm, QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, ResidualStream,
-    RmsNorm, Rotary, RotarySpec, Rounding, Sections, Spectrum, Varlen, VocabParallelEmbedding,
+    Bias, DenseAttention, DenseSpec, Gains, IndexRows, Linear, Parallel, Precision, QkNorm,
+    QkvBias, QkvLinear, QkvNames, QkvSpec, Residual, ResidualStream, RmsNorm, Rotary, RotarySpec,
+    Rounding, Sections, Spectrum, Varlen, VocabParallelEmbedding,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{Arena, Forward, Shape, TensorView, Weight};
@@ -88,8 +89,6 @@ pub struct Plan {
     pub query: u32,
     /// Width of one key/value projection on this rank.
     pub key_value: u32,
-    /// Width of the MLP's intermediate projection on this rank.
-    pub intermediate: u32,
     /// The language model's width.
     pub hidden: u32,
     /// Elements of one head.
@@ -134,7 +133,6 @@ impl Plan {
             grids: grids.to_vec(),
             query: rank.query,
             key_value: rank.key_value,
-            intermediate: rank.intermediate,
             hidden: config.hidden_size,
             head_dim: config.head_dim,
             deepstack: config.vision.deepstack_visual_indexes.len() as u32,
@@ -198,8 +196,6 @@ struct Rank {
     query: u32,
     /// Width of this rank's key and value projections.
     key_value: u32,
-    /// Width of this rank's intermediate projection.
-    intermediate: u32,
 }
 
 impl Rank {
@@ -239,7 +235,6 @@ impl Rank {
             key_value_heads,
             query: query_heads * config.head_dim,
             key_value: key_value_heads * config.head_dim,
-            intermediate: config.intermediate_size / degree,
         })
     }
 }
@@ -262,13 +257,7 @@ struct Buffers {
     attended: TensorView,
     /// `[tokens, hidden]` the attention's output projection.
     projected: TensorView,
-    /// `[tokens, intermediate]` the gate projection.
-    gate: TensorView,
-    /// `[tokens, intermediate]` the up projection.
-    up: TensorView,
-    /// `[tokens, intermediate]` its activation.
-    activated: TensorView,
-    /// `[tokens, hidden]` the down projection: a layer's unsummed output.
+    /// `[tokens, hidden]` the MLP's output: a layer's unsummed update.
     down: TensorView,
     /// `[tokens, head_dim / 2]` FP32: the prompt's rotary cosine.
     cosine: TensorView,
@@ -287,7 +276,6 @@ impl Buffers {
         let hidden = u64::from(plan.hidden);
         let query = u64::from(plan.query);
         let key_value = u64::from(plan.key_value);
-        let intermediate = u64::from(plan.intermediate);
         let factors = u64::from(plan.head_dim / 2);
         let merged = u64::from(plan.merged);
         let out_hidden = hidden;
@@ -308,9 +296,6 @@ impl Buffers {
             value: reserve(Shape::new(&[tokens, key_value]))?,
             attended: reserve(Shape::new(&[tokens, query]))?,
             projected: reserve(Shape::new(&[tokens, hidden]))?,
-            gate: reserve(Shape::new(&[tokens, intermediate]))?,
-            up: reserve(Shape::new(&[tokens, intermediate]))?,
-            activated: reserve(Shape::new(&[tokens, intermediate]))?,
             down: reserve(Shape::new(&[tokens, hidden]))?,
             cosine: factors_of(factors)?,
             sine: factors_of(factors)?,
@@ -361,10 +346,8 @@ struct Layer {
     /// The keys' per-head normalization.
     key_norm: Weight,
     post_norm: RmsNorm,
-    gate: Linear,
-    up: Linear,
-    /// The down projection, row parallel over the intermediate channels.
-    down: Linear,
+    /// The SwiGLU MLP, column parallel in and row parallel out over the tensor-parallel group.
+    mlp: GatedMlp,
 }
 
 impl Layer {
@@ -393,24 +376,22 @@ impl Layer {
         )?;
         let query_norm = attention.scope("q_norm").tensor("weight", &[head_dim])?;
         let key_norm = attention.scope("k_norm").tensor("weight", &[head_dim])?;
-        let mut mlp = scope.scope("mlp");
-        let mut column = |module: &str| {
-            Linear::load(
-                &mut mlp.scope(module),
-                config.hidden_size,
-                config.intermediate_size,
-                Bias::Absent,
-                Parallel::Column(split),
-            )
-        };
-        let gate = column("gate_proj")?;
-        let up = column("up_proj")?;
-        let down = Linear::load(
-            &mut mlp.scope("down_proj"),
-            config.intermediate_size,
-            config.hidden_size,
-            Bias::Absent,
-            Parallel::Row(split),
+        // The gate's product is rounded once (`Rounding::Fused`), as the reference's
+        // `act_fn(gate) * up` in one expression.
+        let mlp = GatedMlp::load(
+            &mut scope.scope("mlp"),
+            GatedMlpSpec {
+                hidden: config.hidden_size,
+                intermediate: config.intermediate_size,
+                activation: ACTIVATION,
+                rounding: Rounding::Fused,
+                gate_up: GateUp::Split {
+                    gate: "gate_proj",
+                    up: "up_proj",
+                },
+                down: "down_proj",
+            },
+            split,
         )?;
         Ok(Self {
             input_norm: RmsNorm::load(
@@ -427,9 +408,7 @@ impl Layer {
                 config.hidden_size,
                 config.rms_norm_eps,
             )?,
-            gate,
-            up,
-            down,
+            mlp,
         })
     }
 
@@ -531,18 +510,7 @@ impl Layer {
             )
             .map_err(Error::from)?;
 
-        self.gate
-            .forward(f, buffers.normalized, buffers.gate)
-            .map_err(Error::from)?;
-        self.up
-            .forward(f, buffers.normalized, buffers.up)
-            .map_err(Error::from)?;
-        let halves = Halves::Split {
-            gate: buffers.gate,
-            value: buffers.up,
-        };
-        encoder.activation.forward(f, halves, buffers.activated)?;
-        Ok(self.down.forward(f, buffers.activated, buffers.down)?)
+        Ok(self.mlp.forward(f, buffers.normalized, buffers.down)?)
     }
 }
 
@@ -557,7 +525,6 @@ pub struct TextEncoder {
     rotary: Rotary,
     layers: Vec<Layer>,
     tower: VisionTower,
-    activation: GatedActivation,
     /// The add of every sub-layer's update into the residual stream.
     residual: Residual,
     /// The layers whose hidden state a DeepStack table is added after.
@@ -633,8 +600,6 @@ impl TextEncoder {
             rotary,
             layers,
             tower: VisionTower::load(loader, &config.vision, dtype)?,
-            activation: GatedActivation::new(ACTIVATION, Rounding::Fused, GateBias::None)
-                .map_err(Error::from)?,
             // Every sub-layer's output joins the stream unscaled.
             residual: Residual::default(),
             deepstack_layers,
@@ -1292,7 +1257,6 @@ mod tests {
         assert_eq!(rank.key_value_heads, 8);
         assert_eq!(rank.query, 64 * 128);
         assert_eq!(rank.key_value, 8 * 128);
-        assert_eq!(rank.intermediate, 25_600);
     }
 
     #[test]
@@ -1308,7 +1272,6 @@ mod tests {
         assert_eq!(rank.key_value_heads, 2);
         assert_eq!(rank.query, 16 * 128);
         assert_eq!(rank.key_value, 2 * 128);
-        assert_eq!(rank.intermediate, 6_400);
     }
 
     #[test]

@@ -11,16 +11,17 @@
 //! published once for the whole stack by its [`Rotary`].
 use std::collections::HashMap;
 
+use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
 use nn::family::Split;
 use nn::layers::{
-    Bias, ExpertNames, ExpertSlots, GateBias, GatedActivation, Linear, Moe, MoeSpec,
-    PagedAttention, PagedSpec, Parallel, ParallelLMHead, QkNorm, QkvBias, QkvLinear, QkvNames,
-    QkvSpec, RmsNorm, Rotary, RotarySpec, Rounding, VocabParallelEmbedding,
+    Bias, ExpertNames, ExpertSlots, Linear, Moe, MoeSpec, PagedAttention, PagedSpec, Parallel,
+    ParallelLMHead, QkNorm, QkvBias, QkvLinear, QkvNames, QkvSpec, RmsNorm, Rotary, RotarySpec,
+    Rounding, VocabParallelEmbedding,
 };
 use nn::quantization::Declaration;
-use nn::weights::{Scope, WeightLoader};
+use nn::weights::WeightLoader;
 
-use crate::model::{AttentionLayer, DecoderLayer, DenseMlp, LoadOptions, Mlp, Qwen3Moe};
+use crate::model::{AttentionLayer, DecoderLayer, LoadOptions, Mlp, Qwen3Moe};
 use crate::{Config, Error, Partition, Result};
 
 /// The module names a Qwen3-MoE checkpoint states a routed block under: `mlp.gate` routes, and
@@ -223,10 +224,22 @@ pub fn load(
                 experts_split,
             )?)
         } else {
-            Mlp::Dense(Box::new(dense_block(
+            // SwiGLU over the two projections' outputs, in the swiglu kernel's value-product
+            // order.
+            Mlp::Dense(Box::new(GatedMlp::load(
                 &mut scope.scope("mlp"),
+                GatedMlpSpec {
+                    hidden: config.hidden_size,
+                    intermediate: config.intermediate_size,
+                    activation: ops::activation::Activation::Silu,
+                    rounding: Rounding::ValueProduct,
+                    gate_up: GateUp::Split {
+                        gate: "gate_proj",
+                        up: "up_proj",
+                    },
+                    down: "down_proj",
+                },
                 tensor,
-                &config,
             )?))
         };
 
@@ -320,42 +333,6 @@ fn expert_slots(
     )?;
     Ok((slots, Some((weight, layers))))
 }
-/// One dense layer's feed-forward block, the module at `scope`: the gate and up projections split
-/// by output channels, the down projection by its contraction, which its forward reduces.
-fn dense_block(scope: &mut Scope<'_, '_>, tensor: Split, config: &Config) -> Result<DenseMlp> {
-    let (hidden, intermediate) = (config.hidden_size, config.intermediate_size);
-    let mut column = |module: &str| {
-        Linear::load(
-            &mut scope.scope(module),
-            hidden,
-            intermediate,
-            Bias::Absent,
-            Parallel::Column(tensor),
-        )
-    };
-    let gate_proj = column("gate_proj")?;
-    let up_proj = column("up_proj")?;
-    let down_proj = Linear::load(
-        &mut scope.scope("down_proj"),
-        intermediate,
-        hidden,
-        Bias::Absent,
-        Parallel::Row(tensor),
-    )?;
-    // SwiGLU over the two projections' outputs, in the swiglu kernel's value-product order.
-    let activation = GatedActivation::new(
-        ops::activation::Activation::Silu,
-        Rounding::ValueProduct,
-        GateBias::None,
-    )?;
-    Ok(DenseMlp {
-        gate_proj,
-        up_proj,
-        down_proj,
-        activation,
-    })
-}
-
 #[cfg(test)]
 mod tests {
 

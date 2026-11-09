@@ -36,10 +36,11 @@
 //! captures a graph, selects a program or owns a runtime object (`AGENTS.md`, Model Library
 //! Boundary).
 
+use nn::blocks::GatedMlp;
 use nn::capability::{CausalLm, KvView, TokenBatch};
 use nn::layers::{
-    Gains, GatedActivation, Halves, Linear, Moe, PagedAttention, ParallelLMHead, QkvLinear,
-    ResidualStream, RmsNorm, Rotary, TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
+    Gains, Linear, Moe, PagedAttention, ParallelLMHead, QkvLinear, ResidualStream, RmsNorm, Rotary,
+    TRTLLM_WORKSPACE_BYTES, VocabParallelEmbedding,
 };
 use nn::weights::Weight;
 use nn::{Arena, DType, Forward, Shape, Strides, TensorView};
@@ -125,16 +126,8 @@ pub(crate) struct AttentionLayer {
 pub(crate) enum Mlp {
     /// Routed experts: a replicated router and the grouped products over the local expert set.
     Experts(Moe),
-    /// A dense block: `down(up(x) · silu(gate(x)))`.
-    Dense(Box<DenseMlp>),
-}
-
-/// A dense feed-forward block.
-pub(crate) struct DenseMlp {
-    pub(crate) gate_proj: Linear,
-    pub(crate) up_proj: Linear,
-    pub(crate) down_proj: Linear,
-    pub(crate) activation: GatedActivation,
+    /// A dense block: `down(up(x) · silu(gate(x)))`, column parallel in and row parallel out.
+    Dense(Box<GatedMlp>),
 }
 
 /// One forward's activation extents, in elements: the widths the forward reserves its buffers at.
@@ -157,8 +150,6 @@ struct Extents {
     key_value: u64,
     /// Elements per rotary factor row (`head_dim / 2`).
     factors: u64,
-    /// Elements per dense feed-forward row; zero when every layer routes to experts.
-    feed_forward: u64,
     /// Bytes of the attention program's workspace.
     workspace: u64,
 }
@@ -193,11 +184,6 @@ impl Extents {
                 "the key/value width",
             )?,
             factors: element(config.head_dim / 2, "head_dim / 2")?,
-            feed_forward: if config.has_dense_layers() {
-                element(partition.local_intermediate(config), "intermediate_size")?
-            } else {
-                0
-            },
             workspace: options.attention_workspace_bytes,
         })
     }
@@ -229,15 +215,6 @@ struct Buffers {
     key_rotated: TensorView,
     value: TensorView,
     attended: TensorView,
-    /// The dense feed-forward pair; absent when every layer routes to experts, so the zero
-    /// feed-forward extent reserves nothing.
-    dense: Option<DenseBuffers>,
-}
-
-/// The two dense feed-forward intermediates.
-struct DenseBuffers {
-    gate: TensorView,
-    up: TensorView,
 }
 
 impl Buffers {
@@ -275,14 +252,6 @@ impl Buffers {
                 .map_err(Error::from)?,
             value: padded(extents.key_value)?,
             attended: padded(extents.query)?,
-            dense: if extents.feed_forward == 0 {
-                None
-            } else {
-                Some(DenseBuffers {
-                    gate: padded(extents.feed_forward)?,
-                    up: padded(extents.feed_forward)?,
-                })
-            },
         })
     }
 }
@@ -503,7 +472,7 @@ impl DecoderLayer {
                 // Both blocks sum their tensor-parallel partial outputs themselves: the routed
                 // block after its experts, the dense one in its row-parallel down projection.
                 Mlp::Experts(moe) => moe.forward(f, normalized, update).map_err(Error::from)?,
-                Mlp::Dense(dense) => dense.forward(f, normalized, buffers, update)?,
+                Mlp::Dense(dense) => dense.forward(f, normalized, update)?,
             }
             Ok::<(), Error>(())
         })?;
@@ -575,33 +544,6 @@ impl AttentionLayer {
         self.o_proj
             .forward(f, attended.reshape(buffers.attended.shape), out)?;
         Ok(())
-    }
-}
-
-impl DenseMlp {
-    /// `down(up · silu(gate))`.
-    fn forward(
-        &self,
-        f: &Forward,
-        normalized: TensorView,
-        buffers: &Buffers,
-        out: TensorView,
-    ) -> Result<()> {
-        let dense = buffers.dense.as_ref().ok_or_else(|| {
-            Error::Config(
-                "a dense block runs in a forward reserved without dense buffers".to_owned(),
-            )
-        })?;
-        self.gate_proj.forward(f, normalized, dense.gate)?;
-        self.up_proj.forward(f, normalized, dense.up)?;
-        // `silu(gate) · up`, written into the gate buffer: the activation applies to the branch
-        // named `gate`, so the argument order is `(f, gate, value, out)` as in every gated layer.
-        let halves = Halves::Split {
-            gate: dense.gate,
-            value: dense.up,
-        };
-        self.activation.forward(f, halves, dense.gate)?;
-        Ok(self.down_proj.forward(f, dense.gate, out)?)
     }
 }
 

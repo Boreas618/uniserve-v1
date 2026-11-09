@@ -26,10 +26,11 @@ use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
+use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
+use nn::family::Split;
 use nn::layers::{
-    Bias, Epilogue, GateBias, GatedActivation, Halves, Linear, Modulation, Parallel, Precision,
-    QkNorm, Residual, ResidualStream, RmsNorm, Rotary, RotarySpec, Rounding, Scale, Spectrum,
-    Varlen,
+    Bias, Epilogue, Linear, Modulation, Parallel, Precision, QkNorm, Residual, ResidualStream,
+    RmsNorm, Rotary, RotarySpec, Rounding, Scale, Spectrum, Varlen,
 };
 use nn::tensor::Backing;
 use nn::weights::{Weight, WeightLoader};
@@ -64,11 +65,9 @@ pub struct Layer {
     norm1: Weight,
     norm2: Weight,
     attention: attention::Layer,
-    gate_up: Linear,
-    down: Linear,
-    /// The stepwise gated activation (`Rounding::Stepwise`): `silu(gate)` and the product are
-    /// evaluated with one rounding each.
-    gated: GatedActivation,
+    /// The value-first SwiGLU, `silu(gate)` and the product evaluated with one rounding each
+    /// (`Rounding::Stepwise`), as the reference's activation rounds.
+    mlp: GatedMlp,
     eps: f32,
 }
 
@@ -91,7 +90,6 @@ impl Layer {
     ) -> Result<Self> {
         let prefix = format!("transformer_blocks.{index}");
         let hidden = u64::from(config.hidden_size);
-        let ffn = u64::from(config.intermediate_size);
         Ok(Self {
             norm1: loader
                 .scope(format!("{prefix}.norm1"))
@@ -103,24 +101,17 @@ impl Layer {
                 kind, index, config, rows, rotary, tile_bound, partition, loader,
             )?,
             // The checkpoint fuses the feed-forward's value half first and its gate half second.
-            gate_up: Linear::load(
-                &mut loader.scope(format!("{prefix}.ff.net.0.proj")),
-                attention::width(hidden)?,
-                attention::width(2 * ffn)?,
-                Bias::Absent,
-                Parallel::None,
-            )?,
-            down: Linear::load(
-                &mut loader.scope(format!("{prefix}.ff.net.2")),
-                attention::width(ffn)?,
-                attention::width(hidden)?,
-                Bias::Absent,
-                Parallel::None,
-            )?,
-            gated: GatedActivation::new(
-                ops::activation::Activation::Silu,
-                Rounding::Stepwise,
-                GateBias::None,
+            mlp: GatedMlp::load(
+                &mut loader.scope(format!("{prefix}.ff.net")),
+                GatedMlpSpec {
+                    hidden: config.hidden_size,
+                    intermediate: config.intermediate_size,
+                    activation: ops::activation::Activation::Silu,
+                    rounding: Rounding::Stepwise,
+                    gate_up: GateUp::ValueFirst("0.proj"),
+                    down: "2",
+                },
+                Split::WHOLE,
             )?,
             eps: config.norm_eps,
         })
@@ -201,8 +192,6 @@ impl Layer {
                     part(out),
                     selected,
                     part(normalized),
-                    part(scratch.packed),
-                    part(scratch.mlp),
                 )?;
                 // These rows are the next layer's input, and its attention reads the whole
                 // sequence, so they leave now, beside the rest of this layer.
@@ -230,17 +219,7 @@ impl Layer {
             &scratch.attention,
             update,
         )?;
-        self.feed_forward(
-            f,
-            modulation,
-            hidden,
-            update,
-            out,
-            rows,
-            normalized,
-            scratch.packed,
-            scratch.mlp,
-        )?;
+        self.feed_forward(f, modulation, hidden, update, out, rows, normalized)?;
         Ok(Vec::new())
     }
 
@@ -279,8 +258,6 @@ impl Layer {
         out: TensorView,
         rows: TensorView,
         normalized: TensorView,
-        packed: TensorView,
-        mlp: TensorView,
     ) -> Result<()> {
         // The MLP norm folds the attention's gated update into the residual and copies the result
         // out: the block's second residual reads it after the down projection has overwritten
@@ -307,17 +284,10 @@ impl Layer {
         };
         mlp_norm.forward(f, update, Some(stream), normalized)?;
 
-        // Feed-forward: the packed value and gate halves, the gated activation, the down
-        // projection, and the second gated residual into the retained residual.
-        self.gate_up.forward(f, normalized, packed)?;
-        // The reference's activation is stepwise here, so the packed
-        // projection is read as its two halves and gated with one rounding each - the video
-        // decoder's SwiGLU is the same projection with the fused recipe, and that is why the
-        // rounding is stated per site rather than per operator.
-        self.gated.forward(f, Halves::ValueFirst(packed), mlp)?;
-        // `hidden` is spent by now, so the down projection lands there, and the gated residual
-        // writes over its `update` operand: the layer's output is `hidden`, in place.
-        self.down.forward(f, mlp, hidden)?;
+        // Feed-forward, then the second gated residual into the retained residual. `hidden` is
+        // spent by now, so the MLP's output lands there, and the gated residual writes over its
+        // `update` operand: the layer's output is `hidden`, in place.
+        self.mlp.forward(f, normalized, hidden)?;
         let residual = Residual::new(Scale::Row(gate_mlp), None)?;
         Ok(residual.forward(f, out, hidden, Some(rows), hidden)?)
     }
@@ -1028,8 +998,6 @@ impl Transformer {
 pub struct Scratch {
     normalized: TensorView,
     update: TensorView,
-    packed: TensorView,
-    mlp: TensorView,
     attention: attention::LayerScratch,
 }
 
@@ -1045,15 +1013,12 @@ impl Scratch {
         let dtype = hidden.dtype;
         let tokens = hidden.shape.dim(0);
         let width = hidden.shape.last();
-        let ffn = u64::from(transformer.config.intermediate_size);
         let layer = transformer.layers.first().ok_or_else(|| {
             Error::Unsupported("a stack with no layers has no scratch".to_owned())
         })?;
         Ok(Self {
             normalized: arena.tensor(dtype, Shape::new(&[tokens, width]))?,
             update: arena.tensor(dtype, Shape::new(&[tokens, width]))?,
-            packed: arena.tensor(dtype, Shape::new(&[tokens, 2 * ffn]))?,
-            mlp: arena.tensor(dtype, Shape::new(&[tokens, ffn]))?,
             attention: layer.attention.reserve(f, hidden, total_rows)?,
         })
     }
