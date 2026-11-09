@@ -104,8 +104,6 @@ impl Admissions {
 /// successor needs of it besides the state and the socket.
 #[derive(Debug)]
 pub(crate) struct FrozenStream {
-    /// The response's identity within this handoff.
-    pub(crate) id: u64,
     /// The request's identity as the deployment named it, which the pause
     /// record reports.
     pub(crate) request_id: String,
@@ -176,6 +174,7 @@ impl Handoff {
     }
 
     /// Whether a hot restart is pausing the responses.
+    #[cfg(test)]
     pub(crate) fn pausing(&self) -> bool {
         self.inner.pausing.load(Ordering::Acquire)
     }
@@ -313,10 +312,6 @@ pub(crate) struct Registration {
 }
 
 impl Registration {
-    /// The response's identity within this daemon.
-    pub(crate) fn id(&self) -> u64 {
-        self.id
-    }
 
     /// Whether a pause was asked for.
     pub(crate) fn paused(&self) -> bool {
@@ -333,6 +328,7 @@ impl Registration {
     /// Waits until a hot restart asks this response to pause.
     ///
     /// Returns `false` when the restart ended without pausing this response.
+    #[cfg(test)]
     pub(crate) async fn pausing(&self) -> bool {
         let mut requested = self.requested.clone();
         requested.wait_for(|requested| *requested).await.is_ok()
@@ -410,13 +406,12 @@ mod tests {
 
     /// A frozen response's minimal state: a socket descriptor is all the
     /// pause needs of it beyond the state the connection filled in.
-    fn frozen(id: u64, request_id: &str) -> FrozenStream {
+    fn frozen(request_id: &str) -> FrozenStream {
         let (decision, _decided) = tokio::sync::oneshot::channel();
         let socket: std::os::fd::OwnedFd = std::fs::File::open("/dev/null")
             .expect("a socket stand-in")
             .into();
         FrozenStream {
-            id,
             request_id: request_id.to_owned(),
             frozen_at_ns: super::now_ns(),
             state: proto::handoff::Stream::default(),
@@ -436,7 +431,7 @@ mod tests {
             let kept = Arc::clone(&kept);
             async move {
                 assert!(kept.pausing().await, "the kept response is asked to pause");
-                kept.report(Some(frozen(kept.id(), "kept"))).await
+                kept.report(Some(frozen("kept"))).await
             }
         });
 
@@ -485,7 +480,7 @@ mod tests {
         // once, because no round holds its report.
         let decision = tokio::time::timeout(
             Duration::from_secs(10),
-            late.report(Some(frozen(late.id(), "late"))),
+            late.report(Some(frozen("late"))),
         )
         .await
         .expect("the response is not left waiting for a decision");
@@ -507,7 +502,7 @@ mod tests {
             let kept = Arc::clone(&kept);
             async move {
                 assert!(kept.pausing().await, "the second round asks it to pause");
-                kept.report(Some(frozen(kept.id(), "kept"))).await
+                kept.report(Some(frozen("kept"))).await
             }
         });
         let paused = tokio::time::timeout(Duration::from_secs(10), handoff.pause())
@@ -546,7 +541,7 @@ mod tests {
             async move {
                 assert!(held.pausing().await, "the held response is asked to pause");
                 released.await.expect("the pause goes on");
-                held.report(Some(frozen(held.id(), "held"))).await
+                held.report(Some(frozen("held"))).await
             }
         });
         let pausing = tokio::spawn({
@@ -560,7 +555,7 @@ mod tests {
         let late = handoff.register();
         let waiting = tokio::spawn(async move {
             assert!(late.pausing().await, "the late response is asked to pause");
-            late.report(Some(frozen(late.id(), "late"))).await
+            late.report(Some(frozen("late"))).await
         });
         go_on.send(()).expect("the pause goes on");
 

@@ -1278,10 +1278,6 @@ impl Transformer {
         })
     }
 
-    /// The configuration this partition was read with.
-    pub const fn config(&self) -> &TransformerConfig {
-        &self.config
-    }
 
     /// The FP32 view an FP32 projection reads when `source` is not FP32 already.
     ///

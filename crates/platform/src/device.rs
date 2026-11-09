@@ -76,10 +76,6 @@ pub struct Device {
     id: DeviceId,
     /// (major, minor) of the compute capability, fixed for the device.
     architecture: (i32, i32),
-    /// Streaming multiprocessors, which size every launch's grid.
-    multiprocessors: i32,
-    /// Total storage of the device, which the allocator's pools are cut from.
-    total_memory: u64,
     context: Arc<PrimaryContext>,
 }
 
@@ -91,14 +87,15 @@ impl Device {
             id.attribute(DeviceAttribute::ComputeCapabilityMajor)?,
             id.attribute(DeviceAttribute::ComputeCapabilityMinor)?,
         );
-        let multiprocessors = id.attribute(DeviceAttribute::MultiprocessorCount)?;
-        let total_memory = id.memory_info()?.total;
+        // The first call that needs the context finishes its initialization here, on this thread
+        // and outside any capture. Without it the expert exchange cells (alltoall, megamoe) never
+        // finish capturing their `expert_join` bucket: most likely the initialization then falls
+        // inside one device thread's capture while the other device waits on it.
+        id.memory_info()?;
 
         Ok(Self {
             id,
             architecture,
-            multiprocessors,
-            total_memory,
             context: Arc::new(context),
         })
     }
@@ -117,29 +114,14 @@ impl Device {
         self.architecture
     }
 
-    pub fn multiprocessor_count(&self) -> i32 {
-        self.multiprocessors
-    }
 
-    /// Total storage of the device in bytes, as of the first use.
-    pub fn total_memory(&self) -> u64 {
-        self.total_memory
-    }
 
     /// Free and total storage now, queried in this device's primary context.
     pub fn memory_info(&self) -> Result<MemoryInfo> {
         self.id.memory_info()
     }
 
-    /// The device's UUID, the same identity NVML reports for it.
-    pub fn uuid(&self) -> Result<DeviceUuid> {
-        self.id.uuid()
-    }
 
-    /// Whether this device can directly address storage resident on `peer`.
-    pub fn can_access_peer(&self, peer: DeviceId) -> Result<bool> {
-        self.id.can_access_peer(peer)
-    }
 
     /// Makes this device's primary context current on the calling thread until
     /// the guard drops, for driver calls that need a current context on a fresh
@@ -236,13 +218,6 @@ impl DeviceId {
         Ok(accessible != 0)
     }
 
-    /// Fails with the error that left the device's primary context
-    /// unusable, such as an illegal memory access or a device-side assert,
-    /// which the driver returns from every call after it; passes while the
-    /// context is usable. Waits for nothing on the device.
-    pub fn context_error(self) -> Result<()> {
-        self.memory_info().map(drop)
-    }
 
     /// Free and total device storage, queried in the device's primary context.
     pub fn memory_info(self) -> Result<MemoryInfo> {

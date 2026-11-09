@@ -267,7 +267,7 @@ async fn serve_deployment(
 ) -> Result<()> {
     let name = config.served_model_name().to_owned();
     let options = config.daemon_options();
-    let mut daemon = tokio::task::spawn_blocking(move || Daemon::start(options))
+    let daemon = tokio::task::spawn_blocking(move || Daemon::start(options))
         .await
         .context("the daemon's start did not complete")?
         .context("failed to start the deployment's daemon")?;

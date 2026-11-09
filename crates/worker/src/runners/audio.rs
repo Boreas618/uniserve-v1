@@ -230,18 +230,6 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
             .unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
-    /// Checks every bucket's plan against the device's share, once, when the runner loads.
-    ///
-    /// The same rule as the clip decoder's, through the same `floor::checked`, so the two media
-    /// runners cannot read an absent plan and a refused one differently.
-    pub fn load(&mut self) -> Result<()> {
-        if self.pools.is_none() {
-            return Err(Error::Resource(
-                "the audio decoder runner loaded before its device's pools were attached",
-            ));
-        }
-        self.claim()
-    }
 
     /// Claims the arena the largest bucket's decode plans.
     fn claim(&mut self) -> Result<()> {

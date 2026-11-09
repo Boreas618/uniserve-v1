@@ -3,7 +3,7 @@
 Host media of the main process: H.264/AAC output encoding and MP4 muxing,
 conditional media reading, and the host resamplers model conditioning uses.
 The crate is the implementation of `specs/worker.md` §3's `media/` row and §9's
-media replacements; it is called by `crates/executor`'s media runner on the
+media replacements; it is called by `crates/worker`'s media runner on the
 main process's blocking thread pool.
 
 ## Native runtime

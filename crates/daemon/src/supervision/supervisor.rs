@@ -978,8 +978,7 @@ mod tests {
     /// own, and the driver calls this stand-in makes are `platform`'s, so the
     /// supervisor's code reaches no driver entry point. It is a test of its own
     /// so that this binary can be run as the stand-in — the mechanism
-    /// `crates/worker/src/transfer/cache_export.rs:625` uses for a child
-    /// process, and `crates/platform/tests/it/gpu.rs:404` for a role.
+    /// `crates/platform/tests/it/gpu.rs` uses for a role.
     #[test]
     #[ignore = "a stand-in rank process, started by `hold_event`"]
     fn event_holder_rank() {

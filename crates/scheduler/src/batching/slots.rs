@@ -60,12 +60,57 @@ pub(crate) struct PageGeometry {
 ///   one slot number per token addresses one of them; the kernels index one unit
 ///   per page today, and a multi-unit page needs a column per unit, which is a
 ///   decision for the worker rather than a guess here.
+#[cfg(test)]
 pub(crate) fn slot_mapping(
     table: &ipc::BlockTable,
     page: PageGeometry,
     positions: Range<u32>,
 ) -> Option<Vec<i32>> {
     slot_mapping_where(table, page, positions, |_| true)
+}
+
+/// The absolute positions of the query tokens a call evaluates: its first
+/// token's logical position, then one per token of the call.
+///
+/// A call's query interval is contiguous in its request's sequence, which is
+/// what `Call.coordinates.logical_position` and its input tokens state.
+#[cfg(test)]
+pub(crate) fn positions(call: &ipc::Call) -> Option<Vec<i32>> {
+    let first = u32::try_from(call.coordinates.logical_position).ok()?;
+    let tokens = u32::try_from(call.input_token_ids.len()).ok()?;
+    positions_of(first, tokens)
+}
+
+/// One entry per forward row: the row whose hidden state the row's logits come
+/// from, or -1 when the row produces no logits.
+///
+/// `rows[i]` is the half-open span of forward rows call `i` occupies, in call
+/// order and contiguous, which is how the assembly builds them. What samples
+/// depends on the kind (`CausalLm`'s reading, model's answer):
+///
+/// - a **prefill** is sampled once, at its last query row, so only that row's
+///   entry names a row;
+/// - a **decode** evaluates one row per request and every row samples, so the
+///   mapping is the identity;
+/// - a **verify** carries one row per candidate position of its request, in
+///   candidate order, so its rows are the positions that sample and the mapping
+///   is the identity there too. That rests on model's confirmation that every
+///   row of a verify call is a candidate position; a call that also carries a
+///   row producing no logits would need that row marked -1 instead;
+/// - every other kind produces latents rather than logits, and a call with no
+///   consumer slots is sampled by nobody: both leave -1 on every row.
+///
+/// `None` when the calls and the spans disagree, when the spans are not the
+/// contiguous row order of one batch, or when a sampling prefill has no row —
+/// a batch must not ask a kernel to sample a row it does not have.
+#[cfg(test)]
+pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Vec<i32>> {
+    logits_rows_of(
+        calls
+            .iter()
+            .map(|call| (call.kind, !call.consumer_slots.is_empty())),
+        rows,
+    )
 }
 
 /// The slot each position of `positions` writes through `table`, with `-1` for a
@@ -128,17 +173,6 @@ pub(crate) fn query_offsets(query_lens: &[u32]) -> Option<Vec<i32>> {
     Some(offsets)
 }
 
-/// The absolute positions of the query tokens a call evaluates: its first
-/// token's logical position, then one per token of the call.
-///
-/// A call's query interval is contiguous in its request's sequence, which is
-/// what `Call.coordinates.logical_position` and its input tokens state.
-pub(crate) fn positions(call: &ipc::Call) -> Option<Vec<i32>> {
-    let first = u32::try_from(call.coordinates.logical_position).ok()?;
-    let tokens = u32::try_from(call.input_token_ids.len()).ok()?;
-    positions_of(first, tokens)
-}
-
 /// The absolute positions of `tokens` query tokens a call evaluates, starting at
 /// its first token's logical position.
 ///
@@ -152,37 +186,6 @@ pub(crate) fn positions_of(first: u32, tokens: u32) -> Option<Vec<i32>> {
         positions.push(i32::try_from(first.checked_add(offset)?).ok()?);
     }
     Some(positions)
-}
-
-/// One entry per forward row: the row whose hidden state the row's logits come
-/// from, or -1 when the row produces no logits.
-///
-/// `rows[i]` is the half-open span of forward rows call `i` occupies, in call
-/// order and contiguous, which is how the assembly builds them. What samples
-/// depends on the kind (`CausalLm`'s reading, model's answer):
-///
-/// - a **prefill** is sampled once, at its last query row, so only that row's
-///   entry names a row;
-/// - a **decode** evaluates one row per request and every row samples, so the
-///   mapping is the identity;
-/// - a **verify** carries one row per candidate position of its request, in
-///   candidate order, so its rows are the positions that sample and the mapping
-///   is the identity there too. That rests on model's confirmation that every
-///   row of a verify call is a candidate position; a call that also carries a
-///   row producing no logits would need that row marked -1 instead;
-/// - every other kind produces latents rather than logits, and a call with no
-///   consumer slots is sampled by nobody: both leave -1 on every row.
-///
-/// `None` when the calls and the spans disagree, when the spans are not the
-/// contiguous row order of one batch, or when a sampling prefill has no row —
-/// a batch must not ask a kernel to sample a row it does not have.
-pub(crate) fn logits_rows(calls: &[ipc::Call], rows: &[Range<u32>]) -> Option<Vec<i32>> {
-    logits_rows_of(
-        calls
-            .iter()
-            .map(|call| (call.kind, !call.consumer_slots.is_empty())),
-        rows,
-    )
 }
 
 /// [`logits_rows`] over the facts it reads from a call, so a batch can answer it

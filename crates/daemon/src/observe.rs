@@ -29,7 +29,6 @@ pub(crate) struct Sample {
     pub(crate) batch_us: u64,
     pub(crate) batches: u64,
     pub(crate) tokens: u64,
-    numerical_faults: u64,
 }
 
 /// The schedulers' statistics of every epoch, kept over the longest span a
@@ -64,7 +63,6 @@ impl Observer {
             batch_us: stats.batch_roundtrip_us,
             batches: stats.batch_count,
             tokens: stats.batch_tokens,
-            numerical_faults: stats.numerical_faults,
         });
         while samples
             .front()
@@ -140,14 +138,6 @@ impl Observer {
         (counter("steps"), counter("bytes"), counter("ended"))
     }
 
-    /// The calls of `epoch` that produced non-finite logits since `since`.
-    pub(crate) fn numerical_faults(&self, epoch: u64, since: Instant) -> u64 {
-        locked(&self.samples)
-            .iter()
-            .filter(|sample| sample.epoch == epoch && sample.at >= since)
-            .map(|sample| sample.numerical_faults)
-            .sum()
-    }
 }
 
 #[cfg(test)]
@@ -165,25 +155,6 @@ mod tests {
         }
     }
 
-    /// An epoch's rates average its own batches over the window, apart from
-    /// another epoch's.
-    #[test]
-    fn rates_average_one_epochs_batches() {
-        let observer = Observer::default();
-        let since = Instant::now();
-        observer.record(1, 0, &stats(1_000, 10, 500, 0));
-        observer.record(1, 0, &stats(3_000, 10, 500, 0));
-        observer.record(2, 0, &stats(90_000, 1, 1, 2));
-        let rates = observer
-            .rates(1, since, Duration::from_secs(60))
-            .expect("epoch 1 ran batches");
-        assert!((rates.step_us - 200.0).abs() < 1e-9, "{rates:?}");
-        assert!(rates.tokens_per_second > 0.0);
-        assert_eq!(observer.numerical_faults(1, since), 0);
-        assert_eq!(observer.numerical_faults(2, since), 2);
-        assert!(observer.rates(3, since, Duration::from_secs(60)).is_none());
-    }
-
     /// A report counts toward the span it arrived in: the steps of a span
     /// that ended are read apart from the ones after it.
     #[test]
@@ -199,5 +170,22 @@ mod tests {
             .expect("the span holds a report");
         assert!((rates.step_us - 100.0).abs() < 1e-9, "{rates:?}");
         assert_eq!(observer.rates_between(1, ended, ended), None);
+    }
+
+    /// An epoch's rates average its own batches over the window, apart from
+    /// another epoch's.
+    #[test]
+    fn rates_average_one_epochs_batches() {
+        let observer = Observer::default();
+        let since = Instant::now();
+        observer.record(1, 0, &stats(1_000, 10, 500, 0));
+        observer.record(1, 0, &stats(3_000, 10, 500, 0));
+        observer.record(2, 0, &stats(90_000, 1, 1, 2));
+        let rates = observer
+            .rates(1, since, Duration::from_secs(60))
+            .expect("epoch 1 ran batches");
+        assert!((rates.step_us - 200.0).abs() < 1e-9, "{rates:?}");
+        assert!(rates.tokens_per_second > 0.0);
+        assert!(observer.rates(3, since, Duration::from_secs(60)).is_none());
     }
 }

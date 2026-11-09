@@ -1175,10 +1175,6 @@ impl ConvolutionPlan {
         self.bytes
     }
 
-    /// The device the plan was built for.
-    pub fn device(&self) -> DeviceId {
-        self.device
-    }
 }
 
 /// The device storage one execution of a convolution reads and writes: the
@@ -1313,10 +1309,6 @@ impl Cudnn {
         })
     }
 
-    /// The device the handle belongs to.
-    pub fn device(&self) -> DeviceId {
-        self.device
-    }
 
     /// The cuDNN version this process loaded (`cudnnGetVersion`).
     pub fn version(&self) -> usize {

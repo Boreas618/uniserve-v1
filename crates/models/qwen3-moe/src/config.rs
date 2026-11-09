@@ -27,13 +27,6 @@ pub enum Activation {
 }
 
 impl Activation {
-    /// The name the operator descriptors carry.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::Silu => "silu",
-            Self::GeluTanh => "gelu_pytorch_tanh",
-        }
-    }
 }
 
 /// A YaRN rotary recipe, the only scaled recipe a Qwen3 checkpoint may use.
@@ -279,10 +272,6 @@ impl Config {
             && (layer + 1).is_multiple_of(self.decoder_sparse_step)
     }
 
-    /// The width of one KV head's row in the cache.
-    pub const fn kv_head_dim(&self) -> usize {
-        self.head_dim
-    }
 
     /// Query heads per key/value head.
     pub const fn group_size(&self) -> usize {

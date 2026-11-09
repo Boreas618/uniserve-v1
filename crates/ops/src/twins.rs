@@ -89,21 +89,6 @@ impl Twins {
         self.capacity().saturating_sub(self.cursor)
     }
 
-    /// A shadow buffer of `shape` elements of `dtype`, with no real buffer recorded.
-    ///
-    /// For a shadow with nothing to compare — a workspace, or an output the operator itself does not
-    /// produce. An output that is compared uses [`Self::shadow_of`], which records the pair.
-    pub fn buffer(&mut self, shape: Shape, dtype: DType) -> TensorView {
-        match self.carve(shape, dtype) {
-            Ok(address) => TensorView::new(address, dtype, shape),
-            Err(error) => {
-                self.fail(error);
-                // A view of the same geometry at the real region's start keeps the launch well
-                // defined; the failure recorded above stops the update from being committed.
-                TensorView::new(self.base(), dtype, shape)
-            }
-        }
-    }
 
     /// A shadow buffer of the same geometry as `real`, recorded as its twin.
     pub fn shadow_of(&mut self, real: TensorView) -> TensorView {

@@ -88,10 +88,6 @@ impl Shadow {
         self.twins.tolerance()
     }
 
-    /// The failure a carving recorded inside the paired forward, if one did.
-    pub fn failure(&self) -> Option<&ops::Error> {
-        self.twins.failure()
-    }
 
     /// Compares every pair of the paired forward on `stream` within `tolerance`.
     ///
@@ -363,10 +359,6 @@ impl Staging {
     }
 }
 
-/// The tolerance of the operator being shadowed, from its descriptor.
-pub fn tolerance_of<O: ops::Op>(descriptor: &O::Descriptor) -> Tolerance {
-    O::tolerance(descriptor)
-}
 
 /// The harness's twin region, for a model that writes through it.
 pub type Region = Arc<Twins>;

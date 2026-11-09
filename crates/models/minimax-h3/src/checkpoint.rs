@@ -56,11 +56,6 @@ pub const TASK_DITS: [(VideoTask, Dit); 3] = [
     (VideoTask::ReferenceToVideoAudio, Dit::Reference),
 ];
 
-/// The module roots a packed ModelOpt export's manifest names, and the network each belongs to.
-pub const MANIFEST_ROOTS: [(&str, Dit); 2] = [
-    ("denoiser", Dit::Base),
-    ("reference_denoiser", Dit::Reference),
-];
 
 /// The pipeline class a load of this crate takes (`model_index.json`'s `_class_name`).
 ///

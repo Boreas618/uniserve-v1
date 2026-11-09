@@ -396,7 +396,7 @@ impl SimWorker {
                 }
             })
             .expect("spawn sim worker thread");
-        let mut worker = Self {
+        let worker = Self {
             worker_info: {
                 WorkerInfo {
                     workers: groups
@@ -464,15 +464,6 @@ impl SimWorker {
         receiver
     }
 
-    /// Reports every throttle of the deployment's transfers the worker
-    /// takes (`Worker::throttle`), `true` for a halving and `false` for a
-    /// restoration, in order, to the returned receiver. The simulator runs
-    /// no transfer: a throttle changes nothing else.
-    pub fn observe_throttles(&mut self) -> Receiver<bool> {
-        let (sender, receiver) = crossbeam_channel::unbounded();
-        self.throttles = Some(sender);
-        receiver
-    }
 
     /// Has the worker report, as the deployment's nodes' storage reports
     /// (`Worker::ledgers`), whatever the returned list holds when the

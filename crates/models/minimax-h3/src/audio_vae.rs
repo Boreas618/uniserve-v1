@@ -675,10 +675,6 @@ pub struct Workspace {
 }
 
 impl Workspace {
-    /// The elements the buffer holds.
-    pub fn elements(&self) -> u64 {
-        u64::from(self.samples) * u64::from(self.channels)
-    }
 }
 
 /// The buffers one decode of `latent_frames` needs, in the order the stages run.

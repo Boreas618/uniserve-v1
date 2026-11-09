@@ -210,23 +210,6 @@ impl Staged {
         Ok(())
     }
 
-    /// Writes `bytes` into `buffer` at the block `offset`, refusing a block that does not fit.
-    fn place(buffer: &mut [u8], offset: u64, bytes: &[u8], what: &str) -> Result<()> {
-        let start = usize::try_from(offset)
-            .map_err(|_| Error::Invalid(format!("a {what} block offset is larger than memory")))?;
-        let end = start
-            .checked_add(bytes.len())
-            .ok_or_else(|| Error::Invalid(format!("a {what} block overflows")))?;
-        if end > buffer.len() {
-            return Err(Error::Invalid(format!(
-                "a {what} block of {} byte(s) at offset {start} does not fit a column of {}",
-                bytes.len(),
-                buffer.len()
-            )));
-        }
-        buffer[start..end].copy_from_slice(bytes);
-        Ok(())
-    }
 }
 
 /// The columns a denoiser stages a batch into, sized for the largest bucket it was bound with.
@@ -785,27 +768,6 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         self.model.schedule(plan.warm.task).map_err(Error::from)
     }
 
-    /// Allocates the tables of every bucket's layout, once, when the runner loads (4.3).
-    ///
-    /// The plan sized this memory before admission (`Tables::plan_bytes`), so nothing here decides
-    /// how much; a table the model needs and the plan did not size is a refusal rather than a
-    /// request-path allocation.
-    pub fn load(&mut self) -> Result<()> {
-        if self.pools.is_none() {
-            return Err(Error::Resource(
-                "the denoiser runner loaded before its device's pools were attached",
-            ));
-        }
-        // **The plan is the floor of the device's share, checked here rather than discovered by a
-        // capture that has to be thrown away.** The pool is the runtime's policy (a share of the
-        // device per stream); the model states what one evaluation reserves. A share below the plan
-        // is a refusal naming both numbers, and it is asked before anything is filled.
-        self.claim()?;
-        for bucket in self.capture_order() {
-            self.fill(bucket)?;
-        }
-        Ok(())
-    }
 
     /// Claims the arena the largest bucket's evaluation plans.
     fn claim(&mut self) -> Result<()> {
@@ -828,12 +790,6 @@ impl<M: Denoiser + Send + Sync> DenoiserRunner<M> {
         Ok(())
     }
 
-    /// The bytes `warm`'s layout needs for its tables, as the plan books them before admission
-    /// (4.3).
-    pub fn table_bytes(model: &M, warm: &WarmRequest) -> Result<u64> {
-        let layout = model.layout(&warm.view());
-        Tables::plan_bytes(&model.state_tables(&layout))
-    }
 
     fn stream_id(&self) -> StreamId {
         StreamId(self.stream.raw())
@@ -2122,7 +2078,7 @@ impl<M: Denoiser + Send + Sync> Runner for DenoiserRunner<M> {
                 // zeros (4.5, section 9).
                 self.first_step(*bucket, *generation)?;
                 self.write_step(*bucket)?;
-                let (served, captured) = self
+                let (served, _) = self
                     .lifecycle
                     .graphs
                     .captured_for(*bucket, *generation)
@@ -2604,15 +2560,6 @@ mod tests {
     fn a_bucket_that_is_not_a_denoise_states_what_it_is() {
         let error = layout_of(Bucket::prefill(1, 16, Variant::Encode)).unwrap_err();
         assert!(format!("{error}").contains("serves a denoising bucket"));
-    }
-
-    #[test]
-    fn a_block_that_does_not_fit_its_column_is_refused_by_name() {
-        let mut buffer = vec![0u8; 8];
-        let error = Staged::place(&mut buffer, 4, &[1u8; 8], "video latents").unwrap_err();
-        assert!(format!("{error}").contains("does not fit a column of 8"));
-        Staged::place(&mut buffer, 4, &[1u8; 4], "video latents").unwrap();
-        assert_eq!(&buffer[4..], &[1, 1, 1, 1]);
     }
 
     /// A denoiser that states nothing: the tests above exercise the runner's own arithmetic, which

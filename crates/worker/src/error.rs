@@ -198,11 +198,6 @@ impl Failure {
         &self.message
     }
 
-    /// Record a failure observed while cleaning up after this one.
-    pub fn note(&mut self, cleanup: &Failure) {
-        self.notes
-            .push(format!("cleanup failed: {}", cleanup.message));
-    }
 }
 
 impl std::fmt::Display for Failure {

@@ -246,16 +246,6 @@ impl Op for FramePad {
 /// The largest message an entry writes into a call structure.
 const MESSAGE: usize = 512;
 
-/// The frame reduction the two frame operators' tolerance covers, in values.
-///
-/// `frame_moments` reduces `channels_per_group · pixels` values per frame and `frame_norm_pad`
-/// reduces the same ones. Both factors travel to the program as runtime scalars - they are a
-/// frame's shape, not a compilation's - so the descriptor cannot name the length and the tolerance
-/// is stated at a declared bound instead. The bound is a class the caller must stay inside, and
-/// nothing enforces it yet: a launch past it gets a tolerance stated for a shorter reduction than
-/// its own, which fails a correct kernel. The repair is a reduction class in the descriptor (the
-/// `max_tiles` pattern), which moves both operators' keys and is therefore not made here.
-pub const FRAME_REDUCTION_CLASS: u32 = 1 << 16;
 
 /// The reduction class a frame of `channels_per_group` channels and `pixels` pixels falls in.
 ///

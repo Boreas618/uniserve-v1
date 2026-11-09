@@ -9,8 +9,7 @@
 //! engine's state changes to the client's state. When the connection closes,
 //! every request still in flight ends with an error event.
 
-use std::collections::{BTreeMap, HashMap};
-use std::os::unix::net::UnixStream;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -155,7 +154,8 @@ enum Answered {
     Index(Vec<wire::GroupIndex>),
     /// What a successor maps of the engine (`CacheDescribed`).
     Cache(wire::Predecessor),
-    Prefixes(Vec<wire::RequestPrefix>),
+    /// The engine described the requests it was asked about (`RequestsDescribed`).
+    Prefixes,
 }
 
 impl Shared {
@@ -202,19 +202,6 @@ pub struct EngineClient {
 }
 
 impl EngineClient {
-    /// A client of the engine at the other end of `stream`, which has
-    /// reported itself ready with `info`; `stats` receives its schedulers'
-    /// statistics.
-    ///
-    /// # Errors
-    ///
-    /// Fails when the connection cannot be shared between the client and
-    /// its reader.
-    pub fn over(stream: UnixStream, info: EngineInfo, stats: StatsSink) -> anyhow::Result<Self> {
-        let reader = Connection::from_unix(stream.try_clone()?)?;
-        let writer = Connection::from_unix(stream)?;
-        Self::new(reader, writer, info, EngineState::Ready, stats, None)
-    }
 
     /// A client of the engine read through `reader` and written through
     /// `writer`, two ends of one connection over which the engine reported
@@ -561,37 +548,7 @@ impl EngineClient {
         }
     }
 
-    /// Resumes a parked engine, ending the storage of the epochs `retire`
-    /// names on its nodes first: the successor a rollback discards.
-    ///
-    /// # Errors
-    ///
-    /// Fails with the reason a scheduler did not resume, or when the engine
-    /// ends first.
-    pub async fn resume(&self, retire: Vec<u64>) -> Result<(), String> {
-        self.ask(|id| wire::engine_command::Kind::Resume(wire::Resume { id, retire }))
-            .await
-            .map(drop)
-    }
 
-    /// Commits the engine's epoch: ends the storage of the epochs `retire`
-    /// names (its predecessor, whose processes are gone) on its nodes, and
-    /// its workers take the predecessor's storage they mapped read-only.
-    /// Returns what each worker reported.
-    ///
-    /// # Errors
-    ///
-    /// Fails with the reason a worker did not commit, or when the engine
-    /// ends first.
-    pub async fn commit(&self, retire: Vec<u64>) -> Result<Vec<String>, String> {
-        match self
-            .ask(|id| wire::engine_command::Kind::Commit(wire::Commit { id, retire }))
-            .await?
-        {
-            Answered::Results(results) => Ok(results),
-            _ => Err("the engine answered a commit with something else".to_owned()),
-        }
-    }
 
     /// Each worker group's KV cache segments as the engine holds them now,
     /// which an epoch succeeding it maps.
@@ -610,21 +567,6 @@ impl EngineClient {
         }
     }
 
-    /// Accepted prefixes of running requests that can move to a successor.
-    /// Request IDs belong to this engine; queued and terminal requests hold
-    /// no state in this inventory.
-    ///
-    /// # Errors
-    /// Fails when the engine or one of its schedulers stops before replying.
-    pub async fn describe_requests(&self) -> Result<Vec<wire::RequestPrefix>, String> {
-        match self
-            .ask(|id| wire::engine_command::Kind::DescribeRequests(wire::DescribeRequests { id }))
-            .await?
-        {
-            Answered::Prefixes(prefixes) => Ok(prefixes),
-            _ => Err("the engine answered a request inventory with something else".to_owned()),
-        }
-    }
 
     /// Pin source pages, reserve target pages, or publish a completed cache
     /// transfer. A snapshot retains its pages until a matching release.
@@ -700,29 +642,6 @@ impl EngineClient {
             .map(Answered::results)
     }
 
-    /// Gives every scheduler of the engine the scheduling limits and policy
-    /// `scheduling` states, from its next step on.
-    ///
-    /// # Errors
-    ///
-    /// Fails with the reason a scheduler refused them (a limit beyond the
-    /// batch the workers were started for), or when the engine ends first.
-    pub async fn configure(&self, scheduling: wire::Scheduling) -> Result<(), String> {
-        let id = self.shared.next_id.fetch_add(1, Ordering::Relaxed);
-        let (answer, answered) = oneshot::channel();
-        lock(&self.shared.answers).insert(id, answer);
-        self.shared
-            .send(to_engine::Kind::Engine(wire::EngineCommand {
-                kind: Some(wire::engine_command::Kind::Configure(wire::Configure {
-                    id,
-                    scheduling: Some(scheduling),
-                })),
-            }));
-        answered
-            .await
-            .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
-            .map(drop)
-    }
 
     /// Gives back or restores the device storage of the engine's KV cache
     /// (`wire::CacheChange`), and returns what each worker reported.
@@ -938,7 +857,7 @@ impl Answered {
     fn results(self) -> Vec<String> {
         match self {
             Self::Results(results) => results,
-            Self::Index(_) | Self::Cache(_) | Self::Prefixes(_) => Vec::new(),
+            Self::Index(_) | Self::Cache(_) | Self::Prefixes => Vec::new(),
         }
     }
 }
@@ -1115,7 +1034,7 @@ fn read_frames(mut reader: Connection, shared: &Shared, stats: &StatsSink) {
             Some(from_engine::Kind::RequestsDescribed(described)) => {
                 if let Some(answer) = lock(&shared.answers).remove(&described.id) {
                     let _ = answer.send(if described.error.is_empty() {
-                        Ok(Answered::Prefixes(described.requests))
+                        Ok(Answered::Prefixes)
                     } else {
                         Err(described.error)
                     });
@@ -1228,11 +1147,6 @@ impl EventStream {
         }
     }
 
-    /// Registers a callback to run once, on the terminal event, the end of
-    /// the stream or its drop.
-    pub fn set_on_finish(&mut self, on_finish: impl FnOnce() + Send + 'static) {
-        self.on_finish = Some(Box::new(on_finish));
-    }
 
     /// The request's identity in the engine that serves it.
     pub fn id(&self) -> RequestId {
@@ -1280,20 +1194,6 @@ impl EventStream {
         std::task::Poll::Ready(event)
     }
 
-    /// Receives the next event without waiting.
-    ///
-    /// # Errors
-    ///
-    /// Returns the channel's error when no event waits or the request ended.
-    pub fn try_recv(&mut self) -> Result<Event, mpsc::error::TryRecvError> {
-        let event = self.events.try_recv();
-        match &event {
-            Ok(event) => self.observe(event),
-            Err(mpsc::error::TryRecvError::Disconnected) => self.finish(),
-            Err(mpsc::error::TryRecvError::Empty) => {}
-        }
-        event
-    }
 
     /// Counts a received event, reports consumption to the engine, and
     /// finishes the stream on a terminal event.

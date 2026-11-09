@@ -135,12 +135,6 @@ impl BufferRegistry {
             .map(|(key, _)| key)
     }
 
-    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
-        self.buffers
-            .values()
-            .any(|buffer| buffer.status == Status::Revoked)
-    }
-
     /// Return successfully retired buffers for destruction outside the owner
     /// lock. A failed or cancelled retirement still retains its backing.
     pub(crate) fn take_finished(&mut self) -> Vec<RegisteredBuffer> {

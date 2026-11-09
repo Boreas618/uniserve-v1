@@ -53,8 +53,6 @@ mod tasks;
 mod tests;
 pub mod weights;
 
-use std::collections::HashMap;
-use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -515,29 +513,6 @@ impl Manifest {
         self.copies.iter().map(Copy::bytes).sum()
     }
 
-    /// Physical bytes target `rank` must allocate before executing this plan.
-    /// Chunks mapped from a retained source need no new allocation.
-    pub fn created_bytes(&self, request: &Request, rank: u32) -> u64 {
-        let mapped: std::collections::BTreeSet<_> = self
-            .mappings
-            .iter()
-            .filter(|mapping| mapping.rank == rank)
-            .map(|mapping| (mapping.storage, mapping.chunk))
-            .collect();
-        let mut bytes = 0;
-        for (storage, held) in request.target.ranks[rank as usize]
-            .storages
-            .iter()
-            .enumerate()
-        {
-            for (chunk, value) in held.chunks.iter().enumerate() {
-                if !mapped.contains(&(storage as u32, chunk as u32)) {
-                    bytes += value.length;
-                }
-            }
-        }
-        bytes
-    }
 
     /// Peak conversion scratch on a receiver. Groups execute serially:
     /// one destination canonical form, one source's gathered fields and
@@ -578,18 +553,7 @@ impl Manifest {
 /// Computes each request's manifest once.
 #[derive(Default)]
 pub struct Planner {
-    manifests: HashMap<[u8; 32], Arc<Manifest>>,
 }
 
 impl Planner {
-    /// The manifest of `request`, computed on its first request.
-    pub fn manifest(&mut self, request: &Request) -> Result<Arc<Manifest>> {
-        let digest = request.digest()?;
-        if let Some(manifest) = self.manifests.get(&digest) {
-            return Ok(Arc::clone(manifest));
-        }
-        let manifest = Arc::new(Manifest::plan(request)?);
-        self.manifests.insert(digest, Arc::clone(&manifest));
-        Ok(manifest)
-    }
 }

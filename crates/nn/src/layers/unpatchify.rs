@@ -53,10 +53,6 @@ impl UnpatchifyVideo {
         })
     }
 
-    /// The channels of the raster.
-    pub const fn channels(&self) -> u32 {
-        self.channels
-    }
 
     /// Map `tokens` into `out`.
     ///

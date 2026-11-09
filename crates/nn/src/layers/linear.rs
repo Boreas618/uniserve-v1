@@ -77,15 +77,6 @@ impl Linear {
         })
     }
 
-    /// The same projection, with the activation element type its descriptor is compiled for.
-    ///
-    /// A model whose activations are one dtype everywhere needs nothing more; a projection on an
-    /// FP32 activation path (H3's latent input and output heads, specs/worker.md 4.3) states it
-    /// here rather than discovering it at launch.
-    pub fn with_input(mut self, dtype: ops::DType) -> Self {
-        self.input = Some(dtype);
-        self
-    }
 
     /// The contraction length.
     pub const fn k(&self) -> u32 {
@@ -393,28 +384,6 @@ impl Nvfp4Linear {
         self.packed.view()
     }
 
-    /// `out = input · weight + bias`, with the activation encoded on the way.
-    ///
-    /// `input` is `[m, k]` of the encoder's element type and unit stride on its last axis; `out` is
-    /// `[m, n]`; `alpha` is `[1]` FP32, the product of the activation's and the weight's tensor
-    /// scales, computed on device by whoever produced the activation scale. The packed activation
-    /// and its block scales are taken from the forward's arena.
-    /// The descriptor of the activation encoding this projection runs first.
-    /// The encoder's descriptor, from the contraction length alone.
-    pub fn encode_descriptor_of(
-        input: DType,
-        columns: u32,
-        layout: ScaleLayout,
-        block: u32,
-    ) -> QuantizeDescriptor {
-        QuantizeDescriptor {
-            input,
-            columns,
-            layout,
-            block: Self::encode_block(columns, block),
-            pdl: false,
-        }
-    }
 
     /// The tile one encoding of a `columns`-wide row runs in.
     ///

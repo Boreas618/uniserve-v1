@@ -210,10 +210,6 @@ impl JobQueue {
         })
     }
 
-    /// The device the queue's worker drives.
-    pub fn device(&self) -> DeviceId {
-        self.device
-    }
 
     /// The event pool deferred work is completed through.
     pub(crate) fn events(&self) -> &Arc<EventPool> {

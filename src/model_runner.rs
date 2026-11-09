@@ -201,13 +201,6 @@ impl worker::data_plane::ModelLoad for RankModel {
 }
 
 impl Served {
-    /// The checkpoint-named class this value was loaded as.
-    pub(crate) fn class(&self) -> ModelClass {
-        match self {
-            Self::Text(_) => ModelClass::CausalLm,
-            Self::Media(_) => ModelClass::Media,
-        }
-    }
 }
 
 /// One rank's model runner: it loads the rank's model on its devices, sizes the KV cache from what
@@ -1751,16 +1744,11 @@ impl ModelRunner {
         let memory = worker::memory::Memory::new(
             worker::memory::OpenMemory {
                 plan: &planned,
-                // A causal-language rank keeps no per-slot bank: its per-request state is the KV
-                // pages in the cache, and the sampler's parameters travel in the batch's columns.
-                slots: &[],
                 device: Some(device),
                 stream: Some(&stream),
-                devices: vec![worker::memory::allocation::MemoryKind::Cuda(device)],
                 // A rank that takes no other rank's export states that as the absence of a
                 // program: a conversion that reaches it is a mistake, and it says so by name.
                 conversion: Arc::new(worker::memory::prefix_cache::conversion::Unimported),
-                events: self.events(),
                 pools,
             },
             storage,

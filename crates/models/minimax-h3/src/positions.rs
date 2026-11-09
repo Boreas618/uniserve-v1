@@ -88,10 +88,6 @@ impl Mrope {
         self.widths
     }
 
-    /// The elements of one head the sections rotate: every element, for H3's text encoder.
-    pub const fn rotated(self) -> u32 {
-        self.head_dim
-    }
 
     /// The position axis of every compact frequency, in frequency order.
     ///
@@ -181,10 +177,6 @@ impl VisionRotary {
         Ok(Self { head_dim })
     }
 
-    /// The elements of one head the rotation covers: every element.
-    pub const fn rotated(self) -> u32 {
-        self.head_dim
-    }
 
     /// The compact frequencies one axis repeats: `head_dim / 4`.
     pub const fn per_axis(self) -> u32 {

@@ -627,14 +627,6 @@ impl Worker {
         self.media.select_media(computation)
     }
 
-    /// The device's one pool set, for an owner that carves its own storage from the same allocator
-    /// (the storage owners' resident planes, the paired forward's scratch pages).
-    ///
-    /// Nothing else on the device constructs a `Pools` (4.1): a second allocator would book the
-    /// same device allowance twice.
-    pub fn pools(&self) -> Arc<std::sync::Mutex<Pools>> {
-        Arc::clone(&self.pools)
-    }
 
     /// The device's mapped bytes per pool kind, from the one allocator that books them (4.1).
     ///
@@ -722,10 +714,6 @@ impl Watchdog {
         self.jobs.iter().max_by_key(|watch| watch.elapsed)
     }
 
-    /// The longest a command has been in flight, `Duration::ZERO` when none is.
-    pub fn elapsed(&self) -> Duration {
-        self.longest().map_or(Duration::ZERO, |watch| watch.elapsed)
-    }
 }
 
 /// What one turn of the device thread finished (4.5's interleaving).

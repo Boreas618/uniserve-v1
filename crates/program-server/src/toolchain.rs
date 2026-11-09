@@ -162,7 +162,6 @@ pub struct ToolchainConfig {
 /// is missing.
 #[derive(Debug)]
 pub struct Toolchains {
-    config: ToolchainConfig,
     nvcc: Discovered<Nvcc>,
     triton: Discovered<Triton>,
     cute_dsl: Discovered<CuteDsl>,
@@ -180,7 +179,6 @@ impl Toolchains {
     pub fn discover(config: &ToolchainConfig) -> Result<Toolchains> {
         let interpreter = resolve(&config.python);
         Ok(Toolchains {
-            config: config.clone(),
             nvcc: Nvcc::discover(config),
             triton: Triton::discover(config, &interpreter),
             cute_dsl: CuteDsl::discover(config, &interpreter),
@@ -248,10 +246,6 @@ impl Toolchains {
         }
     }
 
-    /// The host's configuration of the toolchains.
-    pub fn config(&self) -> &ToolchainConfig {
-        &self.config
-    }
 }
 
 /// nvcc, the CUDA toolkit's compiler.

@@ -13,7 +13,6 @@ use ops::norm::{
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
-use crate::layers::ACCUMULATE;
 use crate::layers::launch::{PDL, row_tile};
 use crate::weights::Weight;
 
@@ -36,15 +35,7 @@ impl RmsNorm {
         })
     }
 
-    /// The normalization's width.
-    pub const fn columns(&self) -> u32 {
-        self.columns
-    }
 
-    /// The variance floor.
-    pub const fn eps(&self) -> f32 {
-        self.eps
-    }
 
     /// The per-channel scale.
     pub fn weight(&self) -> TensorView {
@@ -153,10 +144,6 @@ impl RmsNorm {
         f.operate::<AddRmsNorm>(&descriptor, args)
     }
 
-    /// The bound two implementations of this normalization may differ by, for shadow execution.
-    pub fn tolerance(&self) -> ops::Tolerance {
-        ops::Tolerance::rounding(u64::from(self.columns), ACCUMULATE, self.weight.dtype())
-    }
 }
 
 /// Layer normalization with a per-channel scale and an optional bias.

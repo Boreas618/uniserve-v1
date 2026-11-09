@@ -48,7 +48,6 @@ fn draw_uniforms(seed: &std::cell::Cell<u64>, draws: &mut Vec<f32>, rows: usize)
     seed.set(state);
 }
 
-use crate::graph::Graphs;
 #[cfg(test)]
 use crate::plan::Variant;
 use crate::runner::{Binding, Runner, RunnerId};
@@ -299,10 +298,6 @@ impl Staging {
         self.staged
     }
 
-    /// The staged rows, which the upload builds `nn::TokenBatch` from.
-    pub fn rows(&self) -> &nn::BatchRows {
-        &self.rows
-    }
 
     /// The tokens the staged batch holds, before the padding to its bucket.
     pub fn live_tokens(&self) -> u64 {
@@ -330,10 +325,6 @@ impl Staging {
         &self.commit
     }
 
-    /// The page size and KV bound the upload hands the model with the rows.
-    pub fn geometry(&self) -> (u32, u32) {
-        (self.page_size, self.max_kv_len)
-    }
 
     /// The sampling rows, in batch order (4.4's rows the sampler writes a token for).
     pub fn logits_rows(&self) -> &[i32] {
@@ -1148,71 +1139,6 @@ fn kernel_nodes<'a>(
         .collect()
 }
 
-/// The first difference between one node's captured launch and the same launch issued live.
-fn launch_difference(
-    captured: &platform::OwnedKernelNodeParams,
-    walked: &platform::OwnedKernelNodeParams,
-) -> Option<String> {
-    if captured.grid != walked.grid {
-        return Some(format!(
-            "grid replay={:?} walk={:?}",
-            captured.grid, walked.grid
-        ));
-    }
-    if captured.block != walked.block {
-        return Some(format!(
-            "block replay={:?} walk={:?}",
-            captured.block, walked.block
-        ));
-    }
-    if captured.shared_memory != walked.shared_memory {
-        return Some(format!(
-            "shared replay={} walk={}",
-            captured.shared_memory, walked.shared_memory
-        ));
-    }
-    if captured.parameters.len() != walked.parameters.len() {
-        return Some(format!(
-            "arguments replay={} walk={}",
-            captured.parameters.len(),
-            walked.parameters.len()
-        ));
-    }
-    // A pointer is printed as the word it is: the two blobs differ in a value only where something
-    // the host computed at capture time was replaced by something it computed for this batch.
-    let word = |blob: &[u8], at: usize| -> u64 {
-        blob.get(at & !7..(at & !7) + 8)
-            .map(|bytes| u64::from_ne_bytes(bytes.try_into().unwrap_or([0; 8])))
-            .unwrap_or(0)
-    };
-    for (index, (replay, live)) in captured
-        .parameters
-        .iter()
-        .zip(&walked.parameters)
-        .enumerate()
-    {
-        if replay.len() != live.len() {
-            return Some(format!(
-                "argument {index}: replay={} bytes walk={} bytes",
-                replay.len(),
-                live.len()
-            ));
-        }
-        if let Some(at) = replay
-            .iter()
-            .zip(live)
-            .position(|(left, right)| left != right)
-        {
-            return Some(format!(
-                "argument {index} byte {at}: replay={:#x} walk={:#x}",
-                word(replay, at),
-                word(live, at)
-            ));
-        }
-    }
-    None
-}
-
 /// What a serving graph's attention launches baked, beside what the batch it serves states.
 ///
 /// A captured node keeps the host's values from capture time, and **the batch size is the one of them a
@@ -1852,10 +1778,6 @@ impl<M> Shared<M> {
         Self(model)
     }
 
-    /// The model behind the share.
-    pub fn model(&self) -> &M {
-        &self.0
-    }
 }
 
 impl<M> Clone for Shared<M> {
@@ -2016,30 +1938,10 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self
     }
 
-    /// The runner's name in the worker.
-    pub fn id(&self) -> RunnerId {
-        self.id
-    }
 
-    /// The buckets the runner captures.
-    pub fn buckets(&self) -> &Buckets {
-        &self.buckets
-    }
 
-    /// The generation serving now.
-    pub fn generation(&self) -> &Arc<Generation> {
-        &self.lifecycle.generation
-    }
 
-    /// The captured graphs, for the worker's capture pass and the runner's tests.
-    pub fn graphs(&self) -> &Graphs {
-        &self.lifecycle.graphs
-    }
 
-    /// The graph pools this runner books its buckets in, once the worker attached them.
-    pub fn pools(&self) -> Option<&Arc<std::sync::Mutex<Pools>>> {
-        self.pools.as_ref()
-    }
 
     /// The pools' books, for the caller that reports mapped bytes against the budget.
     fn pool(&self) -> Result<std::sync::MutexGuard<'_, Pools>> {
@@ -4164,29 +4066,6 @@ impl<M: CausalLm> CausalLmRunner<M> {
             Err(error) => out.push_str(&format!(" planes=refused({error})")),
         }
         out
-    }
-
-    /// Whether the plane pointers a launch carries are this runner's own layer 0 planes.
-    fn plane_verdict(&self, key: u64, value: u64) -> String {
-        let Ok(planes) = self.kv.planes(0) else {
-            return " planes=refused".to_owned();
-        };
-        let Some(first) = planes.first() else {
-            return " planes=empty".to_owned();
-        };
-        let mark = |at: u64, own: u64| if at == own { "own" } else { "OTHER" };
-        // The three statements of a page's length, side by side: what the batch declares, what the
-        // cache allocates, and what the plane's own view holds. A kernel that forms page addresses
-        // at one of them while the pages were written at another reads the wrong keys for every
-        // prompt, with no fault and no dependence on the prompt at all.
-        format!(
-            " planes=layer0:{} /{}(key,value) page_size={}/{}/{} (batch/cache/plane)",
-            mark(key, first.key.ptr.address()),
-            mark(value, first.value.ptr.address()),
-            self.geometry.page_size,
-            self.kv.page_size(),
-            first.key.shape.dim(1)
-        )
     }
 
     /// One digest per layer of the keys and values the replay just wrote into the batch's pages.

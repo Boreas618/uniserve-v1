@@ -281,17 +281,6 @@ impl ResponseStream {
         }
     }
 
-    /// Takes a frame that is ready without waiting.
-    pub(crate) fn try_frame(&mut self) -> Option<Bytes> {
-        if let Some(frame) = self.produced.pop_front() {
-            return Some(frame);
-        }
-        match self.frames.try_recv() {
-            Ok(Produced::Frame(frame)) => Some(frame),
-            _ => None,
-        }
-    }
-
     /// Freezes the response at the boundary just reached.
     ///
     /// Every frame produced before the boundary is given to `keep`; the state

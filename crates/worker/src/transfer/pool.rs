@@ -66,11 +66,6 @@ impl TransferPool {
         lock(&self.state)
     }
 
-    pub(crate) fn set_completion_wake(&self, wake: Option<Notify>) {
-        let previous = std::mem::replace(&mut self.state().wake, wake);
-        drop(previous);
-    }
-
     pub(crate) fn completion_wake(&self) -> Option<Notify> {
         self.state().wake.clone()
     }

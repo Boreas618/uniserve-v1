@@ -17,7 +17,7 @@ use platform::{DeviceGuard, Event, EventFlags, HostRegistration, SourceOrder, St
 use super::backing::TransportBuffer;
 use super::export_table::ExportTable;
 use super::read::{NativeRead, ReadCall, payload};
-use super::transport::{Backend, ExportView, Transport, producer, read_destination, row_span};
+use super::transport::{ExportView, Transport, producer, read_destination};
 use super::{
     ACK_SLOTS, ACKNOWLEDGED, ByteReservation, CLAIMED, DRAIN_LIMIT, Spans, copy_planner,
     drain_event,
@@ -313,8 +313,6 @@ impl Drop for SharedBuffer {
 pub struct SharedRead {
     mapping: Arc<SharedMapping>,
     slot: Option<usize>,
-    offset: usize,
-    bytes: usize,
 }
 
 impl SharedRead {
@@ -346,8 +344,6 @@ impl SharedRead {
         Ok(Self {
             mapping: Arc::new(mapping),
             slot: Some(slot),
-            offset,
-            bytes,
         })
     }
 
@@ -387,13 +383,6 @@ impl SharedRead {
         Ok(Arc::clone(&self.mapping))
     }
 
-    pub(crate) fn offset(&self) -> usize {
-        self.offset
-    }
-
-    pub fn nbytes(&self) -> usize {
-        self.bytes
-    }
 
     pub(crate) fn release(&mut self) {
         if let Some(slot) = self.slot.take() {
@@ -507,30 +496,6 @@ impl Transport {
         Ok(locator)
     }
 
-    /// Borrow whole leading rows of a shared-memory export of this host in
-    /// place. `region` is in logical coordinates; releasing the returned
-    /// read ends the claim.
-    pub fn borrow(&self, locator: &Locator, region: Option<&[Range<u64>]>) -> Result<SharedRead> {
-        let Backend::Shared { slot, .. } = &self.backend else {
-            return Err(Error::Invalid(
-                "only shared storage supports host borrowing".into(),
-            ));
-        };
-        if locator.source.host != self.source.host {
-            return Err(Error::Invalid(
-                "shared storage transport requires the source host".into(),
-            ));
-        }
-        let TransferTransport::PosixShm { name, .. } = &locator.transport else {
-            return Err(Error::Invalid(
-                "shared storage borrow requires a shared storage locator".into(),
-            ));
-        };
-        let (offset, bytes) = row_span(locator, region)?;
-        let read = SharedRead::open(name, offset, bytes, *slot)?;
-        read.wait(SHARED_READY_TIMEOUT, || Ok(()))?;
-        Ok(read)
-    }
 }
 
 impl NativeRead {

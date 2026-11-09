@@ -94,9 +94,6 @@ impl PitchedBatch {
         self.copies.is_empty()
     }
 
-    pub fn clear(&mut self) {
-        self.copies.clear();
-    }
 
     pub fn copies(&self) -> &[Pitched] {
         &self.copies

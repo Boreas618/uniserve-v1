@@ -4135,7 +4135,7 @@ fn losing_every_worker_stops_request_admission() {
         CallKind::Forward(ForwardMode::Prefill),
         CallKind::Forward(ForwardMode::Decode),
     ];
-    let mut worker = SimWorker::new(sim);
+    let worker = SimWorker::new(sim);
     let loss = worker.loss();
     let scheduler = support::scheduler(Box::new(worker), special_tokens(), 32)
         .expect("the scheduler is built over the simulated worker");

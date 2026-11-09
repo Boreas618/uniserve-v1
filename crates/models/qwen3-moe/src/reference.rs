@@ -10,7 +10,6 @@
 //! This module is the comparison both a slice run and a runner-level harness use, so that the
 //! expected values have one reader rather than one per harness.
 
-use std::path::Path;
 
 use serde::Deserialize;
 
@@ -41,12 +40,6 @@ pub struct Difference {
 }
 
 impl Reference {
-    /// Reads a reference file, as the projection's `ids`/`margins` pair writes it.
-    pub fn read(path: &Path) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path)
-            .map_err(|error| format!("reading {}: {error}", path.display()))?;
-        Self::parse(&text)
-    }
 
     /// Reads a reference from its JSON text.
     pub fn parse(text: &str) -> Result<Self, String> {

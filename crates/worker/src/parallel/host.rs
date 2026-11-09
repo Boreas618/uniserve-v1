@@ -21,8 +21,7 @@
 //! must not run a parent and a subgroup collective concurrently.
 
 use std::io::{Read, Write};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::net::{SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -68,20 +67,6 @@ impl Rendezvous {
         }
     }
 
-    /// Adopt a listening socket inherited across exec.
-    ///
-    /// # Safety
-    /// `fd` is an open listening TCP socket that nothing else in this process
-    /// owns; the returned value closes it.
-    pub(crate) unsafe fn inherited(address: impl Into<String>, fd: RawFd) -> Result<Self> {
-        // SAFETY: forwarded from the caller.
-        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-        // The daemon cleared close-on-exec only for this process's exec;
-        // nothing this rank starts may inherit the socket.
-        rustix::io::fcntl_setfd(&owned, rustix::io::FdFlags::CLOEXEC)
-            .map_err(|error| Error::transport_source("rendezvous socket", error))?;
-        Ok(Self::serve(address, TcpListener::from(owned)))
-    }
 }
 
 /// One member's connections to every other member of a group.
@@ -95,32 +80,6 @@ pub struct HostGroup {
 }
 
 impl HostGroup {
-    /// Interrupt collective I/O when the owning communication group fails.
-    /// The group must be retired after closing; no operation reconnects it.
-    pub(crate) fn close(&self) {
-        for peer in self.peers.iter().flatten() {
-            let _ = peer.shutdown(std::net::Shutdown::Both);
-        }
-    }
-    /// Form an independent collective channel with the same members.
-    /// Call collectively before either group begins concurrent operations.
-    /// `rendezvous` names the first member's reachable network interface.
-    pub(crate) fn duplicate(&self, rendezvous: &str) -> Result<Self> {
-        let (listener, address) = if self.rank() == 0 {
-            let (listener, address) = bind_beside(rendezvous)?;
-            (Some(listener), Some(address))
-        } else {
-            (None, None)
-        };
-        let address = self.broadcast_bytes(address.as_deref().map(str::as_bytes), 0)?;
-        let address = String::from_utf8(address)
-            .map_err(|_| Error::transport("the collective address is not text"))?;
-        let rendezvous = match listener {
-            Some(listener) => Rendezvous::serve(address, listener),
-            None => Rendezvous::connect(address),
-        };
-        Self::connect(rendezvous, self.rank(), self.size(), STARTUP_TIMEOUT)
-    }
 
     /// A group of one member, which needs no connections.
     /// A group of one member, which needs no connections: a rank that serves
@@ -267,35 +226,6 @@ impl HostGroup {
         Ok(())
     }
 
-    /// The members at indices `members` of this group, sharing its
-    /// connections. Every member of this group must call it, and only the
-    /// selected members use the result.
-    pub(crate) fn subgroup(&self, members: &[usize]) -> Result<Self> {
-        let rank = members
-            .iter()
-            .position(|&member| member == self.rank)
-            .ok_or_else(|| Error::Invalid("a host subgroup must contain its creator".into()))?;
-        if members.iter().any(|&member| member >= self.size()) {
-            return Err(Error::Invalid(
-                "host subgroup members are outside the group".into(),
-            ));
-        }
-        Ok(Self {
-            rank,
-            ranks: members.iter().map(|&member| self.ranks[member]).collect(),
-            peers: members
-                .iter()
-                .map(|&member| self.peers[member].clone())
-                .collect(),
-        })
-    }
-
-    /// This member's index: its place in the member order of
-    /// [`Self::all_gather_bytes`].
-    pub(crate) fn index(&self) -> usize {
-        self.rank
-    }
-
     /// Every member's bytes, in member order.
     pub(crate) fn all_gather_bytes(&self, value: &[u8]) -> Result<Vec<Vec<u8>>> {
         let peers: Vec<(usize, &TcpStream)> = self
@@ -407,35 +337,9 @@ impl HostGroup {
         read_frame(self.peer(root)?)
     }
 
-    /// Wait until every member reaches the barrier.
-    pub(crate) fn barrier(&self) -> Result<()> {
-        self.all_gather_bytes(&[]).map(drop)
-    }
-
     /// Element-wise minimum of every member's integers.
     pub(crate) fn all_reduce_min(&self, values: &[i64]) -> Result<Vec<i64>> {
         self.all_reduce(values, i64::min)
-    }
-
-    /// Split into groups of members with equal `color`, ordered by
-    /// `(key, member)`. Every member calls it.
-    pub(crate) fn split(&self, color: i64, key: i64) -> Result<Self> {
-        let encoded: Vec<u8> = [color, key]
-            .iter()
-            .flat_map(|value| value.to_le_bytes())
-            .collect();
-        let mut members: Vec<(i64, usize)> = Vec::new();
-        for (member, record) in self.all_gather_bytes(&encoded)?.iter().enumerate() {
-            let [other_color, other_key] = decode_integers(record)?[..] else {
-                return Err(Error::transport("host group split record is malformed"));
-            };
-            if other_color == color {
-                members.push((other_key, member));
-            }
-        }
-        members.sort_unstable();
-        let members: Vec<usize> = members.into_iter().map(|(_, member)| member).collect();
-        self.subgroup(&members)
     }
 
     fn all_reduce(&self, values: &[i64], reduce: impl Fn(i64, i64) -> i64) -> Result<Vec<i64>> {
@@ -575,30 +479,6 @@ fn read_frame(stream: &TcpStream) -> Result<Vec<u8>> {
     Ok(value)
 }
 
-/// Bind a listener on the interface a rendezvous address names, for a
-/// service whose address members learn through the host group (for
-/// example a torch store). Returns the listener and the address to publish.
-pub(crate) fn bind_beside(rendezvous: &str) -> Result<(TcpListener, String)> {
-    let (host, _) = rendezvous
-        .rsplit_once(':')
-        .ok_or_else(|| Error::Invalid("rendezvous address must be host:port".into()))?;
-    let loopback = host
-        .parse::<IpAddr>()
-        .is_ok_and(|address| address.is_loopback());
-    let interface = if loopback {
-        IpAddr::V4(Ipv4Addr::LOCALHOST)
-    } else {
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED)
-    };
-    let listener = TcpListener::bind(SocketAddr::new(interface, 0))
-        .map_err(|error| Error::transport_source("store listener", error))?;
-    let port = listener
-        .local_addr()
-        .map_err(|error| Error::transport_source("store listener", error))?
-        .port();
-    Ok((listener, format!("{host}:{port}")))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -695,23 +575,6 @@ mod tests {
         for minimum in results {
             assert_eq!(minimum, vec![8, 0]);
         }
-    }
-
-    #[test]
-    fn subgroups_and_splits_share_the_parent_connections() {
-        let results = group(4, |group| {
-            group.barrier().unwrap();
-            let odd = group
-                .split(group.rank() as i64 % 2, -(group.rank() as i64))
-                .unwrap();
-            let gathered = odd.all_gather_bytes(&[group.rank() as u8]).unwrap();
-            (odd.rank(), gathered)
-        });
-        // Keys order members descending by rank within each color.
-        assert_eq!(results[0], (1, vec![vec![2], vec![0]]));
-        assert_eq!(results[1], (1, vec![vec![3], vec![1]]));
-        assert_eq!(results[2], (0, vec![vec![2], vec![0]]));
-        assert_eq!(results[3], (0, vec![vec![3], vec![1]]));
     }
 
     #[test]

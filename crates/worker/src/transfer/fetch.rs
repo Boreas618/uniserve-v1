@@ -148,17 +148,3 @@ pub fn start(reads: &[Arc<Read>]) -> Result<()> {
     reads.iter().try_for_each(|read| read.start())
 }
 
-/// Read `region` of `tensor` into `destination`: `plan` then `submit`,
-/// whose caller starts the reads.
-pub fn fetch_tensor(
-    tensor: &TensorTransfer,
-    destination: &Spans,
-    transports: &Transports,
-    region: &[Range<u64>],
-    stream: impl Issue,
-    retain: impl FnMut(&Arc<Read>) -> Result<()>,
-) -> Result<Vec<Arc<Read>>> {
-    let mut locators = vec![None; tensor.locations.len()];
-    let reads = plan(tensor, destination, transports, region, &mut locators)?;
-    submit(&reads, stream, retain)
-}

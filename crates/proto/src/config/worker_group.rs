@@ -181,14 +181,6 @@ impl WorkerGroupConfig {
         Ok(groups)
     }
 
-    /// The deployment file stating `groups` as read: every rank names its host and device, and
-    /// block membership and group identities are kept, so independently started replicas read
-    /// back the same groups.
-    pub fn to_file(groups: &[Self]) -> anyhow::Result<String> {
-        Ok(toml::to_string(&File {
-            worker_groups: groups.to_vec(),
-        })?)
-    }
 
     /// Appends this file group's replicas to `groups`, placed on `engine_host`.
     fn expand(self, engine_host: &str, groups: &mut Vec<Self>) -> anyhow::Result<()> {

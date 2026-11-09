@@ -168,9 +168,6 @@ impl Agent {
         created.map(|()| backend)
     }
 
-    pub fn name(&self) -> String {
-        self.shared.name.clone()
-    }
 
     /// Registers `region` with the UCX backend for `access`, so that this
     /// agent's READs can write it (with [`Access::ReadWrite`]) and peers

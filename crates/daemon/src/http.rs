@@ -90,7 +90,7 @@ pub async fn serve(config: ServerArgs, stated: Stated, shutdown: CancellationTok
     // The leader's start waits for the other nodes to join, which blocks.
     let options = config.daemon_options();
     let starting = tokio::task::spawn_blocking(move || Daemon::start(options));
-    let mut daemon = tokio::select! {
+    let daemon = tokio::select! {
         daemon = starting => daemon
             .context("the daemon's start did not complete")?
             .context("failed to start this node's daemon")?,

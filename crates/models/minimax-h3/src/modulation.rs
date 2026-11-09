@@ -91,8 +91,6 @@ pub struct AdaLnCache {
     entries: Weight,
     groups: Groups,
     hidden_size: u32,
-    /// The timestep activation's width, which is the one narrowing the cache's two halves meet at.
-    time_dim: u32,
 }
 
 /// A `[1, count]` index list as the flat `[count]` view the gather operator takes.
@@ -142,7 +140,7 @@ impl AdaLnCache {
         entries: Weight,
         groups: Groups,
         hidden_size: u32,
-        time_dim: u32,
+        _time_dim: u32,
     ) -> Result<Self> {
         if layers.is_empty() {
             return Err(Error::checkpoint(
@@ -178,29 +176,16 @@ impl AdaLnCache {
             entries,
             groups,
             hidden_size,
-            time_dim,
         })
     }
 
-    /// How many transformer layers the cache covers.
-    pub fn len(&self) -> usize {
-        self.layers.len()
-    }
 
-    /// Whether the cache covers no layer.
-    pub fn is_empty(&self) -> bool {
-        self.layers.is_empty()
-    }
 
     /// The timestep groups a step reads.
     pub const fn groups(&self) -> Groups {
         self.groups
     }
 
-    /// The element type of the modulation tables.
-    pub fn dtype(&self) -> nn::DType {
-        self.layers[0].dtype()
-    }
 
     /// The entry ids one step reads: `[1, groups]` i32, gathered from the entry table's `step` row.
     ///
@@ -243,27 +228,8 @@ impl AdaLnCache {
         u64::from(TAGS) * VECTORS as u64 * u64::from(self.hidden_size)
     }
 
-    /// Elements one layer's gathered modulation holds.
-    pub fn layer_elements(&self) -> u64 {
-        u64::from(self.groups.count())
-            * u64::from(self.hidden_size)
-            * VECTORS as u64
-            * u64::from(TAGS)
-    }
 
-    /// Elements the gathered final modulation holds.
-    pub fn output_elements(&self) -> u64 {
-        u64::from(self.groups.count()) * 2 * u64::from(self.hidden_size)
-    }
 
-    /// Bytes the per-forward scratch needs: the entry ids, the largest gathered table, and the one
-    /// narrowing the cache's two halves meet at (an FP32 timestep activation of `time_dim`).
-    pub fn scratch_bytes(&self) -> u64 {
-        let elements = self.layer_elements().max(self.output_elements());
-        let width = elements * self.dtype().bytes().unwrap_or(2);
-        let narrow = u64::from(self.groups.count()) * u64::from(self.time_dim) * 4;
-        width + narrow + u64::from(self.groups.count()) * 4
-    }
 }
 
 /// The distinct noise levels the cache holds and the entry each step's group reads.
@@ -332,7 +298,6 @@ pub struct Projections {
     frequency_dim: u32,
     time_hidden_dim: u32,
     time_dim: u32,
-    hidden_size: u32,
 }
 
 impl Projections {
@@ -418,7 +383,6 @@ impl Projections {
             frequency_dim: config.frequency_dim,
             time_hidden_dim: config.time_hidden_dim,
             time_dim: config.time_dim,
-            hidden_size: config.hidden_size,
         })
     }
 
@@ -553,15 +517,7 @@ impl Projections {
         self.layers.len()
     }
 
-    /// The network width the modulation tables are built for.
-    pub const fn hidden_size(&self) -> u32 {
-        self.hidden_size
-    }
 
-    /// The width of the timestep embedding's output.
-    pub const fn time_dim(&self) -> u32 {
-        self.time_dim
-    }
 }
 
 /// The sinusoidal embedding of each entry time, `[entries, frequency_dim]` FP32.

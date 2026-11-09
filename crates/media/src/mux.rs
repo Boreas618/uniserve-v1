@@ -78,10 +78,6 @@ impl Container {
         Ok(bytes)
     }
 
-    /// Discards an unfinished container.
-    pub fn close(self) {
-        // Dropping the shim's assembly frees it without writing a trailer.
-    }
 }
 
 /// One request's MP4 under assembly.

@@ -61,41 +61,7 @@ impl fmt::Display for BlockShape {
 }
 
 impl BlockShape {
-    /// The shape of a field with `blocks` blocks of `trailing` extent and its strides.
-    ///
-    /// `width` and `block` are the flattened block length and the copy tile; the index vector's
-    /// stride is 1 for a contiguous device vector.
-    pub const fn new(
-        dtype: DType,
-        shape: Shape,
-        strides: Strides,
-        index_stride: u64,
-        width: u64,
-        block: u32,
-    ) -> Self {
-        Self {
-            dtype,
-            shape,
-            strides,
-            index_stride,
-            width,
-            block,
-        }
-    }
 
-    /// The tile a copy of `field` uses: the flattened block, in [`COPY_BLOCK`] element pieces.
-    pub fn of(field: &TensorView, index_stride: u64) -> Result<Self> {
-        let shape = field.shape;
-        let width = shape.numel() / shape.dim(0).max(1);
-        Ok(Self {
-            dtype: field.dtype,
-            shape,
-            strides: field.strides,
-            index_stride,
-            width,
-            block: COPY_BLOCK,
-        })
-    }
 
     /// Check the launch against the compiled variant and the index vector.
     fn check(

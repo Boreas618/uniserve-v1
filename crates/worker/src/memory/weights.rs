@@ -202,10 +202,6 @@ impl<S: WeightStorage> WeightStore<S> {
         });
     }
 
-    /// The device this store maps on.
-    pub fn device(&self) -> platform::DeviceId {
-        self.device
-    }
 
     /// How many weights this rank holds, for the metrics report and for tests.
     pub fn mapped(&self) -> usize {

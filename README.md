@@ -196,7 +196,7 @@ crates/models/          The concrete models and the rules their requests carry
   rules/                Model-family request semantics: the family registry, checkpoint facts and prompt rules of Qwen3 and MiniMax-H3
   qwen3-moe/            `Qwen3MoeForCausalLM`: its checkpoint configuration, mathematical partition and composition
   minimax-h3/           MiniMax-H3 and FastH3: their checkpoint configuration, mathematical partition and components
-crates/executor/        The host half of the main process: the one thread that issues work to the devices
+crates/worker/        The host half of the main process: the one thread that issues work to the devices
 crates/scheduler/          The engine process: schedulers, KV allocation, executors, executor groups and the request interface's service
 crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, input and output processing, the HTTP API, metrics and the engine's client
 crates/frontend/        The deployment's application process: the HTTP and OpenAI API, input and output processing

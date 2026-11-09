@@ -249,11 +249,6 @@ impl Group {
             .map_err(Error::Platform)
     }
 
-    /// Run `call` with the underlying communicator, for an operator whose collective is not one of
-    /// the three above (an expert transport).
-    pub fn with<R>(&self, call: impl FnOnce(&mut Communicator) -> Result<R>) -> Result<R> {
-        call(&mut self.locked())
-    }
 
     /// Waits for a collective issued outside a capture, so the walk goes on with none in flight.
     ///

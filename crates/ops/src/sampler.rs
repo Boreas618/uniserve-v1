@@ -58,14 +58,6 @@ pub const TEMPERATURE: u32 = 0;
 pub const TOP_K: u32 = 1;
 /// The offset of the nucleus threshold.
 pub const TOP_P: u32 = 2;
-/// The offset of the min-p threshold.
-pub const MIN_P: u32 = 3;
-/// The offset of the repetition penalty.
-pub const REPETITION: u32 = 4;
-/// The offset of the frequency penalty.
-pub const FREQUENCY: u32 = 5;
-/// The offset of the presence penalty.
-pub const PRESENCE: u32 = 6;
 
 /// One compilation of `logits_shape`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]

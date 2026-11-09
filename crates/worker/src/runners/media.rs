@@ -334,10 +334,6 @@ impl Output {
         }
     }
 
-    /// The rates every artifact of this output is built at.
-    pub fn rates(&self) -> Rates {
-        self.rates
-    }
 
     /// Encodes one clip of `request` into the unit it covers.
     ///

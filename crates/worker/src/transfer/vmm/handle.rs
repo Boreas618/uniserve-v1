@@ -64,10 +64,6 @@ impl AllocationHandle {
         }
     }
 
-    /// Whether a process on another host can import the allocation.
-    pub(crate) fn crosses_hosts(&self) -> bool {
-        matches!(self, Self::Fabric(_))
-    }
 
     /// This process's handle of the allocation: the fabric handle, or a
     /// descriptor fetched from the exporter's grant socket `endpoint`,

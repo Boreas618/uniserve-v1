@@ -27,12 +27,6 @@ use proto::process::{Claim, Claimed, WeightsKept};
 /// Longest a Storage Server this daemon starts takes to listen.
 const START_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Longest the successor of a Storage Server restart takes to serve.
-const RESTART_TIMEOUT: Duration = Duration::from_secs(120);
-
-/// How often a restart checks whether the successor serves.
-const RESTART_POLL: Duration = Duration::from_millis(50);
-
 /// One deployment's claim on this node.
 struct Held {
     /// The connection that holds the claim; the claim ends with it.

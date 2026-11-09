@@ -30,14 +30,6 @@ pub struct KernelEntry {
 }
 
 impl KernelEntry {
-    /// The kernel of operator `operator` for `descriptor`'s key.
-    pub fn new<O: Op>(descriptor: &O::Descriptor, kernel: Arc<Kernel>) -> Self {
-        Self {
-            operator: O::NAME,
-            descriptor: descriptor::key(descriptor),
-            kernel,
-        }
-    }
 
     /// The kernel of `operator` for an already-formatted key.
     pub fn keyed(operator: &'static str, key: impl Into<String>, kernel: Arc<Kernel>) -> Self {

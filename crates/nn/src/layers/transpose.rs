@@ -36,10 +36,6 @@ impl Transpose {
         Ok(Self { dtype })
     }
 
-    /// The matrix element type.
-    pub const fn dtype(&self) -> DType {
-        self.dtype
-    }
 
     /// Write `source [rows, columns]` into `out [columns, rows]`.
     ///

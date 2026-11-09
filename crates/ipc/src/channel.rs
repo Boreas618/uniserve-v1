@@ -432,25 +432,6 @@ impl Waker {
         self.local.take();
     }
 
-    /// Blocks until a wake fires or `timeout` passes, and reports which.
-    pub fn wait(&mut self, timeout: Duration) -> IpcResult<bool> {
-        if self.local.take() {
-            return Ok(true);
-        }
-        let deadline = Instant::now().checked_add(timeout);
-        loop {
-            let mut descriptors = [self.local.poll_fd()];
-            let remaining =
-                deadline.map(|deadline| deadline.saturating_duration_since(Instant::now()));
-            wait_ready(&mut descriptors, remaining)?;
-            if self.local.take() {
-                return Ok(true);
-            }
-            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                return Ok(false);
-            }
-        }
-    }
 }
 
 /// One end of a connection that carries frames.

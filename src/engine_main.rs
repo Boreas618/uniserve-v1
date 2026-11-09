@@ -2464,7 +2464,7 @@ impl MainProcess {
         // One cell shared by every device's load of this generation: the first structured refusal
         // any of them meets is the one the walk answers with another candidate program.
         let unavailable = UnavailableCell::default();
-        for (index, worker) in self.workers.iter().enumerate() {
+        for worker in &self.workers {
             let ordinal = worker.device();
             let device = platform::Device::new(ordinal)
                 .map_err(|error| invalid(format!("opening device {}: {error}", ordinal.0)))?;
@@ -4437,14 +4437,6 @@ impl MainProcess {
                     },
                 ))
             }
-            // A command that states no id has nothing to answer on, and a log line is what is left.
-            Some(other) => {
-                tracing::warn!(
-                    "the daemon sent an engine command this epoch does not serve: {}",
-                    engine_command_name(&other)
-                );
-                None
-            }
             None => None,
         };
         if let Some(kind) = refused {
@@ -6234,7 +6226,6 @@ enum Unavailable {
     Descriptor {
         op: String,
         backend: String,
-        revision: u32,
         descriptor: String,
     },
     /// No revision of the backend is installed for the operator.
@@ -6248,12 +6239,11 @@ impl Unavailable {
             program_server::Error::UnsupportedDescriptor {
                 op,
                 backend,
-                revision,
                 descriptor,
+                ..
             } => Some(Self::Descriptor {
                 op: op.clone(),
                 backend: backend.clone(),
-                revision: *revision,
                 descriptor: descriptor.clone(),
             }),
             program_server::Error::NotInstalled { op, backend } => Some(Self::Installed {

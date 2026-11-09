@@ -182,20 +182,6 @@ impl Graph {
         Ok(copies)
     }
 
-    /// The nodes that depend directly on `node`, in the driver's order
-    /// (`cuGraphNodeGetDependentNodes`).
-    ///
-    /// A captured graph holds only the edges the recording saw, and a launch that another stream
-    /// issued leaves none: within a graph the work is ordered by its edges, so an edge nobody
-    /// recorded is work that runs in whatever order the driver chooses. This is the only reading
-    /// that answers "does the node after this one actually wait for it".
-    pub fn dependents(&self, node: &GraphNode) -> Result<Vec<GraphNode>> {
-        Ok(self
-            .dependents_with_edges(node)?
-            .into_iter()
-            .map(|(dependent, _)| dependent)
-            .collect())
-    }
 
     /// The nodes that depend directly on `node`, each with what its edge says.
     ///
@@ -552,12 +538,6 @@ impl OwnedKernelNodeParams {
             .collect()
     }
 
-    /// The same parameters for another kernel: what a rebind sets, which
-    /// changes the function and keeps every argument the node captured.
-    pub fn with_function(mut self, function: Function) -> Self {
-        self.function = function;
-        self
-    }
 }
 
 /// A captured graph instantiated for replay (`CUgraphExec`).
@@ -579,10 +559,6 @@ unsafe impl Send for GraphExec {}
 unsafe impl Sync for GraphExec {}
 
 impl GraphExec {
-    /// The `CUgraphExec` handle.
-    pub fn raw(&self) -> usize {
-        self.raw as usize
-    }
 
     /// Submits one execution of the graph to `stream` and returns without
     /// waiting for it. The graph may have been captured on another stream of
@@ -659,7 +635,7 @@ impl GraphExec {
     }
     /// Sets parameters read back from a template's node on this executable:
     /// the values of [`Graph::kernel_node_params`], with the function a rebind
-    /// chooses ([`OwnedKernelNodeParams::with_function`]).
+    /// chooses.
     pub fn set_kernel_node_params_owned(
         &self,
         node: GraphNode,

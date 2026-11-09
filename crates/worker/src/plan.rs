@@ -281,21 +281,6 @@ impl Shape {
         }
     }
 
-    /// The smallest capture size this forward can be served at: itself.
-    ///
-    /// A `Shape` states a causal-LM forward - rows and tokens - so its bucket holds no media
-    /// extent; a media computation is sized by [`Bucket::denoise`] or [`Bucket::clip`], which have
-    /// no `Shape` and are planned rather than admitted as rows.
-    pub const fn bucket(self) -> Bucket {
-        Bucket {
-            rows: self.rows,
-            tokens: self.tokens,
-            variant: self.variant,
-            extent: Extent::None,
-            serves: None,
-            capacity: 0,
-        }
-    }
 }
 
 impl fmt::Display for Shape {
@@ -710,8 +695,6 @@ pub fn prefill_row_buckets(rows: u32) -> Vec<u32> {
     buckets
 }
 
-/// The media flow shapes `(height, width)` captured when the build config names none.
-pub const FLOW_CATALOG: [(u32, u32); 2] = [(1152, 2048), (2048, 1152)];
 
 /// The buckets one runner captures, in the order it captures them.
 ///

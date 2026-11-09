@@ -390,10 +390,6 @@ impl Connection {
         }
     }
 
-    /// The stream, for a server that hands connections between threads.
-    pub fn stream(&self) -> &UnixStream {
-        &self.stream
-    }
 
     /// Sends one frame with the descriptors that belong to it.
     ///

@@ -278,14 +278,6 @@ pub enum Launch {
 }
 
 impl Launch {
-    /// The operator this launch is, as its key names it.
-    pub fn operator(self) -> &'static str {
-        match self {
-            Self::Encode | Self::SecondEncode => "nvfp4_quantize",
-            Self::FirstProduct => "gather_gemm_nvfp4",
-            Self::SecondProduct => "route_gemm_nvfp4",
-        }
-    }
 }
 
 /// One buffer of the encoded step: its extent, its element type, and the launch that writes it.
@@ -1158,31 +1150,8 @@ impl Moe {
         self.experts
     }
 
-    /// Whether this block's experts are the checkpoint's encoded stacks.
-    ///
-    /// What the block launches depends on it: a dense block runs one grouped product per projection,
-    /// an encoded one encodes each operand first and multiplies packed codes. A caller that
-    /// enumerates programs — a key walk, a store's shopping list — asks this rather than the loading
-    /// options, so the two cannot disagree about what the block will launch.
-    pub const fn is_encoded(&self) -> bool {
-        matches!(self.stacks, ExpertStacks::Encoded { .. })
-    }
 
-    /// The element type of the encoded stacks' block scales, or `None` for a dense block.
-    pub fn scale_dtype(&self) -> Option<DType> {
-        match &self.stacks {
-            ExpertStacks::Dense { .. } => None,
-            ExpertStacks::Encoded { up_gate, .. } => Some(up_gate.scales.dtype()),
-        }
-    }
 
-    /// The layout the encoded stacks' block scales are stored in, or `None` for a dense block.
-    pub fn scale_layout(&self) -> Option<ScaleLayout> {
-        match &self.stacks {
-            ExpertStacks::Dense { .. } => None,
-            ExpertStacks::Encoded { up_gate, .. } => Some(up_gate.layout),
-        }
-    }
 
     /// The router's raw scores for `hidden`: `[tokens, experts]`, the gate's product before the
     /// top-k softens it.

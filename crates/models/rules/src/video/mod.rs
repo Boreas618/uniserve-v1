@@ -61,10 +61,6 @@ impl VideoTask {
         Self::ALL.into_iter().find(|task| task.as_str() == name)
     }
 
-    /// Whether the task's requests carry conditions.
-    pub const fn conditioned(self) -> bool {
-        !matches!(self, Self::T2va)
-    }
 }
 
 /// How a condition relates to the generated video.

@@ -158,9 +158,6 @@ pub(crate) fn call_window(depth: usize, calls: usize) -> Result<usize> {
 /// Storage and concurrency bounds consumed by the worker's physical owners.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ArenaCapacity {
-    /// Relay entries of every request slot: the most calls of one request
-    /// whose scalar products the rank holds at once.
-    pub relay_depth: usize,
     /// Device bytes the product store's relay arenas may take. The store's
     /// other products lie in the scheduler-placed buffer pool, which bounds
     /// them.
@@ -226,7 +223,6 @@ impl ArenaCapacity {
         let device_product_bytes = relay_bytes(requests, relay_depth);
 
         Ok(Self {
-            relay_depth,
             device_product_bytes,
             // One byte per ticket until the cache is fitted, whose largest export a read may
             // carry.

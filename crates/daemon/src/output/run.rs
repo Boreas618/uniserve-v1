@@ -304,7 +304,6 @@ pub(crate) struct GenerationRun<S: ResponseSink> {
     /// The response timestamp every chunk repeats, in seconds since the UNIX
     /// epoch.
     created: u64,
-    tokenizer: DynTokenizer,
     prompt_token_ids: Vec<u32>,
     prompt_logprobs: bool,
     logprobs: bool,
@@ -366,7 +365,6 @@ impl<S: ResponseSink> GenerationRun<S> {
         Ok(Self {
             request_id,
             created,
-            tokenizer,
             prompt_token_ids,
             prompt_logprobs,
             logprobs,
@@ -581,7 +579,6 @@ impl<S: ResponseSink> GenerationRun<S> {
         Ok(Self {
             request_id,
             created,
-            tokenizer,
             prompt_token_ids: lowering.prompt_token_ids.clone(),
             prompt_logprobs: lowering.prompt_logprobs,
             logprobs: lowering.logprobs,

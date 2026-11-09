@@ -60,14 +60,6 @@ pub enum FlashInferBackend {
 }
 
 impl FlashInferBackend {
-    /// Returns the stable command-line spelling.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Fa2 => "fa2",
-            Self::Fa3 => "fa3",
-        }
-    }
 }
 
 impl std::str::FromStr for FlashInferBackend {

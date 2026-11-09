@@ -223,15 +223,7 @@ impl Step {
         self.work
     }
 
-    /// How many calls the step holds.
-    pub fn len(&self) -> usize {
-        self.work.len()
-    }
 
-    /// Whether the step holds no work.
-    pub fn is_empty(&self) -> bool {
-        self.work.is_empty()
-    }
 }
 
 #[cfg(test)]

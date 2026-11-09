@@ -113,11 +113,6 @@ impl Table {
         })
     }
 
-    /// The `[rows, width]` i32 view over this table's storage.
-    fn view(&self) -> TensorView {
-        self.view_rows(self.rows)
-    }
-
     /// The `[rows, width]` view over the table's first `rows` rows.
     ///
     /// A bucket narrower than the table addresses its own prefix of it: inside a captured graph
@@ -179,10 +174,6 @@ impl ResidentCache {
         })
     }
 
-    /// The pool behind the provider, for a caller that also drives its imports and exports.
-    pub fn cache(&self) -> &Arc<Mutex<PrefixCache>> {
-        &self.cache
-    }
 
     /// The paired forward's view: its group's table and the layer planes over the scratch pages.
     /// Copies what `group`'s rows have cached into their scratch pages.

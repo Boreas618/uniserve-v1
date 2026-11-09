@@ -8,7 +8,7 @@
 //!
 //! A rank that keeps a paged cache places its pool beside fixed storage: the
 //! product store's relay arenas and the storage the prefix cache reserves
-//! (block tables, request-slot banks, importer scratch). A pool sized from
+//! (block tables and importer scratch). A pool sized from
 //! storage takes the grant left after those, the graph range and the scratch
 //! region. A media rank keeps no paged cache: every resident request keeps its
 //! whole media state, so nothing is fitted.
@@ -168,7 +168,7 @@ pub enum Region {
     Shadow,
     /// The state snapshot a unit's checkpoints are copied through.
     Snapshot,
-    /// Everything else the resident owners map: block tables, request-slot banks,
+    /// Everything else the resident owners map: block tables,
     /// import scratch, the buffer pool, the product store's deferred arenas and
     /// the latent pool.
     Fixed,
@@ -281,13 +281,6 @@ impl MemoryConfig {
             .map_or(0, |cache| cache.state_snapshot_bytes())
     }
 
-    /// The tokens one page of the served cache holds.
-    pub fn block_size(&self) -> u32 {
-        self.cache
-            .as_ref()
-            .and_then(|cache| cache.groups.first().map(|group| group.block_size))
-            .unwrap_or(0)
-    }
 }
 
 /// What a rank's process maps after its plan and beside its pools: the modules a precopy loads and
@@ -404,7 +397,7 @@ fn fit(
         .ok_or_else(|| Error::Invalid("the model's cache states no page size".into()))?;
     memory.width = config.model.max_model_len.div_ceil(block_size);
     // The cache's fixed storage beside its units: block tables of the width a request of the
-    // model's length needs, import scratch and the request-slot banks. Every unit index column is
+    // model's length needs and import scratch. Every unit index column is
     // charged with each unit instead, because the unit count is not known until the pool is fitted
     // - so no column may be charged here as well.
     let fixed = PrefixCache::fixed_bytes(

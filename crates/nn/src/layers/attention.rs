@@ -10,7 +10,6 @@
 //! batch, the lengths, the scale and the window travel in the call.
 
 use ops::attention::dense::{DenseArgs, DenseAttention, DenseDescriptor};
-use ops::attention::sparse::{SparseArgs, SparseAttention, SparseDescriptor};
 use ops::attention::{Args, Descriptor, Mask, PagedAttention, Phase};
 use ops::kv::{self, Descriptor as KvDescriptor, KvWrite, KvWriteScaled};
 use ops::{DType, PhaseKind, Shape, TensorView};
@@ -50,10 +49,6 @@ pub struct Attention {
     causal: bool,
     /// Rows of one query tile and of one key block, for the sparse backend.
     block: u32,
-    /// The largest key extent the sparse module serves.
-    max_keys: u32,
-    /// Whether the sparse call writes the log-sum-exp normalizer.
-    lse: bool,
 }
 
 impl Attention {
@@ -101,8 +96,6 @@ impl Attention {
             max_kv_len,
             causal: true,
             block: 0,
-            max_keys: 0,
-            lse: false,
         })
     }
 
@@ -232,21 +225,17 @@ impl Attention {
             max_kv_len: max_seq_len,
             causal,
             block: 0,
-            max_keys: 0,
-            lse: false,
         })
     }
 
     /// Video Sparse Attention: query tiles of `block` rows read the key blocks the selection names.
     ///
-    /// `max_keys` is the longest key extent the deployment serves; `lse` asks for the log-sum-exp
-    /// normalizer of every query row.
+    /// `max_keys` is the longest key extent the deployment serves.
     pub fn sparse(
         block: u32,
         head_dim: u32,
         heads: u32,
         max_keys: u32,
-        lse: bool,
         scale: f32,
     ) -> Result<Self> {
         if block == 0 || head_dim == 0 || heads == 0 || max_keys == 0 {
@@ -278,8 +267,6 @@ impl Attention {
             max_kv_len: max_keys,
             causal: false,
             block,
-            max_keys,
-            lse,
         })
     }
 
@@ -445,70 +432,6 @@ impl Attention {
         f.operate::<DenseAttention>(&descriptor, args)
     }
 
-    /// Video Sparse Attention: `query [query_tiles · block, heads, head_dim]`,
-    /// `key`/`value [key_blocks · block, heads, head_dim]`, the selection `indices [heads,
-    /// query_tiles, selected]` i32 and its per-tile `counts [heads, query_tiles]` i32, the valid rows
-    /// of each key block `valid [key_blocks]` i32, the optional normalizer and `out`.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the selection is three device-written tables and the normalizer is a fourth \
-                  optional output; grouping them would name the same values twice"
-    )]
-    pub fn attend_sparse(
-        &self,
-        f: &Forward,
-        query: TensorView,
-        key: TensorView,
-        value: TensorView,
-        indices: TensorView,
-        counts: TensorView,
-        valid: TensorView,
-        lse: Option<TensorView>,
-        out: TensorView,
-    ) -> Result<()> {
-        if self.backend != AttentionBackend::Sparse {
-            return Err(Error::Unsupported(format!(
-                "Attention::attend_sparse: the {:?} backend is not the sparse attention",
-                self.backend
-            )));
-        }
-        match (self.lse, lse) {
-            (true, None) => {
-                return Err(Error::shape(
-                    "Attention::attend_sparse",
-                    "the layer writes a normalizer and the call passes none".to_owned(),
-                ));
-            }
-            (false, Some(_)) => {
-                return Err(Error::shape(
-                    "Attention::attend_sparse",
-                    "the call passes a normalizer the layer does not write".to_owned(),
-                ));
-            }
-            _ => {}
-        }
-        let descriptor = SparseDescriptor {
-            block: self.block,
-            dtype: query.dtype,
-            output: out.dtype,
-            head_dim: self.head_dim,
-            lse: self.lse,
-            keys: self.max_keys,
-        };
-        let args = SparseArgs {
-            query,
-            key,
-            value,
-            indices,
-            counts,
-            valid,
-            lse,
-            out,
-            scale: self.scale,
-        };
-
-        f.operate::<SparseAttention>(&descriptor, args)
-    }
 
     /// The elements between consecutive rows of the query a sparse call reads.
     pub const fn block(&self) -> u32 {
@@ -1086,14 +1009,13 @@ mod tests {
 
     #[test]
     fn a_sparse_layer_names_its_tile_and_its_key_bound() {
-        let vsa = Attention::sparse(64, 128, 12, 65_536, true, 0.088).unwrap();
+        let vsa = Attention::sparse(64, 128, 12, 65_536, 0.088).unwrap();
         assert_eq!(vsa.backend(), AttentionBackend::Sparse);
         assert_eq!(vsa.block(), 64);
-        assert_eq!(vsa.max_keys, 65_536);
         // The descriptor's key bound is whole tiles of the block size.
-        assert!(Attention::sparse(64, 128, 12, 1_000, false, 0.088).is_err());
-        assert!(Attention::sparse(0, 128, 12, 1_024, false, 0.088).is_err());
-        assert!(Attention::sparse(128, 128, 12, 1_024, false, 0.088).is_ok());
+        assert!(Attention::sparse(64, 128, 12, 1_000, 0.088).is_err());
+        assert!(Attention::sparse(0, 128, 12, 1_024, 0.088).is_err());
+        assert!(Attention::sparse(128, 128, 12, 1_024, 0.088).is_ok());
     }
 
     /// A page's scale is its own layer's, so two layers of one group carry different ones and the

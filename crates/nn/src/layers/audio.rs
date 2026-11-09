@@ -118,16 +118,7 @@ impl AudioActivation {
         Ok(self)
     }
 
-    /// The channels the block reads.
-    pub const fn channels(&self) -> u32 {
-        self.channels
-    }
 
-    /// The gain the block applies to a signal of `length` samples — the ratio, once, as the
-    /// reference counts it inside the upsample.
-    pub const fn ratio(&self) -> u32 {
-        self.ratio
-    }
 
     /// The descriptor a block of this geometry launches, stated without its weights.
     ///

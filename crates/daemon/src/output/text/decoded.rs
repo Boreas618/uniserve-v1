@@ -236,34 +236,9 @@ impl DecodeStream {
         })
     }
 
-    /// The request's identifier.
-    pub(crate) fn request_id(&self) -> &str {
-        &self.request_id
-    }
-
-    /// The prompt's token identifiers.
-    pub(crate) fn prompt_token_ids(&self) -> &[u32] {
-        &self.prompt_token_ids
-    }
-
-    /// Whether the prompt log-probabilities are requested.
-    pub(crate) fn prompt_logprobs_requested(&self) -> bool {
-        self.prompt_logprobs_requested
-    }
-
-    /// Whether generated-token log-probabilities are requested.
-    pub(crate) fn generated_logprobs_requested(&self) -> bool {
-        self.generated_logprobs_requested
-    }
-
     /// The decode options, with the stop strings not matched yet.
     pub(crate) fn options(&self) -> &TextDecodeOptions {
         &self.options
-    }
-
-    /// Generated text tokens the decoder consumed so far.
-    pub(crate) fn output_tokens(&self) -> usize {
-        self.output_tokens
     }
 
     /// Emits start metadata once scheduling and any requested prompt scores
@@ -300,19 +275,6 @@ impl DecodeStream {
             queued_at,
             scheduled_at,
         }))
-    }
-
-    /// Fails unless `Start` has been emitted and no generated token awaits its
-    /// logprobs, the state every event after `Start` requires.
-    fn ensure_output_ready(&self, event: &str) -> Result<(), Error> {
-        if self.started && self.pending_token.is_none() {
-            Ok(())
-        } else {
-            Err(Error::MalformedOutput {
-                request_id: self.request_id.clone(),
-                message: format!("{event} arrived before output metadata was complete"),
-            })
-        }
     }
 
     /// Pushes one engine event and returns the decoded events it produced.

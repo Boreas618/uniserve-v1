@@ -37,13 +37,9 @@ pub(crate) struct ImportWorkspace {
     stream: Option<Arc<Stream>>,
     scratch: ConversionScratch,
     elements: u64,
-    /// `S` of the scratch: scale entries of the largest group page.
-    scales: u64,
     units: UnitColumn,
     /// The program that converts a span the transports could not copy.
     conversion: Arc<dyn PageConversion>,
-    /// The pool's unit fields, keyed as the library reads them.
-    fields: Vec<(String, StorageView)>,
 }
 
 impl ImportWorkspace {
@@ -73,10 +69,8 @@ impl ImportWorkspace {
             stream,
             scratch,
             elements,
-            scales,
             units,
             conversion,
-            fields: planes.views(),
         })
     }
 
@@ -103,20 +97,8 @@ pub(crate) struct ImportEntry {
 }
 
 impl ImportEntry {
-    pub(crate) fn new(write: Arc<CacheImport>) -> Self {
-        Self {
-            write,
-            retirement: Arc::new(Retirement::default()),
-        }
-    }
 
-    pub(crate) fn write(&self) -> &Arc<CacheImport> {
-        &self.write
-    }
 
-    pub(crate) fn retirement(&self) -> &Arc<Retirement> {
-        &self.retirement
-    }
 }
 
 impl Deref for ImportEntry {
@@ -451,11 +433,9 @@ impl GroupCopy<'_> {
             extent(&self.axes[1]),
             extent(&self.axes[2]),
         );
-        let rows = table.shape.units_per_page as usize;
 
         let mut position = start;
         while position < end {
-            let page = position / block_size;
             let offset = position % block_size;
             let count = (end - position).min(block_size - offset);
             let source_offset = position % source_block_size;
@@ -474,10 +454,9 @@ impl GroupCopy<'_> {
                     workspace.view(8 * elements * field as u64, self.source_dtype, &shape)?;
                 reads.extend(self.fetch(field, &destination, &region, locators)?);
             }
-            let mut pages = 0;
             if self.scale_heads > 0 {
                 let first = position / source_block_size - start / source_block_size;
-                pages = (source_offset + count).div_ceil(source_block_size);
+                let pages = (source_offset + count).div_ceil(source_block_size);
                 let groups = self.axes[1].end.div_ceil(self.scale_heads)
                     - self.axes[1].start / self.scale_heads;
                 let region = [
@@ -496,26 +475,8 @@ impl GroupCopy<'_> {
             }
             self.consume(&reads)?;
 
-            let first_unit = (page - u64::from(table.start_page)) as usize * rows;
-            let units: Vec<u32> = table.units[first_unit..first_unit + rows]
-                .iter()
-                .map(|unit| unit.0)
-                .collect();
             let request = ConversionRequest {
-                scratch: workspace.scratch.view()?,
-                elements,
-                scales: workspace.scales,
                 group: self.index,
-                source_dtype: self.source_dtype,
-                compute_dtype: ElementType::parse(&backend.export.compute_dtype)?,
-                count,
-                offset,
-                source_offset,
-                source_block_size: group.block_size,
-                scale_heads: u32::try_from(self.scale_heads).unwrap_or(u32::MAX),
-                pages,
-                units: &units,
-                fields: &workspace.fields,
             };
             // The conversion enqueues on the workspace stream. The next
             // span's reads record their handoff after it, so no transport

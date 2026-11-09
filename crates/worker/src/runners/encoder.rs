@@ -362,38 +362,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
         buckets
     }
 
-    /// Allocates and fills the tables of every bucket's layout, once, when the runner loads (4.3).
-    ///
-    /// The plan sized this memory before admission (`Tables::bytes`), so nothing here decides how
-    /// much; a table the model needs and the plan did not size is a refusal rather than a request
-    /// path allocation.
-    pub fn load(&mut self) -> Result<()> {
-        if self.pools.is_none() {
-            return Err(Error::Resource(
-                "the encoder runner loaded before its device's pools were attached",
-            ));
-        }
-        let buckets = self.capture_order();
-        for bucket in buckets {
-            self.stage_warm(bucket)?;
-            self.fill(bucket)?;
-        }
-        Ok(())
-    }
 
-    /// The bytes `bucket`'s tables need, as the plan books them before admission (4.3).
-    ///
-    /// The plan calls this once per layout the checkpoint declares, so the resident figure it
-    /// reserves is the model's own statement rather than an estimate; a runner that allocated a
-    /// table the plan had not sized would be allocating resident memory after admission.
-    pub fn table_bytes(model: &M, bucket: Bucket) -> Result<u64> {
-        let layout = EncoderLayout {
-            rows: bucket.tokens,
-            tokens: bucket.tokens,
-            images: Vec::new(),
-        };
-        Tables::plan_bytes(&model.state_tables(&layout))
-    }
 
     fn stream_id(&self) -> StreamId {
         StreamId(self.stream.raw())

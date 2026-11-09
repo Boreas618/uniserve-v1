@@ -64,15 +64,7 @@ impl Embedding {
         })
     }
 
-    /// The width of one embedding row.
-    pub const fn hidden(&self) -> u32 {
-        self.hidden
-    }
 
-    /// The vocabulary size of the whole model.
-    pub const fn vocabulary(&self) -> u32 {
-        self.vocabulary
-    }
 
     /// Whether the table is sharded across ranks.
     pub const fn is_sharded(&self) -> bool {

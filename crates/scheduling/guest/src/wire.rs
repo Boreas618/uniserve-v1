@@ -28,10 +28,6 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// The export that allocates a message buffer.
-pub const EXPORT_ALLOC: &str = "sched_alloc";
-/// The export that releases a buffer.
-pub const EXPORT_FREE: &str = "sched_free";
 /// The export that instantiates: its message is [`crate::policy::Instantiation`].
 pub const EXPORT_INIT: &str = "sched_init";
 /// The export that observes events: its message is `Vec<Event>`.
@@ -116,10 +112,6 @@ impl Call {
         matches!(self, Call::Route | Call::Place)
     }
 
-    /// Whether the call takes a message. Only `limits` takes none.
-    pub fn takes_message(self) -> bool {
-        !matches!(self, Call::Limits)
-    }
 }
 
 /// Packs a reply buffer's pointer and length.

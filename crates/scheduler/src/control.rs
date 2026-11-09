@@ -40,35 +40,6 @@ fn engine_command_name(kind: &proto::process::command::Kind) -> &'static str {
     }
 }
 
-/// Who asked for a stage: the scheduler's own handle, which names the step
-/// the stage applied at, or an engine command, which is answered with
-/// whether it applied.
-///
-/// One path applies every stage; the answer shape is the only difference,
-/// so a stage has exactly one place where it changes the slot.
-#[derive(Debug)]
-pub(super) enum StageAnswer {
-    /// A handle's `stage`, answered with the step it applied at.
-    Step(crossbeam_channel::Sender<Result<handle::StageApplied, String>>),
-    /// An engine command, answered with whether it applied.
-    Applied(crossbeam_channel::Sender<Result<(), String>>),
-}
-
-impl StageAnswer {
-    /// Sends `result`, dropping either the step or the detail as the
-    /// caller's shape requires.
-    fn send(self, result: Result<handle::StageApplied, String>) {
-        match self {
-            Self::Step(answer) => {
-                let _ = answer.send(result);
-            }
-            Self::Applied(answer) => {
-                let _ = answer.send(result.map(|_| ()));
-            }
-        }
-    }
-}
-
 /// An update's ask that the following step's batches also run in shadow for an
 /// epoch generation (§7.3 step 2), with the answer that waits for the step which
 /// shadows them.
@@ -88,7 +59,7 @@ pub(super) struct ShadowPass {
     /// settle nor leave the device to the requests it serves.
     pub(super) shapes: std::collections::HashSet<::worker::plan::Shape>,
     /// Where the ask's answer goes, in the shape every stage's answer takes.
-    pub(super) answer: StageAnswer,
+    pub(super) answer: crossbeam_channel::Sender<Result<(), String>>,
 }
 
 impl Scheduler {
@@ -337,7 +308,7 @@ impl Scheduler {
                 self.program_command(command, answer);
             }
             Command::Shadow { generation, answer } => {
-                self.ask_shadow(generation, StageAnswer::Applied(answer));
+                self.ask_shadow(generation, answer);
             }
             Command::Counters { answer } => {
                 let _ = answer.send(self.counters());
@@ -494,16 +465,16 @@ impl Scheduler {
     /// with the worker's reason. Only the in-process arm shadows: a supplied
     /// worker runs no shadow pass, so the ask is refused there rather than
     /// left waiting for a step that cannot run it.
-    fn ask_shadow(&mut self, generation: u64, answer: StageAnswer) {
+    fn ask_shadow(&mut self, generation: u64, answer: crossbeam_channel::Sender<Result<(), String>>) {
         if !self.worker.serves_in_process() {
-            answer.send(Err(format!(
+            let _ = answer.send(Err(format!(
                 "the shadow pass of generation {generation} starts when a step submits through \
                  ::worker::Batches; this scheduler submits its batches to a supplied worker"
             )));
             return;
         }
         if let Some(pending) = self.shadow_pass.as_ref() {
-            answer.send(Err(format!(
+            let _ = answer.send(Err(format!(
                 "the shadow pass of generation {} is waiting for the step that runs it",
                 pending.generation
             )));
@@ -549,7 +520,7 @@ impl Scheduler {
     /// serves on.
     pub(super) fn shadow_failed(&mut self, reason: impl Into<String>) {
         if let Some(pass) = self.shadow_pass.take() {
-            pass.answer.send(Err(reason.into()));
+            let _ = pass.answer.send(Err(reason.into()));
         }
     }
 
@@ -570,9 +541,8 @@ impl Scheduler {
             // the completion that ends it wakes this thread.
             crate::submission::ShadowStatus::Pending => {}
             crate::submission::ShadowStatus::Settled => {
-                let step = self.step;
                 if let Some(pass) = self.shadow_pass.take() {
-                    pass.answer.send(Ok(handle::StageApplied { step }));
+                    let _ = pass.answer.send(Ok(()));
                 }
             }
             crate::submission::ShadowStatus::Failed(reason) => {

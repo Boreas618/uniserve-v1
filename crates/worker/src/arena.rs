@@ -51,10 +51,6 @@ impl Plan {
         self.bytes
     }
 
-    /// Whether the plan holds no allocation.
-    pub fn is_empty(&self) -> bool {
-        self.bytes == 0
-    }
 }
 
 /// What one stream's pool holds: its reserved range, and the plans of its buckets.
@@ -243,14 +239,17 @@ impl Ledger {
     }
 
     /// Books a stream's whole release.
+#[cfg(test)]
     fn close(&mut self, stream: StreamId) -> u64 {
         self.streams.remove(&stream).map_or(0, |books| books.mapped)
     }
 
+#[cfg(test)]
     fn mapped(&self) -> u64 {
         self.streams.values().map(|books| books.mapped).sum()
     }
 
+#[cfg(test)]
     fn metrics(&self) -> PoolMetrics {
         PoolMetrics {
             streams: self.streams.len(),
@@ -445,10 +444,6 @@ impl Pools {
         PoolTotals::new(allowance)
     }
 
-    /// The device's three books.
-    pub fn totals(&self) -> &Arc<PoolTotals> {
-        &self.totals
-    }
 
     /// Maps `bytes` of `pool` through the device's one allocator, for an owner that carves its own
     /// storage (the resident planes, a scratch page set).
@@ -458,20 +453,12 @@ impl Pools {
         Ok(self.allocator.allocate(pool, size)?)
     }
 
-    /// Gives a `pool` block back to the device's allocator; the block stays mapped, as 4.1 has it.
-    pub fn free(&mut self, buffer: Buffer) {
-        self.allocator.free(buffer);
-    }
 
     /// The bytes `pool` has mapped, as the device's one allocator books them (4.1).
     pub fn mapped_bytes(&self, pool: PoolKind) -> u64 {
         self.allocator.mapped_bytes(pool) as u64
     }
 
-    /// The device's allowance: what its three pools together may hold.
-    pub fn budget(&self) -> u64 {
-        self.totals.allowance()
-    }
 
     /// The bytes a stream's range reserves unless its runner claimed its own figure.
     pub fn reserved(&self) -> u64 {
@@ -530,21 +517,7 @@ impl Pools {
         }
     }
 
-    /// What the device's graph pools hold and what they may hold (4.1, item 5's invariant).
-    pub fn metrics(&self) -> PoolMetrics {
-        let booked = self.ledger.metrics();
-        PoolMetrics {
-            streams: self.pools.len(),
-            reserved: booked.reserved,
-            mapped: self.mapped(),
-            budget: booked.budget,
-        }
-    }
 
-    /// The plan of `bucket` on `stream`, if it was captured.
-    pub fn plan(&self, stream: StreamId, bucket: Bucket) -> Option<&Plan> {
-        self.pools.get(&stream)?.plans.get(&bucket)
-    }
 
     /// The base address of `stream`'s range, allocating the range on first use.
     pub fn base(&mut self, stream: StreamId) -> Result<DevicePtr> {
@@ -686,23 +659,7 @@ impl Pools {
         Ok(())
     }
 
-    /// Gives `stream`'s range back: its plans go and the pool takes the buffer's block back.
-    pub fn release(&mut self, stream: StreamId) -> Result<()> {
-        self.ledger.close(stream);
-        if let Some(pool) = self.pools.remove(&stream) {
-            self.allocator.free(pool.buffer);
-        }
-        Ok(())
-    }
 
-    /// Releases every stream's pool.
-    pub fn release_all(&mut self) -> Result<()> {
-        let streams: Vec<StreamId> = self.pools.keys().copied().collect();
-        for stream in streams {
-            self.release(stream)?;
-        }
-        Ok(())
-    }
 
     fn pool(&mut self, stream: StreamId) -> Result<&mut Pool> {
         if !self.pools.contains_key(&stream) {

@@ -23,8 +23,6 @@ enum Serving {
     Holding,
     /// This engine serves submissions while it is ready.
     Engine(Arc<EngineClient>),
-    /// A group reshape transferred this replica's requests to these owners.
-    Successor(Arc<RequestHold>),
     /// The successor daemon owns readiness and engine recovery.
     Remote(Arc<crate::restart::requests::RemoteHold>),
     /// No engine will serve; submissions fail with the reason.
@@ -88,15 +86,6 @@ impl RequestHold {
         }
     }
 
-    /// Has the requests that migrate out of `kept.epoch` continue with the
-    /// state they reached there: an epoch change's `in_flight = keep` when
-    /// the epoch that serves next computes other numerics. `None` ends it.
-    pub fn keep(&self, kept: Option<Kept>) {
-        *self
-            .kept
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = kept;
-    }
 
     /// The state a request migrating out of epoch `epoch` continues with,
     /// if it keeps it.
@@ -130,7 +119,7 @@ impl RequestHold {
         match &*self.serving.borrow() {
             Serving::Engine(client) => HoldState::Engine(client.state()),
             Serving::Holding => HoldState::Holding,
-            Serving::Successor(_) | Serving::Remote(_) => HoldState::Holding,
+            Serving::Remote(_) => HoldState::Holding,
             Serving::Closed(reason) => HoldState::Closed(reason.clone()),
         }
     }
@@ -138,15 +127,6 @@ impl RequestHold {
     /// Has `client`'s engine serve every held and later submission.
     pub fn serve(&self, client: Arc<EngineClient>) {
         self.serving.send_replace(Serving::Engine(client));
-    }
-
-    /// Transfers continuations to a successor replica. Existing HTTP
-    /// streams retain this hold, while each successor owns its later epoch
-    /// changes. The caller must avoid cycles and restore predecessor holds
-    /// before redirecting successors during rollback.
-    pub(crate) fn redirect(&self, successor: Arc<RequestHold>) {
-        self.serving.send_replace(Serving::Successor(successor));
-        self.paused.send_replace(false);
     }
 
     /// Transfer continuation admission to the successor daemon. The old
@@ -172,9 +152,7 @@ impl RequestHold {
     pub fn client(&self) -> Option<Arc<EngineClient>> {
         match &*self.serving.borrow() {
             Serving::Engine(client) => Some(Arc::clone(client)),
-            Serving::Holding | Serving::Closed(_) | Serving::Successor(_) | Serving::Remote(_) => {
-                None
-            }
+            Serving::Holding | Serving::Closed(_) | Serving::Remote(_) => None,
         }
     }
 
@@ -286,24 +264,9 @@ impl RequestHold {
                     ));
                 }
                 Serving::Closed(reason) => return Err(SubmitError::Unavailable(reason)),
-                Serving::Successor(successor) if !held => {
-                    tokio::select! {
-                        changed = serving.changed() => {
-                            changed.map_err(|_| SubmitError::Unavailable("the daemon stopped serving requests".into()))?;
-                        }
-                        ready = Box::pin(successor.destination(previous_epoch)) => {
-                            let (destination, kept) = ready?;
-                            return Ok((destination, previous_epoch.and_then(|epoch| self.kept(epoch)).or(kept)));
-                        }
-                    }
-                    continue;
-                }
                 // An engine that is not ready serves nothing until whoever
                 // watches it replaces it or closes the hold.
-                Serving::Engine(_)
-                | Serving::Holding
-                | Serving::Successor(_)
-                | Serving::Remote(_) => {}
+                Serving::Engine(_) | Serving::Holding | Serving::Remote(_) => {}
             }
             let changed = tokio::select! {
                 changed = serving.changed() => changed,

@@ -185,10 +185,6 @@ impl ExportTable {
         self.reclaim(key)
     }
 
-    pub(crate) fn awaiting_acknowledgment(&self) -> bool {
-        self.lock().awaiting_acknowledgment()
-    }
-
     /// Sweep remote acknowledgments and discard successfully retired storage.
     pub(crate) fn reap(&self) -> Result<()> {
         let keys: Vec<_> = self.lock().revoked().cloned().collect();
@@ -197,15 +193,6 @@ impl ExportTable {
         }
         self.remove_finished();
         Ok(())
-    }
-
-    pub(crate) fn set_wake(&self, wake: Option<Wake>) {
-        let pool = lock(&self.retirements).clone();
-        if let Some(pool) = pool {
-            pool.set_wake(wake.clone());
-        }
-        let previous = std::mem::replace(&mut *lock(&self.wake), wake);
-        drop(previous);
     }
 
     /// Revoke every export, wait for producers on the host, and retire.

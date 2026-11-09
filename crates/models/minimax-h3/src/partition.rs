@@ -330,10 +330,6 @@ impl Components {
         self.0 & (1 << component.bit()) != 0
     }
 
-    /// Whether no block is placed.
-    pub const fn is_empty(self) -> bool {
-        self.0 == 0
-    }
 
     /// The blocks placed, in deployment order.
     pub fn iter(self) -> impl Iterator<Item = Component> {

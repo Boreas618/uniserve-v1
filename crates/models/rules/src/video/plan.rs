@@ -291,20 +291,7 @@ impl ConditionType {
     /// Every condition type.
     pub const ALL: [Self; 4] = [Self::Image, Self::Video, Self::VideoAudio, Self::Audio];
 
-    /// The type's request name.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Image => "image",
-            Self::Video => "video",
-            Self::VideoAudio => "video_audio",
-            Self::Audio => "audio",
-        }
-    }
 
-    /// The type a request name denotes, if any.
-    pub fn from_name(name: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|kind| kind.as_str() == name)
-    }
 }
 
 /// Whether a condition anchors a generated frame or is a reference: a
@@ -319,20 +306,7 @@ pub enum Role {
 }
 
 impl Role {
-    /// The role's request name.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Keyframe => "keyframe",
-            Self::Reference => "reference",
-        }
-    }
 
-    /// The role a request name denotes, if any.
-    pub fn from_name(name: &str) -> Option<Self> {
-        [Self::Keyframe, Self::Reference]
-            .into_iter()
-            .find(|role| role.as_str() == name)
-    }
 }
 
 /// The generated frame a keyframe anchors.

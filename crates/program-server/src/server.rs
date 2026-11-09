@@ -135,10 +135,6 @@ impl ProgramServer {
         })
     }
 
-    /// The host's toolchains (design section 6.2).
-    pub fn toolchains(&self) -> &Toolchains {
-        &self.toolchains
-    }
 
     /// Serves until the process ends: binds the socket, answers every client
     /// on its own thread, and drives the compile queue.

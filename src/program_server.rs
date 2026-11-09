@@ -26,5 +26,5 @@
 //! instead.
 
 pub(crate) use program_server::command::{
-    Action, Options, ServeOptions, command, default_socket, options, run,
+    command, options, run,
 };

@@ -120,7 +120,7 @@ TREE_CHECKS = (
 #: packages of exactly this kind were deleted on 2026-11-04 after one of their checks cost an evening.
 #: The search strips Rust comments first, because an operator's name in a doc comment is a comment
 #: and not a launch — that distinction is what turned "nine deletions" into six.
-CALLERS = ("crates/nn/src", "crates/models", "crates/executor/src")
+CALLERS = ("crates/nn/src", "crates/models", "crates/worker/src")
 
 
 def declared(repository):

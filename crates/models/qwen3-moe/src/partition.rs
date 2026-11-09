@@ -148,10 +148,6 @@ impl Partition {
         first..first + per_rank
     }
 
-    /// Whether this rank owns expert `expert`.
-    pub fn owns_expert(&self, config: &crate::Config, expert: usize) -> bool {
-        self.expert_range(config).contains(&expert)
-    }
 }
 
 #[cfg(test)]

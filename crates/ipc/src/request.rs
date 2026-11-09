@@ -28,16 +28,6 @@ pub enum RequestKind {
 }
 
 impl RequestKind {
-    /// Returns the stable name of this request kind.
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Info => "info",
-            Self::Submit => "submit",
-            Self::Close => "close",
-            Self::Promote => "promote",
-            Self::Hook => "hook",
-        }
-    }
 }
 
 /// Engine-to-worker request envelope.
@@ -93,16 +83,6 @@ impl MainProcessRequest {
         }
     }
 
-    /// Returns the optional request-response correlation identity.
-    pub const fn message_id(&self) -> Option<u64> {
-        match self {
-            Self::Info { message_id }
-            | Self::Submit { message_id, .. }
-            | Self::Close { message_id }
-            | Self::Promote { message_id }
-            | Self::Hook { message_id, .. } => *message_id,
-        }
-    }
 
     /// Replaces the request-response correlation identity (`message_id`).
     pub fn set_message_id(&mut self, value: Option<u64>) {
@@ -141,19 +121,7 @@ impl MainProcessRequest {
         Self::Close { message_id: None }
     }
 
-    /// Constructs a standby promotion request.
-    pub fn promote() -> Self {
-        Self::Promote { message_id: None }
-    }
 
-    /// Constructs a request that runs the worker hook `name`.
-    pub fn hook(name: impl Into<String>, payload: impl Into<String>) -> Self {
-        Self::Hook {
-            message_id: None,
-            name: name.into(),
-            payload: payload.into(),
-        }
-    }
 }
 
 /// Kind discriminator carried by each worker response frame.
@@ -284,18 +252,6 @@ impl MainProcessResponse {
         }
     }
 
-    /// Returns the optional request-response correlation identity; `None`
-    /// for a stall report, which answers no request.
-    pub const fn message_id(&self) -> Option<u64> {
-        match self {
-            Self::Info { message_id, .. }
-            | Self::Result { message_id, .. }
-            | Self::Ok { message_id }
-            | Self::Error { message_id, .. }
-            | Self::Hooked { message_id, .. } => *message_id,
-            Self::Stalled { .. } => None,
-        }
-    }
 
     /// Replaces the request-response correlation identity (`message_id`) of
     /// a response; a stall report has none to replace.

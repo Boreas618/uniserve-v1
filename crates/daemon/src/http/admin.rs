@@ -944,7 +944,7 @@ async fn rollback(State(state): State<AdminState>, body: axum::body::Bytes) -> R
 /// The status of a failed update.
 fn update_status(error: &UpdateError) -> StatusCode {
     match error {
-        UpdateError::InProgress | UpdateError::OnTrial(_) => StatusCode::CONFLICT,
+        UpdateError::InProgress => StatusCode::CONFLICT,
         UpdateError::Refused(_) => StatusCode::BAD_REQUEST,
         UpdateError::NoEngine => StatusCode::SERVICE_UNAVAILABLE,
         UpdateError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,

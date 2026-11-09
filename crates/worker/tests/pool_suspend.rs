@@ -158,7 +158,7 @@ fn a_suspended_pool_restores_at_the_same_addresses_and_its_graph_replays() {
 #[ignore = "requires a CUDA device"]
 fn a_restore_whose_layout_the_graphs_do_not_address_is_refused() {
     let (mut pools, _allowance) = pools();
-    let stream = Stream::new(DEVICE).expect("a stream");
+    let _stream = Stream::new(DEVICE).expect("a stream");
     let bucket = Bucket::decode(1, worker::plan::Variant::DecodeGreedy);
 
     pools.base(StreamId(0)).expect("the stream's range");

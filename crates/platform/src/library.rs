@@ -13,7 +13,7 @@ use std::ffi::CString;
 
 use crate::driver::{self, Handle};
 use crate::launch::Function;
-use crate::{Device, DeviceId, Error, Result, reclaim};
+use crate::{Device, Error, Result, reclaim};
 
 /// A module of one device loaded as a library (`CUlibrary`).
 ///
@@ -106,15 +106,7 @@ impl Library {
         Ok(Function::new(function, self.device.clone()))
     }
 
-    /// The device the library is loaded on.
-    pub fn device(&self) -> DeviceId {
-        self.device.id()
-    }
 
-    /// The `CUlibrary` handle.
-    pub fn raw(&self) -> usize {
-        self.raw as usize
-    }
 }
 
 impl Drop for Library {
