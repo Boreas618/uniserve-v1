@@ -547,3 +547,207 @@ fn a_step_indexed_projection_gathers_its_steps_row_then_projects() {
         .is_err()
     );
 }
+
+// ---- AdaLN block, final norm and timestep table ---------------------------------------------------
+
+use nn::blocks::{AdaLnBlock, AdaLnOut, AdaLnSpec, ModulationTable};
+use nn::diffusion::{TimestepTable, TimestepTableSpec};
+
+/// The step's gathered modulation of `parameters` rows of `vectors` vectors each.
+fn modulation(arena: &Arena, parameters: u64, vectors: u64) -> TensorView {
+    view(arena, &[parameters, vectors * HIDDEN])
+}
+
+/// A block's table is read by stage, attention then MLP, each vector a row-strided view of the
+/// table; the final norm's table holds a shift and a scale; each refuses the other's reading.
+#[test]
+fn a_modulation_table_cuts_shift_scale_and_gate_in_storage_order() {
+    let arena = Arena::counting();
+    let table = modulation(&arena, 4, 6);
+    let block = ModulationTable::block(table, HIDDEN).unwrap();
+    let address = |weight: nn::Weight| weight.view().ptr.address() - table.ptr.address();
+    let row = 2 * HIDDEN;
+    let (attention, mlp) = (block.attention().unwrap(), block.mlp().unwrap());
+    let offsets = [
+        attention.shift,
+        attention.scale,
+        attention.gate,
+        mlp.shift,
+        mlp.scale,
+        mlp.gate,
+    ]
+    .map(address);
+    assert_eq!(offsets, [0, 1, 2, 3, 4, 5].map(|vector| vector * row));
+    let shift = attention.shift.view();
+    assert_eq!(shift.shape.dims(), &[4, HIDDEN]);
+    assert_eq!(
+        shift.strides.get(0),
+        6 * HIDDEN,
+        "a vector strides over the whole row"
+    );
+    assert!(block.shift_scale().is_err());
+
+    let output = ModulationTable::output(modulation(&arena, 4, 2), HIDDEN).unwrap();
+    let (shift, scale) = output.shift_scale().unwrap();
+    assert_eq!(scale.view().ptr.address() - shift.view().ptr.address(), row);
+    assert!(output.attention().is_err());
+
+    assert!(ModulationTable::block(modulation(&arena, 4, 2), HIDDEN).is_err());
+    assert!(ModulationTable::output(view(&arena, &[4, 2, 2 * HIDDEN]), HIDDEN).is_err());
+}
+
+fn adaln_checkpoint(directory: &std::path::Path) -> Checkpoint {
+    checkpoint(
+        directory,
+        &[
+            ("block.norm1.weight", &[HIDDEN]),
+            ("block.norm2.weight", &[HIDDEN]),
+            ("block.ff.proj.weight", &[2 * INTERMEDIATE, HIDDEN]),
+            ("block.ff.down_proj.weight", &[HIDDEN, INTERMEDIATE]),
+            ("norm_out.weight", &[HIDDEN]),
+        ],
+    )
+}
+
+/// The block normalizes the attention's input under its modulation, runs the caller's attention
+/// on it, folds the gated update into one modulated norm for the MLP, and joins the MLP's output
+/// through its gate.
+#[test]
+fn an_adaln_block_modulates_both_inputs_and_gates_both_updates() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = adaln_checkpoint(directory.path());
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let block = AdaLnBlock::load(
+        &mut loader.scope("block"),
+        AdaLnSpec {
+            hidden: HIDDEN as u32,
+            eps: 1e-6,
+            norm1: "norm1",
+            norm2: "norm2",
+            mlp: GatedMlpSpec {
+                down: "ff.down_proj",
+                ..mlp_spec(Rounding::Stepwise, GateUp::ValueFirst("ff.proj"))
+            },
+        },
+        Split::WHOLE,
+    )
+    .unwrap();
+    assert_eq!(block.dtype(), DType::BF16);
+
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let tokens = 5;
+    let table = ModulationTable::block(modulation(&arena, 6, 6), HIDDEN).unwrap();
+    let rows = arena.tensor(DType::I32, Shape::new(&[tokens])).unwrap();
+    let [hidden, normalized, update, residual] = [0; 4].map(|_| view(&arena, &[tokens, HIDDEN]));
+
+    let mut attended = None;
+    let (result, launches) = launched(|| {
+        block.forward(
+            &f,
+            &table,
+            rows,
+            hidden,
+            normalized,
+            update,
+            residual,
+            |input, output| {
+                attended = Some((input.ptr, output.ptr));
+                Ok(())
+            },
+        )
+    });
+    result.unwrap();
+    assert_eq!(attended, Some((normalized.ptr, update.ptr)));
+    assert_eq!(
+        launches,
+        [
+            "modulated_rms_norm",
+            "modulated_rms_norm",
+            "gemm",
+            "act_and_mul",
+            "gemm",
+            "gated_residual",
+        ]
+    );
+
+    // A final norm's table carries no gated stage.
+    let output = ModulationTable::output(modulation(&arena, 6, 2), HIDDEN).unwrap();
+    assert!(
+        block
+            .attention_input(&f, &output, rows, hidden, normalized)
+            .is_err()
+    );
+}
+
+/// The final norm is one modulated launch into a buffer of its input's shape.
+#[test]
+fn the_final_adaln_norm_modulates_by_shift_and_scale() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = adaln_checkpoint(directory.path());
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let norm = AdaLnOut::load(&mut loader.scope("norm_out"), HIDDEN as u32, 1e-6).unwrap();
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let table = ModulationTable::output(modulation(&arena, 2, 2), HIDDEN).unwrap();
+    let rows = arena.tensor(DType::I32, Shape::new(&[3])).unwrap();
+    let hidden = view(&arena, &[3, HIDDEN]);
+    let (out, launches) = launched(|| norm.apply(&f, &table, rows, hidden));
+    let out = out.unwrap();
+    assert_eq!((out.shape, out.dtype), (hidden.shape, hidden.dtype));
+    assert_eq!(launches, ["modulated_rms_norm"]);
+
+    let block_table = ModulationTable::block(modulation(&arena, 2, 6), HIDDEN).unwrap();
+    assert!(norm.forward(&f, &block_table, rows, hidden, out).is_err());
+}
+
+/// The table holds one row per distinct level, the entry of each step's groups, and a writable
+/// table per block; a step gathers its entries, then each block's rows at them.
+#[test]
+fn a_timestep_table_holds_each_distinct_level_once() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = adaln_checkpoint(directory.path());
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    // Three steps of two groups; the last step repeats the first's levels.
+    let levels = [1.0, 0.75, 0.5, 0.25, 1.0, 0.75];
+    let table = TimestepTable::load(
+        &mut loader.scope("adaln"),
+        &levels,
+        2,
+        TimestepTableSpec {
+            frequency_dim: 16,
+            layers: 2,
+            layer_columns: 6 * HIDDEN,
+            output_columns: 2 * HIDDEN,
+            dtype: DType::BF16,
+        },
+    )
+    .unwrap();
+    assert_eq!((table.groups(), table.steps()), (2, 3));
+    assert_eq!(table.frequencies().shape.dims(), &[4, 16]);
+    let layers = table.layer_tables();
+    assert_eq!(layers.len(), 2);
+    assert_eq!(layers[0].shape.dims(), &[4, 6 * HIDDEN]);
+    assert_eq!(table.output_table().shape.dims(), &[4, 2 * HIDDEN]);
+
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    let step = arena.tensor(DType::I32, Shape::new(&[1])).unwrap();
+    let entries = arena.tensor(DType::I32, Shape::new(&[1, 2])).unwrap();
+    let rows = modulation(&arena, 2, 6);
+    let (result, launches) = launched(|| {
+        table.entries_of(&f, step, entries)?;
+        table.layer(&f, 1, entries, rows)
+    });
+    result.unwrap();
+    assert_eq!(launches.len(), 2);
+    assert!(table.layer(&f, 2, entries, rows).is_err(), "two blocks");
+
+    let (times, indices) = TimestepTable::entries(&levels, 2).unwrap();
+    assert_eq!(times, [1.0, 0.75, 0.5, 0.25]);
+    assert_eq!(indices, [0, 1, 2, 3, 0, 1]);
+    assert!(
+        TimestepTable::entries(&levels, 4).is_err(),
+        "not whole steps"
+    );
+}

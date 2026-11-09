@@ -2,37 +2,28 @@
 //!
 //! One `Transformer` is a checkpoint's DiT partition: a projection of each modality's patchified
 //! latent into the hidden width, the stack of dilated layers, and the output projections back to
-//! each modality's velocity. A layer is conditioned
-//! by the step's AdaLN rows - a modulated normalization of the attention's input, the attention, the
-//! gated residual into the feed-forward's normalization, and the feed-forward's own gated residual:
+//! each modality's velocity. A layer is an [`AdaLnBlock`] over H3's attention, conditioned by the
+//! step's AdaLN rows, and the final normalization is an [`AdaLnOut`].
 //!
-//! ```text
-//! normalized = modulated_rms_norm(hidden, norm1, shift_a, scale_a, rows)
-//! attended   = attention(normalized)
-//! residual   = hidden + gate_a[rows] * attended            (one launch, with the normalization)
-//! normalized = modulated_rms_norm(residual, norm2, shift_m, scale_m, rows)
-//! hidden     = residual + gate_m[rows] * mlp(normalized)
-//! ```
-//!
-//! The step's AdaLN rows are device data ([`crate::modulation`]), so one captured stack serves
-//! every step of the schedule. The tables themselves are the worker's: the model reads the cache
-//! through the borrow it is handed, never through state of its own.
+//! The step's AdaLN rows are device data gathered from the [`TimestepTable`] in H3's row layout
+//! ([`crate::modulation`]), so one captured stack serves every step of the schedule.
 
 use crate::attention::{self, Factors};
 use crate::attention_sparse::Segments;
 use crate::config::{AttentionKind, TransformerConfig};
-use crate::modulation::AdaLnCache;
+use crate::modulation::{TAGS, VECTORS};
 use crate::partition::Partition;
 use crate::schedule::{Modality, Schedule};
 use crate::{Error, Result};
 
-use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
+use nn::blocks::{AdaLnBlock, AdaLnOut, AdaLnSpec, GateUp, GatedMlpSpec, ModulationTable};
+use nn::diffusion::TimestepTable;
 use nn::family::Split;
 use nn::layers::{
-    Bias, Epilogue, Linear, Modulation, Parallel, Precision, QkNorm, Residual, ResidualStream,
-    RmsNorm, Rotary, RotarySpec, Rounding, Scale, Spectrum, StepIndexed, Varlen,
+    Bias, Linear, Parallel, Precision, QkNorm, Rotary, RotarySpec, Rounding, Spectrum, StepIndexed,
+    Varlen,
 };
-use nn::weights::{Weight, WeightLoader};
+use nn::weights::WeightLoader;
 use nn::{Forward, Shape, TensorView};
 
 /// The components a deployment's fence probes name (`profiling_config.fence_components`): the
@@ -58,15 +49,12 @@ pub fn spectrum(config: &TransformerConfig) -> Spectrum {
     }
 }
 
-/// One dilated layer of the stack.
+/// One dilated layer of the stack: an AdaLN block over the layer's dense or sparse attention.
 pub struct Layer {
-    norm1: Weight,
-    norm2: Weight,
+    /// The modulated norms and the value-first SwiGLU, `silu(gate)` and the product evaluated with
+    /// one rounding each (`Rounding::Stepwise`), as the reference's activation rounds.
+    block: AdaLnBlock,
     attention: attention::Layer,
-    /// The value-first SwiGLU, `silu(gate)` and the product evaluated with one rounding each
-    /// (`Rounding::Stepwise`), as the reference's activation rounds.
-    mlp: GatedMlp,
-    eps: f32,
 }
 
 impl Layer {
@@ -86,32 +74,30 @@ impl Layer {
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
-        let prefix = format!("transformer_blocks.{index}");
-        let hidden = u64::from(config.hidden_size);
-        Ok(Self {
-            norm1: loader
-                .scope(format!("{prefix}.norm1"))
-                .tensor("weight", &[hidden])?,
-            norm2: loader
-                .scope(format!("{prefix}.norm2"))
-                .tensor("weight", &[hidden])?,
-            attention: attention::Layer::load(
-                kind, index, config, rows, rotary, tile_bound, partition, loader,
-            )?,
-            // The checkpoint fuses the feed-forward's value half first and its gate half second.
-            mlp: GatedMlp::load(
-                &mut loader.scope(format!("{prefix}.ff.net")),
-                GatedMlpSpec {
+        let block = AdaLnBlock::load(
+            &mut loader.scope(format!("transformer_blocks.{index}")),
+            AdaLnSpec {
+                hidden: config.hidden_size,
+                eps: config.norm_eps,
+                norm1: "norm1",
+                norm2: "norm2",
+                // The checkpoint fuses the feed-forward's value half first and its gate half second.
+                mlp: GatedMlpSpec {
                     hidden: config.hidden_size,
                     intermediate: config.intermediate_size,
                     activation: ops::activation::Activation::Silu,
                     rounding: Rounding::Stepwise,
-                    gate_up: GateUp::ValueFirst("0.proj"),
-                    down: "2",
+                    gate_up: GateUp::ValueFirst("ff.net.0.proj"),
+                    down: "ff.net.2",
                 },
-                Split::WHOLE,
+            },
+            Split::WHOLE,
+        )?;
+        Ok(Self {
+            block,
+            attention: attention::Layer::load(
+                kind, index, config, rows, rotary, tile_bound, partition, loader,
             )?,
-            eps: config.norm_eps,
         })
     }
 
@@ -126,16 +112,15 @@ impl Layer {
         f: &Forward,
         hidden: TensorView,
         out: TensorView,
-        modulation: TensorView,
+        modulation: &ModulationTable,
         rows: TensorView,
         factors: Factors<'_>,
         visible: Option<&Varlen>,
         segments: Option<&Segments>,
         scratch: &Scratch,
-        next: Option<(&Layer, TensorView)>,
+        next: Option<(&Layer, &ModulationTable)>,
         arrived: Vec<nn::Transfer>,
     ) -> Result<Vec<nn::Transfer>> {
-        let width = hidden.shape.last();
         let normalized = scratch.normalized;
         let update = scratch.update;
 
@@ -156,12 +141,12 @@ impl Layer {
             let mut arrived = arrived;
             // The stack's first layer has no layer before it to start its gather.
             if !ahead {
-                self.attention_norm(modulation, width, rows)?
-                    .forward(f, hidden, None, normalized)?;
+                self.block
+                    .attention_input(f, modulation, rows, hidden, normalized)?;
             } else if arrived.is_empty() {
                 let rows_here = sparse.gathered_rows(views, own, 0, own);
-                self.attention_norm(modulation, width, rows)?
-                    .forward(f, hidden, None, rows_here)?;
+                self.block
+                    .attention_input(f, modulation, rows, hidden, rows_here)?;
                 arrived.push(sparse.start_gather(f, views, own, 0, own)?);
             }
             let gate = sparse.attend(
@@ -182,23 +167,24 @@ impl Layer {
                     .at(rows.offset_elements(first))
                     .reshape(nn::Shape::new(&[count]));
                 sparse.receive(f, interval, views, part(update))?;
-                self.feed_forward(
+                self.block.feed_forward(
                     f,
                     modulation,
+                    selected,
                     part(hidden),
                     part(update),
                     part(out),
-                    selected,
                     part(normalized),
                 )?;
                 // These rows are the next layer's input, and its attention reads the whole
                 // sequence, so they leave now, beside the rest of this layer.
                 if ahead && let Some((layer, modulation)) = next {
                     let rows_here = sparse.gathered_rows(views, own, first, count);
-                    layer.attention_norm(modulation, width, selected)?.forward(
+                    layer.block.attention_input(
                         f,
+                        modulation,
+                        selected,
                         part(hidden),
-                        None,
                         rows_here,
                     )?;
                     gathering.push(sparse.start_gather(f, views, own, first, count)?);
@@ -206,88 +192,27 @@ impl Layer {
             }
             return Ok(gathering);
         }
-        self.attention_norm(modulation, width, rows)?
-            .forward(f, hidden, None, normalized)?;
-        self.attention.forward(
+        self.block.forward(
             f,
-            normalized,
-            factors,
-            visible,
-            segments,
-            &scratch.attention,
-            update,
-        )?;
-        self.feed_forward(f, modulation, hidden, update, out, rows, normalized)?;
-        Ok(Vec::new())
-    }
-
-    /// The normalization of this layer's attention input, under its `modulation` table at the
-    /// AdaLN row `rows` names for each activation row.
-    fn attention_norm(
-        &self,
-        modulation: TensorView,
-        width: u64,
-        rows: TensorView,
-    ) -> Result<RmsNorm> {
-        let (shift, scale, _) = chunks(modulation, width, 0)?;
-        let modulation = Modulation {
-            shift,
-            scale,
-            gate: None,
+            modulation,
             rows,
-            retained: None,
-        };
-        Ok(RmsNorm::new(
-            self.norm1,
-            self.eps,
-            Epilogue::Modulated(modulation),
-        )?)
-    }
-
-    /// The block after attention, over any rows of the layer: `update` is the attention's output
-    /// for them, `rows` their AdaLN rows in `modulation`, and the layer's output lands in `hidden`.
-    #[allow(clippy::too_many_arguments)]
-    fn feed_forward(
-        &self,
-        f: &Forward,
-        modulation: TensorView,
-        hidden: TensorView,
-        update: TensorView,
-        out: TensorView,
-        rows: TensorView,
-        normalized: TensorView,
-    ) -> Result<()> {
-        // The MLP norm folds the attention's gated update into the residual and copies the result
-        // out: the block's second residual reads it after the down projection has overwritten
-        // `update`, and `retain` is what lets one launch produce both the normalized feed-forward
-        // input and that residual base (`crates/ops/kernels/modulated_rms_norm`: with `update` the
-        // kernel stores the gated sum, and with `retain` it copies the same value out).
-        let width = hidden.shape.last();
-        let (_, _, gate_attention) = chunks(modulation, width, 0)?;
-        let (shift_mlp, scale_mlp, gate_mlp) = chunks(modulation, width, 3)?;
-        let mlp_norm = RmsNorm::new(
-            self.norm2,
-            self.eps,
-            Epilogue::Modulated(Modulation {
-                shift: shift_mlp,
-                scale: scale_mlp,
-                gate: Some(gate_attention),
-                rows,
-                retained: Some(out),
-            }),
+            hidden,
+            normalized,
+            update,
+            out,
+            |normalized, update| {
+                Ok(self.attention.forward(
+                    f,
+                    normalized,
+                    factors,
+                    visible,
+                    segments,
+                    &scratch.attention,
+                    update,
+                )?)
+            },
         )?;
-        let stream = ResidualStream {
-            input: hidden,
-            output: update,
-        };
-        mlp_norm.forward(f, update, Some(stream), normalized)?;
-
-        // Feed-forward, then the second gated residual into the retained residual. `hidden` is
-        // spent by now, so the MLP's output lands there, and the gated residual writes over its
-        // `update` operand: the layer's output is `hidden`, in place.
-        self.mlp.forward(f, normalized, hidden)?;
-        let residual = Residual::new(Scale::Row(gate_mlp), None)?;
-        Ok(residual.forward(f, out, hidden, Some(rows), hidden)?)
+        Ok(Vec::new())
     }
 }
 
@@ -516,86 +441,19 @@ impl Transformer {
         f: &Forward,
         hidden: TensorView,
         modality: Modality,
-        modulation: TensorView,
+        modulation: &ModulationTable,
         rows: TensorView,
         block: u32,
         step: TensorView,
         out: TensorView,
     ) -> Result<()> {
-        let width = hidden.shape.last();
-        let (shift, scale) = halves(modulation, width)?;
-        let modulation = Modulation {
-            shift,
-            scale,
-            gate: None,
-            rows,
-            retained: None,
-        };
-        let norm = RmsNorm::new(
-            Weight::borrowed(self.norm_out.weight())?,
-            self.config.norm_eps,
-            Epilogue::Modulated(modulation),
-        )?;
-        let normalized = norm.apply(f, hidden, None)?;
+        let normalized = self.norm_out.apply(f, modulation, rows, hidden)?;
         // The final modulation is the checkpoint's own type (the BF16 norm times the BF16 table),
         // and the projection that follows is FP32 - so the widening is
         // here, between them, and not inside the norm.
         let wide = self.wide(f, normalized)?;
         self.project_head(f, wide, modality, block, step, out)
     }
-}
-
-/// The shift and scale halves of a `[rows, 2 * width]` modulation table, as row-strided weights.
-fn halves(table: TensorView, width: u64) -> Result<(Weight, Weight)> {
-    if table.shape.rank() != 2 || table.shape.last() != 2 * width {
-        return Err(Error::checkpoint(format!(
-            "an output modulation of {:?} is not [rows, 2 * {width}]",
-            table.shape.dims()
-        )));
-    }
-    let rows = table.shape.dim(0);
-    let stride = table.strides.get(0);
-    let element = table.dtype.bytes().unwrap_or(1);
-    let chunk = |index: u64| -> Result<Weight> {
-        let view = TensorView::with_strides(
-            nn::DevicePtr::new(table.ptr.address() + index * width * element),
-            table.dtype,
-            Shape::new(&[rows, width]),
-            nn::Strides::new(&[stride, 1]),
-        );
-        Ok(Weight::borrowed(view)?)
-    };
-    Ok((chunk(0)?, chunk(1)?))
-}
-
-/// The six affine vectors one layer's modulation table cuts into.
-///
-/// The table is `[3 · groups, 6 · hidden]`: shift, scale and gate of the attention block, then of
-/// the feed-forward block, in that order, so chunk `k` begins `k · hidden` elements into a row. The
-/// chunks are weights over the caller's gathered table - nothing is copied or retained here.
-fn chunks(table: TensorView, width: u64, first: u64) -> Result<(Weight, Weight, Weight)> {
-    if table.shape.rank() != 2 || table.shape.last() != 6 * width {
-        return Err(Error::checkpoint(format!(
-            "a modulation table of {:?} is not [rows, {}]",
-            table.shape.dims(),
-            6 * width
-        )));
-    }
-    let rows = table.shape.dim(0);
-    let stride = table.strides.get(0);
-    let chunk = |index: u64| -> Result<Weight> {
-        let elements = (first + index) * width;
-        let bytes = elements * table.dtype.bytes().unwrap_or(1);
-        let ptr = nn::DevicePtr::new(table.ptr.address() + bytes);
-        let view = TensorView::with_strides(
-            ptr,
-            table.dtype,
-            Shape::new(&[rows, width]),
-            nn::Strides::new(&[stride, 1]),
-        );
-        Ok(Weight::borrowed(view)?)
-    };
-    Ok((chunk(0)?, chunk(1)?, chunk(2)?))
 }
 
 /// One H3 DiT partition: the projections, the stack and the two output heads.
@@ -605,13 +463,12 @@ pub struct Transformer {
     /// The stack's one rotary embedding, published once and applied by every layer.
     rotary: Rotary,
     layers: Vec<Layer>,
-    norm_out: RmsNorm,
+    norm_out: AdaLnOut,
     /// The base form's one output head per modality. A student fuses its heads instead.
     video_out: Option<Linear>,
     audio_out: Option<Linear>,
     /// A parallel-decoding student's fused heads, when the checkpoint stacks more than one.
     heads: Option<StudentHeads>,
-    config: TransformerConfig,
 }
 
 impl Transformer {
@@ -629,7 +486,7 @@ impl Transformer {
     pub fn dtype(&self) -> nn::DType {
         self.layers
             .first()
-            .map_or_else(|| self.proj_in.weight().dtype, |layer| layer.norm1.dtype())
+            .map_or_else(|| self.proj_in.weight().dtype, |layer| layer.block.dtype())
     }
 
     /// Read one DiT partition of the checkpoint.
@@ -729,7 +586,7 @@ impl Transformer {
             )?),
             rotary,
             layers,
-            norm_out: RmsNorm::load(
+            norm_out: AdaLnOut::load(
                 &mut loader.scope("norm_out.norm"),
                 config.hidden_size,
                 config.norm_eps,
@@ -757,7 +614,6 @@ impl Transformer {
                 )?),
             },
             heads,
-            config: *config,
         })
     }
 
@@ -834,7 +690,7 @@ impl Transformer {
     pub fn forward(
         &self,
         f: &Forward,
-        adaln: &AdaLnCache,
+        adaln: &TimestepTable,
         step: TensorView,
         hidden: TensorView,
         rows: TensorView,
@@ -855,7 +711,7 @@ impl Transformer {
     fn stack(
         &self,
         f: &Forward,
-        adaln: &AdaLnCache,
+        adaln: &TimestepTable,
         step: TensorView,
         hidden: TensorView,
         rows: TensorView,
@@ -868,7 +724,7 @@ impl Transformer {
         let width = hidden.shape.last();
         let tokens = hidden.shape.dim(0);
         let arena = f.arena();
-        let entries = arena.tensor(nn::DType::I32, Shape::new(&[1, u64::from(groups.count())]))?;
+        let entries = arena.tensor(nn::DType::I32, Shape::new(&[1, groups]))?;
         adaln.entries_of(f, step, entries)?;
         // **The gather's own arrangement: one row per entry, the whole 18-vector table across the
         // columns** (`IndexRows::gather` derives its output from the table's columns and the index count,
@@ -879,14 +735,22 @@ impl Transformer {
         // these bytes and nothing is copied.
         let modulation = arena.tensor(
             hidden.dtype,
-            Shape::new(&[u64::from(groups.count()), adaln.layer_width()]),
+            Shape::new(&[groups, u64::from(TAGS) * VECTORS as u64 * width]),
         )?;
         // Two tables, because a layer's last rows are normalized for the next layer while the
         // layer still reads its own.
         let following = arena.tensor(modulation.dtype, modulation.shape)?;
         let tables = [modulation, following];
-        let per_layer = tables
-            .map(|table| table.reshape(Shape::new(&[u64::from(groups.count()) * 3, 6 * width])));
+        let [current, following] = tables.map(|table| {
+            ModulationTable::block(
+                table.reshape(Shape::new(&[
+                    groups * u64::from(TAGS),
+                    VECTORS as u64 * width,
+                ])),
+                width,
+            )
+        });
+        let per_layer = [current?, following?];
         let alternate = arena.tensor(hidden.dtype, Shape::new(&[tokens, width]))?;
         let scratch = Scratch::reserve(self, f, hidden, total_rows)?;
         adaln.layer(f, 0, entries, tables[0])?;
@@ -901,13 +765,13 @@ impl Transformer {
                     f,
                     hidden,
                     alternate,
-                    per_layer[index % 2],
+                    &per_layer[index % 2],
                     rows,
                     factors,
                     visible,
                     segments,
                     &scratch,
-                    next.map(|layer| (layer, per_layer[(index + 1) % 2])),
+                    next.map(|layer| (layer, &per_layer[(index + 1) % 2])),
                     arrived,
                 )
             })?;

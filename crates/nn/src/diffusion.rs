@@ -11,6 +11,7 @@
 //! Grid::Ladder       u_i = rung_i / train_steps in FP64;  sigma_i = time_shift(u_i) in FP64,
 //!                    rounded once to FP32, then the clean endpoint 0
 //! Euler              x += v · (sigma_i - sigma_{i+1})
+//! TimestepTable      the per-block modulation at each distinct level, gathered per step
 //! ```
 //!
 //! ## Precision
@@ -28,11 +29,12 @@
 //! indexed by the caller's step table. Every evaluation then launches against the same buffers, so
 //! one captured graph serves the whole trajectory; only the step table's index changes per replay.
 
-use ops::{Shape, Strides, TensorView};
+use ops::{DType, Shape, Strides, TensorView};
 
 use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::layers::{IndexRows, Residual, Scale};
+use crate::timestep::sinusoidal;
 use crate::weights::{Scope, Weight};
 
 /// The rectified-flow time shift `s u / (1 + (s - 1) u)`, evaluated in `T`.
@@ -245,6 +247,206 @@ impl Euler {
         let sample = elements(sample)?;
         start.forward(f, sample, sample, None, sample)
     }
+}
+
+/// The geometry of a [`TimestepTable`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimestepTableSpec {
+    /// Width of the sinusoidal embedding the levels are evaluated at.
+    pub frequency_dim: u32,
+    /// The blocks the table holds one modulation table for.
+    pub layers: u32,
+    /// Columns of one block's modulation row.
+    pub layer_columns: u64,
+    /// Columns of the final norm's modulation row.
+    pub output_columns: u64,
+    /// Element type of the modulation tables.
+    pub dtype: DType,
+}
+
+/// A diffusion stack's timestep conditioning, precomputed at each distinct noise level of a fixed
+/// schedule and gathered per step on the device.
+///
+/// A step conditions its rows on several timestep groups (a modality's level, a condition's
+/// level), and every block reads one modulation row per group. The schedule is fixed, so each
+/// block's modulation projection is evaluated once per **distinct** level, and a step gathers its
+/// groups' rows by entry index:
+///
+/// ```text
+/// frequencies  [entries, frequency_dim]   FP32   the sinusoidal embedding of each distinct level
+/// entries      [steps, groups]            i32    the entry each (step, group) reads
+/// layers.<i>   [entries, layer_columns]          block i's modulation at each entry
+/// output       [entries, output_columns]         the final norm's modulation at each entry
+/// ```
+///
+/// The model fills the block and output tables from `frequencies` once after loading, through its
+/// own projections. A step's index is a device value, so one captured graph serves every step.
+pub struct TimestepTable {
+    frequencies: Weight,
+    entries: Weight,
+    layers: Vec<Weight>,
+    output: Weight,
+}
+
+impl TimestepTable {
+    /// The distinct levels of `levels` and the entry each level reads.
+    ///
+    /// `levels` is step-major, `groups` per step. Levels are compared bitwise, and an entry is the
+    /// position of its level's first occurrence, so the entries follow the schedule's order. The
+    /// result is `(times, entries)`: one level per entry, and one entry per element of `levels`.
+    ///
+    /// # Errors
+    ///
+    /// No group, levels that are not whole steps, or more entries than an `i32` indexes.
+    pub fn entries(levels: &[f32], groups: u32) -> Result<(Vec<f32>, Vec<i32>)> {
+        if groups == 0 || levels.is_empty() || !levels.len().is_multiple_of(groups as usize) {
+            return Err(Error::shape(
+                "TimestepTable",
+                format!(
+                    "{} levels are not whole steps of {groups} groups",
+                    levels.len()
+                ),
+            ));
+        }
+        let mut times: Vec<f32> = Vec::new();
+        let mut entries = Vec::with_capacity(levels.len());
+        for level in levels {
+            let position = match times
+                .iter()
+                .position(|time| time.to_bits() == level.to_bits())
+            {
+                Some(position) => position,
+                None => {
+                    times.push(*level);
+                    times.len() - 1
+                }
+            };
+            entries.push(i32::try_from(position).map_err(|_| {
+                Error::shape(
+                    "TimestepTable",
+                    "more entries than an i32 indexes".to_owned(),
+                )
+            })?);
+        }
+        Ok((times, entries))
+    }
+
+    /// The table of `levels` (step-major, `groups` per step) under `scope`.
+    ///
+    /// Publishes `frequencies` and `entries` as constants and reserves `layers.<i>` and `output` as
+    /// writable tables, zero until the model fills them.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::entries`], an embedding width [`sinusoidal`] refuses, or a constant the loader
+    /// refuses.
+    pub fn load(
+        scope: &mut Scope<'_, '_>,
+        levels: &[f32],
+        groups: u32,
+        spec: TimestepTableSpec,
+    ) -> Result<Self> {
+        let (times, table) = Self::entries(levels, groups)?;
+        let entries = times.len() as u64;
+        let frequencies = scope.constant_f32(
+            "frequencies",
+            &[entries, u64::from(spec.frequency_dim)],
+            &sinusoidal(&times, spec.frequency_dim)?,
+        )?;
+        // One row per step of the levels, which may be more rows than distinct entries.
+        let steps = (table.len() / groups as usize) as u64;
+        let entry_table = scope.constant_i32("entries", &[steps, u64::from(groups)], &table)?;
+        let layers = (0..spec.layers)
+            .map(|index| {
+                scope.writable_zeros(
+                    &format!("layers.{index}"),
+                    spec.dtype,
+                    &[entries, spec.layer_columns],
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let output = scope.writable_zeros("output", spec.dtype, &[entries, spec.output_columns])?;
+        Ok(Self {
+            frequencies,
+            entries: entry_table,
+            layers,
+            output,
+        })
+    }
+
+    /// The groups one step reads.
+    pub fn groups(&self) -> u64 {
+        self.entries.shape().last()
+    }
+
+    /// The steps the entry table covers.
+    pub fn steps(&self) -> u64 {
+        self.entries.shape().dim(0)
+    }
+
+    /// `[entries, frequency_dim]` FP32: the embedding the model's projections read.
+    pub fn frequencies(&self) -> TensorView {
+        self.frequencies.view()
+    }
+
+    /// The writable block tables, one per block, for the model's projections to fill.
+    pub fn layer_tables(&self) -> Vec<TensorView> {
+        self.layers.iter().map(Weight::view).collect()
+    }
+
+    /// The writable final-norm table.
+    pub fn output_table(&self) -> TensorView {
+        self.output.view()
+    }
+
+    /// The entries step `step` reads: `step` is `[1]` i32 on the device and `out` `[1, groups]`
+    /// i32.
+    ///
+    /// # Errors
+    ///
+    /// The gather's refusal.
+    pub fn entries_of(&self, f: &Forward, step: TensorView, out: TensorView) -> Result<()> {
+        IndexRows.gather(f, self.entries.view(), step, out)
+    }
+
+    /// Block `layer`'s modulation rows at `entries` (the `[1, groups]` view
+    /// [`Self::entries_of`] wrote), into `out` `[groups, layer_columns]`.
+    ///
+    /// # Errors
+    ///
+    /// A block the table does not hold, or the gather's refusal.
+    pub fn layer(
+        &self,
+        f: &Forward,
+        layer: usize,
+        entries: TensorView,
+        out: TensorView,
+    ) -> Result<()> {
+        let table = self.layers.get(layer).ok_or_else(|| {
+            Error::shape(
+                "TimestepTable",
+                format!("{} block tables, not block {layer}", self.layers.len()),
+            )
+        })?;
+        IndexRows.gather(f, table.view(), flat(entries), out)
+    }
+
+    /// The final norm's modulation rows at `entries`, into `out` `[groups, output_columns]`.
+    ///
+    /// # Errors
+    ///
+    /// The gather's refusal.
+    pub fn output(&self, f: &Forward, entries: TensorView, out: TensorView) -> Result<()> {
+        IndexRows.gather(f, self.output.view(), flat(entries), out)
+    }
+}
+
+/// A `[1, groups]` entry list as the one-axis index list a gather takes.
+///
+/// [`TimestepTable::entries_of`] writes `[1, groups]` because the gather derives its output rows
+/// from `out`; the block and output gathers read the same bytes as `[groups]` indices.
+fn flat(entries: TensorView) -> TensorView {
+    entries.reshape(Shape::new(&[entries.shape.numel()]))
 }
 
 /// A contiguous view as the `[elements, 1]` column the elementwise step reads.

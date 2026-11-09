@@ -1,39 +1,31 @@
-//! The diffusion transformer's timestep conditioning: the AdaLN cache and the final output norm.
+//! The diffusion transformer's timestep conditioning: the H3 row layout of its modulation and the
+//! projections that compute it.
 //!
 //! Every layer is conditioned on the step's noise levels through six affine vectors per token -
 //! shift, scale and gate for the attention block and for the feed-forward block - and the final
 //! normalization carries two more. The released network computes them with one shared timestep
 //! embedding and one projection per layer, and the schedule is fixed, so the products are
-//! precomputed once for the schedule's distinct timesteps (an AdaLN cache). The cache is computed
-//! at load on the device: one `Linear(frequency_dim → time_hidden_dim)`, a SiLU, one
-//! `Linear(time_hidden_dim → time_dim)` and then, per layer, one `Linear(time_dim → 18 ·
+//! precomputed once for the schedule's distinct timesteps in an [`nn::diffusion::TimestepTable`].
+//! The table is computed at load on the device: one `Linear(frequency_dim → time_hidden_dim)`, a
+//! SiLU, one `Linear(time_hidden_dim → time_dim)` and then, per layer, one `Linear(time_dim → 18 ·
 //! hidden_size)` - about 260 MMAC per layer per distinct timestep, which no host-side boundary can
 //! absorb (`crate::Solver`'s note has the arithmetic).
 //!
-//! ## What a forward reads
+//! ## The row layout
 //!
-//! Three tables, all of them constants of the checkpoint and the schedule:
-//!
-//! ```text
-//! layers   [layers, entries, 18 · hidden]  BF16   one projection per layer per distinct timestep
-//! output   [entries, 2 · hidden]           BF16   the final normalization's shift and scale
-//! entries  [steps, groups]                 i32    the entry each (step, group) reads
-//! ```
-//!
-//! A step is a **device** value: the worker writes the step's index into a `[1]` i32 table, the
-//! cache gathers that row of `entries` to get `[groups]` entry ids, and each layer gathers its own
-//! rows by those ids. One captured graph therefore serves every step of the schedule.
-//!
-//! Within a step's rows, a token's row is `3 · group + tag`: the group is the timestep the token is
+//! A step reads one modulation row per `(group, tag)`: the group is the timestep the token is
 //! conditioned on (the generated video's, the generated audio's, a visual condition's, an audio
-//! reference's) and the tag is the modality the token belongs to (video 0, text 1, audio 2). The
-//! worker's per-request `modulation_indices` table holds that value for every packed row, and the
-//! layers of [`crate::transformer`] index with it.
+//! reference's) and the tag is the modality the token belongs to (video 0, text 1, audio 2). A
+//! layer's table row holds the three tags' six vectors each, so the gathered `[groups, 18 · hidden]`
+//! rows read as `[3 · groups, 6 · hidden]` and a token's row is `3 · group + tag`. The worker's
+//! per-request `modulation_indices` table holds that value for every packed row, and the layers of
+//! [`crate::transformer`] index with it.
 
 use nn::Shape;
-use nn::layers::{Bias, IndexRows, Linear, Parallel};
+use nn::diffusion::TimestepTable;
+use nn::layers::{Bias, Linear, Parallel};
 use nn::timestep::{TimestepEmbedding, TimestepSpec};
-use nn::weights::{Weight, WeightLoader};
+use nn::weights::WeightLoader;
 use nn::{DType, Forward, TensorView};
 
 use crate::{Error, Result};
@@ -83,136 +75,15 @@ pub const fn row(group: u32, tag: u32) -> u32 {
     TAGS * group + tag
 }
 
-/// The AdaLN cache: the per-layer modulation tables a step gathers from.
-pub struct AdaLnCache {
-    layers: Vec<Weight>,
-    output: Weight,
-    entries: Weight,
-    groups: Groups,
-    hidden_size: u32,
-}
-
-/// A `[1, count]` index list as the flat `[count]` view the gather operator takes.
+/// The noise level of every group of every step, step-major: the levels the timestep table holds.
 ///
-/// The operator's indices are one axis (`ops::logits::GatherArgs::rows`) while its output must be
-/// two - `[count, columns]` - because it derives the row count from `out`. `entries_of` writes
-/// `[1, groups]` to satisfy the output's shape, so the same bytes reach the layer and output
-/// gathers as a two-axis view: the stack's tenth launch refused exactly that (`expected 1 axes,
-/// found 2`). The arrangement is stated once, here, rather than at each of the three gathers.
-fn flat_rows(rows: TensorView) -> TensorView {
-    rows.reshape(Shape::new(&[rows.shape.numel()]))
-}
-
-impl AdaLnCache {
-    /// The cache over `layers`' tables, the final normalization's, and the entry table.
-    ///
-    /// `layers` holds one `[entries, 18 · hidden_size]` table per transformer layer, `output` the
-    /// `[entries, 2 · hidden_size]` table of the final normalization, and `entries` the
-    /// `[steps, groups]` i32 table of the entry each group of each step reads.
-    pub fn new(
-        layers: Vec<Weight>,
-        output: Weight,
-        entries: Weight,
-        groups: Groups,
-        hidden_size: u32,
-        _time_dim: u32,
-    ) -> Result<Self> {
-        if layers.is_empty() {
-            return Err(Error::checkpoint(
-                "the H3 AdaLN cache needs one table per transformer layer".to_owned(),
-            ));
-        }
-        let width = u64::from(hidden_size) * VECTORS as u64 * u64::from(TAGS);
-        for (index, table) in layers.iter().enumerate() {
-            if table.shape().rank() != 2 || table.shape().last() != width {
-                return Err(Error::checkpoint(format!(
-                    "H3 AdaLN layer {index} is [entries, {width}], not {:?}",
-                    table.shape().dims()
-                )));
-            }
-        }
-        if output.shape().rank() != 2 || output.shape().last() != 2 * u64::from(hidden_size) {
-            return Err(Error::checkpoint(format!(
-                "H3 AdaLN output table is [entries, {}], not {:?}",
-                2 * u64::from(hidden_size),
-                output.shape().dims()
-            )));
-        }
-        if entries.shape().rank() != 2 || entries.shape().last() != u64::from(groups.count()) {
-            return Err(Error::checkpoint(format!(
-                "H3 AdaLN entry table is [steps, {}], not {:?}",
-                groups.count(),
-                entries.shape().dims()
-            )));
-        }
-        Ok(Self {
-            layers,
-            output,
-            entries,
-            groups,
-            hidden_size,
-        })
-    }
-
-    /// The timestep groups a step reads.
-    pub const fn groups(&self) -> Groups {
-        self.groups
-    }
-
-    /// The entry ids one step reads: `[1, groups]` i32, gathered from the entry table's `step` row.
-    ///
-    /// `step` is `[1]` i32 - the step index, which the worker writes - and `out` a `[1, groups]`
-    /// i32 scratch view it overwrites with the entries.
-    pub fn entries_of(&self, f: &Forward, step: TensorView, out: TensorView) -> Result<()> {
-        Ok(IndexRows.gather(f, self.entries.view(), step, out)?)
-    }
-
-    /// The modulation rows of layer `layer` at these entries: `[groups, 18 · hidden_size]`.
-    ///
-    /// `entries` is the `[1, groups]` i32 view [`AdaLnCache::entries_of`] wrote; `out` is the
-    /// layer's `[groups, 18 · hidden_size]` view, into which the layer's six vectors per tag land.
-    pub fn layer(
-        &self,
-        f: &Forward,
-        layer: usize,
-        entries: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        let table = self.layers.get(layer).ok_or_else(|| {
-            Error::checkpoint(format!(
-                "H3 AdaLN cache covers {} layers, not {layer}",
-                self.layers.len()
-            ))
-        })?;
-        Ok(IndexRows.gather(f, table.view(), flat_rows(entries), out)?)
-    }
-
-    /// The final normalization's modulation rows at these entries: `[groups, 2 · hidden_size]`.
-    pub fn output(&self, f: &Forward, entries: TensorView, out: TensorView) -> Result<()> {
-        Ok(IndexRows.gather(f, self.output.view(), flat_rows(entries), out)?)
-    }
-
-    /// The columns one entry's modulation table holds: the three interval tags of six vectors.
-    ///
-    /// A gather's output is `[entries, this]` - the shape the operator derives from the table -
-    /// while a block cuts one interval at a time out of the same bytes.
-    pub fn layer_width(&self) -> u64 {
-        u64::from(TAGS) * VECTORS as u64 * u64::from(self.hidden_size)
-    }
-}
-
-/// The distinct noise levels the cache holds and the entry each step's group reads.
-///
-/// The cache is indexed by *value*, not by step: the generated video and audio have their own
-/// noise level per step, the visual condition's level is the video's floored at the clean level the
-/// condition is anchored at ([`crate::denoiser::VISUAL_CONDITION_TIME`]), and an
-/// audio reference is clean at the top of the schedule. Steps whose levels coincide share one entry,
-/// which is where the cache's saving comes from - the schedule's points repeat across the two
-/// modalities and the condition groups.
-///
-/// The result is `(times, entries)`: one FP32 network time per entry, and one entry index per
-/// `(step, group)` in step-major order, ready to be published as the `[steps, groups]` table.
-pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>, Vec<i32>)> {
+/// The generated video and audio have their own level per step; the visual condition's level is
+/// the video's floored at the clean level the condition is anchored at
+/// ([`crate::denoiser::VISUAL_CONDITION_TIME`]), and an audio reference is clean at the top of the
+/// schedule. Levels that coincide share one table entry
+/// ([`nn::diffusion::TimestepTable::entries`]), which is where the table's saving comes from - the
+/// schedule's points repeat across the two modalities and the condition groups.
+pub fn levels(video: &[f32], audio: &[f32], groups: Groups) -> Result<Vec<f32>> {
     if video.is_empty() || video.len() != audio.len() {
         return Err(Error::checkpoint(format!(
             "{} video and {} audio noise levels are not one schedule's",
@@ -220,40 +91,21 @@ pub fn entries(video: &[f32], audio: &[f32], groups: Groups) -> Result<(Vec<f32>
             audio.len()
         )));
     }
-    let mut times: Vec<f32> = Vec::new();
-    let mut table = Vec::with_capacity(video.len() * groups.count() as usize);
+    let mut levels = Vec::with_capacity(video.len() * groups.count() as usize);
     for (video, audio) in video.iter().zip(audio) {
-        let mut levels = vec![*video, *audio];
+        levels.extend([*video, *audio]);
         if groups == Groups::Conditioned {
             // A visual condition sits at the generated video's level until that level is cleaner
             // than its anchor, and an audio reference is always clean.
-            levels.push(video.max(crate::denoiser::VISUAL_CONDITION_TIME));
-            levels.push(crate::denoiser::AUDIO_CONDITION_TIME);
-        }
-        for level in levels {
-            let position = match times
-                .iter()
-                .position(|other| other.to_bits() == level.to_bits())
-            {
-                Some(position) => position,
-                None => {
-                    times.push(level);
-                    times.len() - 1
-                }
-            };
-            table.push(i32::try_from(position).map_err(|_| {
-                Error::checkpoint("an AdaLN cache of more than i32::MAX entries".to_owned())
-            })?);
+            levels.extend([
+                video.max(crate::denoiser::VISUAL_CONDITION_TIME),
+                crate::denoiser::AUDIO_CONDITION_TIME,
+            ]);
         }
     }
-    Ok((times, table))
+    Ok(levels)
 }
 
-/// The checkpoint projections the cache is built from, read once at load.
-///
-/// The reference builds the cache with one shared pair of FP32 linear maps over the sinusoidal
-/// timestep embedding and one projection per layer, then releases them. Nothing runs them per
-/// evaluation, so they are held only until `Projections::fill` has produced the tables once.
 pub struct Projections {
     /// `time_embedder`: `linear_1` `[time_hidden, frequency]` and `linear_2` `[time_dim,
     /// time_hidden]`, FP32, with their biases.
@@ -288,37 +140,25 @@ impl Projections {
         // halves coincide and the crossing is skipped.
         let hidden = config.hidden_size;
         let rows = VECTORS as u32 * hidden * TAGS;
-        // A module read at the deployment's type, or pinned to `dtype`.
-        let projection = |loader: &mut WeightLoader<'_>,
-                          name: &str,
-                          inputs: u32,
-                          outputs: u32,
-                          dtype: Option<DType>|
-         -> Result<Linear> {
-            let mut module = loader.scope(name);
-            let linear = match dtype {
-                Some(dtype) => Linear::load(
-                    &mut module.pinned(dtype),
-                    inputs,
-                    outputs,
-                    Bias::Present,
-                    Parallel::None,
-                ),
-                None => Linear::load(&mut module, inputs, outputs, Bias::Present, Parallel::None),
-            };
-            Ok(linear?)
+        // A modulation projection, read at the deployment's type.
+        let projection = |loader: &mut WeightLoader<'_>, name: &str, outputs: u32| {
+            Linear::load(
+                &mut loader.scope(name),
+                config.time_dim,
+                outputs,
+                Bias::Present,
+                Parallel::None,
+            )
         };
         let layers = (0..config.num_hidden_layers)
             .map(|index| {
                 projection(
                     loader,
                     &format!("transformer_blocks.{index}.adaln_proj.linear"),
-                    config.time_dim,
                     rows,
-                    None,
                 )
             })
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<nn::Result<Vec<_>>>()?;
         Ok(Self {
             time: TimestepEmbedding::load(
                 &mut loader.scope("time_embedder").pinned(DType::F32),
@@ -329,27 +169,24 @@ impl Projections {
                 },
             )?,
             layers,
-            output: projection(loader, "norm_out.linear", config.time_dim, 2 * hidden, None)?,
+            output: projection(loader, "norm_out.linear", 2 * hidden)?,
             frequency_dim: config.frequency_dim,
             time_dim: config.time_dim,
         })
     }
 
-    /// Run the cache's projections over one embedding, `[groups, frequency_dim]` FP32.
+    /// Fill `table`'s block and output tables from its embedding, `[entries, frequency_dim]` FP32.
     ///
-    /// `layers_out` holds one view per transformer layer, `[groups, 18 * hidden]` each, and
-    /// `output_out` is `[groups, 2 * hidden]`: the tables a forward then gathers rows from. The
-    /// launch is captured with every other, so a table is computed once after loading and never
-    /// again - the times it is computed at are the schedule's, which do not change per request.
+    /// Each block table is `[entries, 18 * hidden]` and the output table `[entries, 2 * hidden]`:
+    /// the tables a forward then gathers rows from. The launch is captured with every other, so a
+    /// table is computed once after loading and never again - the times it is computed at are the
+    /// schedule's, which do not change per request.
     ///
     /// The weights are the checkpoint's `[out, in]` matrices, so the geometry is `NxK`.
-    pub fn compute(
-        &self,
-        f: &Forward,
-        embedding: TensorView,
-        layers_out: &[TensorView],
-        output_out: TensorView,
-    ) -> Result<()> {
+    pub fn compute(&self, f: &Forward, table: &TimestepTable) -> Result<()> {
+        let embedding = table.frequencies();
+        let layers_out: &[TensorView] = &table.layer_tables();
+        let output_out = table.output_table();
         if layers_out.len() != self.layers.len() {
             return Err(Error::checkpoint(format!(
                 "{} AdaLN layer views for {} layers",
@@ -434,15 +271,6 @@ impl Projections {
         Ok(self.output.forward(f, narrow, output_out)?)
     }
 
-    /// The sinusoidal embedding a step's network times need: `[groups, frequency_dim]` FP32.
-    ///
-    /// Half a pairwise spectrum over the timestep, `sin` on the even columns and `cos` on the odd
-    /// ones, at the frequencies `theta_high^(-2i / frequency_dim)`: the released recipe, written
-    /// here because it is the only part of the cache that is arithmetic on a host value.
-    pub fn frequencies(&self, times: &[f32]) -> Result<Vec<f32>> {
-        Ok(nn::timestep::sinusoidal(times, self.frequency_dim)?)
-    }
-
     /// The element type the modulation projections read: the tables' type, and the cache's.
     pub fn dtype(&self) -> DType {
         self.layers[0].weight().dtype
@@ -468,28 +296,28 @@ mod tests {
     }
 
     #[test]
-    fn the_entries_are_the_distinct_noise_levels() {
-        // Two steps, one modality pair, the generated groups only: four levels, no sharing.
-        let (times, table) = entries(&[0.9, 0.5], &[0.8, 0.4], Groups::Generated).unwrap();
+    fn a_generated_step_reads_the_video_and_audio_levels() {
+        let levels = levels(&[0.9, 0.5], &[0.8, 0.4], Groups::Generated).unwrap();
+        assert_eq!(levels, vec![0.9, 0.8, 0.5, 0.4]);
+        let (times, table) = TimestepTable::entries(&levels, Groups::Generated.count()).unwrap();
         assert_eq!(times, vec![0.9, 0.8, 0.5, 0.4]);
         assert_eq!(table, vec![0, 1, 2, 3]);
-    }
-
-    #[test]
-    fn a_shared_level_is_one_entry() {
-        // The same pair of levels in both steps, as the last step of a schedule: two entries.
-        let (times, table) = entries(&[1.0, 1.0], &[1.0, 1.0], Groups::Generated).unwrap();
-        assert_eq!(times, vec![1.0]);
-        assert_eq!(table, vec![0, 0, 0, 0]);
     }
 
     #[test]
     fn a_conditioned_step_reads_four_levels() {
         // The visual condition is the video's level floored at the clean anchor, and the audio
         // reference is clean: at the first step both are 1.0, at the second they separate.
-        let (times, table) = entries(&[1.0, 0.5], &[1.0, 0.5], Groups::Conditioned).unwrap();
+        let levels = levels(&[1.0, 0.5], &[1.0, 0.5], Groups::Conditioned).unwrap();
+        let (times, table) = TimestepTable::entries(&levels, Groups::Conditioned.count()).unwrap();
         assert_eq!(times, vec![1.0, 0.5, 0.999]);
         assert_eq!(table, vec![0, 0, 0, 0, 1, 1, 2, 0]);
+    }
+
+    #[test]
+    fn a_schedule_of_unequal_modalities_is_refused() {
+        assert!(levels(&[1.0, 0.5], &[1.0], Groups::Generated).is_err());
+        assert!(levels(&[], &[], Groups::Generated).is_err());
     }
 
     #[test]

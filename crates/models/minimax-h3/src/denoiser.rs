@@ -40,12 +40,14 @@
 //! in the order `Layouts::state_tables` names them; nothing of a request reaches a capture as a
 //! host value, and no table is uploaded from inside a forward.
 
+use nn::blocks::ModulationTable;
 use nn::capability::{ConditionRole, LatentShape, Layout, StateTable, TableValues, VideoRequest};
-use nn::{DType, Forward, Shape, TensorView, Weight, WeightLoader};
+use nn::diffusion::{TimestepTable, TimestepTableSpec};
+use nn::{DType, Forward, Shape, TensorView, WeightLoader};
 
 use crate::attention::Factors;
 use crate::config::{Canvas, DenoiserConfig, MAX_FRAMES};
-use crate::modulation::{AdaLnCache, Groups, Projections};
+use crate::modulation::{Groups, Projections};
 use crate::packing::{self, DensePacking};
 use crate::schedule::{Modality, Schedule};
 use crate::solver::Solver;
@@ -1196,7 +1198,7 @@ fn pieces_of(
 
 /// The level a visual condition is anchored at: `t z + (1 - t) noise` with `t` this,
 /// and the level its modulation group sits at
-/// until the generated video is cleaner than it ([`crate::modulation::entries`]).
+/// until the generated video is cleaner than it ([`crate::modulation::levels`]).
 pub const VISUAL_CONDITION_TIME: f32 = 0.999;
 
 /// The level an audio reference sits at: its latent unchanged, so nothing is mixed in.
@@ -1366,13 +1368,9 @@ pub struct Denoiser {
     solver: Solver,
     transformer: Transformer,
     projections: Projections,
-    cache: AdaLnCache,
-    /// The layer tables `cache` gathers rows from, retained so the post-load launch can write them.
-    adaln_layers: Vec<Weight>,
-    /// The output table of the same cache.
-    adaln_output: Weight,
-    /// The schedule's entry times as their sinusoidal embedding, `[entries, frequency_dim]` FP32.
-    frequencies: Weight,
+    /// The modulation at each distinct level of the schedule, which `projections` fill once after
+    /// loading.
+    cache: TimestepTable,
     evaluations: u32,
     /// The text refiner: the prompt features the DiT conditions on, refined once per request.
     refiner: crate::conditioning::TokenRefiner,
@@ -2452,14 +2450,15 @@ impl Denoiser {
         )?;
 
         // The output: the step's final modulation, then each modality's head.
-        let groups = self.cache.groups().count() as u64;
+        let groups = self.cache.groups();
         let entries = arena.tensor(DType::I32, Shape::new(&[1, groups]))?;
         self.cache.entries_of(f, step_index, entries)?;
-        // This buffer's element is the stack's. The cache refuses a table of another type
-        // (`AdaLnCache::output` compares the destination with its own weights), so a cache whose
-        // projections drifted away from the stack's type is a named refusal and not a mixed gather.
+        // This buffer's element is the stack's. The gather refuses an output of another type than
+        // its table, so a cache whose projections drifted away from the stack's type is a named
+        // refusal and not a mixed gather.
         let modulation = arena.tensor(hidden.dtype, Shape::new(&[groups, 2 * hidden_size]))?;
         self.cache.output(f, entries, modulation)?;
+        let modulation = ModulationTable::output(modulation, hidden_size)?;
 
         // The solver's scale: one FP32 word the `step` table indexes into the coefficient table.
         let coefficient = arena.tensor(DType::F32, Shape::new(&[1, 1]))?;
@@ -2485,7 +2484,7 @@ impl Denoiser {
                 f,
                 video_hidden,
                 Modality::Video,
-                modulation,
+                &modulation,
                 video_groups,
                 step.index,
                 step_index,
@@ -2539,7 +2538,7 @@ impl Denoiser {
                     f,
                     audio_hidden,
                     Modality::Audio,
-                    modulation,
+                    &modulation,
                     audio_groups,
                     step.index,
                     step_index,
@@ -2639,61 +2638,38 @@ impl Denoiser {
             .iter()
             .any(|task| !matches!(task, crate::VideoTask::TextToVideoAudio));
         let groups = Groups::of(conditioned);
-        let (times, table) = crate::modulation::entries(
+        let levels = crate::modulation::levels(
             &schedule.timesteps(Modality::Video),
             &schedule.timesteps(Modality::Audio),
             groups,
         )?;
-        let entries = times.len() as u64;
         let hidden = u64::from(config.transformer.hidden_size);
-        let columns = ADALN_COLUMNS * hidden;
-        let frequency = u64::from(config.transformer.frequency_dim);
         let projections = Projections::load(&config.transformer, loader)?;
-
-        let mut adaln = loader.scope("adaln");
-        let frequencies = adaln.constant_f32(
-            "frequencies",
-            &[entries, frequency],
-            &projections.frequencies(&times)?,
-        )?;
-        // One row per timestep of the ladder, and the row count comes from the table itself: the
-        // grid holds a level for the clean end as well, so a 49-evaluation schedule states 50 rows
-        // (one more than the steps a request takes), while `entries` counts the *distinct* levels
-        // those rows point at - which dedup can make fewer than the rows. Declaring `evaluations` or
-        // `entries` rows made the bytes and the shape disagree and the load refused.
-        let entry_rows = u64::try_from(table.len() / groups.count() as usize).map_err(|_| {
-            Error::checkpoint("an AdaLN entry table wider than u64::MAX rows".to_owned())
-        })?;
-        if entry_rows < u64::from(evaluations) {
-            return Err(Error::checkpoint(format!(
-                "the AdaLN entry table has {entry_rows} rows for {evaluations} evaluations"
-            )));
-        }
-        let entry_table =
-            adaln.constant_i32("entries", &[entry_rows, u64::from(groups.count())], &table)?;
-
         // The tables are the modulation projections' own type, because the reference allocates them
         // from the product - so at a BF16 stack they are BF16 and at an
         // FP32 deployment FP32. The timestep pair in front of them stays FP32, and the one narrowing
         // between the two halves lives in `Projections::compute`.
-        let table_type = projections.dtype();
-        let mut adaln_layers = Vec::with_capacity(config.transformer.num_hidden_layers as usize);
-        for index in 0..config.transformer.num_hidden_layers {
-            adaln_layers.push(adaln.writable_zeros(
-                &format!("layers.{index}"),
-                table_type,
-                &[entries, columns],
-            )?);
-        }
-        let adaln_output = adaln.writable_zeros("output", table_type, &[entries, 2 * hidden])?;
-        let cache = AdaLnCache::new(
-            adaln_layers.clone(),
-            adaln_output,
-            entry_table,
-            groups,
-            config.transformer.hidden_size,
-            config.transformer.time_dim,
+        let cache = TimestepTable::load(
+            &mut loader.scope("adaln"),
+            &levels,
+            groups.count(),
+            TimestepTableSpec {
+                frequency_dim: config.transformer.frequency_dim,
+                layers: config.transformer.num_hidden_layers,
+                layer_columns: ADALN_COLUMNS * hidden,
+                output_columns: 2 * hidden,
+                dtype: projections.dtype(),
+            },
         )?;
+        // One row per timestep of the ladder: the grid holds a level for the clean end as well, so
+        // a 49-evaluation schedule states 50 rows (one more than the steps a request takes), while
+        // the table's entries count the *distinct* levels those rows point at.
+        if cache.steps() < u64::from(evaluations) {
+            return Err(Error::checkpoint(format!(
+                "the AdaLN entry table has {} rows for {evaluations} evaluations",
+                cache.steps()
+            )));
+        }
         // A sparse deployment states the compression's tile bound once, from its own layouts: the
         // score matrix is `[heads, query tiles, tiles]` and must cover every video tile any layout
         // it serves can hold. A dense one has no tiles, and the stack's attention kind never reads
@@ -2740,9 +2716,6 @@ impl Denoiser {
             transformer,
             projections,
             cache,
-            adaln_layers,
-            adaln_output,
-            frequencies,
             evaluations,
             refiner,
             places_encoders: partition
@@ -2787,9 +2760,7 @@ impl Denoiser {
                 out.len()
             )));
         }
-        let views: Vec<TensorView> = self.adaln_layers.iter().map(|layer| layer.view()).collect();
-        self.projections
-            .compute(f, self.frequencies.view(), &views, self.adaln_output.view())
+        self.projections.compute(f, &self.cache)
     }
 }
 
