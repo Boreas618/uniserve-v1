@@ -74,7 +74,7 @@ fn a_manifest_says_what_the_package_is_and_how_it_is_built() {
 }
 
 #[test]
-fn a_package_covers_a_descriptor_by_dimension_values_or_by_name() {
+fn a_package_covers_a_descriptor_by_its_enumerated_values() {
     let root = package(
         REASONABLE,
         &["src/rms.py", "src/compile.py", "tuning/tactics.json"],
@@ -92,34 +92,85 @@ fn a_package_covers_a_descriptor_by_dimension_values_or_by_name() {
     assert!(!descriptors.covers("nonsense"));
 }
 
-#[test]
-fn a_package_may_name_descriptors_the_dimensions_do_not_express() {
-    let text = r#"
-op = "paged_attention"
-backend = "trtllm"
+/// The manifest of a Triton `cache_block_scatter` package whose `descriptors`
+/// line is `descriptors`: width-generic dimensions declared by constraint.
+fn generic(descriptors: &str) -> String {
+    format!(
+        r#"
+op = "cache_block_scatter"
+backend = "triton"
 
 [toolchain]
-kind = "nvcc"
-version = "13.0"
+kind = "triton"
+version = "3.7.1"
 
 [module]
-form = "native"
-
-[module.entries]
-launch = "uniserve_paged_attention_launch"
+form = "cubin"
+metadata = "metadata.json"
 
 [source]
-kind = "cubin"
-files = ["cubin/attention.cubin"]
+kind = "triton"
+files = ["src/scatter.py"]
+script = "src/build.py"
 
 [kernel]
 architectures = ["sm_100a"]
-descriptors = { dimensions = { dtype = ["bf16"] }, keys = ["head_dim_128_page_64_mask"] }
-"#;
-    let root = package(text, &["cubin/attention.cubin"]);
+descriptors = {descriptors}
+"#
+    )
+}
+
+/// A width the kernel handles generically is declared by the constraint the
+/// kernel imposes, and the package covers every key whose value meets it.
+#[test]
+fn a_package_covers_a_generic_dimension_by_its_constraint() {
+    let text = generic(
+        r#"{ dimensions = { dtype = ["bf16"], columns = { multiple = 16 }, block = { power_of_two = true, max = 8192 }, first = { min = 0 }, shape = { separator = "x" }, epsilon = { bits = 32 } } }"#,
+    );
+    let root = package(&text, &["src/scatter.py", "src/build.py"]);
     let manifest = Manifest::load(root.path()).unwrap();
-    assert!(manifest.covers("head_dim_128_page_64_mask"));
-    assert!(manifest.covers("dtype_bf16"));
+    let key = |columns: &str, block: &str, first: &str, shape: &str, epsilon: &str| {
+        format!(
+            "dtype_bf16_columns_{columns}_block_{block}_first_{first}_shape_{shape}_epsilon_{epsilon}"
+        )
+    };
+
+    // Any width that meets every constraint, listed nowhere.
+    assert!(manifest.covers(&key("5376", "1024", "0", "2048x64x1x128", "0x358637bd")));
+    assert!(manifest.covers(&key("16", "8192", "151936", "7", "0x3727c5ac")));
+    // Each constraint refuses what it excludes.
+    assert!(!manifest.covers(&key("5377", "1024", "0", "7", "0x358637bd")));
+    assert!(!manifest.covers(&key("16", "1536", "0", "7", "0x358637bd")));
+    assert!(!manifest.covers(&key("16", "16384", "0", "7", "0x358637bd")));
+    assert!(!manifest.covers(&key("0", "1024", "0", "7", "0x358637bd")));
+    assert!(!manifest.covers(&key("16", "1024", "0", "2048x0x1", "0x358637bd")));
+    assert!(!manifest.covers(&key("16", "1024", "0", "7", "0x123456789")));
+    // A key prints canonical text, so another spelling of a value names nothing.
+    assert!(!manifest.covers(&key("016", "1024", "0", "7", "0x358637bd")));
+    assert!(!manifest.covers(&key("16", "1024", "0", "7", "0x358637BD")));
+    assert!(!manifest.covers(&key("16", "1024", "-1", "7", "0x358637bd")));
+    // An enumeration beside them still admits only its values.
+    assert!(!manifest.covers(&key("16", "1024", "0", "7", "0x358637bd").replace("bf16", "f16")));
+}
+
+/// A constraint that admits no value, or mixes a float with integer fields, is
+/// not a statement about a kernel, and the manifest is refused.
+#[test]
+fn a_contradictory_constraint_is_refused() {
+    for descriptors in [
+        r#"{ dimensions = { columns = { multiple = 0 } } }"#,
+        r#"{ dimensions = { columns = { min = 8, max = 4 } } }"#,
+        r#"{ dimensions = { epsilon = { bits = 16 } } }"#,
+        r#"{ dimensions = { epsilon = { bits = 32, min = 0 } } }"#,
+        r#"{ dimensions = { shape = { separator = "_" } } }"#,
+        r#"{ dimensions = { columns = { step = 8 } } }"#,
+    ] {
+        let root = package(&generic(descriptors), &["src/scatter.py", "src/build.py"]);
+        assert!(
+            Manifest::load(root.path()).is_err(),
+            "{descriptors} is refused"
+        );
+    }
 }
 
 #[test]
@@ -428,7 +479,7 @@ files = ["src/lib.rs"]
 
 [kernel]
 architectures = ["wasm32"]
-descriptors = { keys = ["default"] }
+descriptors = { dimensions = { mode = ["default"] } }
 "#;
     let root = package(text, &["src/lib.rs"]);
     assert!(Manifest::load(root.path()).is_err());
@@ -562,10 +613,10 @@ dimensions = { dtype = ["bf16"], head_dim = ["128"], q_heads = ["56"], rotation 
     );
 }
 
-/// The one-table form is unchanged: a package that writes `[kernel.descriptors]`
-/// with a single `dimensions` table parses and covers as it always did.
+/// A package whose keys all have one shape writes one `[kernel.descriptors]`
+/// table, and covers the keys its dimensions admit.
 #[test]
-fn a_package_may_still_declare_one_descriptor_table() {
+fn a_package_may_declare_one_descriptor_table() {
     let directory = tempfile::tempdir().unwrap();
     let package = directory.path();
     std::fs::create_dir_all(package.join("src")).unwrap();

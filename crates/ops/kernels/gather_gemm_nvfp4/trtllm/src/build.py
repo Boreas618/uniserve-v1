@@ -135,16 +135,71 @@ def fields_of(package, descriptor):
         if name is None:
             raise SystemExit(f"{descriptor}: no dimension starts {remaining!r}")
         rest = remaining[len(name) + 1 :]
-        values = sorted(dimensions[name], key=len, reverse=True)
-        value = next((one for one in values if rest == one or rest.startswith(one + "_")), None)
+        value = declared_value(dimensions[name], rest)
         if value is None:
-            raise SystemExit(f"{descriptor}: {name} takes none of {dimensions[name]} at {rest!r}")
+            raise SystemExit(
+                f"{descriptor}: {name} admits no value at {rest!r}"
+            )
         fields[name] = value
         remaining = rest[len(value) :].removeprefix("_")
     missing = sorted(set(dimensions) - set(fields))
     if missing:
         raise SystemExit(f"{descriptor}: the descriptor names no {missing}")
     return fields
+
+
+def declared_value(declared, rest):
+    """The value a declared dimension reads at the start of ``rest``, or None.
+
+    An enumeration reads the longest of its values that ``rest`` starts with
+    whole. A constraint table (``{ multiple = 16 }``, ``{ bits = 32 }``,
+    ``{ separator = "x" }``) reads the text up to the next ``_``, which no
+    integer, extent tuple or float bit pattern holds, and admits it when it
+    meets the constraint, as the Program Server's manifest does.
+    """
+    if isinstance(declared, list):
+        return next(
+            (
+                one
+                for one in sorted(declared, key=len, reverse=True)
+                if rest == one or rest.startswith(one + "_")
+            ),
+            None,
+        )
+    value = rest.split("_", 1)[0]
+    return value if admits(declared, value) else None
+
+
+def admits(constraint, value):
+    """Whether ``value``, as a key spells it, meets a constraint table."""
+    if "bits" in constraint:
+        # A float enters a key as its bit pattern: `0x`, then lowercase
+        # hexadecimal without leading zeros.
+        digits = value.removeprefix("0x")
+        return (
+            value.startswith("0x")
+            and 0 < len(digits) <= constraint["bits"] // 4
+            and all(digit in "0123456789abcdef" for digit in digits)
+            and (digits == "0" or not digits.startswith("0"))
+        )
+    separator = constraint.get("separator")
+    for part in value.split(separator) if separator else [value]:
+        # An integer enters a key in canonical decimal: `064` names nothing.
+        if not part or any(digit not in "0123456789" for digit in part):
+            return False
+        if part != "0" and part.startswith("0"):
+            return False
+        number = int(part)
+        if number < constraint.get("min", 1):
+            return False
+        if number > constraint.get("max", number):
+            return False
+        if number % constraint.get("multiple", 1) != 0:
+            return False
+        power = number > 0 and number & (number - 1) == 0
+        if constraint.get("power_of_two") and not power:
+            return False
+    return True
 
 
 def distribution():

@@ -255,12 +255,11 @@ pub const WASM_TARGET: &str = "wasm32";
 /// An operator's key shape varies by variant — `qk_norm_rope` prints `rotated`
 /// only when its rotation is narrowed, `rotary_factors` prints `axes`,
 /// `sections` and `interleaved` only when it is sectioned — and a package serves
-/// an *operator*, not one key shape. A manifest writes either the one table it
-/// always wrote
+/// an *operator*, not one key shape. A manifest writes either one table
 ///
 /// ```toml
 /// [kernel.descriptors]
-/// dimensions = { dtype = ["bf16"], head_dim = ["128"], rotated = ["32"] }
+/// dimensions = { dtype = ["bf16"], head_dim = ["128"], rotated = { multiple = 2 } }
 /// ```
 ///
 /// or one table per shape
@@ -270,7 +269,7 @@ pub const WASM_TARGET: &str = "wasm32";
 /// dimensions = { dtype = ["bf16"], head_dim = ["128"] }
 ///
 /// [[kernel.descriptors]]
-/// dimensions = { dtype = ["bf16"], head_dim = ["128"], rotated = ["32"] }
+/// dimensions = { dtype = ["bf16"], head_dim = ["128"], rotated = { multiple = 2 } }
 /// ```
 ///
 /// A key is covered when it covers one of them, so a backend name keeps meaning
@@ -313,33 +312,32 @@ impl DescriptorShapes {
 /// A descriptor is the set of parameter values one compilation covers; its
 /// key is their canonical string, such as `dtype_bf16_head_dim_128_page_64`,
 /// and the key is the module path's last name (design section 5.3). A package
-/// covers a descriptor when it names the descriptor outright in `keys`, or
-/// when every dimension of the key takes one of the values the package
-/// declares for it in `dimensions`.
+/// covers a descriptor when the key splits into `dimension_value` pairs of the
+/// dimensions it declares and every one of them admits its value.
+///
+/// A dimension states what the kernel supports, never the widths of the models
+/// that launch it: an enumeration for a value the kernel is specialized on, a
+/// [`Constraint`] for a value it handles generically. The Program Server
+/// compiles one module per key, so a width the kernel bakes in at compile time
+/// is still generic when the kernel compiles for every value that meets the
+/// constraint.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Descriptors {
-    /// Declared descriptor dimensions and the values the package supports,
-    /// e.g. `dtype = ["bf16", "fp16"]`, `head_dim = ["128"]`.
+    /// The declared dimensions, by name: `dtype = ["bf16", "f16"]`,
+    /// `columns = { multiple = 16 }`.
     #[serde(default)]
-    pub dimensions: BTreeMap<String, Vec<String>>,
-    /// Descriptor keys the package covers that the dimensions do not express.
-    #[serde(default)]
-    pub keys: Vec<String>,
+    pub dimensions: BTreeMap<String, Dimension>,
 }
 
 impl Descriptors {
     /// Whether the package covers the descriptor whose key this is.
     ///
-    /// A key the package names outright is covered. Otherwise the key must
-    /// split into `dimension_value` pairs of declared dimensions, each value
-    /// in the dimension's declared list; an undeclared dimension, or a value
-    /// it does not declare, leaves the descriptor uncovered, and `prepare`
-    /// fails (design section 5.2).
+    /// The key must split into `dimension_value` pairs of declared dimensions,
+    /// each value admitted by its dimension; an undeclared dimension, or a
+    /// value its dimension does not admit, leaves the descriptor uncovered, and
+    /// `prepare` fails (design section 5.2).
     pub fn covers(&self, key: &str) -> bool {
-        if self.keys.iter().any(|named| named == key) {
-            return true;
-        }
         if self.dimensions.is_empty() {
             return false;
         }
@@ -347,10 +345,167 @@ impl Descriptors {
             pairs.iter().all(|(dimension, value)| {
                 self.dimensions
                     .get(dimension)
-                    .is_some_and(|values| values.iter().any(|allowed| allowed == value))
+                    .is_some_and(|declared| declared.admits(value))
             })
         })
     }
+}
+
+/// What one descriptor dimension admits.
+///
+/// ```toml
+/// dtype = ["bf16", "f16"]            # an enumeration
+/// columns = { multiple = 16 }        # a positive multiple of 16
+/// block = { power_of_two = true }    # a power of two
+/// first = { min = 0 }                # a non-negative integer
+/// axes = { min = 1, max = 4 }        # an integer in 1..=4
+/// shape = { separator = "x" }        # positive integers joined by `x`: `2048x64x1x128`
+/// epsilon = { bits = 32 }            # an `f32` bit pattern: `0x358637bd`
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Dimension {
+    /// The values the kernel is specialized on: element types, flags, modes,
+    /// and the integers whose supported set is a property of the kernel, such
+    /// as the head dimensions a CUDA template is instantiated for or the tile
+    /// shapes a GEMM is written for.
+    Values(Vec<String>),
+    /// A value the kernel handles for anything that meets the constraint.
+    Constraint(Constraint),
+}
+
+impl Dimension {
+    /// Whether this dimension admits `value`, exactly as a key spells it.
+    pub fn admits(&self, value: &str) -> bool {
+        match self {
+            Self::Values(values) => values.iter().any(|allowed| allowed == value),
+            Self::Constraint(constraint) => constraint.admits(value),
+        }
+    }
+
+    /// One value this dimension admits: an enumeration's first value, or a
+    /// constraint's least one; `None` when it admits nothing.
+    pub fn example(&self) -> Option<String> {
+        match self {
+            Self::Values(values) => values.first().cloned(),
+            Self::Constraint(constraint) => constraint.example(),
+        }
+    }
+}
+
+/// The constraint a width-generic dimension imposes on its value.
+///
+/// Without `bits` the value is a decimal integer, written without leading
+/// zeros as a key prints it, that is at least `min` (1 unless stated), at most
+/// `max` when stated, a multiple of `multiple` (1 unless stated) and, with
+/// `power_of_two`, a power of two. With `separator` the value is one or more
+/// such integers joined by it, each meeting the same constraint: an extent
+/// tuple the kernel takes whole, such as a block-major shape.
+///
+/// With `bits` the value is a floating-point number as `ops` prints one into a
+/// key: its bit pattern after `0x` in lowercase hexadecimal without leading
+/// zeros, of at most `bits` bits. `bits` takes none of the integer fields.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Constraint {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multiple: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub power_of_two: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separator: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bits: Option<u32>,
+}
+
+impl Constraint {
+    /// Whether `value` meets the constraint.
+    pub fn admits(&self, value: &str) -> bool {
+        if let Some(bits) = self.bits {
+            return admits_bits(bits, value);
+        }
+        match &self.separator {
+            Some(separator) => value
+                .split(separator.as_str())
+                .all(|part| self.admits_integer(part)),
+            None => self.admits_integer(value),
+        }
+    }
+
+    /// The least value the constraint admits, when it admits one.
+    pub fn example(&self) -> Option<String> {
+        if self.bits.is_some() {
+            return Some("0x0".to_owned());
+        }
+        let multiple = self.multiple.unwrap_or(1).max(1);
+        let mut value = self.min.unwrap_or(1).div_ceil(multiple) * multiple;
+        while !self.admits_integer(&value.to_string()) {
+            value = value.checked_add(multiple)?;
+            if self.max.is_some_and(|max| value > max) {
+                return None;
+            }
+        }
+        Some(value.to_string())
+    }
+
+    /// Why a manifest may not state this constraint, when it may not.
+    pub fn invalid(&self) -> Option<&'static str> {
+        let integer = self.min.is_some()
+            || self.max.is_some()
+            || self.multiple.is_some()
+            || self.power_of_two
+            || self.separator.is_some();
+        let separator = self.separator.as_deref().unwrap_or("x");
+        match self.bits {
+            Some(32 | 64) if integer => Some("`bits` states a float and takes no integer field"),
+            Some(32 | 64) => None,
+            Some(_) => Some("`bits` is 32 or 64"),
+            None if self.multiple == Some(0) => Some("`multiple` must be positive"),
+            None if self.max.is_some_and(|max| max < self.min.unwrap_or(1)) => {
+                Some("`max` is below `min`")
+            }
+            None if separator.is_empty()
+                || separator.contains(|c: char| c == '_' || c.is_ascii_digit()) =>
+            {
+                Some("a `separator` is not empty and holds neither `_` nor a digit")
+            }
+            None => None,
+        }
+    }
+
+    /// Whether `text` is an integer in canonical decimal that meets the
+    /// integer fields.
+    fn admits_integer(&self, text: &str) -> bool {
+        // A key prints an integer without leading zeros, so `064` names no value.
+        let canonical = !text.is_empty()
+            && text.bytes().all(|byte| byte.is_ascii_digit())
+            && (text == "0" || !text.starts_with('0'));
+        let Some(value) = canonical.then(|| text.parse::<u64>().ok()).flatten() else {
+            return false;
+        };
+        value >= self.min.unwrap_or(1)
+            && self.max.is_none_or(|max| value <= max)
+            && value % self.multiple.unwrap_or(1).max(1) == 0
+            && (!self.power_of_two || value.is_power_of_two())
+    }
+}
+
+/// Whether `text` is a float's bit pattern as a key prints it: `0x`, then
+/// lowercase hexadecimal without leading zeros, of at most `bits` bits.
+fn admits_bits(bits: u32, text: &str) -> bool {
+    let Some(digits) = text.strip_prefix("0x") else {
+        return false;
+    };
+    !digits.is_empty()
+        && digits.len() <= (bits / 4) as usize
+        && digits
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        && (digits == "0" || !digits.starts_with('0'))
 }
 
 /// Splits a descriptor key into its `dimension_value` pairs, given the
@@ -358,7 +513,7 @@ impl Descriptors {
 /// longest first at each position, and a value runs to the next matched
 /// dimension.
 fn split_key<'a>(
-    dimensions: &BTreeMap<String, Vec<String>>,
+    dimensions: &BTreeMap<String, Dimension>,
     key: &'a str,
 ) -> Option<Vec<(String, &'a str)>> {
     let mut names: Vec<&str> = dimensions.keys().map(String::as_str).collect();
@@ -480,6 +635,17 @@ impl Manifest {
             }
             _ => {}
         }
+        for shape in self.descriptors() {
+            for (name, dimension) in &shape.dimensions {
+                if let Dimension::Constraint(constraint) = dimension
+                    && let Some(reason) = constraint.invalid()
+                {
+                    return Err(ManifestError::Invalid(format!(
+                        "the descriptor dimension {name}: {reason}"
+                    )));
+                }
+            }
+        }
         let missing: Vec<&String> = self
             .source
             .files
@@ -545,7 +711,7 @@ impl Manifest {
     }
 
     /// Whether this package covers a descriptor key: a kernel program by its
-    /// declared dimensions or keys, a scheduling policy by its one module.
+    /// declared dimensions, a scheduling policy by its one module.
     pub fn covers(&self, key: &str) -> bool {
         match &self.kernel {
             Some(kernel) => kernel.descriptors.covers(key),

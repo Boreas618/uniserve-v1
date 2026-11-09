@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use program_server::manifest::Manifest;
+use program_server::manifest::{Dimension, Manifest};
 
 struct Args {
     kernels: PathBuf,
@@ -305,7 +305,11 @@ fn every_element_type_is_one_ops_prints(packages: &[PathBuf]) -> Result<(), Stri
             continue;
         };
         for shape in kernel.descriptors.shapes() {
-            for (field, values) in &shape.dimensions {
+            for (field, dimension) in &shape.dimensions {
+                // An element type is a specialization, so it is always an enumeration.
+                let Dimension::Values(values) = dimension else {
+                    continue;
+                };
                 if !ELEMENT_TYPE_FIELDS.contains(&field.as_str()) {
                     continue;
                 }

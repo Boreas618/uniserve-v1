@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use program_server::builder::{BuildState, Limits};
-use program_server::manifest::ModuleForm;
+use program_server::manifest::{Manifest, ModuleForm};
 use program_server::protocol::{Descriptors, Module, PrepareRequest, ProgramRequest, Selector};
 use program_server::server::{ProgramServer, ServerConfig};
 use program_server::store::{ModulePath, Root};
@@ -288,7 +288,7 @@ fn tree_packages(root: &Path, kind: &str) -> Vec<TreePackage> {
             ) else {
                 continue;
             };
-            let Some(descriptor) = descriptor_key(&text) else {
+            let Some(descriptor) = descriptor_key(&backend, &text) else {
                 continue;
             };
             let script = source
@@ -307,37 +307,40 @@ fn tree_packages(root: &Path, kind: &str) -> Vec<TreePackage> {
     found
 }
 
-/// One descriptor a package covers, as the packages declare them: a list of
-/// names under `keys`, or every dimension's first value joined by `_`.
-fn descriptor_key(text: &str) -> Option<String> {
+/// One descriptor a one-table package covers: every dimension's example value
+/// (an enumeration's first value, a constraint's least one), in the order the
+/// package writes the dimensions, since a build script may read a key in the
+/// order its operator prints one.
+fn descriptor_key(directory: &Path, text: &str) -> Option<String> {
+    let manifest = Manifest::load(directory).ok()?;
+    let [shape] = manifest.descriptors() else {
+        return None;
+    };
     // The section header on its own line: the packages' prose also names it.
-    let kernel = text.split("\n[kernel.descriptors]\n").nth(1)?;
-    if let Some(keys) = kernel
-        .split("keys = [")
-        .nth(1)
-        .and_then(|rest| rest.split(']').next())
-    {
-        let first = keys.split(',').next()?.trim().trim_matches('"');
-        if !first.is_empty() {
-            return Some(first.to_owned());
-        }
-    }
-    let dimensions = kernel.split("dimensions = {").nth(1)?.split('}').next()?;
-    // Each dimension is written `field = ["first", ...]`; the first value and
-    // the field name, in the order the package writes them, are the key.
-    let mut name = Vec::new();
-    let mut rest = dimensions;
-    while let Some(start) = rest.find("= [\"") {
-        let field = rest[..start].trim_start_matches(',').trim();
-        let values = &rest[start + 4..];
-        let end = values.find('"')?;
-        name.push(field.to_owned());
-        name.push(values[..end].to_owned());
-        // Skip the rest of this dimension's values, up to its `]`.
-        let after = &values[end..];
-        rest = &after[after.find(']')? + 1..];
-    }
-    (!name.is_empty()).then(|| name.join("_"))
+    let line = text
+        .split("\n[kernel.descriptors]\n")
+        .nth(1)?
+        .lines()
+        .find(|line| line.starts_with("dimensions = {"))?;
+    let mut fields = shape
+        .dimensions
+        .iter()
+        .map(|(name, dimension)| {
+            // A dimension opens the table or follows a comma; a constraint's own
+            // fields follow `{` too, but no dimension shares their names.
+            let at = [format!("{{ {name} = "), format!(", {name} = ")]
+                .iter()
+                .filter_map(|written| line.find(written.as_str()))
+                .min()?;
+            Some((at, name, dimension.example()?))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    fields.sort();
+    let key: Vec<String> = fields
+        .into_iter()
+        .map(|(_, name, value)| format!("{name}_{value}"))
+        .collect();
+    (!key.is_empty()).then(|| key.join("_"))
 }
 
 /// A copy of a package in `temporary` that declares this host's version of
@@ -850,7 +853,7 @@ fn a_package_that_declares_no_toolchain_version_builds_on_any_host(args: &Args) 
     let source = args.kernels.join("moe_sort/trtllm");
     let manifest =
         std::fs::read_to_string(source.join("package.toml")).context("the package's manifest")?;
-    let Some(key) = descriptor_key(&manifest) else {
+    let Some(key) = descriptor_key(&source, &manifest) else {
         panic!("the moe_sort package declares no descriptor");
     };
     let temporary = tempfile::tempdir().context("a temporary directory")?;
@@ -901,7 +904,7 @@ fn a_package_compiles_from_the_copy_its_install_kept(args: &Args) -> Outcome {
         eprintln!("SKIPPED: the tree holds no moe_sort package");
         return Ok(());
     };
-    let Some(key) = descriptor_key(&manifest) else {
+    let Some(key) = descriptor_key(&source, &manifest) else {
         panic!("the moe_sort package declares no descriptor");
     };
 

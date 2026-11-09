@@ -151,6 +151,24 @@ def parameters(package: pathlib.Path) -> tuple[dict, str]:
     return stated, architectures[0]
 
 
+def sample(dimension: list | dict) -> list[str]:
+    """The values sampled from one declared dimension.
+
+    An enumeration is sampled whole. A constraint table (`{ multiple = 16 }`, `{ bits = 32 }`) admits
+    a range of widths the kernel handles alike, so its least admitted value stands for all of them,
+    as `Dimension::example` in `crates/program-server/src/manifest.rs` picks it.
+    """
+    if isinstance(dimension, list):
+        return dimension
+    if "bits" in dimension:
+        return ["0x0"]
+    multiple = dimension.get("multiple", 1)
+    value = -(-dimension.get("min", 1) // multiple) * multiple
+    while dimension.get("power_of_two") and (value == 0 or value & (value - 1)):
+        value += multiple
+    return [str(value)]
+
+
 def sampled(dimensions: dict) -> list[dict]:
     """A shape's baseline fields, then one field varied at a time.
 
@@ -158,9 +176,10 @@ def sampled(dimensions: dict) -> list[dict]:
     is four thousand compilations - and it is not needed: what a signature's length depends on is
     one declared value at a time (a pointer added by `affine`, a form that takes an extra stride).
     """
-    baseline = {name: values[0] for name, values in dimensions.items()}
+    declared = {name: sample(dimension) for name, dimension in dimensions.items()}
+    baseline = {name: values[0] for name, values in declared.items()}
     seen = [baseline]
-    for name, values in dimensions.items():
+    for name, values in declared.items():
         for value in values[1:]:
             fields = dict(baseline)
             fields[name] = value

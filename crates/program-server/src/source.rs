@@ -1209,7 +1209,7 @@ files = {files}
 architectures = ["sm_100a"]
 
 [kernel.descriptors]
-keys = ["dtype_bf16"]
+dimensions = {{ dtype = ["bf16"] }}
 "#
             ),
         )
@@ -1296,7 +1296,7 @@ files = ["kernel.py"]
 architectures = ["sm_100a"]
 
 [kernel.descriptors]
-keys = ["dtype_bf16"]
+dimensions = { dtype = ["bf16"] }
 "#,
         )
         .unwrap();
