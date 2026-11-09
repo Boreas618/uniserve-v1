@@ -12,8 +12,8 @@
 //!
 //! ## The two flags, and why the canvases are one
 //!
-//! `--root` names the checkpoint every derived row comes from (`MINIMAX_H3_CHECKPOINT` when the flag
-//! is absent, else `$UNISERVE_H3_MODEL`); its `vae/config.json` is the geometry, and the
+//! `--root` names the checkpoint every derived row comes from (a directory or a repository id; `MiniMaxAI/MiniMax-H3`
+//! when the flag is absent); its `vae/config.json` is the geometry, and the
 //! header prints the fields that decided the rows. `--rasters` names the canvases those rows cover, in `HxW`, defaulting
 //! to `NAMED_CANVASES` - **the six the model offers**, because a store built for one canvas stops at
 //! `no kernel` on any other.
@@ -50,7 +50,7 @@
 //! ## Where the numbers come from
 //!
 //! Every geometry below is the checkpoint's, read from
-//! `$UNISERVE_H3_MODEL/{transformer,audio_vae,vae}/config.json`, never inferred from prose:
+//! `MiniMaxAI/MiniMax-H3/{transformer,audio_vae,vae}/config.json`, never inferred from prose:
 //!
 //! - transformer: `hidden_size 5376`, `num_attention_heads 56`, `attention_head_dim 128` (so
 //!   attention is 56 heads of 128, not grouped), `ffn_dim 14336`, `num_layers 50`, `norm_eps` and
@@ -290,11 +290,9 @@ fn main() {
     let mut arguments = std::env::args().skip(1);
     //
     // **One root.** Everything below that reads the checkpoint reads this value, so `--root` moves all
-    // of it at once. `MINIMAX_H3_CHECKPOINT` is the same statement made by the environment, and the
+    // of it at once. The default is the crate's repository, read from the local Hub cache, and the
     // flag overrides it.
-    let mut root = std::env::var_os("MINIMAX_H3_CHECKPOINT")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
+    let mut root = std::path::PathBuf::new();
     let mut rasters: Vec<(u32, u32)> = Vec::new();
     // The clip lengths the deployment serves, in video frames: the audio rows are stated once per
     // track length, so this is a deployment statement like `--rasters` and not a property of a model.
@@ -395,9 +393,12 @@ fn main() {
         }
     }
     if root.as_os_str().is_empty() {
-        eprintln!("name the checkpoint with --root or MINIMAX_H3_CHECKPOINT");
-        std::process::exit(2);
+        root = std::path::PathBuf::from(minimax_h3::REPO_ID);
     }
+    root = nn::hub::model_dir(&root.to_string_lossy()).unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(2)
+    });
     if rasters.is_empty() {
         rasters = minimax_h3::NAMED_CANVASES
             .iter()
@@ -903,7 +904,7 @@ fn header(
     // cannot drift from the rows: both come from one read of `--root`.
     println!(
         "# derived: the video encoder's canvas-class rows, from `--root`'s own config (default \
-         $UNISERVE_H3_MODEL). block_out_channels {:?}, spatial_downsample_factors {:?}, \
+         MiniMaxAI/MiniMax-H3). block_out_channels {:?}, spatial_downsample_factors {:?}, \
          temporal_downsample_factors {:?}, latent_channels {}; rasters (height, width) {:?}.",
         video_vae.block_out_channels,
         video_vae.spatial_downsample_factors,
@@ -917,7 +918,7 @@ fn header(
     // a layout is not a program key but a table the worker uploads - the distinction matters,
     // because only one of the two belongs in a list of programs.
     println!(
-        "# generator needs the checkpoint: the video encoder's rows are derived from `vae/config.json` under `--root` (or MINIMAX_H3_CHECKPOINT), because its frame operators key on classes the raster derives and every canvas the model offers must be served."
+        "# generator needs the checkpoint: the video encoder's rows are derived from `vae/config.json` under `--root`, because its frame operators key on classes the raster derives and every canvas the model offers must be served."
     );
     println!(
         "# request-derived: a key computed from the request's own numbers cannot be a row here. \

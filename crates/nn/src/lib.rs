@@ -50,6 +50,7 @@ pub mod error;
 pub mod exchange;
 pub mod forward;
 pub mod group;
+pub mod hub;
 pub mod layers;
 pub mod model;
 pub mod tensor;

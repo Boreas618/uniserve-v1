@@ -2,6 +2,8 @@
 
 The evaluator runs fixed workloads against the deployments in the [guide](minimax_h3.md) and validates every MP4: canvas, frame count, frame rate and stereo soundtrack. Each run writes its resolved commands, request data, per-request latencies, media validation and GPU storage observations under `artifacts/`. Resolve a plan before running it, and run points serially, one server and one harness at a time, from the checkout whose `.venv` holds the environment:
 
+The profiles name every checkpoint by its Hugging Face repository, and the servers read it from the local Hub cache that `HF_HOME` locates; `hf download <repository>` fills the cache, and `HF_HUB_OFFLINE=1` serves the snapshot the cache holds without contacting the Hub.
+
 ```bash
 uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
 ```
@@ -17,8 +19,6 @@ uv sync --locked --python /usr/bin/python3.12 --extra gpu --extra bench
 The workload is 72 latency requests one at a time, 12 for each combination of a 5, 10 or 15 second clip and a 1000- or 10000-token prompt, and 32 throughput requests at each concurrency after a priming phase, all preceded by six unmeasured warmup requests. The suites are `gb200-4-bf16`, `gb200-4-nvfp4`, `gb200-8-bf16`, `gb200-8-nvfp4`, `rtx-pro-6000-8-bf16` and `rtx-pro-6000-8-nvfp4`:
 
 ```bash
-export UNISERVE_FAST_H3_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2
-export UNISERVE_FAST_H3_NVFP4_MODEL=/workspace/models/FastVideo-FastH3-8-Step-V2-NVFP4
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml plan gb200-4-bf16
 .venv/bin/uniserve-eval --config uniserve_eval/fast_h3.toml run gb200-4-bf16
 ```
@@ -80,14 +80,13 @@ No measurement of these suites is recorded.
 Each point sends one unmeasured warmup at seed 42, then its measured requests one at a time. The manifests in `uniserve_eval/workloads/minimax_h3/` hold every request; each row's `metadata.condition_media` gives every condition file's path under `UNISERVE_MINIMAX_H3_INPUTS`, its source URL and its SHA-256. Reference media decode with FFmpeg 8.1.2.
 
 ```bash
-export UNISERVE_MINIMAX_H3_MODEL=/workspace/models/MiniMax-H3
 export UNISERVE_MINIMAX_H3_INPUTS=/workspace/uniserve/artifacts/minimax_h3/inputs
 export UNISERVE_MINIMAX_H3_FFMPEG=/workspace/tools/ffmpeg-8.1.2/bin
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml plan gb200-4-w3
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-4-w3
 ```
 
-The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref` and `gb200-8` suites group points by checkpoint and parallel configuration. OmniRef points also need `UNISERVE_MINIMAX_H3_OMNIREF`, with the base revision it pins in the Hugging Face cache. The `gb200-4-reference` and `gb200-4-omniref` servers enlarge references to their encoding size (`--set mm_processor_kwargs.enlarge_references=true`), the sizing of the released pipeline and of the SGLang and FastVideo baselines W4 and W5 are compared with. The two-host SGLang suites, `sglang-gb200-8` and `sglang-gb200-8-reference`, need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`, the address of `rank-0`, and the reference suite also `UNISERVE_MINIMAX_H3_SHARED_SCRATCH`, a directory both hosts mount.
+The `gb200-4`, `gb200-4-reference`, `gb200-4-omniref` and `gb200-8` suites group points by checkpoint and parallel configuration. OmniRef points also need the base revision their export pins in the Hugging Face cache. The `gb200-4-reference` and `gb200-4-omniref` servers enlarge references to their encoding size (`--set mm_processor_kwargs.enlarge_references=true`), the sizing of the released pipeline and of the SGLang and FastVideo baselines W4 and W5 are compared with. The two-host SGLang suites, `sglang-gb200-8` and `sglang-gb200-8-reference`, need `UNISERVE_MINIMAX_H3_HEAD_ADDRESS`, the address of `rank-0`, and the reference suite also `UNISERVE_MINIMAX_H3_SHARED_SCRATCH`, a directory both hosts mount.
 
 Cross-engine results are not equal-work ratios: the engines differ in reference-image resizing, noise generators, media codecs and distributed attention. vLLM-Omni's W4 image processing keeps a smaller condition layout than the others, and its diffusion worker does not implement the two-host rank layout.
 
@@ -114,7 +113,6 @@ The matrix runs under both reference sizings (`enlarge_references` of `mm_proces
 A point sends one warmup at seed 42 and three measured requests one at a time, seeds 0 to 2. One deployment across two four-GB200 hosts (`ulysses8-reference-two-host.toml`) serves every cell of a suite, with a text capacity for each cell's prompt and the condition rows of `full`: `--set video_config.max_seconds=15 --max-model-len 24576 --set video_config.text_capacities=4096,7168,8192,9216,10240,12288,15360 --set video_config.max_condition_rows=56192` by default, and `--max-model-len 48128 --set video_config.text_capacities=4096,7168,8192,10240,14336,15360,22528,37888 --set video_config.max_condition_rows=79104 --set mm_processor_kwargs.enlarge_references=true` for the enlarged suite.
 
 ```bash
-export UNISERVE_MINIMAX_H3_OMNIREF=/workspace/models/FastVideo-FastH3-Omni-8-Step-V1
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs --reuse-deployment
 .venv/bin/uniserve-eval --config uniserve_eval/minimax_h3.toml run gb200-8-omniref-refs-enlarged --reuse-deployment
 ```
@@ -162,7 +160,7 @@ passes says the ordering requirement is gone.
 
 The automatic checks are the two this document defines for every video point and nothing more: MP4 validity (canvas, frame count, frame rate and stereo 32-kHz soundtrack, which the `video` task validates) and the performance metrics the profile marks as protected, each checked to be finite and positive. The set adds no gate, tolerance or metric; the confirmation is the person's judgement of the six videos.
 
-The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` for the two transformer partitions and `configs/minimax_h3/ulysses4-reference.toml` for the two reference partitions, and use port 18083 one server at a time. `--reuse-deployment` keeps a checkpoint loaded across its consecutive points, so the four checkpoints load once each. The profile reads `UNISERVE_FAST_H3_MODEL` from the [FastH3 post](#fasth3-post) and `UNISERVE_MINIMAX_H3_MODEL`, `UNISERVE_MINIMAX_H3_OMNIREF`, `UNISERVE_MINIMAX_H3_INPUTS` and `UNISERVE_MINIMAX_H3_FFMPEG` from [MiniMax-H3 workloads](#minimax-h3-workloads):
+The four servers place four GPUs each, with `configs/minimax_h3/ulysses4.toml` for the two transformer partitions and `configs/minimax_h3/ulysses4-reference.toml` for the two reference partitions, and use port 18083 one server at a time. `--reuse-deployment` keeps a checkpoint loaded across its consecutive points, so the four checkpoints load once each. The profile reads its three checkpoints from the local Hugging Face cache, and `UNISERVE_MINIMAX_H3_INPUTS` and `UNISERVE_MINIMAX_H3_FFMPEG` from [MiniMax-H3 workloads](#minimax-h3-workloads):
 
 ```bash
 .venv/bin/uniserve-eval --config uniserve_eval/check_h3.toml plan check-h3

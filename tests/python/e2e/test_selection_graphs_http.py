@@ -27,14 +27,15 @@ from __future__ import annotations
 
 import os
 from collections.abc import Iterator
-from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    QWEN3_MOE,
     find_free_port,
+    model_dir,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -66,9 +67,7 @@ DEVICES_ENV = "UNISERVE_SELECTION_DEVICES"
 
 
 def _checkpoint() -> str:
-    checkpoint = os.environ.get("UNISERVE_QWEN3_MODEL", "")
-    if not checkpoint or not Path(checkpoint).is_dir():
-        pytest.fail("UNISERVE_QWEN3_MODEL must name the model checkpoint")
+    checkpoint = str(model_dir(QWEN3_MOE))
     return checkpoint
 
 

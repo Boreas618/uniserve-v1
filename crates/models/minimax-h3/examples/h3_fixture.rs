@@ -1,7 +1,7 @@
 //! One deployment's fixture, copied from that deployment's walk print.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example programs -- $UNISERVE_H3_MODEL --dtype f16 ... > <walk file>
+//! cargo run -q -p minimax-h3 --example programs -- MiniMaxAI/MiniMax-H3 --dtype f16 ... > <walk file>
 //! cargo run -q -p minimax-h3 --example h3_fixture -- --walk <walk file> --commit <rev> \
 //!     [--blocked <blocked file>] > <key file>
 //! ```

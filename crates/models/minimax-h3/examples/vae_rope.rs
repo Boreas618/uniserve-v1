@@ -19,10 +19,10 @@
 //! found it.
 //!
 //! ```text
-//! cargo run -q -p minimax-h3 --example vae_rope -- --root $UNISERVE_H3_MODEL \
+//! cargo run -q -p minimax-h3 --example vae_rope -- --root MiniMaxAI/MiniMax-H3 \
 //!     --out artifacts/h3-vae-rope
 //! python crates/models/minimax-h3/tools/compare_rope_factors.py --vae artifacts/h3-vae-rope \
-//!     --checkpoint $UNISERVE_H3_MODEL
+//!     --checkpoint MiniMaxAI/MiniMax-H3
 //! ```
 
 use std::path::{Path, PathBuf};
@@ -36,7 +36,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         match flag.as_str() {
-            "--root" => root = Some(PathBuf::from(value()?)),
+            "--root" => root = Some(nn::hub::model_dir(&value()?)?),
             "--out" => out = PathBuf::from(value()?),
             other => {
                 return Err(format!(

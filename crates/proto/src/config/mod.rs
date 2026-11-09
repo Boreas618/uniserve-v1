@@ -887,7 +887,8 @@ impl Default for VideoJobConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ModelConfig {
-    /// Local model directory or Hugging Face repository.
+    /// The checkpoint: a local model directory or Hugging Face repository in the options, and
+    /// the local directory the engine loads once the leader prepares the engine configuration.
     pub model: String,
     /// Longest sequence a request may reach, in tokens: the configured `max_model_len`, else
     /// what the model's files allow. The options state only the configured one (zero when

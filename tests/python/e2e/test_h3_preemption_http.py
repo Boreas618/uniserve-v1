@@ -1,10 +1,10 @@
 """A FastH3 video request preempted mid-trajectory continues exactly.
 
-Serves a FastH3 checkpoint (``UNISERVE_H3_MODEL``) on the two GPUs the
-GPU locks granted (``UNISERVE_EPOCH_DEVICES``): a Ulysses-2 denoiser and a
-TP2 text encoder beside the decoders, and the CPU media group. One
-``t2va`` request is served uninterrupted as the reference. The same
-request, as a video job, is then preempted at a denoising step boundary:
+Serves a FastH3 checkpoint (``FastVideo/FastVideo-FastH3-8-Step-V2``) on the two
+GPUs the GPU locks granted (``UNISERVE_EPOCH_DEVICES``): a Ulysses-2 denoiser
+and a TP2 text encoder beside the decoders, and the CPU media group. One
+``t2va`` request is served uninterrupted as the reference. The same request, as
+a video job, is then preempted at a denoising step boundary:
 
 - by a sleep, which serving uses to give back device storage: the engine
   stores the trajectory in the host latent pools and the request waits in
@@ -64,7 +64,9 @@ import numpy as np
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    FAST_H3,
     find_free_port,
+    model_dir,
     require_uniserve_binary,
     server_process,
     t2va_request,
@@ -84,12 +86,7 @@ SEED = 4242
 
 
 def _model() -> str:
-    model = os.environ.get("UNISERVE_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a supported FastH3 checkpoint "
-            "directory; docs/minimax_h3/minimax_h3.md lists them"
-        )
+    model = str(model_dir(FAST_H3))
     return model
 
 

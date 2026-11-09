@@ -1096,19 +1096,24 @@ mod tests {
         assert_eq!(error.field(), Some(RequestField::TargetDuration));
     }
 
-    /// The checkpoint's own tokenizer, loaded as the server loads it
-    /// (`UNISERVE_MINIMAX_H3_MODEL` names the checkpoint root), encodes every
+    /// The checkpoint's own tokenizer, loaded as the server loads it (from the
+    /// local Hub cache's MiniMax-H3), encodes every
     /// text the vectors present to the reference's token ids and resolves
     /// the vision markers and placeholders to the reference's ids.
     #[tokio::test]
     async fn checkpoint_tokenizer_matches_the_reference() {
         use models::Vocabulary as _;
 
-        let Ok(root) = std::env::var("UNISERVE_MINIMAX_H3_MODEL") else {
-            eprintln!("UNISERVE_MINIMAX_H3_MODEL is not set; skipping the tokenizer parity test");
+        let root = "MiniMaxAI/MiniMax-H3";
+        if hf_hub::Cache::from_env()
+            .model(root.to_owned())
+            .get("model_index.json")
+            .is_none()
+        {
+            eprintln!("the Hub cache holds no {root}; skipping the tokenizer parity test");
             return;
-        };
-        let pipeline = PipelineCheckpoint::resolve(&root).await.unwrap().unwrap();
+        }
+        let pipeline = PipelineCheckpoint::resolve(root).await.unwrap().unwrap();
         let tokenizer = pipeline_tokenizer(&pipeline).await.unwrap();
         let fixture = fixture();
         for (token, id) in fixture["tokens"].as_object().unwrap() {

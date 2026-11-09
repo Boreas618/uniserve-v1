@@ -30,7 +30,11 @@ import httpx
 import pytest
 
 from tests.python.e2e.http_helpers import (
+    FAST_H3,
+    FAST_H3_OMNI,
+    MINIMAX_H3,
     find_free_port,
+    model_dir,
     require_uniserve_binary,
     server_process,
     worker_executable,
@@ -77,11 +81,7 @@ def _request(workload: str, inputs: Path) -> dict:
 
 
 def _root() -> str:
-    model = os.environ.get("UNISERVE_MINIMAX_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_MINIMAX_H3_MODEL must name a MiniMax-H3 diffusers root"
-        )
+    model = str(model_dir(MINIMAX_H3))
     return model
 
 
@@ -165,12 +165,7 @@ def test_base_first_frame_request(tmp_path: Path) -> None:
 
 def test_fasth3_first_frame_request(tmp_path: Path) -> None:
     """A FastH3 DMD student serves its partition's keyframe requests."""
-    model = os.environ.get("UNISERVE_H3_MODEL")
-    if not model or not Path(model).is_dir():
-        pytest.fail(
-            "UNISERVE_H3_MODEL must name a FastH3 DMD export directory; "
-            "docs/minimax_h3/minimax_h3.md lists them"
-        )
+    model = str(model_dir(FAST_H3))
     inputs = _inputs()
     port = find_free_port()
     base = f"http://127.0.0.1:{port}"
@@ -306,17 +301,12 @@ OMNIREF_OPTIONS = [
 
 
 def _omniref() -> str:
-    """The OmniRef export the environment names.
+    """The OmniRef export, from the local Hub cache.
 
     The export reads the components it omits from the Hugging Face cache at
     the base revision it pins.
     """
-    export = os.environ.get("UNISERVE_MINIMAX_H3_OMNIREF")
-    if not export:
-        pytest.fail(
-            "UNISERVE_MINIMAX_H3_OMNIREF must name a FastH3 OmniRef export"
-        )
-    return export
+    return str(model_dir(FAST_H3_OMNI))
 
 
 def test_omniref_reference_requests(tmp_path: Path) -> None:

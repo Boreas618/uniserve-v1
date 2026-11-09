@@ -58,14 +58,7 @@ SPLIT_ROWS = 1319
 
 @pytest.fixture(autouse=True)
 def confirmation_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Set the binary and checkpoint variables a confirmation run documents."""
-    monkeypatch.setenv(
-        "UNISERVE_QWEN3_MOE_MODEL", "/workspace/models/Qwen3-30B-A3B"
-    )
-    monkeypatch.setenv(
-        "UNISERVE_QWEN3_MOE_NVFP4_MODEL",
-        "/workspace/models/Qwen3-30B-A3B-NVFP4",
-    )
+    """Set the binary variable a confirmation run documents."""
     monkeypatch.setenv("UNISERVE_EXECUTABLE", "/srv/uniserve/bin/uniserve")
     monkeypatch.delenv("UNISERVE_QWEN3_FP8_ATTENTION_BACKEND", raising=False)
 
@@ -508,9 +501,9 @@ def test_only_the_checkpoint_and_kv_cache_dtype_differ_between_cells() -> None:
         """Return the checkpoint path a server command serves."""
         return command[command.index("serve") + 1]
 
-    assert model(commands[0]) == "/workspace/models/Qwen3-30B-A3B"
-    assert model(commands[2]) == "/workspace/models/Qwen3-30B-A3B"
-    assert model(commands[1]) == "/workspace/models/Qwen3-30B-A3B-NVFP4"
+    assert model(commands[0]) == "Qwen/Qwen3-30B-A3B"
+    assert model(commands[2]) == "Qwen/Qwen3-30B-A3B"
+    assert model(commands[1]) == "nvidia/Qwen3-30B-A3B-NVFP4"
     assert "kv_cache_config.dtype=float8_e4m3fn" in commands[2]
     # Today's `auto` selection refuses per-block FP8 pages, so the FP8 cell
     # names the one provider that reads them; the other cells leave the

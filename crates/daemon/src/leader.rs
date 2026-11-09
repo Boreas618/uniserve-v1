@@ -891,8 +891,17 @@ impl Leader {
              than a checkpoint's to imply"
         );
         let mut engine = config.engine_config()?;
+        // The engine loads the checkpoint's files in place: a repository it serves is the
+        // snapshot the Hub cache holds.
+        let checkpoint = crate::model::assets::checkpoint_dir(config.model())
+            .await
+            .with_context(|| format!("failed to resolve the checkpoint of `{}`", config.model()))?;
         let control_tokens = special_token_ids(&model_config);
         let model = &mut engine.model;
+        model.model = checkpoint
+            .into_os_string()
+            .into_string()
+            .map_err(|path| anyhow::anyhow!("the checkpoint path {path:?} is not UTF-8"))?;
         model.max_model_len = max_model_len;
         model.generation_limits = model_config.generation_limits(config.dtype);
         model.bos = control_tokens.bos;

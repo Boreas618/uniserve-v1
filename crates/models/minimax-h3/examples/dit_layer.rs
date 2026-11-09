@@ -311,13 +311,12 @@ impl Args {
             std::process::exit(2);
         }
         if args.root.as_os_str().is_empty() {
-            args.root = std::env::var_os("UNISERVE_H3_MODEL")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    eprintln!("name the checkpoint with --root or UNISERVE_H3_MODEL");
-                    std::process::exit(2)
-                });
+            args.root = PathBuf::from(minimax_h3::REPO_ID);
         }
+        args.root = nn::hub::model_dir(&args.root.to_string_lossy()).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            std::process::exit(2)
+        });
         if args.layers < 2 || !args.layers.is_multiple_of(2) {
             return Err(Failure::message(format!(
                 "the stack is loaded with {} layers; `Transformer::forward` alternates two buffers \
