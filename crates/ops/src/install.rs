@@ -111,6 +111,7 @@ const OPERATORS: &[&str] = &[
     <crate::audio_resample::AudioResample as Op>::NAME,
     <crate::snake::Snake as Op>::NAME,
     <crate::bias::BiasAdd as Op>::NAME,
+    <crate::channel_affine::ChannelAffine as Op>::NAME,
     <crate::gelu::Gelu as Op>::NAME,
     <crate::activation::Silu as Op>::NAME,
     <crate::adaptive_pool::AdaptivePool as Op>::NAME,

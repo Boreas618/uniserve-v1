@@ -29,7 +29,7 @@
 //! [`Transpose`](layers::Transpose) and [`SegmentAttention`], and the
 //! audio path adds
 //! [`Snake`], [`AdaptivePool`] and
-//! [`BiasAdd`](layers::BiasAdd). Each holds weight views and geometry, and its forward calls
+//! [`ChannelAffine`](layers::ChannelAffine). Each holds weight views and geometry, and its forward calls
 //! operators.
 //!
 //! ## The capabilities

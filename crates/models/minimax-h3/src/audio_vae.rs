@@ -23,7 +23,8 @@
 
 use crate::{AudioVaeConfig, Error, Result};
 use nn::layers::{
-    AudioActivation, Axpby, Cast, Conv1d, ConvGeometry, ConvTranspose1d, PcmInterleave, Residual,
+    AudioActivation, Axpby, Cast, ChannelAffine, Conv1d, ConvGeometry, ConvTranspose1d,
+    PcmInterleave, Residual,
 };
 use nn::weights::Scope;
 use nn::{
@@ -278,7 +279,7 @@ pub struct BigVgan {
     config: AudioVaeConfig,
     /// The latent statistics as one one-by-one convolution: a diagonal of the deviations and the means
     /// as its bias, which is `value · std + mean` per latent channel.
-    denormalize: Conv1d,
+    denormalize: ChannelAffine,
     input: Conv1d,
     pre: Conv1d,
     stages: Vec<DecoderStage>,
@@ -352,11 +353,11 @@ impl BigVgan {
         let channels = u64::from(config.latent_channels);
         let denormalize = {
             let mut constants = loader.scope("audio_vae.denormalize");
-            Conv1d::new(
-                constants.constant_f32("weight", &[channels, channels, 1], &scale)?,
-                Some(constants.constant_f32("bias", &[channels], &shift)?),
-                geometry(1, 1, 0)?,
-                false,
+            // The latents are `[batch, channels, frames]`: the channel is axis one.
+            ChannelAffine::new(
+                constants.constant_f32("scale", &[channels], &scale)?,
+                constants.constant_f32("shift", &[channels], &shift)?,
+                1,
             )?
         };
         // The audio decoder computes in FP32 throughout (`DType::F32` below), so every weight is
@@ -534,8 +535,8 @@ impl BigVgan {
         let mut length = shape.dim(2);
         // The reference restores each latent channel (`value · std + mean`) before the decoder's first
         // convolution, and this decoder's first convolution is weight-normalized, so its values exist
-        // only after the fold: the statistics are one one-by-one convolution of constants instead of a
-        // fold into that projection.
+        // only after the fold: the statistics are one map of constants instead of a fold into that
+        // projection.
         let restored = self.buffer(f, self.config.latent_channels, length)?;
         self.denormalize.forward(f, latents, restored)?;
         let projected = self.buffer(f, self.config.latent_dim, length)?;
@@ -648,12 +649,8 @@ impl BigVgan {
     }
 }
 
-/// The statistics as the diagonal and the shift of the decoder's restoring convolution.
-///
-/// `value · std + mean` per latent channel is a one-by-one convolution whose weight is the diagonal of
-/// the deviations and whose bias is the means, so the restore is one operator of the same shape as the
-/// projection that follows it. The diagonal is `[channels, channels, 1]` in the convolution's
-/// `[out, in, kernel]` order.
+/// The statistics as the scale and the shift of the decoder's restore, `value · std + mean` per
+/// latent channel: the deviations and the means.
 pub fn denormalize_tables(statistics: &Statistics) -> Result<(Vec<f32>, Vec<f32>)> {
     let channels = statistics.mean.len();
     if channels == 0 || statistics.std.len() != channels {
@@ -663,11 +660,7 @@ pub fn denormalize_tables(statistics: &Statistics) -> Result<(Vec<f32>, Vec<f32>
             statistics.std.len()
         )));
     }
-    let mut scale = vec![0.0_f32; channels * channels];
-    for channel in 0..channels {
-        scale[channel * channels + channel] = statistics.std[channel];
-    }
-    Ok((scale, statistics.mean.clone()))
+    Ok((statistics.std.clone(), statistics.mean.clone()))
 }
 
 impl Decoder for BigVgan {
@@ -897,24 +890,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_restoring_convolution_is_the_diagonal_of_the_deviations() {
+    fn the_restore_scales_by_the_deviations_and_shifts_by_the_means() {
         let config = crate::audio_vae::tests::audio_config();
         let statistics = Statistics::of(&config).expect("the statistics");
-        let channels = statistics.mean.len();
         let (scale, shift) = denormalize_tables(&statistics).expect("the tables");
-        // A one-by-one convolution's weight is `[out, in, 1]`: the deviations on the diagonal and zero
-        // everywhere else, so each channel is scaled by its own deviation and by nothing else.
-        assert_eq!(scale.len(), channels * channels);
-        for out in 0..channels {
-            for input in 0..channels {
-                let want = if out == input {
-                    statistics.std[input]
-                } else {
-                    0.0
-                };
-                assert_eq!(scale[out * channels + input], want);
-            }
-        }
+        assert_eq!(scale, statistics.std);
         assert_eq!(shift, statistics.mean);
     }
 

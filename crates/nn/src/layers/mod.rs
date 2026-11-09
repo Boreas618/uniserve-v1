@@ -18,9 +18,9 @@
 //! step that reads them from a program changes one module.
 
 mod activation;
+mod affine;
 mod attention;
 mod audio;
-mod bias;
 mod conv;
 mod cross_fade;
 mod embedding;
@@ -48,9 +48,9 @@ mod tile_stitch;
 mod transpose;
 
 pub use activation::{GateBias, GatedActivation, Gelu, Halves, Rounding, Silu, Snake};
+pub use affine::ChannelAffine;
 pub use attention::{Attention, AttentionBackend, TRTLLM_WORKSPACE_BYTES};
 pub use audio::AudioActivation;
-pub use bias::BiasAdd;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use cross_fade::CrossFade;
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};

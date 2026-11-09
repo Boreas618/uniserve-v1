@@ -88,6 +88,7 @@ pub mod block_copy;
 #[cfg(test)]
 pub mod call_layout_check;
 pub mod capture;
+pub mod channel_affine;
 pub mod commit;
 pub mod conv;
 pub mod copy_block;

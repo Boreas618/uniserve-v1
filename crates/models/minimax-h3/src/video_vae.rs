@@ -410,8 +410,9 @@ pub const MINIMUM_OVERLAP: u32 = 64;
 
 use nn::Forward;
 use nn::layers::{
-    Attention, Bias, Cast, Epilogue, GateBias, GatedActivation, Halves, IndexRows, LayerNorm,
-    Linear, MergedColumnLinear, Parallel, ResidualStream, RmsNorm, Rotary, Rounding, Sections,
+    Attention, Bias, Cast, ChannelAffine, Epilogue, GateBias, GatedActivation, Halves, IndexRows,
+    LayerNorm, Linear, MergedColumnLinear, Parallel, ResidualStream, RmsNorm, Rotary, Rounding,
+    Sections,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{DType, DecodedMedia, Decoder, Shape, StateTable, TableValues, TensorView};
@@ -458,9 +459,9 @@ pub struct VideoDecoder {
     /// The tile stitch, built at load so that no layer is built on a request's path.
     stitch: crate::decoding::ClipDecoder,
     width: u32,
-    /// `value · std + mean` per latent channel, as a product with the diagonal of the deviations: the
+    /// `value · std + mean` per latent channel, a product then a sum: the
     /// reference restores the latents in FP32 before anything rounds them.
-    restore: Linear,
+    restore: ChannelAffine,
     post_quant: Linear,
     /// `post_quant_conv`'s bias, as a product with the identity: the reference's convolution rounds
     /// its product before it adds the bias, and this is that second rounding.
@@ -667,13 +668,14 @@ impl VideoDecoder {
         // post-quantization bias rides on, the zero row the token layout appends, the two index
         // tables that address a tile's trailing rows, the rotary frequencies and the sequence
         // offsets - are the decoder's own, named under `video_vae`.
-        let (restore_weight, restore_bias) = restore_tables(config)?;
+        let (restore_scale, restore_shift) = restore_tables(config)?;
         let restore = {
             let mut constants = loader.scope("video_vae.restore");
-            Linear::new(
-                constants.constant("weight", STREAM, &[channels, channels], &restore_weight)?,
-                Some(constants.constant("bias", STREAM, &[channels], &restore_bias)?),
-                WeightOrder::NxK,
+            // The latents are `[voxels, channels]`: the channel is the last axis.
+            ChannelAffine::new(
+                constants.constant("scale", STREAM, &[channels], &restore_scale)?,
+                constants.constant("shift", STREAM, &[channels], &restore_shift)?,
+                1,
             )?
         };
         // The post-quantization convolution is 1x1x1: its `[channels, channels, 1, 1, 1]` weight is
@@ -894,7 +896,7 @@ fn width_of(channels: u64) -> Result<u32> {
         .map_err(|_| Error::config(format!("{channels} channels exceed a projection's width")))
 }
 
-/// The restore's weight and bias: the diagonal of the latent deviations, and the means.
+/// The restore's scale and shift: the latent deviations and the means, one per channel.
 fn restore_tables(config: &VideoVaeConfig) -> Result<(Vec<f32>, Vec<f32>)> {
     let channels = config.latents_std.len();
     if channels == 0 || config.latents_mean.len() != channels {
@@ -903,11 +905,7 @@ fn restore_tables(config: &VideoVaeConfig) -> Result<(Vec<f32>, Vec<f32>)> {
             config.latents_mean.len()
         )));
     }
-    let mut weight = vec![0.0_f32; channels * channels];
-    for (channel, deviation) in config.latents_std.iter().enumerate() {
-        weight[channel * channels + channel] = *deviation;
-    }
-    Ok((weight, config.latents_mean.clone()))
+    Ok((config.latents_std.clone(), config.latents_mean.clone()))
 }
 
 /// The decoder's inverse frequencies, in the order its factors are laid out.
@@ -1525,11 +1523,11 @@ pub(crate) mod tests {
         assert_eq!(
             launches.0[..11],
             [
-                "gemm",       // the restore
-                "scaled_add", // the round down
-                "gemm",       // post_quant_conv's product
-                "gemm",       // its bias, a rounding of its own
-                "gemm",       // the input projection
+                "channel_affine", // the restore
+                "scaled_add",     // the round down
+                "gemm",           // post_quant_conv's product
+                "gemm",           // its bias, a rounding of its own
+                "gemm",           // the input projection
                 "scaled_add",
                 "rows",
                 "rows", // the first tile's voxels, registers and zero row

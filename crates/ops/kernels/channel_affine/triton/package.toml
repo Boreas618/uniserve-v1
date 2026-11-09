@@ -1,0 +1,33 @@
+# The channel_affine operator's Triton backend: design 5.2's program package.
+#
+# One cubin per descriptor: `out = x · scale[c] + shift[c]` over a contiguous
+# `[batch, channels, positions]` view, the product and the sum each one IEEE
+# round-to-nearest FP32 operation that the compiler cannot contract into a fused
+# multiply-add. The geometry is launch words, so the key is the element type, the
+# block and the PDL option, e.g. `dtype_f32_block_1024_pdl_false`.
+
+op = "channel_affine"
+backend = "triton"
+
+[toolchain]
+kind = "triton"
+version = "3.7.1"
+packages = []
+
+[module]
+form = "cubin"
+metadata = "metadata.json"
+
+[source]
+kind = "triton"
+files = ["src/channel_affine.py", "src/build.py", "src/_compile.py"]
+script = "src/build.py"
+
+[kernel]
+target = "arch"
+architectures = ["sm_100a", "sm_90a"]
+
+[kernel.descriptors]
+dimensions = { dtype = ["bf16", "f16", "f32"], block = { power_of_two = true }, pdl = ["true", "false"] }
+
+[parameters]
