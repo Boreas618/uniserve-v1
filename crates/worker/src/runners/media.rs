@@ -28,6 +28,8 @@ use std::time::Instant;
 use ipc::RequestKey;
 use nn::capability::MediaFormat;
 
+use crate::runners::conditions;
+
 use crate::Result;
 use crate::batch::{Batch, BatchOutput, CallId, CallOutput, Job, Jobs, RowState};
 use crate::host::{HostAction, Lane, Outcome};
@@ -64,12 +66,12 @@ struct RegionExtents {
 
 impl RegionExtents {
     /// What `conditioning`'s conditions take, as `format` lays them out.
-    fn of(conditioning: &proto::video::Conditions, format: &dyn MediaFormat) -> Result<Self> {
+    fn of(conditioning: &proto::video::Conditions, format: &MediaFormat) -> Result<Self> {
         let mut extents = Self::default();
         for condition in &conditioning.conditions {
             extents.pixels += condition.pixel_bytes();
             if let Some(track) = condition.media.audio() {
-                extents.samples += 2 * format.track_samples(track.samples)?;
+                extents.samples += 2 * conditions::track_samples(format, track.samples)?;
             }
             if let Some(vision) = &condition.vision {
                 extents.patches += vision.grid.patches();
@@ -86,7 +88,7 @@ struct ConditionRead {
     /// The regions the read fills, shared with the stage that publishes them when it ends.
     regions: Arc<Mutex<ConditionRegions>>,
     /// How the model's encoders read what the media decodes to.
-    format: Arc<dyn MediaFormat>,
+    format: MediaFormat,
 }
 
 /// The rates one request's artifact is built at.
@@ -241,7 +243,7 @@ impl HostAction for MediaWork {
                     &self.output.media,
                     self.output.rates,
                     &read.conditioning,
-                    read.format.as_ref(),
+                    &read.format,
                     &mut regions,
                 )?;
                 Ok(None)
@@ -502,8 +504,7 @@ fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> 
     let mut planes = vec![0_u8; frames * 3 * area];
     // A reference image at its encoding size is seven million pixels on a request's critical path,
     // so a frame's pixels are shared out in bands of its three planes.
-    let workers = std::thread::available_parallelism().map_or(1, |count| count.get().min(16));
-    let band = area.div_ceil(workers.div_ceil(frames.max(1))).max(1);
+    let band = conditions::band(area, frames);
     let mut bands = Vec::new();
     for (frame, block) in planes.chunks_mut((3 * area).max(1)).enumerate() {
         let (red, rest) = block.split_at_mut(area);
@@ -519,19 +520,12 @@ fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> 
             first += pixels;
         }
     }
-    let run = bands.len().div_ceil(workers).max(1);
-    std::thread::scope(|scope| {
-        for bands in bands.chunks_mut(run) {
-            scope.spawn(move || {
-                for (first, red, green, blue) in bands {
-                    let pixels = &rgb[*first * 3..(*first + red.len()) * 3];
-                    for (index, pixel) in pixels.as_chunks::<3>().0.iter().enumerate() {
-                        red[index] = pixel[0];
-                        green[index] = pixel[1];
-                        blue[index] = pixel[2];
-                    }
-                }
-            });
+    conditions::share(&mut bands, |(first, red, green, blue)| {
+        let pixels = &rgb[*first * 3..(*first + red.len()) * 3];
+        for (index, pixel) in pixels.as_chunks::<3>().0.iter().enumerate() {
+            red[index] = pixel[0];
+            green[index] = pixel[1];
+            blue[index] = pixel[2];
         }
     });
     planes
@@ -542,7 +536,7 @@ fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> 
 /// The tower reads a grid's own pixels, so each frame is resized to the grid first and packed
 /// second.
 fn pack_block(
-    format: &dyn MediaFormat,
+    format: &MediaFormat,
     rgb: &[u8],
     frames: u32,
     raster: (u32, u32),
@@ -550,7 +544,7 @@ fn pack_block(
     out: &mut [u8],
 ) -> Result<()> {
     let (height, width) = raster;
-    let side = format.patch_side();
+    let side = format.patches.side;
     let (rows, columns) = (grid[1] * side, grid[2] * side);
     let planes = planes_of(rgb, frames as usize, height as usize, width as usize);
     let planes = if (rows, columns) == (height, width) {
@@ -565,9 +559,7 @@ fn pack_block(
         }
         resized
     };
-    format
-        .patches(&planes, frames, grid, out)
-        .map_err(crate::Error::from)
+    conditions::patches(&format.patches, &planes, frames, grid, out)
 }
 
 /// The region's bytes as the `f32` rows a condition is written into.
@@ -596,7 +588,7 @@ fn read_conditions(
     media: &media::MediaRunner,
     rates: Rates,
     conditioning: &proto::video::Conditions,
-    format: &dyn MediaFormat,
+    format: &MediaFormat,
     regions: &mut ConditionRegions,
 ) -> Result<()> {
     use media::read::{
@@ -699,8 +691,8 @@ fn read_conditions(
     let mut samples_at = 0_usize;
     let mut patches_at = 0_usize;
     let patch_bytes = usize::try_from(
-        u64::from(format.patch_width())
-            * format.patch_dtype().bytes().ok_or_else(|| {
+        u64::from(format.patches.width())
+            * format.patches.dtype.bytes().ok_or_else(|| {
                 crate::Error::Invalid("a patch row has no whole-byte size".into())
             })?,
     )
@@ -720,7 +712,7 @@ fn read_conditions(
             pixels_at += source.len();
         }
         if let Some(track) = condition.media.audio() {
-            let padded = 2 * usize::try_from(format.track_samples(track.samples)?)
+            let padded = 2 * usize::try_from(conditions::track_samples(format, track.samples)?)
                 .map_err(|_| crate::Error::Invalid("a track is larger than memory".into()))?;
             let region = regions
                 .samples
@@ -729,7 +721,8 @@ fn read_conditions(
             // SAFETY: as for the pixels above.
             let floats = unsafe { region.as_mut_slice() };
             let floats = float_view(floats)?;
-            format.track(
+            conditions::track(
+                format,
                 &pcm[read.samples.start * 2..read.samples.end * 2],
                 track.samples,
                 &mut floats[samples_at..samples_at + padded],
@@ -793,21 +786,20 @@ fn read_conditions(
 
 /// Lays one visual condition's RGB out as its encoder reads it, at the head of `out`.
 fn condition_rows(
-    format: &dyn MediaFormat,
+    format: &MediaFormat,
     rgb: &[u8],
     frames: u32,
     canvas: proto::video::Canvas,
     out: &mut [f32],
 ) -> Result<()> {
-    format
-        .condition_pixels(
-            rgb,
-            frames,
-            canvas.height,
-            canvas.width,
-            &mut out[..rgb.len()],
-        )
-        .map_err(crate::Error::from)
+    conditions::pixels(
+        &format.pixels,
+        rgb,
+        frames,
+        canvas.height,
+        canvas.width,
+        &mut out[..rgb.len()],
+    )
 }
 
 /// A request's identity for the media crate, whose assembly is keyed by a number.
@@ -865,7 +857,7 @@ pub struct MediaStage {
     /// would leave every request after the first without an answer.
     pending: Vec<Prepared>,
     /// How the model's encoders read a request's decoded media.
-    format: Arc<dyn MediaFormat>,
+    format: MediaFormat,
     /// The regions of the requests whose conditions were read, until their artifact is assembled:
     /// the store's views name this storage and own none of it.
     conditions: std::collections::HashMap<RequestKey, Arc<Mutex<ConditionRegions>>>,
@@ -899,7 +891,7 @@ impl MediaStage {
         output: Arc<Output>,
         lane: Lane<MediaWork>,
         units_of: Units,
-        format: Arc<dyn MediaFormat>,
+        format: MediaFormat,
     ) -> Self {
         Self {
             id: binding.id,
@@ -924,7 +916,7 @@ impl MediaStage {
                     "a media request's conditioning does not decode: {error}"
                 ))
             })?;
-        let extents = RegionExtents::of(&conditioning, self.format.as_ref())?;
+        let extents = RegionExtents::of(&conditioning, &self.format)?;
         let region = |elements: u64, width: u64| -> Result<Option<platform::PinnedBuffer>> {
             if elements == 0 {
                 return Ok(None);
@@ -933,8 +925,8 @@ impl MediaStage {
                 .map_err(|_| crate::Error::Invalid("a condition is larger than memory".into()))?;
             Ok(Some(platform::PinnedBuffer::new(self.device, bytes)?))
         };
-        let row = u64::from(self.format.patch_width())
-            * self.format.patch_dtype().bytes().ok_or_else(|| {
+        let row = u64::from(self.format.patches.width())
+            * self.format.patches.dtype.bytes().ok_or_else(|| {
                 crate::Error::Invalid("a patch row has no whole-byte size".into())
             })?;
         let float = CONDITION_MEDIA
@@ -947,7 +939,7 @@ impl MediaStage {
                 samples: region(extents.samples, float)?,
                 patches: region(extents.patches, row)?,
             })),
-            format: Arc::clone(&self.format),
+            format: self.format,
         })
     }
 
@@ -961,7 +953,7 @@ impl MediaStage {
         request: RequestKey,
         regions: Arc<Mutex<ConditionRegions>>,
     ) -> Result<()> {
-        let format = Arc::clone(&self.format);
+        let format = self.format;
         let products = Arc::clone(self.products()?);
         let stream_id = crate::arena::StreamId(self.stream.raw());
         {
@@ -977,8 +969,8 @@ impl MediaStage {
                 )
             };
             let patch = |buffer: &platform::PinnedBuffer| -> Result<ops::TensorView> {
-                let dtype = format.patch_dtype();
-                let width = u64::from(format.patch_width());
+                let dtype = format.patches.dtype;
+                let width = u64::from(format.patches.width());
                 let row = width
                     * dtype.bytes().ok_or_else(|| {
                         crate::Error::Invalid("a patch row has no whole-byte size".into())

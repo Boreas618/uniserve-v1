@@ -49,7 +49,6 @@
 const NORM_EPS: f32 = 1e-5;
 use crate::config::VideoVaeConfig;
 use crate::{Error, Result};
-use qwen3::processor::PatchLayout;
 
 /// The spatial compression of the video encoder: input pixels per latent position.
 pub const SPATIAL_RATIO: u32 = 16;
@@ -57,159 +56,16 @@ pub const SPATIAL_RATIO: u32 = 16;
 /// The channels of a condition's raster: RGB.
 pub const PIXEL_CHANNELS: u32 = 3;
 
-/// How H3's encoders read a request's decoded media, on the host.
-///
-/// Three layouts, one per encoder: the video encoder's normalised planar pixels, the vision tower's
-/// patch rows and the audio encoder's zero-padded channel rows.
-#[derive(Clone, Debug)]
-pub struct ConditionFormat {
-    /// The vision tower's patch rows, rounded to its weights' own element type.
-    patches: PatchLayout,
-    /// Samples of one audio latent frame.
-    hop: u64,
-}
-
-impl ConditionFormat {
-    /// The format of `config`'s encoders, with the tower at `dtype`.
-    pub fn new(config: &crate::Config, dtype: DType) -> Result<Self> {
-        Ok(Self {
-            patches: PatchLayout::new(&config.text_encoder.vision, config.pixels, dtype),
-            hop: u64::from(AudioStack::of(&config.audio_vae)?.samples_per_latent),
-        })
-    }
-}
-
-/// The threads a host stage on a request's critical path shares its work over.
-fn workers() -> usize {
-    std::thread::available_parallelism().map_or(1, |count| count.get().min(16))
-}
-
-/// Runs `work` over `items`, a run of them on each of `workers` threads.
-fn share<T: Send>(items: &mut [T], workers: usize, work: impl Fn(&mut T) + Sync) {
-    let run = items.len().div_ceil(workers.max(1)).max(1);
-    let work = &work;
-    std::thread::scope(|scope| {
-        for items in items.chunks_mut(run) {
-            scope.spawn(move || items.iter_mut().for_each(work));
-        }
-    });
-}
-
-impl nn::capability::MediaFormat for ConditionFormat {
-    fn condition_pixels(
-        &self,
-        rgb: &[u8],
-        frames: u32,
-        height: u32,
-        width: u32,
-        out: &mut [f32],
-    ) -> nn::Result<()> {
-        let area = height as usize * width as usize;
-        let frames = frames as usize;
-        let channels = PIXEL_CHANNELS as usize;
-        if rgb.len() != frames * area * channels || out.len() != rgb.len() {
-            return Err(nn::Error::from(Error::Unsupported(format!(
-                "{} RGB bytes and {} elements for {frames} frames of {height}x{width}",
-                rgb.len(),
-                out.len()
-            ))));
-        }
-        // `[frames, rows, columns, 3]` to `[3, frames, rows, columns]`, each byte through the
-        // normalisation the reference applies in FP32. A byte has 256 values, so the normalisation
-        // is a table of them, and a frame's pixels are shared out in bands: this runs on a request's
-        // critical path, and a reference image at its encoding size is twenty million elements.
-        let mut table = [[0.0_f32; 256]; 3];
-        for byte in 0..=u8::MAX {
-            let values = normalize([byte; 3]);
-            for (channel, value) in values.iter().enumerate() {
-                table[channel][usize::from(byte)] = *value;
-            }
-        }
-        let table = &table;
-        let workers = workers();
-        let band = area.div_ceil(workers.div_ceil(frames.max(1))).max(1);
-        let mut planes: Vec<_> = out
-            .chunks_mut(area)
-            .map(|plane| plane.chunks_mut(band))
-            .collect();
-        let mut bands = Vec::new();
-        for frame in 0..frames {
-            let mut first = frame * area;
-            while let (Some(red), Some(green), Some(blue)) = (
-                planes[frame].next(),
-                planes[frames + frame].next(),
-                planes[2 * frames + frame].next(),
-            ) {
-                let pixels = red.len();
-                bands.push((first, red, green, blue));
-                first += pixels;
-            }
-        }
-        share(&mut bands, workers, |(first, red, green, blue)| {
-            let source = &rgb[*first * channels..(*first + red.len()) * channels];
-            for (index, pixel) in source.chunks_exact(channels).enumerate() {
-                red[index] = table[0][usize::from(pixel[0])];
-                green[index] = table[1][usize::from(pixel[1])];
-                blue[index] = table[2][usize::from(pixel[2])];
-            }
-        });
-        Ok(())
-    }
-
-    fn patch_dtype(&self) -> DType {
-        self.patches.dtype
-    }
-
-    fn patch_width(&self) -> u32 {
-        self.patches.width()
-    }
-
-    fn patch_side(&self) -> u32 {
-        self.patches.patch
-    }
-
-    /// The processor's patch rows ([`PatchLayout`]), its bands shared out over the host's threads
-    /// as they lie in `out`.
-    fn patches(
-        &self,
-        planes: &[u8],
-        frames: u32,
-        grid: [u32; 3],
-        out: &mut [u8],
-    ) -> nn::Result<()> {
-        let layout = &self.patches;
-        let band = layout.check(planes.len(), frames, grid, out.len())?;
-        let table = layout.table()?;
-        let table = &table;
-        let mut bands: Vec<(usize, &mut [u8])> = out.chunks_mut(band).enumerate().collect();
-        share(&mut bands, workers(), |(index, out)| {
-            layout.band(table, planes, frames, grid, *index, out);
-        });
-        Ok(())
-    }
-
-    fn track_samples(&self, samples: u64) -> nn::Result<u64> {
-        padded_samples(samples, self.hop).map_err(nn::Error::from)
-    }
-
-    /// `[samples, 2]` interleaved to `[2, 1, padded]`, each channel's tail zero.
-    fn track(&self, pcm: &[f32], samples: u64, out: &mut [f32]) -> nn::Result<()> {
-        let padded = self.track_samples(samples)? as usize;
-        let samples = samples as usize;
-        if pcm.len() != 2 * samples || out.len() != 2 * padded {
-            return Err(nn::Error::from(Error::Unsupported(format!(
-                "{} PCM values and {} elements for a track of {samples} samples",
-                pcm.len(),
-                out.len()
-            ))));
-        }
-        out.fill(0.0);
-        for sample in 0..samples {
-            out[sample] = pcm[2 * sample];
-            out[padded + sample] = pcm[2 * sample + 1];
-        }
-        Ok(())
-    }
+/// How H3's encoders read a request's decoded media, with the vision tower at `dtype`: the video
+/// encoder's planar pixels normalized by the ImageNet constants ([`crate::output::PIXEL_NORM`]), the
+/// vision tower's patch rows by the processor's statistics, and the audio encoder's channel rows
+/// padded to whole latent hops.
+pub fn media_format(config: &crate::Config, dtype: DType) -> Result<nn::capability::MediaFormat> {
+    Ok(nn::capability::MediaFormat {
+        pixels: crate::output::PIXEL_NORM,
+        patches: qwen3::processor::patch_format(&config.text_encoder.vision, config.pixels, dtype),
+        hop: u64::from(AudioStack::of(&config.audio_vae)?.samples_per_latent),
+    })
 }
 
 /// The extents of one tensor of the encoder's stack, in frames, rows and columns.
@@ -436,20 +292,6 @@ impl Stack {
             .copied()
             .ok_or_else(|| Error::config("the video encoder's stack has no level".to_owned()))
     }
-}
-
-/// One pixel's normalized channels: `(pixel / 255 − mean) / std`.
-///
-/// The inverse of the decoder's byte step (`value * std + mean`, clamped to [0, 1], scaled to 255
-/// and rounded half to even), and the input the video encoder reads. A kernel that normalizes the
-/// raster computes this; the round trip through the decoder's quantization recovers the byte.
-pub fn normalize(pixel: [u8; 3]) -> [f32; 3] {
-    let mut values = [0.0f32; 3];
-    for (channel, byte) in pixel.iter().enumerate() {
-        values[channel] = (f32::from(*byte) / 255.0 - crate::output::PIXEL_NORM.mean[channel])
-            / crate::output::PIXEL_NORM.std[channel];
-    }
-    values
 }
 
 /// The audio encoder's stack: DAC's strided widening network and the latent projection.
@@ -1699,52 +1541,19 @@ impl GeGlu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nn::capability::MediaFormat as _;
 
-    /// The format of a tower of 16-pixel patches, two-frame tubelets and `2 x 2` merges, and of
-    /// an audio encoder of 800 samples a latent.
-    fn format() -> ConditionFormat {
-        ConditionFormat {
-            patches: PatchLayout {
-                patch: 16,
-                temporal: 2,
-                merge: 2,
-                channels: 3,
-                pixels: qwen3::processor::PixelConfig {
-                    mean: [0.5; 3],
-                    std: [0.5; 3],
-                },
-                dtype: DType::BF16,
-            },
-            hop: 800,
+    /// One pixel's normalized channels: `(pixel / 255 − mean) / std`.
+    ///
+    /// The inverse of the decoder's byte step (`value * std + mean`, clamped to [0, 1], scaled to 255
+    /// and rounded half to even), and the input the video encoder reads. A kernel that normalizes the
+    /// raster computes this; the round trip through the decoder's quantization recovers the byte.
+    fn normalize(pixel: [u8; 3]) -> [f32; 3] {
+        let mut values = [0.0f32; 3];
+        for (channel, byte) in pixel.iter().enumerate() {
+            values[channel] = (f32::from(*byte) / 255.0 - crate::output::PIXEL_NORM.mean[channel])
+                / crate::output::PIXEL_NORM.std[channel];
         }
-    }
-
-    /// A condition's pixels are planar and normalised as the encoder reads them, and the track is
-    /// two channel rows padded to whole latent frames.
-    #[test]
-    fn a_conditions_pixels_are_planar_and_a_track_is_padded_channel_rows() {
-        let format = format();
-        let rgb = [255_u8, 0, 128, 0, 255, 128];
-        let mut out = [0.0_f32; 6];
-        format
-            .condition_pixels(&rgb, 1, 1, 2, &mut out)
-            .expect("one frame of two pixels");
-        let first = normalize([255, 0, 128]);
-        let second = normalize([0, 255, 128]);
-        assert_eq!(
-            out,
-            [
-                first[0], second[0], first[1], second[1], first[2], second[2]
-            ]
-        );
-
-        assert_eq!(format.track_samples(801).expect("a whole frame"), 1600);
-        let pcm = [1.0_f32, -1.0, 2.0, -2.0];
-        let mut track = vec![9.0_f32; 2 * 800];
-        format.track(&pcm, 2, &mut track).expect("two samples");
-        assert_eq!(&track[..3], &[1.0, 2.0, 0.0]);
-        assert_eq!(&track[800..803], &[-1.0, -2.0, 0.0]);
+        values
     }
 
     use crate::video_vae::tests::video_config;

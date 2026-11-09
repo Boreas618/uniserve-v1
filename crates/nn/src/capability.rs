@@ -717,46 +717,51 @@ pub struct ConditionPiece {
     pub draw_offset: u64,
 }
 
-/// How a model's encoders read the media a request's conditions decode to, on the host.
+/// How a model's encoders read the media a request's conditions decode to.
 ///
 /// The media reader decodes bytes into RGB frames and stereo PCM, which are the media's own forms.
-/// What an encoder reads is the model's arithmetic: its channel order and normalisation, its patch
-/// rows, the padding of a track. The worker owns the decoding and the buffers and asks the model
-/// for these conversions, so no model constant reaches it.
-pub trait MediaFormat: Send + Sync {
-    /// Writes `[frames, height, width, 3]` RGB bytes as `out`, the pixels
-    /// [`MediaInput::pixels`] carries: `3 * frames * height * width` elements.
-    fn condition_pixels(
-        &self,
-        rgb: &[u8],
-        frames: u32,
-        height: u32,
-        width: u32,
-        out: &mut [f32],
-    ) -> Result<()>;
+/// What an encoder reads is the model's arithmetic: the normalization of its pixels, its vision
+/// tower's patch rows, the padding of a track. The model declares that layout here and the runtime
+/// performs the conversions on its host threads, so no model holds a thread or a media byte format.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct MediaFormat {
+    /// The normalization of a condition's pixels, which [`MediaInput::pixels`] carries as
+    /// `[3, frames, height, width]` FP32, each byte `(byte / 255 - mean) / std`.
+    pub pixels: PixelNorm,
+    /// The patch rows a vision block presents to the text encoder ([`ImageInput::pixels`]).
+    pub patches: PatchFormat,
+    /// Samples of one audio latent frame. A track [`MediaInput::audio`] carries is right-padded with
+    /// zeros to a whole number of them, as `[2, 1, padded]` channel rows.
+    pub hop: u64,
+}
 
-    /// The element type of a vision tower's patch rows.
-    fn patch_dtype(&self) -> DType;
+/// The patch rows of a vision tower, as the processor lays them out.
+///
+/// Each row is one channel-major tubelet of `channels × temporal × side × side` values; rows run over
+/// each temporal patch's merge blocks of `merge × merge` patches, a short temporal patch repeating its
+/// last frame. A value is `(byte - 255 · mean) / (255 · std)` in FP32, rounded once to `dtype`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct PatchFormat {
+    /// The pixels one patch spans along each side of a frame; a block's frames are resized to its
+    /// grid times this.
+    pub side: u32,
+    /// Frames one temporal patch spans.
+    pub temporal: u32,
+    /// Patches one merge block spans along each side.
+    pub merge: u32,
+    /// The raster's channels.
+    pub channels: u32,
+    /// The processor's normalization.
+    pub norm: PixelNorm,
+    /// The element type the rows are stored in: the tower's weights' own.
+    pub dtype: DType,
+}
 
-    /// The elements of one patch row.
-    fn patch_width(&self) -> u32;
-
-    /// The pixels one patch spans along each side of a frame.
-    ///
-    /// The frames [`Self::patches`] reads are resized to `grid` times this.
-    fn patch_side(&self) -> u32;
-
-    /// Writes `[frames, 3, height, width]` planar RGB bytes, already at the grid's raster, as `out`:
-    /// the `grid[0] * grid[1] * grid[2]` patch rows [`ImageInput::pixels`] carries, in
-    /// [`Self::patch_dtype`].
-    fn patches(&self, planes: &[u8], frames: u32, grid: [u32; 3], out: &mut [u8]) -> Result<()>;
-
-    /// The samples an encoder reads of a track of `samples` samples, padding included.
-    fn track_samples(&self, samples: u64) -> Result<u64>;
-
-    /// Writes `[samples, 2]` interleaved stereo as `out`, the view [`MediaInput::audio`] carries:
-    /// `2 * self.track_samples(samples)` elements.
-    fn track(&self, pcm: &[f32], samples: u64, out: &mut [f32]) -> Result<()>;
+impl PatchFormat {
+    /// The elements of one patch row: `channels · temporal · side²`.
+    pub const fn width(&self) -> u32 {
+        self.channels * self.temporal * self.side * self.side
+    }
 }
 
 /// What a denoiser conditions on at a step.

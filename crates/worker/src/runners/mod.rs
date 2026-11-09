@@ -12,6 +12,7 @@
 pub mod audio;
 pub mod causal_lm;
 pub(crate) mod columns;
+pub(crate) mod conditions;
 pub mod decoder;
 pub mod denoiser;
 pub mod encoder;

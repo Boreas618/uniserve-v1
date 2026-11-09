@@ -313,12 +313,12 @@ pub trait VideoModel: Send + Sync {
     /// The frames one decode call produces: the video decoder's window.
     fn decode_window(&self) -> u32;
 
-    /// How the pipeline reads a request's condition media.
+    /// How the pipeline's encoders read a request's condition media, which the runtime lays out.
     ///
     /// # Errors
     ///
-    /// Fails when the format cannot be built for the deployment's element type.
-    fn format(&self) -> Result<Arc<dyn MediaFormat>>;
+    /// Fails when the configuration states no format for the deployment's element type.
+    fn format(&self) -> Result<MediaFormat>;
 
     /// The frames of the least legal timeline that lasts at least `seconds`.
     ///

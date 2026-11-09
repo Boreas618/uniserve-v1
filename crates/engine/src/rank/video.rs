@@ -127,7 +127,7 @@ impl ModelRunner {
         // over its stream's region: its recorded walk encodes them so the region holds them.
         let vision = media_encoder::WarmVision {
             prompts: pipeline.warm_prompts(&serving)?,
-            format: Arc::clone(&format),
+            patches: format.patches,
         };
         let encoder = media_encoder::EncoderRunner::new(
             Binding {

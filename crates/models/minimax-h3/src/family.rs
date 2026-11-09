@@ -253,9 +253,8 @@ impl VideoModel for H3Pipeline {
             * self.config.video_vae.temporal_compression()
     }
 
-    fn format(&self) -> nn::Result<Arc<dyn MediaFormat>> {
-        let format = crate::encoding::ConditionFormat::new(&self.config, self.dtype)?;
-        Ok(Arc::new(format))
+    fn format(&self) -> nn::Result<MediaFormat> {
+        Ok(crate::encoding::media_format(&self.config, self.dtype)?)
     }
 
     fn timeline(&self, seconds: f64) -> nn::Result<u32> {

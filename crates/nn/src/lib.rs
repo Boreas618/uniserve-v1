@@ -71,8 +71,8 @@ pub mod weights;
 pub use capability::{
     CausalLm, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
     Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput,
-    ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, MediaFormat, PixelNorm, Placed, Seed,
-    StateTable, Step, TableValues, TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
+    ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, MediaFormat, PatchFormat, PixelNorm,
+    Placed, Seed, StateTable, Step, TableValues, TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};

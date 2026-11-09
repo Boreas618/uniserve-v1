@@ -31,7 +31,7 @@ use std::sync::{Arc, Mutex};
 use ipc::TimingCounters;
 use nn::capability::{
     Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageInput, ImageShape,
-    MediaFormat, StateTable, TableValues, TokenBatch, WarmPrompt,
+    PatchFormat, StateTable, TableValues, TokenBatch, WarmPrompt,
 };
 use ops::{DType, PhaseKind, TensorView};
 use platform::DeviceId;
@@ -64,7 +64,7 @@ pub struct WarmVision {
     pub prompts: Vec<WarmPrompt>,
     /// How the media stage writes the patch rows a vision encode reads
     /// ([`Product::VisionPixels`]): their element type and row width.
-    pub format: Arc<dyn MediaFormat>,
+    pub patches: PatchFormat,
 }
 
 /// The columns an encoder stages a batch into, sized for the largest bucket it was bound with.
@@ -977,8 +977,8 @@ impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
     fn record_walk(&mut self) -> Result<Footprint> {
         let mut footprint = Footprint::default();
         let group = self.group.clone();
-        let patch_dtype = self.warm.format.patch_dtype();
-        let patch_width = u64::from(self.warm.format.patch_width());
+        let patch_dtype = self.warm.patches.dtype;
+        let patch_width = u64::from(self.warm.patches.width());
         for bucket in self.capture_order() {
             footprint.walk(Some(bucket), |walk| {
                 let state = walk.tables(

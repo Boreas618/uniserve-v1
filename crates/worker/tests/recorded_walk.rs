@@ -22,8 +22,8 @@ use std::sync::{Arc, Mutex};
 use nn::capability::{
     Clip, ConditionPiece, ConditionRole, ConditionShape, Conditioning, DecodedMedia, Decoder,
     Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs, EncoderPrompt, ImageShape,
-    LatentShape, Latents, Layout, MediaFormat, MediaRole, Seed, StateTable, Step, TableValues,
-    TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
+    LatentShape, Latents, Layout, MediaRole, PatchFormat, PixelNorm, Seed, StateTable, Step,
+    TableValues, TokenBatch, VideoRequest, WarmPrompt, WarmRequest,
 };
 use nn::{Forward, Result};
 use ops::logits::{GatherArgs, GatherDescriptor, LogitsGather};
@@ -314,38 +314,22 @@ fn a_decoder_records_its_gather_and_its_decode() {
 /// The row width of the fake media format's patch rows.
 const PATCH_WIDTH: u32 = 24;
 
-/// A media format whose patch rows are `PATCH_WIDTH` BF16 elements: what an encoder's recorded
-/// walk lays a vision prompt's placeholder rows out by. It converts nothing.
-struct Patches;
-
-impl MediaFormat for Patches {
-    fn condition_pixels(&self, _: &[u8], _: u32, _: u32, _: u32, _: &mut [f32]) -> Result<()> {
-        Err(nn::Error::Unsupported("a walk converts no pixels".into()))
-    }
-
-    fn patch_dtype(&self) -> DType {
-        DType::BF16
-    }
-
-    fn patch_width(&self) -> u32 {
-        PATCH_WIDTH
-    }
-
-    fn patch_side(&self) -> u32 {
-        16
-    }
-
-    fn patches(&self, _: &[u8], _: u32, _: [u32; 3], _: &mut [u8]) -> Result<()> {
-        Err(nn::Error::Unsupported("a walk converts no patches".into()))
-    }
-
-    fn track_samples(&self, samples: u64) -> Result<u64> {
-        Ok(samples)
-    }
-
-    fn track(&self, _: &[f32], _: u64, _: &mut [f32]) -> Result<()> {
-        Err(nn::Error::Unsupported("a walk converts no track".into()))
-    }
+/// Patch rows of `PATCH_WIDTH` BF16 elements (`3 · 2 · 2²`): what an encoder's recorded walk lays a
+/// vision prompt's placeholder rows out by.
+fn patches() -> PatchFormat {
+    let format = PatchFormat {
+        side: 2,
+        temporal: 2,
+        merge: 2,
+        channels: 3,
+        norm: PixelNorm {
+            mean: [0.5; 3],
+            std: [0.5; 3],
+        },
+        dtype: DType::BF16,
+    };
+    assert_eq!(format.width(), PATCH_WIDTH);
+    format
 }
 
 /// An encoder whose text encode reserves 1 KiB and whose vision encode reserves 4 KiB per image,
@@ -427,7 +411,7 @@ fn an_encoder_records_its_vision_prompts() {
                     tokens: 16,
                 },
             ],
-            format: Arc::new(Patches),
+            patches: patches(),
         },
         EncoderShape {
             hidden: 16,
