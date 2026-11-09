@@ -25,7 +25,7 @@
 
 use nn::Denoiser;
 
-use super::denoiser::WarmRequest;
+use nn::WarmRequest;
 
 /// One warm request per distinct layout, in the caller's order.
 ///
@@ -52,7 +52,6 @@ mod tests {
 
     use nn::capability::{
         ConditionShape, Conditioning, LatentShape, Layout, Seed, StateTable, Step, VideoRequest,
-        VideoTask,
     };
     use nn::{Error, Forward, Latents, Result};
 
@@ -135,7 +134,6 @@ mod tests {
 
     fn warm(first: u32, last: u32, references: u32) -> WarmRequest {
         WarmRequest {
-            task: VideoTask::TextToVideoAudio,
             width: 768,
             height: 1344,
             frames: 121,

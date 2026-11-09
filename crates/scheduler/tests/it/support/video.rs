@@ -8,10 +8,9 @@ use ipc::{
     CallKind, ComponentInfo, DType, DiffusionSamplingParams, DimBound, MediaCall, OutputInfo,
     RasterAxes, RequestId, ShapeBound,
 };
-use models::video::Canvas;
+use proto::video::Canvas;
 use scheduler::{
     BlockConfig, BlockDistribution, DiffusionRequest, Request, SimEngine, VideoDenoiserInfo,
-    VideoTaskInfo,
 };
 
 /// Denoising steps the simulated model advertises and every request follows.
@@ -138,12 +137,7 @@ pub(crate) fn video_worker_denoising_on(
         .map(|call| CallKind::Media(*call))
         .collect();
     info.video_denoiser = Some(VideoDenoiserInfo {
-        tasks: [("t2va", false), ("fl2va", true), ("ref2va", true)]
-            .map(|(name, conditioned)| VideoTaskInfo {
-                name: name.to_owned(),
-                conditioned,
-            })
-            .to_vec(),
+        takes_conditions: true,
         denoise_steps: STEPS,
         description: b"{}".to_vec(),
     });
@@ -250,7 +244,6 @@ pub(crate) fn video_worker_denoising_on(
 pub(crate) fn video_request(id: u64, video_units: u32) -> Request {
     Request::Diffusion(DiffusionRequest {
         request_id: RequestId(id),
-        task: "t2va".to_owned(),
         prompt_token_ids: PROMPT.to_vec(),
         conditioning: b"{}".to_vec(),
         conditions: Vec::new(),

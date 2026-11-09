@@ -920,9 +920,9 @@ dependencies = [
  "llm-multimodal",
  "minijinja",
  "minijinja-contrib",
- "models",
  "ops",
  "platform",
+ "processing",
  "program-server",
  "prometheus-client",
  "prost",
@@ -934,6 +934,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_with",
+ "service",
  "sha2",
  "storage",
  "tempfile",
@@ -1175,6 +1176,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "engine"
+version = "2.0.0"
+dependencies = [
+ "anyhow",
+ "crossbeam-channel",
+ "ipc",
+ "nn",
+ "ops",
+ "platform",
+ "program-server",
+ "proto",
+ "scheduler",
+ "serde_json",
+ "storage",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+ "worker",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1342,12 +1365,11 @@ dependencies = [
 name = "frontend"
 version = "2.0.0"
 dependencies = [
- "anyhow",
  "axum",
  "fastokens",
  "frontend",
  "hf-hub 0.5.0",
- "models",
+ "processing",
  "proto",
  "serde",
  "serde_json",
@@ -2444,10 +2466,11 @@ checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 name = "minimax-h3"
 version = "2.0.0"
 dependencies = [
- "models",
  "nn",
  "ops",
  "platform",
+ "processing",
+ "proto",
  "serde",
  "serde_json",
  "tempfile",
@@ -2473,16 +2496,6 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "models"
-version = "2.0.0"
-dependencies = [
- "proto",
- "serde",
- "serde_json",
- "thiserror",
 ]
 
 [[package]]
@@ -3008,6 +3021,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "processing"
+version = "2.0.0"
+dependencies = [
+ "proto",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "program-server"
 version = "2.0.0"
 dependencies = [
@@ -3021,6 +3044,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "service",
  "tempfile",
  "thiserror",
  "toml",
@@ -3266,6 +3290,7 @@ dependencies = [
  "nn",
  "ops",
  "platform",
+ "processing",
  "serde",
  "serde_json",
  "tempfile",
@@ -3650,7 +3675,6 @@ dependencies = [
  "fnv",
  "ipc",
  "libc",
- "models",
  "nn",
  "png",
  "program-server",
@@ -3659,6 +3683,7 @@ dependencies = [
  "scheduling",
  "serde",
  "serde_json",
+ "service",
  "sha2",
  "storage",
  "storage-server",
@@ -3881,6 +3906,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "service"
+version = "2.0.0"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+ "tempfile",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "sha2"
 version = "0.10.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4036,6 +4071,7 @@ dependencies = [
  "serde",
  "serde_bytes",
  "serde_json",
+ "service",
  "sha2",
  "tempfile",
  "thiserror",
@@ -4055,12 +4091,11 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
- "signal-hook-registry",
+ "service",
  "storage",
  "tempfile",
  "thiserror",
  "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -4640,35 +4675,26 @@ version = "2.0.0"
 dependencies = [
  "anyhow",
  "clap",
- "crossbeam-channel",
  "daemon",
- "frontend",
- "ipc",
+ "engine",
  "libc",
- "libloading",
  "mimalloc",
  "minimax-h3",
- "models",
- "nn",
- "ops",
- "platform",
+ "processing",
  "program-server",
- "proto",
  "qwen3-moe",
  "rustix",
- "scheduler",
  "serde",
  "serde_json",
+ "service",
  "storage",
  "storage-server",
  "tempfile",
  "time",
  "tokio",
  "tokio-util",
- "toml",
  "tracing",
  "tracing-subscriber",
- "worker",
 ]
 
 [[package]]
@@ -5650,7 +5676,6 @@ dependencies = [
  "libc",
  "libloading",
  "media",
- "models",
  "nn",
  "nvtx",
  "ops",

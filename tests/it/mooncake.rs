@@ -18,11 +18,11 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
 use storage::protocol::{Event, PageLevel, PageShape, PageSlot, Reply, Request};
-use storage::{Client, Key, Role, Scope, socket};
+use storage::{Client, Key, Role, Scope};
 
 const PAGE_BYTES: u64 = 4096;
 
-/// A `uniserve storage serve` process on a socket of its own, with
+/// A `uniserve storage-server serve` process on a socket of its own, with
 /// its Mooncake connector, stopped when dropped.
 struct Serving {
     child: Child,
@@ -35,7 +35,7 @@ impl Serving {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_uniserve"))
-            .args(["storage", "serve"])
+            .args(["storage-server", "serve"])
             .arg("--socket")
             .arg(&socket)
             .args(["--page-pool-gib", "1", "--mooncake-master", master])
@@ -48,7 +48,7 @@ impl Serving {
             socket,
             _directory: directory,
         };
-        wait_for("the server to listen", || socket::serving(&serving.socket));
+        wait_for("the server to listen", || service::serving(&serving.socket));
         // Lookups count L3 only while the connector is connected.
         wait_for("the connector to connect", || {
             operator(&serving.socket).list().unwrap().connector

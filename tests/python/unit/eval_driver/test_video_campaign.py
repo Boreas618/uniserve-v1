@@ -38,7 +38,17 @@ from uniserve_eval.types import (
 pytestmark = pytest.mark.unit
 
 
-def point(**kwargs):
+# The output shape and soundtrack every point states: MiniMax-H3's 768p 16:9
+# raster at 24 fps with a stereo 32 kHz soundtrack.
+STATED = {
+    "size": "1344x768",
+    "fps": 24,
+    "audio_sample_rate": 32000,
+    "audio_channels": 2,
+}
+
+
+def point(video=None, **kwargs):
     return BenchmarkPoint(
         name="video",
         server="video",
@@ -47,6 +57,7 @@ def point(**kwargs):
         dataset="jsonl",
         endpoint=VIDEOS_SYNC,
         metrics=(MetricDefinition(("videos_per_second",), "higher"),),
+        video=video or VideoConfig(**STATED),
         **kwargs,
     )
 
@@ -74,6 +85,29 @@ def stated_schedule(backend, schedule=FAST_H3_SCHEDULE):
         # FastVideo takes its shifts from the checkpoint.
         return {"num_inference_steps": schedule["num_inference_steps"]}
     return dict(schedule)
+
+
+def stated_target(backend, aspect_ratio="16:9", seconds=5.0):
+    """The requested-target fields a point measuring ``backend`` states."""
+    if backend in ("sglang", "vllm-omni"):
+        return {"aspect_ratio": aspect_ratio, "duration_seconds": seconds}
+    if backend == "fastvideo":
+        return {"duration_seconds": seconds}
+    return {}
+
+
+def video_config(backend="uniserve", size="1344x768", **settings):
+    """A point's video settings for ``backend`` with everything it needs."""
+    return VideoConfig(
+        **{
+            **STATED,
+            "size": size,
+            "backend": backend,
+            **stated_schedule(backend),
+            **stated_target(backend),
+            **settings,
+        }
+    )
 
 
 def form_fields(request):
@@ -119,36 +153,51 @@ def decoded(width=1344, height=768, frames=124, audio_samples=None):
     )
 
 
-def answered(request, video):
-    """The record of a request whose response decoded to ``video``."""
+def answered(request, video, served="stated"):
+    """The record of a request whose response decoded to ``video``.
+
+    ``served`` is the shape the server reported generating; by default the
+    stated one, as a conforming server reports.
+    """
     return RequestRecord(
         request_id="row",
         task="video",
-        requested_seconds=request.payload["target"]["duration_seconds"],
         video_shape=request.video_shape,
+        served_shape=request.video_shape if served == "stated" else served,
         decoded_video=video,
     )
 
 
-def test_each_duration_uses_ties_to_even_and_native_alignment():
-    task = VideoTask(point())
-    records = []
-    # 106.5 rounds to 106, giving 107; half-up would incorrectly yield 124.
-    for seconds, frames in [
-        (4, 107),
-        (106.5 / 24, 107),
-        (5, 124),
-        (10, 243),
-        (15, 362),
-    ]:
-        request = task.build_request(Example("row", "scene", seconds=seconds))
-        assert request.video_shape == VideoShape(1344, 768, frames)
-        records.append(answered(request, decoded(frames=frames)))
-    assert task.validate_output(records).valid
-    records[-1].decoded_video = replace(
-        records[-1].decoded_video, frame_count=124
+def mp4_response(headers=None):
+    """A synchronous video response carrying stand-in MP4 bytes."""
+    return web.Response(
+        body=b"mp4", headers={"content-type": "video/mp4", **(headers or {})}
     )
-    assert not task.validate_output(records).valid
+
+
+@pytest.mark.parametrize("frames", [107, 124, 243, 362])
+def test_a_row_frame_count_is_stated_and_the_output_is_held_to_it(frames):
+    task = VideoTask(point(video_config(num_frames=124)))
+    request = task.build_request(Example("row", "scene", num_frames=frames))
+
+    assert request.video_shape == VideoShape(1344, 768, frames, 24)
+    assert request.payload["num_frames"] == frames
+    record = answered(request, decoded(frames=frames))
+    assert task.validate_output([record]).valid
+    record.decoded_video = decoded(frames=frames + 17)
+    assert not task.validate_output([record]).checks["stated_frame_count"]
+
+
+def test_a_row_without_a_frame_count_takes_the_points():
+    task = VideoTask(point(video_config(num_frames=243)))
+    request = task.build_request(Example("row", "scene"))
+
+    assert request.video_shape == VideoShape(1344, 768, 243, 24)
+
+
+def test_a_frame_count_stated_by_neither_row_nor_point_is_not_sent():
+    with pytest.raises(ValueError, match="num_frames"):
+        VideoTask(point()).build_request(Example("row", "scene"))
 
 
 @pytest.mark.parametrize(
@@ -162,11 +211,11 @@ def test_each_duration_uses_ties_to_even_and_native_alignment():
         (361, round(360 / 24 * 32000), False),
     ],
 )
-def test_media_length_tolerates_one_frame_around_the_aligned_duration(
+def test_media_length_tolerates_one_frame_around_the_stated_duration(
     frames, audio_samples, valid
 ):
     task = VideoTask(point())
-    request = task.build_request(Example("row", "scene", seconds=15))
+    request = task.build_request(Example("row", "scene", num_frames=362))
     record = answered(
         request, decoded(frames=frames, audio_samples=audio_samples)
     )
@@ -174,61 +223,142 @@ def test_media_length_tolerates_one_frame_around_the_aligned_duration(
     assert task.validate_output([record]).valid is valid
 
 
-@pytest.mark.parametrize(
-    "aspect_ratio,canvas",
-    [
-        ("auto", (1344, 768)),
-        ("21:9", (1536, 672)),
-        ("16:9", (1344, 768)),
-        ("4:3", (1024, 768)),
-        ("1:1", (768, 768)),
-        ("3:4", (768, 1024)),
-        ("9:16", (768, 1344)),
-    ],
-)
-def test_media_must_have_the_canvas_the_target_resolves_to(
-    aspect_ratio, canvas
-):
-    width, height = canvas
-    task = VideoTask(point(video=VideoConfig(aspect_ratio=aspect_ratio)))
-    request = task.build_request(Example("row", "scene", seconds=5))
+@pytest.mark.parametrize("size", ["1344x768", "768x1344", "1536x672"])
+def test_media_must_have_the_stated_size(size):
+    width, height = (int(side) for side in size.split("x"))
+    task = VideoTask(point(video_config(size=size)))
+    request = task.build_request(Example("row", "scene", num_frames=124))
     record = answered(request, decoded(width, height))
 
+    assert request.payload["size"] == size
     assert task.validate_output([record]).valid
     record.decoded_video = decoded(width + 32, height)
-    assert not task.validate_output([record]).checks["target_canvas"]
+    assert not task.validate_output([record]).checks["stated_size"]
+
+
+def test_media_must_have_the_stated_frame_rate_and_soundtrack():
+    task = VideoTask(point())
+    request = task.build_request(Example("row", "scene", num_frames=124))
+    record = answered(request, replace(decoded(), fps_numerator=25))
+    checks = task.validate_output([record]).checks
+    assert not checks["stated_fps"]
+
+    record = answered(request, replace(decoded(), audio_sample_rate=48000))
+    assert not task.validate_output([record]).checks["stated_aac_audio"]
+
+
+@pytest.mark.parametrize(
+    "served",
+    [
+        None,
+        VideoShape(768, 1344, 124, 24),
+        VideoShape(1344, 768, 141, 24),
+        VideoShape(1344, 768, 124, 25),
+    ],
+    ids=["unreported", "other-size", "other-frames", "other-fps"],
+)
+def test_a_uniserve_output_is_held_to_the_shape_the_server_reports(served):
+    task = VideoTask(point())
+    request = task.build_request(Example("row", "scene", num_frames=124))
+
+    assert task.validate_output([answered(request, decoded())]).valid
+    record = answered(request, decoded(), served=served)
+    assert not task.validate_output([record]).checks["served_shape"]
+
+
+def test_a_baseline_output_is_not_held_to_a_reported_shape():
+    task = VideoTask(point(video_config("fastvideo")))
+    request = task.build_request(Example("row", "scene", num_frames=124))
+    record = answered(request, decoded(), served=None)
+
+    assert "served_shape" not in task.validate_output([record]).checks
+    assert task.validate_output([record]).valid
+
+
+@pytest.mark.parametrize("endpoint", [VIDEOS_SYNC, "/v1/videos"])
+def test_the_reported_shape_is_read_from_headers_or_the_job(endpoint):
+    """The sync route reports it in headers, a job in its record."""
+
+    async def exercise():
+        async def handler(request):
+            if request.method == "POST" and endpoint == "/v1/videos":
+                return web.json_response({"id": "job", "status": "queued"})
+            if request.method == "GET" and not request.path.endswith(
+                "/content"
+            ):
+                return web.json_response(
+                    {
+                        "id": "job",
+                        "object": "video",
+                        "status": "completed",
+                        "size": "1344x768",
+                        "seconds": "10.125",
+                        "num_frames": 243,
+                        "fps": 24,
+                    }
+                )
+            headers = {}
+            if endpoint == VIDEOS_SYNC:
+                headers = {
+                    "x-video-size": "1344x768",
+                    "x-video-num-frames": "243",
+                    "x-video-fps": "24",
+                }
+            return mp4_response(headers)
+
+        config = replace(
+            point(video_config(poll_interval_s=0.001)), endpoint=endpoint
+        )
+        request = VideoTask(config).build_request(
+            Example("row", "scene", num_frames=243)
+        )
+        async with (
+            stub_server(handler) as base_url,
+            aiohttp.ClientSession() as client,
+        ):
+            return await send_request(
+                client, base_url, request, "row", task="video"
+            )
+
+    record = asyncio.run(exercise())
+    assert record.success
+    assert record.served_shape == VideoShape(1344, 768, 243, 24)
+    assert record.record_dict()["served_shape"] == {
+        "width": 1344,
+        "height": 768,
+        "frames": 243,
+        "fps": 24,
+    }
 
 
 @pytest.mark.parametrize(
     "backend", ["uniserve", "sglang", "vllm-omni", "fastvideo"]
 )
-@pytest.mark.parametrize(
-    "aspect_ratio,canvas", [("16:9", (1344, 768)), ("9:16", (768, 1344))]
-)
+@pytest.mark.parametrize("size", ["1344x768", "768x1344"])
 @pytest.mark.parametrize("schedule", [BASE_SCHEDULE, FAST_H3_SCHEDULE])
-@pytest.mark.parametrize("seconds,frames", [(5, 124), (7.3, 175)])
-def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
-    backend, aspect_ratio, canvas, schedule, seconds, frames
+@pytest.mark.parametrize("seconds,frames", [(5.0, 124), (7.3, 175)])
+def test_each_backend_receives_the_shape_and_schedule_in_its_own_fields(
+    backend, size, schedule, seconds, frames
 ):
-    """The canonical body reaches every backend as the same generated work."""
+    """The stated work reaches every backend as the same generated work."""
     sent = []
+    aspect_ratio = "16:9" if size == "1344x768" else "9:16"
 
     async def exercise():
         async def handler(request):
             sent.append((request.headers, await request.read()))
-            return web.Response(
-                body=b"mp4", headers={"content-type": "video/mp4"}
-            )
+            return mp4_response()
 
         config = point(
-            video=VideoConfig(
-                backend=backend,
-                aspect_ratio=aspect_ratio,
+            video_config(
+                backend,
+                size=size,
                 **stated_schedule(backend, schedule),
+                **stated_target(backend, aspect_ratio, seconds),
             )
         )
         request = VideoTask(config).build_request(
-            Example("row", "precise prompt", seconds=seconds, seed=11)
+            Example("row", "precise prompt", num_frames=frames, seed=11)
         )
         async with (
             stub_server(handler) as base_url,
@@ -238,13 +368,27 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
                 client, base_url, request, "row", task="video"
             )
         assert record.success
-        assert record.requested_seconds == seconds
+        assert record.video_shape == VideoShape(
+            *(int(side) for side in size.split("x")), frames, 24
+        )
 
     asyncio.run(exercise())
-    width, height = canvas
+    width, height = (int(side) for side in size.split("x"))
     points = schedule["num_inference_steps"]
-    if backend in ("uniserve", "sglang"):
-        # Both take the official body; SGLang also runs the stated schedule.
+    if backend == "uniserve":
+        # UniServe takes the model-agnostic body; its checkpoint fixes the
+        # schedule.
+        assert json.loads(sent[0][1]) == {
+            "model": "h3",
+            "prompt": "precise prompt",
+            "size": size,
+            "num_frames": frames,
+            "fps": 24,
+            "seed": 11,
+        }
+    elif backend == "sglang":
+        # SGLang's native H3 body names the stated target and runs the
+        # stated schedule.
         assert json.loads(sent[0][1]) == {
             "model": "h3",
             "prompt": "precise prompt",
@@ -256,15 +400,16 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
                 "duration_seconds": seconds,
             },
             "seed": 11,
-            **stated_schedule(backend, schedule),
+            **schedule,
         }
     elif backend == "vllm-omni":
         fields = form_fields(sent[0])
         assert fields["prompt"] == "precise prompt"
         assert int(fields["seed"]) == 11
-        assert (int(fields["width"]), int(fields["height"])) == canvas
+        assert (int(fields["width"]), int(fields["height"])) == (width, height)
         assert fields["aspect_ratio"] == aspect_ratio
         assert int(fields["fps"]) == 24
+        assert int(fields["num_frames"]) == frames
         # vLLM-Omni counts schedule intervals: one fewer than the points.
         assert int(fields["num_inference_steps"]) == points - 1
         assert float(fields["guidance_scale"]) == 1
@@ -278,7 +423,7 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
         payload = json.loads(sent[0][1])
         assert payload["prompt"] == "precise prompt"
         assert payload["seed"] == 11
-        assert payload["size"] == f"{width}x{height}"
+        assert payload["size"] == size
         assert payload["fps"] == 24
         assert payload["num_inference_steps"] == points
         assert payload["num_frames"] == frames
@@ -288,33 +433,6 @@ def test_each_backend_receives_the_target_and_schedule_in_its_own_fields(
         )
         assert "flow_shift" not in payload
         assert "audio_flow_shift" not in payload
-
-
-def test_uniserve_request_without_a_stated_schedule_omits_it():
-    request = VideoTask(point()).build_request(
-        Example("row", "precise prompt", seconds=15, seed=11)
-    )
-
-    assert request.payload == {
-        "model": "h3",
-        "prompt": "precise prompt",
-        "task": "t2va",
-        "conditions": [],
-        "target": {
-            "short_edge": 768,
-            "aspect_ratio": "16:9",
-            "duration_seconds": 15.0,
-        },
-        "seed": 11,
-    }
-
-
-@pytest.mark.parametrize("seconds", [3.99, 15.01])
-def test_a_duration_outside_the_api_range_is_not_sent(seconds):
-    with pytest.raises(ValueError, match="duration"):
-        VideoTask(point()).build_request(
-            Example("row", "precise prompt", seconds=seconds)
-        )
 
 
 @pytest.mark.parametrize(
@@ -344,21 +462,11 @@ def test_native_transport_waits_for_media_and_enforces_logical_deadline(
             )
 
         config = replace(
-            point(
-                video=VideoConfig(
-                    backend=backend,
-                    poll_interval_s=0.001,
-                    **(
-                        stated_schedule(backend)
-                        if backend != "uniserve"
-                        else {}
-                    ),
-                )
-            ),
+            point(video_config(backend, poll_interval_s=0.001)),
             endpoint=endpoint,
         )
         request = VideoTask(config).build_request(
-            Example("row", "precise prompt", seconds=5, seed=11)
+            Example("row", "precise prompt", num_frames=124, seed=11)
         )
         async with (
             stub_server(handler) as base_url,
@@ -409,14 +517,14 @@ def test_vllm_omni_request_carries_configured_extra_params():
             )
 
         config = point(
-            video=VideoConfig(
-                backend="vllm-omni",
+            video_config(
+                "vllm-omni",
                 extra_params={"preencode_mp4": True},
-                **FAST_H3_SCHEDULE,
+                duration_seconds=10.0,
             )
         )
         request = VideoTask(config).build_request(
-            Example("row", "precise prompt", seconds=10, seed=11)
+            Example("row", "precise prompt", num_frames=243, seed=11)
         )
         async with (
             stub_server(handler) as base_url,
@@ -452,19 +560,19 @@ def test_sglang_request_carries_configured_extra_params():
 
         config = replace(
             point(
-                video=VideoConfig(
-                    backend="sglang",
+                video_config(
+                    "sglang",
                     extra_params={
                         "x264_preset": "ultrafast",
                         "output_compression": 53,
                     },
-                    **FAST_H3_SCHEDULE,
+                    duration_seconds=10.0,
                 )
             ),
             endpoint="/v1/videos",
         )
         request = VideoTask(config).build_request(
-            Example("row", "precise prompt", seconds=10, seed=11)
+            Example("row", "precise prompt", num_frames=243, seed=11)
         )
         async with (
             stub_server(handler) as base_url,
@@ -497,9 +605,8 @@ def test_sglang_request_carries_configured_extra_params():
 def test_video_extra_params_cannot_change_the_work_or_go_unsent(
     backend, extra_params, message
 ):
-    schedule = stated_schedule(backend) if backend != "uniserve" else {}
     with pytest.raises(ValueError, match=message):
-        VideoConfig(backend=backend, extra_params=extra_params, **schedule)
+        video_config(backend, extra_params=extra_params)
 
 
 @pytest.mark.parametrize(
@@ -528,11 +635,31 @@ def test_video_extra_params_cannot_change_the_work_or_go_unsent(
         ({"num_inference_steps": 1}, "at least 2"),
         ({"flow_shift": 0.0}, "flow_shift"),
         ({"audio_flow_shift": float("nan")}, "audio_flow_shift"),
-        # A conditioned task reads its rows' media from a condition root,
-        # which a t2va point has no use for.
-        ({"task": "fl2va"}, "condition_root"),
-        ({"task": "ref2va"}, "condition_root"),
-        ({"condition_root": "inputs"}, "condition_root"),
+        # SGLang and vLLM-Omni name a requested target beside the shape.
+        (
+            {"backend": "sglang", **BASE_SCHEDULE, "duration_seconds": 5.0},
+            "aspect_ratio",
+        ),
+        (
+            {"backend": "vllm-omni", **BASE_SCHEDULE, "aspect_ratio": "16:9"},
+            "duration_seconds",
+        ),
+        # UniServe takes the shape alone; FastVideo names no aspect ratio.
+        ({"aspect_ratio": "16:9"}, "cannot receive"),
+        ({"duration_seconds": 5.0}, "cannot receive"),
+        (
+            {
+                "backend": "fastvideo",
+                "num_inference_steps": 9,
+                "duration_seconds": 5.0,
+                "aspect_ratio": "16:9",
+            },
+            "cannot receive",
+        ),
+        ({"size": "1344:768"}, "WxH"),
+        ({"size": "1344x0"}, "WxH"),
+        ({"num_frames": 0}, "num_frames"),
+        ({"fps": 24.0}, "fps"),
     ],
 )
 def test_video_config_refuses_work_a_backend_cannot_be_sent(settings, message):
@@ -543,8 +670,10 @@ def test_video_config_refuses_work_a_backend_cannot_be_sent(settings, message):
 @pytest.mark.parametrize(
     "video,message",
     [
-        ('aspect_ratio = "16:10"', "aspect_ratio must be auto or one of"),
-        ('aspect_ratio = "016:9"', "aspect_ratio must be auto or one of"),
+        # A video point states its output shape and soundtrack.
+        ("", "requires"),
+        ('size = "1344x768"\nfps = 24', "audio_sample_rate"),
+        ('size = "16:9"', "WxH"),
         ('backend = "sglang"', "requires"),
     ],
 )
@@ -604,13 +733,7 @@ def test_async_job_failure_or_published_media_url_is_terminal(failed):
 
         task = VideoTask(
             replace(
-                point(
-                    video=VideoConfig(
-                        backend="sglang",
-                        poll_interval_s=0.001,
-                        **FAST_H3_SCHEDULE,
-                    )
-                ),
+                point(video_config("sglang", poll_interval_s=0.001)),
                 endpoint="/v1/videos",
             )
         )
@@ -621,7 +744,7 @@ def test_async_job_failure_or_published_media_url_is_terminal(failed):
             record = await send_request(
                 client,
                 base_url,
-                task.build_request(Example("row", "scene", seconds=5)),
+                task.build_request(Example("row", "scene", num_frames=124)),
                 "row",
                 task="video",
             )
@@ -652,6 +775,10 @@ def test_run_releases_slots_before_inspection_and_retains_invalid_media(
             body = b"broken mp4" if request["prompt"] == "invalid" else media
             self.send_response(200)
             self.send_header("content-type", "video/mp4")
+            # The fixture's shape, which the server reports generating.
+            self.send_header("x-video-size", "1344x768")
+            self.send_header("x-video-num-frames", "107")
+            self.send_header("x-video-fps", "24")
             self.send_header("content-length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -664,7 +791,7 @@ def test_run_releases_slots_before_inspection_and_retains_invalid_media(
             pass
 
     rows = [
-        {"id": prompt, "prompt": prompt, "seconds": 4}
+        {"id": prompt, "prompt": prompt, "num_frames": 107}
         for prompt in ("valid", "invalid")
     ]
     manifest = tmp_path / "rows.jsonl"
@@ -673,7 +800,7 @@ def test_run_releases_slots_before_inspection_and_retains_invalid_media(
     priming = tmp_path / "priming.jsonl"
     for path, identity in ((warmup, "warmup"), (priming, "prime")):
         path.write_text(
-            json.dumps({"id": identity, "prompt": identity, "seconds": 4})
+            json.dumps({"id": identity, "prompt": identity, "num_frames": 107})
             + "\n"
         )
     # PyAV is an external decoder boundary. Decoding any response before both
@@ -746,12 +873,12 @@ def test_excluded_manifests_preserve_order_and_do_not_enter_measurements(
     observed = []
     warmup = [
         Example(
-            f"warm-{duration}-{tokens}",
+            f"warm-{frames}-{tokens}",
             "warm",
-            seconds=duration,
+            num_frames=frames,
             prompt_len=tokens,
         )
-        for duration in (5, 10, 15)
+        for frames in (124, 243, 362)
         for tokens in (1000, 10000)
     ]
     measured = [Example("measured", "measure")]

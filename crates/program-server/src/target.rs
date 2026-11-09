@@ -8,11 +8,10 @@
 //! (`flash_attn/cute/tile_scheduler.py:409-413`), so its modules are stored
 //! under the GPU model's name.
 //!
-//! Which targets this host builds for is a property of its devices, so the
-//! Program Server is told them: it launches no kernel and allocates no device
-//! memory (design section 6.1), and the executable gives it the device list
-//! through [`Devices`] — in the `uniserve program-server` command, from the
-//! platform crate's device query (design section 6.2's crate dependency).
+//! Which targets this host builds for is a property of its devices: the
+//! `serve` command is given them as `--target`s or reads their architectures
+//! from the driver ([`Target::of`]). The Program Server itself launches no
+//! kernel and allocates no device memory (design section 6.1).
 
 use std::fmt;
 
@@ -43,6 +42,22 @@ impl Target {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// The architecture target of `device`: its architecture-specific
+    /// instruction set, such as `sm_100a`.
+    ///
+    /// The suffixed name is the one kernels are built for: the plain name
+    /// omits the family's instructions, and a module built for it runs a
+    /// fraction as fast. Reads two device attributes and creates no context.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the driver cannot report the device's compute capability.
+    pub fn of(device: platform::DeviceId) -> platform::Result<Self> {
+        let major = device.attribute(platform::DeviceAttribute::ComputeCapabilityMajor)?;
+        let minor = device.attribute(platform::DeviceAttribute::ComputeCapabilityMinor)?;
+        Ok(Self(format!("sm_{major}{minor}a")))
+    }
 }
 
 impl fmt::Display for Target {
@@ -59,15 +74,6 @@ pub struct Device {
     pub arch: Target,
     /// The GPU model, such as the name its vendor gives it.
     pub model: Target,
-}
-
-/// The host's devices, which the Program Server builds for.
-///
-/// The Program Server does not call CUDA or NVML itself (design section 4.1:
-/// only the platform crate does); the executable hands it the device list
-/// with an implementation of this trait.
-pub trait Devices: Send + Sync {
-    fn devices(&self) -> Result<Vec<Device>>;
 }
 
 /// The targets of a set of devices for a package's kind of target, without

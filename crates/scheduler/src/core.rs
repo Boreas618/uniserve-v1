@@ -67,6 +67,7 @@ pub fn sim_args(model: impl Into<String>) -> EngineArgs {
         executable: proto::BUILD.to_owned(),
         model: proto::config::ModelConfig {
             model: model.into(),
+            base: None,
             max_model_len: 0,
             dtype: crate::ModelDtype::BFloat16,
             quantization: Default::default(),
@@ -377,7 +378,7 @@ impl SchedulerHandle {
         // Both pools are the deployment's, mapped by its ranks under its claim, so the stores reach
         // them under the deployment's name whether or not this scheduler keeps a host KV tier.
         scheduler.enable_trajectory_store(
-            &storage::socket::default_socket(),
+            &storage::default_socket(),
             &engine.deployment,
             args.epoch,
             &args.host,
@@ -385,7 +386,7 @@ impl SchedulerHandle {
         // Ranks executing video encoders that map host encoder pools report
         // them: a request's encoder outputs are stored and found there.
         scheduler.enable_encoder_store(
-            &storage::socket::default_socket(),
+            &storage::default_socket(),
             &engine.deployment,
             args.epoch,
             &args.host,

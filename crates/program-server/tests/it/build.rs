@@ -215,7 +215,7 @@ fn a_vendor_cubin_is_installed_stored_and_resolved_as_it_is() {
         temporary.path(),
         ToolchainConfig {
             nvcc: None,
-            python: temporary.path().join("no-python"),
+            python: Some(temporary.path().join("no-python")),
             wasm: None,
             cargo: None,
             max_jobs: 1,
@@ -327,7 +327,7 @@ fn an_executable_program_is_installed_stored_and_resolved_as_it_is() {
         "dtype_bf16",
         ToolchainConfig {
             nvcc: None,
-            python: temporary.path().join("no-python"),
+            python: Some(temporary.path().join("no-python")),
             wasm: None,
             cargo: None,
             max_jobs: 1,
@@ -417,7 +417,7 @@ script = "src/build.py"
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: None,
-            python: python.clone(),
+            python: Some(python.clone()),
             wasm: Some(precompiler),
             cargo: None,
             max_jobs: 1,
@@ -489,41 +489,43 @@ script = "src/build.py"
 /// command is where they are made absolute.
 #[test]
 fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
-    let command = program_server::command::command();
-    let matches = command
-        .try_get_matches_from([
-            "program-server",
-            "serve",
-            "--socket",
-            "relative/program-server.sock",
-            "--package-root",
-            "relative/packages",
-            "--store-root",
-            "relative/store",
-            // Relative to the directory this test runs in, which is the crate's:
-            // the command resolves a path where it was typed.
-            "--python",
-            "relative/python",
-            "--wasm",
-            "target/debug/scheduling-precompile",
-        ])
-        .expect("the command's own flags parse");
-    let options = program_server::command::options(&matches).expect("the command's options");
-    assert!(
-        options.socket.is_absolute(),
-        "the socket stayed {}",
-        options.socket.display()
-    );
-    let program_server::command::Action::Serve(serve) = options.action else {
-        panic!("serve did not answer serve options");
+    use clap::Parser as _;
+    use program_server::command::{Args, Command};
+
+    let args = Args::try_parse_from([
+        "program-server",
+        "serve",
+        "--socket",
+        "relative/program-server.sock",
+        "--package-root",
+        "relative/packages",
+        "--store-root",
+        "relative/store",
+        // Relative to the directory this test runs in, which is the crate's:
+        // the command resolves a path where it was typed.
+        "--python",
+        "relative/python",
+        "--wasm",
+        "target/debug/scheduling-precompile",
+    ])
+    .expect("the command's own flags parse");
+    let Command::Serve(serve) = args.command else {
+        panic!("serve did not parse as serve");
     };
+    let config = serve.settings.config(Vec::new());
+    let python = config
+        .toolchains
+        .python
+        .clone()
+        .expect("an interpreter was named");
     for (name, path) in [
-        ("package root", &serve.package_root),
-        ("store root", &serve.store_roots[0]),
-        ("python", &serve.toolchains.python),
+        ("socket", &config.socket),
+        ("package root", &config.package_root),
+        ("store root", &config.store_roots[0].path),
+        ("python", &python),
         (
             "wasm",
-            serve
+            config
                 .toolchains
                 .wasm
                 .as_ref()
@@ -538,7 +540,7 @@ fn the_command_makes_every_path_absolute_before_the_server_sees_it() {
     // which is every host but the one that ran `uv sync`.
     let typed_in = std::env::current_dir().expect("the directory the test runs in");
     assert_eq!(
-        serve.toolchains.python,
+        python,
         typed_in.join("relative/python"),
         "the relative interpreter did not resolve against the directory it was typed in",
     );

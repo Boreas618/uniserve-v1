@@ -302,22 +302,18 @@ pub struct ArtifactEvent {
 
 /// A video request. Final media bytes are returned through shared storage.
 ///
-/// What the request asks of the model family (its task's semantics, its
-/// presentation tags and its conditions) travels opaque in `conditioning`
-/// to the workers; the engine schedules it by the task's name and by the
-/// sizes of its conditions (`conditions`) alone.
+/// What the request asks of the model (its conditions and where its prompt
+/// presents them) travels opaque in `conditioning` to the workers; the
+/// engine schedules it by the sizes of its conditions (`conditions`) alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiffusionRequest {
     /// Engine request identity.
     pub request_id: RequestId,
-    /// The task the request runs, by its request name; the deployment's
-    /// denoiser must serve it.
-    pub task: String,
     /// The conditioner's presentation (condition labels, vision placeholders
     /// and the prompt), tokenized.
     pub prompt_token_ids: Vec<u32>,
-    /// The request's task, presentation tags and conditions as the model
-    /// family plans them, which the workers decode.
+    /// The request's conditions as its model planned them
+    /// (`crate::video::Conditions`, JSON), which the workers decode.
     pub conditioning: Vec<u8>,
     /// The sizes of each condition, in request order; empty for a task
     /// without conditions. The submitter keeps each condition's media
@@ -455,9 +451,9 @@ impl DiffusionRequest {
                 "a request states condition rows exactly when it carries conditions",
             ));
         }
-        if self.task.is_empty() || self.conditioning.is_empty() {
+        if self.conditioning.is_empty() {
             return Err(DiffusionRequestError::Conditions(
-                "the request names no task or carries no conditioning",
+                "the request carries no conditioning",
             ));
         }
         // The encoder inputs name what the request's encoders read: a unit

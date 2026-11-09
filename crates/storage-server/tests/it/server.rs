@@ -17,7 +17,6 @@ use std::time::Duration;
 use ::storage::protocol::{ErrorKind, Item};
 use ::storage::{
     Access, Claim, Client, Error, Key, Location, Mode, Role, Scope, StorageRecord, TensorRecord,
-    socket,
 };
 use storage_server::{Launch, Server};
 
@@ -58,7 +57,7 @@ impl Running {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("storage.sock");
         let transfer = transfer(&socket);
-        let (listener, lock) = socket::bind(&socket).unwrap().unwrap();
+        let (listener, lock) = service::bind(&socket).unwrap().unwrap();
         let mut ends = [0; 2];
         // SAFETY: pipe2 fills the two descriptors it creates.
         let created = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_NONBLOCK) };

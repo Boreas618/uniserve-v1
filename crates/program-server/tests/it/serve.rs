@@ -63,7 +63,7 @@ fn config(temporary: &Path) -> ServerConfig {
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: None,
-            python: std::path::PathBuf::from("/python/bin/python"),
+            python: Some(std::path::PathBuf::from("/python/bin/python")),
             wasm: None,
             cargo: None,
             max_jobs: 1,

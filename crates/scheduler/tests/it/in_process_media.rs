@@ -98,12 +98,11 @@ fn text_request(id: u64, length: u32) -> GenerationRequest {
 fn video_request(id: u64) -> DiffusionRequest {
     DiffusionRequest {
         request_id: RequestId(id),
-        task: "t2va".to_owned(),
         prompt_token_ids: vec![1; 4],
-        conditioning: models::video::Conditioning {
-            task: models::video::VideoTask::T2va,
-            text_tags: vec![1; 4],
+        conditioning: proto::video::Conditions {
             conditions: Vec::new(),
+            prompt_tokens: 4,
+            vision_spans: Vec::new(),
         }
         .encode()
         .expect("the conditioning encodes"),

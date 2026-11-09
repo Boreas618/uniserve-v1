@@ -50,16 +50,14 @@ pub(crate) struct VideoJob {
     pub completed_at: Option<u64>,
     /// Set with `completed_at`, to the store's retention after it.
     pub expires_at: Option<u64>,
-    /// Requested duration in seconds: the target's, or the length of the
-    /// reference soundtrack that sets it.
-    pub seconds: f64,
-    /// Duration in seconds of the frames the model generates, `num_frames`
-    /// at the model's frame rate. It may exceed `seconds`, since the model
-    /// extends a duration to a complete VAE clip.
-    pub actual_seconds: f64,
-    /// Frames the model generates for the requested duration.
+    /// Duration in seconds of the frames the model generates, `num_frames` at
+    /// `fps`, as a decimal string as the OpenAI video record states it.
+    pub seconds: String,
+    /// Frames the model generates.
     pub num_frames: u32,
-    /// The generated canvas, `WxH` in pixels.
+    /// The output's frame rate.
+    pub fps: u32,
+    /// The generated raster, `WxH` in pixels.
     pub size: String,
     pub status: String,
     /// `queued`, then the phases the generation task reports from runtime
@@ -500,9 +498,9 @@ mod tests {
             created_at: crate::openai::unix_time(),
             completed_at: None,
             expires_at: None,
-            seconds: 5.0,
-            actual_seconds: 124.0 / 24.0,
+            seconds: format!("{}", 124.0 / 24.0),
             num_frames: 124,
+            fps: 24,
             size: "1344x768".to_owned(),
             status: "queued".to_owned(),
             phase: "queued".to_owned(),

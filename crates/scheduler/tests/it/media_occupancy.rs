@@ -22,7 +22,7 @@ use crossbeam_channel::Receiver;
 
 use ipc::{BufferId, Call, CallKind, DimBound, MediaCall};
 use ipc::{DiffusionSamplingParams, RequestId};
-use models::video::Canvas;
+use proto::video::Canvas;
 use scheduler::{
     BatchEvent, BatchResult, CommandSender, ExecutionBatch, PoolLayout, RequestDispatch,
     SchedulerConfig, SimEngine, SimWorker, Worker, WorkerError, WorkerGroupId, WorkerInfo,
@@ -150,7 +150,6 @@ fn slow_consumer_receives_the_completed_video_before_the_terminal_event() {
     let mut stream = handle
         .submit(Request::Diffusion(DiffusionRequest {
             request_id: RequestId(90),
-            task: "t2va".to_owned(),
             prompt_token_ids: PROMPT.to_vec(),
             conditioning: b"{}".to_vec(),
             conditions: Vec::new(),
@@ -651,7 +650,6 @@ fn reference_request(id: u64) -> Request {
     let prompt_tokens = 3 + 4 + 2 + 8 + 3;
     Request::Diffusion(DiffusionRequest {
         request_id: RequestId(id),
-        task: "ref2va".to_owned(),
         prompt_token_ids: (0..prompt_tokens).collect(),
         conditioning: b"{}".to_vec(),
         conditions,
@@ -852,9 +850,9 @@ fn a_reference_request_reads_encodes_and_prepares_its_conditions() {
     }
 }
 
-/// A conditioned request is refused, naming its task, when the deployment's
-/// denoiser does not serve it, and its condition rows are refused, naming
-/// the product and both sizes, beyond what the latent encoder declares.
+/// A conditioned request is refused when the deployment's denoiser takes no
+/// conditions, and its condition rows are refused, naming the product and
+/// both sizes, beyond what the latent encoder declares.
 #[test]
 fn conditioned_requests_beyond_the_deployment_are_refused() {
     let rejected = |served: &Served, id: u64| match served.outcomes[&RequestId(id)].as_slice() {
@@ -869,11 +867,11 @@ fn conditioned_requests_beyond_the_deployment_are_refused() {
 
     let mut sim = video_worker(2, 2);
     if let Some(denoiser) = sim.mut_info_for_test().video_denoiser.as_mut() {
-        denoiser.tasks.retain(|task| task.name == "t2va");
+        denoiser.takes_conditions = false;
     }
     let served = serve(sim, vec![reference_request(1)]);
     let message = rejected(&served, 1);
-    assert!(message.contains("ref2va"), "{message}");
+    assert!(message.contains("takes no conditions"), "{message}");
 
     let Request::Diffusion(mut oversized) = reference_request(2) else {
         unreachable!("the fixture is a video request");

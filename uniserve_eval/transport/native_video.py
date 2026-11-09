@@ -1,19 +1,26 @@
 """Native video APIs, ending only when all encoded media bytes arrive.
 
-A request's payload is the canonical MiniMax-H3 body (``task``,
-``conditions``, ``target``, ``seed`` and any stated schedule). UniServe and
-SGLang take it as is, reading condition media from its ``file://`` URIs;
-vLLM-Omni and FastVideo take the same work in their own fields, vLLM-Omni
-with the media uploaded as request parts and FastVideo with plain local
-paths. No decoding, hashing or filesystem work belongs in these logical
-requests: the media bytes were read when the request was built. The caller
-owns the overall deadline and retains bodies for later inspection.
+A request's payload is UniServe's model-agnostic ``/v1/videos`` body: the
+prompt, the stated ``size``, ``num_frames`` and ``fps``, the seed and any
+``input_references``. UniServe takes it as is, reading reference media from
+their ``file://`` URLs. The baselines serve MiniMax-H3 in their own forms,
+which this module translates the body into: SGLang's native H3 body names a
+task, ``conditions`` and a ``target`` of short edge, aspect ratio and
+duration; vLLM-Omni and FastVideo take the raster, frame rate and frame count
+in their own fields, vLLM-Omni with the media uploaded as request parts and
+FastVideo with plain local paths. No decoding, hashing or filesystem work
+belongs in these logical requests: the media bytes were read when the request
+was built. The caller owns the overall deadline and retains bodies for later
+inspection.
 
 A server's own timings of a request (its inference time, named stage
 durations and peak device storage) are recorded as it reports them: in the
 ``X-Inference-Time-S``, ``X-Stage-Durations`` and ``X-Peak-Storage-MB``
 headers of a synchronous response, or the ``inference_time_s``,
-``stage_durations`` and ``peak_storage_mb`` fields of a completed job.
+``stage_durations`` and ``peak_storage_mb`` fields of a completed job. The
+shape a server reports generating is recorded the same way: the
+``x-video-size``, ``x-video-num-frames`` and ``x-video-fps`` headers, or the
+job's ``size``, ``num_frames`` and ``fps``.
 """
 
 from __future__ import annotations
@@ -28,8 +35,7 @@ from urllib.parse import quote, urljoin
 
 import aiohttp
 
-from .. import video_rules
-from ..types import RequestRecord, TaskRequest
+from ..types import RequestRecord, TaskRequest, VideoShape, parse_size
 
 # Response headers in which a synchronous video route reports its timings.
 _TIMING_HEADERS = (
@@ -38,9 +44,13 @@ _TIMING_HEADERS = (
     "x-peak-memory-mb",
 )
 
+# Response headers in which a synchronous video route reports the shape it
+# generated.
+_SHAPE_HEADERS = ("x-video-size", "x-video-num-frames", "x-video-fps")
+
 # vLLM-Omni and FastVideo present a request's references grouped by media
 # type in this order, whatever order they arrive in.
-_TYPE_ORDER = {"image": 0, "video": 1, "video_audio": 1, "audio": 2}
+_TYPE_ORDER = {"image": 0, "video": 1, "audio": 2}
 
 
 async def receive_video(
@@ -50,6 +60,9 @@ async def receive_video(
     record: RequestRecord,
 ) -> None:
     """Submit the native payload, poll as needed, and collect original bytes."""
+    video = request.video
+    if video is None:
+        raise ValueError("a video request carries its point's video settings")
     kwargs = native_request(request)
     url = base_url.rstrip("/") + request.endpoint
 
@@ -69,7 +82,7 @@ async def receive_video(
             record.close_now()
             record.mark_failure("video_job_failed", str(job.get("error", job)))
             return
-        await asyncio.sleep(request.poll_interval_s)
+        await asyncio.sleep(video.poll_interval_s)
         async with client.get(poll_url) as response:
             if await _failed_status(response, record):
                 return
@@ -80,6 +93,9 @@ async def receive_video(
         job.get("stage_durations"),
         job.get("peak_storage_mb"),
     )
+    record.served_shape = _served_shape(
+        job.get("size"), job.get("num_frames"), job.get("fps")
+    )
 
     # SGLang may publish a storage URL instead of a local content route.
     media_url = urljoin(base_url + "/", job.get("url") or f"{poll_url}/content")
@@ -89,101 +105,179 @@ async def receive_video(
 def native_request(request: TaskRequest) -> dict[str, Any]:
     """Return the JSON or multipart body arguments for the request's backend.
 
-    The canonical body states the schedule in sigma points including the
-    clean endpoint; a baseline's request always states it (``VideoConfig``
-    requires the fields each baseline takes). ``request.video_shape`` carries
-    the canvas and frame count the target resolves to.
+    A baseline's request always states its schedule in sigma points
+    including the clean endpoint (``VideoConfig`` requires the fields each
+    baseline takes), and ``request.video_shape`` carries the stated shape.
 
     Raises:
-        ValueError: The backend cannot be sent the request's conditions as
-            the same work: in their order, or with a field it lacks.
+        ValueError: The request carries no video settings, or the backend
+            cannot be sent the request's references as the same work: in
+            their order, or with a field it lacks.
     """
-    backend = request.video_backend or "uniserve"
+    video = request.video
+    if video is None:
+        raise ValueError("a video request carries its point's video settings")
+    backend = video.backend
     payload = dict(request.payload)
     if backend == "uniserve":
         return {"json": payload}
-    if backend == "sglang":
-        # Native H3 admission takes the canonical body and counts sigma
-        # points. Configured serving options, such as x264_preset, join it;
-        # the configuration cannot restate the work fields.
-        return {"json": {**payload, **request.video_extra_params}}
 
     shape = request.video_shape
     if shape is None:
         raise ValueError(f"a {backend} video request needs its video shape")
-    conditions = payload["conditions"]
-    _check_type_order(backend, conditions)
+    references = list(payload.get("input_references", []))
+    task = h3_task(references)
+    if backend == "sglang":
+        # Configured serving options, such as x264_preset, join the native
+        # body; the configuration cannot restate the work fields.
+        return {
+            "json": {
+                **_sglang_body(request, payload, references, task),
+                **video.extra_params,
+            }
+        }
+
+    _check_type_order(backend, references)
     common = {
         "model": payload["model"],
         "prompt": payload["prompt"],
         "seed": payload["seed"],
     }
     if backend == "vllm-omni":
-        return _vllm_omni_request(request, payload, conditions, common)
+        return _vllm_omni_request(request, references, task, common)
     if backend == "fastvideo":
-        return _fastvideo_request(request, payload, conditions, common)
+        return _fastvideo_request(request, references, task, common)
     raise ValueError(f"unknown video backend {backend!r}")
+
+
+def h3_task(references: list[dict[str, Any]]) -> str:
+    """Return the MiniMax-H3 task the baselines' native forms name.
+
+    UniServe derives it from the references; the H3 baselines take it as a
+    field. No reference is ``t2va``; only image anchor keyframes (items with
+    ``frame_index``) are ``fl2va``; any reference without ``frame_index`` is
+    ``ref2va``.
+
+    Raises:
+        ValueError: A video or audio reference carries ``frame_index``, which
+            no task takes.
+    """
+    if not references:
+        return "t2va"
+    if any("frame_index" not in reference for reference in references):
+        return "ref2va"
+    if all(reference["type"] == "image" for reference in references):
+        return "fl2va"
+    raise ValueError("only image references may anchor a keyframe")
+
+
+def _sglang_body(
+    request: TaskRequest,
+    payload: dict[str, Any],
+    references: list[dict[str, Any]],
+    task: str,
+) -> dict[str, Any]:
+    """Return SGLang's native MiniMax-H3 body for the request.
+
+    Native H3 admission names its canvas by the short edge and an aspect
+    ratio and its frames by a duration, which the point states as the ones
+    resolving to its stated shape, and counts its schedule in sigma points.
+    Each reference becomes a condition whose role is ``keyframe`` for an
+    anchor and ``reference`` otherwise.
+    """
+    video = request.video
+    shape = request.video_shape
+    assert video is not None and shape is not None
+    conditions = []
+    for reference in references:
+        condition: dict[str, Any] = {
+            "type": reference["type"],
+            "uri": reference["url"],
+            "role": "keyframe" if "frame_index" in reference else "reference",
+        }
+        for name in ("frame_index", "start_time_seconds"):
+            if name in reference:
+                condition[name] = reference[name]
+        conditions.append(condition)
+    return {
+        "model": payload["model"],
+        "prompt": payload["prompt"],
+        "task": task,
+        "conditions": conditions,
+        "target": {
+            "short_edge": min(shape.width, shape.height),
+            "aspect_ratio": video.aspect_ratio,
+            "duration_seconds": video.duration_seconds,
+        },
+        "seed": payload["seed"],
+        **video.schedule(),
+    }
 
 
 def _vllm_omni_request(
     request: TaskRequest,
-    payload: dict[str, Any],
-    conditions: list[dict[str, Any]],
+    references: list[dict[str, Any]],
+    task: str,
     common: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return vLLM-Omni's multipart body for the canonical request.
+    """Return vLLM-Omni's multipart body for the request.
 
-    Omni counts schedule intervals (denoiser forwards), not points. Its
-    native duration field preserves fractional seconds without the generic
-    OpenAI form field's integer restriction. Condition media go up as
-    repeated ``input_references`` parts, which the server classifies by
-    media type; keyframes take their frame indices in ``extra_params``, and
+    Omni counts schedule intervals (denoiser forwards), not points. The
+    raster, frame rate and frame count are the stated shape, beside the
+    point's requested aspect ratio and duration. Reference media
+    go up as repeated ``input_references`` parts, which the server classifies
+    by media type; keyframes take their frame indices in ``extra_params``, and
     a video's soundtrack conditions the request whenever the file has one.
     """
-    task = payload["task"]
+    video = request.video
+    shape = request.video_shape
+    assert video is not None and shape is not None
     keyframes = [
-        condition["frame_index"]
-        for condition in conditions
-        if condition["role"] == "keyframe"
+        reference["frame_index"]
+        for reference in references
+        if "frame_index" in reference
     ]
     if keyframes and task != "fl2va":
         raise ValueError("vLLM-Omni takes keyframes only for fl2va")
-    extra = {
+    assert video.num_inference_steps is not None
+    assert video.flow_shift is not None and video.audio_flow_shift is not None
+    assert video.duration_seconds is not None
+    extra: dict[str, Any] = {
         "task": task,
-        "duration": float(payload["target"]["duration_seconds"]),
-        "audio_flow_shift": float(payload["audio_flow_shift"]),
+        # Omni's native duration field preserves fractional seconds without
+        # the generic OpenAI form field's integer restriction.
+        "duration": float(video.duration_seconds),
+        "audio_flow_shift": float(video.audio_flow_shift),
     }
     if keyframes:
         extra["frame_indices"] = keyframes
     starts = [
-        float(condition.get("start_time_seconds", 0.0))
-        for condition in conditions
-        if condition["type"] in {"video", "video_audio"}
+        float(reference.get("start_time_seconds", 0.0))
+        for reference in references
+        if reference["type"] == "video"
     ]
     if any(starts):
         # One offset per video, in the videos' order.
         extra["start_time_seconds"] = starts
 
-    shape = request.video_shape
-    assert shape is not None
     fields = {
         **common,
         "width": shape.width,
         "height": shape.height,
-        "aspect_ratio": payload["target"]["aspect_ratio"],
-        # The model's output frame rate.
-        "fps": video_rules.FPS,
-        "num_inference_steps": int(payload["num_inference_steps"]) - 1,
+        "aspect_ratio": video.aspect_ratio,
+        "fps": shape.fps,
+        "num_frames": shape.frames,
+        "num_inference_steps": video.num_inference_steps - 1,
         "guidance_scale": 1.0,
-        "flow_shift": float(payload["flow_shift"]),
+        "flow_shift": float(video.flow_shift),
         # Configured serving options, such as preencode_mp4; the
         # configuration cannot restate the work fields.
-        "extra_params": json.dumps({**extra, **request.video_extra_params}),
+        "extra_params": json.dumps({**extra, **video.extra_params}),
     }
     parts = aiohttp.FormData(default_to_multipart=True)
     for key, value in fields.items():
         parts.add_field(key, str(value))
-    for media in request.condition_media:
+    for media in request.reference_media:
         parts.add_field(
             "input_references",
             media.data,
@@ -195,72 +289,89 @@ def _vllm_omni_request(
 
 def _fastvideo_request(
     request: TaskRequest,
-    payload: dict[str, Any],
-    conditions: list[dict[str, Any]],
+    references: list[dict[str, Any]],
+    task: str,
     common: dict[str, Any],
 ) -> dict[str, Any]:
-    """Return FastVideo's JSON body for the canonical request.
+    """Return FastVideo's JSON body for the request.
 
     FastVideo takes the shifts from the checkpoint and counts the schedule
     in sigma points, or in fused-block forwards for a parallel decoding
     student. It validates an already aligned causal-VAE frame count, so the
-    frames carry the work and integral requested seconds are kept beside
-    them. References name local files by path in its typed reference
-    fields; it has no keyframe or start-offset fields.
+    stated frames carry the work, and an integral requested duration is kept
+    beside them. References name local files by path in its
+    typed reference fields; it has no keyframe or start-offset fields.
     """
-    points = int(payload["num_inference_steps"])
+    video = request.video
     shape = request.video_shape
-    assert shape is not None
+    assert video is not None and shape is not None
+    assert video.num_inference_steps is not None
+    points = video.num_inference_steps
     body: dict[str, Any] = {
         **common,
-        "size": f"{shape.width}x{shape.height}",
-        # The model's output frame rate.
-        "fps": video_rules.FPS,
+        "size": shape.size,
+        "fps": shape.fps,
         "num_inference_steps": (
-            points - 1 if request.video_parallel_decoding else points
+            points - 1 if video.parallel_decoding else points
         ),
         "num_frames": shape.frames,
     }
-    seconds = float(payload["target"]["duration_seconds"])
-    if seconds.is_integer():
-        # The generic seconds field accepts integers only; the aligned
-        # frame count alone carries a fractional duration.
-        body["seconds"] = seconds
-    if payload["task"] == "t2va":
+    assert video.duration_seconds is not None
+    if float(video.duration_seconds).is_integer():
+        # The generic seconds field accepts integers only; the stated frame
+        # count alone carries a fractional duration.
+        body["seconds"] = float(video.duration_seconds)
+    if task == "t2va":
         return {"json": body}
 
-    references: dict[str, list[dict[str, str]]] = {}
+    typed: dict[str, list[dict[str, str]]] = {}
     fields = {
         "image": ("image_reference", "image_url"),
         "video": ("video_reference", "video_url"),
-        "video_audio": ("video_reference", "video_url"),
         "audio": ("audio_reference", "audio_url"),
     }
-    for condition, media in zip(
-        conditions, request.condition_media, strict=True
+    for reference, media in zip(
+        references, request.reference_media, strict=True
     ):
-        if condition["role"] != "reference":
-            raise ValueError("FastVideo takes reference conditions only")
-        if condition.get("start_time_seconds"):
+        if "frame_index" in reference:
+            raise ValueError("FastVideo takes references without keyframes")
+        if reference.get("start_time_seconds"):
             raise ValueError("FastVideo has no reference start offset")
-        field, key = fields[condition["type"]]
-        references.setdefault(field, []).append({key: media.path})
-    return {"json": {**body, "task": payload["task"], **references}}
+        field, key = fields[reference["type"]]
+        typed.setdefault(field, []).append({key: media.path})
+    return {"json": {**body, "task": task, **typed}}
 
 
-def _check_type_order(backend: str, conditions: list[dict[str, Any]]) -> None:
-    """Require conditions in the order a type-grouping backend presents.
+def _check_type_order(backend: str, references: list[dict[str, Any]]) -> None:
+    """Require references in the order a type-grouping backend presents.
 
     Raises:
-        ValueError: A later condition has an earlier media type, so the
-            backend would present the conditions in another order.
+        ValueError: A later reference has an earlier media type, so the
+            backend would present the references in another order.
     """
-    order = [_TYPE_ORDER[condition["type"]] for condition in conditions]
+    order = [_TYPE_ORDER[reference["type"]] for reference in references]
     if order != sorted(order):
         raise ValueError(
             f"{backend} presents images, then videos, then audio; the "
-            "request's conditions must already be in that order"
+            "request's references must already be in that order"
         )
+
+
+def _served_shape(size: Any, frames: Any, fps: Any) -> VideoShape | None:
+    """Return the shape a server reported, or ``None`` when it is not one.
+
+    A server reports these as strings in headers or as JSON values in a job;
+    a malformed or absent value leaves the shape unset, which validation of a
+    server that must report it then fails.
+    """
+    try:
+        width, height = parse_size(str(size))
+        count, rate = int(str(frames)), int(str(fps))
+    except (TypeError, ValueError):
+        return None
+    if count < 1 or rate < 1:
+        return None
+    return VideoShape(width, height, count, rate)
 
 
 def _record_timings(
@@ -344,4 +455,9 @@ async def _body(
                     response.headers.get("x-inference-time-s"),
                     response.headers.get("x-stage-durations"),
                     response.headers.get("x-peak-memory-mb"),
+                )
+            # Likewise its generated shape; a job's stands.
+            if any(name in response.headers for name in _SHAPE_HEADERS):
+                record.served_shape = _served_shape(
+                    *(response.headers.get(name) for name in _SHAPE_HEADERS)
                 )

@@ -1,13 +1,13 @@
-"""Build MiniMax-H3 video requests and inspect complete MP4s after measurement.
+"""Build video requests and inspect complete MP4s after measurement.
 
-Every request is the official MiniMax-H3 body that UniServe and SGLang
-accept: a ``task``, its ``conditions`` and a ``target`` of short edge, aspect
-ratio and duration. A t2va row carries no conditions; an fl2va or ref2va row
-lists its condition media, which the body names by ``file://`` URI under the
-point's ``video.condition_root``. The canvas and frame count a target
-resolves to follow the request rules the server plans with, which
-``uniserve_eval.video_rules`` asks; validation holds every MP4 to its own
-request's canvas and frames.
+Every request is UniServe's model-agnostic ``/v1/videos`` body: the prompt,
+the output shape the point states (``size``, ``num_frames`` and ``fps``),
+the seed, and the row's ``input_references``, each naming its media by a
+``file://`` URL under the point's ``video.reference_root``. The point states
+the size and frame rate; a row may state its own frame count, which must
+already be one the model generates. Validation holds every MP4 to its own
+request's stated shape and soundtrack, and a UniServe output also to the shape
+the server reported generating.
 Media files are read when the request is built, before measurement, and
 inspection uses each request's shape and never runs inside a load slot.
 """
@@ -19,27 +19,24 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
-from PIL import Image
-
-from .. import video_rules
 from ..transport.native_video import native_request
 from ..transport.video import VideoOutputError, inspect_video_bytes
 from ..types import (
-    VIDEO_SCHEDULE_FIELDS,
     VIDEOS_SYNC,
     BenchmarkPoint,
-    ConditionMedia,
     Example,
+    ReferenceMedia,
     RequestRecord,
     TaskName,
     TaskRequest,
     ValidationResult,
     VideoConfig,
     VideoShape,
+    parse_size,
 )
 from .base import BenchmarkTask
 
-# Media types of the condition files the request API accepts, by suffix:
+# Media types of the reference files the request API accepts, by suffix:
 # JPEG, PNG and WEBP images, MP4 and QuickTime videos, MP3 and WAV audio.
 MEDIA_TYPES = {
     ".jpg": "image/jpeg",
@@ -52,101 +49,26 @@ MEDIA_TYPES = {
     ".wav": "audio/wav",
 }
 
-# The media type family each condition type requires.
-_CONDITION_MEDIA = {
+# The media type family each reference type requires.
+_REFERENCE_MEDIA = {
     "image": "image/",
     "video": "video/",
-    "video_audio": "video/",
     "audio": "audio/",
 }
 
-# The EXIF orientations that turn an image by 90 degrees, so its displayed
-# width is its stored height.
-_TRANSPOSED_ORIENTATIONS = frozenset({5, 6, 7, 8})
-_EXIF_ORIENTATION = 0x0112
+# The keys a workload row's reference may carry: its request type, its file
+# under the reference root, and the request's optional anchor and offset.
+_REFERENCE_KEYS = frozenset(
+    {"type", "media", "frame_index", "start_time_seconds"}
+)
 
-
-def target_canvas(
-    task: str, aspect_ratio: str, keyframe: tuple[int, int] | None = None
-) -> tuple[int, int]:
-    """Resolve the canvas of a target.
-
-    A target names ``auto`` or one of the named ratios, which the
-    adapt_shape_v1 canvas rule turns into pixels. ``auto`` is 16:9 for t2va
-    and ref2va, and for fl2va the displayed aspect of the first keyframe.
-
-    Args:
-        task: ``t2va``, ``fl2va`` or ``ref2va``.
-        aspect_ratio: The target's aspect ratio.
-        keyframe: The first keyframe's displayed ``(width, height)``, which
-            an fl2va ``auto`` target requires.
-
-    Returns:
-        The canvas as ``(width, height)`` in pixels.
-
-    Raises:
-        ValueError: The task does not accept the aspect ratio, or an fl2va
-            ``auto`` target has no keyframe or one outside 1:4 to 4:1.
-    """
-    _named_ratio(task, aspect_ratio)
-    size = video_rules.named_canvas(task, aspect_ratio)
-    if size is None:
-        if keyframe is None:
-            raise ValueError("an fl2va auto target follows its first keyframe")
-        size = video_rules.canvas(*keyframe)
-    return size
-
-
-def target_frames(seconds: float) -> int:
-    """Return the frames a target duration generates.
-
-    The duration times the model's frame rate (24) rounds half to even
-    and aligns up to the next ``17 n + 5`` frames.
-
-    Raises:
-        ValueError: The duration lies outside 4 to 15 seconds.
-    """
-    return video_rules.frame_count(seconds)
-
-
-def _named_ratio(task: str, aspect_ratio: str) -> tuple[int, int] | None:
-    """Return a named target ratio, or ``None`` for ``auto``.
-
-    Raises:
-        ValueError: The ratio is neither ``auto`` nor a named ratio.
-    """
-    if aspect_ratio == "auto":
-        return None
-    # The API spells a ratio in canonical decimal form, so a named ratio is
-    # accepted exactly as written here.
-    named = {
-        f"{width}:{height}": (width, height)
-        for width, height in video_rules.NAMED_ASPECT_RATIOS
-    }
-    if aspect_ratio not in named:
-        raise ValueError(
-            f"aspect_ratio must be auto or one of {', '.join(named)} for "
-            f"{task}, got {aspect_ratio!r}"
-        )
-    return named[aspect_ratio]
-
-
-def _displayed_size(path: Path) -> tuple[int, int]:
-    """Return an image's ``(width, height)`` after its EXIF orientation.
-
-    Only the header is read; the orientation decides whether the stored
-    sides swap, as the server's probe does before it plans the canvas.
-    """
-    with Image.open(path) as picture:
-        width, height = picture.size
-        orientation = picture.getexif().get(_EXIF_ORIENTATION)
-    if orientation in _TRANSPOSED_ORIENTATIONS:
-        return height, width
-    return width, height
+# The point's fields that state the output shape and soundtrack every
+# request is held to; the frame count may come from each row instead.
+_STATED_FIELDS = ("size", "fps", "audio_sample_rate", "audio_channels")
 
 
 class VideoTask(BenchmarkTask):
-    """Builds MiniMax-H3 video requests and validates the media contract."""
+    """Builds video requests and validates the stated media contract."""
 
     name: ClassVar[TaskName] = TaskName.VIDEO
     allowed_endpoints: ClassVar[tuple[str, ...]] = (VIDEOS_SYNC, "/v1/videos")
@@ -154,143 +76,137 @@ class VideoTask(BenchmarkTask):
     default_stream: ClassVar[bool] = False
 
     def __init__(self, point: BenchmarkPoint) -> None:
-        """Bind the point to the condition media root it reads rows from."""
+        """Bind the point to the reference media root it reads rows from."""
         super().__init__(point)
-        root = point.video.condition_root
-        self.condition_root = Path(root).resolve() if root else None
+        root = point.video.reference_root
+        self.reference_root = Path(root).resolve() if root else None
 
     @classmethod
     def check_video(cls, video: VideoConfig, context: str) -> None:
-        """Reject a target ratio the task does not accept."""
-        try:
-            _named_ratio(video.task, video.aspect_ratio)
-        except ValueError as error:
-            raise ValueError(f"{context}: {error}") from error
+        """Require the output shape and soundtrack a video point measures."""
+        missing = [
+            name for name in _STATED_FIELDS if getattr(video, name) is None
+        ]
+        if missing:
+            raise ValueError(
+                f"{context}: a video point states its output shape and "
+                f"soundtrack and requires {missing}"
+            )
 
     def build_request(self, example: Example) -> TaskRequest:
-        """Build one request from the row's duration, seed and conditions.
+        """Build one request from the row's frame count, seed and references.
 
-        A row without its own duration or seed takes the point's video
-        duration and load seed. The stated schedule fields are sent when the
-        point sets them. The row's condition media are read here, so a
-        backend that uploads them sends bytes already in storage.
+        A row without its own frame count or seed takes the point's
+        ``video.num_frames`` and load seed. The row's reference media are read
+        here, so a backend that uploads them sends bytes already in storage.
 
         Raises:
-            ValueError: The duration lies outside 4 to 15 seconds, the
-                row's conditions do not fit the point's task, or the backend
-                cannot be sent them as the same work.
-            OSError: A condition media file cannot be read.
+            ValueError: The point does not state its shape, neither the row
+                nor the point states a frame count, a reference does not fit
+                the request API, or the backend cannot be sent the request
+                as the same work.
+            OSError: A reference media file cannot be read.
         """
         video = self.point.video
-        seconds = float(
-            example.seconds if example.seconds is not None else video.seconds
+        self.check_video(video, f"benchmark {self.point.name} video")
+        frames = (
+            example.num_frames
+            if example.num_frames is not None
+            else video.num_frames
         )
-        frames = target_frames(seconds)
-        conditions, media = self._conditions(example)
+        if (
+            isinstance(frames, bool)
+            or not isinstance(frames, int)
+            or frames < 1
+        ):
+            raise ValueError(
+                f"row {example.id}: num_frames must be a positive integer, "
+                f"stated by the row or by the point's video.num_frames"
+            )
+        assert video.size is not None and video.fps is not None
+        width, height = parse_size(video.size)
+        shape = VideoShape(width, height, frames, video.fps)
+        references, media = self._references(example)
 
-        # Only an fl2va auto target reads its canvas from the first keyframe,
-        # whose displayed size the server probes the same way.
-        keyframe = (
-            _displayed_size(Path(media[0].path))
-            if video.task == "fl2va"
-            else None
-        )
-        width, height = target_canvas(video.task, video.aspect_ratio, keyframe)
-        payload = {
+        payload: dict[str, Any] = {
             "model": self.point.model,
             "prompt": example.prompt,
-            "task": video.task,
-            "conditions": conditions,
-            "target": {
-                # The short edge the model names its canvases at.
-                "short_edge": video_rules.CANVAS_SHORT_EDGE,
-                "aspect_ratio": video.aspect_ratio,
-                "duration_seconds": seconds,
-            },
+            "size": shape.size,
+            "num_frames": shape.frames,
+            "fps": shape.fps,
             "seed": int(
                 example.seed
                 if example.seed is not None
                 else self.point.load.seed
             ),
         }
-        for name in VIDEO_SCHEDULE_FIELDS:
-            value = getattr(video, name)
-            if value is not None:
-                payload[name] = value
+        if references:
+            payload["input_references"] = references
         request = TaskRequest(
             self.point.endpoint,
             payload,
             stream=False,
-            video_backend=video.backend,
-            poll_interval_s=video.poll_interval_s,
-            video_extra_params=dict(video.extra_params),
-            video_shape=VideoShape(width=width, height=height, frames=frames),
-            condition_media=tuple(media),
-            video_parallel_decoding=video.parallel_decoding,
+            video=video,
+            video_shape=shape,
+            reference_media=tuple(media),
         )
         # A request its backend cannot take as the same work fails here,
         # before measurement, rather than as a measured transport failure.
         native_request(request)
         return request
 
-    def _conditions(
+    def _references(
         self, example: Example
-    ) -> tuple[list[dict[str, Any]], list[ConditionMedia]]:
-        """Return a row's request conditions and their media, in row order.
+    ) -> tuple[list[dict[str, Any]], list[ReferenceMedia]]:
+        """Return a row's request references and their media, in row order.
 
-        Each condition names its file by an absolute ``file://`` URI. The
-        rows' structure is checked only as far as the canvas and the
-        backends' request forms depend on it: t2va takes no conditions,
-        fl2va only image keyframes, and ref2va at least one reference. The
-        server enforces the remaining request rules.
+        Each reference names its file by an absolute ``file://`` URL. A row
+        is checked only as far as the request API's reference fields and the
+        backends' upload forms depend on it; the server enforces the model's
+        own rules on which references it takes.
 
         Raises:
-            ValueError: The conditions do not fit the point's task.
+            ValueError: A reference has an unknown key or type, a file whose
+                suffix is not its type's media, or the point has no
+                reference root.
             OSError: A media file cannot be read.
         """
-        task = self.point.video.task
-        rows = example.conditions or []
-        if task == "t2va":
-            if rows:
-                raise ValueError(f"row {example.id}: t2va takes no conditions")
-            return [], []
+        rows = example.input_references or []
         if not rows:
-            raise ValueError(f"row {example.id}: {task} requires conditions")
+            return [], []
+        if self.reference_root is None:
+            raise ValueError(
+                f"row {example.id}: input_references need the point's "
+                f"video.reference_root"
+            )
 
-        assert self.condition_root is not None
-        conditions: list[dict[str, Any]] = []
-        media: list[ConditionMedia] = []
+        references: list[dict[str, Any]] = []
+        media: list[ReferenceMedia] = []
         for index, row in enumerate(rows):
-            context = f"row {example.id} conditions[{index}]"
-            kind, role = row.get("type"), row.get("role")
-            if kind not in _CONDITION_MEDIA:
+            context = f"row {example.id} input_references[{index}]"
+            if unknown := sorted(set(row) - _REFERENCE_KEYS):
+                raise ValueError(f"{context}: unknown keys {unknown}")
+            kind = row.get("type")
+            if kind not in _REFERENCE_MEDIA:
                 raise ValueError(f"{context}: unknown type {kind!r}")
-            if role not in {"keyframe", "reference"}:
-                raise ValueError(f"{context}: unknown role {role!r}")
-            if task == "fl2va" and (role != "keyframe" or kind != "image"):
-                raise ValueError(f"{context}: fl2va takes image keyframes")
+            anchor = row.get("frame_index")
+            if anchor is not None and (
+                isinstance(anchor, bool) or not isinstance(anchor, int)
+            ):
+                raise ValueError(f"{context}: frame_index must be an integer")
 
-            path = (self.condition_root / str(row["media"])).resolve()
+            path = (self.reference_root / str(row["media"])).resolve()
             mime = MEDIA_TYPES.get(path.suffix.lower())
-            if mime is None or not mime.startswith(_CONDITION_MEDIA[kind]):
+            if mime is None or not mime.startswith(_REFERENCE_MEDIA[kind]):
                 raise ValueError(f"{context}: {path.name} is not {kind} media")
 
-            condition: dict[str, Any] = {
-                "type": kind,
-                "uri": path.as_uri(),
-                "role": role,
-            }
+            reference: dict[str, Any] = {"type": kind, "url": path.as_uri()}
             for name in ("frame_index", "start_time_seconds"):
                 if row.get(name) is not None:
-                    condition[name] = row[name]
-            conditions.append(condition)
-            media.append(ConditionMedia(str(path), mime, path.read_bytes()))
-
-        if task == "ref2va" and not any(
-            condition["role"] == "reference" for condition in conditions
-        ):
-            raise ValueError(f"row {example.id}: ref2va requires a reference")
-        return conditions, media
+                    reference[name] = row[name]
+            references.append(reference)
+            media.append(ReferenceMedia(str(path), mime, path.read_bytes()))
+        return references, media
 
     def inspect_output(self, record: RequestRecord) -> None:
         """Decode and classify a response outside the load window."""
@@ -313,15 +229,15 @@ class VideoTask(BenchmarkTask):
     def validate_output(
         self, records: Sequence[RequestRecord]
     ) -> ValidationResult:
-        """Validate canvas, codecs, audio, and duration alignment.
+        """Validate raster, frame rate, codecs, soundtrack and length.
 
-        Each output is held to the canvas and frame count its own request
-        resolved to (``RequestRecord.video_shape``); a record without one
-        fails every shape check. The frame rate, sample rate and channel
-        count are the model's own (``video_rules``), the facts the serving
-        workers declare in their handshake.
+        Each output is held to the shape its own request states
+        (``RequestRecord.video_shape``) and to the point's stated soundtrack;
+        a record without a stated shape fails every check. A UniServe output
+        must also come with the server's report of the shape it generated,
+        equal to the stated one.
         """
-        fps = video_rules.FPS
+        video_config = self.point.video
         outputs = [record.decoded_video for record in records]
         shapes = [record.video_shape for record in records]
         present = (
@@ -336,60 +252,67 @@ class VideoTask(BenchmarkTask):
         ]
         videos = [video for video, _ in pairs]
 
-        # Both streams are measured against the aligned media length rather
-        # than each other: the video may differ from the aligned frame count
-        # by one frame, and the audio duration from the aligned duration by
+        # Both streams are measured against the stated media length rather
+        # than each other: the video may differ from the stated frame count
+        # by one frame, and the audio duration from the stated duration by
         # one frame period. A one-frame-short video with full-length audio is
         # therefore valid, while a missing or truncated stream is not.
         frame_tolerance = 1
-        duration_tolerance_s = 1.0 / fps
+        checks = {
+            "decoded_video": present,
+            "h264_video": present
+            and all(video.video_codec == "h264" for video in videos),
+            "stated_size": present
+            and all(
+                (video.width, video.height) == (shape.width, shape.height)
+                for video, shape in pairs
+            ),
+            # The container frame rate is a rational; require exactly the
+            # stated one.
+            "stated_fps": present
+            and all(
+                video.fps_numerator == shape.fps * video.fps_denominator
+                for video, shape in pairs
+            ),
+            "stated_frame_count": present
+            and all(
+                abs(video.frame_count - shape.frames) <= frame_tolerance
+                for video, shape in pairs
+            ),
+            "stated_aac_audio": present
+            and all(
+                video.audio_codec == "aac"
+                and video.audio_channels == video_config.audio_channels
+                and video.audio_sample_rate == video_config.audio_sample_rate
+                for video in videos
+            ),
+            "stated_audio_duration": present
+            and all(
+                abs(video.audio_duration_s - shape.duration_s)
+                <= 1.0 / shape.fps
+                for video, shape in pairs
+            ),
+            "nonzero_video_variance": present
+            and all(
+                math.isfinite(video.video_variance) and video.video_variance > 0
+                for video in videos
+            ),
+            "nonzero_audio_rms": present
+            and all(
+                math.isfinite(video.audio_rms) and video.audio_rms > 0
+                for video in videos
+            ),
+        }
+        if video_config.backend == "uniserve":
+            # UniServe reports the shape it generated in the job record or
+            # the synchronous response headers.
+            checks["served_shape"] = present and all(
+                record.served_shape is not None
+                and record.served_shape == record.video_shape
+                for record in records
+            )
         return ValidationResult(
-            checks={
-                "decoded_video": present,
-                "h264_video": present
-                and all(video.video_codec == "h264" for video in videos),
-                "target_canvas": present
-                and all(
-                    (video.width, video.height) == (shape.width, shape.height)
-                    for video, shape in pairs
-                ),
-                # The container frame rate is a rational; require exactly
-                # the model's.
-                "24fps_video": present
-                and all(
-                    video.fps_numerator == fps * video.fps_denominator
-                    for video in videos
-                ),
-                "aligned_frame_count": present
-                and all(
-                    abs(video.frame_count - shape.frames) <= frame_tolerance
-                    for video, shape in pairs
-                ),
-                "aac_stereo_32khz_audio": present
-                and all(
-                    video.audio_codec == "aac"
-                    and video.audio_channels == video_rules.AUDIO_CHANNELS
-                    and video.audio_sample_rate == video_rules.AUDIO_SAMPLE_RATE
-                    for video in videos
-                ),
-                "aligned_audio_duration": present
-                and all(
-                    abs(video.audio_duration_s - shape.frames / fps)
-                    <= duration_tolerance_s
-                    for video, shape in pairs
-                ),
-                "nonzero_video_variance": present
-                and all(
-                    math.isfinite(video.video_variance)
-                    and video.video_variance > 0
-                    for video in videos
-                ),
-                "nonzero_audio_rms": present
-                and all(
-                    math.isfinite(video.audio_rms) and video.audio_rms > 0
-                    for video in videos
-                ),
-            },
+            checks=checks,
             statistics={
                 "completed_videos": len(videos),
                 "media_bytes": sum(video.byte_size for video in videos),
@@ -397,4 +320,4 @@ class VideoTask(BenchmarkTask):
         )
 
 
-__all__ = ["MEDIA_TYPES", "VideoTask", "target_canvas", "target_frames"]
+__all__ = ["MEDIA_TYPES", "VideoTask"]

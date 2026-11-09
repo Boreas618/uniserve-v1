@@ -4,7 +4,7 @@ UniServe serves FastH3 8-Step text-to-video-with-audio and keyframe-conditioned 
 
 UniServe is a Rust serving system. Rust owns the control and data planes and the numerical computation alike: HTTP admission, scheduling, the main processes, request state, storage, CUDA streams and graph policy, transfers and response assembly. No serving process carries a Python interpreter: Python appears in the Program Server alone, as the compiler of Triton and CuTe DSL kernel programs, and in the evaluation client `uniserve_eval`.
 
-The configured model descriptions are `qwen3` and `minimax_h3`. A server process loads exactly one description and exposes one served-model identity.
+The executable serves two model families, Qwen3-MoE (chat) and MiniMax-H3 (video generation), each registered once in `src/main.rs`. A server resolves its checkpoint to the family that claims the class it declares, serves exactly that model and exposes one served-model identity.
 
 ## Requirements
 
@@ -48,13 +48,13 @@ uniserve serve "$H3_MODEL" \
   --max-running-requests 2
 ```
 
-Startup prepares and captures every admitted request shape before `/health` reports ready; on four GB200 GPUs this takes about 11 minutes. The first startup on a machine also compiles and caches the kernels FastH3 runs and takes about 19 minutes. Until preparation finishes, the log reports `executors still busy during startup` with `elapsed_secs`. Then generate a video:
+Startup prepares and captures every admitted request shape before `/health` reports ready; on four GB200 GPUs this takes about 11 minutes. The first startup on a machine also compiles and caches the kernels FastH3 runs and takes about 19 minutes. Then generate a video:
 
 ```bash
 curl --fail-with-body --max-time 600 \
   http://127.0.0.1:8000/v1/videos/sync \
   -H 'Content-Type: application/json' \
-  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","task":"t2va","target":{"short_edge":768,"aspect_ratio":"16:9","duration_seconds":5},"seed":1000}' \
+  -d '{"model":"FastH3","prompt":"A clear stream flows through a green forest while birds sing.","size":"1344x768","seconds":5,"seed":1000}' \
   --output forest.mp4
 ```
 
@@ -82,20 +82,20 @@ One replica spanning every GPU gives the lowest latency; replicas serve more req
 | `GET /metrics` | Runtime metrics |
 | `GET /version` | Build information |
 | `GET /v1/models` | Configured served model |
-| `GET /v1/capabilities` | Served tasks, canvases, duration limits, schedule, accepted request fields and job retention |
+| `GET /v1/capabilities` | The served model's video rules (tasks, sizes, durations, frame rate, schedule), prompt capacity, media policy, accepted request fields and job retention |
 | `POST /v1/videos/sync` | Generate one video and return the MP4 |
 | `POST /v1/videos` | Create an asynchronous video job |
 | `GET /v1/videos`, `GET /v1/videos/{id}` | List jobs, or read one job's state and progress |
 | `GET /v1/videos/{id}/content` | Download a completed job's MP4 |
 | `DELETE /v1/videos/{id}` | Cancel or delete a job |
-| `POST /v1/chat/completions` | Streaming and non-streaming text, image-input, image-output, and interleaved generation |
+| `POST /v1/chat/completions` | Streaming and non-streaming chat generation, with reasoning and tool-call parsing where the model's chat profile names them |
 | `/admin/*` | The admin API: configuration changes (`PUT /admin/config`), each moving the deployment to a new epoch on trial without failing a request, their commit and rollback, and the other operations of a serving deployment ([docs/admin.md](docs/admin.md)) |
 
 The server registers the routes of the tasks the served model performs: the video routes and `/v1/capabilities` for a video model, and chat completions for a text model. Any other path answers `404` with `{"detail": "Not Found"}`. With an API key configured, every route but `/health` and `/metrics` requires it. Another build of the engine and workers is a configuration change of `worker_config.executable` (`PUT /admin/config` with `{"set": ["worker_config.executable=/path/to/uniserve"]}`): it answers once the new epoch serves on trial, with `pause_seconds`, how long requests waited for it, and `POST /admin/config/commit` ends the trial. On SIGTERM or Ctrl-C the server stops accepting connections and lets requests in flight, streamed responses included, finish within `server_config.shutdown_timeout`; asynchronous video jobs end at once, since a restarted server keeps none.
 
 
 
-A video request is the MiniMax-H3 request body: `model`, `prompt`, `task` (`t2va`), `target` with `short_edge` 768, `aspect_ratio` `16:9` and `duration_seconds` (4 to 15), and an optional `seed` (default 42). The [FastH3 guide](docs/minimax_h3/minimax_h3.md#generate-a-video) lists every field. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
+A video request has the same fields for every video model: `model`, `prompt`, `negative_prompt`, `size` (`WxH`), `seconds` or `num_frames`, `fps`, `seed`, `num_inference_steps`, `guidance_scale`, `input_references` (image, video or audio media, each optionally anchoring a generated frame with `frame_index`) and `extra_params`; any other field is refused. The served model's processor holds a request to its own rules: MiniMax-H3 derives its task from the references, serves the sizes the deployment prepares (1344x768 and 768x1344 by default), aligns `seconds` (4 to 15) to its frame rule at 24 fps and uses seed 42 when none is given. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#generate-a-video) lists every field and MiniMax-H3's mapping. Model discovery returns exactly one entry with the standard `id`, `object`, `created`, and `owned_by` fields; `id` is the configured served-model name.
 
 The metrics endpoint publishes scheduler, worker, request and HTTP metrics in one OpenMetrics response. Each finished request is counted in `uniserve:request_success_total` under its `finished_reason` (`stop`, `length`, `abort`, `error`), with its latency, queue time and token counts in the request histograms, labeled by model name and the data-parallel rank (`engine`) that served it; running and waiting requests are the scheduler gauges `uniserve:num_requests_running` and `uniserve:num_requests_waiting`.
 
@@ -106,7 +106,6 @@ UniServe's options form one tree, following TensorRT-LLM's serving configuration
 ```bash
 uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
   --served-model-name FastH3 --max-running-requests 2 \
-  --set cuda_graph_config.policy=off \
   --set quantization.mode=balanced
 ```
 
@@ -127,11 +126,11 @@ uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
 | `cuda_graph_config`, `flashinfer_config`, `worker_config` | CUDA graph capture, the FlashInfer provider, and the worker processes |
 | `logging_config` | Request and statistics logs |
 | `chat_config`, `image_fetch_config` | Chat models: chat template, reasoning parser and image URL fetching |
-| `video_config`, `media_config`, `video_job_config` | MiniMax-H3: canvases, durations, prompt capacities, condition media and asynchronous jobs |
+| `video_config`, `media_config`, `video_job_config` | Video models: output sizes, durations, prompt capacities, condition media and asynchronous jobs |
 
-A model-family table is refused at startup when the served checkpoint belongs to another family. `GET /admin/config` returns the resolved tree in the form `--config` reads; `--log-level` and `--log-level-http` set the process's log levels. [Configuration](docs/configuration.md) describes every option, the configuration file and the deployment-file format.
+A chat option or table is refused at startup when the served checkpoint is a video model, and a video table when it is a chat model. `GET /admin/config` returns the resolved tree in the form `--config` reads; `--log-level` and `--log-level-http` set the process's log levels. [Configuration](docs/configuration.md) describes every option, the configuration file and the deployment-file format.
 
-On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Prefill graphs hold up to `max_num_batched_tokens` prompt tokens (plus one image's feature tokens for models that read images) and up to 31 prompts; decode graphs hold up to 128 requests. Both hold at most `max_running_requests` and at most as many requests as the KV pool holds a page of every cache group for. A prefill or decode step that no captured graph holds runs eagerly. Larger token budgets capture more graphs, so startup takes longer. Startup also runs every image encoder and decoder once, so the `uniserve-kernel-table` line it logs names the kernel of every call the server makes. `cuda_graph_config.policy = "off"` serves every call without graphs, and so does `auto` with `attention_backend = "torch"`, whose captured calls attend over every row's whole capacity.
+On a GPU, startup captures CUDA graphs for decode steps and for prefill steps before the server reports ready, and serving replays them. Prefill graphs hold up to `max_num_batched_tokens` prompt tokens and up to 31 prompts; decode graphs hold up to 128 requests. Both hold at most `max_running_requests` and at most as many requests as the KV pool holds a page of every cache group for. A prefill or decode step that no captured graph holds runs eagerly. Larger token budgets capture more graphs, so startup takes longer. Startup also runs every image encoder and decoder once, so the `uniserve-kernel-table` line it logs names the kernel of every call the server makes. With `attention_backend = "torch"` every call serves without graphs, since its captured calls would attend over every row's whole capacity.
 
 Run `uniserve serve --help` for the flags; [Configuration](docs/configuration.md) lists every option.
 
@@ -183,7 +182,9 @@ For decision-session replay, give every row of a JSON Lines workload a non-empty
 The [architecture guide](docs/architecture.md) describes how the daemons, the engine process and the executors divide the work, how a main process's threads divide it, and how a request travels through them.
 
 ```text
-crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf)
+src/                    The root package, `uniserve`: the command line, logging, the `serve` command, and `main.rs`, which dispatches every command and registers the model families
+crates/engine/          The main process of a node and epoch: its control thread, schedulers, executors and blocking pool, and the catalogue that resolves a checkpoint to its model family
+crates/proto/           The interfaces across builds: the request interface and the process interface (Protobuf), and the video condition vocabulary
 crates/ipc/             Scheduler-to-main-process messages, rank channels and the launch descriptor
 crates/scheduling/      The scheduling interface between the scheduler's mechanism and its policy
 crates/storage/         The Storage Server's protocol and client
@@ -191,19 +192,19 @@ crates/storage-server/  The Storage Server, its Mooncake connector and its Trans
 crates/nixl/            NIXL agents with the UCX backend, loaded at runtime
 crates/platform/        The CUDA boundary: driver, virtual memory, device memory and allocator, streams, events, graphs, kernels and NCCL
 crates/ops/             The interface between Rust and kernel programs: operators, launch code and every kernel, one package per operator and backend under `kernels/`
-crates/nn/              The shared computation library: tensor views, numerical layers, capability traits and a loaded model's blocks
-crates/models/          The concrete models and the rules their requests carry
-  rules/                Model-family request semantics: the family registry, checkpoint facts and prompt rules of Qwen3 and MiniMax-H3
-  qwen3-moe/            `Qwen3MoeForCausalLM`: its checkpoint configuration, mathematical partition and composition
-  minimax-h3/           MiniMax-H3 and FastH3: their checkpoint configuration, mathematical partition and components
-crates/worker/        The host half of the main process: the one thread that issues work to the devices
-crates/scheduler/          The engine process: schedulers, KV allocation, executors, executor groups and the request interface's service
+crates/nn/              The shared computation library: tensor views, numerical layers, capability traits and the model family contract execution loads models through
+crates/processing/      The request-side model contract: a family's chat profile or video processor, which checks and plans model-agnostic video requests
+crates/models/          The concrete models, each a crate that implements both contracts
+  qwen3-moe/            `Qwen3MoeForCausalLM`: checkpoint configuration, mathematical partition, composition and the Qwen3 chat profile
+  minimax-h3/           MiniMax-H3 and FastH3: checkpoint configuration, mathematical partition, components and request processing (`src/processing/`)
+crates/worker/          The executors: the one thread per device that issues its work, with the runners, graphs and memory owners
+crates/scheduler/       The main process's mechanism: schedulers, KV allocation, executor groups and the request interface's service
 crates/daemon/          The node's daemon: process supervision and the Storage Server claim; on the leader, serving options, input and output processing, the HTTP API, metrics and the engine's client
-crates/frontend/        The deployment's application process: the HTTP and OpenAI API, input and output processing
+crates/frontend/        The application's view of the served checkpoint: its tokenizer, files, configuration and family profile
+crates/service/         Host services: the per-user socket, its owner lock, a detached start and the start of an absent service
 crates/media/           H.264/AAC output encoding and MP4 muxing, conditional media reading and host resamplers
-crates/program-server/  The Program Server: compiles programs, keeps them and hands them out; one process per host
+crates/program-server/  The Program Server: compiles programs, keeps them and hands them out; one host service per host and user
 crates/manager/         `uniserve-manager`: an optional multi-node manager, a client of each node's `/admin`
-src/                    The root package, `uniserve`: one module per command (`serve`, `frontend`, `engine`, `storage`, `program-server`, `rules`)
 uniserve_eval/          Serving evaluator, profiles, and request workloads
 configs/                Deployment files: H3 (`minimax_h3/`) and dedicated experts (`afd/`)
 docs/architecture.md    Processes, the rank planes and the request path

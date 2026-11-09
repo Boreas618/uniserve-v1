@@ -1,12 +1,13 @@
 """Issues benchmark HTTP requests and records normalized observable outputs.
 
 ``send_request`` is the single entry point the benchmark runner
-(``uniserve_eval.pipeline.run``) uses per request. It routes by endpoint to a
-transport for native video APIs, image generations, streamed chat, or
-non-streaming chat, and folds everything observable into one
-``RequestRecord``: HTTP status, success and a stable failure classifier, client
-timing, token usage with its provenance, generated text, and media. Video
-bodies remain encoded until the runner inspects them after measurement.
+(``uniserve_eval.pipeline.run``) uses per request. It routes a video request
+to the native video transport and other requests by endpoint to a transport
+for image generations, streamed chat, or non-streaming chat, and folds
+everything observable into one ``RequestRecord``: HTTP status, success and a
+stable failure classifier, client timing, token usage with its provenance,
+generated text, and media. Video bodies remain encoded until the runner
+inspects them after measurement.
 
 All timestamps are ``time.perf_counter`` values on the same clock as
 ``RequestRecord.start_time``. Streamed events carry the client receipt time
@@ -24,7 +25,6 @@ import aiohttp
 
 from ..types import (
     IMAGES_GENERATIONS,
-    VIDEOS_SYNC,
     RequestRecord,
     TaskRequest,
 )
@@ -49,10 +49,12 @@ async def send_request(
 ) -> RequestRecord:
     """Dispatch one task request through its endpoint-specific transport.
 
-    The endpoint selects the transport before ``request.stream`` is
-    consulted, so video and image-generation requests never take the SSE
-    path. ``output_len_fallback`` becomes the record's
-    ``requested_output_len`` for every endpoint. On chat endpoints,
+    A video request, which carries its point's video settings, takes the
+    native video transport; the endpoint selects among the others. Both are
+    decided before ``request.stream`` is consulted, so video and
+    image-generation requests never take the SSE path.
+    ``output_len_fallback`` becomes the record's ``requested_output_len`` for
+    every endpoint. On chat endpoints,
     ``prompt_len`` and ``output_len_fallback`` stand in for token counts the
     server does not report.
 
@@ -78,11 +80,8 @@ async def send_request(
     )
     record.base_url = base_url
     try:
-        if request.video_backend is not None or request.endpoint == VIDEOS_SYNC:
+        if request.video is not None:
             record.prompt_len = prompt_len
-            record.requested_seconds = float(
-                payload["target"]["duration_seconds"]
-            )
             record.video_shape = request.video_shape
             # One deadline covers dispatch, polling and the complete media body.
             async with asyncio.timeout(timeout_s):

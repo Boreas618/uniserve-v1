@@ -1,7 +1,7 @@
 //! The Transfer Server: the Storage Server's child process that copies
 //! bytes between the storage the server holds.
 //!
-//! The server runs it as `uniserve storage transfer` and starts it again
+//! The server runs it as `uniserve storage-server transfer` and starts it again
 //! when it ends, so a fault in a copy or a CUDA context ends this process
 //! and never the server, which creates no CUDA context of its own. It knows
 //! the allocations the server gives it (retained storages: CUDA VMM

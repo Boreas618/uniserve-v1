@@ -20,8 +20,9 @@
 # artifacts/minimax_h3/check-reversed/<checkpoint>-<task>/<request id>.mp4 in
 # check-h3-reversed. Both suites' result bundles go to artifact_root, under
 # the point's own name. The automatic checks are exactly the ones the video
-# task already makes (MP4 validity: canvas, frame count, frame rate, stereo
-# soundtrack) and the protected performance metrics; nothing else is added.
+# task already makes (MP4 validity: size, frame count, frame rate, stereo
+# soundtrack, and the shape the server reports generating) and the protected
+# performance metrics; nothing else is added.
 #
 # The launch's default dtype is bfloat16 and an empty quantization loads
 # the model's first precision preset, quality (DiT and text encoder BF16, video
@@ -140,9 +141,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-base-ref2va.video]
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 media_dir = "artifacts/minimax_h3/check/base-ref2va"
 
 [benchmarks.check-base-ref2va.load]
@@ -170,8 +173,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-fasth3-dmd-t2va.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 media_dir = "artifacts/minimax_h3/check/fasth3-dmd-t2va"
 
 [benchmarks.check-fasth3-dmd-t2va.load]
@@ -199,8 +204,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-base-t2va.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 media_dir = "artifacts/minimax_h3/check/base-t2va"
 
 [benchmarks.check-base-t2va.load]
@@ -232,9 +239,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-fasth3-dmd-fl2va.video]
-task = "fl2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 media_dir = "artifacts/minimax_h3/check/fasth3-dmd-fl2va"
 
 [benchmarks.check-fasth3-dmd-fl2va.load]
@@ -262,9 +271,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-base-fl2va.video]
-task = "fl2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 media_dir = "artifacts/minimax_h3/check/base-fl2va"
 
 [benchmarks.check-base-fl2va.load]
@@ -296,9 +307,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-fasth3-omniref-ref2va.video]
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 media_dir = "artifacts/minimax_h3/check/fasth3-omniref-ref2va"
 
 [benchmarks.check-fasth3-omniref-ref2va.load]
@@ -336,9 +349,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-base-ref2va-reversed.video]
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 media_dir = "artifacts/minimax_h3/check-reversed/base-ref2va"
 
 [benchmarks.check-base-ref2va-reversed.load]
@@ -366,8 +381,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-fasth3-dmd-t2va-reversed.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 media_dir = "artifacts/minimax_h3/check-reversed/fasth3-dmd-t2va"
 
 [benchmarks.check-fasth3-dmd-t2va-reversed.load]
@@ -395,8 +412,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-t2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-base-t2va-reversed.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 media_dir = "artifacts/minimax_h3/check-reversed/base-t2va"
 
 [benchmarks.check-base-t2va-reversed.load]
@@ -428,9 +447,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-fasth3-dmd-fl2va-reversed.video]
-task = "fl2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 media_dir = "artifacts/minimax_h3/check-reversed/fasth3-dmd-fl2va"
 
 [benchmarks.check-fasth3-dmd-fl2va-reversed.load]
@@ -458,9 +479,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-fl2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-base-fl2va-reversed.video]
-task = "fl2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 media_dir = "artifacts/minimax_h3/check-reversed/base-fl2va"
 
 [benchmarks.check-base-fl2va-reversed.load]
@@ -492,9 +515,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/check-ref2va.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.check-fasth3-omniref-ref2va-reversed.video]
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 media_dir = "artifacts/minimax_h3/check-reversed/fasth3-omniref-ref2va"
 
 [benchmarks.check-fasth3-omniref-ref2va-reversed.load]

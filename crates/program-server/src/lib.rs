@@ -1,8 +1,10 @@
 //! The Program Server (design section 6): it compiles programs, keeps them,
 //! and hands them out.
 //!
-//! One process per host, beside the Storage Server, started as
-//! `uniserve program-server`. It does three things: compile a program package
+//! One process per host and serving user, beside the Storage Server: a host
+//! service (the `service` crate) on [`default_socket`], started as
+//! `uniserve program-server serve`, and by a daemon whose host has none. It
+//! does three things: compile a program package
 //! into the modules of its descriptors, keep those modules, and answer
 //! `install`, `prepare`, `resolve` and `list` on its Unix socket. It launches
 //! no kernel and allocates no device memory, and it is not on the serving
@@ -56,7 +58,14 @@ pub use protocol::{
 };
 pub use server::{Installed, Listing, ProgramServer, ServerConfig};
 pub use store::{ModulePath, Root, Store};
-pub use target::{Device, Devices, Target};
+pub use target::{Device, Target};
+
+/// The socket of this host's Program Server for the calling user:
+/// `program-server.sock` in the user's service directory
+/// ([`service::runtime_directory`]).
+pub fn default_socket() -> std::path::PathBuf {
+    service::runtime_directory().join("program-server.sock")
+}
 pub use toolchain::{ToolJob, Toolchain, Toolchains};
 
 use std::path::PathBuf;

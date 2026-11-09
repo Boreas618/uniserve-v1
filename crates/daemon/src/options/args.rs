@@ -5,7 +5,7 @@
 //! the option of its own name, declared on the option's field of
 //! [`ServerArgs`]), and repeatable
 //! `--set PATH=VALUE` assignments that reach any option by its path, such as
-//! `--set cuda_graph_config.policy=off`. The three are merged as TOML values
+//! `--set video_config.max_seconds=10`. The three are merged as TOML values
 //! and deserialized once, so every option is checked by the same type
 //! whichever place states it, and an error names the option's path.
 
@@ -15,15 +15,6 @@ use anyhow::{Context as _, anyhow};
 use toml::{Table, Value};
 
 use super::ServerArgs;
-
-/// Which process the `--host` and `--port` flags state the listening address
-/// of: the daemon's own server (`admin_config`) or the application's
-/// (`server_config`, which `uniserve frontend` serves).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Listen {
-    Daemon,
-    Frontend,
-}
 
 /// The configuration paths an invocation stated: every table and option the
 /// file, the flags and `--set` named, rather than left at its default.
@@ -80,7 +71,7 @@ impl ServerArgs {
     /// Resolves the configuration this command line states: the `--config` file, overridden by
     /// the flags the command line states, overridden by `--set`, with every unstated option at its
     /// default and `server_config.api_key` falling back to `UNISERVE_API_KEY`. `--host` and
-    /// `--port` state `listen`'s address. Returns it with the paths the invocation stated.
+    /// `--port` state the daemon's own address (`admin_config`). Returns it with the paths the invocation stated.
     ///
     /// `matches` are the command line's own: a flag counts when the command line states it, which
     /// clap's value source tells apart from the default it parsed beside the stated ones.
@@ -95,7 +86,6 @@ impl ServerArgs {
     pub fn resolve(
         &self,
         matches: &clap::ArgMatches,
-        listen: Listen,
     ) -> anyhow::Result<(ServerArgs, Stated)> {
         let mut tree = match &self.config_file {
             Some(path) => std::fs::read_to_string(path)
@@ -115,18 +105,14 @@ impl ServerArgs {
                 set(&mut tree, &[id.to_owned()], value.clone())?;
             }
         }
-        let (host, port) = match listen {
-            Listen::Daemon => ("admin_config", "admin_config"),
-            Listen::Frontend => ("server_config", "server_config"),
-        };
         let path = |table: &str, key: &str| vec![table.to_owned(), key.to_owned()];
         if let Some(value) = &self.host {
-            set(&mut tree, &path(host, "host"), Value::String(value.clone()))?;
+            set(&mut tree, &path("admin_config", "host"), Value::String(value.clone()))?;
         }
         if let Some(value) = self.port {
             set(
                 &mut tree,
-                &path(port, "port"),
+                &path("admin_config", "port"),
                 Value::Integer(i64::from(value)),
             )?;
         }
@@ -330,7 +316,7 @@ mod tests {
     use std::time::Duration;
 
     use clap::{FromArgMatches, Parser};
-    use proto::request::{ExpertExchange, GraphPolicy, SchedulingPolicy};
+    use proto::request::{ExpertExchange, SchedulingPolicy};
 
     use super::*;
 
@@ -346,7 +332,7 @@ mod tests {
             command.try_get_matches_from(std::iter::once("serve").chain(args.iter().copied()))?;
         Command::from_arg_matches(&matches)?
             .serve
-            .resolve(&matches, Listen::Daemon)
+            .resolve(&matches)
     }
 
     fn written(name: &str, body: &str) -> PathBuf {
@@ -366,7 +352,6 @@ mod tests {
         let file = written(
             "precedence",
             "model = \"/models/file\"\nmax_running_requests = 4\n\
-             [cuda_graph_config]\npolicy = \"full\"\n\
              [scheduler_config]\npolicy = \"priority\"\n",
         );
         let file = file.to_str().unwrap();
@@ -374,7 +359,6 @@ mod tests {
         let (config, _) = resolved(&["--config", file]).unwrap();
         assert_eq!(config.model.as_deref(), Some("/models/file"));
         assert_eq!(config.max_running_requests.get(), 4);
-        assert_eq!(config.cuda_graph_config.policy, GraphPolicy::Full);
 
         let (config, _) = resolved(&[
             "/models/flag",
@@ -385,13 +369,12 @@ mod tests {
             "--set",
             "max_running_requests=1",
             "--set",
-            "cuda_graph_config.policy=off",
+            "scheduler_config.policy=fcfs",
         ])
         .unwrap();
         assert_eq!(config.model.as_deref(), Some("/models/flag"));
         assert_eq!(config.max_running_requests.get(), 1);
-        assert_eq!(config.cuda_graph_config.policy, GraphPolicy::Off);
-        assert_eq!(config.scheduler_config.policy, SchedulingPolicy::Priority);
+        assert_eq!(config.scheduler_config.policy, SchedulingPolicy::Fcfs);
         assert_eq!(config.server_config.port, 8000);
     }
 
@@ -403,7 +386,7 @@ mod tests {
             "--set",
             "video_config.text_capacities=1024,10240",
             "--set",
-            "video_config.aspect_ratios=[\"16:9\"]",
+            "video_config.sizes=[\"1344x768\"]",
             "--set",
             "quantization={\"mode\":\"balanced\"}",
             "--set",
@@ -423,7 +406,7 @@ mod tests {
                 .map(|sizes| sizes.iter().map(|size| size.get()).collect::<Vec<_>>()),
             Some(vec![1024, 10240])
         );
-        assert_eq!(config.video_config.aspect_ratios, ["16:9"]);
+        assert_eq!(config.video_config.sizes, ["1344x768"]);
         assert_eq!(config.quantization["mode"], "balanced");
         assert!(config.moe_config.expert_parallel);
         assert_eq!(config.moe_config.exchange, ExpertExchange::DeepEp);
@@ -441,14 +424,14 @@ mod tests {
     #[test]
     fn malformed_options_are_refused_by_path() {
         for (args, named) in [
-            (vec!["--set", "cuda_graph_config.polcy=off"], "polcy"),
+            (vec!["--set", "cuda_graph_config.decode_batch_szes=[1]"], "decode_batch_szes"),
             (
                 vec!["--set", "max_running_requests=0"],
                 "max_running_requests",
             ),
             (
-                vec!["--set", "cuda_graph_config.policy=sometimes"],
-                "cuda_graph_config.policy",
+                vec!["--set", "scheduler_config.policy=sometimes"],
+                "scheduler_config.policy",
             ),
             (vec!["--set", "max_batch=4"], "max_batch"),
             (vec!["--set", "dtype.size=2"], "dtype"),
@@ -558,11 +541,11 @@ mod tests {
 
     #[test]
     fn exported_options_remain_valid_for_their_model_family() {
-        use models::ModelDescription::{MiniMaxH3, Qwen3};
+        use crate::test_support::{CHAT, VIDEO};
 
         for (description, setting) in [
-            (Qwen3, "chat_config.reasoning_parser=none"),
-            (MiniMaxH3, "video_config.max_seconds=5"),
+            (&CHAT, "chat_config.reasoning_parser=none"),
+            (&VIDEO, "video_config.max_seconds=5"),
         ] {
             let (config, stated) = resolved(&["m", "--set", setting]).unwrap();
             config.validate(&stated).unwrap();
@@ -876,27 +859,27 @@ mod tests {
     }
 
     /// The server listens on a non-blank host or Unix socket path, port 0
-    /// asks for an ephemeral port, and a video capacity lies within the
-    /// durations the video API admits.
+    /// asks for an ephemeral port, and a video capacity is a positive
+    /// duration; the model holds it to its own bounds when it binds.
     #[test]
     fn listeners_and_video_capacities_are_checked() {
         assert!(lowered(&["m", "--port", "0"]).is_ok());
         assert!(lowered(&["m", "--host", " "]).is_err());
         assert!(lowered(&["m", "--set", "server_config.uds=\"\""]).is_err());
-        for (seconds, valid) in [("4", true), ("15", true), ("3.9", false), ("15.5", false)] {
+        for (seconds, valid) in [("4", true), ("15.5", true), ("0", false), ("-1", false)] {
             let set = format!("video_config.max_seconds={seconds}");
             assert_eq!(lowered(&["m", "--set", &set]).is_ok(), valid, "{seconds} s");
         }
     }
 
-    /// An option of another model family than the served one is refused
+    /// An option of another kind of model than the served one is refused
     /// rather than ignored; unstated defaults never are.
     #[test]
     fn options_of_another_family_are_refused() {
-        use models::ModelDescription::{MiniMaxH3, Qwen3};
+        use crate::test_support::{CHAT as Chat, VIDEO as Video};
 
         let (_, defaults) = resolved(&["m"]).unwrap();
-        for description in [Qwen3, MiniMaxH3] {
+        for description in [&Chat, &Video] {
             assert!(defaults.refuse_foreign_options(description).is_ok());
         }
 
@@ -904,18 +887,18 @@ mod tests {
             let (_, stated) = resolved(&["m", "--set", set]).unwrap();
             stated.refuse_foreign_options(description).is_err()
         };
-        assert!(refused("video_config.max_seconds=5", Qwen3));
-        assert!(!refused("video_config.max_seconds=5", MiniMaxH3));
-        assert!(refused("chat_config.reasoning_parser=none", MiniMaxH3));
-        assert!(!refused("chat_config.reasoning_parser=none", Qwen3));
+        assert!(refused("video_config.max_seconds=5", &Chat));
+        assert!(!refused("video_config.max_seconds=5", &Video));
+        assert!(refused("chat_config.reasoning_parser=none", &Video));
+        assert!(!refused("chat_config.reasoning_parser=none", &Chat));
         // A video pipeline schedules no token batches and renders no chat.
         for token_option in [
             "max_num_batched_tokens=2048",
             "scheduler_config.chunked_prefill_size=512",
             "chat_config.reasoning_parser=none",
         ] {
-            assert!(refused(token_option, MiniMaxH3), "{token_option}");
-            assert!(!refused(token_option, Qwen3), "{token_option}");
+            assert!(refused(token_option, &Video), "{token_option}");
+            assert!(!refused(token_option, &Chat), "{token_option}");
         }
     }
 }

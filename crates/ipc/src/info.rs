@@ -503,52 +503,26 @@ impl MainProcessEndpoint {
 /// schedules it.
 ///
 /// The denoiser fixes its schedule, and with it every request's step count.
-/// What else bounds a request (its canvases, frame counts and reference
-/// limits) is the model family's, and reaches the frontend in `description`
-/// for it to plan requests with.
+/// What else bounds a request (its sizes, frame counts and reference limits)
+/// is the model family's, and reaches request processing in `description`
+/// for the family's processor to plan requests with.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoDenoiserInfo {
-    /// The tasks the denoiser serves, in canonical order.
-    pub tasks: Vec<VideoTaskInfo>,
+    /// Whether the denoiser takes conditions: a conditioned request's media is
+    /// read on a host component and encoded before denoising.
+    pub takes_conditions: bool,
     /// The network evaluations of the fixed schedule: the step count of
     /// every request.
     pub denoise_steps: u32,
-    /// The denoiser as its model family describes it to the frontend
-    /// (`models::video::DenoiserInfo`, JSON); the engine reads none of it.
+    /// The denoiser as its model family describes it to its request
+    /// processing; the engine reads none of it.
     pub description: Vec<u8>,
 }
 
-/// One task a video denoiser serves.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct VideoTaskInfo {
-    /// The task's request name.
-    pub name: String,
-    /// Whether the task's requests carry conditions, which a host component
-    /// reads and the condition encoders encode before denoising.
-    pub conditioned: bool,
-}
-
 impl VideoDenoiserInfo {
-    /// The task named `name`, when the denoiser serves it.
-    pub fn task(&self, name: &str) -> Option<&VideoTaskInfo> {
-        self.tasks.iter().find(|task| task.name == name)
-    }
-
-    /// Checks that tasks are named once each, the schedule takes a step and
-    /// the model family described the denoiser.
+    /// Checks that the schedule takes a step and the model family described
+    /// the denoiser.
     pub fn validate(&self) -> ValidationResult<()> {
-        ensure_valid!(
-            !self.tasks.is_empty()
-                && self.tasks.iter().all(|task| !task.name.is_empty())
-                && self
-                    .tasks
-                    .iter()
-                    .map(|task| &task.name)
-                    .collect::<HashSet<_>>()
-                    .len()
-                    == self.tasks.len(),
-            "a video denoiser names each of its tasks once"
-        );
         ensure_valid!(
             self.denoise_steps > 0,
             "a video denoiser schedule takes no step"

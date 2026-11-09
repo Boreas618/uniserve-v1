@@ -43,15 +43,18 @@ pub mod decoding;
 pub mod denoiser;
 pub mod diagnosis;
 pub mod encoding;
+pub mod family;
 pub mod load;
 pub mod modulation;
 pub mod output;
 pub mod packing;
 pub mod partition;
 pub mod positions;
+pub mod processing;
 pub mod programs;
 pub mod schedule;
 pub mod solver;
+pub mod task;
 pub mod text_encoder;
 pub mod tiled_encode;
 pub mod transformer;
@@ -64,7 +67,7 @@ pub use checkpoint::{
 pub use config::{
     AUDIO_CHANNELS, AUDIO_HOP, AUDIO_LATENTS_PER_SECOND, AUDIO_SAMPLE_RATE, AttentionKind,
     AudioVaeConfig, CANVAS_MULTIPLE, CANVAS_SHORT_EDGE, CLIP_FRAMES, CLIP_LATENTS, Canvas, Config,
-    DMD_CANVASES, DROPPED_LATENTS, DenoiserConfig, FPS, NAMED_ASPECT_RATIOS, NAMED_CANVASES,
+    DROPPED_LATENTS, DenoiserConfig, FPS, NAMED_ASPECT_RATIOS, NAMED_CANVASES,
     NUM_TRAIN_TIMESTEPS, PixelConfig, RETAINED_LAYERS, SPARSE_TILE_ROWS, ScheduleGrid,
     ScheduleSpec, Shifts, SpatialPadding, TextEncoderConfig, TransformerConfig,
     UNIFORM_GRID_POINTS, VideoVaeConfig, VisionConfig,
@@ -79,6 +82,7 @@ pub use config::{
 pub const SPLIT_HALF: ops::rope::Rotation = ops::rope::Rotation::Half;
 
 pub use load::load;
+pub use task::VideoTask;
 pub use partition::{Component, Partition};
 pub use transformer::Trace;
 

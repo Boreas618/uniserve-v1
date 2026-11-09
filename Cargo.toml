@@ -7,18 +7,19 @@ resolver = "3"
 members = [
     "crates/platform",
     "crates/daemon",
+    "crates/engine",
     "crates/scheduler",
     "crates/worker",
     "crates/frontend",
     "crates/ipc",
     "crates/manager",
     "crates/media",
-    "crates/models/rules",
     "crates/models/qwen3-moe",
     "crates/models/minimax-h3",
     "crates/nixl",
     "crates/nn",
     "crates/ops",
+    "crates/processing",
     "crates/program-server",
     "crates/proto",
     "crates/scheduling",
@@ -26,6 +27,7 @@ members = [
     "crates/scheduling/policies/fcfs",
     "crates/scheduling/policies/fixture",
     "crates/scheduling/policies/priority",
+    "crates/service",
     "crates/storage",
     "crates/storage-server",
 ]
@@ -41,25 +43,15 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 daemon.workspace = true
-scheduler.workspace = true
-worker.workspace = true
-frontend.workspace = true
-ipc.workspace = true
-nn.workspace = true
-ops.workspace = true
-platform.workspace = true
-proto.workspace = true
-qwen3-moe.workspace = true
+engine.workspace = true
+libc.workspace = true
+mimalloc.workspace = true
 minimax-h3.workspace = true
-models.workspace = true
-crossbeam-channel.workspace = true
+processing.workspace = true
+program-server.workspace = true
+qwen3-moe.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-libc.workspace = true
-libloading.workspace = true
-mimalloc.workspace = true
-program-server.workspace = true
-storage.workspace = true
 storage-server.workspace = true
 time.workspace = true
 tokio = { workspace = true, features = ["signal"] }
@@ -72,9 +64,8 @@ workspace = true
 
 [dev-dependencies]
 rustix = { workspace = true, features = ["mm"] }
-# A test states the arguments a deployment pinned on a program, which are a TOML table
-# (`program_server::Program`); production code never names `toml` from this package.
-toml.workspace = true
+service.workspace = true
+storage.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "macros"] }
 
@@ -88,23 +79,25 @@ readme = "README.md"
 [workspace.dependencies]
 platform = { path = "crates/platform" }
 daemon = { path = "crates/daemon" }
+engine = { path = "crates/engine" }
 scheduler = { path = "crates/scheduler" }
 worker = { path = "crates/worker" }
 frontend = { path = "crates/frontend" }
 ipc = { path = "crates/ipc" }
 media = { path = "crates/media" }
-models = { path = "crates/models/rules" }
 nn = { path = "crates/nn" }
 ops = { path = "crates/ops" }
 qwen3-moe = { path = "crates/models/qwen3-moe" }
 minimax-h3 = { path = "crates/models/minimax-h3" }
 nixl = { path = "crates/nixl" }
+processing = { path = "crates/processing" }
 program-server = { path = "crates/program-server" }
 proto = { path = "crates/proto" }
 scheduling = { path = "crates/scheduling" }
 scheduling-guest = { path = "crates/scheduling/guest" }
 scheduling-policy-fcfs = { path = "crates/scheduling/policies/fcfs" }
 scheduling-policy-priority = { path = "crates/scheduling/policies/priority" }
+service = { path = "crates/service" }
 storage = { path = "crates/storage" }
 storage-server = { path = "crates/storage-server" }
 

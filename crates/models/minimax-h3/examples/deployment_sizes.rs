@@ -246,9 +246,9 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
     // store holds finds no cell: the widest is always one the store has.)
     let mut conditioned = 0;
     for task in [
-        nn::capability::VideoTask::TextToVideoAudio,
-        nn::capability::VideoTask::FirstLastToVideoAudio,
-        nn::capability::VideoTask::ReferenceToVideoAudio,
+        minimax_h3::VideoTask::TextToVideoAudio,
+        minimax_h3::VideoTask::FirstLastToVideoAudio,
+        minimax_h3::VideoTask::ReferenceToVideoAudio,
     ] {
         conditioned = conditioned.max(minimax_h3::partition::condition_rows(&config, task)?);
     }
@@ -438,35 +438,35 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
         (
             "t2va, 1 rank",
             Dit::Base,
-            nn::capability::VideoTask::TextToVideoAudio,
+            minimax_h3::VideoTask::TextToVideoAudio,
             1_usize,
             1_usize,
         ),
         (
             "t2va, Ulysses 2 (the text encoder unsharded)",
             Dit::Base,
-            nn::capability::VideoTask::TextToVideoAudio,
+            minimax_h3::VideoTask::TextToVideoAudio,
             2,
             1,
         ),
         (
             "t2va, Ulysses 2 x tensor 2",
             Dit::Base,
-            nn::capability::VideoTask::TextToVideoAudio,
+            minimax_h3::VideoTask::TextToVideoAudio,
             2,
             2,
         ),
         (
             "fl2va (conditioned), 1 rank",
             Dit::Base,
-            nn::capability::VideoTask::FirstLastToVideoAudio,
+            minimax_h3::VideoTask::FirstLastToVideoAudio,
             1,
             1,
         ),
         (
             "ref2va (OmniRef DiT), 1 rank",
             Dit::Reference,
-            nn::capability::VideoTask::ReferenceToVideoAudio,
+            minimax_h3::VideoTask::ReferenceToVideoAudio,
             1,
             1,
         ),
@@ -480,7 +480,7 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
             task,
             minimax_h3::partition::Ulysses::of(
                 ulysses,
-                minimax_h3::partition::Projection::Exchange,
+                nn::family::Projection::Exchange,
             ),
             tensor,
             0,
@@ -488,7 +488,7 @@ fn derived(root: &std::path::Path, decode: nn::DType) -> Result<(), Box<dyn std:
         )?;
         let arrangement = partition.arrangement(rules)?;
         for frames in [124_u32, 362] {
-            let conditioned = !matches!(task, nn::capability::VideoTask::TextToVideoAudio);
+            let conditioned = !matches!(task, minimax_h3::VideoTask::TextToVideoAudio);
             let request = nn::capability::Layout {
                 video: nn::capability::LatentShape {
                     channels: rules.transformer.video_channels,

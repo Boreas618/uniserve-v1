@@ -5,18 +5,18 @@
 //! its default. Its top level holds the options most deployments state; the
 //! rest sit in `*_config` tables, one per owner of the behavior they
 //! configure (`cuda_graph_config` for graph capture, `moe_config` for expert
-//! parallelism, `video_config` for MiniMax-H3 video generation, and so on).
+//! parallelism, `video_config` for video generation, and so on).
 //! [`ServerArgs::resolve`] reads the tree: a `--config` file first, then the
 //! flags that name a path of it, then `--set` assignments, each overriding the
 //! last. The tree is the server's configuration: each part of the server reads
 //! its own table, and [`ServerArgs::engine_config`] resolves what of it builds
 //! the engine processes.
 //!
-//! Some options configure one model family: the token batch budgets,
-//! `chat_config` and `image_fetch_config` token models, `video_config`,
-//! `media_config` and `video_job_config` MiniMax-H3. Startup refuses such an
-//! option stated for a checkpoint of another family rather than ignoring it
-//! ([`Stated::refuse_foreign_options`]).
+//! Some options configure what one kind of model serves: the token batch
+//! budgets, `chat_config` and `image_fetch_config` chat models, and
+//! `video_config`, `media_config` and `video_job_config` video models. Startup
+//! refuses such an option stated for a checkpoint of another kind rather than
+//! ignoring it ([`Stated::refuse_foreign_options`]).
 
 mod args;
 
@@ -27,15 +27,14 @@ use std::time::Duration;
 
 use crate::supervision::DaemonOptions;
 use anyhow::Context as _;
-use proto::config::{MAX_VIDEO_SECONDS, MIN_VIDEO_SECONDS};
 use proto::request::ModelDtype;
 pub use proto::request::StandbyStorage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use models::ModelDescription;
+use processing::{Family, Serving};
 
-pub use args::{Listen, Stated, overridden, printed, resolve_text};
+pub use args::{Stated, overridden, printed, resolve_text};
 pub use proto::config::{
     ChatConfig, ChatTemplateContentFormat, CudaGraphConfig, DEFAULT_FENCE_COMPONENTS, DeviceConfig,
     FlashInferConfig, ImageFetchConfig, ImageSize, KvCacheConfig, LoadConfig, LoggingConfig,
@@ -57,15 +56,15 @@ const RANK_LAYOUT_SHORTHAND: [&str; 5] = [
     "device_config.queue_depth",
 ];
 
-/// The model families whose behavior some options configure, with those
+/// The kinds of model whose behavior some options configure, with those
 /// options by configuration path.
 ///
-/// Token models schedule token batches and render chat prompts, which a
-/// video pipeline does neither of; the video tables configure behavior only
-/// their family has.
-const FAMILY_OPTIONS: [(Family, &[&str]); 2] = [
+/// Chat models schedule token batches and render chat prompts, which a video
+/// pipeline does neither of; the video tables configure behavior only video
+/// models have.
+const KIND_OPTIONS: [(Kind, &[&str]); 2] = [
     (
-        Family::TokenModels,
+        Kind::Chat,
         &[
             "max_num_batched_tokens",
             "scheduler_config.chunked_prefill_size",
@@ -75,55 +74,55 @@ const FAMILY_OPTIONS: [(Family, &[&str]); 2] = [
         ],
     ),
     (
-        Family::MiniMaxH3,
+        Kind::Video,
         &["video_config", "media_config", "video_job_config"],
     ),
 ];
 
-/// A group of model families some options belong to.
+/// A kind of model some options belong to.
 #[derive(Debug, Clone, Copy)]
-enum Family {
-    TokenModels,
-    MiniMaxH3,
+enum Kind {
+    Chat,
+    Video,
 }
 
-impl Family {
-    /// Whether `description` belongs to this family.
-    fn serves(self, description: ModelDescription) -> bool {
-        match self {
-            Self::TokenModels => !description.is_pipeline(),
-            Self::MiniMaxH3 => description == ModelDescription::MiniMaxH3,
+impl Kind {
+    /// Whether `family` is of this kind.
+    fn serves(self, family: &Family) -> bool {
+        match (self, family.serving) {
+            (Self::Chat, Serving::Chat(_)) | (Self::Video, Serving::Video(_)) => true,
+            (Self::Chat, Serving::Video(_)) | (Self::Video, Serving::Chat(_)) => false,
         }
     }
 
-    /// The family as the refusal names it.
+    /// The kind as the refusal names it.
     fn name(self) -> &'static str {
         match self {
-            Self::TokenModels => "token models",
-            Self::MiniMaxH3 => "MiniMax-H3 video generation",
+            Self::Chat => "chat models",
+            Self::Video => "video generation",
         }
     }
 }
 
 impl Stated {
-    /// Refuses a stated option that configures a family other than the
-    /// served model's, rather than ignoring it.
+    /// Refuses a stated option that configures a kind of model other than
+    /// the served model's, rather than ignoring it.
     ///
     /// # Errors
     ///
-    /// Fails, naming the first such option and the served model, when a
-    /// video pipeline states a token-model option, or a token model states a
-    /// MiniMax-H3 table.
-    pub fn refuse_foreign_options(&self, description: ModelDescription) -> anyhow::Result<()> {
-        for (family, paths) in FAMILY_OPTIONS {
-            if family.serves(description) {
+    /// Fails, naming the first such option and the served family, when a
+    /// video pipeline states a chat option, or a chat model states a video
+    /// table.
+    pub fn refuse_foreign_options(&self, family: &Family) -> anyhow::Result<()> {
+        for (kind, paths) in KIND_OPTIONS {
+            if kind.serves(family) {
                 continue;
             }
             if let Some(path) = paths.iter().find(|path| self.contains(path)) {
                 anyhow::bail!(
                     "`{path}` configures {}, but the served checkpoint is a {} model; remove it",
-                    family.name(),
-                    description.id()
+                    kind.name(),
+                    family.id
                 );
             }
         }
@@ -143,7 +142,8 @@ pub struct ServerArgs {
     pub served_model_name: Option<String>,
     /// Longest sequence a request may reach, in tokens. Unset, a checkpoint
     /// with a root `config.json` uses its `max_position_embeddings` (8192
-    /// when it declares none) and a MiniMax-H3 pipeline 16384 prompt tokens.
+    /// when it declares none) and a video pipeline its family's default
+    /// prompt bound.
     #[arg(long)]
     pub max_model_len: Option<NonZeroU32>,
     /// Element type of parameters and activations.
@@ -178,13 +178,13 @@ pub struct ServerArgs {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[arg(skip)]
     pub moe_runner_backend: Option<String>,
-    /// This host's Program Server socket (`program_server`), which the
-    /// daemon prepares an epoch's programs against (§5.1, §6.3); unset takes
-    /// the Program Server's default socket. A host-layer value: the daemon
-    /// reads it alone, and a change of it is a hot restart.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[arg(long, value_name = "PATH")]
-    pub program_server: Option<PathBuf>,
+    /// This host's Program Server (`program_config`): the socket the daemon
+    /// prepares an epoch's programs at (§5.1, §6.3), the Program Server's
+    /// default socket when unset, and the settings it starts the host's
+    /// Program Server with when none serves there. A host-layer value: the
+    /// daemon reads it alone, and a change of it is a hot restart.
+    #[arg(skip)]
+    pub program_config: program_server::command::Settings,
     /// Concurrently resident requests, clamped to what the workers hold.
     #[arg(long, default_value_t = ServerArgs::default().max_running_requests)]
     pub max_running_requests: NonZeroUsize,
@@ -281,7 +281,7 @@ pub struct ServerArgs {
     #[serde(skip)]
     #[arg(long = "config", value_name = "FILE")]
     pub config_file: Option<PathBuf>,
-    /// Set the option at PATH, such as `cuda_graph_config.policy=off` or
+    /// Set the option at PATH, such as `video_config.max_seconds=10` or
     /// `moe_config.exchange=deepep`; repeatable, and it overrides the flags
     /// and the file. VALUE is a TOML value (`2`, `true`, `[1024, 4096]`,
     /// `{ mode = "balanced" }`) or JSON, and otherwise text; a list may be
@@ -290,13 +290,11 @@ pub struct ServerArgs {
     #[serde(skip)]
     #[arg(long = "set", value_name = "PATH=VALUE")]
     pub set: Vec<String>,
-    /// TCP address the server listens on (`admin_config.host` for `serve`,
-    /// `server_config.host` for `frontend`).
+    /// TCP address the daemon's own server listens on (`admin_config.host`).
     #[serde(skip)]
     #[arg(long)]
     pub host: Option<String>,
-    /// TCP port the server listens on (`admin_config.port` for `serve`,
-    /// `server_config.port` for `frontend`).
+    /// TCP port the daemon's own server listens on (`admin_config.port`).
     #[serde(skip)]
     #[arg(long)]
     pub port: Option<u16>,
@@ -326,7 +324,7 @@ impl Default for ServerArgs {
             prefill_attention_backend: None,
             decode_attention_backend: None,
             moe_runner_backend: None,
-            program_server: None,
+            program_config: program_server::command::Settings::default(),
             max_running_requests: positive(128),
             max_num_batched_tokens: None,
             mem_fraction_static: 0.7,
@@ -427,9 +425,9 @@ pub fn daemon_options_differ(current: &ServerArgs, target: &ServerArgs) -> bool 
         || current.video_job_config != target.video_job_config
         || current.migration_config != target.migration_config
         || current.mm_processor_kwargs != target.mm_processor_kwargs
-        // Where this host's Program Server listens: the daemon reads it
-        // alone, and an epoch's programs are prepared against it (§5.1).
-        || current.program_server != target.program_server
+        // This host's Program Server: the daemon reads it alone, and an
+        // epoch's programs are prepared against it (§5.1).
+        || current.program_config != target.program_config
 }
 
 /// How the deployment moves to a new configuration in another epoch
@@ -548,6 +546,7 @@ impl ServerArgs {
             executable: proto::BUILD.to_owned(),
             model: proto::config::ModelConfig {
                 model: self.model().to_owned(),
+                base: None,
                 max_model_len: self.max_model_len.map_or(0, NonZeroU32::get),
                 dtype: self.dtype,
                 quantization: self.quantization.clone(),
@@ -795,14 +794,11 @@ impl ServerArgs {
                 "`admin_config.host` must not be empty"
             ),
         }
-        // A smaller capacity admits no request and a larger one exceeds what
-        // the video API accepts.
-        let seconds = MIN_VIDEO_SECONDS..=MAX_VIDEO_SECONDS;
+        // The model holds the capacity to its own bounds when its processor
+        // is bound; a duration that is no positive number admits nothing.
         anyhow::ensure!(
-            seconds.contains(&self.video_config.max_seconds),
-            "`video_config.max_seconds` must lie in [{}, {}], got {}",
-            seconds.start(),
-            seconds.end(),
+            self.video_config.max_seconds.is_finite() && self.video_config.max_seconds > 0.0,
+            "`video_config.max_seconds` must be a positive number of seconds, got {}",
             self.video_config.max_seconds
         );
         Ok(())
@@ -842,7 +838,7 @@ impl ServerArgs {
 /// The directory this daemon keeps its runtime files in: its sockets, and the
 /// launch and build-config files its main processes read.
 pub(crate) fn runtime_directory() -> PathBuf {
-    storage::socket::default_socket()
+    storage::default_socket()
         .parent()
         .map_or_else(std::env::temp_dir, Path::to_path_buf)
 }

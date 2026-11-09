@@ -86,14 +86,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             denoiser.tasks
         );
         println!("  attention: {:?}", denoiser.attention);
-        match denoiser.canvases {
-            None => println!("  canvases: the canvas rule's twelve at 768p and 480p"),
-            Some(canvases) => println!(
-                "  canvases: {} named, e.g. {:?}",
-                canvases.len(),
-                canvases[0]
-            ),
-        }
     }
     println!(
         "video VAE: {} decoder layers, {} latent channels",
@@ -102,9 +94,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for component in Component::ALL {
         println!(
-            "component {} -> block {}, activation {:?}",
+            "component {}, activation {:?}",
             component.name(),
-            component.block(),
             component.activation()
         );
     }

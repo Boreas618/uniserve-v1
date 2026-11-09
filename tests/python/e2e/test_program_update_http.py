@@ -185,8 +185,8 @@ def server(
         str(port),
         "--worker-executable",
         str(worker_executable()),
-        "--program-server",
-        str(program_server["socket"]),
+        "--set",
+        f"program_config.socket={program_server['socket']}",
         "--set",
         f"kv_cache_config.host_gib={HOST_GIB}",
     ]

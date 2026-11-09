@@ -15,7 +15,6 @@ Options none of them states keep their defaults. `GET /admin/config` returns the
 ```bash
 uniserve serve "$H3_MODEL" --worker-groups configs/minimax_h3/ulysses4.toml \
   --max-running-requests 2 \
-  --set cuda_graph_config.policy=off \
   --set video_config.text_capacities=1024,10240
 
 uniserve serve --config fasth3.toml --set quantization.mode=performance
@@ -24,7 +23,7 @@ uniserve serve --config fasth3.toml --set quantization.mode=performance
 | Flag | Path |
 | --- | --- |
 | `MODEL` (positional) | `model` |
-| `--host`, `--port` | `server_config.host`, `server_config.port` |
+| `--host`, `--port` | `admin_config.host`, `admin_config.port` |
 | `--served-model-name` | `served_model_name` |
 | `--worker-groups` | `worker_groups` |
 | `--tensor-parallel-size`, `--data-parallel-size` | `tensor_parallel_size`, `data_parallel_size` |
@@ -37,13 +36,15 @@ uniserve serve --config fasth3.toml --set quantization.mode=performance
 
 `--log-level` and `--log-level-http` set the log levels of the `uniserve` process; every subcommand takes them, before or after its name.
 
-A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode = "balanced" }`) or JSON, and otherwise the text itself, so `--set cuda_graph_config.policy=off` and `--set server_config.host=0.0.0.0` need no quotes. A list may be comma-separated text (`--set video_config.aspect_ratios=16:9,9:16`); quoting is safer than brackets, which the shell may expand. One invocation may set a path several times, the last winning, but not both a table and an option inside it.
+A `--set` value is a TOML value (`2`, `true`, `"text"`, `[1024, 4096]`, `{ mode = "balanced" }`) or JSON, and otherwise the text itself, so `--set quantization.mode=balanced` and `--set server_config.host=0.0.0.0` need no quotes. A list may be comma-separated text (`--set video_config.sizes=1344x768,768x1344`); quoting is safer than brackets, which the shell may expand. One invocation may set a path several times, the last winning, but not both a table and an option inside it.
 
 Every option is checked by its type wherever it is stated, and an error names its path: an unknown option, a value its option does not take, or zero for a positive count. A duration is whole seconds or a value with units (`500ms`, `30s`, `5m`, `1h`). A byte size is whole bytes or an integer with a decimal (`20MB`) or binary (`512MiB`) unit. Paths in options resolve against the server's working directory.
 
-Each host's Storage Server (`uniserve storage serve`, see `architecture.md`) is started by the host's daemon when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve storage serve --page-pool-gib N` sizes a host page pool whose worker states no size (64 GiB unless stated), `--host-reserve-gib N` sets the host storage a new page pool leaves to other processes (10 GiB unless stated: a pool the host's available storage less the reserve cannot hold is refused, unless the server runs a Mooncake connector, which has it stage pages through a pool of at most 256 MiB on each rank from its reserve), `--transfer-chunk-us N` sets how long one chunk of its Transfer Server's copies lasts at the link's bandwidth (1000 µs unless stated), `--nixl-library PATH` names NIXL's `libnixl_capi.so` (of the NIXL release the build binds, 1.5.1, with its UCX backend) that the Transfer Server loads for copies from other hosts, whose storage it registers pinned and outside UCX's registration cache; another host reads a read-only tensor in host storage only through a NIXL and UCX built with the read-only registration patches (`artifacts/native/build-ucx.sh` and `build-nixl.sh`, documented beside them) (the loader's search path finds the library unless stated; `UCX_NET_DEVICES` in the server's environment limits UCX to the host's usable RDMA ports), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve storage list` prints what it holds, and `uniserve storage retire --deployment NAME` releases the storage of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the storage it left under the same name. Page pools belong to a deployment: each worker maps one per cache group, holding the token count the engine sizes its epoch's host KV cache at (`kv_cache_config.host_ratio` and `host_gib`), and a pool is allocated and pinned whole when the first worker maps it. An epoch shares the pools of the previous epoch whose pages have the same layout; a pool the host cannot hold first takes the place of the deployment's pools no epoch maps any more. When a deployment claims a host, the server retires every other deployment whose daemon is no longer connected, so a host keeps the weights and caches of the deployments it serves only.
+Each host's Storage Server (`uniserve storage-server serve`, see `architecture.md`) is started by the host's daemon when the host has none and keeps running across server restarts. It takes its own options when started by hand before the server: `uniserve storage-server serve --page-pool-gib N` sizes a host page pool whose worker states no size (64 GiB unless stated), `--host-reserve-gib N` sets the host storage a new page pool leaves to other processes (10 GiB unless stated: a pool the host's available storage less the reserve cannot hold is refused, unless the server runs a Mooncake connector, which has it stage pages through a pool of at most 256 MiB on each rank from its reserve), `--transfer-chunk-us N` sets how long one chunk of its Transfer Server's copies lasts at the link's bandwidth (1000 µs unless stated), `--nixl-library PATH` names NIXL's `libnixl_capi.so` (of the NIXL release the build binds, 1.5.1, with its UCX backend) that the Transfer Server loads for copies from other hosts, whose storage it registers pinned and outside UCX's registration cache; another host reads a read-only tensor in host storage only through a NIXL and UCX built with the read-only registration patches (`artifacts/native/build-ucx.sh` and `build-nixl.sh`, documented beside them) (the loader's search path finds the library unless stated; `UCX_NET_DEVICES` in the server's environment limits UCX to the host's usable RDMA ports), and `--mooncake-master HOST:PORT` with `--mooncake-metadata`, `--mooncake-protocol`, `--mooncake-device`, `--mooncake-hostname`, `--mooncake-segment-bytes` and `--mooncake-library` runs its Mooncake connector, as `kv_cache_config.mooncake` does for a server the deployment starts. `uniserve storage-server list` prints what it holds, and `uniserve storage-server retire --deployment NAME` releases the storage of a deployment that is no longer served. A deployment is named by its served model name, so a restarted server finds the storage it left under the same name. Page pools belong to a deployment: each worker maps one per cache group, holding the token count the engine sizes its epoch's host KV cache at (`kv_cache_config.host_ratio` and `host_gib`), and a pool is allocated and pinned whole when the first worker maps it. An epoch shares the pools of the previous epoch whose pages have the same layout; a pool the host cannot hold first takes the place of the deployment's pools no epoch maps any more. When a deployment claims a host, the server retires every other deployment whose daemon is no longer connected, so a host keeps the weights and caches of the deployments it serves only.
 
-Some tables configure one model family: `chat_config` and `image_fetch_config` the text and chat models (Qwen3); `video_config`, `media_config` and `video_job_config` MiniMax-H3. Startup refuses such a table stated for a checkpoint of another family, naming the table and the served model.
+Each host's Program Server (`uniserve program-server serve`, see `architecture.md`) is configured by `program_config`, whose keys are the flags of its `serve` command: `socket` (the user's `program-server.sock` unless stated), `package_root` and `store_roots` (`programs/packages` and `programs/modules` in `$XDG_DATA_HOME/uniserve`, else `~/.local/share/uniserve`; the first store root is written, the rest are read-only shared roots), `upstream` (the socket of the upstream Program Server that accepts `install`, on a host that is not it), `targets` (the architectures it builds for, the host's devices' unless stated), `max_jobs` and `host_reserve` (the builds that run at once, 4 unless stated, and the host memory in bytes a build leaves free), and the toolchains `nvcc` (`$CUDA_HOME/bin/nvcc` unless stated), `python` (the interpreter of the Program Server's environment, `crates/program-server/python`, without which Triton and CuTe DSL packages are refused), `wasm` (the scheduling policy precompiler) and `cargo`. The daemon prepares an epoch's programs at `program_config.socket`, and starts the host's Program Server with these settings when none serves there; a Program Server that serves already keeps the settings it was started with. `uniserve program-server install DIR` installs a package on the upstream Program Server and `uniserve program-server list` prints the installed packages, revisions and modules.
+
+Some options configure one kind of model, by what the served model family serves: `max_num_batched_tokens`, `scheduler_config.chunked_prefill_size`, `speculative_config`, `chat_config` and `image_fetch_config` configure chat models (Qwen3-MoE); `video_config`, `media_config` and `video_job_config` configure video generation (MiniMax-H3). Startup refuses such an option stated for a model of the other kind, naming the option and the served family.
 
 ## Configuration file
 
@@ -61,9 +62,6 @@ host = "0.0.0.0"
 [quantization]
 mode = "quality"
 
-[cuda_graph_config]
-policy = "auto"
-
 [video_config]
 text_capacities = [1024, 10240]
 
@@ -73,7 +71,7 @@ retention = "30m"
 
 ## Options
 
-Each option's destination follows what its value is used for (§7.7 of `specs/worker.md`): a value that builds the main process is **build config**; one that selects an implementation is a **program backend name**; one that only steers a decision is a **program parameter**; what the frontend or the daemon reads stays in the **host layer**. An option a section does not name separately has the destination stated under that section's heading; the sections whose options split state it per field below.
+Each option's destination follows what its value is used for: a value that builds the main process is **build config**; one that selects an implementation is a **program backend name**; one that only steers a decision is a **program parameter**; what the daemon reads stays in the **host layer**. An option a section does not name separately has the destination stated under that section's heading; the sections whose options split state it per field below.
 
 Three backend-name fields the split names already exist in the code and are read with `attention_backend` (`crates/daemon/src/epoch.rs:1293-1299`): `prefill_attention_backend` and `decode_attention_backend` each override it for their phase, and `moe_runner_backend` selects the grouped expert GEMM (`epoch.rs:1218`).
 
@@ -84,7 +82,7 @@ Three backend-name fields the split names already exist in the code and are read
 | Deployment identity, cannot change | `model`, `served_model_name` |
 | Build config | `max_model_len`, `dtype`, `quantization`, `max_running_requests`, `mem_fraction_static`, `tensor_parallel_size`, `data_parallel_size`, `worker_groups`, `engine_host` |
 | Host layer, daemon (a node's startup arguments) | `host_identity`, `nnodes`, `node_rank`, `dist_init_addr` |
-| Host layer, frontend | `mm_processor_kwargs` |
+| Host layer | `mm_processor_kwargs` |
 | Program backend name | `attention_backend` (attention), with `prefill_attention_backend` and `decode_attention_backend` overriding it per phase; read at `crates/daemon/src/epoch.rs:1293-1299` |
 | Program parameter | `max_num_batched_tokens` (the scheduling policy's bound); read at `crates/daemon/src/epoch.rs:1364-1366` |
 | Retired, refused by name | `quantization_config`: the option is stated as `quantization`, and the retired spelling is refused with the name to state instead |
@@ -112,14 +110,14 @@ Three backend-name fields the split names already exist in the code and are read
 
 ### `server_config`
 
-**Destination: host layer, frontend.** The frontend's own server reads these, as its process does; the daemon's listener has its own address (`admin_config`).
+**Destination: host layer.** The leader daemon's application server reads these: the HTTP and OpenAI API; the daemon's own listener has its own address (`admin_config`).
 
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `host` | `"127.0.0.1"` | TCP address the frontend's server listens on |
-| `port` | `8000` | TCP port the frontend's server listens on |
-| `uds` | Unset | Unix domain socket the frontend's server listens on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
+| `host` | `"127.0.0.1"` | TCP address the application server listens on |
+| `port` | `8000` | TCP port the application server listens on |
+| `uds` | Unset | Unix domain socket the application server listens on instead of TCP; a stale socket file is replaced and the socket file is removed at shutdown |
 | `api_key` | Unset | Bearer token every route but `/health` and `/metrics` requires; `UNISERVE_API_KEY` supplies it when unset or blank. Never printed |
 | `request_timeout` | Unset | Time until a response head is sent, answered with 504 when it expires; streamed bodies are not bounded |
 | `max_concurrent_requests` | Unset | In-flight chat, image generation, System One and synchronous video requests above which requests are shed with 503 |
@@ -185,7 +183,7 @@ Three backend-name fields the split names already exist in the code and are read
 
 **Destination, per field:** `num_draft_tokens` is build config (it sizes the draft the main process builds); `expected_speedup` and `refill_token_cost` are program parameters of the scheduling policy.
 
-**Read at:** `num_draft_tokens` where the draft is built; `expected_speedup` and `refill_token_cost` become the policy program's arguments at `crates/daemon/src/epoch.rs:1469-1470`, which the policy reads at `crates/engine/src/scheduler/policy.rs:96-97`.
+**Read at:** `num_draft_tokens` where the draft is built; `expected_speedup` and `refill_token_cost` become the policy program's arguments at `crates/daemon/src/epoch.rs:1469-1470`, which the policy reads at `crates/scheduler/src/policy.rs:96-97`.
 
 
 Speculative decoding with the model's own drafter, the multi-token prediction layer a checkpoint declares (`mtp_num_hidden_layers`); token models only. Every step, each decoding request's verification evaluates its committed token followed by the draft tokens the drafter proposed after its last step and commits the longest prefix of drafts the model's own selections agree with, plus the model's token after it, so a request generates the tokens it would without speculation, one or more per step. The scheduler chooses each request's draft count every step: the drafts proposed, at most `num_draft_tokens` and one fewer than the tokens the request may still generate. The drafter keeps a cache of its own per request, the draft cache: optional state held in its own group of the KV cache, published, reused and offloaded to the host KV cache as the other groups' pages are, and released from a running request when another request's required pages need the units. A request without its draft cache (a prompt prefix reused without it, a request an epoch change moved from an epoch that did not speculate, a draft cache released for another request) verifies no drafts, a verification of one token, and decodes as without speculation; a refill then evaluates the model again over the positions before the draft cache entries the request wrote itself, in chunks of the token budget a prefill step leaves, when it is worth its cost: when the request's remaining tokens times `1 - 1 / g` exceed the refill's tokens times `k`, both sides in decode steps, with `g` the speedup speculation gives a request and `k` the time of evaluating one context token. Each scheduler measures both from what its epoch executes, as averages over about the last sixteen observations: a verification carrying drafts commits `s` tokens, the workers' decoding step takes `v` with drafts and `d` without, and a prompt step `p` per token; speculating, a request takes `v / s` per token in place of `d`, so `g = s * d / v` and `k = p / d`, and while every step has carried drafts `d` is `v`. An epoch whose verification steps cost as many decode steps as they commit tokens (`g` at most `1`) refills nothing; until it has measured what it needs, an epoch refills, which measures it. A new request writes its draft cache while it prefills and speculates from its first decoding step. Verification and the drafter run eagerly: a model that keeps a recurrent state per request serves eagerly in any case.
@@ -193,12 +191,12 @@ Speculative decoding with the model's own drafter, the multi-token prediction la
 | Option | Default | Meaning |
 | --- | --- | --- |
 | `num_draft_tokens` | `0` | The most draft tokens a verification carries per request; `0` does not speculate. An epoch that speculates keeps the draft cache in its pool and runs the drafter, so setting or changing it is an epoch change (`PUT /admin/config`) |
-| `expected_speedup` | Measured | The refill policy's speedup `g`, stated in place of the measured one, at least `1`; a change of it moves the policy program at `PUT /admin/config` (§7.3) |
-| `refill_token_cost` | Measured | The refill policy's time `k` of evaluating one context token in a refill, in decode steps, stated in place of the measured one, not negative; a change of it moves the policy program at `PUT /admin/config` (§7.3) |
+| `expected_speedup` | Measured | The refill policy's speedup `g`, stated in place of the measured one, at least `1`; a change of it moves the policy program at `PUT /admin/config` |
+| `refill_token_cost` | Measured | The refill policy's time `k` of evaluating one context token in a refill, in decode steps, stated in place of the measured one, not negative; a change of it moves the policy program at `PUT /admin/config` |
 
 ### `migration_config`
 
-**Destination: host layer, frontend.**
+**Destination: host layer.**
 
 
 A token request that generates text moves to the engine that serves next when its epoch parks for an epoch change or a rollback, or loses the workers that hold it; it continues after the last token it delivered, with the same output and usage.
@@ -241,7 +239,7 @@ Each entry is the median over the point's reports of the step time over its run'
 
 ### `device_config`
 
-**Destination: build config** — it decides where ranks run, by the rule that places `worker_groups` and `engine_host` there. §7.7's table does not list this section; the destination is stated here so no option is without one, and it is the one destination in this file that asks for confirmation rather than quoting the table.
+**Destination: build config** — it decides where ranks run, by the rule that places `worker_groups` and `engine_host` there.
 
 
 `device`, `devices`, `worker_hosts` and `queue_depth` place ranks without a deployment file, so each is refused together with `worker_groups`, as is `tensor_parallel_size`.
@@ -276,7 +274,6 @@ Each entry is the median over the point's reports of the step time over its run'
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `policy` | `"auto"` | Whether a worker group runs every call with CUDA graphs or every call eagerly, chosen when its workers load and never mixed: `auto` captures graphs unless serving does not capture the attention provider's calls or a module's (a gated delta attention layer runs a host loop over its chunks), and then serves eagerly; `full` requires graphs; `off` serves every call eagerly (CPU workers always do). Under graphs the text buckets hold every decode and prefill batch the worker admits; prefill and image denoising are always captured, and a request whose shapes no captured graph holds is refused with the reason, never run eagerly: an image vision encoder must pack its images into fixed slots, and a video denoiser serving `ref2va` serves only with `off` |
 | `decode_batch_sizes` | Worker catalog | Decode batch sizes captured, strictly increasing; the largest decode batch the worker admits is captured besides them |
 | `prefill_token_sizes` | Worker catalog | Prefill token counts captured, strictly increasing; the batch token bound is captured besides them, for every row bucket up to the largest batch the worker admits |
 | `flow_shapes` | The model's default image size and its transpose | Distinct `HEIGHTxWIDTH` image sizes captured. Under graphs an image model generates only these sizes, encodes only the generated images of these sizes into latents (input images whose latent size is not among them are refused), and decodes only these sizes |
@@ -303,7 +300,7 @@ Each entry is the median over the point's reports of the step time over its run'
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `executable` | The daemon's own executable when it is installed in a Python environment, else the active virtual environment's `uniserve` | The `uniserve` executable the deployment's main processes run as (`uniserve engine --launch <path>`), and that starts a host's Storage Server, resolved through the Python environment it is installed in when there is one. A change of it changes the epoch's build config, so the change is applied by an epoch switch (§7.4) — the target executable starts as the next generation of the same group and rank, parks, is promoted in place, and serves once the previous epoch has drained — and the epoch's build identity is the one its first child reports |
+| `executable` | The daemon's own executable when it is installed in a Python environment, else the active virtual environment's `uniserve` | The `uniserve` executable the deployment's main processes run as (`uniserve engine --launch <path>`), and that starts a host's Storage Server, resolved through the Python environment it is installed in when there is one. A change of it changes the epoch's build config, so the change is applied by an epoch switch ([Epochs](architecture.md#epochs)) — the target executable starts as the next generation of the same group and rank, parks, is promoted in place, and serves once the previous epoch has drained — and the epoch's build identity is the one its first child reports |
 | `watchdog_timeout` | `"5m"` | Time a batch may run without progress of its workers before the worker group is replaced; a worker reports a stalled job after half of it |
 | `mesh` | Unset | `tower=gen:<device>` places the generation tower on another device than the worker's |
 | `standby` | `false` | Keep a parked standby beside every node's main process of the serving epoch. The standby is a second child of the same group, rank and epoch at the next launch generation, with its own CUDA contexts: it maps the epoch's weights and cache read-only, captures its graphs on the warmup scratch units, keeps its graph pools, scratch and communicators resident or suspended per `standby_storage`, and parks; it reports `Parked` when it is ready, and `Promoted` when the promotion took effect: an update's target is parked by the switch that starts it and answers those reports to it, while the standby a serving epoch keeps parks while it starts and is promoted in place when its failure domain fails, without an update in flight. When the serving main process fails with a process-fatal fault, its whole failure domain — the node's main process plus every cross-node group it is in — promotes one parked child per node, every promotion issued before any answer is awaited, and each node then starts a new standby at the generation after the promoted one. A member of the domain without a parked standby makes the domain relaunch instead, and a GPU that needs a reset takes its node's standby with it, so only migration to another node or replica helps. No standby exists while the epoch is in precopy or on probation: a fault there reverts the update, and the epoch is started again rather than promoted. Each standby child holds a CUDA context, graph pools and workspaces of its own, which the device storage `mem_fraction_static` leaves must hold. `worker_config.executable` and the workers it still starts keep their standby by the same rule until the worker process is retired: a group that is its own failure domain and runs on one node keeps a standby rank group, and the groups of an expert epoch or on several nodes keep a standby epoch of the domain |
@@ -337,7 +334,7 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 
 ### `chat_config`
 
-**Destination: host layer, frontend.**
+**Destination: host layer.**
 
 
 | Option | Default | Meaning |
@@ -349,7 +346,7 @@ The workers' always-on profiling: the fence probes at the entry and exit of the 
 
 ### `image_fetch_config`
 
-**Destination: host layer, frontend.**
+**Destination: host layer.**
 
 
 | Option | Default | Meaning |
@@ -367,15 +364,14 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `max_seconds` | `15` | Longest admitted clip, 4 to 15 seconds |
-| `resolutions` | `["768p"]` | Resolution classes startup prepares, each at every aspect ratio |
-| `aspect_ratios` | `["16:9", "9:16"]` | Aspect ratios startup prepares |
+| `max_seconds` | `15` | Longest admitted output, in seconds: a positive number, which the served model also holds to its own bounds when its request processor binds (4 to 15 for MiniMax-H3) |
+| `sizes` | `["1344x768", "768x1344"]` | Output sizes startup prepares and requests may name, each `WxH` in pixels; the served model refuses at startup a size its checkpoint does not generate |
 | `text_capacities` | `1024`, then steps of 2048 | Prompt capacities below `max_model_len`, strictly increasing |
 | `max_condition_rows` | Largest condition set | Denoiser rows one request's conditions may take |
 
 ### `media_config`
 
-**Destination: host layer, frontend.**
+**Destination: host layer.**
 
 
 | Option | Default | Meaning |
@@ -387,7 +383,7 @@ The [FastH3 guide](minimax_h3/minimax_h3.md#startup-and-capacity) explains how t
 
 ### `video_job_config`
 
-**Destination: host layer, frontend.**
+**Destination: host layer.**
 
 
 | Option | Default | Meaning |

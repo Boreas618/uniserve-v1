@@ -60,8 +60,11 @@ struct Node {
     /// The token that brings the current deployment down.
     current: Mutex<Option<CancellationToken>>,
     server: ServerConfig,
-    /// The host's Program Server, which a deployment that names none resolves its programs at.
-    program_server: Option<std::path::PathBuf>,
+    /// The host's Program Server, which a deployment that configures none resolves its programs
+    /// at.
+    program_config: program_server::command::Settings,
+    /// The model families the executable serves.
+    catalogue: processing::Catalogue,
 }
 
 fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -78,7 +81,8 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 pub async fn node(
     admin: AdminConfig,
     server: ServerConfig,
-    program_server: Option<std::path::PathBuf>,
+    program_config: program_server::command::Settings,
+    catalogue: processing::Catalogue,
     shutdown: CancellationToken,
 ) -> Result<()> {
     let listener = Listener::bind(&admin)
@@ -90,7 +94,8 @@ pub async fn node(
         last_error: Mutex::new(None),
         current: Mutex::new(None),
         server: server.clone(),
-        program_server,
+        program_config,
+        catalogue,
     });
     let mut app = Router::new()
         .route("/admin/config", put(deploy).get(idle_config))
@@ -208,8 +213,8 @@ async fn deploy(State(node): State<Arc<Node>>, request: Request) -> Response {
     }
     // The node's server serves the deployment's routes.
     config.server_config = node.server.clone();
-    if config.program_server.is_none() {
-        config.program_server = node.program_server.clone();
+    if config.program_config == program_server::command::Settings::default() {
+        config.program_config = node.program_config.clone();
     }
     if let Err(error) = config.validate(&stated) {
         return ApiError::invalid_request(format!("{error:#}"), Some("config")).into_response();
@@ -287,7 +292,7 @@ async fn serve_deployment(
         // first program switch commands through.
         let commands = daemon.commands();
         let engine = tokio::select! {
-            engine = Leader::start(config, stated, address, commands.as_ref(), updates) => {
+            engine = Leader::start(&node.catalogue, config, stated, address, commands.as_ref(), updates) => {
                 Arc::new(engine?)
             }
             () = token.cancelled() => return Ok(()),

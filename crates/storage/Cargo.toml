@@ -6,8 +6,8 @@ license.workspace = true
 publish = false
 
 # The Storage Server's protocol and its client. It depends on no workspace
-# crate and never links CUDA: the Storage Server outlives builds of every
-# other process, which speak to it through this crate.
+# crate but `service` and never links CUDA: the Storage Server outlives
+# builds of every other process, which speak to it through this crate.
 [dependencies]
 libc.workspace = true
 rmp-serde.workspace = true
@@ -15,6 +15,7 @@ rustix = { workspace = true, features = ["net"] }
 serde.workspace = true
 serde_bytes.workspace = true
 serde_json.workspace = true
+service.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

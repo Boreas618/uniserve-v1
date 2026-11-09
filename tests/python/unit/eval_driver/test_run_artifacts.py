@@ -28,7 +28,7 @@ from uniserve_eval.types import (
 pytestmark = pytest.mark.unit
 
 
-def test_jsonl_video_row_preserves_duration_override(tmp_path: Path) -> None:
+def test_jsonl_video_row_preserves_frame_count_override(tmp_path: Path) -> None:
     dataset = tmp_path / "video.jsonl"
     dataset.write_text(
         json.dumps(
@@ -36,7 +36,7 @@ def test_jsonl_video_row_preserves_duration_override(tmp_path: Path) -> None:
                 "id": "heldout-video",
                 "prompt": "A camera pans across a quiet harbor.",
                 "seed": 73001,
-                "seconds": 10.0,
+                "num_frames": 243,
             }
         )
         + "\n",
@@ -55,7 +55,7 @@ def test_jsonl_video_row_preserves_duration_override(tmp_path: Path) -> None:
 
     examples = JsonlDataset(point).load()
 
-    assert examples[0].seconds == 10.0
+    assert examples[0].num_frames == 243
 
 
 class _EmptyStreamHandler(BaseHTTPRequestHandler):

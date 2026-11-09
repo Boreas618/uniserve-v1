@@ -228,12 +228,12 @@ def _serve(
     }
     try:
         if storage is not None:
-            socket = runtime / "uniserve" / "storage.sock"
+            socket = runtime / "uniserve" / "storage-server.sock"
             socket.parent.mkdir(mode=0o700)
             subprocess.run(
                 [
                     str(require_uniserve_binary()),
-                    "storage",
+                    "storage-server",
                     "serve",
                     "--socket",
                     str(socket),
@@ -249,7 +249,7 @@ def _serve(
         ):
             yield base_url, log
     finally:
-        _stop_storage_server(runtime / "uniserve" / "storage.sock")
+        _stop_storage_server(runtime / "uniserve" / "storage-server.sock")
         storage_log = runtime / "uniserve" / "storage-server.log"
         if storage_log.is_file():
             shutil.copy(storage_log, tmp_path / "storage-server.log")

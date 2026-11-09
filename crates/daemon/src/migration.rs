@@ -934,7 +934,6 @@ mod tests {
     fn a_video_request_migrates_with_the_steps_its_engine_stored() {
         let video = DiffusionRequest {
             request_id: Default::default(),
-            task: "t2va".to_owned(),
             prompt_token_ids: vec![1, 2],
             conditioning: Vec::new(),
             conditions: Vec::new(),

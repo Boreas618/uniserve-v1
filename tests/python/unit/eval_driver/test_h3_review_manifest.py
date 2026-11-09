@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from uniserve_eval.h3_review_manifest import condition_media, manifest
+from uniserve_eval.h3_review_manifest import manifest, reference_media
 
 
 def write_cell(root: Path, name: str, mp4: str) -> None:
@@ -28,23 +28,14 @@ def profile(tmp_path: Path) -> Path:
             "id": "w1-measured-seed0",
             "prompt": "a starship bridge",
             "seed": 0,
-            "conditions": [],
         },
         "check-ref2va.jsonl": {
             "id": "w1-measured-seed0",
             "prompt": "a man walks",
             "seed": 0,
-            "conditions": [
-                {
-                    "type": "image",
-                    "media": "media/ref.png",
-                    "role": "reference",
-                },
-                {
-                    "type": "audio",
-                    "media": "media/ref.mp3",
-                    "role": "reference",
-                },
+            "input_references": [
+                {"type": "image", "media": "media/ref.png"},
+                {"type": "audio", "media": "media/ref.mp3"},
             ],
         },
     }
@@ -66,12 +57,12 @@ checkpoint = "base"
 [benchmarks.check-t2va]
 server = "dmd"
 dataset_path = "check-t2va.jsonl"
-[benchmarks.check-t2va.video]
+[benchmarks.check-t2va.provenance]
 task = "t2va"
 [benchmarks.check-ref2va]
 server = "base-reference"
 dataset_path = "check-ref2va.jsonl"
-[benchmarks.check-ref2va.video]
+[benchmarks.check-ref2va.provenance]
 task = "ref2va"
 [suites.check-h3]
 points = ["check-t2va", "check-ref2va"]
@@ -95,8 +86,8 @@ def test_every_cell_has_a_task_a_checkpoint_a_seed_and_its_inputs(
     assert "**Baseline MP4**: `t2va.mp4`" in text
     assert "**Baseline MP4**: `ref2va.mp4`" in text
     assert "a starship bridge" in text
-    assert "image: `media/ref.png` (reference)" in text
-    assert "audio: `media/ref.mp3` (reference)" in text
+    assert "image: `media/ref.png`" in text
+    assert "audio: `media/ref.mp3`" in text
 
 
 def test_the_shipped_profile_names_the_three_checkpoints(
@@ -154,9 +145,21 @@ def test_a_candidate_mp4_is_named_beside_the_baseline_it_is_compared_with(
     assert "**Candidate MP4**: `candidate.mp4`" in text
 
 
-def test_a_row_with_no_conditions_names_no_inputs() -> None:
-    assert condition_media({"prompt": "x", "conditions": []}) == []
-    assert condition_media({"prompt": "x"}) == []
+def test_a_row_with_no_references_names_no_inputs() -> None:
+    assert reference_media({"prompt": "x", "input_references": []}) == []
+    assert reference_media({"prompt": "x"}) == []
+
+
+def test_a_keyframe_names_the_frame_it_anchors() -> None:
+    row = {
+        "prompt": "x",
+        "input_references": [
+            {"type": "image", "media": "media/last.png", "frame_index": -1}
+        ],
+    }
+    assert reference_media(row) == [
+        "image: `media/last.png` (keyframe at frame -1)"
+    ]
 
 
 def test_a_candidate_alone_is_a_reviewable_run(tmp_path: Path) -> None:

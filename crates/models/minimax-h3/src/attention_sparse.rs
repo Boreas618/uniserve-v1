@@ -7,7 +7,8 @@ use ops::gemm::WeightOrder;
 
 use crate::attention::{Factors, HeadProjection, HeadsToRows};
 use crate::config::TransformerConfig;
-use crate::partition::{Partition, Projection};
+use crate::partition::Partition;
+use nn::family::Projection;
 use crate::{Error, Result};
 
 /// One layer's sparse attention: four projections, the tile preparation, and both attentions.

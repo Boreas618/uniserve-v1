@@ -108,7 +108,7 @@ pub struct GenerationParams {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoAdmission {
     /// The request's task, presentation tags and conditions as the model
-    /// family plans them (`models::video::Conditioning`, JSON), which the
+    /// model plans them (`proto::video::Conditions`, JSON), which the
     /// workers decode and check.
     pub conditioning: Vec<u8>,
 }

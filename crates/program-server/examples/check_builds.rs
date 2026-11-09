@@ -148,7 +148,7 @@ fn key_operators(path: &Path) -> Vec<String> {
 fn toolchains(args: &Args) -> ToolchainConfig {
     ToolchainConfig {
         nvcc: Some(args.nvcc.clone()),
-        python: args.python.clone(),
+        python: Some(args.python.clone()),
         wasm: None,
         cargo: None,
         max_jobs: 1,
@@ -573,7 +573,7 @@ fn a_triton_package_builds_a_cubin_module_and_resolves_it(args: &Args) {
     };
     let toolchains = ToolchainConfig {
         nvcc: Some(args.nvcc.clone()),
-        python: python.clone(),
+        python: Some(python.clone()),
         wasm: None,
         cargo: None,
         max_jobs: 2,
@@ -671,7 +671,7 @@ fn a_cuda_package_builds_the_module_its_manifest_declares(args: &Args) {
     let temporary = tempfile::tempdir().unwrap();
     let toolchains = ToolchainConfig {
         nvcc: Some(args.nvcc.clone()),
-        python: args.python.clone(),
+        python: Some(args.python.clone()),
         wasm: None,
         cargo: None,
         max_jobs: 2,
@@ -755,7 +755,7 @@ fn a_cute_dsl_package_builds_a_native_module_with_its_entries(args: &Args) {
     };
     let toolchains = ToolchainConfig {
         nvcc: Some(args.nvcc.clone()),
-        python: python.clone(),
+        python: Some(python.clone()),
         wasm: None,
         cargo: None,
         max_jobs: 2,
@@ -927,7 +927,7 @@ fn the_policy_fixture_installs_and_serves_without_a_compiler(args: &Args) {
         limits: Limits::default(),
         toolchains: ToolchainConfig {
             nvcc: None,
-            python: args.python.clone(),
+            python: Some(args.python.clone()),
             wasm: Some(precompiler),
             cargo: Some(args.cargo.clone()),
             max_jobs: 2,

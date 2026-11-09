@@ -34,7 +34,7 @@ pub struct Settings {
 }
 
 impl Settings {
-    /// The command-line arguments of `uniserve storage serve` that state
+    /// The command-line arguments of `uniserve storage-server serve` that state
     /// these settings.
     pub fn arguments(&self) -> Vec<String> {
         let mut arguments = vec![

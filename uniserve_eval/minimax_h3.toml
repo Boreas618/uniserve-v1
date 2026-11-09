@@ -24,24 +24,28 @@
 #   it is one rank-0 and rank-1 both mount.
 #
 # Workloads (uniserve_eval/workloads/minimax_h3/), each a t2va, fl2va or
-# ref2va request at the 768-pixel short edge:
-# - W1: the official t2va prompt (537 prompt tokens), 16:9 (1344x768), 5 s
-#   (124 frames).
-# - W2: the same prompt, 16:9, 15 s (362 frames).
-# - W3: the official fl2va request: its first keyframe and prompt, auto
-#   canvas (the 16:9 keyframe resolves 1344x768), 8 s (192 frames).
+# ref2va request whose output is 1344x768 at 24 fps with a 32 kHz stereo
+# soundtrack; every row states its frame count and every point its size:
+# - W1: the official t2va prompt (537 prompt tokens), 124 frames.
+# - W2: the same prompt, 362 frames.
+# - W3: the official fl2va request: its first keyframe (1920x1080) and
+#   prompt, 192 frames.
 # - W4: a ref2va image reference (2560x1440) and the official audio
-#   reference, auto canvas (16:9), 5 s.
+#   reference, 124 frames.
 # - W5: the official ref2va request: its reference video, whose soundtrack
-#   conditions too, and its audio reference, auto canvas (16:9), 5 s.
+#   conditions too, and its audio reference, 124 frames.
 # - ref-<composition>-<seconds>s: the FastH3 OmniRef reference matrix, each
-#   ref2va at 16:9, nine compositions at 5, 10 and 15 s: one subject image
-#   (image), with a reference voice (image-voice), three images (images3),
-#   nine square images (images9), one 2-second clip with its soundtrack
-#   (clip), one 6-second reference video with its soundtrack (video), three
-#   2-second clips (clips3), an image, a reference video and a reference
-#   voice together (mixed), and nine square images with three 2-second
-#   clips (full).
+#   ref2va, nine compositions at 124, 243 and 362 frames (named 5, 10 and
+#   15 s): one subject image (image), with a reference voice (image-voice),
+#   three images (images3), nine square images (images9), one 2-second clip
+#   with its soundtrack (clip), one 6-second reference video with its
+#   soundtrack (video), three 2-second clips (clips3), an image, a reference
+#   video and a reference voice together (mixed), and nine square images with
+#   three 2-second clips (full).
+# A baseline point also states the requested target its native form names:
+# SGLang and vLLM-Omni the aspect ratio (16:9, or auto where the canvas
+# follows the keyframe or defaults) and the duration (5, 8 or 15 s) that
+# resolve to the stated shape, FastVideo the duration.
 # The base checkpoint's schedule is 50 sigma points (49 denoiser
 # evaluations) with video shift 12 and audio shift 3; OmniRef's is 9 points,
 # its 8 fused-block forwards, with the same shifts. A UniServe point states
@@ -90,8 +94,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-w1.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-4-w1.load]
 num_prompts = 8
@@ -114,8 +120,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-w2.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-4-w2.load]
 num_prompts = 4
@@ -147,9 +155,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w3.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-w3.video]
-task = "fl2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-w3.load]
 num_prompts = 8
@@ -182,9 +192,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-reference-w4.video]
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-reference-w4.load]
 num_prompts = 8
@@ -207,9 +219,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-reference-w5.video]
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-reference-w5.load]
 num_prompts = 8
@@ -242,9 +256,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-omniref-w4.video]
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-omniref-w4.load]
 num_prompts = 8
@@ -267,9 +283,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-omniref-w5.video]
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-4-omniref-w5.load]
 num_prompts = 8
@@ -311,9 +329,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-image-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-5s.load]
 num_prompts = 3
@@ -336,9 +356,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-image-voice-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-voice-5s.load]
 num_prompts = 3
@@ -361,9 +383,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-images3-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images3-5s.load]
 num_prompts = 3
@@ -386,9 +410,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-images9-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images9-5s.load]
 num_prompts = 3
@@ -411,9 +437,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-clip-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clip-5s.load]
 num_prompts = 3
@@ -436,9 +464,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-video-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-video-5s.load]
 num_prompts = 3
@@ -461,9 +491,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-clips3-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clips3-5s.load]
 num_prompts = 3
@@ -486,9 +518,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-mixed-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-mixed-5s.load]
 num_prompts = 3
@@ -511,9 +545,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-full-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-full-5s.load]
 num_prompts = 3
@@ -536,9 +572,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-image-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-10s.load]
 num_prompts = 3
@@ -561,9 +599,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-image-voice-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-voice-10s.load]
 num_prompts = 3
@@ -586,9 +626,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-images3-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images3-10s.load]
 num_prompts = 3
@@ -611,9 +653,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-images9-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images9-10s.load]
 num_prompts = 3
@@ -636,9 +680,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-clip-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clip-10s.load]
 num_prompts = 3
@@ -661,9 +707,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-video-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-video-10s.load]
 num_prompts = 3
@@ -686,9 +734,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-clips3-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clips3-10s.load]
 num_prompts = 3
@@ -711,9 +761,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-mixed-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-mixed-10s.load]
 num_prompts = 3
@@ -736,9 +788,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-full-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-full-10s.load]
 num_prompts = 3
@@ -761,9 +815,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-image-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-15s.load]
 num_prompts = 3
@@ -786,9 +842,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-image-voice-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-image-voice-15s.load]
 num_prompts = 3
@@ -811,9 +869,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-images3-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images3-15s.load]
 num_prompts = 3
@@ -836,9 +896,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-images9-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-images9-15s.load]
 num_prompts = 3
@@ -861,9 +923,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-clip-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clip-15s.load]
 num_prompts = 3
@@ -886,9 +950,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-video-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-video-15s.load]
 num_prompts = 3
@@ -911,9 +977,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-clips3-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-clips3-15s.load]
 num_prompts = 3
@@ -936,9 +1004,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-mixed-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-mixed-15s.load]
 num_prompts = 3
@@ -961,9 +1031,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-ref-full-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-ref-full-15s.load]
 num_prompts = 3
@@ -998,9 +1070,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-5s.load]
 num_prompts = 3
@@ -1023,9 +1097,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-voice-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-voice-5s.load]
 num_prompts = 3
@@ -1048,9 +1124,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images3-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images3-5s.load]
 num_prompts = 3
@@ -1073,9 +1151,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images9-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images9-5s.load]
 num_prompts = 3
@@ -1098,9 +1178,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clip-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clip-5s.load]
 num_prompts = 3
@@ -1123,9 +1205,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-video-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-video-5s.load]
 num_prompts = 3
@@ -1148,9 +1232,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clips3-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clips3-5s.load]
 num_prompts = 3
@@ -1173,9 +1259,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-mixed-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-mixed-5s.load]
 num_prompts = 3
@@ -1198,9 +1286,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-full-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-full-5s.load]
 num_prompts = 3
@@ -1223,9 +1313,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-10s.load]
 num_prompts = 3
@@ -1248,9 +1340,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-voice-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-voice-10s.load]
 num_prompts = 3
@@ -1273,9 +1367,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images3-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images3-10s.load]
 num_prompts = 3
@@ -1298,9 +1394,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images9-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images9-10s.load]
 num_prompts = 3
@@ -1323,9 +1421,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clip-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clip-10s.load]
 num_prompts = 3
@@ -1348,9 +1448,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-video-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-video-10s.load]
 num_prompts = 3
@@ -1373,9 +1475,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clips3-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clips3-10s.load]
 num_prompts = 3
@@ -1398,9 +1502,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-mixed-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-mixed-10s.load]
 num_prompts = 3
@@ -1423,9 +1529,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-full-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-full-10s.load]
 num_prompts = 3
@@ -1448,9 +1556,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-15s.load]
 num_prompts = 3
@@ -1473,9 +1583,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-voice-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-image-voice-15s.load]
 num_prompts = 3
@@ -1498,9 +1610,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images3-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images3-15s.load]
 num_prompts = 3
@@ -1523,9 +1637,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images9-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-images9-15s.load]
 num_prompts = 3
@@ -1548,9 +1664,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clip-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clip-15s.load]
 num_prompts = 3
@@ -1573,9 +1691,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-video-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-video-15s.load]
 num_prompts = 3
@@ -1598,9 +1718,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clips3-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-clips3-15s.load]
 num_prompts = 3
@@ -1623,9 +1745,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-mixed-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-mixed-15s.load]
 num_prompts = 3
@@ -1648,9 +1772,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-full-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.gb200-8-omniref-enlarged-ref-full-15s.load]
 num_prompts = 3
@@ -1680,8 +1806,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-w1.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-8-w1.load]
 num_prompts = 8
@@ -1704,8 +1832,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-8-w2.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-8-w2.load]
 num_prompts = 4
@@ -1729,9 +1859,9 @@ videos_per_second = "higher"
 # from the root diffusers components, and hold only that denoiser.
 #
 # Their requests carry the same work as UniServe's: the prompt, the
-# condition media files, the canvas, the frame count, the schedule (vLLM-Omni
+# reference media files, the size, the frame count, the schedule (vLLM-Omni
 # counts its 49 intervals, FastVideo OmniRef its 8 fused blocks), the shifts
-# and the seed. SGLang reads the media from the same file:// URIs, vLLM-Omni
+# and the seed. SGLang reads the media from the same file:// URLs, vLLM-Omni
 # receives the files as uploaded request parts, and FastVideo by their local
 # paths. None runs a lossy path: no step cache, no sparse or quantized
 # attention beyond OmniRef's trained sparsity, no FP8.
@@ -1790,9 +1920,13 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-4-w1.video]
-backend = "sglang"
-task = "t2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
+duration_seconds = 5.0
+backend = "sglang"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -1819,9 +1953,13 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-4-w2.video]
-backend = "sglang"
-task = "t2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
+duration_seconds = 15.0
+backend = "sglang"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -1848,10 +1986,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w3.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-4-w3.video]
-backend = "sglang"
-task = "fl2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 8.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -1892,10 +2034,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-4-reference-w4.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -1922,10 +2068,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-4-reference-w5.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -1978,9 +2128,13 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.vllm-omni-gb200-4-w1.video]
-backend = "vllm-omni"
-task = "t2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
+duration_seconds = 5.0
+backend = "vllm-omni"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2006,9 +2160,13 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.vllm-omni-gb200-4-w2.video]
-backend = "vllm-omni"
-task = "t2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
+duration_seconds = 15.0
+backend = "vllm-omni"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2034,10 +2192,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w3.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.vllm-omni-gb200-4-w3.video]
-backend = "vllm-omni"
-task = "fl2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 8.0
+backend = "vllm-omni"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2079,10 +2241,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.vllm-omni-gb200-4-reference-w4.video]
-backend = "vllm-omni"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "vllm-omni"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2108,10 +2274,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.vllm-omni-gb200-4-reference-w5.video]
-backend = "vllm-omni"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "vllm-omni"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2156,10 +2326,13 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w4.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.fastvideo-gb200-4-omniref-w4.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+duration_seconds = 5.0
 backend = "fastvideo"
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 9
 parallel_decoding = true
 
@@ -2184,10 +2357,13 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w5.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.fastvideo-gb200-4-omniref-w5.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+duration_seconds = 5.0
 backend = "fastvideo"
-task = "ref2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 9
 parallel_decoding = true
 
@@ -2222,9 +2398,11 @@ endpoint = "/v1/videos/sync"
 
 
 [benchmarks.gb200-8-w3.video]
-task = "fl2va"
-aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 
 [benchmarks.gb200-8-w3.load]
@@ -2275,9 +2453,13 @@ endpoint = "/v1/videos"
 
 
 [benchmarks.sglang-gb200-8-w1.video]
-backend = "sglang"
-task = "t2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
+duration_seconds = 5.0
+backend = "sglang"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2308,9 +2490,13 @@ endpoint = "/v1/videos"
 
 
 [benchmarks.sglang-gb200-8-w2.video]
-backend = "sglang"
-task = "t2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
+duration_seconds = 15.0
+backend = "sglang"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2341,10 +2527,14 @@ endpoint = "/v1/videos"
 
 
 [benchmarks.sglang-gb200-8-w3.video]
-backend = "sglang"
-task = "fl2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "auto"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 8.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2390,10 +2580,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-5s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-image-5s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2420,10 +2614,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-image-voice-5s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2450,10 +2648,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-5s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-images3-5s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2480,10 +2682,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-5s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-images9-5s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2510,10 +2716,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-5s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-clip-5s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2540,10 +2750,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-5s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-video-5s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2570,10 +2784,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-5s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-clips3-5s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2600,10 +2818,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-mixed-5s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2630,10 +2852,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-5s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-full-5s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 5.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2660,10 +2886,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-10s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-image-10s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 10.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2690,10 +2920,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-image-voice-10s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 10.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2720,10 +2954,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-10s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-images3-10s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 10.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2750,10 +2988,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-10s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-images9-10s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 10.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2780,10 +3022,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-10s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-clip-10s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 10.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2810,10 +3056,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-10s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-video-10s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 10.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2840,10 +3090,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-10s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-clips3-10s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 10.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2870,10 +3124,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-mixed-10s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 10.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2900,10 +3158,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-10s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-full-10s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 10.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2930,10 +3192,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-15s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-image-15s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 15.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2960,10 +3226,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-image-voice-15s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 15.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -2990,10 +3260,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-15s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-images3-15s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 15.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -3020,10 +3294,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-15s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-images9-15s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 15.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -3050,10 +3328,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-15s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-clip-15s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 15.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -3080,10 +3362,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-15s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-video-15s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 15.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -3110,10 +3396,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-15s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-clips3-15s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 15.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -3140,10 +3430,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-mixed-15s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 15.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -3170,10 +3464,14 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-15s.jsonl"
 endpoint = "/v1/videos"
 
 [benchmarks.sglang-gb200-8-ref-full-15s.video]
-backend = "sglang"
-task = "ref2va"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+duration_seconds = 15.0
+backend = "sglang"
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 num_inference_steps = 50
 flow_shift = 12.0
 audio_flow_shift = 3.0
@@ -3215,9 +3513,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-image-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-image-5s.load]
 num_prompts = 3
@@ -3240,9 +3540,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-image-voice-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-image-voice-5s.load]
 num_prompts = 3
@@ -3265,9 +3567,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-images3-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-images3-5s.load]
 num_prompts = 3
@@ -3290,9 +3594,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-images9-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-images9-5s.load]
 num_prompts = 3
@@ -3315,9 +3621,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-clip-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-clip-5s.load]
 num_prompts = 3
@@ -3340,9 +3648,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-video-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-video-5s.load]
 num_prompts = 3
@@ -3365,9 +3675,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-clips3-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-clips3-5s.load]
 num_prompts = 3
@@ -3390,9 +3702,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-mixed-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-mixed-5s.load]
 num_prompts = 3
@@ -3415,9 +3729,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-full-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-full-5s.load]
 num_prompts = 3
@@ -3440,9 +3756,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-image-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-image-10s.load]
 num_prompts = 3
@@ -3465,9 +3783,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-image-voice-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-image-voice-10s.load]
 num_prompts = 3
@@ -3490,9 +3810,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-images3-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-images3-10s.load]
 num_prompts = 3
@@ -3515,9 +3837,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-images9-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-images9-10s.load]
 num_prompts = 3
@@ -3540,9 +3864,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-clip-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-clip-10s.load]
 num_prompts = 3
@@ -3565,9 +3891,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-video-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-video-10s.load]
 num_prompts = 3
@@ -3590,9 +3918,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-clips3-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-clips3-10s.load]
 num_prompts = 3
@@ -3615,9 +3945,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-mixed-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-mixed-10s.load]
 num_prompts = 3
@@ -3640,9 +3972,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-full-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-full-10s.load]
 num_prompts = 3
@@ -3665,9 +3999,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-image-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-image-15s.load]
 num_prompts = 3
@@ -3690,9 +4026,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-image-voice-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-image-voice-15s.load]
 num_prompts = 3
@@ -3715,9 +4053,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-images3-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-images3-15s.load]
 num_prompts = 3
@@ -3740,9 +4080,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-images9-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-images9-15s.load]
 num_prompts = 3
@@ -3765,9 +4107,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-clip-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-clip-15s.load]
 num_prompts = 3
@@ -3790,9 +4134,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-video-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-video-15s.load]
 num_prompts = 3
@@ -3815,9 +4161,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-clips3-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-clips3-15s.load]
 num_prompts = 3
@@ -3840,9 +4188,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-mixed-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-mixed-15s.load]
 num_prompts = 3
@@ -3865,9 +4215,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-ref-full-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-ref-full-15s.load]
 num_prompts = 3
@@ -3899,9 +4251,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-5s.load]
 num_prompts = 3
@@ -3924,9 +4278,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-voice-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-voice-5s.load]
 num_prompts = 3
@@ -3949,9 +4305,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images3-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images3-5s.load]
 num_prompts = 3
@@ -3974,9 +4332,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images9-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images9-5s.load]
 num_prompts = 3
@@ -3999,9 +4359,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clip-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clip-5s.load]
 num_prompts = 3
@@ -4024,9 +4386,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-video-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-video-5s.load]
 num_prompts = 3
@@ -4049,9 +4413,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clips3-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clips3-5s.load]
 num_prompts = 3
@@ -4074,9 +4440,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-mixed-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-mixed-5s.load]
 num_prompts = 3
@@ -4099,9 +4467,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-full-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-full-5s.load]
 num_prompts = 3
@@ -4124,9 +4494,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-10s.load]
 num_prompts = 3
@@ -4149,9 +4521,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-voice-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-voice-10s.load]
 num_prompts = 3
@@ -4174,9 +4548,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images3-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images3-10s.load]
 num_prompts = 3
@@ -4199,9 +4575,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images9-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images9-10s.load]
 num_prompts = 3
@@ -4224,9 +4602,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clip-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clip-10s.load]
 num_prompts = 3
@@ -4249,9 +4629,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-video-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-video-10s.load]
 num_prompts = 3
@@ -4274,9 +4656,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clips3-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clips3-10s.load]
 num_prompts = 3
@@ -4299,9 +4683,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-mixed-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-mixed-10s.load]
 num_prompts = 3
@@ -4324,9 +4710,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-full-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-full-10s.load]
 num_prompts = 3
@@ -4349,9 +4737,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-15s.load]
 num_prompts = 3
@@ -4374,9 +4764,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-voice-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-image-voice-15s.load]
 num_prompts = 3
@@ -4399,9 +4791,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images3-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images3-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images3-15s.load]
 num_prompts = 3
@@ -4424,9 +4818,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-images9-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images9-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-images9-15s.load]
 num_prompts = 3
@@ -4449,9 +4845,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clip-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clip-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clip-15s.load]
 num_prompts = 3
@@ -4474,9 +4872,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-video-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-video-15s.load]
 num_prompts = 3
@@ -4499,9 +4899,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-clips3-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clips3-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-clips3-15s.load]
 num_prompts = 3
@@ -4524,9 +4926,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-mixed-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-mixed-15s.load]
 num_prompts = 3
@@ -4549,9 +4953,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-full-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.h200-8-omniref-enlarged-ref-full-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.h200-8-omniref-enlarged-ref-full-15s.load]
 num_prompts = 3
@@ -4572,7 +4978,7 @@ videos_per_second = "higher"
 host = "127.0.0.1"
 port = 18083
 ready_path = "/health"
-command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses8-reference.toml", "--max-running-requests", "2", "--max-model-len", "24576", "--set", "video_config.text_capacities=4096,7168,8192,9216,10240,12288,15360", "--set", "video_config.max_seconds=15", "--set", "video_config.max_condition_rows=56192", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "cuda_graph_config.policy=off", "--set", "quantization.mode=quality"]
+command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_MINIMAX_H3_OMNIREF}", "--served-model-name", "MiniMax-H3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses8-reference.toml", "--max-running-requests", "2", "--max-model-len", "24576", "--set", "video_config.text_capacities=4096,7168,8192,9216,10240,12288,15360", "--set", "video_config.max_seconds=15", "--set", "video_config.max_condition_rows=56192", "--set", "media_config.directory=${UNISERVE_MINIMAX_H3_INPUTS}", "--set", "media_config.ffprobe=${UNISERVE_MINIMAX_H3_FFMPEG}/ffprobe", "--set", "media_config.ffmpeg=${UNISERVE_MINIMAX_H3_FFMPEG}/ffmpeg", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "quantization.mode=quality"]
 
 [servers.rtx-pro-6000-8-omniref-refs.environment]
 CUDA_VISIBLE_DEVICES = "0,1,2,3,4,5,6,7"
@@ -4586,9 +4992,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-5s.load]
 num_prompts = 3
@@ -4611,9 +5019,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-10s.load]
 num_prompts = 3
@@ -4636,9 +5046,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-15s.load]
 num_prompts = 3
@@ -4661,9 +5073,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-5s.load]
 num_prompts = 3
@@ -4686,9 +5100,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-10s.load]
 num_prompts = 3
@@ -4711,9 +5127,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-image-voice-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-image-voice-15s.load]
 num_prompts = 3
@@ -4736,9 +5154,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-video-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-video-5s.load]
 num_prompts = 3
@@ -4761,9 +5181,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-video-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-video-10s.load]
 num_prompts = 3
@@ -4786,9 +5208,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-video-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-video-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-video-15s.load]
 num_prompts = 3
@@ -4811,9 +5235,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-5s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-mixed-5s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-mixed-5s.load]
 num_prompts = 3
@@ -4836,9 +5262,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-10s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-mixed-10s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-mixed-10s.load]
 num_prompts = 3
@@ -4861,9 +5289,11 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/ref-mixed-15s.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-mixed-15s.video]
-task = "ref2va"
-aspect_ratio = "16:9"
-condition_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+reference_root = "${UNISERVE_MINIMAX_H3_INPUTS}"
 
 [benchmarks.rtx-pro-6000-8-omniref-ref-mixed-15s.load]
 num_prompts = 3

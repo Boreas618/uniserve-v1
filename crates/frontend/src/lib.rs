@@ -1,22 +1,12 @@
-//! The frontend: the deployment's application process (`uniserve frontend`).
+//! The application's view of the served checkpoint, which the daemon's HTTP
+//! and OpenAI API reads. It links no numerical code: models, the scheduler
+//! and the workers are the main process's. Its modules are layered, each
+//! using only those below it:
 //!
-//! It serves the HTTP and OpenAI API, processes every request's input and
-//! output, keeps the facts of the requests in flight and migrates them between
-//! epochs, and exports the serving address's metrics. It links no numerical
-//! code: models, the scheduler and the workers are the main process's
-//! (`specs/worker.md` §2.1, §3).
-//!
-//! The daemon starts it, tells it which epoch serves, and hands it a successor
-//! on a hot restart together with its connections and the streams in flight
-//! (§7.5.1). Its modules are layered, each using only those below it:
-//!
-//! - `control`: the link to the daemon that commands the frontend, which says
-//!   which epoch serves, drains it and gates its admissions;
 //! - `tokenizer`: the served checkpoint's tokenizer and incremental decoding;
 //! - `model`: the served checkpoint's files, configuration and family
 //!   profile.
 
-pub mod control;
 pub mod model;
 pub mod tokenizer;
 

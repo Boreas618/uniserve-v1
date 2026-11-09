@@ -104,7 +104,7 @@ async fn videos_sync(
     if let Err(error) = check_model_served(&body.model, engine.served_model_name()) {
         return error.into_response();
     }
-    let (_, mut stream) = match engine.generate_video(request_id, body).await {
+    let (processed, mut stream) = match engine.generate_video(request_id, body).await {
         Ok(generation) => generation,
         Err(error) => return ApiError::from(error).into_response(),
     };
@@ -137,7 +137,14 @@ async fn videos_sync(
         .header(
             "server-timing",
             format!("generation;dur={generation_ms:.1}"),
-        );
+        )
+        // The shape the model generated, which a client holds the media to.
+        .header(
+            "x-video-size",
+            format!("{}x{}", processed.size.width, processed.size.height),
+        )
+        .header("x-video-num-frames", processed.num_frames)
+        .header("x-video-fps", processed.fps);
     if let Some(timing) = clock.finish() {
         response = response
             .header(
@@ -163,12 +170,12 @@ async fn videos_sync(
 /// Both content types deserialize into the same `VideoGenerationRequest`,
 /// whose `deny_unknown_fields` rejects unknown fields at every level. A
 /// multipart body carries every field as a text part of the same name:
-/// `conditions` and `target` as JSON text and the seed as an unsigned
-/// integer. File parts, repeated fields and fields outside the schema are
+/// `input_references` and `extra_params` as JSON text, counts as unsigned
+/// integers and `seconds` and `guidance_scale` as numbers. File parts, repeated fields and fields outside the schema are
 /// rejected. A JSON body that is not the schema is a `json_parse_error`, a
 /// refused multipart body an `invalid_request_error` (both `400`), and an
 /// unsupported content type `415 Unsupported Media Type`. Semantic checks
-/// (served model, task, conditions and target) happen in the handlers and in
+/// (served model, the model's own rules) happen in the handlers and in
 /// `VideoService::process`.
 pub(crate) struct VideoBody(pub VideoGenerationRequest);
 
@@ -181,14 +188,17 @@ enum PartKind {
     Json,
     /// An unsigned integer.
     Unsigned,
+    /// A number.
+    Number,
 }
 
 /// The multipart part of each request field.
 fn part_kind(name: &str) -> Option<PartKind> {
     Some(match name {
-        "model" | "prompt" | "task" => PartKind::Text,
-        "conditions" | "target" => PartKind::Json,
-        "seed" => PartKind::Unsigned,
+        "model" | "prompt" | "negative_prompt" | "size" => PartKind::Text,
+        "input_references" | "extra_params" => PartKind::Json,
+        "num_frames" | "fps" | "seed" | "num_inference_steps" => PartKind::Unsigned,
+        "seconds" | "guidance_scale" => PartKind::Number,
         _ => return None,
     })
 }
@@ -206,6 +216,13 @@ fn part_value(name: &'static str, kind: PartKind, text: String) -> Result<Value,
             .parse::<u64>()
             .map(Value::from)
             .map_err(|_| invalid("must be an unsigned integer")),
+        PartKind::Number => text
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number)
+            .ok_or_else(|| invalid("must be a number")),
     }
 }
 
@@ -307,17 +324,17 @@ async fn videos_create(
         created_at: crate::openai::unix_time(),
         completed_at: None,
         expires_at: None,
-        seconds: prepared.duration_seconds,
-        actual_seconds: prepared.actual_seconds,
+        seconds: format!("{}", prepared.seconds()),
         num_frames: prepared.num_frames,
-        size: format!("{}x{}", prepared.canvas.width, prepared.canvas.height),
+        fps: prepared.fps,
+        size: format!("{}x{}", prepared.size.width, prepared.size.height),
         status: "queued".to_owned(),
         phase: "queued".to_owned(),
         completed_steps: 0,
         // The deployment's denoiser fixes every request's step count.
         total_steps: engine
-            .video_denoiser()
-            .map_or(0, |denoiser| denoiser.denoise_steps()),
+            .video_service()
+            .map_or(0, |video| video.denoise_steps()),
         inference_time_s: None,
         stage_durations: None,
         error: None,
@@ -483,19 +500,18 @@ async fn capabilities(State(state): State<JobState>) -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::ModelParameters;
     use crate::test_support::{SERVED_MODEL, post_json, router, send, sim_engine};
 
     fn video_router() -> Router {
-        router(sim_engine(ModelParameters::MiniMaxH3))
+        router(sim_engine(crate::test_support::VIDEO))
     }
 
     fn video_request() -> serde_json::Value {
         serde_json::json!({
             "model": SERVED_MODEL,
             "prompt": "A river",
-            "task": "t2va",
-            "target": {"short_edge": 768, "aspect_ratio": "16:9", "duration_seconds": 5},
+            "size": "64x64",
+            "seconds": 5,
         })
     }
 
@@ -571,22 +587,21 @@ mod tests {
 
     #[tokio::test]
     async fn json_and_multipart_normalize_to_the_same_request() {
-        let conditions = r#"[{"type": "image", "uri": "data:image/png;base64,AA==", "role": "keyframe", "frame_index": 0}]"#;
-        let target = r#"{"short_edge": 768, "aspect_ratio": "auto", "duration_seconds": 5.5}"#;
+        let references = r#"[{"type": "image", "url": "data:image/png;base64,AA==", "frame_index": 0}]"#;
         let json = json_request(&serde_json::json!({
             "model": "FastH3",
             "prompt": "A river",
-            "task": "fl2va",
-            "conditions": serde_json::from_str::<serde_json::Value>(conditions).unwrap(),
-            "target": serde_json::from_str::<serde_json::Value>(target).unwrap(),
+            "size": "1344x768",
+            "seconds": 5.5,
+            "input_references": serde_json::from_str::<serde_json::Value>(references).unwrap(),
             "seed": 7,
         }));
         let multipart = multipart(&[
             ("model", "FastH3"),
             ("prompt", "A river"),
-            ("task", "fl2va"),
-            ("conditions", conditions),
-            ("target", target),
+            ("size", "1344x768"),
+            ("seconds", "5.5"),
+            ("input_references", references),
             ("seed", "7"),
         ]);
 
@@ -594,32 +609,27 @@ mod tests {
         let right = VideoBody::from_request(multipart, &()).await.unwrap().0;
 
         assert_eq!(left, right);
-        assert_eq!(left.task, models::video::VideoTask::Fl2va);
-        assert_eq!(left.conditions[0].frame_index, Some(0));
-        assert_eq!(left.target.duration_seconds, Some(5.5));
-        assert_eq!(left.seed, 7);
-
-        // An omitted seed is the reference's 42.
-        let defaulted = VideoBody::from_request(json_request(&video_request()), &())
-            .await
-            .unwrap()
-            .0;
-        assert_eq!(defaulted.seed, crate::input::video::DEFAULT_VIDEO_SEED);
+        assert_eq!(left.input_references[0].frame_index, Some(0));
+        assert_eq!(left.seed, Some(7));
+        assert_eq!(
+            left.spec().unwrap().length,
+            Some(processing::Length::Seconds(5.5))
+        );
     }
 
-    /// Fields outside the schema, a schedule field included, and file parts
-    /// are refused in both formats, and a body without a task names the
-    /// missing `task`.
+    /// Fields outside the schema, a nested one included, and file parts are refused in both
+    /// formats, and a body without a prompt names the missing `prompt`.
     #[tokio::test]
     async fn fields_outside_the_schema_are_rejected_in_both_formats() {
         let mut extra = video_request();
-        extra["num_inference_steps"] = serde_json::json!(50);
+        extra["task"] = serde_json::json!("t2va");
         let mut nested = video_request();
-        nested["target"]["fps"] = serde_json::json!(24);
+        nested["input_references"] =
+            serde_json::json!([{"type": "image", "url": "data:,", "role": "keyframe"}]);
         let file = axum::extract::Request::builder()
             .header(header::CONTENT_TYPE, "multipart/form-data; boundary=clip")
             .body(Body::from(
-                "--clip\r\nContent-Disposition: form-data; name=\"conditions\"; filename=\"image.png\"\r\n\r\nimage\r\n--clip--\r\n",
+                "--clip\r\nContent-Disposition: form-data; name=\"input_references\"; filename=\"image.png\"\r\n\r\nimage\r\n--clip--\r\n",
             ))
             .unwrap();
         let requests = [
@@ -636,8 +646,8 @@ mod tests {
         }
 
         for request in [
-            json_request(&serde_json::json!({"model": "FastH3", "prompt": "A river"})),
-            multipart(&[("model", "FastH3"), ("prompt", "A river")]),
+            json_request(&serde_json::json!({"model": "FastH3"})),
+            multipart(&[("model", "FastH3")]),
         ] {
             let error = match VideoBody::from_request(request, &()).await {
                 Ok(VideoBody(body)) => panic!("{body:?} was accepted"),
@@ -645,13 +655,14 @@ mod tests {
             };
             assert_eq!(error.status_code(), StatusCode::BAD_REQUEST);
             let message = error.to_error_response().error.message;
-            assert!(message.contains("task"), "{message}");
+            assert!(message.contains("prompt"), "{message}");
         }
     }
 
-    /// The capabilities report what the placed denoiser serves.
+    /// The capabilities state the model's own part beside the request fields every video model
+    /// takes.
     #[tokio::test]
-    async fn capabilities_follow_the_denoiser_handshake() {
+    async fn capabilities_state_the_models_part() {
         let router = video_router();
         let request = axum::extract::Request::builder()
             .uri("/v1/capabilities")
@@ -660,32 +671,10 @@ mod tests {
         let (status, _, body) = send(&router, request).await;
 
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["video"]["tasks"], serde_json::json!(["t2va"]));
-        assert_eq!(body["video"]["schedule"]["num_inference_steps"], 5);
-        // The deployment prepared the named aspect ratios' canvases at 768p,
-        // each reported with the pair that selects it.
-        let canvas = |aspect_ratio: &str, width: u32, height: u32| {
-            serde_json::json!({
-                "short_edge": 768,
-                "aspect_ratio": aspect_ratio,
-                "width": width,
-                "height": height,
-            })
-        };
+        assert_eq!(body["video"]["model"]["sizes"], serde_json::json!(["64x64"]));
         assert_eq!(
-            body["video"]["canvas"]["canvases"],
-            serde_json::json!([
-                canvas("21:9", 1536, 672),
-                canvas("16:9", 1344, 768),
-                canvas("4:3", 1024, 768),
-                canvas("1:1", 768, 768),
-                canvas("3:4", 768, 1024),
-                canvas("9:16", 768, 1344),
-            ])
-        );
-        assert_eq!(
-            body["video"]["canvas"]["aspect_ratios"],
-            serde_json::json!(["21:9", "16:9", "4:3", "1:1", "3:4", "9:16"])
+            body["video"]["request_fields"],
+            serde_json::json!(crate::input::video::REQUEST_FIELDS)
         );
     }
 }

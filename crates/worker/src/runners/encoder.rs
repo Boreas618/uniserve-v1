@@ -123,7 +123,7 @@ fn spans(offsets: &[i32]) -> Result<Vec<(u32, u32)>> {
 }
 
 /// The encoder's runner: one device stream, the buckets its plan captures, and its model.
-pub struct EncoderRunner<M: Encoder + Send + Sync> {
+pub struct EncoderRunner<M: Encoder + Send + Sync + ?Sized> {
     id: RunnerId,
     phases: Vec<ipc::PhaseId>,
     model: Arc<M>,
@@ -184,9 +184,9 @@ struct VisionPrompt {
 /// The vision blocks a request's conditioning presents, in presentation order.
 ///
 /// Every condition with a conditioner's view is one block, and they are presented in request order
-/// (`models::video::presentation`). An audio reference and a `ref2va` keyframe present none.
+/// (its model's request processing). An audio reference and a `ref2va` keyframe present none.
 fn vision_grids(conditioning: &[u8]) -> Result<Vec<[u32; 3]>> {
-    let decoded = models::video::Conditioning::decode(conditioning).map_err(|error| {
+    let decoded = proto::video::Conditions::decode(conditioning).map_err(|error| {
         Error::Invalid(format!(
             "a media request's conditioning does not decode: {error}"
         ))
@@ -199,7 +199,7 @@ fn vision_grids(conditioning: &[u8]) -> Result<Vec<[u32; 3]>> {
         .collect())
 }
 
-impl<M: Encoder + Send + Sync> EncoderRunner<M> {
+impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
     /// Binds an encoder to one device stream.
     ///
     /// The buckets are the ones the plan states for this runner (`Runner::media_plan`), and the
@@ -821,7 +821,7 @@ impl<M: Encoder + Send + Sync> EncoderRunner<M> {
     }
 }
 
-impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
+impl<M: Encoder + Send + Sync + ?Sized> Runner for EncoderRunner<M> {
     fn phases(&self) -> &[ipc::PhaseId] {
         &self.phases
     }
@@ -1043,7 +1043,7 @@ impl<M: Encoder + Send + Sync> Runner for EncoderRunner<M> {
     }
 }
 
-impl<M: Encoder + Send + Sync> EncoderRunner<M> {
+impl<M: Encoder + Send + Sync + ?Sized> EncoderRunner<M> {
     /// Captures one bucket of `generation`: the walk here, the graph kept by the lifecycle.
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;

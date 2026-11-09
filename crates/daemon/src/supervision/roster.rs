@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use proto::process::{self, Command, Exit, Report, Request, Spawn};
 
-use crate::epoch::{Epochs, ManagedProcess, ProcessState, Role};
+use crate::epoch::{Epochs, ManagedProcess, ProcessState};
 use crate::supervision::ProcessCommands;
 use crate::updates::switch::{Event, Roster};
 
@@ -183,8 +183,7 @@ impl ProcessRoster {
         let mut processes = self.epochs.processes();
         let mut found = false;
         for process in &mut processes {
-            let ours = process.role == Role::MainProcess
-                && process.group == launch.group
+            let ours = process.group == launch.group
                 && process.rank == launch.rank
                 && process.generation == generation;
             if ours {
@@ -196,7 +195,6 @@ impl ProcessRoster {
         }
         if !found {
             processes.push(ManagedProcess {
-                role: Role::MainProcess,
                 group: launch.group.clone(),
                 rank: launch.rank,
                 pid: launch.pid,
@@ -560,7 +558,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, Sender};
 
     use super::*;
-    use crate::epoch::{ProcessState, Role};
+    use crate::epoch::ProcessState;
     use proto::process::report;
 
     /// A fake leader service: it answers every request the way a node's
@@ -688,7 +686,6 @@ mod tests {
         let mut roster = roster(&epochs, link);
         // A row of another node's process is not the adapter's to replace.
         epochs.set_processes(vec![ManagedProcess {
-            role: Role::Frontend,
             group: String::new(),
             rank: 0,
             pid: Some(1),

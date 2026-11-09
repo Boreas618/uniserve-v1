@@ -1,5 +1,5 @@
-//! The shared computation library: tensor views, numerical layers, capability traits, a loaded
-//! model's block structure, and the checkpoint and weight-loading boundary.
+//! The shared computation library: tensor views, numerical layers, capability traits, the model
+//! families execution loads, and the checkpoint and weight-loading boundary.
 //!
 //! ## Where this crate sits
 //!
@@ -34,9 +34,10 @@
 //!
 //! ## The capabilities
 //!
-//! A model hands the worker one [`Block`] per named capability it implements: [`Encoder`],
-//! [`Denoiser`], [`Decoder`] or [`CausalLm`] ([`capability`]). The worker dispatches by the
-//! capability, never by the concrete model.
+//! A model's blocks implement the capabilities execution calls: [`Encoder`], [`Denoiser`],
+//! [`Decoder`] or [`CausalLm`] ([`capability`]). A model crate exports its [`family::Family`], the
+//! one value execution resolves a checkpoint with and receives the loaded model's blocks from; it
+//! dispatches by the capability, never by the concrete model.
 //!
 //! ## Checkpoints and weights
 //!
@@ -48,10 +49,10 @@ pub mod capability;
 pub mod checkpoint;
 pub mod error;
 pub mod exchange;
+pub mod family;
 pub mod forward;
 pub mod group;
 pub mod layers;
-pub mod model;
 pub mod tensor;
 pub mod weights;
 
@@ -59,7 +60,7 @@ pub use capability::{
     BatchRow, BatchRows, CausalLm, ConditionPiece, ConditionRole, ConditionShape, Conditioning,
     DecodedMedia, Decoder, Denoiser, Encoder, EncoderInputs, EncoderLayout, EncoderOutputs,
     EncoderPrompt, ImageInput, ImageShape, KvGroup, KvPlanes, KvView, Latents, Layout, MediaFormat,
-    RowKind, Seed, StateTable, Step, TokenBatch, VideoRequest, VideoTask,
+    RowKind, Seed, StateTable, Step, TokenBatch, VideoRequest, WarmRequest,
 };
 pub use checkpoint::{Checkpoint, CheckpointFile, FileIdentity, Reading, TensorLocation};
 pub use error::{Error, Result};
@@ -76,7 +77,6 @@ pub use layers::{
     Silu, Snake, SwiGlu, TRTLLM_WORKSPACE_BYTES, UlyssesExchange, VsaTiles, WeightedRmsNorm,
     gather_rows,
 };
-pub use model::{Block, BlockName, Model, PhaseId};
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};
 pub use tensor::Backing;

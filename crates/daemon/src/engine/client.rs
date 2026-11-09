@@ -29,9 +29,9 @@ const READ_INTERVAL: Duration = Duration::from_millis(200);
 pub struct EngineInfo {
     /// The limits every request is checked against.
     pub limits: GenerationLimits,
-    /// The video denoiser as its model family describes it
-    /// (`models::video::DenoiserInfo`, JSON); empty when the engine
-    /// generates no video.
+    /// The video denoiser as its model family describes it to its request
+    /// processing (`processing::VideoBinding::description`); empty when the
+    /// engine generates no video.
     pub video_denoiser: Vec<u8>,
     /// Condition units one latent encoding call covers at once; zero when no
     /// worker encodes latents.

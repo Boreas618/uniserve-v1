@@ -25,6 +25,7 @@ pub mod profile;
 pub mod report;
 pub mod request;
 mod shared_memory;
+pub mod video;
 
 pub use connection::{Connection, Error, Handed, Listener, Result};
 pub use media::{MappedMedia, MediaLocator, MediaReceiver, MediaSource};

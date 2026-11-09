@@ -54,7 +54,7 @@ fn media_of(batch: &Batch) -> Result<&crate::batch::MediaColumns> {
 }
 
 /// The audio decoder's runner: one device stream, the tracks its model serves, and their graphs.
-pub struct AudioDecoderRunner<M: Decoder + Send + Sync> {
+pub struct AudioDecoderRunner<M: Decoder + Send + Sync + ?Sized> {
     id: RunnerId,
     phases: Vec<ipc::PhaseId>,
     model: Arc<M>,
@@ -85,7 +85,7 @@ pub struct AudioDecoderRunner<M: Decoder + Send + Sync> {
     published_for: Option<ipc::RequestKey>,
 }
 
-impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
+impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
     /// Binds an audio decoder to one device stream.
     ///
     /// Every audio bucket's layout is taken from the bucket's own extent, so a plan whose bucket
@@ -391,7 +391,7 @@ impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
     }
 }
 
-impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
+impl<M: Decoder + Send + Sync + ?Sized> Runner for AudioDecoderRunner<M> {
     fn phases(&self) -> &[ipc::PhaseId] {
         &self.phases
     }
@@ -570,7 +570,7 @@ impl<M: Decoder + Send + Sync> Runner for AudioDecoderRunner<M> {
     }
 }
 
-impl<M: Decoder + Send + Sync> AudioDecoderRunner<M> {
+impl<M: Decoder + Send + Sync + ?Sized> AudioDecoderRunner<M> {
     /// Captures one bucket of `generation`: the walk here, the graph kept by the lifecycle.
     fn capture(&mut self, bucket: Bucket, generation: u64) -> Result<()> {
         let kernels = self.lifecycle.generation_named(generation)?;

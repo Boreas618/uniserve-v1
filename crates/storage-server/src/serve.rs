@@ -2,7 +2,7 @@
 //!
 //! [`serve`] holds this host's retained storage for the calling user until it
 //! is stopped with SIGTERM or SIGINT. A process that starts a server when its
-//! host has none starts it with `daemon` set (`::storage::socket::ensure`):
+//! host has none starts it with `daemon` set (`service::ensure`):
 //! the server then leaves its starter's session and process tree, writes its
 //! log beside its socket and signals its starter once it listens, so a
 //! starter's end never ends it.
@@ -12,22 +12,19 @@
 //! always runs its Transfer Server ([`run_transfer_server`]) the same way.
 
 use std::ffi::OsString;
-use std::fs::OpenOptions;
-use std::io::{Read, Write};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use ::storage::connector::Settings;
-use ::storage::{Client, socket};
+use ::storage::Client;
 use anyhow::Context;
 
 use crate::transfer::storage_name;
 use crate::{Launch, Server};
 
-/// How to serve: the arguments of `uniserve storage serve`.
+/// How to serve: the arguments of `uniserve storage-server serve`.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     /// The socket to listen on.
@@ -46,10 +43,10 @@ pub struct ServeOptions {
     /// The Mooncake connector's settings, when the server runs one.
     pub connector: Option<Settings>,
     /// The command that runs the connector, before its own arguments: this
-    /// executable and its `storage connector` command.
+    /// executable and its `storage-server connector` command.
     pub connector_command: Vec<OsString>,
     /// The command that runs the Transfer Server, before its own arguments:
-    /// this executable and its `storage transfer` command.
+    /// this executable and its `storage-server transfer` command.
     pub transfer_command: Vec<OsString>,
     /// How long one chunk of the Transfer Server's copies lasts at its
     /// link's bandwidth.
@@ -73,11 +70,11 @@ pub struct ServeOptions {
 pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
     // Forked before any thread exists. A successor runs detached already.
     let ready = if options.daemon && options.predecessor.is_none() {
-        Some(detach(&options.socket)?)
+        Some(service::detach(&options.socket).context("leaving the starter's session")?)
     } else {
         None
     };
-    init_logging();
+    service::init_logging("storage-server");
     let served = match options.predecessor {
         Some(descriptor) => serve_resumed(&options, descriptor),
         None => serve_on(&options, ready),
@@ -95,7 +92,7 @@ pub fn serve(options: ServeOptions) -> anyhow::Result<()> {
 ///
 /// Fails when the connector cannot reach Mooncake or the server.
 pub fn run_connector(socket: &Path, settings: &Settings) -> anyhow::Result<()> {
-    init_logging();
+    service::init_logging("storage-server");
     let ran = crate::mooncake::run(socket, settings).map_err(anyhow::Error::from);
     if let Err(error) = &ran {
         tracing::error!("the Mooncake connector failed: {error:#}");
@@ -113,7 +110,7 @@ pub fn run_transfer_server(
     socket: &Path,
     options: &crate::transfer::Options,
 ) -> anyhow::Result<()> {
-    init_logging();
+    service::init_logging("storage-server");
     let ran = crate::transfer::run(socket, options).map_err(anyhow::Error::from);
     if let Err(error) = &ran {
         tracing::error!("the Transfer Server failed: {error:#}");
@@ -226,37 +223,24 @@ pub fn retire(socket: &Path, deployment: &str) -> ::storage::Result<()> {
     Ok(())
 }
 
-/// Log to standard error at `UNISERVE_STORAGE_LOG`'s level, `info` when
-/// unset.
-fn init_logging() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("UNISERVE_STORAGE_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .init();
-}
-
 /// Bind the socket and serve until stopped. `ready` is the starter's pipe,
 /// written once the server listens or found another one listening.
-fn serve_on(options: &ServeOptions, ready: Option<OwnedFd>) -> anyhow::Result<()> {
+fn serve_on(options: &ServeOptions, ready: Option<service::Ready>) -> anyhow::Result<()> {
     let socket = &options.socket;
-    let signal = |ready: Option<OwnedFd>| {
+    let signal = |ready: Option<service::Ready>| {
         if let Some(ready) = ready {
-            let _ = std::fs::File::from(ready).write_all(b"1");
+            ready.signal();
         }
     };
     let Some((listener, lock)) =
-        socket::bind(socket).with_context(|| format!("binding {}", socket.display()))?
+        service::bind(socket).with_context(|| format!("binding {}", socket.display()))?
     else {
         tracing::info!(socket = %socket.display(), "another storage server serves this socket");
         signal(ready);
         return Ok(());
     };
     raise_descriptor_limit()?;
-    let (wake, stop) = stop_signals()?;
+    let (wake, stop) = service::stop_signals().context("installing the stop signals")?;
     let mut server = Server::new(
         listener,
         options.page_pool_bytes,
@@ -280,14 +264,14 @@ fn serve_on(options: &ServeOptions, ready: Option<OwnedFd>) -> anyhow::Result<()
 /// handoff socket at `descriptor`, and serve until stopped.
 fn serve_resumed(options: &ServeOptions, descriptor: i32) -> anyhow::Result<()> {
     raise_descriptor_limit()?;
-    let (wake, stop) = stop_signals()?;
+    let (wake, stop) = service::stop_signals().context("installing the stop signals")?;
     let (server, lock) = Server::resume(
         descriptor,
         connector_launch(options),
         Some(transfer_launch(options)),
     )
     .context("taking the server over from its predecessor")?;
-    let lock = socket::SocketLock::resume(lock, options.socket.clone());
+    let lock = service::SocketLock::resume(lock, options.socket.clone());
     tracing::info!(socket = %options.socket.display(), "storage server listening after a hot restart");
     run_until_stopped(server, &wake, &stop, lock)
 }
@@ -297,7 +281,7 @@ fn run_until_stopped(
     mut server: Server,
     wake: &OwnedFd,
     stop: &AtomicBool,
-    lock: socket::SocketLock,
+    lock: service::SocketLock,
 ) -> anyhow::Result<()> {
     match server.run(wake.as_fd(), &|| stop.load(Ordering::Acquire))? {
         Some(pending) => {
@@ -362,86 +346,4 @@ fn raise_descriptor_limit() -> anyhow::Result<()> {
         return Err(std::io::Error::last_os_error()).context("raising the descriptor limit");
     }
     Ok(())
-}
-
-/// A descriptor that becomes readable, and a flag that is set, when SIGTERM
-/// or SIGINT arrives.
-fn stop_signals() -> anyhow::Result<(OwnedFd, Arc<AtomicBool>)> {
-    let mut ends = [0; 2];
-    // SAFETY: pipe2 fills the two descriptors it creates.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("creating the signal pipe");
-    }
-    // SAFETY: pipe2 returned two new descriptors this function owns.
-    let (reader, writer) =
-        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
-    // The write end lives for the process: a handler may run until exit.
-    let writer = Box::leak(Box::new(writer)).as_raw_fd();
-    let stop = Arc::new(AtomicBool::new(false));
-    for signal in [libc::SIGTERM, libc::SIGINT] {
-        let flag = Arc::clone(&stop);
-        // SAFETY: the action stores to an atomic and writes to a descriptor
-        // that is never closed, both async-signal-safe.
-        unsafe {
-            signal_hook_registry::register(signal, move || {
-                flag.store(true, Ordering::Release);
-                let _ = libc::write(writer, b"x".as_ptr().cast(), 1);
-            })
-        }
-        .context("installing a signal handler")?;
-    }
-    Ok((reader, stop))
-}
-
-/// Leave the starter: fork, let the parent wait for the child's readiness
-/// and exit, and make the child the leader of a session of its own with its
-/// standard streams on `storage-server.log` beside the socket. Returns the
-/// child's end of the readiness pipe.
-fn detach(socket: &Path) -> anyhow::Result<OwnedFd> {
-    let directory = socket.parent().context("the socket has no directory")?;
-    std::fs::create_dir_all(directory)
-        .with_context(|| format!("creating {}", directory.display()))?;
-    let log = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(directory.join("storage-server.log"))
-        .context("opening the storage server's log")?;
-
-    let mut ends = [0; 2];
-    // SAFETY: pipe2 fills the two descriptors it creates.
-    if unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-        return Err(std::io::Error::last_os_error()).context("creating the readiness pipe");
-    }
-    // SAFETY: pipe2 returned two new descriptors this function owns.
-    let (reader, writer) =
-        unsafe { (OwnedFd::from_raw_fd(ends[0]), OwnedFd::from_raw_fd(ends[1])) };
-
-    // SAFETY: the process has one thread, so the child may run anything.
-    match unsafe { libc::fork() } {
-        -1 => Err(std::io::Error::last_os_error()).context("forking the storage server"),
-        0 => {
-            drop(reader);
-            // SAFETY: setsid and dup2 on descriptors this process owns.
-            unsafe {
-                libc::setsid();
-                let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY);
-                if null >= 0 {
-                    libc::dup2(null, 0);
-                    libc::close(null);
-                }
-                libc::dup2(log.as_raw_fd(), 1);
-                libc::dup2(log.as_raw_fd(), 2);
-            }
-            Ok(writer)
-        }
-        _ => {
-            drop(writer);
-            // The child writes once it listens; a child that dies first
-            // closes the pipe, which reads as end of file.
-            let mut byte = [0_u8; 1];
-            let started = std::fs::File::from(reader).read(&mut byte).unwrap_or(0) == 1;
-            // SAFETY: `_exit` ends the starter without running handlers.
-            unsafe { libc::_exit(if started { 0 } else { 1 }) }
-        }
-    }
 }

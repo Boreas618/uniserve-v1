@@ -9,8 +9,9 @@
 # each combination of a 5, 10 or 15 second clip and a 1000- or 10000-token
 # prompt. A throughput point fills its concurrency with the priming requests,
 # then measures the 32 throughput requests at that concurrency. Every
-# request is a t2va request whose target is the 16:9 canvas (1344x768) and
-# its row's duration, under the checkpoint's own schedule. Each suite covers
+# request is a t2va request for a 1344x768, 24 fps output of its row's frame
+# count (124, 243 or 362 frames for the 5, 10 and 15 second clips), under
+# the checkpoint's own schedule. Each suite covers
 # one hardware configuration and checkpoint; run points serially, one server
 # at a time.
 #
@@ -38,6 +39,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-4-bf16-latency.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-4-bf16-latency.load]
 num_prompts = 72
 request_rate = inf
@@ -57,6 +64,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-bf16-throughput-c1.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-4-bf16-throughput-c1.load]
 num_prompts = 32
@@ -79,6 +92,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-4-bf16-throughput-c2.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-4-bf16-throughput-c2.load]
 num_prompts = 32
 request_rate = inf
@@ -100,6 +119,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-4-bf16-throughput-c4.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-4-bf16-throughput-c4.load]
 num_prompts = 32
 request_rate = inf
@@ -120,6 +145,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-bf16-throughput-c8.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-4-bf16-throughput-c8.load]
 num_prompts = 32
@@ -147,6 +178,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-4-nvfp4-latency.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-4-nvfp4-latency.load]
 num_prompts = 72
 request_rate = inf
@@ -166,6 +203,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-nvfp4-throughput-c1.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-4-nvfp4-throughput-c1.load]
 num_prompts = 32
@@ -188,6 +231,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-4-nvfp4-throughput-c2.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-4-nvfp4-throughput-c2.load]
 num_prompts = 32
 request_rate = inf
@@ -209,6 +258,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-4-nvfp4-throughput-c4.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-4-nvfp4-throughput-c4.load]
 num_prompts = 32
 request_rate = inf
@@ -229,6 +284,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-4-nvfp4-throughput-c8.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-4-nvfp4-throughput-c8.load]
 num_prompts = 32
@@ -256,6 +317,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-8-bf16-latency.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-8-bf16-latency.load]
 num_prompts = 72
 request_rate = inf
@@ -281,6 +348,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-8-bf16-throughput-c1.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-8-bf16-throughput-c1.load]
 num_prompts = 32
 request_rate = inf
@@ -301,6 +374,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-bf16-throughput-c2.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-8-bf16-throughput-c2.load]
 num_prompts = 32
@@ -323,6 +402,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-8-bf16-throughput-c4.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-8-bf16-throughput-c4.load]
 num_prompts = 32
 request_rate = inf
@@ -344,6 +429,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-8-bf16-throughput-c8.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-8-bf16-throughput-c8.load]
 num_prompts = 32
 request_rate = inf
@@ -364,6 +455,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-bf16-throughput-c16.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-8-bf16-throughput-c16.load]
 num_prompts = 32
@@ -391,6 +488,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-8-nvfp4-latency.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-8-nvfp4-latency.load]
 num_prompts = 72
 request_rate = inf
@@ -416,6 +519,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-8-nvfp4-throughput-c1.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-8-nvfp4-throughput-c1.load]
 num_prompts = 32
 request_rate = inf
@@ -436,6 +545,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-nvfp4-throughput-c2.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-8-nvfp4-throughput-c2.load]
 num_prompts = 32
@@ -458,6 +573,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-8-nvfp4-throughput-c4.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-8-nvfp4-throughput-c4.load]
 num_prompts = 32
 request_rate = inf
@@ -478,6 +599,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.gb200-8-nvfp4-throughput-c8.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-8-nvfp4-throughput-c8.load]
 num_prompts = 32
@@ -500,6 +627,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.gb200-8-nvfp4-throughput-c16.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.gb200-8-nvfp4-throughput-c16.load]
 num_prompts = 32
 request_rate = inf
@@ -516,7 +649,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-bf16-latency]
 host = "127.0.0.1"
 port = 18083
-command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses8.toml", "--max-running-requests", "2", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "cuda_graph_config.policy=off", "--set", "video_config.text_capacities=1024,10240", "--set", "quantization.mode=quality"]
+command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses8.toml", "--max-running-requests", "2", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "video_config.text_capacities=1024,10240", "--set", "quantization.mode=quality"]
 
 [benchmarks.rtx-pro-6000-8-bf16-latency]
 server = "rtx-pro-6000-8-bf16-latency"
@@ -525,6 +658,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-bf16-latency.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-bf16-latency.load]
 num_prompts = 72
@@ -541,7 +680,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-bf16-throughput]
 host = "127.0.0.1"
 port = 18083
-command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-ulysses4x2.toml", "--max-running-requests", "4", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "cuda_graph_config.policy=off", "--set", "video_config.text_capacities=1024,10240", "--set", "quantization.mode=quality"]
+command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-ulysses4x2.toml", "--max-running-requests", "4", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "video_config.text_capacities=1024,10240", "--set", "quantization.mode=quality"]
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c1]
 server = "rtx-pro-6000-8-bf16-throughput"
@@ -550,6 +689,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-bf16-throughput-c1.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c1.load]
 num_prompts = 32
@@ -572,6 +717,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.rtx-pro-6000-8-bf16-throughput-c2.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c2.load]
 num_prompts = 32
 request_rate = inf
@@ -592,6 +743,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-bf16-throughput-c4.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c4.load]
 num_prompts = 32
@@ -614,6 +771,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.rtx-pro-6000-8-bf16-throughput-c8.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c8.load]
 num_prompts = 32
 request_rate = inf
@@ -635,6 +798,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.rtx-pro-6000-8-bf16-throughput-c16.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.rtx-pro-6000-8-bf16-throughput-c16.load]
 num_prompts = 32
 request_rate = inf
@@ -651,7 +820,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-nvfp4-latency]
 host = "127.0.0.1"
 port = 18083
-command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses8.toml", "--max-running-requests", "2", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "cuda_graph_config.policy=off", "--set", "video_config.text_capacities=1024,10240"]
+command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/ulysses8.toml", "--max-running-requests", "2", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "video_config.text_capacities=1024,10240"]
 
 [benchmarks.rtx-pro-6000-8-nvfp4-latency]
 server = "rtx-pro-6000-8-nvfp4-latency"
@@ -660,6 +829,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-latency.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-latency.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-nvfp4-latency.load]
 num_prompts = 72
@@ -676,7 +851,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-nvfp4-throughput]
 host = "127.0.0.1"
 port = 18083
-command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-ulysses4x2.toml", "--max-running-requests", "4", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "cuda_graph_config.policy=off", "--set", "video_config.text_capacities=1024,10240"]
+command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-ulysses4x2.toml", "--max-running-requests", "4", "--max-model-len", "16384", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "video_config.text_capacities=1024,10240"]
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c1]
 server = "rtx-pro-6000-8-nvfp4-throughput"
@@ -685,6 +860,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-throughput-c1.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c1.load]
 num_prompts = 32
@@ -707,6 +888,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.rtx-pro-6000-8-nvfp4-throughput-c2.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c2.load]
 num_prompts = 32
 request_rate = inf
@@ -727,6 +914,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-throughput-c4.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c4.load]
 num_prompts = 32
@@ -749,6 +942,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.rtx-pro-6000-8-nvfp4-throughput-c8.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c8.load]
 num_prompts = 32
 request_rate = inf
@@ -769,6 +968,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-nvfp4-throughput-c16.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-nvfp4-throughput-c16.load]
 num_prompts = 32
@@ -792,7 +997,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-dp8-nvfp4]
 host = "127.0.0.1"
 port = 18083
-command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-dp8-text-tp8.toml", "--max-running-requests", "8", "--max-model-len", "10240", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "cuda_graph_config.policy=off", "--set", "video_config.text_capacities=1024", "--set", "video_config.aspect_ratios=16:9"]
+command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-dp8-text-tp8.toml", "--max-running-requests", "8", "--max-model-len", "10240", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "video_config.text_capacities=1024", "--set", "video_config.sizes=1344x768"]
 
 [benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c8]
 server = "rtx-pro-6000-8-dp8-nvfp4"
@@ -801,6 +1006,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c8.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c8.load]
 num_prompts = 32
@@ -823,6 +1034,12 @@ dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
 
+[benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c16.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
+
 [benchmarks.rtx-pro-6000-8-dp8-nvfp4-throughput-c16.load]
 num_prompts = 32
 request_rate = inf
@@ -839,7 +1056,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-dp8-tp4x2-nvfp4]
 host = "127.0.0.1"
 port = 18083
-command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-dp8-text-tp4x2.toml", "--max-running-requests", "8", "--max-model-len", "10240", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "cuda_graph_config.policy=off", "--set", "video_config.text_capacities=1024", "--set", "video_config.aspect_ratios=16:9"]
+command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_NVFP4_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-dp8-text-tp4x2.toml", "--max-running-requests", "8", "--max-model-len", "10240", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "video_config.text_capacities=1024", "--set", "video_config.sizes=1344x768"]
 
 [benchmarks.rtx-pro-6000-8-dp8-tp4x2-nvfp4-throughput-c8]
 server = "rtx-pro-6000-8-dp8-tp4x2-nvfp4"
@@ -848,6 +1065,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-dp8-tp4x2-nvfp4-throughput-c8.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-dp8-tp4x2-nvfp4-throughput-c8.load]
 num_prompts = 32
@@ -870,7 +1093,7 @@ videos_per_second = "higher"
 [servers.rtx-pro-6000-8-dp8-bf16]
 host = "127.0.0.1"
 port = 18083
-command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-dp8-text-tp8-host-weights.toml", "--max-running-requests", "8", "--max-model-len", "10240", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "cuda_graph_config.policy=off", "--set", "video_config.text_capacities=1024", "--set", "video_config.aspect_ratios=16:9", "--set", "quantization.mode=quality"]
+command = ["${UNISERVE_EXECUTABLE}", "serve", "${UNISERVE_FAST_H3_MODEL}", "--served-model-name", "FastH3", "--host", "127.0.0.1", "--port", "18083", "--worker-groups", "configs/minimax_h3/fasth3-dp8-text-tp8-host-weights.toml", "--max-running-requests", "8", "--max-model-len", "10240", "--set", "video_config.max_seconds=15", "--mem-fraction-static", "0.92", "--set", "dtype=bfloat16", "--set", "video_config.text_capacities=1024", "--set", "video_config.sizes=1344x768", "--set", "quantization.mode=quality"]
 
 [benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c8]
 server = "rtx-pro-6000-8-dp8-bf16"
@@ -879,6 +1102,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c8.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c8.load]
 num_prompts = 32
@@ -900,6 +1129,12 @@ model = "FastH3"
 dataset = "jsonl"
 dataset_path = "uniserve_eval/workloads/minimax_h3/fasth3-throughput.jsonl"
 endpoint = "/v1/videos/sync"
+
+[benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c16.video]
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.rtx-pro-6000-8-dp8-bf16-throughput-c16.load]
 num_prompts = 32
@@ -927,8 +1162,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w1.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-bf16-w1.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-4-bf16-w1.load]
 num_prompts = 8
@@ -951,8 +1188,10 @@ dataset_path = "uniserve_eval/workloads/minimax_h3/w2.jsonl"
 endpoint = "/v1/videos/sync"
 
 [benchmarks.gb200-4-bf16-w2.video]
-task = "t2va"
-aspect_ratio = "16:9"
+size = "1344x768"
+fps = 24
+audio_sample_rate = 32000
+audio_channels = 2
 
 [benchmarks.gb200-4-bf16-w2.load]
 num_prompts = 4

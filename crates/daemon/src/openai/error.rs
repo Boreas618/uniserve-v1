@@ -17,7 +17,7 @@ use axum::response::{IntoResponse, Response};
 use thiserror_ext::{Construct, Macro};
 
 use crate::openai::{ErrorDetail, ErrorResponse};
-use models::video::plan::VideoInputError;
+use processing::InputError;
 
 use crate::input::ServeError;
 use crate::output::OutputError;
@@ -235,11 +235,11 @@ impl From<ServeError> for ApiError {
                 Self::invalid_request(format!("{error}: {source}"), None)
             }
             ServeError::Video(error) => match &error {
-                VideoInputError::Invalid { field, .. } => {
-                    Self::invalid_request(error.to_string(), Some(field.param()))
+                InputError::Invalid { param, .. } => {
+                    Self::invalid_request(error.to_string(), video_param(param))
                 }
-                VideoInputError::Internal(message) => {
-                    Self::server_error(format!("video condition processing failed: {message}"))
+                InputError::Internal(message) => {
+                    Self::server_error(format!("video request processing failed: {message}"))
                 }
             },
             ServeError::Submit(source) => {
@@ -265,6 +265,16 @@ impl From<VideoStreamError> for ApiError {
             error => Self::server_error(error.to_string()),
         }
     }
+}
+
+/// The video request field a refusal's parameter names: `input_references[2]` is the
+/// `input_references` field, whose index the message states.
+fn video_param(param: &str) -> Option<&'static str> {
+    let field = param.split(['[', '.']).next().unwrap_or(param);
+    crate::input::video::REQUEST_FIELDS
+        .iter()
+        .copied()
+        .find(|known| *known == field)
 }
 
 #[cfg(test)]
@@ -305,29 +315,26 @@ mod tests {
     /// error.
     #[test]
     fn video_rejections_map_to_openai_categories() {
-        let rejected = ApiError::from(ServeError::from(VideoInputError::condition(
-            2,
+        let rejected = ApiError::from(ServeError::from(InputError::invalid(
+            "input_references[2]",
             "is not an image",
         )));
         assert_eq!(
             rejected,
-            ApiError::invalid_request("conditions[2]: is not an image", Some("conditions"))
-        );
-
-        let rejected = ApiError::from(ServeError::from(VideoInputError::invalid(
-            models::video::plan::RequestField::TargetDuration,
-            "is required",
-        )));
-        assert_eq!(
-            rejected,
             ApiError::invalid_request(
-                "target.duration_seconds: is required",
-                Some("target.duration_seconds")
+                "input_references[2]: is not an image",
+                Some("input_references")
             )
         );
 
-        let failed = ApiError::from(ServeError::from(VideoInputError::internal(
-            "ffprobe did not start",
+        let rejected = ApiError::from(ServeError::from(InputError::invalid("size", "is not served")));
+        assert_eq!(
+            rejected,
+            ApiError::invalid_request("size: is not served", Some("size"))
+        );
+
+        let failed = ApiError::from(ServeError::from(InputError::Internal(
+            "ffprobe did not start".to_owned(),
         )));
         assert_eq!(failed.code(), "server_error");
     }

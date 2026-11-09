@@ -41,14 +41,14 @@ use crate::http::handoff::Handoff;
 use crate::input::chat::{
     ChatContent, ChatContentPart, ChatMessage as ServingChatMessage, ChatRequest, ChatToolChoice,
 };
-use crate::input::{GenerateRequest, ImageSamplingParams, Prompt, SamplingParams};
+use crate::input::{GenerateRequest, Prompt, SamplingParams};
 use crate::leader::Leader;
 use crate::openai::RequestId;
 use crate::openai::error::{bail_invalid_request, bail_server_error, server_error};
 use crate::openai::{
     ApiError, AssistantRole, ChatCompletionChoice, ChatCompletionMessage, ChatCompletionRequest,
     ChatCompletionResponse, ChatCompletionStreamChoice, ChatCompletionStreamResponse,
-    ChatImageConfig, ChatLogProbs, ChatLogProbsContent, ChatMessage, ChatMessageDelta,
+    ChatLogProbs, ChatLogProbsContent, ChatMessage, ChatMessageDelta,
     ChatModality, ContentPart, FunctionCallDelta, FunctionCallResponse, ImageUrl, MessageContent,
     Tool, ToolCall, ToolCallDelta, TopLogProb, Usage, ValidatedJson, check_model_served,
     convert_logit_bias,
@@ -1377,8 +1377,6 @@ fn append_delta_text(slot: &mut Option<String>, delta: String) {
 
 
 
-
-
 /// Builds the initial assistant-role SSE chunk required by OpenAI streaming.
 fn start_chunk(
     request_id: &str,
@@ -1621,7 +1619,6 @@ pub fn lower_chat_request(
             skip_special_tokens: request.skip_special_tokens,
             include_stop_str_in_output: request.include_stop_str_in_output,
         },
-        image_params: request.image_config.as_ref().map(convert_image_config),
         priority: request.priority.unwrap_or(0),
         cache_salt: request.cache_salt,
         adapter: None,
@@ -1641,28 +1638,6 @@ fn convert_modalities(modalities: &[ChatModality]) -> GenerationConstraint {
         (true, false) => GenerationConstraint::UndOnly,
         (false, true) => GenerationConstraint::GenOnly,
         (true, true) | (false, false) => GenerationConstraint::Default,
-    }
-}
-
-/// Maps chat `image_config` fields onto serving image controls.
-///
-/// Wire names differ from the serving names: `guidance_scale` and
-/// `image_guidance_scale` are the text and image CFG scales, `cfg_norm` is the
-/// renormalization type, and `num_images` is `max_images`.
-fn convert_image_config(config: &ChatImageConfig) -> ImageSamplingParams {
-    ImageSamplingParams {
-        resolution: config.resolution,
-        width: config.width,
-        height: config.height,
-        steps: config.steps,
-        cfg_text_scale: config.guidance_scale,
-        cfg_img_scale: config.image_guidance_scale,
-        cfg_interval: config.cfg_interval,
-        cfg_renorm_type: config.cfg_norm,
-        cfg_renorm_min: config.cfg_renorm_min,
-        timestep_shift: config.timestep_shift,
-        seed: config.seed,
-        max_images: config.num_images,
     }
 }
 

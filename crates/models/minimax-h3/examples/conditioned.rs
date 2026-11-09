@@ -42,10 +42,9 @@ use minimax_h3::denoiser::{Denoiser, Layouts};
 use minimax_h3::encoding::Extent;
 use minimax_h3::partition::{Component, Components, Partition, Ulysses};
 use nn::capability::{Conditioning, Denoiser as _, MediaInput, MediaRole};
-use nn::{
-    Arena, Backing, Checkpoint, ConditionRole, ConditionShape, DType, DevicePtr, Forward,
-    RetainedWeights, Shape, TensorView, VideoRequest, VideoTask, WeightKey, WeightLoader,
-};
+use nn::{Arena, Backing, Checkpoint, ConditionRole, ConditionShape, DType, DevicePtr, Forward,
+    RetainedWeights, Shape, TensorView, VideoRequest, WeightKey, WeightLoader};
+use minimax_h3::VideoTask;
 
 /// The two checkpoint directories a conditioned deployment reads its media from.
 const VAE: &str = "vae";
@@ -605,7 +604,6 @@ fn plan(args: &Args) -> Result<(), String> {
     // the rows cannot be read off a layout sized by a constant.
     let (conditions, first_frames, last_frames, references) = case_conditions(args)?;
     let request = VideoRequest {
-        task: args.task,
         width: args.width,
         height: args.height,
         frames: args.frames,
@@ -826,7 +824,6 @@ fn encode(args: &Args) -> Result<(), String> {
     let config = Config::read(&args.root, None).map_err(show)?;
     let (conditions, first_frames, last_frames, references) = case_conditions(args)?;
     let request = VideoRequest {
-        task: args.task,
         width: args.width,
         height: args.height,
         frames: args.frames,

@@ -5,25 +5,21 @@ edition.workspace = true
 license.workspace = true
 publish = false
 
-# The deployment's application process (`uniserve frontend`): the HTTP and
-# OpenAI API, requests' input and output processing, the facts of the requests
-# in flight and their migration between epochs, and the metrics of the serving
-# address. It links no numerical code (`specs/worker.md` §2.1, §3).
+# The application's view of the served checkpoint: its tokenizer, files,
+# configuration and family profile, which the daemon's HTTP and OpenAI API
+# reads. It links no numerical code.
 [dependencies]
-anyhow.workspace = true
 # The tokenizer's decoder chain, which the served tokenizer loads.
 fastokens.workspace = true
 # The checkpoint's own files and the Hub's cache layout.
 hf-hub.workspace = true
-models.workspace = true
+processing.workspace = true
 proto.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_with.workspace = true
 thiserror.workspace = true
 thiserror-ext.workspace = true
-# The control link publishes the daemon's commands as a watch channel.
-tokio.workspace = true
 tracing.workspace = true
 # Builds the deterministic serving tokenizer of the test fixtures.
 tokenizers = { workspace = true, optional = true }

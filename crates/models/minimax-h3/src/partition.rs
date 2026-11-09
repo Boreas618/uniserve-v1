@@ -11,7 +11,9 @@
 //! the model is told how many ranks the exchange runs over, and the layer that shards a tensor
 //! reads only the degree and the rank's position in it.
 
-use nn::{DType, VideoTask};
+use nn::family::Projection;
+use crate::VideoTask;
+use nn::DType;
 
 use crate::checkpoint::TASK_DITS;
 use crate::denoiser::Arrangement;
@@ -49,14 +51,15 @@ pub fn condition_rows(config: &Config, task: VideoTask) -> Result<u32> {
         .iter()
         .find_map(|(served, dit)| (*served == task).then_some(*dit))
         .ok_or_else(|| Error::config(format!("no MiniMax-H3 deployment serves {task:?}")))?;
-    let denoiser = config
-        .denoisers
-        .get(&dit)
-        .ok_or_else(|| Error::config(format!("the checkpoint holds no {} DiT", dit.directory())))?;
+    if !config.denoisers.contains_key(&dit) {
+        return Err(Error::config(format!(
+            "the checkpoint holds no {} DiT",
+            dit.directory()
+        )));
+    }
     // The frame's rows at the largest canvas the deployment offers: a keyframe is fitted to the
     // generated canvas, so this is its size whatever the request asks for.
-    let frame_rows = denoiser
-        .offered_canvases()
+    let frame_rows = crate::config::offered_canvases()
         .iter()
         .map(|canvas| crate::packing::latent_raster(canvas).map(|raster| raster.patch_rows()))
         .collect::<Result<Vec<u32>>>()?
@@ -203,23 +206,6 @@ impl Component {
         }
     }
 
-    /// The name the runner addresses this block by.
-    ///
-    /// Blocks are addressed by the capability their runner serves, not by the checkpoint's
-    /// directories: both DiT partitions are the `Denoiser` block, so a rank that places either
-    /// serves the same media call. The engine's media calls name `denoiser`, `text_encoder`,
-    /// `video_decoder`, `audio_decoder` and `latent_encoder`, which is this list.
-    pub const fn block(self) -> &'static str {
-        match self {
-            Self::TextEncoder => "text_encoder",
-            Self::Transformer | Self::TransformerRef => "denoiser",
-            Self::VideoDecoder => "video_decoder",
-            Self::AudioDecoder => "audio_decoder",
-            Self::LatentEncoder => "latent_encoder",
-            Self::VideoPostprocessor => "video_postprocessor",
-        }
-    }
-
     /// The component a deployment file names, when it names one of these.
     pub fn named(name: &str) -> Option<Self> {
         Self::ALL
@@ -270,7 +256,7 @@ impl Capacity {
         let condition = self.condition_rows;
         let frames = crate::packing::align_num_frames(self.frames);
         let mut largest = 0;
-        for canvas in config.offered_canvases() {
+        for canvas in crate::config::offered_canvases() {
             let packing = crate::packing::dense_packing(frames, canvas, text, condition, unit)?;
             largest = largest.max(packing.padded_tokens);
             // A sparse deployment packs by video tiles as well, and its segments pad the audio
@@ -343,23 +329,6 @@ impl FromIterator<Component> for Components {
     fn from_iter<I: IntoIterator<Item = Component>>(components: I) -> Self {
         Self::of(components)
     }
-}
-
-/// How a Ulysses member's merged head projections reach it.
-///
-/// A deployment states this (`crates/ipc`'s `HeadProjection`); it is normalized here, at the loading
-/// boundary, because it decides two things this stack cannot change at run time: **the weights a rank
-/// holds** and **the communication its attention runs**.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Projection {
-    /// Every member gathers every member's rows and projects **its own head shard** with
-    /// head-partitioned weights, so a rank of `d` holds `1/d` of the attention projections: one
-    /// all-gather of the normalized rows per layer.
-    Gather,
-    /// Every member projects its own rows for all heads with **whole weights**, one launch per
-    /// member so each member's head shard lands in its own block, and sends each member its block:
-    /// one all-to-all per projection.
-    Exchange,
 }
 
 /// A deployment's Ulysses group: its sequence degree and the projection its members use.
@@ -984,22 +953,6 @@ mod tests {
         assert_eq!(partition.vocabulary_shard(10), (9, 10));
     }
 
-    #[test]
-    fn a_block_is_named_for_the_capability_its_runner_serves() {
-        // Both DiT partitions are the denoiser: a rank places one of them, and the runner's media
-        // call looks the capability up, not the checkpoint's directory.
-        assert_eq!(Component::Transformer.block(), "denoiser");
-        assert_eq!(Component::TransformerRef.block(), "denoiser");
-        assert_ne!(
-            Component::Transformer.name(),
-            Component::TransformerRef.name(),
-            "the two partitions stay distinct components of one checkpoint"
-        );
-        for component in Component::ALL {
-            assert!(!component.block().is_empty());
-            assert!(!component.name().is_empty());
-        }
-    }
 
     #[test]
     fn a_rank_holds_one_denoiser() {

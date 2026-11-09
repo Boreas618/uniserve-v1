@@ -64,7 +64,7 @@ struct RegionExtents {
 
 impl RegionExtents {
     /// What `conditioning`'s conditions take, as `format` lays them out.
-    fn of(conditioning: &models::video::Conditioning, format: &dyn MediaFormat) -> Result<Self> {
+    fn of(conditioning: &proto::video::Conditions, format: &dyn MediaFormat) -> Result<Self> {
         let mut extents = Self::default();
         for condition in &conditioning.conditions {
             extents.pixels += condition.pixel_bytes();
@@ -82,7 +82,7 @@ impl RegionExtents {
 /// What one host call reads a request's conditions with.
 struct ConditionRead {
     /// The request's plan of them.
-    conditioning: models::video::Conditioning,
+    conditioning: proto::video::Conditions,
     /// The regions the read fills, shared with the stage that publishes them when it ends.
     regions: Arc<Mutex<ConditionRegions>>,
     /// How the model's encoders read what the media decodes to.
@@ -482,7 +482,7 @@ impl Rates {
 }
 
 /// The bytes one condition's media was published as, read from shared memory.
-fn published_bytes(source: &models::video::MediaLocator) -> Result<Vec<u8>> {
+fn published_bytes(source: &proto::video::MediaLocator) -> Result<Vec<u8>> {
     let read = |error: std::io::Error| {
         crate::Error::Invalid(format!(
             "reading the published media {:?} of {} byte(s): {error}",
@@ -579,14 +579,14 @@ fn pack_block(
 fn read_conditions(
     media: &media::MediaRunner,
     rates: Rates,
-    conditioning: &models::video::Conditioning,
+    conditioning: &proto::video::Conditions,
     format: &dyn MediaFormat,
     regions: &mut ConditionRegions,
 ) -> Result<()> {
     use media::read::{
         AudioTransform, ConditionProducts, ConditionSource, ImageTransform, VideoClip,
     };
-    use models::video::ConditionMedia;
+    use proto::video::ConditionMedia;
 
     let conditions = &conditioning.conditions;
     let bytes = conditions
@@ -610,7 +610,7 @@ fn read_conditions(
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let audio_transform = |track: &models::video::AudioClip| -> Result<AudioTransform> {
+    let audio_transform = |track: &proto::video::AudioClip| -> Result<AudioTransform> {
         let index = |value: u64| {
             usize::try_from(value)
                 .map_err(|_| crate::Error::Invalid("a track is larger than memory".into()))
@@ -780,7 +780,7 @@ fn condition_rows(
     format: &dyn MediaFormat,
     rgb: &[u8],
     frames: u32,
-    canvas: models::video::Canvas,
+    canvas: proto::video::Canvas,
     out: &mut [f32],
 ) -> Result<()> {
     format
@@ -801,6 +801,9 @@ fn condition_rows(
 fn request_id(request: RequestKey) -> u64 {
     request.request_id.0
 }
+
+/// The frames of each video unit of a timeline of the given frames: the model's own schedule.
+pub type Units = Arc<dyn Fn(u32) -> Result<Vec<u32>> + Send + Sync>;
 
 /// The runner that serves a media request's three host calls.
 ///
@@ -837,7 +840,7 @@ pub struct MediaStage {
     products: Option<Arc<dyn Products>>,
     /// The frames of each video unit of a request's timeline: the model's schedule, handed in as a
     /// function because it is the model's arithmetic and the worker holds no copy of it.
-    units_of: fn(u32) -> Result<Vec<u32>>,
+    units_of: Units,
     /// What `submit` staged, one entry per call of the batch it was handed, and what `serve`
     /// performs call by call.
     ///
@@ -879,7 +882,7 @@ impl MediaStage {
         binding: Binding,
         output: Arc<Output>,
         lane: Lane<MediaWork>,
-        units_of: fn(u32) -> Result<Vec<u32>>,
+        units_of: Units,
         format: Arc<dyn MediaFormat>,
     ) -> Self {
         Self {
@@ -900,7 +903,7 @@ impl MediaStage {
     /// The regions `conditioning`'s conditions are read into, and the read that fills them.
     fn prepare_read(&self, staged: &crate::batch::StagedRequest) -> Result<ConditionRead> {
         let conditioning =
-            models::video::Conditioning::decode(&staged.conditioning).map_err(|error| {
+            proto::video::Conditions::decode(&staged.conditioning).map_err(|error| {
                 crate::Error::Invalid(format!(
                     "a media request's conditioning does not decode: {error}"
                 ))

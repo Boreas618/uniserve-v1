@@ -1867,7 +1867,7 @@ mod tests {
         fn reserving(host_reserve: u64) -> Self {
             let directory = tempfile::tempdir().unwrap();
             let socket = directory.path().join("storage.sock");
-            let (listener, lock) = storage::socket::bind(&socket).unwrap().unwrap();
+            let (listener, lock) = service::bind(&socket).unwrap().unwrap();
             let mut ends = [0; 2];
             // SAFETY: pipe2 fills the two descriptors it creates.
             let created = unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_NONBLOCK) };

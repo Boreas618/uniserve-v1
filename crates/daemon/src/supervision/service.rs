@@ -415,11 +415,6 @@ fn publish(local: &Local, table: &ProcessTable) {
             continue;
         }
         rows.push(crate::epoch::ManagedProcess {
-            role: if process.group == FRONTEND_GROUP {
-                crate::epoch::Role::Frontend
-            } else {
-                crate::epoch::Role::MainProcess
-            },
             group: process.group,
             rank: u64::from(process.rank),
             pid: Some(process.pid),
@@ -446,9 +441,6 @@ fn same_process(
         && row.rank == u64::from(process.rank)
         && row.generation == process.generation
 }
-
-/// The worker group the application's process runs in.
-const FRONTEND_GROUP: &str = "frontend";
 
 pub(crate) fn serve_leader(
     host: &str,

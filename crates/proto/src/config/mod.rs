@@ -21,7 +21,7 @@ use serde_json::Value;
 
 use crate::request::wire::{ExpertOrder, Predecessor};
 use crate::request::{
-    ExpertExchange, FlashInferBackend, GraphPolicy, LoadFormat, PrefixCacheDtype, SchedulingPolicy,
+    ExpertExchange, FlashInferBackend, LoadFormat, PrefixCacheDtype, SchedulingPolicy,
     StandbyStorage,
 };
 pub use block::{
@@ -34,10 +34,6 @@ pub use worker_group::{
     WorkerGroupRole, WorkerRank,
 };
 
-/// Shortest admitted clip, in seconds.
-pub const MIN_VIDEO_SECONDS: f64 = 4.0;
-/// Longest admitted clip, in seconds.
-pub const MAX_VIDEO_SECONDS: f64 = 15.0;
 
 /// A positive count, for the defaults of non-zero options.
 pub const fn positive(count: usize) -> NonZeroUsize {
@@ -423,9 +419,6 @@ impl Default for MoeConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CudaGraphConfig {
-    /// `auto` captures graphs unless serving does not capture the attention
-    /// provider's calls, `full` requires them, `off` serves eagerly.
-    pub policy: GraphPolicy,
     /// Decode batch sizes captured, strictly increasing; the worker's
     /// catalog when unset.
     #[serde(deserialize_with = "values::optional_list::deserialize")]
@@ -466,7 +459,6 @@ impl CudaGraphConfig {
 impl Default for CudaGraphConfig {
     fn default() -> Self {
         Self {
-            policy: GraphPolicy::Auto,
             decode_batch_sizes: None,
             prefill_token_sizes: None,
             flow_shapes: None,
@@ -661,20 +653,16 @@ impl Default for ImageFetchConfig {
     }
 }
 
-/// MiniMax-H3 video generation (`video_config`).
+/// Video generation (`video_config`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct VideoConfig {
-    /// Longest admitted clip, 4 to 15 seconds.
+    /// Longest admitted output, in seconds, within the model's own bounds.
     pub max_seconds: f64,
-    /// Resolution classes startup prepares (`768p`, `480p`), each at every
-    /// aspect ratio.
+    /// Output sizes startup prepares, each `WxH` in pixels (`1344x768`); the
+    /// model refuses a size it does not generate.
     #[serde(deserialize_with = "values::list::deserialize")]
-    pub resolutions: Vec<String>,
-    /// Aspect ratios startup prepares (`21:9`, `16:9`, `4:3`, `1:1`, `3:4`,
-    /// `9:16`).
-    #[serde(deserialize_with = "values::list::deserialize")]
-    pub aspect_ratios: Vec<String>,
+    pub sizes: Vec<String>,
     /// Prompt capacities below `max_model_len`, strictly increasing; 1024,
     /// then steps of 2048, when unset.
     #[serde(deserialize_with = "values::optional_list::deserialize")]
@@ -687,9 +675,8 @@ pub struct VideoConfig {
 impl Default for VideoConfig {
     fn default() -> Self {
         Self {
-            max_seconds: MAX_VIDEO_SECONDS,
-            resolutions: vec!["768p".to_owned()],
-            aspect_ratios: vec!["16:9".to_owned(), "9:16".to_owned()],
+            max_seconds: 15.0,
+            sizes: vec!["1344x768".to_owned(), "768x1344".to_owned()],
             text_capacities: None,
             max_condition_rows: None,
         }
@@ -889,6 +876,10 @@ impl Default for VideoJobConfig {
 pub struct ModelConfig {
     /// Local model directory or Hugging Face repository.
     pub model: String,
+    /// The local snapshot of the base release the checkpoint continues, whose directories it
+    /// omits; `None` for a checkpoint that holds every directory. The leader resolves it when it
+    /// reads the checkpoint, and an engine opens the checkpoint and its base as one.
+    pub base: Option<String>,
     /// Longest sequence a request may reach, in tokens: the configured `max_model_len`, else
     /// what the model's files allow. The options state only the configured one (zero when
     /// unset); the leader resolves it when it reads the checkpoint.

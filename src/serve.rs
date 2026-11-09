@@ -2,9 +2,9 @@
 //!
 //! On the leader (node rank 0) the daemon also serves the deployment's
 //! application: the HTTP and OpenAI API, input and output processing, facts
-//! and migration, until the application moves to `uniserve frontend`
-//! (`crates/frontend`). Every node's daemon supervises the node's processes
-//! and holds the node's Storage Server claim.
+//! and migration. Every node's daemon supervises the node's processes, holds
+//! the node's Storage Server claim and makes sure its host's Program Server
+//! serves.
 //!
 //! A daemon started as the successor of one this build replaces
 //! (`--predecessor FD`, which `POST /admin/restart` passes) first takes the
@@ -33,11 +33,12 @@ pub(crate) fn run(
     let runtime = crate::runtime()?;
     if let Some(descriptor) = args.predecessor {
         runtime.block_on(async move {
-            daemon::restart::take_over(descriptor, crate::shutdown_signal()).await
+            daemon::restart::take_over(descriptor, crate::processing()?, crate::shutdown_signal())
+                .await
         })?;
         return Ok(ExitCode::SUCCESS);
     }
-    let resolved = args.resolve(matches, daemon::options::Listen::Daemon)?;
+    let resolved = args.resolve(matches)?;
     runtime.block_on(serve(resolved))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -57,7 +58,8 @@ async fn serve(
         return daemon::node(
             config.admin_config,
             config.server_config,
-            config.program_server,
+            config.program_config,
+            crate::processing()?,
             crate::shutdown_signal(),
         )
         .await;
@@ -65,5 +67,5 @@ async fn serve(
     info!(model = %config.model(),
         resident_requests = config.max_running_requests,
         worker_executable = %config.worker_config.executable.display(), "resolved serving options");
-    daemon::serve(config, stated, crate::shutdown_signal()).await
+    daemon::serve(config, stated, crate::processing()?, crate::shutdown_signal()).await
 }

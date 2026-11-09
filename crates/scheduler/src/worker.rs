@@ -499,29 +499,32 @@ impl WorkerInfo {
     }
 }
 
-/// Checks that the deployment places a component for every call of every
-/// task its video denoiser serves.
+/// Checks that the deployment places a component for every call its video
+/// denoiser's requests make.
 ///
-/// A conditioned task reads its media on a host component and encodes its
-/// conditions before denoising, so a deployment serving one must place the
-/// media reader and both condition encoders as well as the generation calls.
+/// A conditioned request reads its media on a host component and encodes its
+/// conditions before denoising, so a deployment whose denoiser takes
+/// conditions must place the media reader and both condition encoders as
+/// well as the generation calls.
 fn check_video_tasks(info: &MainProcessInfo) -> anyhow::Result<()> {
     let Some(denoiser) = info.video_denoiser.as_ref() else {
         return Ok(());
     };
-    for task in &denoiser.tasks {
-        let missing = crate::graph::video_calls(task.conditioned)
-            .into_iter()
-            .filter(|call| !info.media_components.contains_key(call))
-            .map(|call| format!("{call:?}"))
-            .collect::<Vec<_>>();
-        anyhow::ensure!(
-            missing.is_empty(),
-            "the deployment serves {} but places no component for {}",
-            task.name,
-            missing.join(", ")
-        );
-    }
+    let missing = crate::graph::video_calls(denoiser.takes_conditions)
+        .into_iter()
+        .filter(|call| !info.media_components.contains_key(call))
+        .map(|call| format!("{call:?}"))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        missing.is_empty(),
+        "the deployment's denoiser {} but places no component for {}",
+        if denoiser.takes_conditions {
+            "takes conditions"
+        } else {
+            "generates"
+        },
+        missing.join(", ")
+    );
     Ok(())
 }
 
@@ -1079,10 +1082,7 @@ mod tests {
                 .map(|(call, _)| CallKind::Media(*call))
                 .collect(),
             video_denoiser: denoises.then(|| VideoDenoiserInfo {
-                tasks: vec![ipc::VideoTaskInfo {
-                    name: "t2va".to_owned(),
-                    conditioned: false,
-                }],
+                takes_conditions: false,
                 denoise_steps: 4,
                 description: b"{}".to_vec(),
             }),
@@ -1296,7 +1296,7 @@ mod tests {
     /// media reader and both condition encoders; one serving `t2va` alone
     /// needs only the generation calls.
     #[test]
-    fn a_conditioned_task_requires_its_condition_components() {
+    fn a_denoiser_that_takes_conditions_requires_its_condition_components() {
         let generation = [
             (MediaCall::TextEncoding, "text_encoder"),
             (MediaCall::LatentPreparation, "denoiser"),
@@ -1307,16 +1307,10 @@ mod tests {
             (MediaCall::AudioEncoding, "muxer"),
             (MediaCall::Muxing, "muxer"),
         ];
-        let serving = |tasks: &[&str], routes: &[(MediaCall, &str)]| {
+        let serving = |takes_conditions: bool, routes: &[(MediaCall, &str)]| {
             let mut info = media_info(routes);
             info.video_denoiser = Some(VideoDenoiserInfo {
-                tasks: tasks
-                    .iter()
-                    .map(|task| ipc::VideoTaskInfo {
-                        name: (*task).to_owned(),
-                        conditioned: *task != "t2va",
-                    })
-                    .collect(),
+                takes_conditions,
                 denoise_steps: 4,
                 description: b"{}".to_vec(),
             });
@@ -1326,13 +1320,13 @@ mod tests {
             }
         };
 
-        assert!(serving(&["t2va"], &generation).runtime_info().is_ok());
-        let message = serving(&["t2va", "fl2va"], &generation)
+        assert!(serving(false, &generation).runtime_info().is_ok());
+        let message = serving(true, &generation)
             .runtime_info()
-            .expect_err("fl2va reads and encodes conditions")
+            .expect_err("a conditioned request reads and encodes its conditions")
             .to_string();
         assert!(
-            message.contains("fl2va") && message.contains("MediaReading"),
+            message.contains("takes conditions") && message.contains("MediaReading"),
             "{message}"
         );
 
@@ -1342,7 +1336,7 @@ mod tests {
             (MediaCall::LatentEncoding, "latent_encoder"),
         ];
         let routes = [generation.as_slice(), conditioned.as_slice()].concat();
-        assert!(serving(&["t2va", "fl2va"], &routes).runtime_info().is_ok());
+        assert!(serving(true, &routes).runtime_info().is_ok());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //! deployment's engine is configured from before its workers report their own
 //! (`specs/worker.md` §4.2).
 
-use super::{ModelConfig, ModelParameters};
+use super::ModelConfig;
 
 impl ModelConfig {
     /// Model facts used at startup before the loaded workers' capacities and
@@ -11,14 +11,12 @@ impl ModelConfig {
         &self,
         _model_dtype: proto::request::ModelDtype,
     ) -> proto::request::GenerationLimits {
-        match &self.parameters {
-            ModelParameters::Qwen3 | ModelParameters::MiniMaxH3 => {
-                proto::request::GenerationLimits {
-                    latent_downsample: 1,
-                    max_cfg_branches: 1,
-                    ..Default::default()
-                }
-            }
+        // Both lower bounds are divisors and counts that admit nothing at zero;
+        // no family this daemon serves states a capacity before its workers do.
+        proto::request::GenerationLimits {
+            latent_downsample: 1,
+            max_cfg_branches: 1,
+            ..Default::default()
         }
     }
 }

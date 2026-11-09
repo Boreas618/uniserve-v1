@@ -103,7 +103,7 @@ pub use crate::sim::{
     BatchEvent, ContextLog, ContextWrite, Pace, SimEngine, SimSpeculation, SimWorker,
     sim_candidate_logprob, sim_canvas_stop_step, sim_text_token,
 };
-pub use ipc::{MediaCall, VideoDenoiserInfo, VideoTaskInfo};
+pub use ipc::{MediaCall, VideoDenoiserInfo};
 pub use proto::config::DEFAULT_BLOCK;
 /// Serializable scheduler, cache, and worker performance snapshots.
 pub use proto::report;

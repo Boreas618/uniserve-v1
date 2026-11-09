@@ -29,8 +29,8 @@ _OPTIONAL = (
     "steps",
     "seed",
     "aspect_ratio",
-    "seconds",
-    "conditions",
+    "num_frames",
+    "input_references",
     "metadata",
 )
 

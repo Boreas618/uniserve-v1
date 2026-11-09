@@ -1,17 +1,14 @@
 //! Cache keys for video encoder inputs resolved by request preprocessing.
 
-use models::video::{ConditionMedia, ConditionRole, ConditionVision, Conditioning, VideoCondition};
 use proto::request::EncoderInputs;
+use proto::video::{Condition, ConditionMedia, ConditionRole, ConditionVision, Conditions};
 use serde::Serialize;
 use storage::key::Digest;
 
 /// The digest of what the condition's encodings read: the media's
 /// content (`content`, the fetched media content key) and the
 /// condition's plan, but not where the media are published.
-fn condition_key(
-    condition: &VideoCondition,
-    content: &[u8; 32],
-) -> Result<[u8; 32], serde_json::Error> {
+fn condition_key(condition: &Condition, content: &[u8; 32]) -> Result<[u8; 32], serde_json::Error> {
     /// The plan of a condition without its media's object name.
     #[derive(Serialize)]
     struct Plan<'a> {
@@ -57,7 +54,7 @@ fn condition_key(
 ///
 /// The caller supplies one content key per condition, in condition order.
 pub(super) fn encoder_inputs(
-    conditioning: &Conditioning,
+    conditioning: &Conditions,
     prompt_token_ids: &[u32],
     contents: &[[u8; 32]],
 ) -> Result<EncoderInputs, serde_json::Error> {

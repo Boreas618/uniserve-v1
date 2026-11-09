@@ -18,9 +18,9 @@
 //! server holds, for the tasks heads and workers submit; that process, not
 //! the server, holds the CUDA contexts the copies need.
 //!
-//! [`serve`] runs a server, the `uniserve storage serve` command, and
-//! [`list`] and [`retire`] are the operator's commands against a running
-//! one.
+//! [`command`] is the `uniserve storage-server` command: [`serve`] runs a
+//! server, and [`list`] and [`retire`] are the operator's commands against a
+//! running one.
 //!
 //! One thread serves every client with `poll(2)`. Requests are answered in
 //! order on their connection. A request that must wait for a previous
@@ -29,6 +29,7 @@
 //! served on.
 
 mod child;
+pub mod command;
 mod kv_storage;
 mod ledger;
 pub mod mooncake;

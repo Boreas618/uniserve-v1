@@ -11,9 +11,9 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Any, Literal, TypeGuard
 
-# Endpoint paths. `send_request` in `uniserve_eval.transport.client` selects
-# the video and image-generation transports by path; any other endpoint uses a
-# chat transport.
+# Endpoint paths. `send_request` in `uniserve_eval.transport.client` sends a
+# request carrying video settings to one of the video endpoints, selects the
+# image-generation transport by path, and uses a chat transport otherwise.
 CHAT_COMPLETIONS = "/v1/chat/completions"
 IMAGES_GENERATIONS = "/v1/images/generations"
 VIDEOS_SYNC = "/v1/videos/sync"
@@ -194,12 +194,8 @@ VIDEO_WORK_FIELDS = {
 }
 
 
-# Video tasks the video benchmark builds requests for. A t2va request carries
-# no conditions; fl2va and ref2va rows carry their condition media.
-VIDEO_TASKS = frozenset({"t2va", "fl2va", "ref2va"})
-
-# The schedule fields of the canonical request body: sigma points including
-# the clean endpoint, then the video and audio schedule shifts.
+# The schedule fields a point may state: sigma points including the clean
+# endpoint, then the video and audio schedule shifts.
 VIDEO_SCHEDULE_FIELDS = (
     "num_inference_steps",
     "flow_shift",
@@ -219,15 +215,53 @@ _SCHEDULE_FIELDS = {
 }
 
 
+# The requested-target fields each backend's native form takes; see
+# ``VideoConfig``.
+_BASELINE_TARGET = {
+    "uniserve": frozenset(),
+    "sglang": frozenset({"aspect_ratio", "duration_seconds"}),
+    "vllm-omni": frozenset({"aspect_ratio", "duration_seconds"}),
+    "fastvideo": frozenset({"duration_seconds"}),
+}
+
+
+def parse_size(size: str) -> tuple[int, int]:
+    """Return the ``(width, height)`` in pixels of a ``"WxH"`` size.
+
+    Raises:
+        ValueError: The size is not two positive decimal integers joined by
+            ``x``.
+    """
+    width, separator, height = str(size).partition("x")
+    if (
+        separator != "x"
+        or not width.isdecimal()
+        or not height.isdecimal()
+        or int(width) < 1
+        or int(height) < 1
+    ):
+        raise ValueError(f"video size must be WxH in pixels, got {size!r}")
+    return int(width), int(height)
+
+
 @dataclass(frozen=True)
 class VideoConfig:
     """Configures the generated video work and how a backend is asked for it.
 
-    ``task`` and ``aspect_ratio`` form each request's target together with the
-    768-pixel short edge; ``seconds`` is the target duration of rows without
-    a per-row override. ``aspect_ratio`` is ``auto`` or a named ``W:H`` ratio
-    the task accepts; the video task resolves it to the generated canvas with
-    the model package's canvas rule when the profile loads.
+    A point states the output shape it measures: ``size`` (``"WxH"`` pixels,
+    one of the deployment's served sizes), ``fps``, and the soundtrack's
+    ``audio_sample_rate`` and ``audio_channels``. ``num_frames`` is the exact
+    frame count of rows that do not state their own; it must already be a
+    count the model generates, because the request asks for it verbatim. The
+    video task sends this shape and holds every output to it.
+
+    ``aspect_ratio`` (``auto`` or ``W:H``) and ``duration_seconds`` are the
+    requested target that the baselines' native MiniMax-H3 forms name beside
+    or instead of the size and frame count, stated as the ratio and duration
+    that resolve to the point's stated shape. SGLang's target and vLLM-Omni's
+    form take both, and FastVideo takes an integral duration beside the frame
+    count; each states exactly the fields its backend takes
+    (``_BASELINE_TARGET``), and a UniServe point states neither.
 
     ``num_inference_steps``, ``flow_shift`` and ``audio_flow_shift`` state the
     sampling schedule the point measures: sigma points including the clean
@@ -237,9 +271,9 @@ class VideoConfig:
     three, and FastVideo, whose shifts come from its checkpoint, needs the
     point count and refuses the shifts.
 
-    ``condition_root`` is the directory that the condition media paths of
-    fl2va and ref2va rows are relative to; a t2va point has none. Every
-    backend receives the same files from it, each in its own request form.
+    ``reference_root`` is the directory that the media paths of rows'
+    ``input_references`` are relative to. Every backend receives the same
+    files from it, each in its own request form.
 
     ``parallel_decoding`` marks a FastVideo point that measures a parallel
     decoding (PDD) student, such as FastH3 OmniRef. FastVideo counts such a
@@ -255,9 +289,13 @@ class VideoConfig:
     work, and other backends refuse them rather than ignoring them.
     """
 
-    seconds: float = 5.0
-    task: str = "t2va"
-    aspect_ratio: str = "16:9"
+    size: str | None = None
+    num_frames: int | None = None
+    fps: int | None = None
+    audio_sample_rate: int | None = None
+    audio_channels: int | None = None
+    aspect_ratio: str | None = None
+    duration_seconds: float | None = None
     num_inference_steps: int | None = None
     flow_shift: float | None = None
     audio_flow_shift: float | None = None
@@ -265,25 +303,19 @@ class VideoConfig:
     backend: str = "uniserve"
     poll_interval_s: float = 0.1
     media_dir: str | None = None
-    condition_root: str | None = None
+    reference_root: str | None = None
     parallel_decoding: bool = False
     extra_params: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        """Validate the work, the schedule a backend needs, and its options."""
-        if not math.isfinite(self.seconds) or self.seconds <= 0.0:
-            raise ValueError("video seconds must be finite and positive")
-        if self.task not in VIDEO_TASKS:
-            raise ValueError(f"video task must be one of {sorted(VIDEO_TASKS)}")
-        # Conditioned tasks read their rows' media from the root; t2va rows
-        # carry none, so a root there would be configuration without effect.
-        if (self.task == "t2va") != (self.condition_root is None):
-            raise ValueError(
-                "video condition_root names the condition media of fl2va "
-                "and ref2va rows and is required exactly for those tasks"
-            )
-        if not isinstance(self.aspect_ratio, str):
-            raise ValueError("video aspect_ratio must be a string")
+        """Validate the shape, the schedule a backend needs, and its options."""
+        if self.size is not None:
+            parse_size(self.size)
+        counts = ("num_frames", "fps", "audio_sample_rate", "audio_channels")
+        for name in counts:
+            value = getattr(self, name)
+            if value is not None and not _is_positive_int(value):
+                raise ValueError(f"video {name} must be a positive integer")
         if self.prompt_tokens < 1:
             raise ValueError("video prompt_tokens must be positive")
         if self.backend not in {"uniserve", "vllm-omni", "sglang", "fastvideo"}:
@@ -296,6 +328,7 @@ class VideoConfig:
                 "video parallel_decoding applies only to fastvideo"
             )
         self._check_schedule()
+        self._check_baseline_target()
         if self.extra_params and self.backend not in VIDEO_WORK_FIELDS:
             raise ValueError(
                 "video extra_params apply only to "
@@ -307,14 +340,44 @@ class VideoConfig:
         if fixed:
             raise ValueError(f"video extra_params may not set {sorted(fixed)}")
 
+    def _check_baseline_target(self) -> None:
+        """Require exactly the requested-target fields the backend takes."""
+        required = _BASELINE_TARGET[self.backend]
+        stated = {
+            name
+            for name in ("aspect_ratio", "duration_seconds")
+            if getattr(self, name) is not None
+        }
+        if missing := sorted(required - stated):
+            raise ValueError(
+                f"video backend {self.backend} names a requested target and "
+                f"requires {missing}"
+            )
+        if unsent := sorted(stated - required):
+            raise ValueError(
+                f"video backend {self.backend} cannot receive {unsent}"
+            )
+        if self.aspect_ratio is not None and not isinstance(
+            self.aspect_ratio, str
+        ):
+            raise ValueError("video aspect_ratio must be a string")
+        seconds = self.duration_seconds
+        if seconds is not None and (
+            isinstance(seconds, bool)
+            or not isinstance(seconds, int | float)
+            or not math.isfinite(seconds)
+            or seconds <= 0
+        ):
+            raise ValueError(
+                "video duration_seconds must be finite and positive"
+            )
+
     def _check_schedule(self) -> None:
         """Validate the stated schedule and the fields the backend takes."""
         steps = self.num_inference_steps
         # One interval between the noise and the clean endpoint is the
         # shortest schedule.
-        if steps is not None and (
-            isinstance(steps, bool) or not isinstance(steps, int) or steps < 2
-        ):
+        if steps is not None and (not _is_positive_int(steps) or steps < 2):
             raise ValueError(
                 "video num_inference_steps counts sigma points including the "
                 "clean endpoint and must be an integer of at least 2"
@@ -345,6 +408,19 @@ class VideoConfig:
                 f"video backend {self.backend} cannot receive {unsent}"
             )
 
+    def schedule(self) -> dict[str, Any]:
+        """Return the stated schedule fields, in sigma points."""
+        return {
+            name: getattr(self, name)
+            for name in VIDEO_SCHEDULE_FIELDS
+            if getattr(self, name) is not None
+        }
+
+
+def _is_positive_int(value: Any) -> bool:
+    """Recognize positive integers while excluding booleans."""
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
 
 @dataclass(frozen=True)
 class Example:
@@ -356,10 +432,13 @@ class Example:
     server-reported usage when a chat response carries none; the text task
     also uses ``output_len`` as its output limit.
 
-    ``conditions`` lists a video row's condition media in request order, each
-    an object with the request's ``type``, ``role`` and, where they apply,
-    ``frame_index`` and ``start_time_seconds``, plus ``media``: the file's
-    path relative to the point's ``video.condition_root``.
+    ``num_frames`` is a video row's exact output frame count, which takes
+    precedence over the point's ``video.num_frames``. ``input_references``
+    lists a video row's reference media in request order, each an object with
+    the request's ``type`` and, where they apply, ``frame_index`` (an anchor
+    keyframe; ``-1`` is the last frame) and ``start_time_seconds``, plus
+    ``media``: the file's path relative to the point's
+    ``video.reference_root``.
     """
 
     id: str
@@ -375,8 +454,8 @@ class Example:
     steps: int | None = None
     seed: int | None = None
     aspect_ratio: str | None = None
-    seconds: float | None = None
-    conditions: list[dict[str, Any]] | None = None
+    num_frames: int | None = None
+    input_references: list[dict[str, Any]] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
     state: Any = None
     questions: dict[str, Any] | None = None
@@ -396,16 +475,27 @@ class Example:
 
 @dataclass(frozen=True)
 class VideoShape:
-    """The canvas and frame count a video request's target resolves to."""
+    """A video's raster in pixels, its frame count and its frame rate."""
 
     width: int
     height: int
     frames: int
+    fps: int
+
+    @property
+    def size(self) -> str:
+        """Return the raster as the API spells it, ``"WxH"``."""
+        return f"{self.width}x{self.height}"
+
+    @property
+    def duration_s(self) -> float:
+        """Return the duration the frames span at the frame rate."""
+        return self.frames / self.fps
 
 
 @dataclass(frozen=True)
-class ConditionMedia:
-    """A condition's media file, read before the request is measured.
+class ReferenceMedia:
+    """A reference's media file, read before the request is measured.
 
     Attributes:
         path: Absolute local path of the file.
@@ -423,25 +513,23 @@ class ConditionMedia:
 class TaskRequest:
     """Contains an endpoint payload and its streaming mode.
 
-    A video request's ``payload`` is the canonical MiniMax-H3 body (``task``,
-    ``conditions``, ``target``, ``seed`` and any stated schedule), which the
-    native video transport sends to UniServe and SGLang as is and translates
-    for the other backends; those take explicit dimensions or a frame count
-    from ``video_shape``. Its conditions name their media by ``file://`` URI;
-    ``condition_media`` holds the same files in the same order for backends
-    that take uploads or plain paths instead. ``video_parallel_decoding`` is
-    the point's ``VideoConfig.parallel_decoding``.
+    A video request's ``payload`` is UniServe's ``/v1/videos`` body (``model``,
+    ``prompt``, ``size``, ``num_frames``, ``fps``, ``seed`` and any
+    ``input_references``), which the native video transport sends to UniServe
+    as is and translates into each baseline's own form. ``video`` is the
+    point's video configuration, which names the backend and the fields a
+    baseline needs beyond the body, and ``video_shape`` is the stated shape
+    the output is held to. The body's references name their media by
+    ``file://`` URL; ``reference_media`` holds the same files in the same
+    order for backends that take uploads or plain paths instead.
     """
 
     endpoint: str
     payload: dict[str, Any]
     stream: bool
-    video_backend: str | None = None
-    poll_interval_s: float = 0.1
-    video_extra_params: dict[str, Any] = field(default_factory=dict)
+    video: VideoConfig | None = None
     video_shape: VideoShape | None = None
-    condition_media: tuple[ConditionMedia, ...] = ()
-    video_parallel_decoding: bool = False
+    reference_media: tuple[ReferenceMedia, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -603,10 +691,12 @@ class RequestRecord:
     decoded_video: DecodedVideo | None = field(default=None, repr=False)
     video_body: bytes | None = field(default=None, repr=False)
     video_mime: str = ""
-    requested_seconds: float | None = None
-    # The canvas and frame count the request's target resolves to, which
-    # the output is validated against.
+    # The shape the request states, which the output is validated against,
+    # and the shape the server reported generating (a job record's size,
+    # num_frames and fps, or a synchronous response's x-video-* headers);
+    # a server that reports none leaves it unset.
     video_shape: VideoShape | None = None
+    served_shape: VideoShape | None = None
     # Timings a video server reported for this request, as it defines them:
     # its inference time, its named stage durations, and its peak device
     # storage in MiB. Servers that report none leave them unset.
@@ -876,10 +966,14 @@ class RequestRecord:
                 if self.decoded_video is not None
                 else None
             ),
-            "requested_seconds": self.requested_seconds,
             "video_shape": (
                 asdict(self.video_shape)
                 if self.video_shape is not None
+                else None
+            ),
+            "served_shape": (
+                asdict(self.served_shape)
+                if self.served_shape is not None
                 else None
             ),
             "server_inference_s": self.server_inference_s,

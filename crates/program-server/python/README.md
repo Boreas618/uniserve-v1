@@ -10,9 +10,9 @@ It is **not** the repository's `.venv`. The serving environment holds the full P
 uv sync --project crates/program-server/python --python /usr/bin/python3.12
 ```
 
-This writes `python/.venv` (git-ignored) from `pyproject.toml` and `uv.lock`. The Program Server's `--python` option names the interpreter and defaults to `python/.venv/bin/python` under the repository root; `Toolchains::discover` resolves that relative path from the workspace root, so both `uniserve program-server serve` started at the root and one started inside `crates/program-server` find it.
+This writes `python/.venv` (git-ignored) from `pyproject.toml` and `uv.lock`. The Program Server's `--python` option (`program_config.python` for a server the daemon starts) names the interpreter, `crates/program-server/python/.venv/bin/python`; a relative path is made absolute against the directory the command was started in.
 
-A host without the environment is not an error of the Program Server: the Triton and CuTe DSL toolchains are recorded as missing with that reason, and only a build that needs them fails.
+A server without the interpreter is not an error: the Triton and CuTe DSL toolchains are recorded as missing with that reason, and only a build that needs them fails.
 
 ## What it locks
 

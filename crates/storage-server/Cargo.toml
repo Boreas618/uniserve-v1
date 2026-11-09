@@ -12,20 +12,19 @@ publish = false
 # between hosts (`nixl`), at run time.
 [dependencies]
 anyhow.workspace = true
+clap.workspace = true
 platform.workspace = true
 libc.workspace = true
 mooncake_store.workspace = true
 nixl.workspace = true
 rustix = { workspace = true, features = ["event", "fs", "mm", "net", "pipe", "process", "time"] }
 serde.workspace = true
-signal-hook-registry.workspace = true
+service.workspace = true
 storage.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [dev-dependencies]
-clap.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 

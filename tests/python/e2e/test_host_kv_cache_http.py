@@ -181,7 +181,7 @@ def test_a_restarted_engine_loads_a_prompts_pages_from_the_host_kv_cache(
         ):
             _, host, host_hits = _ask(base_url)
     finally:
-        _stop_storage_server(runtime / "uniserve" / "storage.sock")
+        _stop_storage_server(runtime / "uniserve" / "storage-server.sock")
         shutil.rmtree(runtime, ignore_errors=True)
 
     # Reusable pages leave one prompt token to compute.
@@ -218,7 +218,7 @@ def test_a_closing_engine_offloads_its_last_pages_to_the_host_kv_cache(
         ):
             _, host, host_hits = _ask(base_url, prompt, 1)
     finally:
-        _stop_storage_server(runtime / "uniserve" / "storage.sock")
+        _stop_storage_server(runtime / "uniserve" / "storage-server.sock")
         shutil.rmtree(runtime, ignore_errors=True)
 
     reusable = (prompt_tokens - 1) // BLOCK_SIZE * BLOCK_SIZE

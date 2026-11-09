@@ -284,12 +284,6 @@ mod tests {
     fn request(conditions: Vec<ConditionExtent>) -> DiffusionRequest {
         DiffusionRequest {
             request_id: RequestId(1),
-            task: if conditions.is_empty() {
-                "t2va"
-            } else {
-                "ref2va"
-            }
-            .to_owned(),
             prompt_token_ids: vec![1; 40],
             conditioning: b"{}".to_vec(),
             priority: 0,

@@ -30,10 +30,20 @@ use serde::Deserialize;
 use tokio::process::Command;
 use tokio::sync::Semaphore;
 
-use models::video::plan::{
-    AudioMetadata, ConditionType, FrameRate, ImageMetadata, MediaMetadata, VideoInputError,
+use processing::{
+    AudioMetadata, FrameRate, ImageMetadata, InputError, MediaMetadata, ReferenceKind,
     VideoMetadata,
 };
+
+/// Refuses `input_references[index]` with `message`.
+fn refuse(index: usize, message: impl Into<String>) -> InputError {
+    InputError::invalid(format!("input_references[{index}]"), message)
+}
+
+/// A failure of the prober's own resources.
+fn internal(message: impl Into<String>) -> InputError {
+    InputError::Internal(message.into())
+}
 
 /// The largest image accepted, in pixels: Pillow, which decodes condition
 /// images for the conditioner and the VAE, refuses larger ones as
@@ -314,39 +324,37 @@ impl MediaProber {
         Self { config, permits }
     }
 
-    /// Probes the media of `conditions[index]`, of type `condition_type`.
+    /// Probes the media of `input_references[index]`, of kind `kind`.
     ///
     /// # Errors
     ///
-    /// Returns [`VideoInputError::Invalid`] naming `conditions[index]` for
+    /// Returns [`InputError::Invalid`] naming `input_references[index]` for
     /// media of the wrong type or outside the accepted formats, and
-    /// [`VideoInputError::Internal`] when `ffprobe` cannot run or the scratch
+    /// [`InputError::Internal`] when `ffprobe` cannot run or the scratch
     /// copy cannot be written.
     pub async fn probe(
         &self,
         index: usize,
-        condition_type: ConditionType,
+        kind: ReferenceKind,
         bytes: &Bytes,
-    ) -> Result<MediaMetadata, VideoInputError> {
-        let reject = |message: String| VideoInputError::condition(index, message);
+    ) -> Result<MediaMetadata, InputError> {
+        let reject = |message: String| refuse(index, message);
         let _permit = self
             .permits
             .acquire()
             .await
-            .map_err(|_| VideoInputError::internal("the media prober is shut down"))?;
-        if condition_type == ConditionType::Image {
+            .map_err(|_| internal("the media prober is shut down"))?;
+        if kind == ReferenceKind::Image {
             let bytes = bytes.clone();
             let probed = tokio::task::spawn_blocking(move || probe_image(&bytes))
                 .await
-                .map_err(|error| {
-                    VideoInputError::internal(format!("image probe failed: {error}"))
-                })?;
+                .map_err(|error| internal(format!("image probe failed: {error}")))?;
             return probed.map(MediaMetadata::Image).map_err(reject);
         }
 
         let scratch = self.scratch_copy(bytes).await?;
         let path = scratch.to_path_buf();
-        if condition_type == ConditionType::Audio {
+        if kind == ReferenceKind::Audio {
             let output = self.metadata(index, &path, AUDIO_FORMATS).await?;
             let stream = audio_stream(&output, true).map_err(reject)?;
             let samples = self
@@ -387,7 +395,7 @@ impl MediaProber {
     }
 
     /// Writes `bytes` to a scratch file that is removed when dropped.
-    async fn scratch_copy(&self, bytes: &Bytes) -> Result<tempfile::TempPath, VideoInputError> {
+    async fn scratch_copy(&self, bytes: &Bytes) -> Result<tempfile::TempPath, InputError> {
         let bytes = bytes.clone();
         let directory = self.config.scratch_directory.clone();
         tokio::task::spawn_blocking(move || -> std::io::Result<tempfile::TempPath> {
@@ -398,9 +406,9 @@ impl MediaProber {
             Ok(file.into_temp_path())
         })
         .await
-        .map_err(|error| VideoInputError::internal(format!("scratch copy failed: {error}")))?
+        .map_err(|error| internal(format!("scratch copy failed: {error}")))?
         .map_err(|error| {
-            VideoInputError::internal(format!(
+            internal(format!(
                 "cannot write a scratch copy in {}: {error}",
                 self.config.scratch_directory.display()
             ))
@@ -415,7 +423,7 @@ impl MediaProber {
         path: &Path,
         formats: &str,
         arguments: &[&str],
-    ) -> Result<Vec<u8>, VideoInputError> {
+    ) -> Result<Vec<u8>, InputError> {
         let mut command = Command::new(&self.config.ffprobe);
         command
             .args(["-v", "error", "-hide_banner"])
@@ -428,7 +436,7 @@ impl MediaProber {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let child = command.spawn().map_err(|error| {
-            VideoInputError::internal(format!(
+            internal(format!(
                 "cannot run ffprobe at {}: {error}",
                 self.config.ffprobe.display()
             ))
@@ -436,7 +444,7 @@ impl MediaProber {
         let output = tokio::time::timeout(self.config.timeout, child.wait_with_output())
             .await
             .map_err(|_| {
-                VideoInputError::condition(
+                refuse(
                     index,
                     format!(
                         "probing the media took longer than {} s",
@@ -444,14 +452,11 @@ impl MediaProber {
                     ),
                 )
             })?
-            .map_err(|error| VideoInputError::internal(format!("ffprobe failed: {error}")))?;
+            .map_err(|error| internal(format!("ffprobe failed: {error}")))?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let reason = stderr.lines().last().unwrap_or("unreadable media").trim();
-            return Err(VideoInputError::condition(
-                index,
-                format!("the media cannot be read: {reason}"),
-            ));
+            return Err(refuse(index, format!("the media cannot be read: {reason}")));
         }
         Ok(output.stdout)
     }
@@ -462,7 +467,7 @@ impl MediaProber {
         index: usize,
         path: &Path,
         formats: &str,
-    ) -> Result<ProbeOutput, VideoInputError> {
+    ) -> Result<ProbeOutput, InputError> {
         let stdout = self
             .ffprobe(
                 index,
@@ -471,9 +476,8 @@ impl MediaProber {
                 &["-print_format", "json", "-show_format", "-show_streams"],
             )
             .await?;
-        serde_json::from_slice(&stdout).map_err(|error| {
-            VideoInputError::internal(format!("unexpected ffprobe output: {error}"))
-        })
+        serde_json::from_slice(&stdout)
+            .map_err(|error| internal(format!("unexpected ffprobe output: {error}")))
     }
 
     /// Frames a decoder outputs: packets of the stream not marked discard.
@@ -482,7 +486,7 @@ impl MediaProber {
         index: usize,
         path: &Path,
         stream: u32,
-    ) -> Result<u64, VideoInputError> {
+    ) -> Result<u64, InputError> {
         let stream = stream.to_string();
         let stdout = self
             .ffprobe(
@@ -509,7 +513,7 @@ impl MediaProber {
         path: &Path,
         formats: &str,
         stream: u32,
-    ) -> Result<u64, VideoInputError> {
+    ) -> Result<u64, InputError> {
         let stream = stream.to_string();
         let stdout = self
             .ffprobe(
@@ -526,9 +530,8 @@ impl MediaProber {
                 ],
             )
             .await?;
-        sum_frame_samples(&String::from_utf8_lossy(&stdout)).map_err(|error| {
-            VideoInputError::internal(format!("unexpected ffprobe output: {error}"))
-        })
+        sum_frame_samples(&String::from_utf8_lossy(&stdout))
+            .map_err(|error| internal(format!("unexpected ffprobe output: {error}")))
     }
 }
 
@@ -805,12 +808,10 @@ mod tests {
     use image::{ImageEncoder as _, RgbImage};
     use serde_json::json;
 
-    use models::video::plan::RequestField;
-
     use super::{
-        AudioMetadata, ConditionType, FrameRate, ImageMetadata, MediaMetadata, MediaProber,
-        ProbeConfig, ProbeOutput, VideoMetadata, audio_stream, count_decoded_packets,
-        exif_orientation, probe_image, sum_frame_samples, video_streams,
+        AudioMetadata, FrameRate, ImageMetadata, InputError, MediaMetadata, MediaProber,
+        ProbeConfig, ProbeOutput, ReferenceKind, VideoMetadata, audio_stream,
+        count_decoded_packets, exif_orientation, probe_image, sum_frame_samples, video_streams,
     };
 
     /// A TIFF-structured EXIF block holding one orientation entry of the
@@ -1278,10 +1279,10 @@ mod tests {
             frames: 75,
             soundtrack: Some(soundtrack),
         });
-        let probed = prober.probe(0, ConditionType::Video, &plain).await.unwrap();
+        let probed = prober.probe(0, ReferenceKind::Video, &plain).await.unwrap();
         assert_eq!(probed, expected);
         let MediaMetadata::Video(probed) = prober
-            .probe(0, ConditionType::Video, &rotated)
+            .probe(0, ReferenceKind::Video, &rotated)
             .await
             .unwrap()
         else {
@@ -1293,7 +1294,7 @@ mod tests {
         // An edit list that starts mid-GOP discards the leading frames; the
         // decoder's own count is the oracle.
         let MediaMetadata::Video(probed) = prober
-            .probe(0, ConditionType::Video, &trimmed)
+            .probe(0, ReferenceKind::Video, &trimmed)
             .await
             .unwrap()
         else {
@@ -1314,7 +1315,7 @@ mod tests {
         assert!(probed.soundtrack.is_none());
 
         let MediaMetadata::Video(probed) =
-            prober.probe(0, ConditionType::Video, &hevc).await.unwrap()
+            prober.probe(0, ReferenceKind::Video, &hevc).await.unwrap()
         else {
             panic!("not a video");
         };
@@ -1329,7 +1330,7 @@ mod tests {
             samples: 145_530,
         });
         assert_eq!(
-            prober.probe(1, ConditionType::Audio, &mp3).await.unwrap(),
+            prober.probe(1, ReferenceKind::Audio, &mp3).await.unwrap(),
             expected
         );
         let expected = MediaMetadata::Audio(AudioMetadata {
@@ -1337,21 +1338,27 @@ mod tests {
             samples: 158_400,
         });
         assert_eq!(
-            prober.probe(1, ConditionType::Audio, &wav).await.unwrap(),
+            prober.probe(1, ReferenceKind::Audio, &wav).await.unwrap(),
             expected
         );
 
         // Media of the wrong kind names its condition.
         let error = prober
-            .probe(3, ConditionType::Audio, &plain)
+            .probe(3, ReferenceKind::Audio, &plain)
             .await
             .unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::Condition(3)));
+        assert!(
+            matches!(&error, InputError::Invalid { param, .. } if param == "input_references[3]"),
+            "{error}"
+        );
         let error = prober
-            .probe(4, ConditionType::Video, &mp3)
+            .probe(4, ReferenceKind::Video, &mp3)
             .await
             .unwrap_err();
-        assert_eq!(error.field(), Some(RequestField::Condition(4)));
+        assert!(
+            matches!(&error, InputError::Invalid { param, .. } if param == "input_references[4]"),
+            "{error}"
+        );
     }
 
     /// A missing `ffprobe` is the server's failure, not the request's.
@@ -1365,9 +1372,9 @@ mod tests {
             max_concurrent_probes: 1,
         });
         let error = prober
-            .probe(0, ConditionType::Audio, &Bytes::from_static(b"RIFF"))
+            .probe(0, ReferenceKind::Audio, &Bytes::from_static(b"RIFF"))
             .await
             .unwrap_err();
-        assert_eq!(error.field(), None);
+        assert!(matches!(error, InputError::Internal(_)), "{error}");
     }
 }
