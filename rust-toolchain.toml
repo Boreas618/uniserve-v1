@@ -1,3 +1,5 @@
 [toolchain]
 channel = "stable"
 components = ["rustfmt", "clippy"]
+# The scheduling policies are wasm32 modules; the scheduler's tests build one from this tree.
+targets = ["wasm32-unknown-unknown"]

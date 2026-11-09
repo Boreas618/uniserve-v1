@@ -34,7 +34,7 @@ jobs:
           FFMPEG_SOURCE="$RUNNER_TEMP/ffmpeg-8.1.2" crates/media/native/build.sh "$UNISERVE_FFMPEG_DIR"
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo test --workspace --no-fail-fast
       - run: cargo bench --workspace --no-run
 
   python:
