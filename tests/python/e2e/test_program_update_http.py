@@ -60,20 +60,21 @@ from tests.python.e2e.http_helpers import (
     find_free_port,
     require_uniserve_binary,
     server_process,
-    wait_health,
     worker_executable,
 )
 from tests.python.e2e.program_server import (
     program_server as running_program_server,
 )
 
-#: Options every deployment this file serves with. They are the live-update file's, deliberately:
-#: the two files serve the same model on the same host, and a deployment that stated a different
-#: attention backend, graph catalogue or token budget would be a second deployment whose numbers
-#: nobody could compare with the first's.
+#: Options every deployment this file serves with. They are the live-update
+#: file's, deliberately: the two files serve the same model on the same host,
+#: and a deployment that stated a different attention backend, graph catalogue
+#: or token budget would be a second deployment whose numbers nobody could
+#: compare with the first's.
 #:
-#: `attention_backend` in particular is not optional: a program is selected by its backend's name,
-#: so a deployment left at `auto` states no package and its epoch cannot be prepared at all.
+#: `attention_backend` in particular is not optional: a program is selected by
+#: its backend's name, so a deployment left at `auto` states no package and its
+#: epoch cannot be prepared at all.
 DEPLOYMENT_OPTIONS = (
     "dtype=bfloat16",
     "attention_backend=trtllm",
@@ -84,8 +85,9 @@ DEPLOYMENT_OPTIONS = (
     "max_num_batched_tokens=512",
 )
 
-#: Host KV cache this deployment holds, in GiB. The live-update file serves the same model
-#: with the same figure, so the two files' deployments size their host memory alike.
+#: Host KV cache this deployment holds, in GiB. The live-update file serves the
+#: same model with the same figure, so the two files' deployments size their
+#: host memory alike.
 HOST_GIB = 8
 
 pytestmark = [pytest.mark.e2e, pytest.mark.gpu, pytest.mark.model("qwen3")]

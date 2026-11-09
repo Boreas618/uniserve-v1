@@ -31,6 +31,8 @@ source .venv/bin/activate
 
 The sync builds the `uniserve` executable, and the `gpu` extra installs the NCCL and CUPTI libraries serving loads. The Program Server keeps an environment of its own, which `uv sync --locked --python /usr/bin/python3.12 --project crates/program-server/python` creates; it compiles the kernel programs with that environment and the host's CUDA toolkit. The [FastH3 guide](docs/minimax_h3/minimax_h3.md#install) lists the system packages and a container build.
 
+The build links the shared FFmpeg 8.1.2 with libx264 that `UNISERVE_FFMPEG_DIR` names; `FFMPEG_SOURCE=<FFmpeg 8.1.2 source> crates/media/native/build.sh <prefix>` builds one. A binary that ships is built with `PCRE2_SYS_STATIC=1`, so the tokenizer's PCRE2 is linked into it rather than loaded from the host, as the container build and CI do.
+
 For RDMA transfers between hosts, install the pinned UCX and NIXL builds described in [NIXL transfers](docs/nixl.md).
 
 ## Quickstart
