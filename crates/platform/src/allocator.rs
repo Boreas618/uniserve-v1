@@ -434,6 +434,14 @@ impl Allocator {
             .protect(buffer.address(), protection)
     }
 
+    /// The virtual addresses `pool` reserves: the bytes asked for, rounded up
+    /// to the allocation granularity; zero for a pool that is not reserved.
+    pub fn reserved_bytes(&self, pool: PoolKind) -> usize {
+        self.pools[pool.index()]
+            .as_ref()
+            .map_or(0, VirtualPool::reserved_bytes)
+    }
+
     /// The physical storage `pool` maps now, or would map once restored:
     /// exactly what has been booked for it.
     pub fn mapped_bytes(&self, pool: PoolKind) -> usize {

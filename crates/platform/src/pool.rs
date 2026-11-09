@@ -165,6 +165,12 @@ impl VirtualPool {
         self.suspended
     }
 
+    /// The bytes of virtual addresses the pool reserves: what it was asked for,
+    /// rounded up to the device's allocation granularity.
+    pub fn reserved_bytes(&self) -> usize {
+        self.reserved
+    }
+
     /// The bytes of physical storage the pool maps now: every block whose
     /// storage is mapped, and so exactly what its budget has booked for it.
     pub fn mapped_bytes(&self) -> usize {
