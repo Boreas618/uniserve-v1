@@ -4993,7 +4993,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         }
         if first {
             self.pool()?
-                .record(self.stream_id(), bucket, arena.used())?;
+                .record(self.stream_id(), bucket, arena.peak())?;
         }
         Ok(())
     }
@@ -5074,7 +5074,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         self.model.join_expert_step(&forward).map_err(Error::from)?;
         if first {
             self.pool()?
-                .record(self.stream_id(), bucket, arena.used())?;
+                .record(self.stream_id(), bucket, arena.peak())?;
         }
         Ok(())
     }

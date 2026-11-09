@@ -38,11 +38,21 @@ use crate::tensor::{DType, DevicePtr, Shape, TensorView};
 pub const ALIGNMENT: u64 = 256;
 
 /// The activation region of one forward.
+///
+/// Besides the cursor, the arena keeps the furthest byte any reservation reached since it was made
+/// ([`Arena::peak`]). A forward hands per-layer scratch back with [`Arena::release`], so the cursor
+/// at the end of a forward understates what the forward addressed; the peak is the extent a
+/// captured graph needs mapped.
 pub struct Arena {
     base: DevicePtr,
     bytes: u64,
     cursor: Cell<u64>,
+    peak: Cell<u64>,
 }
+
+/// The first address a counting arena hands out: aligned, and far from zero so that no synthetic
+/// view reads as a null pointer to an argument check.
+const COUNTING_BASE: u64 = 1 << 40;
 
 impl Arena {
     /// The arena of `bytes` bytes starting at `base`, aligned up to [`ALIGNMENT`].
@@ -65,7 +75,19 @@ impl Arena {
             base: DevicePtr::new(aligned),
             bytes: bytes.saturating_sub(skew),
             cursor: Cell::new(0),
+            peak: Cell::new(0),
         }
+    }
+
+    /// An unbounded arena at synthetic addresses, for a recording forward.
+    ///
+    /// Every reservation succeeds at an [`ALIGNMENT`]-aligned address that no device memory backs,
+    /// so a forward walked over it reports, through [`Arena::peak`], the extent the same forward
+    /// reserves on a real arena: reservations depend on shapes and element types alone, never on
+    /// the base address. Nothing may read or write a view of this arena; a recording forward
+    /// launches nothing.
+    pub fn counting() -> Self {
+        Self::new(DevicePtr::new(COUNTING_BASE), u64::MAX - COUNTING_BASE)
     }
 
     /// The region's first address, aligned to [`ALIGNMENT`].
@@ -78,9 +100,17 @@ impl Arena {
         self.bytes
     }
 
-    /// Bytes handed out since the last [`Arena::reset`].
+    /// Bytes handed out since the last [`Arena::reset`], net of what [`Arena::release`] gave back.
     pub fn used(&self) -> u64 {
         self.cursor.get()
+    }
+
+    /// The furthest offset any reservation reached since this arena was made.
+    ///
+    /// Neither [`Arena::release`] nor [`Arena::reset`] lowers it: it is the extent of the region
+    /// every forward run over this arena addressed, which is what the region must map.
+    pub fn peak(&self) -> u64 {
+        self.peak.get()
     }
 
     /// Start the next forward at the region's first address.
@@ -128,6 +158,7 @@ impl Arena {
             });
         }
         self.cursor.set(end);
+        self.peak.set(self.peak.get().max(end));
         Ok(DevicePtr::new(self.base.address() + at))
     }
 
@@ -598,6 +629,36 @@ mod tests {
         assert_eq!(second.ptr.address(), held.ptr.address() + ALIGNMENT);
         // The buffer reserved before the mark is still the arena's, and still where it was.
         assert_eq!(arena.used(), ALIGNMENT + 2048);
+    }
+
+    /// A forward that hands a layer's scratch back still addressed it: the peak keeps the furthest
+    /// byte reached, which is the extent a captured graph needs mapped, while the cursor falls back.
+    #[test]
+    fn the_peak_keeps_what_a_release_hands_back() {
+        let arena = Arena::new(DevicePtr::new(0x1_0000), 1 << 20);
+        arena.tensor(DType::BF16, Shape::new(&[16])).unwrap();
+        let mark = arena.mark();
+        arena.tensor(DType::F32, Shape::new(&[1024])).unwrap();
+        arena.release(mark);
+        arena.tensor(DType::F32, Shape::new(&[8])).unwrap();
+        assert_eq!(arena.used(), ALIGNMENT + 32);
+        assert_eq!(arena.peak(), ALIGNMENT + 4096);
+        arena.reset();
+        assert_eq!(arena.peak(), ALIGNMENT + 4096);
+    }
+
+    /// A counting arena measures what a real arena of any base would reserve, without a bound.
+    #[test]
+    fn a_counting_arena_reserves_what_a_real_one_does() {
+        let counting = Arena::counting();
+        let real = Arena::new(DevicePtr::new(0x1_0000), 1 << 20);
+        for arena in [&counting, &real] {
+            arena.tensor(DType::BF16, Shape::new(&[3])).unwrap();
+            arena.tensor(DType::F32, Shape::new(&[1000])).unwrap();
+        }
+        assert_eq!(counting.peak(), real.peak());
+        assert_eq!(counting.base().address() % ALIGNMENT, 0);
+        assert!(counting.tensor(DType::F32, Shape::new(&[1 << 40])).is_ok());
     }
 
     #[test]

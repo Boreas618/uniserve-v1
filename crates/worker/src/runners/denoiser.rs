@@ -1763,7 +1763,7 @@ impl<M: Denoiser + Send + Sync + ?Sized> DenoiserRunner<M> {
             .map_err(Error::from)?;
         if first {
             self.pool()?
-                .record(self.stream_id(), bucket, arena.used())?;
+                .record(self.stream_id(), bucket, arena.peak())?;
         }
         Ok(())
     }
