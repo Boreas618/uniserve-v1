@@ -655,10 +655,12 @@ pub fn padded_samples(samples: u64, hop: u64) -> Result<u64> {
 // ---------------------------------------------------------------------------------------------
 
 use nn::Forward;
+use nn::blocks::{GateUp, GatedMlp, GatedMlpSpec};
+use nn::family::Split;
 use nn::layers::{
-    AdaptiveAvgPool2d, CausalPad, Conv1d, Conv3d, ConvSpec, DenseAttention, DenseSpec, GateBias,
-    GatedActivation, GroupNorm, Halves, LayerNorm, Linear, Padding, Posterior, Residual,
-    ResnetBlock3d, ResnetSpec, Rounding, Transpose, WeightOrder,
+    AdaptiveAvgPool2d, Bias, CausalPad, Conv1d, Conv3d, ConvSpec, DenseAttention, DenseSpec,
+    GroupNorm, LayerNorm, Linear, Padding, Posterior, Residual, ResnetBlock3d, ResnetSpec,
+    Rounding, Transpose, WeightOrder,
 };
 use nn::weights::{Scope, WeightLoader};
 use nn::{DType, Shape, TensorView};
@@ -1384,11 +1386,9 @@ struct Projection {
 /// A normalized tanh-GELU gated linear unit: the reference's `GeGLU`.
 struct GeGlu {
     norm: LayerNorm,
-    gate: Linear,
-    value: Linear,
-    output: Linear,
-    /// `gelu_tanh(gate) · value`, the reference's `F.gelu(gate, approximate="tanh") * value`.
-    product: GatedActivation,
+    /// `output(gelu_tanh(gate(x)) · value(x))`, the gated product in one rounding: the reference's
+    /// `F.gelu(gate, approximate="tanh") * value`.
+    mlp: GatedMlp,
 }
 
 impl AudioEncoder {
@@ -1739,54 +1739,33 @@ impl GeGlu {
     /// The normalized tanh-GELU gated linear unit at `scope` over the latent channels: its `norm`,
     /// the gate `w0`, the value `w1` and the output `w2`.
     fn load(config: &crate::AudioVaeConfig, scope: &mut Scope<'_, '_>) -> Result<Self> {
-        let channels = u64::from(config.latent_channels);
-        let hidden = 2 * channels;
-        let norm = LayerNorm::load(&mut scope.scope("norm"), config.latent_channels, NORM_EPS)?;
-        let mut linear = |module: &str, out: u64, input: u64| -> Result<Linear> {
-            let mut module = scope.scope(module);
-            Ok(Linear::new(
-                module.tensor("weight", &[out, input])?,
-                Some(module.tensor("bias", &[out])?),
-                WeightOrder::NxK,
-            )?)
-        };
-        let gate = linear("w0", hidden, channels)?;
-        let value = linear("w1", hidden, channels)?;
-        let output = linear("w2", channels, hidden)?;
+        let channels = config.latent_channels;
         Ok(Self {
-            norm,
-            gate,
-            value,
-            output,
-            product: GatedActivation::new(
-                ops::activation::Activation::GeluTanh,
-                Rounding::Fused,
-                GateBias::None,
+            norm: LayerNorm::load(&mut scope.scope("norm"), channels, NORM_EPS)?,
+            mlp: GatedMlp::load(
+                scope,
+                GatedMlpSpec {
+                    hidden: channels,
+                    intermediate: 2 * channels,
+                    activation: ops::activation::Activation::GeluTanh,
+                    rounding: Rounding::Fused,
+                    gate_up: GateUp::Split {
+                        gate: "w0",
+                        up: "w1",
+                    },
+                    down: "w2",
+                    bias: Bias::Present,
+                },
+                Split::WHOLE,
             )?,
         })
     }
 
     /// `output(gelu_tanh(gate(norm(x))) · value(norm(x)))` into `out`.
     fn forward(&self, f: &Forward, x: TensorView, out: TensorView) -> Result<()> {
-        let (frames, hidden) = (x.shape.dim(0), 2 * x.shape.dim(1));
-        let normed = f
-            .arena()
-            .tensor(DType::F32, Shape::new(&[frames, x.shape.dim(1)]))?;
+        let normed = f.arena().tensor(DType::F32, x.shape)?;
         self.norm.forward(f, x, None, normed)?;
-        let gate = f
-            .arena()
-            .tensor(DType::F32, Shape::new(&[frames, hidden]))?;
-        let value = f
-            .arena()
-            .tensor(DType::F32, Shape::new(&[frames, hidden]))?;
-        self.gate.forward(f, normed, gate)?;
-        self.value.forward(f, normed, value)?;
-        let product = f
-            .arena()
-            .tensor(DType::F32, Shape::new(&[frames, hidden]))?;
-        self.product
-            .forward(f, Halves::Split { gate, value }, product)?;
-        Ok(self.output.forward(f, product, out)?)
+        Ok(self.mlp.forward(f, normed, out)?)
     }
 }
 
