@@ -510,16 +510,9 @@ impl DecoderLayer {
 
         f.fenced(MOE, format_args!("layers.{layer}.mlp"), || {
             match &self.mlp {
-                Mlp::Experts(moe) => {
-                    moe.forward(f, normalized, update).map_err(Error::from)?;
-                    // A tensor group holds every rank's block of the intermediate width, so each
-                    // rank's update is a partial sum, summed once after the experts. An expert
-                    // group's exchange returns the whole sum and runs with no tensor group.
-                    if f.split().is_some() {
-                        f.all_reduce(update).map_err(Error::from)?;
-                    }
-                }
-                // The dense block's down projection is row-parallel and reduces its own output.
+                // Both blocks sum their tensor-parallel partial outputs themselves: the routed
+                // block after its experts, the dense one in its row-parallel down projection.
+                Mlp::Experts(moe) => moe.forward(f, normalized, update).map_err(Error::from)?,
                 Mlp::Dense(dense) => dense.forward(f, normalized, buffers, update)?,
             }
             Ok::<(), Error>(())

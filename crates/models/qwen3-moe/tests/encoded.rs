@@ -206,7 +206,8 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
         .nvfp4_stack(
             "layers.0.mlp.experts.up",
             "model.layers.0.mlp.experts",
-            &["up", "gate"],
+            &["up_proj", "gate_proj"],
+            &(0..EXPERTS).collect::<Vec<u32>>(),
             EXPERTS,
             Nvfp4Names::vllm(),
             nn::weights::ValueLayout::Shuffled {
@@ -215,6 +216,7 @@ fn a_two_expert_encoded_stack_is_joined_expert_major_with_its_three_fields() {
             ScaleLayout::Linear,
             false,
         )
+        .map(|(stack, _)| stack)
         .expect("a two-expert encoded stack loads");
 
     // The packed field: every expert's every projection, expert-major, `[experts · projections ·
@@ -267,7 +269,8 @@ fn a_packed_field_that_is_not_u8_is_refused_by_name() {
         .nvfp4_stack(
             "layers.0.mlp.experts.up",
             "model.layers.0.mlp.experts",
-            &["up"],
+            &["up_proj"],
+            &(0..EXPERTS).collect::<Vec<u32>>(),
             EXPERTS,
             Nvfp4Names::vllm(),
             nn::weights::ValueLayout::Shuffled {
@@ -276,6 +279,7 @@ fn a_packed_field_that_is_not_u8_is_refused_by_name() {
             ScaleLayout::Linear,
             false,
         )
+        .map(|(stack, _)| stack)
         .unwrap_err();
     assert!(format!("{error}").contains("up_proj.weight"), "{error}");
 }
@@ -296,7 +300,8 @@ fn a_stack_whose_experts_declare_different_scale_types_is_refused() {
         .nvfp4_stack(
             "layers.0.mlp.experts.up",
             "model.layers.0.mlp.experts",
-            &["up"],
+            &["up_proj"],
+            &(0..EXPERTS).collect::<Vec<u32>>(),
             EXPERTS,
             Nvfp4Names::vllm(),
             nn::weights::ValueLayout::Shuffled {
@@ -305,6 +310,7 @@ fn a_stack_whose_experts_declare_different_scale_types_is_refused() {
             ScaleLayout::Linear,
             false,
         )
+        .map(|(stack, _)| stack)
         .unwrap_err();
     let message = format!("{error}");
     assert!(message.contains("weight_scale"), "{message}");
@@ -320,7 +326,8 @@ fn a_projection_the_shard_does_not_hold_is_refused_by_name() {
         .nvfp4_stack(
             "layers.0.mlp.experts.down",
             "model.layers.0.mlp.experts",
-            &["down"],
+            &["down_proj"],
+            &(0..EXPERTS).collect::<Vec<u32>>(),
             EXPERTS,
             Nvfp4Names::vllm(),
             nn::weights::ValueLayout::Shuffled {
@@ -329,6 +336,7 @@ fn a_projection_the_shard_does_not_hold_is_refused_by_name() {
             ScaleLayout::Linear,
             false,
         )
+        .map(|(stack, _)| stack)
         .unwrap_err();
     assert!(format!("{error}").contains("down"), "{error}");
 }

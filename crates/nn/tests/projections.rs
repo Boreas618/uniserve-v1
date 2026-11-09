@@ -10,8 +10,8 @@ use std::path::Path;
 
 use nn::family::Split;
 use nn::layers::{
-    Bias, Linear, MergedColumnLinear, Parallel, ParallelLMHead, QkvBias, QkvLinear, QkvNames,
-    QkvSpec, VocabParallelEmbedding,
+    Bias, ExpertNames, ExpertSlots, Linear, MergedColumnLinear, Moe, MoeSpec, Parallel,
+    ParallelLMHead, QkvBias, QkvLinear, QkvNames, QkvSpec, VocabParallelEmbedding,
 };
 use nn::quantization::{Declaration, KvCache, Scheme};
 use nn::weights::RetainedWeights;
@@ -493,4 +493,124 @@ fn the_embedding_and_the_head_hold_the_same_vocabulary_rows() {
     );
     assert_eq!(head.padded(), 16);
     assert_eq!(ParallelLMHead::tied(&embedding).unwrap().padded(), 16);
+}
+
+/// A routed block of two experts, intermediate width four, over a hidden width of eight.
+fn routed(directory: &Path) -> Checkpoint {
+    let mut tensors = vec![("mlp.gate.weight".to_owned(), vec![2, 8])];
+    for expert in 0..2 {
+        for (module, shape) in [
+            ("up_proj", [4, 8]),
+            ("gate_proj", [4, 8]),
+            ("down_proj", [8, 4]),
+        ] {
+            tensors.push((
+                format!("mlp.experts.{expert}.{module}.weight"),
+                shape.to_vec(),
+            ));
+        }
+    }
+    let tensors: Vec<(&str, DType, Vec<u64>, Vec<u8>)> = tensors
+        .iter()
+        .map(|(name, shape)| {
+            let bytes = matrix(shape[0], shape[1]);
+            (
+                name.as_str(),
+                DType::BF16,
+                shape.clone(),
+                bytes[..bytes.len() / 2].to_vec(),
+            )
+        })
+        .collect();
+    shard(directory, &tensors);
+    checkpoint(directory, "{}")
+}
+
+#[test]
+fn a_routed_block_loads_its_window_and_reduces_its_split() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = routed(directory.path());
+    let spec = MoeSpec {
+        experts: 2,
+        top: 1,
+        hidden: 8,
+        intermediate: 4,
+        activation: ops::moe::grouped::Activation::Silu,
+        renormalize: true,
+    };
+    let names = ExpertNames {
+        router: "gate",
+        experts: "experts",
+        up: "up_proj",
+        gate: "gate_proj",
+        down: "down_proj",
+    };
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let map = loader
+        .constant("slots", DType::I32, Shape::new(&[2]), &[0; 8], "test")
+        .unwrap();
+    let order = [1, 0];
+    let slots = ExpertSlots { order: &order, map };
+    let whole = Split::WHOLE;
+
+    // Over an expert group of two, each rank holds one of the two experts.
+    let window = Moe::load(
+        &mut loader.scope("mlp"),
+        spec,
+        names,
+        slots,
+        whole,
+        Split { size: 2, rank: 1 },
+    )
+    .unwrap();
+    assert_eq!((window.experts(), window.local_experts()), (2, 1));
+
+    // Over a tensor group of two, each rank holds every expert's half of the intermediate width,
+    // and its output is a partial sum the block reduces: a forward with no group is refused.
+    let split = Moe::load(
+        &mut loader.scope("mlp"),
+        spec,
+        names,
+        slots,
+        Split { size: 2, rank: 0 },
+        whole,
+    )
+    .unwrap();
+    assert_eq!(split.local_experts(), 2);
+    let arena = nn::Arena::counting();
+    let hidden = arena.tensor(DType::BF16, Shape::new(&[4, 8])).unwrap();
+    let out = arena.tensor(DType::BF16, Shape::new(&[4, 8])).unwrap();
+    let alone = nn::Forward::recording(&arena);
+    let refused = split.forward(&alone, hidden, out).unwrap_err().to_string();
+    assert!(refused.contains("no group"), "{refused}");
+    let grouped = nn::Forward::recording(&arena).with_split(0, 2).unwrap();
+    split
+        .forward(&grouped, hidden, out)
+        .expect("a split forward reduces");
+
+    // A tensor group that does not divide the width, and slots that are not every expert, are
+    // refused by the block's name.
+    for refused in [
+        Moe::load(
+            &mut loader.scope("mlp"),
+            spec,
+            names,
+            slots,
+            Split { size: 3, rank: 0 },
+            whole,
+        ),
+        Moe::load(
+            &mut loader.scope("mlp"),
+            spec,
+            names,
+            ExpertSlots { order: &[0], map },
+            whole,
+            whole,
+        ),
+    ] {
+        let message = refused.err().expect("a refused block").to_string();
+        assert!(message.contains("mlp"), "{message}");
+    }
+    assert_eq!(Moe::slot_map(&[2, 0, 1]).unwrap(), [1, 2, 0]);
+    assert!(Moe::slot_map(&[0, 0, 1]).is_err());
 }

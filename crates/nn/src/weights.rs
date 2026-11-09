@@ -1745,98 +1745,37 @@ impl<'a> WeightLoader<'a> {
         Ok(scale)
     }
 
-    /// Load the encoded fields of a whole expert stack: `experts` experts, each contributing
-    /// `projections.len()` projections in the order the operator reads them.
+    /// Load the encoded fields of a stack of experts: the experts `slots` names, in that order, of
+    /// a vocabulary of `vocabulary` experts, each contributing one projection per module of
+    /// `projections` in the order the operator reads them.
     ///
-    /// The checkpoint stores each expert's projection as its own tensor, so a stack is a
-    /// concatenation: expert-major, and within an expert the projections in `projections`' order
-    /// (the gated product reads up first, gate second). The three fields answer the three the
-    /// operators take — packed values, block scales, and one tensor scale per **expert and
-    /// projection** — and all three are published through retained storage under one key per field,
-    /// so a second load of the same checkpoint costs nothing.
+    /// Expert `e`'s projection `p` is the module `<prefix>.<e>.<p>`: the model names the modules, as
+    /// its checkpoint does, and the loader reads their fields in the export's spelling `names`.
+    /// A stack is a concatenation: slot-major, and within a slot the projections in order (the
+    /// gated product reads up first, gate second). The three fields answer the three the operators
+    /// take — packed values, block scales, and one tensor scale per **expert and projection** — and
+    /// each is published through retained storage under one key, so a second load of the same
+    /// checkpoint costs nothing. Slot `s` holds expert `slots[s]`, so a redistribution's order is a
+    /// load of the same checkpoint.
     ///
     /// The tensor scales are two per expert for a fused `up`/`gate` stack: the checkpoint gives each
     /// projection its own `weight_scale_2`, and dequantizing the gate half with the up half's scale
-    /// would be wrong by the ratio of the two with nothing to show for it.
+    /// would be wrong by the ratio of the two with nothing to show for it. The activation encoder's
+    /// scale is the whole vocabulary's: a token is encoded once on the rank that holds it, for
+    /// experts on any rank, so every rank encodes with the same number. The second value answered
+    /// is each held expert's tensor scales, expert-major, one per projection; a meta loader answers
+    /// [`Self::tensor_scale`]'s placeholder for each.
     ///
     /// `name` names the stack in keys and errors and must not collide with a tensor's: a computed
-    /// weight needs its own name. A block-scale layout whose per-expert entry is padded, or a
-    /// projection count that would break the swizzle's 128-row tiles, is refused here rather than
-    /// read as a table no program expects.
+    /// weight needs its own name. A block-scale layout whose per-expert entry is padded, or a row
+    /// count that would break the shuffle's blocks, is refused here rather than read as a table no
+    /// program expects.
     #[allow(
         clippy::too_many_arguments,
-        reason = "the design's stack carries its own name, the checkpoint's prefix, the projections, \
-                  the expert count, the export's spelling and the scale layout"
+        reason = "the stack is named by its parts: its name, the experts' module, the projections, \
+                  the slots, the vocabulary, the export's spelling and the two layouts"
     )]
     pub fn nvfp4_stack(
-        &mut self,
-        name: &str,
-        prefix: &str,
-        projections: &[&str],
-        experts: u32,
-        names: Nvfp4Names,
-        values_layout: ValueLayout,
-        layout: ScaleLayout,
-        input_scale: bool,
-    ) -> Result<QuantizedStack> {
-        let slots: Vec<u32> = (0..experts).collect();
-        self.nvfp4_stack_in_slots(
-            name,
-            prefix,
-            projections,
-            &slots,
-            names,
-            values_layout,
-            layout,
-            input_scale,
-        )
-    }
-
-    /// [`Self::nvfp4_stack`] with the experts of `slots` in that order: slot `s` of the stack holds
-    /// expert `slots[s]`, so a redistribution's order is a load of the same checkpoint.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the arguments of `nvfp4_stack`, with the slots in place of the expert count"
-    )]
-    pub fn nvfp4_stack_in_slots(
-        &mut self,
-        name: &str,
-        prefix: &str,
-        projections: &[&str],
-        slots: &[u32],
-        names: Nvfp4Names,
-        values_layout: ValueLayout,
-        layout: ScaleLayout,
-        input_scale: bool,
-    ) -> Result<QuantizedStack> {
-        let vocabulary = u32::try_from(slots.len())
-            .map_err(|_| Error::weight(name, "more slots than a stack holds".to_owned()))?;
-        self.nvfp4_window(
-            name,
-            prefix,
-            projections,
-            slots,
-            vocabulary,
-            names,
-            values_layout,
-            layout,
-            input_scale,
-        )
-        .map(|(stack, _)| stack)
-    }
-
-    /// [`Self::nvfp4_stack_in_slots`] over the `slots` of a vocabulary of `vocabulary` experts one
-    /// rank holds.
-    ///
-    /// The activation encoder's scale is the whole vocabulary's: a token is encoded once on the rank
-    /// that holds it, for experts on any rank, so every rank must encode with the same number. The
-    /// second value is each held expert's tensor scales, expert-major, one per projection; a meta
-    /// loader answers [`Self::tensor_scale`]'s placeholder for each.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "the stack is named by its parts, as `nvfp4_stack` names them"
-    )]
-    pub fn nvfp4_window(
         &mut self,
         name: &str,
         prefix: &str,
@@ -1874,7 +1813,7 @@ impl<'a> WeightLoader<'a> {
         let mut scale_dtype = None;
         for expert in slots {
             for projection in projections {
-                let stem = format!("{prefix}.{expert}.{projection}_proj");
+                let stem = format!("{prefix}.{expert}.{projection}");
                 let (values_name, scales_name) = (
                     format!("{stem}.{}", spelling.values),
                     format!("{stem}.{}", spelling.block_scale),
@@ -2163,7 +2102,7 @@ impl<'a> WeightLoader<'a> {
         if calibrated {
             for expert in (0..vocabulary).filter(|expert| !slots.contains(expert)) {
                 for projection in projections {
-                    let stem = format!("{prefix}.{expert}.{projection}_proj");
+                    let stem = format!("{prefix}.{expert}.{projection}");
                     let tensor = format!("{stem}.{}", spelling.input_scale);
                     let request = WeightRequest::region(&tensor, 0, Shape::new(&[1]));
                     encode = encode.min(self.activation_reciprocal(&request)?);

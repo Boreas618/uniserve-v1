@@ -651,13 +651,15 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
             .nvfp4_stack(
                 "layer.0.mlp.experts.up_gate",
                 "experts",
-                &["up", "gate"],
+                &["up_proj", "gate_proj"],
+                &(0..2).collect::<Vec<u32>>(),
                 2,
                 Nvfp4Names::vllm(),
                 nn::ValueLayout::Plain,
                 ops::fp4::ScaleLayout::Linear,
                 false,
             )
+            .map(|(stack, _)| stack)
             .unwrap()
     };
 
@@ -703,13 +705,15 @@ fn a_calibrated_expert_stack_is_joined_expert_major_and_projection_by_projection
             .nvfp4_stack(
                 "layer.0.mlp.experts.up_gate",
                 "experts",
-                &["up", "gate"],
+                &["up_proj", "gate_proj"],
+                &(0..2).collect::<Vec<u32>>(),
                 2,
                 Nvfp4Names::vllm(),
                 nn::ValueLayout::Plain,
                 ops::fp4::ScaleLayout::Linear,
                 false,
             )
+            .map(|(stack, _)| stack)
             .unwrap()
     };
     assert_eq!(again.values.shape().dims(), stack.values.shape().dims());
@@ -766,13 +770,15 @@ fn a_stack_needs_every_expert_to_agree_on_its_geometry() {
         .nvfp4_stack(
             "layer.0.mlp.experts.up",
             "experts",
-            &["up"],
+            &["up_proj"],
+            &(0..2).collect::<Vec<u32>>(),
             2,
             Nvfp4Names::vllm(),
             nn::ValueLayout::Plain,
             ops::fp4::ScaleLayout::Linear,
             false,
         )
+        .map(|(stack, _)| stack)
         .expect_err("two experts of different shapes are not one stack");
     assert!(
         format!("{error}").contains("against the stack's"),
@@ -1125,13 +1131,15 @@ fn a_stack_keeps_the_checkpoint_s_e4m3_block_scales() {
         .nvfp4_stack(
             "layer.0.mlp.experts.up_gate",
             "experts",
-            &["up", "gate"],
+            &["up_proj", "gate_proj"],
+            &(0..2).collect::<Vec<u32>>(),
             2,
             Nvfp4Names::vllm(),
             nn::ValueLayout::Plain,
             ops::fp4::ScaleLayout::Linear,
             false,
         )
+        .map(|(stack, _)| stack)
         .unwrap();
     assert_eq!(
         stack.scales.dtype(),
@@ -1245,13 +1253,15 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
         .nvfp4_stack(
             "layer.0.mlp.experts.up",
             "experts",
-            &["up"],
+            &["up_proj"],
+            &(0..2).collect::<Vec<u32>>(),
             2,
             Nvfp4Names::diffusers(),
             nn::ValueLayout::Plain,
             ops::fp4::ScaleLayout::Linear,
             false,
         )
+        .map(|(stack, _)| stack)
         .expect("an export that states weight_packed and weight_tensor_scale loads as such");
     assert_eq!(stack.values.shape().dims(), &[2, 4, 32]);
     assert_eq!(stack.global_scale.shape().dims(), &[1, 2]);
@@ -1265,13 +1275,15 @@ fn a_calibrated_stack_names_its_fields_with_its_exports_suffixes() {
             .nvfp4_stack(
                 "layer.0.mlp.experts.up",
                 "experts",
-                &["up"],
+                &["up_proj"],
+                &(0..2).collect::<Vec<u32>>(),
                 2,
                 Nvfp4Names::vllm(),
                 nn::ValueLayout::Plain,
                 ops::fp4::ScaleLayout::Linear,
                 false,
             )
+            .map(|(stack, _)| stack)
             .expect_err("a diffusers checkpoint read as vLLM's spelling")
     };
     let text = format!("{other}");
@@ -1387,7 +1399,8 @@ fn a_shuffled_stack_permutes_its_values_rows_at_load() {
             .nvfp4_stack(
                 "layer.0.mlp.experts.up_gate",
                 "experts",
-                &["up", "gate"],
+                &["up_proj", "gate_proj"],
+                &(0..1).collect::<Vec<u32>>(),
                 1,
                 Nvfp4Names::diffusers(),
                 nn::ValueLayout::Shuffled {
@@ -1396,6 +1409,7 @@ fn a_shuffled_stack_permutes_its_values_rows_at_load() {
                 ops::fp4::ScaleLayout::Linear,
                 false,
             )
+            .map(|(stack, _)| stack)
             .unwrap();
     }
     assert_eq!(
@@ -1460,7 +1474,8 @@ fn a_shuffled_stack_permutes_its_values_rows_at_load() {
             .nvfp4_stack(
                 "layer.0.mlp.experts.up_gate",
                 "experts",
-                &["up", "gate"],
+                &["up_proj", "gate_proj"],
+                &(0..1).collect::<Vec<u32>>(),
                 1,
                 Nvfp4Names::diffusers(),
                 nn::ValueLayout::Shuffled {
@@ -1469,6 +1484,7 @@ fn a_shuffled_stack_permutes_its_values_rows_at_load() {
                 ops::fp4::ScaleLayout::Linear,
                 false,
             )
+            .map(|(stack, _)| stack)
             .expect_err("a 30-row matrix has no 32-row arrangement")
     };
     assert!(format!("{error}").contains("32-row blocks"), "{error}");
@@ -1518,7 +1534,8 @@ fn a_swizzled_scale_table_is_built_from_the_shards_linear_one() {
             .nvfp4_stack(
                 "layer.0.mlp.experts.down",
                 "experts",
-                &["down"],
+                &["down_proj"],
+                &(0..1).collect::<Vec<u32>>(),
                 1,
                 Nvfp4Names::diffusers(),
                 nn::ValueLayout::Shuffled {
@@ -1527,6 +1544,7 @@ fn a_swizzled_scale_table_is_built_from_the_shards_linear_one() {
                 ops::fp4::ScaleLayout::Swizzled128X4,
                 false,
             )
+            .map(|(stack, _)| stack)
             .unwrap();
     }
     // Two scale columns pad to four, and 128 rows are one tile: 128 × 4 bytes.
@@ -1756,16 +1774,19 @@ fn nvfp4_loads(loader: &mut WeightLoader<'_>) -> nn::Result<Vec<Option<Answer>>>
         ops::fp4::ScaleLayout::Swizzled128X4,
         global_scale,
     )?;
-    let stack = loader.nvfp4_stack(
-        "experts.up_gate",
-        "experts",
-        &["up", "gate"],
-        2,
-        Nvfp4Names::vllm(),
-        nn::ValueLayout::Plain,
-        ops::fp4::ScaleLayout::Swizzled128X4,
-        true,
-    )?;
+    let stack = loader
+        .nvfp4_stack(
+            "experts.up_gate",
+            "experts",
+            &["up_proj", "gate_proj"],
+            &(0..2).collect::<Vec<u32>>(),
+            2,
+            Nvfp4Names::vllm(),
+            nn::ValueLayout::Plain,
+            ops::fp4::ScaleLayout::Swizzled128X4,
+            true,
+        )
+        .map(|(stack, _)| stack)?;
     Ok(vec![
         Some(answer(&quantized.packed)),
         Some(answer(&quantized.scales)),
@@ -1889,13 +1910,15 @@ fn a_meta_load_refuses_what_the_header_contradicts() {
             .nvfp4_stack(
                 "experts.up_gate",
                 "experts",
-                &["up", "gate"],
+                &["up_proj", "gate_proj"],
+                &(0..1).collect::<Vec<u32>>(),
                 1,
                 Nvfp4Names::vllm(),
                 nn::ValueLayout::Plain,
                 ops::fp4::ScaleLayout::Linear,
                 false,
             )
+            .map(|(stack, _)| stack)
             .map(|_| ())
     };
     let mut store = Recording::default();

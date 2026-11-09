@@ -66,7 +66,7 @@ pub use linear::{
     QkvNames, QkvSpec, encode_block, packed_rows,
 };
 pub use modulation::{GatedResidual, ModulatedRmsNorm};
-pub use moe::{FusedTables, Moe};
+pub use moe::{ExpertNames, ExpertSlots, Moe, MoeSpec, WEIGHT_SCALE_LAYOUT};
 pub use noise::{Key as NoiseKey, Noise};
 pub use norm::{LayerNorm, RmsNorm};
 pub use ops::activation::Activation;

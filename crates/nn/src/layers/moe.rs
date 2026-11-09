@@ -34,9 +34,15 @@ use ops::moe::sort::{self, MoeSort, SortArgs};
 use ops::{DType, DevicePtr, Op, Shape, TensorView};
 
 use crate::error::{Error, Result};
+use crate::family::Split;
 use crate::forward::Forward;
 use crate::layers::linear::{ENCODE_CHUNK, Linear, encode_block};
-use crate::weights::{QuantizedStack, Weight};
+use crate::quantization::Scheme;
+use crate::weights::{
+    Nvfp4Names, PartBlock, QuantizedStack, Scope, ValueLayout, Weight, WeightLayout, WeightLoader,
+    WeightRequest,
+};
+use ops::gemm::WeightOrder;
 
 /// The scratch one grouped product of `routes` permuted rows and `width` columns needs, in bytes.
 ///
@@ -103,9 +109,66 @@ const MMA_CLUSTER: (u32, u32) = (1, 1);
 /// buffer is padded to.
 const TILE_ROWS: u32 = MMA_TILE.0;
 
+/// The block-scale layout the expert products read the **weights** in: the 128x4 swizzled form.
+///
+/// Both families carry their weight operand this way — `mSfLayoutA` is `SfLayout(3)` in every one of
+/// the artifact's E2M1 kernels, and `BatchedGemmOptions.h` states the rule it follows: "mSfLayoutA
+/// has to be R128cX when not batch M or not routed". The plane the two families disagree about is
+/// the **tokens** operand ([`Moe::GATED_TOKEN_SCALE_LAYOUT`], [`Moe::ACTIVATION_SCALE_LAYOUT`]).
+///
+/// The shard stores the plain form, so the loader builds this table once at load.
+pub const WEIGHT_SCALE_LAYOUT: ScaleLayout = ScaleLayout::Swizzled128X4;
+
+/// The mathematics of a routed block, as its model's configuration states it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MoeSpec {
+    /// Routed experts of the block: the router's vocabulary.
+    pub experts: u32,
+    /// Experts each token is routed to.
+    pub top: u32,
+    /// The hidden width the experts read and write.
+    pub hidden: u32,
+    /// One expert's intermediate width, before any tensor-parallel split.
+    pub intermediate: u32,
+    /// The gate's activation.
+    pub activation: Activation,
+    /// Whether the selected experts' weights renormalize to one.
+    pub renormalize: bool,
+}
+
+/// The module names a checkpoint states a routed block's parameters under.
+///
+/// A model's checkpoint names its own modules; the block composes them as the checkpoint does:
+/// the router is `<block>.<router>` and expert `e`'s projections `<block>.<experts>.<e>.<up>`,
+/// `.<gate>` and `.<down>`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ExpertNames<'n> {
+    /// The router's module.
+    pub router: &'n str,
+    /// The module list holding the experts.
+    pub experts: &'n str,
+    /// An expert's up projection.
+    pub up: &'n str,
+    /// An expert's gate projection.
+    pub gate: &'n str,
+    /// An expert's down projection.
+    pub down: &'n str,
+}
+
+/// Where a block's experts sit: the expert each slot holds, and the table a route reads its slot
+/// from.
+#[derive(Clone, Copy, Debug)]
+pub struct ExpertSlots<'s> {
+    /// The expert slot `s` holds, for every slot of the vocabulary: a permutation of the experts.
+    pub order: &'s [u32],
+    /// `[experts]` i32: the slot of each expert ([`Moe::slot_map`] of `order`), as a published
+    /// table's row. The model publishes every routed layer's rows as one table, so the rows share
+    /// one allocation.
+    pub map: Weight,
+}
 /// The per-expert scalars a fused exchange's kernel multiplies in, one table per use.
 #[derive(Clone)]
-pub struct FusedTables {
+pub(crate) struct FusedTables {
     /// `[local]` f32: dequantizes the first product, a weight's tensor scale times the rows' scale.
     pub up_gate_alpha: Weight,
     /// `[local]` f32: dequantizes the second product.
@@ -186,6 +249,9 @@ pub struct Moe {
     local: u32,
     /// The first expert of this rank's window.
     local_offset: u32,
+    /// Ranks of the tensor group this block's experts are split over by their intermediate width:
+    /// above one, each rank's output is a partial sum its forward reduces over the group.
+    reduce: u32,
 }
 
 impl Moe {
@@ -221,7 +287,7 @@ impl Moe {
         reason = "every argument is a geometry or weight the design states separately; a \
                   configuration struct would restate them"
     )]
-    pub fn new(
+    fn new(
         router: Linear,
         up_gate: Weight,
         down: Weight,
@@ -261,7 +327,7 @@ impl Moe {
         reason = "the same arguments as the dense constructor, with the encoded stacks in place \
                   of the dense weights"
     )]
-    pub fn quantized(
+    fn quantized(
         router: Linear,
         up_gate: QuantizedStack,
         down: QuantizedStack,
@@ -490,6 +556,7 @@ impl Moe {
             renormalize,
             scale,
             fused: None,
+            reduce: 1,
             tile: TILE_ROWS,
             local,
             local_offset,
@@ -504,7 +571,7 @@ impl Moe {
         clippy::too_many_arguments,
         reason = "the block is named by its parts, as `expert_parallel` names them"
     )]
-    pub fn fused_expert_parallel(
+    fn fused_expert_parallel(
         router: Linear,
         up_gate: QuantizedStack,
         down: QuantizedStack,
@@ -547,7 +614,7 @@ impl Moe {
         reason = "the block is named by its parts: the router, the two expert stacks, the map, \
                   the vocabulary, the resident window and the routing"
     )]
-    pub fn expert_parallel(
+    fn expert_parallel(
         router: Linear,
         up_gate: Weight,
         down: Weight,
@@ -574,6 +641,330 @@ impl Moe {
         )
     }
 
+    /// The routed block the module at `scope` states.
+    ///
+    /// The model supplies the block's mathematics (`spec`) and its checkpoint's module names
+    /// (`names`): the router is `<scope>.<router>`, and expert `e`'s projections are
+    /// `<scope>.<experts>.<e>.<up|gate|down>`. The block reads the router replicated and the experts
+    /// `slots` places, in slot order, and holds:
+    ///
+    /// - over an expert-parallel group (`exchange`), this rank's contiguous window of the slots,
+    ///   with the router over the whole vocabulary so every rank routes a token the same way;
+    /// - over a tensor group (`tensor`), this rank's block of every expert's intermediate width
+    ///   (the gate and up projections' rows, the down projection's columns), whose partial sums
+    ///   [`Self::forward`] reduces over the group.
+    ///
+    /// A dense checkpoint's experts are stacked expert-major, up before gate. A calibrated NVFP4
+    /// checkpoint's are read as packed stacks in the arrangement their products read: over a group,
+    /// the fused exchange's (each gate block before its up block) with the per-expert scalars its
+    /// kernel multiplies in; on one rank, the shuffled rows the trtllm-gen products read. The
+    /// declaration the loader was given decides which, from the first held expert's weight.
+    ///
+    /// # Errors
+    ///
+    /// When the slots are no permutation of the vocabulary, a split does not divide the experts
+    /// or their width, or a tensor is missing or of another extent.
+    pub fn load(
+        scope: &mut Scope<'_, '_>,
+        spec: MoeSpec,
+        names: ExpertNames<'_>,
+        slots: ExpertSlots<'_>,
+        tensor: Split,
+        exchange: Split,
+    ) -> Result<Self> {
+        let path = scope.path().to_owned();
+        let refuse = |problem: String| Error::weight(&path, problem);
+        let experts = spec.experts;
+        if slots.order.len() != experts as usize {
+            return Err(refuse(format!(
+                "{} slots for {experts} experts",
+                slots.order.len()
+            )));
+        }
+        if exchange.size == 0 || !experts.is_multiple_of(exchange.size) {
+            return Err(refuse(format!(
+                "an expert group of {} does not divide {experts} experts",
+                exchange.size
+            )));
+        }
+        if tensor.size == 0 || !spec.intermediate.is_multiple_of(tensor.size) {
+            return Err(refuse(format!(
+                "a tensor group of {} does not divide an expert's {} intermediate columns",
+                tensor.size, spec.intermediate
+            )));
+        }
+        let hidden = u64::from(spec.hidden);
+        let intermediate = u64::from(spec.intermediate);
+        // The rank's block of every expert: the tensor group splits the intermediate width.
+        let local_intermediate = intermediate / u64::from(tensor.size);
+        // The rank's window of the slots.
+        let local = experts / exchange.size;
+        let offset = exchange.rank * local;
+        let window = &slots.order[offset as usize..(offset + local) as usize];
+
+        let router = Linear::new(
+            scope
+                .scope(names.router)
+                .tensor("weight", &[u64::from(experts), hidden])?,
+            None,
+            WeightOrder::NxK,
+        )?;
+        let mut experts_scope = scope.scope(names.experts);
+        let stem = experts_scope.path().to_owned();
+        let stem = stem.as_str();
+        let encoded = experts_scope
+            .loader()
+            .scheme(&format!("{stem}.{}.{}.weight", window[0], names.up))
+            == Scheme::Nvfp4;
+
+        let mut block = if encoded {
+            Self::load_encoded(
+                experts_scope.loader(),
+                &path,
+                stem,
+                spec,
+                names,
+                window,
+                slots.map,
+                exchange,
+                router,
+            )?
+        } else {
+            let mut up_gate_parts = Vec::with_capacity(window.len() * 2);
+            let mut down_parts = Vec::with_capacity(window.len());
+            for expert in window {
+                let projection = |module: &str| format!("{stem}.{expert}.{module}.weight");
+                up_gate_parts.push(projection(names.up));
+                up_gate_parts.push(projection(names.gate));
+                down_parts.push(projection(names.down));
+            }
+            let rank = u64::from(tensor.rank);
+            let count = u64::from(local);
+            // A gate or up projection is `[intermediate, hidden]`, so a rank's block is its rows; a
+            // down projection is `[hidden, intermediate]`, so a rank's block is its columns of every
+            // row.
+            let request = |name: String, parts: Vec<String>, shape: Shape, layout, block| {
+                if tensor.size == 1 {
+                    WeightRequest::parts(name, parts, shape, layout)
+                } else {
+                    WeightRequest::part_blocks(name, parts, shape, layout, block)
+                }
+            };
+            let up_gate = experts_scope.load(request(
+                format!("{path}.experts.up_gate"),
+                up_gate_parts,
+                Shape::new(&[count, 2 * local_intermediate, hidden]),
+                WeightLayout::UP_GATE,
+                PartBlock {
+                    start: rank * local_intermediate * hidden,
+                    rows: local_intermediate,
+                    columns: hidden,
+                    row_stride: hidden,
+                },
+            ))?;
+            let down = experts_scope.load(request(
+                format!("{path}.experts.down"),
+                down_parts,
+                Shape::new(&[count, hidden, local_intermediate]),
+                WeightLayout::DOWN,
+                PartBlock {
+                    start: rank * local_intermediate,
+                    rows: hidden,
+                    columns: local_intermediate,
+                    row_stride: intermediate,
+                },
+            ))?;
+            if exchange.size == 1 {
+                Self::new(
+                    router,
+                    up_gate,
+                    down,
+                    Some(slots.map),
+                    local,
+                    spec.top,
+                    spec.activation,
+                    spec.renormalize,
+                    None,
+                )?
+            } else {
+                Self::expert_parallel(
+                    router,
+                    up_gate,
+                    down,
+                    Some(slots.map),
+                    experts,
+                    local,
+                    offset,
+                    spec.top,
+                    spec.activation,
+                    spec.renormalize,
+                    None,
+                )?
+            }
+        };
+        block.reduce = tensor.size;
+        Ok(block)
+    }
+
+    /// The packed experts of `window`, as [`Self::load`] reads a calibrated checkpoint's.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the block's parts as `load` resolved them: the loader, the block's path, the \
+                  experts' module, the spec, the names, the window, the slot map, the expert group \
+                  and the router"
+    )]
+    fn load_encoded(
+        loader: &mut WeightLoader<'_>,
+        path: &str,
+        stem: &str,
+        spec: MoeSpec,
+        names: ExpertNames<'_>,
+        window: &[u32],
+        map: Weight,
+        exchange: Split,
+        router: Linear,
+    ) -> Result<Self> {
+        let experts = spec.experts;
+        let local = u32::try_from(window.len()).unwrap_or(u32::MAX);
+        let spelling = Nvfp4Names::vllm();
+        if exchange.size > 1 {
+            // An encoded block over a group runs in the exchange's one fused launch, which reads
+            // its own arrangement of the same bytes: each gate block before its up block, and the
+            // block scales in the swizzled table.
+            let (up_gate, up_scales) = loader.nvfp4_stack(
+                &format!("{path}.experts.up_gate"),
+                stem,
+                &[names.up, names.gate],
+                window,
+                experts,
+                spelling,
+                ValueLayout::GateFirst,
+                WEIGHT_SCALE_LAYOUT,
+                true,
+            )?;
+            let (down, down_scales) = loader.nvfp4_stack(
+                &format!("{path}.experts.down"),
+                stem,
+                &[names.down],
+                window,
+                experts,
+                spelling,
+                ValueLayout::Plain,
+                WEIGHT_SCALE_LAYOUT,
+                true,
+            )?;
+            // The kernel's three scalars per expert: each product dequantizes with the weight's
+            // tensor scale times its rows' activation scale, and the gated rows encode with the
+            // second activation scale's reciprocal. A fused first projection carries one tensor
+            // scale per expert, which up and gate share.
+            let up_alpha: Vec<f32> = up_scales
+                .chunks(2)
+                .map(|scales| scales[0] * up_gate.activation_scale)
+                .collect();
+            let down_alpha: Vec<f32> = down_scales
+                .iter()
+                .map(|scale| scale * down.activation_scale)
+                .collect();
+            let gated = vec![down.activation_scale.recip(); window.len()];
+            let mut table = |what: &str, values: Vec<f32>| {
+                let bytes: Vec<u8> = values
+                    .iter()
+                    .flat_map(|value| value.to_ne_bytes())
+                    .collect();
+                loader.constant(
+                    &format!("{path}.experts.{what}"),
+                    DType::F32,
+                    Shape::new(&[u64::from(local)]),
+                    &bytes,
+                    "nn::Moe",
+                )
+            };
+            let tables = FusedTables {
+                up_gate_alpha: table("up_gate_alpha", up_alpha)?,
+                down_alpha: table("down_alpha", down_alpha)?,
+                gated_scale: table("gated_scale", gated)?,
+            };
+            return Self::fused_expert_parallel(
+                router,
+                up_gate,
+                down,
+                tables,
+                Some(map),
+                experts,
+                local,
+                exchange.rank * local,
+                spec.top,
+                spec.activation,
+                spec.renormalize,
+            );
+        }
+        // On one rank the products read their A operand shuffled: the gated stack interleaves its
+        // halves first. The shard's block scales are linear, and the published table is built from
+        // them once here.
+        let (up_gate, _) = loader.nvfp4_stack(
+            &format!("{path}.experts.up_gate"),
+            stem,
+            &[names.up, names.gate],
+            window,
+            experts,
+            spelling,
+            ValueLayout::InterleavedShuffled {
+                epilogue_tile_m: 128,
+            },
+            WEIGHT_SCALE_LAYOUT,
+            true,
+        )?;
+        let (down, _) = loader.nvfp4_stack(
+            &format!("{path}.experts.down"),
+            stem,
+            &[names.down],
+            window,
+            experts,
+            spelling,
+            ValueLayout::Shuffled {
+                epilogue_tile_m: 128,
+            },
+            WEIGHT_SCALE_LAYOUT,
+            true,
+        )?;
+        Self::quantized(
+            router,
+            up_gate,
+            down,
+            Some(map),
+            experts,
+            spec.top,
+            spec.activation,
+            spec.renormalize,
+            None,
+        )
+    }
+
+    /// The slot of each expert, inverting `order`, the expert each slot holds: the row of the table
+    /// a route reads its slot from.
+    ///
+    /// # Errors
+    ///
+    /// When `order` is no permutation of its experts.
+    pub fn slot_map(order: &[u32]) -> Result<Vec<u32>> {
+        let mut row = vec![u32::MAX; order.len()];
+        for (slot, expert) in order.iter().enumerate() {
+            let entry = row.get_mut(*expert as usize).ok_or_else(|| {
+                Error::shape(
+                    "Moe",
+                    format!("a slot order names expert {expert} of {}", order.len()),
+                )
+            })?;
+            *entry = u32::try_from(slot).unwrap_or(u32::MAX);
+        }
+        if row.contains(&u32::MAX) {
+            return Err(Error::shape(
+                "Moe",
+                "a slot order is not a permutation of its experts".to_owned(),
+            ));
+        }
+        Ok(row)
+    }
     /// The experts this rank holds.
     pub const fn local_experts(&self) -> u32 {
         self.local
@@ -713,10 +1104,37 @@ impl Moe {
         })
     }
 
-    /// `out = Σ_routes weight · expert(hidden)`.
+    /// `out = Σ_routes weight · expert(hidden)`, summed over the tensor group.
     ///
-    /// `hidden` and `out` are `[tokens, hidden]`.
+    /// `hidden` and `out` are `[tokens, hidden]`. A block whose experts the tensor group splits by
+    /// their intermediate width holds one rank's block of every expert, so its output is a partial
+    /// sum: it is reduced over the group here, once after the experts, and a forward that carries no
+    /// group is refused. An expert group's exchange returns the whole sum.
+    ///
+    /// # Errors
+    ///
+    /// When a view does not fit the block, an operator refuses, or a split block runs on a forward
+    /// without a group.
     pub fn forward(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
+        self.combine(f, hidden, out)?;
+        if self.reduce > 1 {
+            if f.split().is_none() {
+                return Err(Error::shape(
+                    "Moe",
+                    format!(
+                        "experts split over {} tensor ranks run on a forward that carries no group \
+                         to reduce over",
+                        self.reduce
+                    ),
+                ));
+            }
+            f.all_reduce(out)?;
+        }
+        Ok(())
+    }
+
+    /// `out = Σ_routes weight · expert(hidden)` over this rank's experts and block.
+    fn combine(&self, f: &Forward, hidden: TensorView, out: TensorView) -> Result<()> {
         if self.local != self.experts || f.exchange.is_some() {
             return self.forward_expert_parallel(f, hidden, out);
         }
@@ -1878,6 +2296,8 @@ pub(super) mod tests {
 #[cfg(test)]
 mod parallel_tests {
     use super::tests::expert_parallel_block;
+    use super::{Moe, WEIGHT_SCALE_LAYOUT};
+    use ops::fp4::ScaleLayout;
 
     #[test]
     fn an_expert_parallel_block_holds_a_window_of_the_vocabulary() {
@@ -1901,5 +2321,51 @@ mod parallel_tests {
         let last = expert_parallel_block(128, 32, 96).unwrap();
         assert_eq!(last.experts(), 128);
         assert_eq!(last.local_experts(), 32);
+    }
+
+    /// The block-scale layouts each product's kernels were built for, held against the packages.
+    ///
+    /// A product's planes are read by kernels that were **compiled** with a layout for each operand,
+    /// and nothing checks the two against each other at runtime: the layouts are not options the
+    /// runner's lookup compares (`GemmOptions` carries no `SfLayout`), so a package built for one
+    /// form handed a plane in another reads every block factor at the wrong offset and answers
+    /// plausible numbers. This is the one place the two statements meet.
+    ///
+    /// `mSfLayoutA` is the **weights** and `mSfLayoutB` the **tokens** — `BatchedGemmOptions.h`
+    /// states both ("mSfLayoutA has to be R128cX", "Tokens need use SF linear layout when being
+    /// routed") — and the two families disagree about the second only.
+    #[test]
+    fn a_products_package_states_the_scale_layouts_nn_publishes() {
+        let kernels = std::path::Path::new(ops::KERNELS).to_path_buf();
+        let cases = [
+            (
+                "gather_gemm_nvfp4",
+                WEIGHT_SCALE_LAYOUT,
+                Moe::GATED_TOKEN_SCALE_LAYOUT,
+            ),
+            (
+                "route_gemm_nvfp4",
+                WEIGHT_SCALE_LAYOUT,
+                Moe::ACTIVATION_SCALE_LAYOUT,
+            ),
+        ];
+        let name = |layout: ScaleLayout| match layout {
+            ScaleLayout::Linear => "\"linear\"",
+            ScaleLayout::Swizzled128X4 => "\"swizzled_128x4\"",
+        };
+        for (operator, weights, tokens) in cases {
+            let package = kernels.join(operator).join("trtllm/package.toml");
+            let stated = std::fs::read_to_string(&package)
+                .unwrap_or_else(|error| panic!("{}: {error}", package.display()));
+            for (option, expected) in [("mSfLayoutA", name(weights)), ("mSfLayoutB", name(tokens))]
+            {
+                let line = format!("{option} = {expected}");
+                assert!(
+                    stated.contains(&line),
+                    "{operator}'s package does not state `{line}`: the kernels it publishes would \
+                     read a plane nn publishes in another form, and nothing at launch would say so"
+                );
+            }
+        }
     }
 }
