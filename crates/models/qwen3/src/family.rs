@@ -1,4 +1,4 @@
-//! The Qwen3-MoE family as execution loads it ([`nn::family`]).
+//! The Qwen3 family as execution loads it ([`nn::family`]).
 //!
 //! [`FAMILY`] claims the `Qwen3MoeForCausalLM` class. A checkpoint opens to its configuration and
 //! its quantization declaration, both read once from its sidecars; a load places the model by the
@@ -13,10 +13,12 @@ use nn::family::{
 };
 use nn::{Checkpoint, DType, WeightLoader};
 
-use crate::{Config, LoadOptions, Partition, Qwen3Moe};
 use nn::quantization::Declaration;
 
-/// The Qwen3-MoE family.
+use crate::config::MoeConfig;
+use crate::moe::{LoadOptions, Qwen3Moe};
+
+/// The Qwen3 family.
 pub const FAMILY: Family = Family::Text(&Qwen3MoeFamily);
 
 /// The family's one value, which [`FAMILY`] refers to.
@@ -28,7 +30,7 @@ impl TextFamily for Qwen3MoeFamily {
     }
 
     fn open(&self, checkpoint: &Checkpoint) -> nn::Result<Box<dyn TextCheckpoint>> {
-        let config = Config::open(checkpoint)?;
+        let config = MoeConfig::open(checkpoint)?;
         let declaration = Declaration::read(checkpoint)?;
         Ok(Box::new(Qwen3MoeCheckpoint {
             config,
@@ -39,14 +41,14 @@ impl TextFamily for Qwen3MoeFamily {
 
 /// A Qwen3-MoE checkpoint: the configuration and the quantization declaration read from it.
 struct Qwen3MoeCheckpoint {
-    config: Config,
+    config: MoeConfig,
     declaration: Declaration,
 }
 
 impl TextCheckpoint for Qwen3MoeCheckpoint {
     fn expert_layers(&self) -> std::collections::BTreeMap<String, u32> {
         let experts = self.config.num_experts;
-        crate::load::expert_modules(&self.config)
+        crate::moe::load::expert_modules(&self.config)
             .into_iter()
             .map(|module| (module, experts))
             .collect()
@@ -65,23 +67,16 @@ impl TextCheckpoint for Qwen3MoeCheckpoint {
         placement: &TextPlacement,
         experts: &ExpertOrder,
     ) -> nn::Result<Arc<dyn TextModel>> {
-        let partition = Partition::new(
-            &self.config,
-            placement.tensor.size,
-            placement.tensor.rank,
-            placement.experts.size,
-            placement.experts.rank,
-        )?;
-
         // The model's own defaults stand for the page and the attention workspace.
         let options = LoadOptions::default();
 
         // The checkpoint states its own representation: a calibrated export is read packed and a
         // dense one dense.
-        let model = crate::load::load(
+        let model = crate::moe::load::load(
             &self.config,
             &self.declaration,
-            partition,
+            placement.tensor,
+            placement.experts,
             loader,
             options,
             experts,
@@ -92,11 +87,11 @@ impl TextCheckpoint for Qwen3MoeCheckpoint {
 
 impl TextModel for Qwen3Moe {
     fn hidden(&self) -> u32 {
-        self.config().hidden_size
+        self.config().text.hidden_size
     }
 
     fn vocabulary(&self) -> u32 {
-        self.config().vocab_size
+        self.config().text.vocab_size
     }
 
     fn dtype(&self) -> DType {
@@ -104,13 +99,14 @@ impl TextModel for Qwen3Moe {
     }
 
     fn cache(&self) -> CacheShape {
-        let config = self.config();
+        let text = &self.config().text;
         CacheShape {
             page_tokens: self.page_tokens(),
-            layers: config.num_hidden_layers,
-            // A tensor rank stores the heads its attention holds.
-            kv_heads: self.partition().local_key_value_heads(config),
-            head_dim: config.head_dim,
+            layers: text.num_hidden_layers,
+            // A tensor rank stores the heads its attention holds; the load checked the split
+            // divides them.
+            kv_heads: text.num_key_value_heads / self.tensor().size,
+            head_dim: text.head_dim,
         }
     }
 

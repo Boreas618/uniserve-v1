@@ -13,7 +13,7 @@ members = [
     "crates/ipc",
     "crates/manager",
     "crates/media",
-    "crates/models/qwen3-moe",
+    "crates/models/qwen3",
     "crates/models/minimax-h3",
     "crates/nixl",
     "crates/nn",
@@ -48,7 +48,7 @@ mimalloc.workspace = true
 minimax-h3.workspace = true
 processing.workspace = true
 program-server.workspace = true
-qwen3-moe.workspace = true
+qwen3.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 storage-server.workspace = true
@@ -86,7 +86,7 @@ ipc = { path = "crates/ipc" }
 media = { path = "crates/media" }
 nn = { path = "crates/nn" }
 ops = { path = "crates/ops" }
-qwen3-moe = { path = "crates/models/qwen3-moe" }
+qwen3 = { path = "crates/models/qwen3" }
 minimax-h3 = { path = "crates/models/minimax-h3" }
 nixl = { path = "crates/nixl" }
 processing = { path = "crates/processing" }

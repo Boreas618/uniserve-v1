@@ -1,29 +1,28 @@
 //! The loading boundary of `Qwen3MoeForCausalLM`: the model's modules, read through the checkpoint's
 //! own module paths.
 //!
-//! ## What the boundary owns
-//!
 //! The family reads `config.json` and the quantization declaration once, when it opens the
 //! checkpoint; this module builds the model from them. Every module is read through a
 //! [`nn::weights::Scope`] named as the checkpoint names it (`model.layers.<i>.self_attn.q_proj`),
 //! and each `nn` layer reads its own tensors, shards itself by the deployment's split and chooses its
 //! representation from the declaration. The rotary spectrum, which no checkpoint stores, is
-//! published once for the whole stack by its [`Rotary`].
+//! published once for the whole stack by the stack's rotary.
+
 use std::collections::HashMap;
 
-use nn::blocks::{
-    AttentionKind, GateUp, GatedMlp, GatedMlpSpec, QkNormNames, QkvAttention, QkvAttentionSpec,
-};
-use nn::family::Split;
+use nn::blocks::AttentionKind;
+use nn::family::{ExpertOrder, Split};
 use nn::layers::{
-    Bias, ExpertNames, ExpertSlots, Moe, MoeSpec, ParallelLMHead, QkNorm, QkvBias, QkvNames,
-    QkvSpec, RmsNorm, Rotary, RotarySpec, Rounding, VocabParallelEmbedding,
+    ExpertNames, ExpertSlots, Moe, MoeSpec, ParallelLMHead, RmsNorm, Rounding,
+    VocabParallelEmbedding,
 };
 use nn::quantization::Declaration;
 use nn::weights::WeightLoader;
 
-use crate::model::{DecoderLayer, LoadOptions, Mlp, Qwen3Moe};
-use crate::{Config, Error, Partition, Result};
+use super::{COMPONENTS, LoadOptions, Qwen3Moe};
+use crate::config::MoeConfig;
+use crate::decoder::{DecoderStack, LayerForm};
+use crate::{Error, Result};
 
 /// The module names a Qwen3-MoE checkpoint states a routed block under: `mlp.gate` routes, and
 /// expert `e` of `mlp.experts` holds `gate_proj`, `up_proj` and `down_proj`.
@@ -35,10 +34,6 @@ const EXPERT_NAMES: ExpertNames<'static> = ExpertNames {
     down: "down_proj",
 };
 
-/// Each routed layer's logical expert ids in physical slot order, by the layer's
-/// [`expert_module`]. A layer this map does not name keeps the checkpoint's order.
-pub type ExpertOrder = std::collections::BTreeMap<String, Vec<u32>>;
-
 /// The path an [`ExpertOrder`] names the routed experts of decoder layer `layer` by:
 /// `layers.<layer>.mlp.experts`, the model's module path without the checkpoint's `model.` prefix.
 pub fn expert_module(layer: u32) -> String {
@@ -46,15 +41,16 @@ pub fn expert_module(layer: u32) -> String {
 }
 
 /// The [`expert_module`] of every routed layer of `config`, in layer order.
-pub fn expert_modules(config: &Config) -> Vec<String> {
-    (0..config.num_hidden_layers)
+pub fn expert_modules(config: &MoeConfig) -> Vec<String> {
+    (0..config.text.num_hidden_layers)
         .filter(|&layer| config.sparse(layer))
         .map(expert_module)
         .collect()
 }
 
-/// Load `checkpoint` in the representation `declaration` states about it, with the routed experts
-/// in the slots `order` states (`docs/admin.md`, Expert redistribution).
+/// Load the checkpoint `config` and `declaration` describe at the rank `tensor` and `experts`
+/// place, with the routed experts in the slots `order` states (`docs/admin.md`, Expert
+/// redistribution).
 ///
 /// `config` and `declaration` are what the family read from the checkpoint when it opened it;
 /// nothing here reads a configuration file again. The loader resolves the declaration against the
@@ -67,148 +63,90 @@ pub fn expert_modules(config: &Config) -> Vec<String> {
 /// are the graphs any later order replays over: a redistribution changes what the table's address
 /// and the stacks' addresses map, and no capture.
 pub fn load(
-    config: &Config,
+    config: &MoeConfig,
     declaration: &Declaration,
-    partition: Partition,
+    tensor: Split,
+    experts: Split,
     loader: &mut WeightLoader<'_>,
     options: LoadOptions,
     order: &ExpertOrder,
 ) -> Result<Qwen3Moe> {
-    partition.validate(config)?;
+    config.check_splits(tensor, experts)?;
     loader.declare(declaration);
     // The model reports this option to execution as its experts' encoding, so the declaration
     // decides it once here.
-    let experts_encoded = declaration.is_encoded() && config.has_sparse_layers();
     let options = LoadOptions {
-        experts_encoded,
+        experts_encoded: declaration.is_encoded() && config.has_sparse_layers(),
         ..options
     };
-    let config = config.clone();
-    let tensor = Split {
-        size: partition.tensor_parallel,
-        rank: partition.tensor_rank,
-    };
-    let experts_split = Split {
-        size: partition.expert_parallel,
-        rank: partition.expert_rank,
-    };
-
-    let q_heads = partition.local_attention_heads(&config);
-    let kv_heads = partition.local_key_value_heads(&config);
+    let text = &config.text;
 
     // The embedding and the head are vocabulary parallel over the tensor group; a tied head reads
     // the embedding's own matrix.
     let embedding = VocabParallelEmbedding::load(
         &mut loader.scope("model.embed_tokens"),
-        config.vocab_size,
-        config.hidden_size,
+        text.vocab_size,
+        text.hidden_size,
         tensor,
     )?;
     let dtype = embedding.weight().dtype();
-    let head = if config.tie_word_embeddings {
+    let head = if text.tie_word_embeddings {
         ParallelLMHead::tied(&embedding)?
     } else {
         ParallelLMHead::load(
             &mut loader.scope("lm_head"),
-            config.vocab_size,
-            config.hidden_size,
+            text.vocab_size,
+            text.hidden_size,
             tensor,
         )?
     };
-
     let norm = RmsNorm::load(
         &mut loader.scope("model.norm"),
-        config.hidden_size,
-        config.rms_norm_eps,
+        text.hidden_size,
+        text.rms_norm_eps,
     )?;
 
-    // One rotary for the stack: every layer turns its queries and keys by the same factors, and
-    // the per-head norm before the rotation is fused into it at the model's epsilon.
-    let rotary = Rotary::load(
-        &mut loader.scope("model.rotary_emb"),
-        config.rope,
-        RotarySpec {
-            head_dim: config.head_dim,
-            heads: q_heads,
-            kv_heads,
-            qk_norm: QkNorm::Fused {
-                epsilon: config.rms_norm_eps,
-            },
+    let (slots, slot_table) = expert_slots(config, order, loader)?;
+    let form = LayerForm {
+        attention: AttentionKind::Paged {
+            page_size: options.page_tokens,
+            max_kv_len: text.max_position_embeddings,
+            window: None,
         },
-    )?;
-    let score_scale = config.rope.score_scale(config.head_dim)?;
-
-    let (slots, slot_table) = expert_slots(&config, order, loader)?;
-    let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
-    for layer in 0..config.num_hidden_layers {
-        let mut scope = loader.scope(format!("model.layers.{layer}"));
-        let eps = config.rms_norm_eps;
-        let input_norm =
-            RmsNorm::load(&mut scope.scope("input_layernorm"), config.hidden_size, eps)?;
-        let post_attention_norm = RmsNorm::load(
-            &mut scope.scope("post_attention_layernorm"),
-            config.hidden_size,
-            eps,
-        )?;
-
-        let attention = QkvAttention::load(
-            &mut scope.scope("self_attn"),
-            QkvAttentionSpec {
-                qkv: QkvSpec {
-                    hidden: config.hidden_size,
-                    heads: config.num_attention_heads,
-                    kv_heads: config.num_key_value_heads,
-                    head_dim: config.head_dim,
-                },
-                names: QkvNames::Separate(["q_proj", "k_proj", "v_proj"]),
-                bias: if config.attention_bias {
-                    QkvBias::Present
-                } else {
-                    QkvBias::Absent
-                },
-                output: "o_proj",
-                output_bias: if config.attention_bias {
-                    Bias::Present
-                } else {
-                    Bias::Absent
-                },
-                qk_norm: QkNormNames::Fused {
-                    query: "q_norm",
-                    key: "k_norm",
-                },
-                kind: AttentionKind::Paged {
-                    page_size: options.page_tokens,
-                    max_kv_len: config.max_position_embeddings,
-                    window: None,
-                },
-                scale: score_scale,
-            },
-            tensor,
-        )?;
-
-        let mlp = if config.sparse(layer) {
-            let map = match &slot_table {
-                Some((table, layers)) => {
-                    let row = layers.iter().position(|routed| *routed == layer);
-                    let row = row.ok_or_else(|| {
-                        Error::Config(format!("layer {layer} has no row of the expert table"))
-                    })?;
-                    table.row(as_u64(row, "an expert table row")?)?
-                }
-                None => {
-                    return Err(Error::Config(format!(
-                        "layer {layer} routes and no routed layer has a table"
-                    )));
-                }
+        // A dense layer's SwiGLU runs in the swiglu kernel's value-product order.
+        rounding: Rounding::ValueProduct,
+        components: COMPONENTS,
+    };
+    let stack = DecoderStack::load(
+        &mut loader.scope("model"),
+        text,
+        form,
+        tensor,
+        0..text.num_hidden_layers,
+        |layer, scope| {
+            if !config.sparse(layer) {
+                return Ok(None);
+            }
+            let Some((table, routed)) = &slot_table else {
+                return Err(Error::Config(format!(
+                    "layer {layer} routes and no routed layer has a table"
+                )));
             };
-            Mlp::Experts(Moe::load(
-                &mut scope.scope("mlp"),
+            let row = routed
+                .iter()
+                .position(|routed| *routed == layer)
+                .ok_or_else(|| {
+                    Error::Config(format!("layer {layer} has no row of the expert table"))
+                })?;
+            let map = table.row(as_u64(row, "an expert table row")?)?;
+            Ok(Some(Moe::load(
+                scope,
                 MoeSpec {
                     experts: config.num_experts,
                     top: config.num_experts_per_tok,
-                    hidden: config.hidden_size,
+                    hidden: text.hidden_size,
                     intermediate: config.moe_intermediate_size,
-                    activation: config.hidden_act,
+                    activation: text.hidden_act,
                     renormalize: config.norm_topk_prob,
                 },
                 EXPERT_NAMES,
@@ -217,40 +155,21 @@ pub fn load(
                     map,
                 },
                 tensor,
-                experts_split,
-            )?)
-        } else {
-            // SwiGLU over the two projections' outputs, in the swiglu kernel's value-product
-            // order.
-            Mlp::Dense(Box::new(GatedMlp::load(
-                &mut scope.scope("mlp"),
-                GatedMlpSpec {
-                    hidden: config.hidden_size,
-                    intermediate: config.intermediate_size,
-                    activation: ops::activation::Activation::Silu,
-                    rounding: Rounding::ValueProduct,
-                    gate_up: GateUp::Split {
-                        gate: "gate_proj",
-                        up: "up_proj",
-                    },
-                    down: "down_proj",
-                    bias: Bias::Absent,
-                },
-                tensor,
+                experts,
             )?))
-        };
+        },
+    )?;
 
-        layers.push(DecoderLayer {
-            input_norm,
-            post_attention_norm,
-            attention,
-            mlp,
-        });
-    }
-
-    Qwen3Moe::new(
-        config, partition, dtype, embedding, rotary, layers, norm, head, options,
-    )
+    Ok(Qwen3Moe {
+        config: config.clone(),
+        tensor,
+        dtype,
+        embedding,
+        stack,
+        norm,
+        head,
+        options,
+    })
 }
 
 /// A count as an element count.
@@ -285,12 +204,12 @@ type SlotTable = (HashMap<u32, Vec<u32>>, Option<(nn::Weight, Vec<u32>)>);
 /// Every layer's row is one weight's row, because a retained weight takes a whole allocation
 /// granule: one table per layer would hold 2 MiB each for 512 bytes of content.
 fn expert_slots(
-    config: &Config,
+    config: &MoeConfig,
     order: &ExpertOrder,
     loader: &mut WeightLoader<'_>,
 ) -> Result<SlotTable> {
     let experts = config.num_experts;
-    let layers: Vec<u32> = (0..config.num_hidden_layers)
+    let layers: Vec<u32> = (0..config.text.num_hidden_layers)
         .filter(|&layer| config.sparse(layer))
         .collect();
     let modules = expert_modules(config);
@@ -309,7 +228,8 @@ fn expert_slots(
             Some(order) => order.clone(),
             None => (0..experts).collect(),
         };
-        // A slot is below the vocabulary, which `Config` holds in u32 and the router's I32 ids.
+        // A slot is below the vocabulary, which the configuration holds in u32 and the router's
+        // I32 ids.
         table.extend(
             slot_row(&module, &order, experts as usize)?
                 .iter()
@@ -330,9 +250,9 @@ fn expert_slots(
     )?;
     Ok((slots, Some((weight, layers))))
 }
+
 #[cfg(test)]
 mod tests {
-
     #[test]
     fn a_slot_row_inverts_the_order_it_is_read_from() {
         // Slot 0 holds expert 2, so a route to expert 2 reads slot 0.

@@ -530,7 +530,7 @@ fn load_model(
     rank: u32,
     ranks: u32,
 ) -> nn::Result<std::sync::Arc<dyn nn::family::TextModel>> {
-    let nn::family::Family::Text(family) = qwen3_moe::family::FAMILY else {
+    let nn::family::Family::Text(family) = qwen3::family::FAMILY else {
         panic!("Qwen3-MoE is a text family");
     };
     let checkpoint = Checkpoint::open(dir)?;

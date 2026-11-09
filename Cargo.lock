@@ -3285,7 +3285,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "qwen3-moe"
+name = "qwen3"
 version = "2.0.0"
 dependencies = [
  "nn",
@@ -4681,7 +4681,7 @@ dependencies = [
  "minimax-h3",
  "processing",
  "program-server",
- "qwen3-moe",
+ "qwen3",
  "rustix",
  "serde",
  "serde_json",

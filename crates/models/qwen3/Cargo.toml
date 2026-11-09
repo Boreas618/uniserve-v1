@@ -1,6 +1,6 @@
 [package]
-name = "qwen3-moe"
-description = "Qwen3MoeForCausalLM: configuration, partition and the causal-LM model"
+name = "qwen3"
+description = "The Qwen3 family: its configurations, decoder layer and stack, Qwen3MoeForCausalLM and the Qwen3 chat profile"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
