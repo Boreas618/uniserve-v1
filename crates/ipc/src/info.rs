@@ -133,7 +133,6 @@ pub struct CacheTable {
     pub held: u32,
 }
 
-
 /// The host page pool of one cache group on one rank: the Storage Server
 /// pool its pages are copied to and from, and what the pages hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -218,7 +217,6 @@ pub struct ImageEncoderOutput {
 }
 
 impl PrefixCacheInfo {
-
     /// Returns the largest block size of any group, in tokens.
     ///
     /// Every block size divides it (`validate`), so a length aligned to it is

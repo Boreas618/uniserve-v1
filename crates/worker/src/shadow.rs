@@ -88,7 +88,6 @@ impl Shadow {
         self.twins.tolerance()
     }
 
-
     /// Compares every pair of the paired forward on `stream` within `tolerance`.
     ///
     /// The stream is the one the paired forward ran on; the comparison waits for it, which is
@@ -358,7 +357,6 @@ impl Staging {
         unsafe { std::slice::from_raw_parts(self.shadow.as_ptr(), self.shadow.len()) }
     }
 }
-
 
 /// The harness's twin region, for a model that writes through it.
 pub type Region = Arc<Twins>;

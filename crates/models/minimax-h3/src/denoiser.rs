@@ -1392,8 +1392,6 @@ pub const AUDIO_CONDITION_TIME: f32 = 1.0;
 /// `std * (eps_request - eps_42)` - and the rows that disagreement lands in feed every evaluation.
 pub const POSTERIOR_SEED: u64 = 42;
 
-
-
 /// Refuse a diagnostic view whose shape is not the tensor it is meant to hold.
 fn check_trace_view(view: TensorView, rows: u64, columns: u64, name: &str) -> Result<()> {
     if view.shape.dims() != [rows, columns] {
@@ -2499,7 +2497,6 @@ impl Denoiser {
         Ok(())
     }
 
-
     /// Whether this deployment places the condition encoders.
     ///
     /// The runner asks before it offers a conditioned request: a task that carries conditions on a
@@ -2986,7 +2983,6 @@ impl Denoiser {
             trace.and_then(|t| t.refined),
         )
     }
-
 
     /// One denoising step: the latents in, the model's velocity, and the schedule's update.
     ///
@@ -3583,7 +3579,6 @@ impl Denoiser {
         &self.schedule
     }
 
-
     /// The element type the block computes in: the checkpoint's own, read from a block's gain.
     ///
     /// Not from an end projection: those four are pinned FP32 at every preset, so they would report
@@ -3595,7 +3590,6 @@ impl Denoiser {
     pub fn dtype(&self) -> DType {
         self.transformer.dtype()
     }
-
 
     /// The tables the runner fills after loading.
     ///
@@ -3747,12 +3741,8 @@ mod tests {
         };
         let schedule = Schedule::new(&config.schedule).expect("the checkpoint's schedule");
         let count = schedule.num_steps().expect("an aligned grid");
-        let steps = schedule_for(
-            &config,
-            &schedule,
-            crate::VideoTask::TextToVideoAudio,
-        )
-        .expect("the task this checkpoint serves");
+        let steps = schedule_for(&config, &schedule, crate::VideoTask::TextToVideoAudio)
+            .expect("the task this checkpoint serves");
 
         // The ladders are the schedule's own, walked once: one step per pair of sigma points, indexed
         // from zero, ending at the clean endpoint. A runner that rebuilt them from the spec would be
@@ -3772,12 +3762,8 @@ mod tests {
 
         // A task the checkpoint does not state is refused by name, and the refusal lists what it
         // does serve: every H3 task shares one grid, so the numbers alone cannot tell a wrong key.
-        let error = schedule_for(
-            &config,
-            &schedule,
-            crate::VideoTask::ReferenceToVideoAudio,
-        )
-        .expect_err("a task this checkpoint does not serve");
+        let error = schedule_for(&config, &schedule, crate::VideoTask::ReferenceToVideoAudio)
+            .expect_err("a task this checkpoint does not serve");
         let message = error.to_string();
         assert!(message.contains("ReferenceToVideoAudio"), "{message}");
         assert!(message.contains("TextToVideoAudio"), "{message}");
@@ -4613,7 +4599,6 @@ mod tests {
             crate::config::AUDIO_CHANNELS * frames
         );
     }
-
 
     #[test]
     fn the_tables_are_the_layout_s_and_the_step_is_the_worker_s_to_write() {

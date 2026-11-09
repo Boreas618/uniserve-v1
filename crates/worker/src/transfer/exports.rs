@@ -176,7 +176,6 @@ impl Exports {
         }
         Ok(locations)
     }
-
 }
 
 /// Give up the staged exports of an export that failed or is not

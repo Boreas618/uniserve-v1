@@ -30,7 +30,6 @@ pub(crate) struct CacheImport {
 }
 
 impl CacheImport {
-
     pub(crate) fn cancelled(&self) -> bool {
         self.lock().cancelled
     }
@@ -109,8 +108,6 @@ impl CacheImporter {
         lock(&self.state)
     }
 
-
-
     /// Wait only on a thread of the import pool, never on the builder or
     /// control thread. Cancellation and shutdown wake blocked workspace
     /// borrowers.
@@ -137,7 +134,6 @@ impl CacheImporter {
         }
         Ok(())
     }
-
 
     pub(crate) fn stop(&self) -> Vec<Arc<ReadRef>> {
         self.cancel_matching(|_| true, true)

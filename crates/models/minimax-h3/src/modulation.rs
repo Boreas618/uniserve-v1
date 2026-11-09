@@ -179,13 +179,10 @@ impl AdaLnCache {
         })
     }
 
-
-
     /// The timestep groups a step reads.
     pub const fn groups(&self) -> Groups {
         self.groups
     }
-
 
     /// The entry ids one step reads: `[1, groups]` i32, gathered from the entry table's `step` row.
     ///
@@ -227,9 +224,6 @@ impl AdaLnCache {
     pub fn layer_width(&self) -> u64 {
         u64::from(TAGS) * VECTORS as u64 * u64::from(self.hidden_size)
     }
-
-
-
 }
 
 /// The distinct noise levels the cache holds and the entry each step's group reads.
@@ -516,8 +510,6 @@ impl Projections {
     pub fn layers(&self) -> usize {
         self.layers.len()
     }
-
-
 }
 
 /// The sinusoidal embedding of each entry time, `[entries, frequency_dim]` FP32.

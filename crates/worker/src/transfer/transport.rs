@@ -27,9 +27,7 @@ use super::export_table::ExportTable;
 use super::pool::TransferPool;
 use super::read::{self, BorrowedReads, NativeRead, Read, ReadCall, ReadContext};
 use super::vmm::{CudaExports, Exported};
-use super::{
-    ByteReservation, ReadReservation, Retirement, Spans, TransferCapacity, notify,
-};
+use super::{ByteReservation, ReadReservation, Retirement, Spans, TransferCapacity, notify};
 use crate::memory::allocation::ElementType;
 use crate::memory::allocation::MemoryKind;
 use crate::memory::allocation::Storage;
@@ -55,7 +53,6 @@ impl TransportKind {
             Self::Channel => "channel",
         }
     }
-
 
     /// The mechanism a locator was exported through.
     pub fn of(locator: &Locator) -> Self {
@@ -579,7 +576,6 @@ pub(super) fn read_destination(
     destination.validate_destination(&shape, ElementType::parse(&locator.dtype)?, device)?;
     Ok(destination.clone())
 }
-
 
 /// The transports a rank configured, sharing one capacity and event pool.
 ///

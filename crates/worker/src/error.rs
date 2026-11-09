@@ -197,7 +197,6 @@ impl Failure {
     pub fn message(&self) -> &str {
         &self.message
     }
-
 }
 
 impl std::fmt::Display for Failure {

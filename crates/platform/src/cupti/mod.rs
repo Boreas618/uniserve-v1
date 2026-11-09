@@ -119,7 +119,6 @@ pub(crate) type Callback = unsafe extern "C" fn(*mut c_void, i32, u32, *const c_
 pub(crate) type BufferRequested = unsafe extern "C" fn(*mut *mut u8, *mut usize, *mut usize);
 pub(crate) type BufferCompleted = unsafe extern "C" fn(*mut c_void, u32, *mut u8, usize, usize);
 
-
 /// Declares the CUPTI table: one typed field per entry point. The profiling
 /// entry points are lazy (`Result`s), so that a CUPTI without them still
 /// serves the callback and activity APIs and fails only the collector that

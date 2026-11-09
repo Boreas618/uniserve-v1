@@ -88,7 +88,6 @@ impl Mrope {
         self.widths
     }
 
-
     /// The position axis of every compact frequency, in frequency order.
     ///
     /// Interleaved M-RoPE cycles the axes: frequency `j` reads axis `j % 3` while
@@ -176,7 +175,6 @@ impl VisionRotary {
         }
         Ok(Self { head_dim })
     }
-
 
     /// The compact frequencies one axis repeats: `head_dim / 4`.
     pub const fn per_axis(self) -> u32 {

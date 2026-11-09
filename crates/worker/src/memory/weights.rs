@@ -202,7 +202,6 @@ impl<S: WeightStorage> WeightStore<S> {
         });
     }
 
-
     /// How many weights this rank holds, for the metrics report and for tests.
     pub fn mapped(&self) -> usize {
         self.mapped.len()

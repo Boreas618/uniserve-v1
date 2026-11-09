@@ -120,7 +120,6 @@ impl Union {
         })
     }
 
-
     /// States where `rank` is woken, once its worker exists.
     pub fn bind(&self, rank: usize, queue: Arc<JobQueue>, runner: RunnerId) -> Result<()> {
         let slot = self
@@ -378,7 +377,6 @@ impl Member {
         self.mode = ops::moe::exchange::Mode::Fused;
         self
     }
-
 
     /// Whether this rank only holds experts: every walk it takes is a join.
     pub const fn experts_only(&self) -> bool {

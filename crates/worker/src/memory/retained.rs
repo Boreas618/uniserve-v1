@@ -669,10 +669,6 @@ impl Retained {
             .iter()
             .any(|retainer| retainer.scope == self.scope && retainer.epoch == self.epoch)
     }
-
-
-
-
 }
 
 impl ExclusiveStorage for &Retained {
@@ -1143,8 +1139,6 @@ impl Retained {
         self.release_keys(&mut state, &released, "releasing an abandoned weight load")
     }
 
-
-
     /// Takes the parts of a segmented storage: as
     /// [`ExclusiveStorage::exclusive`] takes whole ones, except that a
     /// standby leaves a part its predecessor gave back absent, and that the
@@ -1342,7 +1336,6 @@ impl Retained {
             .map_err(|error| storage_error(doing, error))?;
         Ok(())
     }
-
 }
 
 /// The name a part of a segmented storage is retained under.

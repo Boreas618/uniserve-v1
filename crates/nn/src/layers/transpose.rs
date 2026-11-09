@@ -36,7 +36,6 @@ impl Transpose {
         Ok(Self { dtype })
     }
 
-
     /// Write `source [rows, columns]` into `out [columns, rows]`.
     ///
     /// Both views are contiguous row-major matrices of the layer's type. A caller that has a batch

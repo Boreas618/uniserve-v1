@@ -89,7 +89,6 @@ impl Twins {
         self.capacity().saturating_sub(self.cursor)
     }
 
-
     /// A shadow buffer of the same geometry as `real`, recorded as its twin.
     pub fn shadow_of(&mut self, real: TensorView) -> TensorView {
         match self.carve(real.shape, real.dtype) {

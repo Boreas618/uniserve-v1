@@ -327,7 +327,10 @@ mod tests {
             )
         );
 
-        let rejected = ApiError::from(ServeError::from(InputError::invalid("size", "is not served")));
+        let rejected = ApiError::from(ServeError::from(InputError::invalid(
+            "size",
+            "is not served",
+        )));
         assert_eq!(
             rejected,
             ApiError::invalid_request("size: is not served", Some("size"))

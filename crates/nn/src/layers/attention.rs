@@ -432,7 +432,6 @@ impl Attention {
         f.operate::<DenseAttention>(&descriptor, args)
     }
 
-
     /// The elements between consecutive rows of the query a sparse call reads.
     pub const fn block(&self) -> u32 {
         self.block

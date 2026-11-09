@@ -64,7 +64,6 @@ impl AllocationHandle {
         }
     }
 
-
     /// This process's handle of the allocation: the fabric handle, or a
     /// descriptor fetched from the exporter's grant socket `endpoint`,
     /// which serves it under `export`.

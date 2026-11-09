@@ -38,7 +38,6 @@ impl PooledBuffer {
     fn new(buffer: Buffer) -> Arc<Self> {
         Arc::new(Self { buffer })
     }
-
 }
 
 impl Backing for PooledBuffer {
@@ -243,7 +242,6 @@ impl ScratchCache {
             value_initialized: plane(&self.initialized, 1, ElementType::U8)?,
         })
     }
-
 }
 
 impl PrefixCache {

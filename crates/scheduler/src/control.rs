@@ -465,7 +465,11 @@ impl Scheduler {
     /// with the worker's reason. Only the in-process arm shadows: a supplied
     /// worker runs no shadow pass, so the ask is refused there rather than
     /// left waiting for a step that cannot run it.
-    fn ask_shadow(&mut self, generation: u64, answer: crossbeam_channel::Sender<Result<(), String>>) {
+    fn ask_shadow(
+        &mut self,
+        generation: u64,
+        answer: crossbeam_channel::Sender<Result<(), String>>,
+    ) {
         if !self.worker.serves_in_process() {
             let _ = answer.send(Err(format!(
                 "the shadow pass of generation {generation} starts when a step submits through \

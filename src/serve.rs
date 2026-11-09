@@ -67,5 +67,11 @@ async fn serve(
     info!(model = %config.model(),
         resident_requests = config.max_running_requests,
         worker_executable = %config.worker_config.executable.display(), "resolved serving options");
-    daemon::serve(config, stated, crate::processing()?, crate::shutdown_signal()).await
+    daemon::serve(
+        config,
+        stated,
+        crate::processing()?,
+        crate::shutdown_signal(),
+    )
+    .await
 }

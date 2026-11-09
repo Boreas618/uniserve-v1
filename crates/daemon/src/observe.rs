@@ -137,7 +137,6 @@ impl Observer {
         };
         (counter("steps"), counter("bytes"), counter("ended"))
     }
-
 }
 
 #[cfg(test)]

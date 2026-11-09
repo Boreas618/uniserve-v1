@@ -170,7 +170,6 @@ impl Plan {
         Ok(plan)
     }
 
-
     /// The bytes one encode call of this plan reserves in the arena.
     pub fn bytes(&self, config: &TextEncoderConfig, dtype: nn::DType) -> Result<u64> {
         let bytes = Buffers::bytes(self, dtype)?;
@@ -364,7 +363,6 @@ impl Buffers {
         })
     }
 
-
     /// The bytes [`Buffers::new`] reserves.
     fn bytes(plan: &Plan, dtype: nn::DType) -> Result<u64> {
         let arena = Arena::new(DevicePtr::new(0), u64::MAX);
@@ -380,7 +378,6 @@ impl Buffers {
     ) -> Result<u64> {
         crate::vision::Buffers::bytes(config, patches, dtype)
     }
-
 
     /// `view`'s rows as `[rows, heads, head_dim]` for the rotation and attention operators.
     fn as_heads(&self, view: TensorView, heads: u32, head_dim: u32) -> Result<TensorView> {
@@ -889,13 +886,10 @@ impl TextEncoder {
         })
     }
 
-
-
     /// The element type of the encoder's activations.
     pub const fn dtype(&self) -> nn::DType {
         self.dtype
     }
-
 
     /// How many prompt tokens one encode call of `grids` covers at most: the packed tokens.
     pub fn plan(&self, tokens: u32, grids: &[[u32; 3]]) -> Result<Plan> {
@@ -952,7 +946,6 @@ impl TextEncoder {
     ) -> Result<()> {
         write_state(&self.config, prompt.ids, layout, out)
     }
-
 
     /// Sum a row-parallel projection's partial product over the group.
     fn reduce(&self, f: &Forward, view: TensorView) -> Result<()> {
@@ -1200,8 +1193,7 @@ impl TextEncoder {
     }
 }
 
-impl TextEncoder {
-}
+impl TextEncoder {}
 
 impl Encoder for TextEncoder {
     /// The layout of a batch and its images.
@@ -1779,7 +1771,6 @@ mod tests {
         // norms, two layer norms and the gated MLP's three.
         assert_eq!(keys.len(), 11 * config.num_retained_layers as usize + 1);
     }
-
 
     /// The tower's named plan is its byte plan, for a block of patches.
     #[test]

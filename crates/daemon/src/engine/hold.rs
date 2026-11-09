@@ -86,7 +86,6 @@ impl RequestHold {
         }
     }
 
-
     /// The state a request migrating out of epoch `epoch` continues with,
     /// if it keeps it.
     pub fn kept(&self, epoch: u64) -> Option<Kept> {

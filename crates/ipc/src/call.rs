@@ -54,8 +54,7 @@ pub enum ForwardMode {
     TokenDenoising,
 }
 
-impl ForwardMode {
-}
+impl ForwardMode {}
 
 /// The storage action performed between concrete producers and consumers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -70,7 +69,6 @@ pub enum TransferMode {
 impl TransferMode {
     /// Every transfer mode in declaration order.
     pub const ALL: [Self; 3] = [Self::Tensor, Self::CacheExport, Self::CacheInstall];
-
 }
 
 /// Exactly one call classification. The sum preserves the distinct
@@ -122,7 +120,6 @@ impl CallKind {
             Self::Forward(_) | Self::Media(MediaCall::LatentPreparation | MediaCall::Denoising)
         )
     }
-
 }
 
 /// Hard resource maxima the scheduler reserves before a call runs.
@@ -170,8 +167,7 @@ pub struct SamplingState {
     pub force_finish: bool,
 }
 
-impl SamplingState {
-}
+impl SamplingState {}
 
 /// The coordinates one call executes at.
 ///
@@ -556,8 +552,6 @@ impl Call {
         self.latent_input.is_some() || self.latent_output.is_some()
     }
 
-
-
     /// Tensor dependencies in the call's signature, excluding its predicate.
     ///
     /// Includes `token_input` and `latent_input`, which [`Self::buffer_inputs`]
@@ -925,7 +919,6 @@ impl MediaCall {
         Self::AudioEncoding,
         Self::Muxing,
     ];
-
 
     /// The calls that read this call's products in a video request's graph,
     /// in the order the graph consumes them.

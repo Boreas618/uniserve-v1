@@ -505,7 +505,6 @@ impl Matmul {
         })
     }
 
-
     /// The algorithms cuBLASLt proposes for `descriptor`, best first, at most
     /// `limit`, none needing more than `workspace_bytes` of workspace.
     ///

@@ -35,8 +35,6 @@ impl RmsNorm {
         })
     }
 
-
-
     /// The per-channel scale.
     pub fn weight(&self) -> TensorView {
         self.weight.view()
@@ -143,7 +141,6 @@ impl RmsNorm {
 
         f.operate::<AddRmsNorm>(&descriptor, args)
     }
-
 }
 
 /// Layer normalization with a per-channel scale and an optional bias.

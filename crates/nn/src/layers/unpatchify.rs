@@ -53,7 +53,6 @@ impl UnpatchifyVideo {
         })
     }
 
-
     /// Map `tokens` into `out`.
     ///
     /// `tokens` is `[voxels, channels · temporal · spatial²]` and `out` is

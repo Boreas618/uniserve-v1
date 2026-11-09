@@ -202,7 +202,6 @@ pub struct EngineClient {
 }
 
 impl EngineClient {
-
     /// A client of the engine read through `reader` and written through
     /// `writer`, two ends of one connection over which the engine reported
     /// itself in `state` (ready or standing by) with `info`; frames `reader`
@@ -548,8 +547,6 @@ impl EngineClient {
         }
     }
 
-
-
     /// Each worker group's KV cache segments as the engine holds them now,
     /// which an epoch succeeding it maps.
     ///
@@ -566,7 +563,6 @@ impl EngineClient {
             _ => Err("the engine answered a cache description with something else".to_owned()),
         }
     }
-
 
     /// Pin source pages, reserve target pages, or publish a completed cache
     /// transfer. A snapshot retains its pages until a matching release.
@@ -641,7 +637,6 @@ impl EngineClient {
             .unwrap_or_else(|_| Err("the engine ended before it answered".to_owned()))
             .map(Answered::results)
     }
-
 
     /// Gives back or restores the device storage of the engine's KV cache
     /// (`wire::CacheChange`), and returns what each worker reported.
@@ -1147,7 +1142,6 @@ impl EventStream {
         }
     }
 
-
     /// The request's identity in the engine that serves it.
     pub fn id(&self) -> RequestId {
         self.id
@@ -1193,7 +1187,6 @@ impl EventStream {
         }
         std::task::Poll::Ready(event)
     }
-
 
     /// Counts a received event, reports consumption to the engine, and
     /// finishes the stream on a terminal event.

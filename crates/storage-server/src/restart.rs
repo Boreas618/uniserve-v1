@@ -705,8 +705,8 @@ mod tests {
     use std::os::fd::IntoRawFd as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use ::storage::protocol::{Item, Location, Mode, TensorRecord};
     use ::storage::Client;
+    use ::storage::protocol::{Item, Location, Mode, TensorRecord};
 
     use super::*;
 

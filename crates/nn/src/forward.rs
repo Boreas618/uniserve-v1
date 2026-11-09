@@ -500,7 +500,6 @@ impl<'a> Forward<'a> {
         }
     }
 
-
     /// The arena of this forward.
     pub fn arena(&self) -> &Arena {
         self.arena

@@ -11,9 +11,9 @@
 //! the model is told how many ranks the exchange runs over, and the layer that shards a tensor
 //! reads only the degree and the rank's position in it.
 
-use nn::family::Projection;
 use crate::VideoTask;
 use nn::DType;
+use nn::family::Projection;
 
 use crate::checkpoint::TASK_DITS;
 use crate::denoiser::Arrangement;
@@ -315,7 +315,6 @@ impl Components {
     pub const fn contains(self, component: Component) -> bool {
         self.0 & (1 << component.bit()) != 0
     }
-
 
     /// The blocks placed, in deployment order.
     pub fn iter(self) -> impl Iterator<Item = Component> {
@@ -952,7 +951,6 @@ mod tests {
         };
         assert_eq!(partition.vocabulary_shard(10), (9, 10));
     }
-
 
     #[test]
     fn a_rank_holds_one_denoiser() {

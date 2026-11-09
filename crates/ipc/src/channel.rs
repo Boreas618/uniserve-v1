@@ -431,7 +431,6 @@ impl Waker {
     pub fn drain(&mut self) {
         self.local.take();
     }
-
 }
 
 /// One end of a connection that carries frames.

@@ -13,9 +13,7 @@ const CU_EVENT_WAIT_EXTERNAL: u32 = 1;
 /// What keeps a stream's (and its events') CUDA context alive.
 #[derive(Clone)]
 pub(crate) enum Retention {
-    Primary {
-        _context: PrimaryContext,
-    },
+    Primary { _context: PrimaryContext },
 }
 
 /// The capture state of a stream (`CUstreamCaptureStatus`).
@@ -154,7 +152,6 @@ impl Stream {
             retention,
         })
     }
-
 
     /// Creates an independent owned stream in this stream's context with the
     /// same priority. It retains whatever this stream retains; forking a

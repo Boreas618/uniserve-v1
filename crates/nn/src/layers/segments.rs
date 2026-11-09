@@ -138,7 +138,6 @@ impl VsaTiles {
         self.width
     }
 
-
     /// The descriptor one `vsa_add_gated_tiles` launch takes.
     pub fn add_gated_tiles_descriptor(&self, dtype: DType) -> segments::AddGatedTilesDescriptor {
         segments::AddGatedTilesDescriptor {

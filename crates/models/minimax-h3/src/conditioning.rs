@@ -533,7 +533,6 @@ impl Scratch {
             ("ffn", self.ffn),
         ]
     }
-
 }
 
 impl Rows {

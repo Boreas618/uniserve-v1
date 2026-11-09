@@ -674,8 +674,7 @@ pub struct Workspace {
     pub channels: u32,
 }
 
-impl Workspace {
-}
+impl Workspace {}
 
 /// The buffers one decode of `latent_frames` needs, in the order the stages run.
 ///
@@ -1693,11 +1692,14 @@ pub(crate) mod tests {
         let config = audio_config();
         let mut ours = BigVgan::keys(&config).expect("the decoder's keys");
         ours.sort_unstable();
-        let fixture: Vec<&str> = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/audio-decoder-names.txt"))
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .collect();
+        let fixture: Vec<&str> = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/data/audio-decoder-names.txt"
+        ))
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
         assert_eq!(fixture.len(), 914, "the recorded export's decoder half");
         let missing: Vec<&str> = fixture
             .iter()

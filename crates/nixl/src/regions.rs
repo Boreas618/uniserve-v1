@@ -94,7 +94,6 @@ impl Registration {
     pub fn region(&self) -> Region {
         self.region
     }
-
 }
 
 impl std::fmt::Debug for Registration {

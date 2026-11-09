@@ -131,7 +131,6 @@ pub struct SortArgs {
     pub local_offset: u32,
 }
 
-
 /// The call structure the package's entry receives.
 ///
 /// Mirrored by hand in `crates/ops/kernels/moe_sort/<backend>/include/uniserve_moe_sort.h`.

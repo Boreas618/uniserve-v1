@@ -36,7 +36,6 @@ impl HandleType {
         }
     }
 
-
     /// The handle type exportable allocations on `device` use: fabric if the
     /// driver can create a fabric-exportable allocation there, otherwise a
     /// file descriptor.
@@ -617,7 +616,6 @@ impl PeerMapping {
     pub fn len(&self) -> usize {
         self.bytes
     }
-
 }
 
 /// A reserved virtual range whose segments are physical allocations of
@@ -739,7 +737,6 @@ impl SegmentedMapping {
         })
     }
 
-
     /// The device address of byte 0.
     pub fn address(&self) -> u64 {
         self.address
@@ -748,7 +745,6 @@ impl SegmentedMapping {
     pub fn len(&self) -> usize {
         self.bytes
     }
-
 
     /// The segments' count.
     pub fn segments(&self) -> usize {
@@ -947,7 +943,6 @@ impl SegmentedMapping {
         self.segments[index].3 = protection;
         self.map(index, offset, bytes, handle)
     }
-
 
     /// Unmaps segment `index` and releases this process's mapped reference to
     /// its storage; the caller has drained every device access to it. The

@@ -78,7 +78,6 @@ pub fn load(
     )
 }
 
-
 /// Load a checkpoint in the representation it declares about itself.
 ///
 /// A calibrated export states its representation in its metadata (`quantization_config` in

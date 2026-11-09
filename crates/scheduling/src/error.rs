@@ -65,7 +65,6 @@ pub enum PolicyError {
 }
 
 impl PolicyError {
-
     /// A decision the mechanism found invalid, reported as a policy failure
     /// (§4.4: a decision naming an object that does not exist, does not fit or
     /// cannot be chosen is the policy's failure, not the mechanism's).

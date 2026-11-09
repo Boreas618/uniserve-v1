@@ -117,7 +117,6 @@ impl Planned {
     pub fn bytes(&self) -> u64 {
         self.ranks.iter().map(|rank| rank.bytes).max().unwrap_or(0)
     }
-
 }
 
 /// The room one device has beside what it holds.
@@ -429,7 +428,6 @@ impl DataPlane {
     pub fn poisoned(&self) -> Option<String> {
         lock(&self.poisoned).clone()
     }
-
 
     /// The target the ranks serve now.
     pub fn target(&self) -> Target {

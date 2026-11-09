@@ -43,7 +43,6 @@ impl MediaRunner {
         }
     }
 
-
     /// Verifies that the linked FFmpeg runtime provides the serving encoders.
     ///
     /// # Errors

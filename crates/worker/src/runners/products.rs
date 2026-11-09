@@ -609,7 +609,6 @@ impl Held {
     pub fn len(&self) -> usize {
         crate::lock(&self.entries).len()
     }
-
 }
 
 impl Products for Held {

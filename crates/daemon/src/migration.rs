@@ -95,7 +95,6 @@ impl Migrator {
         }
     }
 
-
     /// Submits `request` through the hold and returns its events and the
     /// scheduler serving it, as `RequestHold::submit` does. A token request
     /// that resumes from its tokens, and a video request, are kept for a
@@ -349,7 +348,6 @@ impl RequestEvents {
             on_finish: None,
         }
     }
-
 
     /// Receives the next event; `None` once the request ended.
     pub async fn recv(&mut self) -> Option<Event> {

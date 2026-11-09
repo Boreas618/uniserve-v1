@@ -70,7 +70,6 @@ impl Noise {
         }
     }
 
-
     /// Draw `out` `[rows, elements]` in its own element type.
     ///
     /// `key` is the request's, in whichever of the two forms the caller holds: per-row keys for a

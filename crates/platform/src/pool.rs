@@ -156,7 +156,6 @@ impl VirtualPool {
         })
     }
 
-
     /// Whether the pool is parked: its blocks reserve addresses but none is
     /// mapped, and every one holds a saved host copy of its contents.
     ///
@@ -186,8 +185,6 @@ impl VirtualPool {
                 .book(self.device, booking.kind, self.mapped_bytes() as u64);
         }
     }
-
-
 
     /// [`Self::allocate`], also answering with the block it gave out, so that a
     /// buffer can export it.

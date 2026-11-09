@@ -118,8 +118,6 @@ impl AudioActivation {
         Ok(self)
     }
 
-
-
     /// The descriptor a block of this geometry launches, stated without its weights.
     ///
     /// A deployment answers "which programs must be compiled for me?" before any weight is read, and

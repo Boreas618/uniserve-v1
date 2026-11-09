@@ -32,8 +32,8 @@ use std::time::Instant;
 use crate::metrics::{EngineLabels, METRICS};
 use anyhow::Context as _;
 use futures::StreamExt as _;
-use proto::request::wire;
 use proto::request::Request;
+use proto::request::wire;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
@@ -394,7 +394,6 @@ impl Leader {
         }
         Ok(results)
     }
-
 
     /// The LoRA adapter named `name` the workers hold, which a request
     /// naming it as its model computes with.
@@ -1125,7 +1124,6 @@ impl Leader {
     pub fn served_model_name(&self) -> &str {
         &self.served_model_name
     }
-
 
     /// The video service of this deployment; `None` for a model that
     /// generates no video.
@@ -3264,9 +3262,10 @@ impl Replica {
                 .map_err(UpdateError::Refused)?;
             config.model = Some(model_path.to_owned());
             config.load_config.weights = None;
-            let prepared = Leader::prepare(&self.catalogue, &config, &Stated::from_paths(Vec::new()))
-                .await
-                .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
+            let prepared =
+                Leader::prepare(&self.catalogue, &config, &Stated::from_paths(Vec::new()))
+                    .await
+                    .map_err(|error| UpdateError::Refused(format!("{error:#}")))?;
             let served = locked(&self.served)
                 .as_ref()
                 .map(|args| args.engine_config.model.clone());
@@ -3290,8 +3289,8 @@ impl Replica {
         if let Some(args) = locked(&self.served).as_mut() {
             if !streamed {
                 args.engine_config.model.model = model_path.to_owned();
-                args.engine_config.model.base = base_release(model_path)
-                    .map_err(UpdateError::Failed)?;
+                args.engine_config.model.base =
+                    base_release(model_path).map_err(UpdateError::Failed)?;
             }
             args.engine_config
                 .load

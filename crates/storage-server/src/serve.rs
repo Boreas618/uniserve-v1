@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use ::storage::connector::Settings;
 use ::storage::Client;
+use ::storage::connector::Settings;
 use anyhow::Context;
 
 use crate::transfer::storage_name;

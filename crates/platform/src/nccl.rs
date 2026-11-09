@@ -8,7 +8,6 @@ use ffi::{Handle, RawConfig, RawUniqueId, api};
 
 use crate::{DataType, DeviceId, DevicePtr, DeviceRange, Error, PrimaryContext, Result, Stream};
 
-
 /// `NCCL_SPLIT_NOCOLOR`: the colour a rank that does not join a split passes,
 /// `#define NCCL_SPLIT_NOCOLOR -1` in `nccl.h`, compared there by
 /// `tests::the_nccl_constants_are_the_headers`.
@@ -224,7 +223,6 @@ impl Communicator {
         };
         api.check(status, "ncclAllReduce")
     }
-
 
     /// Gathers `count` elements from every rank into `recv`, rank-major.
     ///
@@ -532,9 +530,6 @@ impl Communicator {
         // SAFETY: the communicator is owned and destroyed once.
         api.check(unsafe { (api.comm_destroy)(self.raw) }, "ncclCommDestroy")
     }
-
-
-
 }
 
 /// The bytes `count` elements of `dtype` occupy, without overflowing.

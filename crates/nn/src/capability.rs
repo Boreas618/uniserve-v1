@@ -138,7 +138,6 @@ impl TokenBatch {
         u64::from(self.num_tokens)
     }
 
-
     /// Check the batch's own parts against each other: the shapes a layer reads by pointer.
     ///
     /// The four index tensors are read by arithmetic inside a kernel, so a batch whose slot mapping

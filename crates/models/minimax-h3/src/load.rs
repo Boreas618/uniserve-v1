@@ -91,8 +91,6 @@ impl std::fmt::Debug for MinimaxH3 {
 }
 
 impl MinimaxH3 {
-
-
     /// The text encoder, when this rank places it.
     pub fn text_encoder(&self) -> Option<&Arc<TextEncoder>> {
         self.text_encoder.as_ref()
@@ -317,7 +315,6 @@ impl ElementTypes {
             .collect::<Vec<_>>()
             .join(", ")
     }
-
 }
 
 /// One component's stored element types as its shards state them, counted per type.

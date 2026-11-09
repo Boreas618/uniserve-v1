@@ -156,8 +156,6 @@ impl Pcm {
     }
 }
 
-
-
 /// One clip's position in the timeline, as the output stage reads it.
 ///
 /// The body is the frames the timeline keeps from this clip; the overlap is the tail the next clip
@@ -255,7 +253,6 @@ impl VideoPostprocessor {
         }
         programs.finish()
     }
-
 
     /// The frames one clip of `splice` writes, which is what [`Self::forward`]'s `out` must hold.
     pub fn frames(splice: &Splice) -> u32 {

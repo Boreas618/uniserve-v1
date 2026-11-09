@@ -206,7 +206,6 @@ impl Seams {
         self.starts.len()
     }
 
-
     /// The latent span of tile `index`: `(first, end)` in latent cells, end exclusive, over a raster
     /// whose extent is `raster` **output pixels** (the same unit `split` was given).
     pub fn latent(&self, index: usize, raster: u32, ratio: u32) -> (u32, u32) {
@@ -1333,8 +1332,6 @@ impl VideoDecoder {
         table_bytes_into(&self.config, latent_height, latent_width, out)
     }
 
-
-
     /// The rasters this decoder serves: the deployment's canvases, every one of them.
     ///
     /// The constants a decode reads are a **tile's** (its register and zero-row offsets, its sequence
@@ -1343,7 +1340,6 @@ impl VideoDecoder {
     pub fn canvases(&self) -> &[Canvas] {
         &self.canvases
     }
-
 
     /// The largest of this clip's decode tiles: every tile of a served grid has its rows.
     pub fn largest_tile(&self, canvas: &Canvas) -> Result<Canvas> {
