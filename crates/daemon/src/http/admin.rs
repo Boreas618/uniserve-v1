@@ -565,7 +565,9 @@ async fn apply_config(State(state): State<AdminState>, body: axum::body::Bytes) 
         // programs moves the main processes in place, and the epoch path would
         // answer `none` for it because its build config is unchanged (§7.2,
         // §7.3).
-        if let Some(program) = program_update(&admin, &leader, &request, body.dry_run).await? {
+        if let Some(program) =
+            Box::pin(program_update(&admin, &leader, &request, body.dry_run)).await?
+        {
             return Ok(program);
         }
         // The change's future holds the model files it resolves.

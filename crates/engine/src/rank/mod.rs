@@ -227,10 +227,10 @@ impl ModelRunner {
         // catalogue is built and long before any weight is mapped; a stated decode tier above the
         // request bound is the clamp in `Scheduler::new`, not a refusal. `tier_refusal` is where
         // that asymmetry is stated and argued.
-        if let Some(sizes) = &tokens {
-            if let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, tokens_bound) {
-                bail!("{refusal}");
-            }
+        if let Some(sizes) = &tokens
+            && let Some(refusal) = tier_refusal(rows.as_deref(), rows_bound, sizes, tokens_bound)
+        {
+            bail!("{refusal}");
         }
         let buckets = Buckets::for_batch(
             rows.as_deref(),

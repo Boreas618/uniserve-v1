@@ -616,6 +616,11 @@ impl PeerMapping {
     pub fn len(&self) -> usize {
         self.bytes
     }
+
+    /// Whether the length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// A reserved virtual range whose segments are physical allocations of
@@ -744,6 +749,11 @@ impl SegmentedMapping {
 
     pub fn len(&self) -> usize {
         self.bytes
+    }
+
+    /// Whether the length is zero.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 
     /// The segments' count.

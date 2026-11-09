@@ -218,6 +218,10 @@ fn group_over(
 /// node's workers through `worker::Batches`: the scheduler forms a batch, the worker issues
 /// it, and the scheduler reads the result - nothing crosses threads except the batch and its
 /// result.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a rank's schedulers are built from its launch, model, workers, memory and wakes"
+)]
 pub(super) fn schedulers(
     model_runner: &ModelRunner,
     launch: &EngineArgs,

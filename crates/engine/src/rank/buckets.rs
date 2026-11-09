@@ -117,13 +117,18 @@ pub(super) fn tier_refusal(
 /// device that did not state these three would refuse the first encode of every request.
 /// The one host call every rank serves: the encode of the units it decoded.
 pub(super) fn unit_phases() -> Vec<PhaseId> {
-    vec![PhaseId(
-        u16::try_from(scheduler::phase_id(scheduler::PhaseKind::VideoEncode).0)
-            .expect("a phase id fits"),
-    )]
+    vec![phase(scheduler::PhaseKind::VideoEncode)]
 }
 
 /// The phase id `kind` is planned as.
+///
+/// The scheduler numbers a phase with the epoch's `u32` and the worker names one with the wire's
+/// `u16`: the plan is where the two meet, and a kind that did not fit would be a table this
+/// process cannot state rather than a phase to serve quietly.
+#[expect(
+    clippy::expect_used,
+    reason = "the phase table is fixed and small, so a kind beyond the wire's u16 is a defect"
+)]
 pub(super) fn phase(kind: scheduler::PhaseKind) -> PhaseId {
     PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits"))
 }
@@ -138,7 +143,7 @@ pub(super) fn host_phases() -> Vec<PhaseId> {
         scheduler::PhaseKind::LatentEncoding,
     ]
     .into_iter()
-    .map(|kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits")))
+    .map(phase)
     .collect()
 }
 
@@ -180,13 +185,7 @@ pub(super) fn served_phases(buckets: &Buckets) -> Vec<PhaseId> {
     }
     kinds.sort_by_key(|kind| scheduler::phase_id(*kind).0);
     kinds.dedup();
-    kinds
-        .into_iter()
-        // The scheduler numbers a phase with the epoch's `u32` and the worker names one with the
-        // wire's `u16`: the plan is where the two meet, and a kind that did not fit would be a table
-        // this process cannot state rather than a phase to serve quietly.
-        .map(|kind| PhaseId(u16::try_from(scheduler::phase_id(kind).0).expect("a phase id fits")))
-        .collect()
+    kinds.into_iter().map(phase).collect()
 }
 
 #[cfg(test)]

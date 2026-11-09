@@ -80,10 +80,10 @@ pub(super) fn checkpoint_tokens(dir: &Path, end_of_text: Option<&str>) -> Result
             }
         }
     }
-    if let Some(end_of_text) = end_of_text {
-        if !eos.contains(&end_of_text) {
-            eos.push(end_of_text);
-        }
+    if let Some(end_of_text) = end_of_text
+        && !eos.contains(&end_of_text)
+    {
+        eos.push(end_of_text);
     }
     anyhow::ensure!(
         !eos.is_empty(),

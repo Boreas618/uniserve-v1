@@ -162,8 +162,8 @@ fn widen(dtype: DType, payload: &[u8]) -> Result<(DType, Vec<u8>)> {
         DType::I32 => Ok((DType::I32, payload.to_vec())),
         DType::BF16 => {
             let mut out = Vec::with_capacity(payload.len() * 2);
-            for pair in payload.chunks_exact(2) {
-                let value = u16::from_le_bytes([pair[0], pair[1]]);
+            for pair in payload.as_chunks::<2>().0 {
+                let value = u16::from_le_bytes(*pair);
                 out.extend_from_slice(&(u32::from(value) << 16).to_le_bytes());
             }
             Ok((DType::F32, out))

@@ -161,7 +161,9 @@ fn words(stream: &Stream, address: u64) -> Vec<u32> {
     stream.synchronize().expect("synchronize the stream");
     // SAFETY: the copy completed and the buffer holds `BYTES` readable bytes.
     unsafe { host.as_slice() }
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|word| u32::from_ne_bytes([word[0], word[1], word[2], word[3]]))
         .collect()
 }

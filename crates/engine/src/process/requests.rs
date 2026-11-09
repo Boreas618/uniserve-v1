@@ -262,37 +262,37 @@ impl MainProcess {
                 // stream that skips tokens with nothing saying so. It is refused, naming the two
                 // positions and how far behind the consumer was, so the daemon ends the response
                 // instead of serving a body with a hole in it.
-                if let (Some((oldest, _, _)), true) = (kept.front(), sent > takeover.events) {
-                    if takeover.events + 1 < *oldest {
-                        let oldest = *oldest;
-                        let behind = sent - takeover.events;
-                        tracing::error!(
-                            request = command.request,
-                            front,
-                            from = takeover.events,
-                            oldest,
-                            sent,
-                            behind,
-                            "a takeover names a position this process no longer holds: the \
+                if let (Some((oldest, _, _)), true) = (kept.front(), sent > takeover.events)
+                    && takeover.events + 1 < *oldest
+                {
+                    let oldest = *oldest;
+                    let behind = sent - takeover.events;
+                    tracing::error!(
+                        request = command.request,
+                        front,
+                        from = takeover.events,
+                        oldest,
+                        sent,
+                        behind,
+                        "a takeover names a position this process no longer holds: the \
                              consumer was more events behind than the journal kept"
-                        );
-                        self.reject(
-                            front,
-                            command.request,
-                            proto::request::RejectionKind::Overloaded,
-                            format!(
-                                "the request could not be taken over: its consumer's position \
+                    );
+                    self.reject(
+                        front,
+                        command.request,
+                        proto::request::RejectionKind::Overloaded,
+                        format!(
+                            "the request could not be taken over: its consumer's position \
                                  {} is {} event(s) behind, and this process kept the last {} of \
                                  them from position {} - the handover produced more events of \
                                  this request than a pause may",
-                                takeover.events,
-                                behind,
-                                kept.len(),
-                                oldest,
-                            ),
-                        );
-                        return Ok(());
-                    }
+                            takeover.events,
+                            behind,
+                            kept.len(),
+                            oldest,
+                        ),
+                    );
+                    return Ok(());
                 }
                 let replay = replay_after(&kept, takeover.events);
                 self.streams[index].front = front;

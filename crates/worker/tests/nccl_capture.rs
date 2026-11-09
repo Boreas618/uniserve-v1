@@ -174,7 +174,7 @@ fn fill(
 ) -> Result<(), String> {
     // SAFETY: `host` is exclusive to this thread and no copy that writes it is pending.
     let target = unsafe { host.as_mut_slice() };
-    for slot in target.chunks_exact_mut(4) {
+    for slot in target.as_chunks_mut::<4>().0 {
         slot.copy_from_slice(&value.to_le_bytes());
     }
     // SAFETY: the copy is 16 bytes from a 16-byte pinned buffer into a 16-byte allocation, and the
@@ -203,8 +203,8 @@ fn read_back(
     // SAFETY: the copy above wrote the buffer's 16 bytes and nothing else is pending.
     unsafe {
         let bytes = host.as_slice();
-        for (slot, chunk) in values.iter_mut().zip(bytes.chunks_exact(4)) {
-            *slot = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        for (slot, chunk) in values.iter_mut().zip(bytes.as_chunks::<4>().0) {
+            *slot = f32::from_le_bytes(*chunk);
         }
     }
     Ok(values)

@@ -6,6 +6,7 @@
 //! These cases state the contract from the outside — the command line a package
 //! is built with, and the artifact the main process then loads — because the
 //! two processes never share memory, only files.
+#![cfg(test)]
 
 use std::fs;
 use std::path::PathBuf;

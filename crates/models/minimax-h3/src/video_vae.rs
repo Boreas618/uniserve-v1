@@ -206,6 +206,11 @@ impl Seams {
         self.starts.len()
     }
 
+    /// Whether this axis has no tile.
+    pub fn is_empty(&self) -> bool {
+        self.starts.is_empty()
+    }
+
     /// The latent span of tile `index`: `(first, end)` in latent cells, end exclusive, over a raster
     /// whose extent is `raster` **output pixels** (the same unit `split` was given).
     pub fn latent(&self, index: usize, raster: u32, ratio: u32) -> (u32, u32) {
@@ -1654,7 +1659,7 @@ impl Decoder for VideoDecoder {
         let voxels = trajectory.numel() / channels;
         let clip = Canvas::clip(&self.config, layout.video.height, layout.video.width);
         let frames = u64::from(clip.frames);
-        if trajectory.numel() % channels != 0
+        if !trajectory.numel().is_multiple_of(channels)
             || (u64::from(first) + frames) * plane > voxels
             || trajectory.dtype != STREAM
             || block.dtype != STREAM

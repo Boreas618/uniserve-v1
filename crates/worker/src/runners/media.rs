@@ -525,7 +525,7 @@ fn planes_of(rgb: &[u8], frames: usize, height: usize, width: usize) -> Vec<u8> 
             scope.spawn(move || {
                 for (first, red, green, blue) in bands {
                     let pixels = &rgb[*first * 3..(*first + red.len()) * 3];
-                    for (index, pixel) in pixels.chunks_exact(3).enumerate() {
+                    for (index, pixel) in pixels.as_chunks::<3>().0.iter().enumerate() {
                         red[index] = pixel[0];
                         green[index] = pixel[1];
                         blue[index] = pixel[2];
@@ -698,6 +698,8 @@ fn read_conditions(
             // SAFETY: nothing reads the region before this call publishes it, and it was allocated
             // for this request alone.
             let floats = unsafe { region.as_mut_slice() };
+            // SAFETY: every bit pattern is a valid f32, so the region's bytes may be viewed as
+            // f32; the allocation is page aligned, so the aligned middle is the whole region.
             let (_, floats, _) = unsafe { floats.align_to_mut::<f32>() };
             condition_rows(format, source, frames, canvas, &mut floats[pixels_at..])?;
             pixels_at += source.len();
@@ -711,6 +713,8 @@ fn read_conditions(
                 .ok_or_else(|| crate::Error::Invalid("a track has no region".into()))?;
             // SAFETY: as for the pixels above.
             let floats = unsafe { region.as_mut_slice() };
+            // SAFETY: every bit pattern is a valid f32, so the region's bytes may be viewed as
+            // f32; the allocation is page aligned, so the aligned middle is the whole region.
             let (_, floats, _) = unsafe { floats.align_to_mut::<f32>() };
             format.track(
                 &pcm[read.samples.start * 2..read.samples.end * 2],

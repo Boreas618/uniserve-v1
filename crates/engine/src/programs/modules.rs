@@ -32,7 +32,7 @@ impl HostAction for ListStore {
         let mut client = self
             .programs
             .lock()
-            .map_err(|_| worker::Error::State("the Program Server client was poisoned".into()))?;
+            .map_err(|_| worker::Error::State("the Program Server client was poisoned"))?;
         let listing = client.list().map_err(|error| {
             worker::Error::Invalid(format!("reading the Program Server's store: {error}"))
         })?;
@@ -776,7 +776,7 @@ impl HostAction for Install {
         let mut client = self
             .programs
             .lock()
-            .map_err(|_| worker::Error::State("the Program Server client was poisoned".into()))?;
+            .map_err(|_| worker::Error::State("the Program Server client was poisoned"))?;
         let mut entries = Vec::new();
         let mut copies = 0_usize;
         let mut prepared: Vec<(String, usize)> = Vec::new();

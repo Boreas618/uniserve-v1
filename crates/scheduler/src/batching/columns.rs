@@ -189,7 +189,7 @@ pub(crate) fn columns(
             return None;
         }
 
-        let first = u32::try_from(call.coordinates.logical_position).ok()?;
+        let first = call.coordinates.logical_position;
         rows.positions
             .extend(slots::positions_of(first, tokens_of_call)?);
 
@@ -396,7 +396,9 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> ::worker::plan::Shape {
     let variant = if prefill {
         let mut endings = columns
             .parameters
-            .chunks_exact(SAMPLER_PARAMETERS)
+            .as_chunks::<SAMPLER_PARAMETERS>()
+            .0
+            .iter()
             .zip(&columns.rows.logits_rows)
             .filter(|(_, row)| **row >= 0)
             .peekable();
@@ -409,7 +411,9 @@ pub(crate) fn batch_shape(columns: &BatchColumns) -> ::worker::plan::Shape {
         }
     } else if columns
         .parameters
-        .chunks_exact(SAMPLER_PARAMETERS)
+        .as_chunks::<SAMPLER_PARAMETERS>()
+        .0
+        .iter()
         .all(|row| row[TEMPERATURE_COLUMN] == 0.0)
     {
         Variant::DecodeGreedy

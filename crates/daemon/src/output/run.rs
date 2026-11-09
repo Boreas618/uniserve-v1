@@ -354,13 +354,13 @@ impl<S: ResponseSink> GenerationRun<S> {
         } = inputs;
         let stream = DecodeStream::new(
             request_id.clone(),
-            tokenizer.clone(),
+            std::sync::Arc::clone(&tokenizer),
             prompt_token_ids.clone(),
             prompt_logprobs,
             logprobs,
             decode,
         )?;
-        let created = (unix_us() / 1_000_000) as u64;
+        let created = unix_us() / 1_000_000;
         let started = outcome.started();
         Ok(Self {
             request_id,
@@ -546,13 +546,13 @@ impl<S: ResponseSink> GenerationRun<S> {
             .as_ref()
             .map(decode_options)
             .unwrap_or_default();
-        let parser = lowering.parser.clone().unwrap_or_default();
+        let parser = lowering.parser.unwrap_or_default();
         let kind = handoff::parser::Kind::try_from(parser.kind)
             .unwrap_or(handoff::parser::Kind::ParserKindNone);
         let mut processor = match kind {
             handoff::parser::Kind::ParserKindQwen3 => ChatOutputProcessor::qwen3(
                 parser.parse_tools.then_some(&[][..]),
-                tokenizer.clone(),
+                std::sync::Arc::clone(&tokenizer),
                 parser.parse_reasoning,
             )?,
             handoff::parser::Kind::ParserKindNone => ChatOutputProcessor::new(None, None),
@@ -562,7 +562,7 @@ impl<S: ResponseSink> GenerationRun<S> {
         }
         let decode = DecodeStream::resume(
             request_id.clone(),
-            tokenizer.clone(),
+            std::sync::Arc::clone(&tokenizer),
             lowering.prompt_token_ids.clone(),
             lowering.prompt_logprobs,
             lowering.logprobs,
@@ -609,10 +609,10 @@ impl<S: ResponseSink> GenerationRun<S> {
         let (consumed_events, consumed_tokens) = self.events.progress();
         let lowering = handoff::Lowering {
             prompt_token_ids: self.prompt_token_ids.clone(),
-            decode_options: Some(decode_state(&self.decode.options())),
+            decode_options: Some(decode_state(self.decode.options())),
             prompt_logprobs: self.prompt_logprobs,
             logprobs: self.logprobs,
-            parser: Some(self.parser.clone()),
+            parser: Some(self.parser),
             response: Some(handoff::ChatResponseOptions {
                 created: self.created,
                 ..handoff::ChatResponseOptions::from(&self.context)
@@ -902,6 +902,10 @@ impl<M: AsRef<[u8]> + Send + Sync + 'static> VideoContentRun<M> {
 
     /// The same body, going on at the byte `offset` the process that handed
     /// it over reached.
+    #[expect(
+        clippy::wrong_self_convention,
+        reason = "the reader is handed back resumed from the offset, as a builder step"
+    )]
     pub(crate) fn from_offset(mut self, offset: usize) -> Self {
         self.offset = offset.min(self.media.as_ref().as_ref().len());
         self

@@ -239,6 +239,10 @@ impl MainProcess {
     /// forward says which ones it launches. So the first generation starts with the keys already
     /// learned and finds the rest by walking - each attempt that finds a kernel missing names the
     /// operator and key it needed, and the install is admitted again with that key added.
+    #[expect(
+        clippy::type_complexity,
+        reason = "the modules to fetch and the cell they leave unavailable are one answer"
+    )]
     pub(super) fn admit_installs(
         &mut self,
         programs: &Programs,

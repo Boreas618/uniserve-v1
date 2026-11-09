@@ -141,10 +141,6 @@ impl Mapping {
 /// partition, a projection this stack does not implement is refused rather than served at degree
 /// one, and a mode that is not Ulysses is refused by name because the denoiser's sequence exchange
 /// is Ulysses' alone.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the page, the rank's place in it, and the components the checkpoint names"
-)]
 pub(super) fn video_split(
     groups: Option<&[scheduler::WorkerGroupConfig]>,
     group: &str,

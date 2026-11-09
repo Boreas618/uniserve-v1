@@ -459,7 +459,12 @@ impl Daemon {
         if let Some(table) = &self.table {
             epochs.attach_processes(Arc::clone(table));
         }
-        let roster = roster::ProcessRoster::new(epochs.clone(), deployment, Vec::new(), link);
+        let roster = roster::ProcessRoster::new(
+            std::sync::Arc::clone(&epochs),
+            deployment,
+            Vec::new(),
+            link,
+        );
         Some((
             Arc::new(crate::updates::driver::Driver::new(
                 epochs,
@@ -793,6 +798,10 @@ mod tests {
 impl ProcessCommands {
     /// The ends an epoch-layer test needs: the commands the adapter sends
     /// down to a peer, and the way a test plays a peer's reports up.
+    #[expect(
+        clippy::type_complexity,
+        reason = "a test plays both ends of the link, and the pair is those ends, once"
+    )]
     pub(crate) fn pair() -> (
         Self,
         std::sync::mpsc::Receiver<(u64, proto::process::Command)>,
