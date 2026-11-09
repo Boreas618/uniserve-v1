@@ -30,7 +30,9 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_kv_bf16_page_64_heads_4_head_dim_128_tile_128_pdl_false`.
+#
+# `page`, `heads` and `head_dim` are launch words; the tile is a `tl.arange` extent.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], kv = ["bf16", "f16", "f32"], page = ["64", "16", "32", "128"], heads = ["4", "8", "1", "2"], head_dim = ["128", "64", "256"], tile = ["128", "256", "512", "1024"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], kv = ["bf16", "f16", "f32"], page = { min = 1 }, heads = { min = 1 }, head_dim = { min = 1 }, tile = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

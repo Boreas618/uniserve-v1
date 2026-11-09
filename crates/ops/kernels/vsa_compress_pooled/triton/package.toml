@@ -31,15 +31,11 @@ script = "src/build.py"
 target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
-# `dtype_bf16_heads_56_width_128_max_tiles_640_block_128_pdl_false`.
-#
-# 640 is the tile count of the deployment's longest sparse reduction: 40960 keys at the sparse
-# path's 64-key tiles. The wider bound is the same arithmetic for a longer clip, and both are
-# compiled because the tile count is the tolerance's reduction length.
+# `dtype_bf16_heads_56_width_128_max_tiles_1024_block_128_pdl_false`.
 [kernel.descriptors]
-# `max_tiles` is a **class**, not a count: the package compiles the reduction to the bound's next
-# power of two, so 640 and 1024 are one module and the key names 1024. The declared values are the
-# powers of two a deployment can land in, not the tile counts it may state.
-dimensions = { dtype = ["bf16", "f16", "f32"], heads = ["56", "14"], width = ["128"], max_tiles = ["1024", "2048", "4096", "512", "256", "8192"], block = ["128"], pdl = ["false", "true"] }
+# `max_tiles` is a **class**, not a count: the key names the bound's next power of two, so a bound
+# of 640 tiles and one of 1024 are one module. `block` is a `tl.arange` extent; `heads` and `width`
+# compile for any positive value, the lanes past `width` masked.
+dimensions = { dtype = ["bf16", "f16", "f32"], heads = { min = 1 }, width = { min = 1 }, max_tiles = { power_of_two = true }, block = { power_of_two = true }, pdl = ["false", "true"] }
 
 [parameters]

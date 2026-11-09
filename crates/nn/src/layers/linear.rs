@@ -186,9 +186,9 @@ pub struct Nvfp4Linear {
 /// request's rows**, and the caller pads its buffers to that class — the same division the sparse
 /// attention states for a partial tile: the padding belongs to the caller, the tile to the module.
 ///
-/// The five classes are the set `nvfp4_gemm/cute_dsl/package.toml` declares, and the last holds the
-/// longest prefill chunk a build admits. A class here without a cell there is a launch with no
-/// program, and a cell there without a class here is a program no launch states.
+/// Each class is a whole number of the module's 128-row output tiles, which is what
+/// `nvfp4_gemm/cute_dsl/package.toml` admits for `m`; five classes bound the modules a deployment
+/// compiles per product, and the last holds the longest prefill chunk a build admits.
 pub const PACKED_M_CLASSES: [u32; 5] = [128, 256, 1024, 4096, 16384];
 
 /// The packed product's row class for `rows` activation rows: the smallest declared class that
@@ -713,8 +713,8 @@ mod tests {
 
     #[test]
     fn the_class_is_the_smallest_declared_one_that_holds_the_rows() {
-        // The classes are the set the package declares, and a request lands in the smallest that
-        // holds it: a decode of 1 or 15 rows is the 128-row tile, 129 is the 256-row one.
+        // A request lands in the smallest class that holds it: a decode of 1 or 15 rows is the
+        // 128-row tile, 129 is the 256-row one.
         for (rows, class) in [
             (1, 128),
             (15, 128),
@@ -830,7 +830,7 @@ mod tests {
     /// The encoder's tile divides the row it encodes.
     ///
     /// The package refuses a tile that does not divide the row, so this is not a preference: a row
-    /// of 768 against a requested 1024 must state 256, which is the cell `nvfp4_quantize` declares.
+    /// of 768 against a requested 1024 must state 256.
     /// Both halves are asserted — the tile divides, and it is the largest power of two that does —
     /// because a smaller tile than necessary is a different key and a different program.
     #[test]

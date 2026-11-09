@@ -11,7 +11,8 @@
 # `dtype_bf16_width_3072_block_4096_value_stride_3072_gate_stride_3072_value_bias_true_gate_bias_true_absmax_false`.
 #
 # The row strides are whole multiples of the row width: each half is written by
-# its own projection. The values narrow to the keys `model` publishes for H3.
+# its own projection. The width and both strides are compiled in for any
+# positive value; the block is a `tl.arange` extent, so a power of two.
 
 op = "swiglu"
 backend = "triton"
@@ -35,6 +36,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], width = ["1024", "1536", "2048", "3072", "4096", "6144", "7168", "8192", "12288", "16384"], block = ["1024", "2048", "4096", "8192", "32768"], value_stride = ["1024", "1536", "2048", "3072", "4096", "4608", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152", "65536", "73728", "98304"], gate_stride = ["1024", "1536", "2048", "3072", "4096", "4608", "6144", "7168", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152", "65536", "73728", "98304"], value_bias = ["true", "false"], gate_bias = ["true", "false"], absmax = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], width = { min = 1 }, block = { power_of_two = true }, value_stride = { min = 1 }, gate_stride = { min = 1 }, value_bias = ["true", "false"], gate_bias = ["true", "false"], absmax = ["true", "false"] }
 
 [parameters]

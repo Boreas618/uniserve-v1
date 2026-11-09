@@ -1,6 +1,6 @@
 # The sparse_attention operator's SM120 backend: design 5.2's program package.
 #
-# One native module per descriptor: H3's Video Sparse Attention on SM120/SM121, through
+# One native module per descriptor: Video Sparse Attention on SM120/SM121, through
 # FlashInfer's CuTe DSL block-sparse kernel (`BlockSparseAttnForwardSm120Blk64`). The vendor
 # ships the kernel and a torch-shaped wrapper; this package drives the kernel once at build
 # time with fake tensors on the CPU, exports it to C, and fills the generated structs from the

@@ -31,6 +31,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["128", "256", "512", "1024", "2048"], block = ["256", "512", "1024", "2048", "4096"], residual = ["true", "false"], residual_bias = ["true", "false"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = { min = 1 }, block = { power_of_two = true }, residual = ["true", "false"], residual_bias = ["true", "false"], pdl = ["true", "false"] }
 
 [parameters]

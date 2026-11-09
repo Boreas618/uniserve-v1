@@ -45,8 +45,12 @@ architectures = ["sm_100a", "sm_100f"]
 # sixteen elements of the head dimension per key, per head and per page, and the
 # operator's call carries one FP32 scale per page, so the module could not read
 # the scales the kernel asks for.
+#
+# `head_dim` and `page` select the artifact's cubins, which exist for the listed
+# values; the head counts are call words the entry checks and `len` changes no
+# program.
 [kernel.descriptors]
-dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = ["32", "24", "16", "8"], kv_heads = ["4", "8", "2", "1"], mask = ["causal", "dense"], window = ["false"], len = ["40960"] }
+dimensions = { phase = ["decode", "prefill"], dtype = ["bf16", "f16"], kv = ["bf16", "f16"], out = ["bf16", "f16"], head_dim = ["128", "64", "256"], page = ["64", "16", "32"], q_heads = { min = 1 }, kv_heads = { min = 1 }, mask = ["causal", "dense"], window = ["false"], len = { min = 1 } }
 
 [parameters]
 # The trtllm-gen artifact: the pin its manifest is hashed by.

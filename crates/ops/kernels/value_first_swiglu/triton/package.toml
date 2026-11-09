@@ -12,8 +12,9 @@
 # `dtype_bf16_width_3072_block_4096_input_stride_6144_bias_true_absmax_false`.
 #
 # The packed row stride is the row width times a whole number: the projection
-# writes both halves into one buffer, often beside other projections. The values
-# narrow to the keys `model` publishes.
+# writes both halves into one buffer, often beside other projections. The width
+# and the stride take any positive value (the module states sixteen-element
+# alignment only when both are multiples of sixteen); the block is a power of two.
 
 op = "value_first_swiglu"
 backend = "triton"
@@ -37,6 +38,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], width = ["1024", "1536", "2048", "3072", "4096", "6144", "7168", "8192", "12288", "14336", "16384"], block = ["1024", "2048", "4096", "8192", "32768"], input_stride = ["2048", "3072", "4096", "4608", "6144", "8192", "9216", "12288", "14336", "16384", "18432", "21504", "24576", "28672", "32768", "36864", "43008", "49152", "57344", "65536", "73728", "98304", "131072"], bias = ["true", "false"], absmax = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], width = { min = 1 }, block = { power_of_two = true }, input_stride = { min = 1 }, bias = ["true", "false"], absmax = ["true", "false"] }
 
 [parameters]

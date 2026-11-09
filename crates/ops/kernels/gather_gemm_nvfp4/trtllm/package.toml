@@ -44,8 +44,12 @@ architectures = ["sm_100a", "sm_100f"]
 # options a kernel must have been built with. The BF16-output gated kernels of this
 # artifact all carry a per-expert, per-column f32 bias (`mBiasType = M`); this operator
 # has none, and the entry hands them a null pointer, which the runner takes as no bias.
+# The widths are the runner's problem size. A weight's rows are whole 128-row tiles of the
+# shuffled gated matrix, `2 * intermediate` a multiple of 256, and the contraction's
+# block scales are whole 128x4 atoms, `hidden` a multiple of 64; the runner refuses at launch
+# a size no published tactic divides.
 [kernel.descriptors]
-dimensions = { hidden = ["2048", "7168", "4096"], intermediate = ["768", "14336", "1536"], experts = ["128", "256", "64"], top = ["8", "4", "2"], activation = ["silu", "gelu_tanh"], dtype = ["bf16"], scale = ["f8e4m3", "u8"], layout = ["swizzled_128x4", "linear"], tile = ["128x8", "128x16", "128x32", "128x64", "128x128", "128x192", "128x256"], cluster = ["1x1", "2x1", "1x2"] }
+dimensions = { hidden = { multiple = 64 }, intermediate = { multiple = 128 }, experts = { min = 1 }, top = { min = 1 }, activation = ["silu", "gelu_tanh"], dtype = ["bf16"], scale = ["f8e4m3", "u8"], layout = ["swizzled_128x4", "linear"], tile = ["128x8", "128x16", "128x32", "128x64", "128x128", "128x192", "128x256"], cluster = ["1x1", "2x1", "1x2"] }
 
 [parameters]
 # The trtllm-gen batched-GEMM artifact: the pin its manifest is hashed by, and the

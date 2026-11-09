@@ -33,6 +33,6 @@ architectures = ["sm_100a", "sm_90a"]
 # The affine form is its own program because its launch carries two more pointers; everything else
 # the operator reads — the channels, the token grid and the patch — travels as words, so one module
 # of a form serves every raster.
-dimensions = { dtype = ["bf16", "f16", "f32"], affine = ["true", "false"], block = ["1024"], pdl = ["false"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], affine = ["true", "false"], block = { power_of_two = true }, pdl = ["false"] }
 
 [parameters]

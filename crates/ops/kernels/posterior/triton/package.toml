@@ -37,6 +37,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
 [kernel.descriptors]
-dimensions = { block = ["1024"], pdl = ["true", "false"] }
+dimensions = { block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

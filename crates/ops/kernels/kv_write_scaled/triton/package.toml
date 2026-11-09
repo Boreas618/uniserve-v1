@@ -35,7 +35,9 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_scale_f32_page_64_heads_4_head_dim_128_block_128_pdl_false`.
+#
+# `page`, `heads` and `head_dim` are launch words; the block is a `tl.arange` extent.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f32"], scale = ["f32"], page = ["64", "16", "32", "128"], heads = ["4", "8", "1", "2"], head_dim = ["128", "64", "256"], block = ["128", "256", "512", "1024"], pdl = ["true", "false"] }
+dimensions = { dtype = ["bf16", "f32"], scale = ["f32"], page = { min = 1 }, heads = { min = 1 }, head_dim = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

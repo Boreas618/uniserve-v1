@@ -1,6 +1,6 @@
 # The sparse_attention operator's SM90 backend: design 5.2's program package.
 #
-# One native module per descriptor: H3's Video Sparse Attention, attention over the key
+# One native module per descriptor: Video Sparse Attention, attention over the key
 # blocks a caller selected (`ops::attention::sparse::SparseCall`, 704 bytes), on Hopper.
 # The kernel is the warpgroup-pipelined SM90a block-sparse forward pass carried verbatim in
 # this package's sources; this package owns the operator's side — the call structure, the

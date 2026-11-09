@@ -30,7 +30,9 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `field_key_source_f8e4m3_compute_bf16_head_dim_128_heads_1_layers_32_scaled_true`.
+#
+# `head_dim` is a `tl.arange` extent; the head and layer counts compile for any positive value.
 [kernel.descriptors]
-dimensions = { field = ["key", "value"], source = ["f8e4m3", "bf16"], compute = ["bf16", "f16", "f32"], head_dim = ["128", "64"], heads = ["1", "4"], layers = ["32"], scaled = ["true", "false"] }
+dimensions = { field = ["key", "value"], source = ["f8e4m3", "bf16"], compute = ["bf16", "f16", "f32"], head_dim = { power_of_two = true }, heads = { min = 1 }, layers = { min = 1 }, scaled = ["true", "false"] }
 
 [parameters]

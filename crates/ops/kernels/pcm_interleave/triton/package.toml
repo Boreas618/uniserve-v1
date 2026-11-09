@@ -35,6 +35,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
 [kernel.descriptors]
-dimensions = { dtype = ["f32"], block = ["256", "512", "1024", "2048"], pdl = ["true", "false"] }
+dimensions = { dtype = ["f32"], block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

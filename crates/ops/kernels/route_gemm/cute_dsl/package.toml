@@ -29,8 +29,11 @@ target = "arch"
 architectures = ["sm_100a"]
 
 # `hidden_2048_intermediate_768_experts_128_top_8_dtype_bf16_tile_128x128_cluster_1x1`.
+# `tile` and `cluster` are the MMA shapes the kernel is written for. The widths are launch
+# values whose rows the tensor-memory loads and the bulk-copy epilogue need on 16-byte
+# bounds: `hidden` and `intermediate` are multiples of 8 elements.
 [kernel.descriptors]
-dimensions = { hidden = ["2048", "7168", "4096"], intermediate = ["768", "1536", "512", "384", "192"], experts = ["128", "256", "64"], top = ["8", "4", "2"], dtype = ["bf16"], tile = ["128x128", "256x128", "128x256", "256x256"], cluster = ["1x1", "2x1", "1x2", "2x2"] }
+dimensions = { hidden = { multiple = 8 }, intermediate = { multiple = 8 }, experts = { min = 1 }, top = { min = 1 }, dtype = ["bf16"], tile = ["128x128", "256x128", "128x256", "256x256"], cluster = ["1x1", "2x1", "1x2", "2x2"] }
 
 [parameters]
 # The representative problem the compile describes: the metadata and the output

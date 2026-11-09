@@ -32,7 +32,8 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `scores_bf16_experts_128_top_8_renormalize_true_scale_none`.
+# The module compiles for any expert count and top-k width it bakes in.
 [kernel.descriptors]
-dimensions = { scores = ["bf16", "f16", "f32"], experts = ["128", "256", "64", "32"], top = ["8", "4", "2", "1"], renormalize = ["true", "false"], scale = ["none", "bf16", "f16", "f32"] }
+dimensions = { scores = ["bf16", "f16", "f32"], experts = { min = 1 }, top = { min = 1 }, renormalize = ["true", "false"], scale = ["none", "bf16", "f16", "f32"] }
 
 [parameters]

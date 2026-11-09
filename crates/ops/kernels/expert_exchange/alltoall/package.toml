@@ -51,7 +51,11 @@ target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
 # `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_8192_ranks_2_attention_0_dtype_bf16`.
+# Every extent is a launch value the kernels read from the call, so one object serves any of
+# them; `src/exchange.cu`'s create refuses a row that is not whole 16-byte vectors (`hidden`
+# a multiple of 8 two-byte elements), more than 64 ranks or more than 32 routes per token.
+# `intermediate` is the key's, not the exchange's. The backend has no attention ranks.
 [kernel.descriptors]
-dimensions = { mode = ["dispatch", "combine"], hidden = ["2048", "7168", "4096"], intermediate = ["768", "1536", "512"], top = ["8", "4", "2"], experts = ["128", "256", "64"], max_tokens = ["512", "8192", "4096", "16384"], ranks = ["1", "2", "4", "8"], attention = ["0"], dtype = ["bf16", "f16"] }
+dimensions = { mode = ["dispatch", "combine"], hidden = { multiple = 8 }, intermediate = { min = 1 }, top = { min = 1, max = 32 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1, max = 64 }, attention = ["0"], dtype = ["bf16", "f16"] }
 
 [parameters]

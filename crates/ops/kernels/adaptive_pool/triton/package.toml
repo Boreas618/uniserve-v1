@@ -38,9 +38,8 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a", "sm_100f"]
 
 [kernel.descriptors]
-# The checkpoint's own numbers narrow: 8 heads of 256 elements pooled to the audio
-# latent's 32 channels. The other values are the same pool at other widths, which is
-# what a second decoder scale would ask for.
-dimensions = { dtype = ["f16", "bf16", "f32"], heads = ["8", "16"], width = ["256"], output = ["32", "64"], block = ["1024"], pdl = ["true", "false"] }
+# The program unrolls any head count and window, so the three extents are any
+# positive integers; `block` is a `tl.arange` extent, so a power of two.
+dimensions = { dtype = ["f16", "bf16", "f32"], heads = { min = 1 }, width = { min = 1 }, output = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

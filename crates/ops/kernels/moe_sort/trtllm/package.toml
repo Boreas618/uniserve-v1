@@ -42,7 +42,9 @@ target = "arch"
 architectures = ["sm_100a", "sm_100f"]
 
 # `experts_128_top_8_local_128_tile_128_scales_f32`.
+# Every extent is a launch value. One block's shared memory holds 18 counters per local
+# expert within 46 KiB, which bounds `local` at 654 (`src/routing.cu`).
 [kernel.descriptors]
-dimensions = { experts = ["128", "256", "64"], top = ["8", "4", "2"], local = ["128", "256", "64"], tile = ["128", "64", "256"], scales = ["f32", "bf16", "f16"], counted = ["true"] }
+dimensions = { experts = { min = 1 }, top = { min = 1 }, local = { min = 1, max = 654 }, tile = { min = 1 }, scales = ["f32", "bf16", "f16"], counted = ["true"] }
 
 [parameters]

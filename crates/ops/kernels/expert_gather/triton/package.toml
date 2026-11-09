@@ -28,8 +28,10 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 # `experts_128_top_8`.
+# The program maps a flat run of picks, so the expert count and the top-k width name the
+# key and constrain nothing it compiles.
 [kernel.descriptors]
-dimensions = { experts = ["128", "256", "64", "32"], top = ["8", "4", "2", "1"] }
+dimensions = { experts = { min = 1 }, top = { min = 1 } }
 
 [parameters]
 # Picks one program maps.

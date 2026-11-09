@@ -386,7 +386,8 @@ fn every_shipping_package_declares_its_toolchain_version(
 }
 
 /// The expert exchange's topology is a descriptor dimension, so a module built for one group size
-/// is never resolved for another.
+/// is never resolved for another. Whether a group divides the experts relates two dimensions, which
+/// the exchange's create checks for the call rather than the manifest for the key.
 fn the_exchange_keeps_its_group_sizes_apart(kernels: &Path) -> Result<(), String> {
     let package = kernels.join("expert_exchange/alltoall");
     let manifest =
@@ -404,12 +405,6 @@ fn the_exchange_keeps_its_group_sizes_apart(kernels: &Path) -> Result<(), String
                 "the package does not build the module of a group of {ranks} ranks"
             ));
         }
-    }
-    if manifest.covers(&key(3)) {
-        failures.push(
-            "a group of 3 ranks, which the vocabulary does not divide into, has a module"
-                .to_owned(),
-        );
     }
     joined(failures)
 }

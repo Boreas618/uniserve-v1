@@ -31,6 +31,6 @@ target = "arch"
 architectures = ["sm_100a", "sm_90a"]
 
 [kernel.descriptors]
-dimensions = { mode = ["upsample", "downsample"], dtype = ["f32", "bf16", "f16"], channels = ["8", "16", "32", "64", "128", "256", "512", "1024", "1536", "2048"], kernel = ["12", "16", "24"], ratio = ["2", "4", "6"], block = ["256", "512", "1024"], pdl = ["true", "false"] }
+dimensions = { mode = ["upsample", "downsample"], dtype = ["f32", "bf16", "f16"], channels = { min = 1 }, kernel = { min = 1 }, ratio = { min = 1 }, block = { power_of_two = true }, pdl = ["true", "false"] }
 
 [parameters]

@@ -31,6 +31,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_channels_1152_in_side_48_block_1024_pdl_false`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["1152"], in_side = ["48"], block = ["1024"], pdl = ["false", "true"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = { min = 1 }, in_side = { min = 1 }, block = { power_of_two = true }, pdl = ["false", "true"] }
 
 [parameters]

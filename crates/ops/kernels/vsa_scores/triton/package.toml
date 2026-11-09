@@ -29,6 +29,8 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_bf16_heads_56_width_128_block_128_pdl_false`.
 [kernel.descriptors]
-dimensions = { heads = ["56", "14"], width = ["128"], block = ["128", "256"], pdl = ["false", "true"] }
+# `block` is a `tl.arange` extent; `heads` and `width` compile for any positive value, the lanes past
+# `width` masked.
+dimensions = { heads = { min = 1 }, width = { min = 1 }, block = { power_of_two = true }, pdl = ["false", "true"] }
 
 [parameters]

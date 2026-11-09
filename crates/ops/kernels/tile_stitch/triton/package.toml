@@ -28,6 +28,6 @@ architectures = ["sm_100a", "sm_90a"]
 
 # `dtype_f16_channels_3_patch_frames_4_patch_side_16_block_1024`.
 [kernel.descriptors]
-dimensions = { dtype = ["bf16", "f16", "f32"], channels = ["3"], patch_frames = ["4"], patch_side = ["16"], block = ["1024"] }
+dimensions = { dtype = ["bf16", "f16", "f32"], channels = { min = 1 }, patch_frames = { min = 1 }, patch_side = { min = 1 }, block = { power_of_two = true } }
 
 [parameters]

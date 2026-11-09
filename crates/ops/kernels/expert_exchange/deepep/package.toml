@@ -116,7 +116,11 @@ target = "arch"
 architectures = ["sm_100a"]
 
 # `mode_dispatch_hidden_2048_intermediate_768_top_8_experts_128_max_tokens_512_ranks_2_attention_0_dtype_bf16`.
+# The extents are DeepEP's template arguments, which compile for any value its static
+# assertions admit: a hidden row of whole 256-element combine vectors and at most 32
+# routes per token (`vendor/deep_ep/impls/combine.cuh`, `dispatch.cuh`). The expert
+# count's division over the expert ranks is the operator's to check.
 [kernel.descriptors]
-dimensions = { mode = ["dispatch", "combine"], hidden = ["2048", "7168", "4096"], intermediate = ["768", "1536", "512"], top = ["8", "4", "2"], experts = ["128", "256", "64"], max_tokens = ["512", "8192", "4096", "16384"], ranks = ["2", "3", "4", "8"], attention = ["0", "1", "2"], dtype = ["bf16"] }
+dimensions = { mode = ["dispatch", "combine"], hidden = { multiple = 256 }, intermediate = { min = 1 }, top = { min = 1, max = 32 }, experts = { min = 1 }, max_tokens = { min = 1 }, ranks = { min = 1 }, attention = { min = 0 }, dtype = ["bf16"] }
 
 [parameters]

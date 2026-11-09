@@ -32,12 +32,12 @@ architectures = ["sm_100a", "sm_90a"]
 # rotation, so the package declares the two key shapes: positions are `[tokens]`
 # for one axis, and `[axes, tokens]` — one coordinate per axis — for M-RoPE.
 [[kernel.descriptors]]
-dimensions = { dtype = ["f32"], positions = ["f32", "i32", "i64"], columns = ["64", "128", "32", "24", "48"], block = ["256", "512", "1024"], scale = ["0x49742400", "0x3f800000", "0x461c4000"], pdl = ["true", "false"] }
+dimensions = { dtype = ["f32"], positions = ["f32", "i32", "i64"], columns = { min = 1 }, block = { power_of_two = true }, scale = { bits = 32 }, pdl = ["true", "false"] }
 
 [[kernel.descriptors]]
-dimensions = { dtype = ["f32", "f16"], positions = ["f32", "i32", "i64"], columns = ["24", "48", "64", "96"], block = ["256"], scale = ["0x3f800000", "0x461c4000", "0x49742400"], pdl = ["false"], axes = ["3"], sections = ["16-16-16", "32-32-32", "48-40-40"], interleaved = ["true"] }
+dimensions = { dtype = ["f32", "f16"], positions = ["f32", "i32", "i64"], columns = { min = 1 }, block = { power_of_two = true }, scale = { bits = 32 }, pdl = ["false"], axes = { min = 1, max = 4 }, sections = { multiple = 2, separator = "-" }, interleaved = ["true"] }
 
 # A sectioned rotation of half-width pairs prints no `interleaved`, so it is a key shape of its own.
 [[kernel.descriptors]]
-dimensions = { dtype = ["f32", "f16"], positions = ["f32", "i32", "i64"], columns = ["24", "48", "64", "96"], block = ["256"], scale = ["0x3f800000", "0x461c4000", "0x49742400"], pdl = ["false"], axes = ["3"], sections = ["16-16-16", "32-32-32", "48-40-40"] }
+dimensions = { dtype = ["f32", "f16"], positions = ["f32", "i32", "i64"], columns = { min = 1 }, block = { power_of_two = true }, scale = { bits = 32 }, pdl = ["false"], axes = { min = 1, max = 4 }, sections = { multiple = 2, separator = "-" } }
 [parameters]
