@@ -12,7 +12,6 @@ crossbeam-channel.workspace = true
 worker.workspace = true
 fnv.workspace = true
 ipc.workspace = true
-nn.workspace = true
 proto.workspace = true
 scheduling.workspace = true
 program-server.workspace = true

@@ -27,7 +27,8 @@ use platform::DeviceId;
 
 use crate::arena::{Pools, StreamId};
 use crate::batch::{
-    Batch, BatchColumns, BatchId, BatchOutput, CallId, CallOutput, Job, Jobs, RowState,
+    Batch, BatchColumns, BatchId, BatchOutput, BatchRow, BatchRows, CallId, CallOutput, Job, Jobs,
+    RowKind, RowState,
 };
 use crate::plan::{Bucket, Buckets, Shape};
 /// `rows` uniform draws in `[0, 1)`, from the runner's generator into its own buffer.
@@ -62,12 +63,12 @@ use crate::{Error, Result};
 /// The host columns of one batch, padded to a bucket and held for the upload.
 ///
 /// The buffers are allocated once, at bind, sized for the largest bucket, so serving a batch writes
-/// into them and allocates nothing. The row layout is the model's `nn::BatchRows`, padded: a
+/// into them and allocates nothing. The row layout is the batch's `BatchRows`, padded: a
 /// padded token carries `slot_mapping = -1` (it writes no cache page) and a padded row carries a
 /// commit slot below zero (it keeps no token state).
 #[derive(Default, Debug)]
 pub struct Staging {
-    rows: nn::BatchRows,
+    rows: BatchRows,
     input_ids: Vec<i32>,
     slots: Vec<i32>,
     parameters: Vec<f32>,
@@ -107,7 +108,7 @@ impl Staging {
         // The commit table's height is ops' business; `reserve` leaves it empty and `stage` sizes
         // it to whatever the mechanism wrote, which `check` has already validated.
         self.commit = Vec::new();
-        self.rows = nn::BatchRows::default();
+        self.rows = BatchRows::default();
         self.staged = None;
         Ok(())
     }
@@ -247,12 +248,12 @@ impl Staging {
         while (owned as usize) < bucket_rows {
             let start = owned;
             owned += 1;
-            self.rows.calls.push(nn::BatchRow {
+            self.rows.calls.push(BatchRow {
                 request: 0,
                 kind: if bucket.variant.is_decode() {
-                    nn::RowKind::Decode
+                    RowKind::Decode
                 } else {
-                    nn::RowKind::Prefill
+                    RowKind::Prefill
                 },
                 cache_group: 0,
                 rows: start..owned,
@@ -331,7 +332,7 @@ impl Staging {
     }
 
     /// The rows of the batch as the model reads them, padded to the bucket.
-    pub fn batch_rows(&self) -> &nn::BatchRows {
+    pub fn batch_rows(&self) -> &BatchRows {
         &self.rows
     }
 
@@ -867,7 +868,7 @@ struct Flight {
     turn: usize,
     slots: Vec<i32>,
     logits_rows: Vec<i32>,
-    rows: nn::BatchRows,
+    rows: BatchRows,
     calls: Vec<CallId>,
 }
 
@@ -902,16 +903,16 @@ struct Sampled {
 /// A device's graph serves one class: a prefill evaluates a chunk of prompt tokens and a decode one
 /// token per row. The mechanism partitions by class before it plans, so a batch that mixes them is a
 /// planning disagreement - and the refusal says which rows were which, not only that two classes met.
-fn row_classes(rows: &nn::BatchRows) -> String {
+fn row_classes(rows: &BatchRows) -> String {
     if rows.calls.is_empty() {
         return "no rows".to_owned();
     }
     let mut classes = Vec::with_capacity(rows.calls.len());
     for call in &rows.calls {
         let kind = match call.kind {
-            nn::RowKind::Prefill => "prefill",
-            nn::RowKind::Decode => "decode",
-            nn::RowKind::Verify => "verify",
+            RowKind::Prefill => "prefill",
+            RowKind::Decode => "decode",
+            RowKind::Verify => "verify",
         };
         classes.push(format!(
             "rows {}..{} {kind}",
@@ -3252,7 +3253,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
             turn,
             slots: Vec::new(),
             logits_rows: Vec::new(),
-            rows: nn::BatchRows::default(),
+            rows: BatchRows::default(),
             calls: Vec::new(),
         };
         let Some(samples) = sampled else {
@@ -5299,7 +5300,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
         let rows = bucket.rows as usize;
         let span = warm_span(bucket);
         let columns = BatchColumns {
-            rows: nn::BatchRows {
+            rows: BatchRows {
                 positions: vec![0; tokens],
                 slot_mapping: vec![-1; tokens],
                 // The partition the launch reads, and the calls below are the same shape a serving
@@ -5348,7 +5349,7 @@ impl<M: CausalLm> CausalLmRunner<M> {
 /// below zero names no state at all and reports the default.
 fn states_of(
     slots: &[i32],
-    rows: &nn::BatchRows,
+    rows: &BatchRows,
     calls: usize,
     logical: &[i32],
     sampling: &[i32],
@@ -5400,7 +5401,7 @@ fn length_at(column: &[i32], row: usize) -> u32 {
 pub fn calls_output(
     ids: &[i32],
     sampling_rows: &[i32],
-    rows: &nn::BatchRows,
+    rows: &BatchRows,
     calls: &[CallId],
     states: &[RowState],
 ) -> Result<Vec<CallOutput>> {
@@ -5480,21 +5481,21 @@ fn warm_call_ids(bucket: Bucket) -> Vec<CallId> {
 /// would describe a batch no serving batch has - and a capture states its pose to the model for the
 /// life of the bucket. A prefill row genuinely carries a run, so its pose states one call over the
 /// bucket's tokens.
-fn warm_calls(bucket: Bucket) -> Vec<nn::BatchRow> {
+fn warm_calls(bucket: Bucket) -> Vec<BatchRow> {
     let rows = bucket.rows;
     if bucket.variant.is_decode() {
         (0..rows)
-            .map(|row| nn::BatchRow {
+            .map(|row| BatchRow {
                 request: 0,
-                kind: nn::RowKind::Decode,
+                kind: RowKind::Decode,
                 cache_group: 0,
                 rows: row..row + 1,
             })
             .collect()
     } else {
-        vec![nn::BatchRow {
+        vec![BatchRow {
             request: 0,
-            kind: nn::RowKind::Prefill,
+            kind: RowKind::Prefill,
             cache_group: 0,
             rows: 0..bucket.tokens,
         }]
@@ -5662,7 +5663,7 @@ mod tests {
         let calls = super::warm_calls(bucket);
         assert_eq!(calls.len(), 4, "one call per decode row");
         for (row, call) in calls.iter().enumerate() {
-            assert_eq!(call.kind, nn::RowKind::Decode);
+            assert_eq!(call.kind, RowKind::Decode);
             assert_eq!(
                 call.rows,
                 row as u32..row as u32 + 1,
@@ -5946,22 +5947,22 @@ mod tests {
 
     fn decode_columns() -> BatchColumns {
         BatchColumns {
-            rows: nn::BatchRows {
+            rows: BatchRows {
                 positions: vec![3, 4],
                 slot_mapping: vec![10, 11],
                 seq_lens: vec![4, 9],
                 query_offsets: vec![0, 1, 2],
                 logits_rows: vec![0, 1],
                 calls: vec![
-                    nn::BatchRow {
+                    BatchRow {
                         request: 0,
-                        kind: nn::RowKind::Decode,
+                        kind: RowKind::Decode,
                         cache_group: 0,
                         rows: 0..1,
                     },
-                    nn::BatchRow {
+                    BatchRow {
                         request: 1,
-                        kind: nn::RowKind::Decode,
+                        kind: RowKind::Decode,
                         cache_group: 0,
                         rows: 1..2,
                     },
@@ -5978,15 +5979,15 @@ mod tests {
 
     fn prefill_columns() -> BatchColumns {
         BatchColumns {
-            rows: nn::BatchRows {
+            rows: BatchRows {
                 positions: vec![0, 1, 2],
                 slot_mapping: vec![0, 1, 2],
                 seq_lens: vec![3],
                 query_offsets: vec![0, 3],
                 logits_rows: vec![2],
-                calls: vec![nn::BatchRow {
+                calls: vec![BatchRow {
                     request: 0,
-                    kind: nn::RowKind::Prefill,
+                    kind: RowKind::Prefill,
                     cache_group: 0,
                     rows: 0..1,
                 }],
@@ -6106,15 +6107,15 @@ mod tests {
         staging.reserve(&buckets)?;
         let count = tokens as usize;
         let mut columns = BatchColumns {
-            rows: nn::BatchRows {
+            rows: BatchRows {
                 positions: (0..tokens).collect(),
                 slot_mapping: (0..tokens).collect(),
                 seq_lens: vec![tokens],
                 query_offsets: vec![0, tokens],
                 logits_rows: vec![tokens - 1],
-                calls: vec![nn::BatchRow {
+                calls: vec![BatchRow {
                     request: 0,
-                    kind: nn::RowKind::Prefill,
+                    kind: RowKind::Prefill,
                     cache_group: 0,
                     rows: 0..1,
                 }],
@@ -6337,22 +6338,22 @@ mod tests {
     /// read another call's lengths, nor a row the table does not hold.
     #[test]
     fn a_completion_reads_its_own_row_of_the_commit_table() {
-        let rows = nn::BatchRows {
+        let rows = BatchRows {
             positions: vec![1, 2],
             slot_mapping: vec![0, 1],
             seq_lens: vec![2, 3],
             query_offsets: vec![0, 1, 2],
             logits_rows: vec![0, 1],
             calls: vec![
-                nn::BatchRow {
+                BatchRow {
                     request: 0,
-                    kind: nn::RowKind::Decode,
+                    kind: RowKind::Decode,
                     cache_group: 0,
                     rows: 0..1,
                 },
-                nn::BatchRow {
+                BatchRow {
                     request: 1,
-                    kind: nn::RowKind::Decode,
+                    kind: RowKind::Decode,
                     cache_group: 0,
                     rows: 1..2,
                 },
@@ -6381,15 +6382,15 @@ mod tests {
     /// call, and a call whose slot names no state reports nothing.
     #[test]
     fn a_multi_row_call_reports_one_state_and_no_slot_reports_none() {
-        let rows = nn::BatchRows {
+        let rows = BatchRows {
             positions: vec![9, 10, 11],
             slot_mapping: vec![0, 1, 2],
             seq_lens: vec![1, 1, 1],
             query_offsets: vec![0, 1, 2, 3],
             logits_rows: vec![0, 1, 2],
-            calls: vec![nn::BatchRow {
+            calls: vec![BatchRow {
                 request: 0,
-                kind: nn::RowKind::Verify,
+                kind: RowKind::Verify,
                 cache_group: 0,
                 rows: 0..3,
             }],
@@ -6430,8 +6431,8 @@ mod tests {
 mod sampled_output_tests {
     use super::*;
 
-    fn rows(calls: &[(u32, std::ops::Range<u32>)]) -> nn::BatchRows {
-        nn::BatchRows {
+    fn rows(calls: &[(u32, std::ops::Range<u32>)]) -> BatchRows {
+        BatchRows {
             positions: Vec::new(),
             slot_mapping: Vec::new(),
             seq_lens: Vec::new(),
@@ -6439,9 +6440,9 @@ mod sampled_output_tests {
             logits_rows: Vec::new(),
             calls: calls
                 .iter()
-                .map(|(request, rows)| nn::BatchRow {
+                .map(|(request, rows)| BatchRow {
                     request: *request,
-                    kind: nn::RowKind::Decode,
+                    kind: RowKind::Decode,
                     cache_group: 0,
                     rows: rows.clone(),
                 })

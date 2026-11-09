@@ -1144,24 +1144,22 @@ mod tests {
         }
     }
 
-    /// The bucket a denoise is planned into: one step over one request's layout.
+    /// The bucket a denoise is planned into: one step over one small request, the extent a media
+    /// batch states.
     fn denoise_bucket() -> Bucket {
-        Bucket::denoise(1, denoise_layout())
-    }
-
-    /// A layout of one small canvas: the extent a media batch states.
-    fn denoise_layout() -> nn::capability::Layout {
-        nn::capability::Layout {
-            video: nn::capability::LatentShape {
-                channels: 4,
-                frames: 2,
-                height: 8,
-                width: 8,
+        Bucket {
+            variant: Variant::Denoise,
+            rows: 1,
+            tokens: 0,
+            extent: Extent::Request {
+                frames: 5,
+                width: 128,
+                height: 128,
+                text_rows: 4,
+                condition_rows: 0,
             },
-            audio: None,
-            text_rows: 4,
-            condition_rows: 0,
-            condition_elements: 0,
+            serves: None,
+            capacity: 0,
         }
     }
 
@@ -1279,10 +1277,10 @@ mod tests {
             .expect("a media batch arrives with its computation");
         assert_eq!(media.computation.call, MediaCall::Denoising);
         assert_eq!(media.computation.rows, 1);
-        assert!(
-            matches!(media.computation.extent, Extent::Latents(_)),
-            "the extent is the bucket's, which is what the worker answered: {:?}",
-            media.computation.extent
+        assert_eq!(
+            media.computation.extent,
+            denoise_bucket().extent,
+            "the extent is the bucket's, which is what the worker answered"
         );
     }
 

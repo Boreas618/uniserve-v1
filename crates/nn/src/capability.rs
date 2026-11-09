@@ -9,16 +9,15 @@
 //!
 //! ## What the mechanism writes and what the model reads
 //!
-//! A batch has two halves. [`BatchRows`] is the host half: the scheduler's mechanism assembles the
-//! per-call rows and their column values, the worker uploads them, and they are not visible to a
-//! model. [`TokenBatch`] is the device half: the views a model's layers read, laid out exactly as
-//! the attention and KV-write kernels read them, so a forward does no host conversion.
+//! A batch has two halves. The host half is the worker's (`worker::batch`): the scheduler's
+//! mechanism assembles the per-call rows and their column values, the worker uploads them, and
+//! they are not visible to a model. [`TokenBatch`] is the device half: the views a model's layers
+//! read, laid out exactly as the attention and KV-write kernels read them, so a forward does no
+//! host conversion.
 //!
 //! The paged cache is [`KvView`]: one entry per attention group, each with its block table, its
 //! page geometry and its per-layer key/value planes. A model with one attention type (Qwen3-MoE) has
 //! one group; a model whose blocks attend differently has one per group.
-
-use std::ops::Range;
 
 use ops::PhaseKind;
 
@@ -26,81 +25,10 @@ use crate::error::{Error, Result};
 use crate::forward::Forward;
 use crate::tensor::{DType, Shape, TensorView};
 
-/// One host-side call of a batch: which request, which phase, which rows it occupies.
-///
-/// The mechanism builds these from the scheduler's plan; the worker turns them into the device
-/// columns [`BatchRows`] carries and uploads them into a [`TokenBatch`]. A call's `rows` are the
-/// half-open row range it owns in the batch's device columns.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct BatchRow {
-    /// The request slot the call belongs to.
-    pub request: u32,
-    /// What the call does.
-    pub kind: RowKind,
-    /// Which attention group the call's keys and values belong to.
-    pub cache_group: u32,
-    /// The rows this call owns in the batch's device columns.
-    pub rows: Range<u32>,
-}
-
-/// What one call of a batch computes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RowKind {
-    /// Prompt tokens of a request.
-    Prefill,
-    /// One generated token per request.
-    Decode,
-    /// Speculative verification rows: drafted tokens whose logits the model produces.
-    Verify,
-}
-
-/// The host columns of one batch, as the mechanism writes them and the worker uploads them.
-///
-/// Every column is already in the layout the device views of [`TokenBatch`] have: the worker
-/// copies these into the pinned arena and uploads them before the graph replay. The columns are
-/// long-lived buffers the worker reuses every step, so assembling a batch does not allocate.
-#[derive(Clone, Default, Debug)]
-pub struct BatchRows {
-    /// The calls of the batch, in issue order.
-    pub calls: Vec<BatchRow>,
-    /// `[tokens]` rotary positions.
-    pub positions: Vec<i32>,
-    /// `[tokens]` cache slots; `-1` writes nothing.
-    pub slot_mapping: Vec<i32>,
-    /// `[rows]` keys visible to each row's last query.
-    pub seq_lens: Vec<i32>,
-    /// `[rows + 1]` packed query offsets.
-    pub query_offsets: Vec<i32>,
-    /// `[rows]` hidden rows whose logits are wanted.
-    pub logits_rows: Vec<i32>,
-}
-
-impl BatchRows {
-    /// Drop every column, keeping the buffers' capacity.
-    pub fn clear(&mut self) {
-        self.calls.clear();
-        self.positions.clear();
-        self.slot_mapping.clear();
-        self.seq_lens.clear();
-        self.query_offsets.clear();
-        self.logits_rows.clear();
-    }
-
-    /// The number of packed query tokens.
-    pub fn tokens(&self) -> usize {
-        self.positions.len()
-    }
-
-    /// The number of rows (sequences) of the batch.
-    pub fn rows(&self) -> usize {
-        self.seq_lens.len()
-    }
-}
-
 /// The device-side layout of one batch, as a model's layers read it.
 ///
-/// Every view addresses a column the mechanism wrote through [`BatchRows`]; a model never converts
-/// a host value into a device one. The views live as long as the runner's batch buffers, so a
+/// Every view addresses a column the mechanism wrote into the worker's host batch; a model never
+/// converts a host value into a device one. The views live as long as the runner's batch buffers, so a
 /// captured graph addresses them unchanged from capture to replay.
 #[derive(Clone, Copy)]
 pub struct TokenBatch {
@@ -1310,7 +1238,7 @@ pub trait Decoder {
 
 /// An autoregressive token model.
 ///
-/// The batch is already in the layout the kernels read (the mechanism writes [`BatchRows`], the
+/// The batch is already in the layout the kernels read (the mechanism writes the host rows, the
 /// worker uploads the [`TokenBatch`] views), so no method here converts or gathers on the host.
 pub trait CausalLm {
     /// Write the embeddings of `ids` into `out` (`[tokens, hidden]`).

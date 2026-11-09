@@ -220,12 +220,83 @@ pub struct Batch {
 /// the columns and modes the kernels read instead of a copy of them.
 pub use ops::commit;
 
+/// One host-side call of a batch: which request, which phase, which rows it occupies.
+///
+/// The mechanism builds these from the scheduler's plan; the worker uploads the columns
+/// [`BatchRows`] carries into the device views a model reads (`nn::TokenBatch`). A call's `rows`
+/// are the half-open row range it owns in the batch's device columns.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct BatchRow {
+    /// The request slot the call belongs to.
+    pub request: u32,
+    /// What the call does.
+    pub kind: RowKind,
+    /// Which attention group the call's keys and values belong to.
+    pub cache_group: u32,
+    /// The rows this call owns in the batch's device columns.
+    pub rows: std::ops::Range<u32>,
+}
+
+/// What one call of a batch computes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RowKind {
+    /// Prompt tokens of a request.
+    Prefill,
+    /// One generated token per request.
+    Decode,
+    /// Speculative verification rows: drafted tokens whose logits the model produces.
+    Verify,
+}
+
+/// The host columns of one batch, as the mechanism writes them and the worker uploads them.
+///
+/// Every column is already in the layout the device views of `nn::TokenBatch` have: the worker
+/// copies these into the pinned arena and uploads them before the graph replay. The columns are
+/// long-lived buffers the worker reuses every step, so assembling a batch does not allocate.
+#[derive(Clone, Default, Debug)]
+pub struct BatchRows {
+    /// The calls of the batch, in issue order.
+    pub calls: Vec<BatchRow>,
+    /// `[tokens]` rotary positions.
+    pub positions: Vec<i32>,
+    /// `[tokens]` cache slots; `-1` writes nothing.
+    pub slot_mapping: Vec<i32>,
+    /// `[rows]` keys visible to each row's last query.
+    pub seq_lens: Vec<i32>,
+    /// `[rows + 1]` packed query offsets.
+    pub query_offsets: Vec<i32>,
+    /// `[rows]` hidden rows whose logits are wanted.
+    pub logits_rows: Vec<i32>,
+}
+
+impl BatchRows {
+    /// Drop every column, keeping the buffers' capacity.
+    pub fn clear(&mut self) {
+        self.calls.clear();
+        self.positions.clear();
+        self.slot_mapping.clear();
+        self.seq_lens.clear();
+        self.query_offsets.clear();
+        self.logits_rows.clear();
+    }
+
+    /// The number of packed query tokens.
+    pub fn tokens(&self) -> usize {
+        self.positions.len()
+    }
+
+    /// The number of rows (sequences) of the batch.
+    pub fn rows(&self) -> usize {
+        self.seq_lens.len()
+    }
+}
+
 /// The host columns of one batch, in the layout the phase's kernels read.
 ///
 /// The mechanism writes these from the request state it owns; the worker stages them into the
 /// pinned arena, uploads them on the batch's stream and builds the device views the model reads.
-/// The row layout is `nn::BatchRows`, the model's own host half — one definition, no conversion in
-/// the mechanism. The runner pads to the bucket it serves and never reorders what the mechanism
+/// The row layout is [`BatchRows`], the batch's host half — one definition, no conversion in the
+/// mechanism. The runner pads to the bucket it serves and never reorders what the mechanism
 /// wrote; a padded row carries `slot_mapping = -1` and a commit slot below zero, so it writes no
 /// cache page and keeps no token state.
 ///
@@ -249,7 +320,7 @@ pub use ops::commit;
 pub struct BatchColumns {
     /// The rows and their calls, as the model reads them: positions, slot mapping, lengths, query
     /// offsets, the sampling rows and the calls.
-    pub rows: nn::BatchRows,
+    pub rows: BatchRows,
     /// `[tokens]` the ids the embedding op reads; the runner stages them to the descriptor's id
     /// element type.
     pub input_ids: Vec<i32>,

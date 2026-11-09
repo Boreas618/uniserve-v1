@@ -1,8 +1,8 @@
 //! One batch's worker columns, filled from the calls the mechanism planned.
 //!
 //! A batch is one numerical call of one phase on one component (§4.4, `M499`),
-//! and the worker reads it in the layout the kernels address: `nn::BatchRows`
-//! — one [`nn::BatchRow`] per call with the half-open row range it owns, then
+//! and the worker reads it in the layout the kernels address: `worker::batch::BatchRows`
+//! — one [`BatchRow`] per call with the half-open row range it owns, then
 //! the token and row columns — beside the sampler's own columns. Nothing is
 //! converted between the mechanism and the model: the mechanism writes exactly
 //! what the kernels read, and the worker stages it into the pinned arena.
@@ -10,7 +10,7 @@
 //! The columns this module fills are the ones the calls themselves state:
 //!
 //! - **rows**: one `BatchRow` per call, contiguous in plan order, with the
-//!   request slot the call's rows belong to, its [`nn::RowKind`] and its rows;
+//!   request slot the call's rows belong to, its [`RowKind`] and its rows;
 //! - **positions**: each call's query tokens start at its own logical position;
 //! - **slot_mapping**: one absolute slot per token through the call's block
 //!   table, `-1` where the call's row writes no cache page — the mechanism's
@@ -52,9 +52,8 @@
 
 use std::ops::Range;
 
-use ::worker::batch::{BatchColumns, commit};
+use ::worker::batch::{BatchColumns, BatchRow, BatchRows, RowKind, commit};
 use ipc::{Call, CallKind, ForwardMode};
-use nn::{BatchRow, BatchRows, RowKind};
 use proto::request::SamplingParams;
 
 use super::slots::{self, PageGeometry};
