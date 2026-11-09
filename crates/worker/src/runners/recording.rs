@@ -201,7 +201,9 @@ mod tests {
             &gather(columns),
             GatherArgs {
                 hidden: scratch,
-                rows: rows.reshape(Shape::new(&[rows.numel()])),
+                // The gather reads the first eight row indices of the region's leading buffer, one
+                // per scratch row.
+                rows: nn::TensorView::new(rows.ptr, DType::I32, Shape::new(&[8])),
                 out: scratch,
             },
         )?;
