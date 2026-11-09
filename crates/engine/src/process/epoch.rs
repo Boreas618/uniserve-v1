@@ -291,6 +291,11 @@ impl MainProcess {
         // An early `Serve` is honoured here rather than at its arrival: this is the pass that
         // admits, so the request waiting in the frontend is exactly what it was waiting for.
         self.pending_serve = false;
+        // Every bucket of the serving generation is captured now, so the serving path's warm-up
+        // may submit its requests: one submitted earlier reached a bucket before its capture.
+        for scheduler in &self.schedulers {
+            scheduler.admit();
+        }
         // What the ranks hold to serve is warm by now, so the ledger hears of it before any request
         // can ask for more. A rank past its quota does not serve.
         self.data

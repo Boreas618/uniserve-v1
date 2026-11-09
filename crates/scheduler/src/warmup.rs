@@ -56,13 +56,17 @@ use proto::config::EngineArgs;
 /// prepared latent and a step from a denoised one.
 const IMAGE_STEPS: u16 = 2;
 
-/// Runs the warmup requests the workers' reports call for on `core`.
+/// The bit every warm-up request's id sets.
 ///
-/// Returns once every request has finished. Fails, naming the group, when a
-/// request is rejected, ends in an error, or the engine dies first.
-///
-/// Warmup runs only where the workers execute on CUDA devices: a CPU or stub
-/// worker has no kernels or graphs to warm.
+/// A daemon numbers the requests it submits to an engine from one, a front's
+/// interval of 2^32 after another's (`EngineClient`), so none of them sets this
+/// bit. A warm-up request numbered from one as well took the first client
+/// request's id: the two shared the scheduler's entry and the policy's view of
+/// that request, so the client's stream could end with the warm-up's request,
+/// and a request migrated into the epoch could be dispatched in the warm-up's
+/// phase.
+const WARMUP_ID_BIT: u64 = 1 << 63;
+
 /// What a warm-up needs of a scheduler, so a thread of the engine's can warm a
 /// rank without holding the handle the engine serves with.
 pub(crate) struct Warm {
@@ -92,12 +96,13 @@ impl Warm {
         self.generation_limits.clone()
     }
 
-    /// A request id of this scheduler's, so warm-up requests are numbered with
-    /// a client's.
+    /// A request id no request a daemon submits takes ([`WARMUP_ID_BIT`]).
     fn next_request_id(&self) -> ipc::RequestId {
         ipc::RequestId(
-            self.next_id
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            WARMUP_ID_BIT
+                | self
+                    .next_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         )
     }
 
@@ -115,16 +120,28 @@ impl Warm {
     }
 }
 
-/// Runs the warm-up once the epoch's first policy serves, on a thread of its own
-/// ([`Warm`] is what it holds).
+/// Runs the warm-up on a thread of its own ([`Warm`] is what it holds), once
+/// the epoch's first policy serves and the engine opened admission.
+///
+/// A policy serves at the switchover, and the switchover only queues the
+/// captures of the generation's buckets (§4.5). A warm-up request submitted at
+/// the switchover reached a bucket before its capture, and the worker refused
+/// the batch for a graph that did not exist yet. The engine opens admission
+/// once every bucket is captured ([`SchedulerHandle::admit`]), which is when a
+/// request of the serving path can run.
 pub(crate) fn after_serving(core: &SchedulerHandle, args: &EngineArgs) {
+    if !on_cuda(args) {
+        return;
+    }
     let intent = core.warmup();
     let serving = core.serving();
+    let admission = core.admission();
     let args = args.clone();
     let spawned = std::thread::Builder::new()
         .name("warmup".to_owned())
         .spawn(move || {
             wait_serving(serving);
+            wait_serving(admission);
             if let Err(error) = warm(&intent, &args) {
                 // Serving continues: the shapes this warms are the ones a client
                 // request reaches anyway, where its failure is visible.
@@ -136,7 +153,8 @@ pub(crate) fn after_serving(core: &SchedulerHandle, args: &EngineArgs) {
     }
 }
 
-/// Blocks until a policy instance serves, given the scheduler's serving signal.
+/// Blocks until `serving` is set: the scheduler's serving signal, or its
+/// admission signal.
 ///
 /// The signal is the scheduler's `watch`, polled: the waiters are ordinary
 /// threads (the warm-up's), and a closed channel means the scheduler is gone.
@@ -298,15 +316,26 @@ pub(crate) fn groups(
     Ok(groups)
 }
 
-pub(crate) fn warm(core: &Warm, args: &EngineArgs) -> anyhow::Result<()> {
-    let on_cuda = args
-        .engine_config
+/// Whether a rank of the deployment runs on a CUDA device: the only place a
+/// warm-up has kernels or graphs to warm.
+fn on_cuda(args: &EngineArgs) -> bool {
+    args.engine_config
         .parallel
         .worker_groups
         .iter()
         .flat_map(|worker| &worker.ranks)
-        .any(|rank| rank.device == "cuda" || rank.device.starts_with("cuda:"));
-    if !on_cuda {
+        .any(|rank| rank.device == "cuda" || rank.device.starts_with("cuda:"))
+}
+
+/// Runs the warmup requests the workers' reports call for on `core`.
+///
+/// Returns once every request has finished. Fails, naming the group, when a
+/// request is rejected, ends in an error, or the engine dies first.
+///
+/// Warmup runs only where the workers execute on CUDA devices: a CPU or stub
+/// worker has no kernels or graphs to warm.
+pub(crate) fn warm(core: &Warm, args: &EngineArgs) -> anyhow::Result<()> {
+    if !on_cuda(args) {
         return Ok(());
     }
 

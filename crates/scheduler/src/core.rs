@@ -183,6 +183,10 @@ pub struct SchedulerHandle {
     next_id: Arc<AtomicU64>,
     /// Set once a policy instance actually serves (§7.3); see `wait_serving`.
     serving: tokio::sync::watch::Receiver<bool>,
+    /// Set once the engine opens admission ([`Self::admit`]): every bucket of
+    /// the serving generation is captured, so a batch replays a graph that
+    /// exists.
+    admitted: Arc<tokio::sync::watch::Sender<bool>>,
     /// The generation each of this scheduler's batches is stamped with: the
     /// number the control thread's switchover arm last wrote (§7.3). One cell
     /// per rank, shared with the scheduler thread and the in-process submission
@@ -250,8 +254,8 @@ impl SchedulerHandle {
         let mut handle = Self::spawn(scheduler, engine.model.model.clone(), waker)?;
         handle.batches = Some(batches);
         // The serving path's warm-up is the serving path's: it runs once the
-        // epoch's first policy serves, on a thread of its own, and startup does
-        // not wait for it.
+        // epoch's first policy serves and the engine opened admission, on a
+        // thread of its own, and startup does not wait for it.
         crate::warmup::after_serving(&handle, args);
         Ok(handle)
     }
@@ -454,6 +458,7 @@ impl SchedulerHandle {
             batches: None,
             next_id: Arc::new(AtomicU64::new(1)),
             serving,
+            admitted: Arc::new(tokio::sync::watch::channel(false).0),
             generation,
             thread: Mutex::new(Some(thread)),
         })
@@ -492,6 +497,17 @@ impl SchedulerHandle {
     /// holding the handle ([`crate::warmup::after_serving`]).
     pub fn serving(&self) -> tokio::sync::watch::Receiver<bool> {
         self.serving.clone()
+    }
+
+    /// The engine opened admission: every bucket of the serving generation is
+    /// captured (§4.5), so the serving path's warm-up may submit its requests.
+    pub fn admit(&self) {
+        self.admitted.send_replace(true);
+    }
+
+    /// The admission signal [`Self::admit`] sets, for the warm-up's thread.
+    pub(crate) fn admission(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.admitted.subscribe()
     }
 
     /// The policy slot of this scheduler, as the control thread holds it (§7.3):
