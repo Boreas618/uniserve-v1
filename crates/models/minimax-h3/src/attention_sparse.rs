@@ -1,49 +1,47 @@
+//! FastH3's video sparse attention layer: the VSA attention over this rank's heads of the whole
+//! sequence, inside the sequence-parallel projections.
+//!
+//! Under Ulysses the four projections (query, key, value and the compression's gate) travel to their
+//! heads one after another while the next one multiplies, and the attended rows return to their
+//! owners interval by interval, each interval's gated composition started as soon as it is composed,
+//! so the transformer can project and feed forward an interval while the later ones travel.
+
+use nn::family::Projection;
 use nn::layers::{
-    Bias, Linear, Parallel, Rotary, UlyssesExchange, VsaAttention, VsaScratch, VsaSpec, VsaTables,
+    Interval, Rotary, UlyssesAttention, UlyssesSpec, VsaAttention, VsaScratch, VsaSpec, VsaTables,
 };
 use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
 
-use crate::attention::{Factors, HeadProjection, HeadsToRows, width};
+use crate::attention::{Factors, sequence_split};
 use crate::config::TransformerConfig;
 use crate::partition::Partition;
 use crate::{Error, Result};
-use nn::family::Projection;
 
-/// One layer's sparse attention: four projections, the tile preparation, and both attentions.
+/// The input projections a sparse layer reads, in the order the attention reads them.
+const INPUTS: [&str; 4] = ["to_q", "to_k", "to_v", "to_gate_compress"];
+
+/// The index of the compression's gate among [`INPUTS`].
+const GATE: usize = 3;
+
+/// One layer's sparse attention: four projections, the tile attention, and the output projection.
 pub struct Sparse {
-    /// The query, key and value projections, `[inner, hidden]` each.
-    pub(crate) query: HeadProjection,
-    pub(crate) key: HeadProjection,
-    pub(crate) value: HeadProjection,
-    /// The gate the compression is weighted by, `[inner, hidden]`: a fourth projection of the same
-    /// fused matrix as the three above.
-    pub(crate) gate: HeadProjection,
-    /// The output projection back to the residual's width, `[hidden, inner]`.
-    pub output: Linear,
+    ulysses: UlyssesAttention<VsaAttention>,
     /// Per-head normalization gains of the query and the key.
-    pub query_gain: Weight,
-    pub key_gain: Weight,
-    /// The video sparse attention over this rank's heads of the whole sequence.
-    pub vsa: VsaAttention,
-    /// Heads of the whole model, and the heads this rank holds.
-    pub heads: u32,
-    pub local_heads: u32,
+    query_gain: Weight,
+    key_gain: Weight,
     /// Elements of one head.
-    pub head_dim: u32,
+    head_dim: u32,
     /// Rows of one tile.
-    pub tile_rows: u32,
-    /// The Ulysses exchange, absent when one rank holds the sequence.
-    exchange: Option<UlyssesExchange>,
-    /// How this rank reaches its heads.
-    projection: Projection,
-    /// This rank's place in the group: which block of the gathered sequence holds its rows.
-    rank: u64,
+    tile_rows: u32,
 }
 
 impl Sparse {
     /// Read layer `index`'s sparse attention of a DiT partition.
     ///
+    /// `rows` bounds the keys of one call, `rotary` is the stack's (the tile preparation turns the
+    /// channels it turns, by the same tables), and `tile_bound` is the deployment's key-tile bound
+    /// every compression reduces over (`Layouts::tiles_bound`).
     #[allow(clippy::too_many_arguments)]
     pub fn load(
         index: u32,
@@ -55,71 +53,44 @@ impl Sparse {
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
-        let prefix = format!("transformer_blocks.{index}.attn");
-        let hidden = u64::from(config.hidden_size);
         let head = u64::from(config.head_dim);
-        let inner = u64::from(config.num_attention_heads) * head;
-        // The tile preparation turns the leading channels the stack's rotary turns, by the same
-        // factor tables, fused with its own per-head norm.
         let rotated = rotary.spectrum().rotated();
-        let mut attention = loader.scope(&prefix);
-        let query_gain = attention.scope("norm_q").tensor("weight", &[head])?;
-        let key_gain = attention.scope("norm_k").tensor("weight", &[head])?;
+        let mut scope = loader.scope(format!("transformer_blocks.{index}.attn"));
+        let query_gain = scope.scope("norm_q").tensor("weight", &[head])?;
+        let key_gain = scope.scope("norm_k").tensor("weight", &[head])?;
         let local_heads = partition.denoiser_heads(config.num_attention_heads);
-        let exchange = match partition.ulysses_degree {
-            1 => None,
-            degree => Some(UlyssesExchange::new(degree as u64)?),
-        };
-        // The compression reduces over every key tile of the layout, so the layer states the
-        // deployment's own tile bound once (`Layouts::tiles_bound`) and the score matrix is sized by
-        // it rather than guessed from a layout at launch.
-        let head_projection = |loader: &mut WeightLoader<'_>, name: &str| {
-            HeadProjection::load(
-                loader,
-                &format!("{prefix}.{name}"),
-                inner,
-                hidden,
-                partition,
-            )
-        };
-        let query = head_projection(loader, "to_q")?;
-        let stack = query.dtype();
-        // The compression reduces over every key tile of the layout, so the layer states the
-        // deployment's own tile bound once (`Layouts::tiles_bound`); the fine attention writes the
-        // rows the projections produce, in the stack's own type.
-        let vsa = VsaAttention::new(VsaSpec {
-            tile_rows,
-            heads: local_heads,
-            head_dim: config.head_dim,
-            qk_norm: true,
-            epsilon: config.qk_norm_eps,
-            rotated,
-            max_tiles: tile_bound,
-            max_keys: rows,
-            output: stack,
-        })?;
+        let ulysses = UlyssesAttention::load(
+            &mut scope,
+            UlyssesSpec {
+                hidden: config.hidden_size,
+                heads: config.num_attention_heads,
+                head_dim: config.head_dim,
+                inputs: &INPUTS,
+                output: "to_out.0",
+            },
+            sequence_split(partition)?,
+            partition.projection,
+            // The fine attention writes the rows the projections produce, in the stack's own type.
+            |stack| {
+                VsaAttention::new(VsaSpec {
+                    tile_rows,
+                    heads: local_heads,
+                    head_dim: config.head_dim,
+                    qk_norm: true,
+                    epsilon: config.qk_norm_eps,
+                    rotated,
+                    max_tiles: tile_bound,
+                    max_keys: rows,
+                    output: stack,
+                })
+            },
+        )?;
         Ok(Self {
-            query,
-            key: head_projection(loader, "to_k")?,
-            value: head_projection(loader, "to_v")?,
-            gate: head_projection(loader, "to_gate_compress")?,
-            output: Linear::load(
-                &mut loader.scope(format!("{prefix}.to_out.0")),
-                width(inner)?,
-                width(hidden)?,
-                Bias::Absent,
-                Parallel::None,
-            )?,
+            ulysses,
             query_gain,
             key_gain,
-            vsa,
-            heads: config.num_attention_heads,
-            local_heads,
             head_dim: config.head_dim,
             tile_rows,
-            exchange,
-            projection: partition.projection,
-            rank: partition.sequence_rank as u64,
         })
     }
 
@@ -152,39 +123,49 @@ impl Sparse {
             scratch,
             Vec::new(),
         )?;
-        // The compression is folded into the fine rows, in place, and one binding names both the
-        // buffer the fold writes and the buffer the projection reads: `add_gated` modifies its first
-        // argument only, so folding into any other buffer would drop this branch without a shape
-        // ever saying so.
+        // The compressed rows are broadcast over their query tile and folded into the fine rows in
+        // place, and the output projection reads the same buffer.
         let rows = scratch.query.shape.dim(0);
-        let shape = Shape::new(&[rows, u64::from(self.local_heads), u64::from(self.head_dim)]);
-        self.vsa.add_gated(
+        let shape = self.headed(rows);
+        self.ulysses.inner().add_gated(
             f,
             scratch.vsa.fine.reshape(shape),
             scratch.vsa.compressed,
             scratch.gate.reshape(shape),
         )?;
-        Ok(self.output.forward(f, scratch.vsa.fine, out)?)
+        Ok(self
+            .ulysses
+            .return_rows(f, scratch.vsa.fine, scratch.staging, scratch.merged, out)?)
+    }
+
+    /// `[rows, local heads, head_dim]`.
+    fn headed(&self, rows: u64) -> Shape {
+        Shape::new(&[
+            rows,
+            u64::from(self.ulysses.local_heads()),
+            u64::from(self.head_dim),
+        ])
     }
 
     /// Whether this layer's rows return from the other members' heads: the layer then runs as
     /// [`Self::attend`], [`Self::deliver`] and [`Self::receive`] rather than [`Self::forward`].
     pub fn exchanges(&self) -> bool {
-        self.exchange.is_some()
+        self.ulysses.exchanges()
     }
 
     /// Whether this layer's input rows are gathered ahead of it: the gather mode reads the whole
     /// sequence, and what fills it is started as the rows are normalized, which the layer before
     /// does interval by interval.
     pub fn gathers_ahead(&self) -> bool {
-        self.exchange.is_some() && self.projection == Projection::Gather
+        self.ulysses.exchanges() && self.ulysses.projection() == Projection::Gather
     }
 
     /// This rank's rows `first..first + count` of the gathered sequence, of its `own` rows.
     pub fn gathered_rows(&self, scratch: &Scratch, own: u64, first: u64, count: u64) -> TensorView {
         let rows = scratch.gathered_rows;
         let width = rows.shape.last();
-        rows.at(rows.offset_elements((self.rank * own + first) * width))
+        let rank = u64::from(self.ulysses.split().rank);
+        rows.at(rows.offset_elements((rank * own + first) * width))
             .reshape(Shape::new(&[count, width]))
     }
 
@@ -198,20 +179,22 @@ impl Sparse {
         first: u64,
         count: u64,
     ) -> Result<nn::Transfer> {
-        let exchange = self
-            .exchange
-            .as_ref()
-            .ok_or_else(|| Error::config("a layer of one rank gathers no rows".to_owned()))?;
-        Ok(exchange.start_gather(f, scratch.gathered_rows, own, first, count)?)
+        if !self.ulysses.exchanges() {
+            return Err(Error::config(
+                "a layer of one rank gathers no rows".to_owned(),
+            ));
+        }
+        Ok(self
+            .ulysses
+            .start_gather(f, scratch.gathered_rows, own, first, count)?)
     }
 
     /// Attends this rank's heads of every row, up to the fine rows and the compression.
     ///
     /// In the exchange mode the four projections alternate with their transfers: each member's
-    /// heads of a projection travel while the next one multiplies, on the group's lane, so the two
-    /// staging buffers take turns, and a buffer is written again only after the transfer that read
-    /// it. The gate is read last, so its transfer is answered still running, and it travels beside
-    /// the attention.
+    /// heads of a projection travel while the next one multiplies, so the two staging buffers take
+    /// turns, and a buffer is written again only after the transfer that read it. The gate is read
+    /// last, so its transfer is answered still running, and it travels beside the attention.
     #[allow(clippy::too_many_arguments)]
     pub fn attend(
         &self,
@@ -224,8 +207,8 @@ impl Sparse {
         scratch: &Scratch,
         arrived: Vec<nn::Transfer>,
     ) -> Result<Option<nn::Transfer>> {
-        // The sequence is whole here whatever this rank owns of it: the buffers below are the rows of
-        // every member, in member order, for this rank's heads.
+        // The sequence is whole here whatever this rank owns of it: the buffers below are the rows
+        // of every member, in member order, for this rank's heads.
         let rows = scratch.query.shape.dim(0);
         if !rows.is_multiple_of(u64::from(self.tile_rows)) {
             return Err(Error::config(format!(
@@ -233,66 +216,45 @@ impl Sparse {
                 self.tile_rows
             )));
         }
-        let exchange = self.exchange.as_ref();
-        let gate = match (exchange, self.projection) {
-            (Some(exchange), Projection::Exchange) => {
-                let (even, odd) = (scratch.staging, scratch.returned);
-                let query = self
-                    .query
-                    .start(f, exchange, normalized, even, scratch.query)?;
-                let key = self.key.start(f, exchange, normalized, odd, scratch.key)?;
-                exchange.finish(f, query)?;
-                let value = self
-                    .value
-                    .start(f, exchange, normalized, even, scratch.value)?;
-                exchange.finish(f, key)?;
-                let gate = self
-                    .gate
-                    .start(f, exchange, normalized, odd, scratch.gate)?;
-                exchange.finish(f, value)?;
-                Some(gate)
+        let ulysses = &self.ulysses;
+        let projected = [scratch.query, scratch.key, scratch.value, scratch.gate];
+        let gate = if ulysses.exchanges() && ulysses.projection() == Projection::Exchange {
+            let (even, odd) = (scratch.staging, scratch.returned);
+            let query = ulysses.start_projection(f, 0, normalized, even, projected[0])?;
+            let key = ulysses.start_projection(f, 1, normalized, odd, projected[1])?;
+            ulysses.finish(f, query)?;
+            let value = ulysses.start_projection(f, 2, normalized, even, projected[2])?;
+            ulysses.finish(f, key)?;
+            let gate = ulysses.start_projection(f, GATE, normalized, odd, projected[GATE])?;
+            ulysses.finish(f, value)?;
+            Some(gate)
+        } else {
+            let source = if ulysses.exchanges() {
+                for transfer in arrived {
+                    ulysses.finish(f, transfer)?;
+                }
+                scratch.gathered_rows
+            } else {
+                normalized
+            };
+            for (index, out) in projected.into_iter().enumerate() {
+                ulysses.project(f, index, source, scratch.staging, out)?;
             }
-            _ => {
-                let source = match exchange {
-                    Some(exchange) => {
-                        for transfer in arrived {
-                            exchange.finish(f, transfer)?;
-                        }
-                        scratch.gathered_rows
-                    }
-                    None => normalized,
-                };
-                self.query
-                    .forward(f, exchange, source, scratch.staging, scratch.query)?;
-                self.key
-                    .forward(f, exchange, source, scratch.staging, scratch.key)?;
-                self.value
-                    .forward(f, exchange, source, scratch.staging, scratch.value)?;
-                self.gate
-                    .forward(f, exchange, source, scratch.staging, scratch.gate)?;
-                None
-            }
+            None
         };
 
-        // The rows are `[tiles * tile_rows, heads, width]` for the preparation; the pooled views are
-        // `[tiles, heads, width]` FP32 and stay tile-major, which is the order the reference's
-        // permutation reads them in.
-        let shape = Shape::new(&[rows, u64::from(self.local_heads), u64::from(self.head_dim)]);
-        let (query, key, value) = (
-            scratch.query.reshape(shape),
-            scratch.key.reshape(shape),
-            scratch.value.reshape(shape),
-        );
+        // The rows are `[tiles * tile_rows, heads, width]` for the preparation and the attention.
+        let shape = self.headed(rows);
         let tables = VsaTables {
             sizes,
             segments,
             keep,
         };
-        self.vsa.attend(
+        ulysses.inner().attend(
             f,
-            query,
-            key,
-            value,
+            scratch.query.reshape(shape),
+            scratch.key.reshape(shape),
+            scratch.value.reshape(shape),
             Some((&self.query_gain, &self.key_gain)),
             Some((factors.cosine, factors.sine)),
             &tables,
@@ -303,11 +265,10 @@ impl Sparse {
 
     /// Composes this rank's attended heads and starts returning them to their rows' owners.
     ///
-    /// Every interval of an owner's `own` rows is composed into its payload and started here, as
-    /// the reference's `token_chunks` does: the lane then carries them one after another, and
-    /// [`Self::receive`] takes up an interval while the later ones travel. `gate` is the transfer
-    /// [`Self::attend`] left running. An interval is whole row blocks of the composition, and one
-    /// member's rows are whole rows of a tile's share.
+    /// Every interval of an owner's `own` rows is composed into its payload and started here: the
+    /// lane then carries them one after another, and [`Self::receive`] takes up an interval while
+    /// the later ones travel. `gate` is the transfer [`Self::attend`] left running. An interval is
+    /// whole row blocks of the composition, and one member's rows are whole rows of a tile's share.
     pub fn deliver(
         &self,
         f: &Forward,
@@ -315,31 +276,25 @@ impl Sparse {
         scratch: &Scratch,
         own: u64,
     ) -> Result<Vec<Returning>> {
-        let exchange = self
-            .exchange
-            .as_ref()
-            .ok_or_else(|| Error::config("a layer of one rank returns no rows".to_owned()))?;
-        if let Some(gate) = gate {
-            exchange.finish(f, gate)?;
+        let ulysses = &self.ulysses;
+        if !ulysses.exchanges() {
+            return Err(Error::config(
+                "a layer of one rank returns no rows".to_owned(),
+            ));
         }
-        let members = exchange.ranks();
-        let heads = u64::from(self.local_heads);
+        if let Some(gate) = gate {
+            ulysses.finish(f, gate)?;
+        }
+        let members = u64::from(ulysses.split().size);
+        let heads = u64::from(ulysses.local_heads());
         let width = u64::from(self.head_dim);
         let shape = Shape::new(&[members * own, heads, width]);
         let (fine, gate) = (scratch.vsa.fine.reshape(shape), scratch.gate.reshape(shape));
         let slots: Vec<u32> = (0..members as u32).collect();
-        let unit = (u64::from(self.tile_rows) / members).max(1);
-        let total: u64 = RETURN_SHARES.iter().sum();
+        let unit = u64::from(self.tile_rows) / members;
         let mut returning = Vec::new();
-        let mut first = 0;
-        let mut reached = 0;
-        for share in RETURN_SHARES {
-            reached += share;
-            let end = (own * reached / total).next_multiple_of(unit).min(own);
-            if end == first {
-                continue;
-            }
-            let count = end - first;
+        for interval in UlyssesAttention::<VsaAttention>::intervals(own, unit) {
+            let Interval { first, count } = interval;
             let block = Shape::new(&[members, count, heads, width]);
             let at = first * members * heads * width;
             let payload = scratch
@@ -350,7 +305,7 @@ impl Sparse {
                 .returned
                 .at(scratch.returned.offset_elements(at))
                 .reshape(block);
-            self.vsa.compose(
+            ulysses.inner().compose(
                 f,
                 payload,
                 fine,
@@ -365,9 +320,8 @@ impl Sparse {
                 first,
                 count,
                 landed,
-                transfer: exchange.start(f, payload, landed)?,
+                transfer: ulysses.start_return(f, payload, landed)?,
             });
-            first = end;
         }
         Ok(returning)
     }
@@ -380,27 +334,16 @@ impl Sparse {
         scratch: &Scratch,
         out: TensorView,
     ) -> Result<()> {
-        let exchange = self
-            .exchange
-            .as_ref()
-            .ok_or_else(|| Error::config("a layer of one rank returns no rows".to_owned()))?;
-        exchange.finish(f, interval.transfer)?;
-        let every = u64::from(self.heads) * u64::from(self.head_dim);
+        let every = u64::from(self.ulysses.heads()) * u64::from(self.head_dim);
         let merged = scratch
             .merged
             .at(scratch.merged.offset_elements(interval.first * every))
             .reshape(Shape::new(&[interval.count, every]));
-        HeadsToRows::merge(f, exchange.ranks(), interval.landed, merged)?;
-        Ok(self.output.forward(f, merged, out)?)
+        Ok(self
+            .ulysses
+            .receive(f, interval.transfer, interval.landed, merged, out)?)
     }
 }
-
-/// The intervals an owner's rows return in, as shares of the rows.
-///
-/// The first interval's transfer is the part of the return nothing hides, and the last interval's
-/// gather is the part of the next layer's input nothing hides, so the two ends are the small ones:
-/// an interval's output projection and feed-forward take longer per row than either transfer.
-const RETURN_SHARES: [u64; 4] = [1, 2, 2, 1];
 
 /// One interval of this rank's rows on its way back from the members that attended it.
 pub struct Returning {
@@ -461,24 +404,25 @@ impl Scratch {
         let dtype = normalized.dtype;
         let rows = u64::from(total_rows);
         let own = normalized.shape.dim(0);
-        let inner = u64::from(layer.local_heads) * u64::from(layer.head_dim);
-        let every = u64::from(layer.heads) * u64::from(layer.head_dim);
+        let ulysses = &layer.ulysses;
+        let inner = u64::from(ulysses.local_heads()) * u64::from(layer.head_dim);
+        let every = u64::from(ulysses.heads()) * u64::from(layer.head_dim);
         let arena = f.arena();
         // A layer that does not communicate reserves nothing for it: on one rank these views are
         // buffers the layer already holds, and the branches that read them do not run.
-        let (staging, returned, merged) = match layer.exchange {
-            Some(_) => (
+        let (staging, returned, merged) = if ulysses.exchanges() {
+            (
                 arena.tensor(dtype, Shape::new(&[own, every]))?,
                 arena.tensor(dtype, Shape::new(&[own, every]))?,
                 arena.tensor(dtype, Shape::new(&[own, every]))?,
-            ),
-            None => (normalized, normalized, normalized),
+            )
+        } else {
+            (normalized, normalized, normalized)
         };
-        let gathered_rows = match (&layer.exchange, layer.projection) {
-            (Some(_), Projection::Gather) => {
-                arena.tensor(dtype, Shape::new(&[rows, normalized.shape.last()]))?
-            }
-            _ => normalized,
+        let gathered_rows = if layer.gathers_ahead() {
+            arena.tensor(dtype, Shape::new(&[rows, normalized.shape.last()]))?
+        } else {
+            normalized
         };
         Ok(Self {
             staging,
@@ -489,7 +433,7 @@ impl Scratch {
             key: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
             value: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
             gate: arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            vsa: VsaScratch::reserve(arena, &layer.vsa, rows, dtype)?,
+            vsa: VsaScratch::reserve(arena, ulysses.inner(), rows, dtype)?,
         })
     }
 }

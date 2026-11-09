@@ -23,7 +23,7 @@
 //! [`VocabParallelEmbedding`](layers::VocabParallelEmbedding), [`DenseAttention`](layers::DenseAttention),
 //! [`PagedAttention`](layers::PagedAttention), [`Moe`],
 //! [`Conv3d`], [`Conv1d`],
-//! [`ConvTranspose1d`], [`UlyssesExchange`],
+//! [`ConvTranspose1d`], [`UlyssesAttention`](layers::UlyssesAttention),
 //! [`Sampler`] and [`ParallelLMHead`]; the diffusion and
 //! video models add [`Patchify`](layers::Patchify), [`Copy`](layers::Copy),
 //! [`CrossFade`], [`RgbBytes`],
@@ -78,7 +78,7 @@ pub use layers::{
     ConvGeometry, ConvTranspose1d, CrossFade, Epilogue, FramePad, GateBias, GatedActivation, Gelu,
     GroupNorm, Halves, IndexRows, LayerNorm, Linear, Modulation, Moe, Noise, NoiseKey,
     ParallelLMHead, PcmInterleave, Residual, ResidualStream, RgbBytes, RmsNorm, Rotary, Rounding,
-    Sampler, SamplerState, Samples, Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES, UlyssesExchange,
+    Sampler, SamplerState, Samples, Scale, Silu, Snake, TRTLLM_WORKSPACE_BYTES,
 };
 pub use ops::PhaseKind;
 pub use ops::{DType, DevicePtr, MAX_RANK, Shape, Strides, TensorView};

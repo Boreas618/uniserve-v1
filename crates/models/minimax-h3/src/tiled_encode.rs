@@ -454,11 +454,8 @@ impl ClipEncoder {
             // This clip's blocks alone: a member's share of them lies at the head of its own.
             let shared = share as u64 * elements;
             let sent = own.reshape(Shape::new(&[shared]));
-            nn::layers::UlyssesExchange::new(ranks as u64)?.gather(
-                f,
-                sent,
-                gathered.reshape(Shape::new(&[shared * ranks as u64])),
-            )?;
+            // The forward's group checks that it holds `ranks` members' blocks.
+            f.all_gather(sent, gathered.reshape(Shape::new(&[shared * ranks as u64])))?;
         }
 
         // The tiles are row-major (`Plan::tiles`), so the neighbour above is one row of the grid

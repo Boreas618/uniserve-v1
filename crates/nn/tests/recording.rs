@@ -7,7 +7,8 @@
 // The helpers below unwrap; clippy's test detection needs the crate to say it is a test crate.
 #![cfg(test)]
 
-use nn::layers::{ParallelLMHead, UlyssesExchange};
+use nn::family::Projection;
+use nn::layers::{ParallelLMHead, UlyssesAttention, UlyssesSpec};
 use nn::{Arena, Checkpoint, DType, Forward, Shape, Split, WeightLoader};
 use ops::Op;
 use ops::logits::VocabUnpad;
@@ -102,27 +103,87 @@ fn a_shard_of_a_partial_tile_is_refused_at_load() {
     assert!(refused.to_string().contains("15"), "{refused}");
 }
 
-/// A sequence-parallel exchange over two ranks moves two equal blocks: a recording forward split
-/// as rank 1 of 2 accepts the views that rank exchanges and refuses a layer built for another
-/// group size, as the launching forward of that group does.
+/// A checkpoint whose `attn.to_q.weight` is `[64, 32]` and `attn.to_out.weight` `[32, 64]` BF16.
+fn attention_checkpoint(directory: &std::path::Path) -> Checkpoint {
+    let header = r#"{"attn.to_q.weight":{"dtype":"BF16","shape":[64,32],"data_offsets":[0,4096]},"attn.to_out.weight":{"dtype":"BF16","shape":[32,64],"data_offsets":[4096,8192]}}"#;
+    let mut file = (header.len() as u64).to_le_bytes().to_vec();
+    file.extend_from_slice(header.as_bytes());
+    file.resize(file.len() + 8192, 0);
+    std::fs::write(directory.join("model.safetensors"), file).unwrap();
+    Checkpoint::open(directory).unwrap()
+}
+
+/// Member 1 of 2 of a four-head, sixteen-wide attention reaching its heads by `projection`.
+fn ulysses(checkpoint: &Checkpoint, projection: Projection) -> UlyssesAttention<()> {
+    let mut loader = WeightLoader::meta(checkpoint, None, None);
+    UlyssesAttention::load(
+        &mut loader.scope("attn"),
+        UlyssesSpec {
+            hidden: 32,
+            heads: 4,
+            head_dim: 16,
+            inputs: &["to_q"],
+            output: "to_out",
+        },
+        nn::family::Split { size: 2, rank: 1 },
+        projection,
+        |_| Ok(()),
+    )
+    .unwrap()
+}
+
+/// In the exchange mode a member projects its rows for each member's heads and exchanges the
+/// blocks; in the gather mode it gathers every member's rows and projects its own heads. Either
+/// way the return sets the members' blocks side by side before the output projection, and a
+/// forward split over another member count is refused before any collective.
 #[test]
-fn a_split_recording_checks_an_exchange_against_its_member_count() {
+fn a_sequence_split_projects_heads_by_its_mode_and_returns_rows() {
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = attention_checkpoint(directory.path());
     let arena = Arena::counting();
     let f = Forward::recording(&arena).with_split(1, 2).unwrap();
-    let send = arena.tensor(DType::BF16, Shape::new(&[2, 4, 64])).unwrap();
-    let recv = arena.tensor(DType::BF16, Shape::new(&[8, 64])).unwrap();
+    let tensor = |dims: &[u64]| arena.tensor(DType::BF16, Shape::new(dims)).unwrap();
+    // Four own rows of a sequence of eight; this member's heads are two of four, 32 channels.
+    let (normalized, gathered) = (tensor(&[4, 32]), tensor(&[8, 32]));
+    let (staging, heads) = (tensor(&[4, 64]), tensor(&[8, 32]));
 
-    let two = UlyssesExchange::new(2).unwrap();
-    two.exchange(&f, send, recv).unwrap();
-    let transfer = two.start(&f, send, recv).unwrap();
-    two.finish(&f, transfer).unwrap();
-    let rows = arena.tensor(DType::BF16, Shape::new(&[4, 64])).unwrap();
-    two.gather(&f, rows, recv).unwrap();
+    let exchange = ulysses(&checkpoint, Projection::Exchange);
+    let (projected, launches) = recorded(|| {
+        let rows = exchange.rows(&f, normalized, gathered)?;
+        exchange.project(&f, 0, rows, staging, heads)
+    });
+    projected.unwrap();
+    let operators: Vec<&str> = launches.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(operators, ["gemm", "gemm"], "one product per member");
 
-    let four = UlyssesExchange::new(4).unwrap();
-    let refused = four.exchange(&f, send, recv).unwrap_err();
+    let gather = ulysses(&checkpoint, Projection::Gather);
+    let (projected, launches) = recorded(|| {
+        let rows = gather.rows(&f, normalized, gathered)?;
+        gather.project(&f, 0, rows, staging, heads)
+    });
+    projected.unwrap();
+    assert_eq!(
+        launches.len(),
+        1,
+        "one product of this member's heads: {launches:?}"
+    );
+
+    let (merged, out) = (tensor(&[4, 64]), tensor(&[4, 32]));
+    let (returned, launches) = recorded(|| exchange.return_rows(&f, heads, staging, merged, out));
+    returned.unwrap();
+    let operators: Vec<&str> = launches.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(operators[operators.len() - 1], "gemm");
     assert!(
-        format!("{refused}").contains("built for 4 ranks"),
+        operators.len() == 2,
+        "the merge and the output projection: {operators:?}"
+    );
+
+    let four = Forward::recording(&arena).with_split(1, 4).unwrap();
+    let refused = exchange
+        .project(&four, 0, normalized, staging, heads)
+        .unwrap_err();
+    assert!(
+        format!("{refused}").contains("built for 2 members"),
         "{refused}"
     );
 }

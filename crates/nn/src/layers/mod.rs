@@ -24,7 +24,6 @@ mod audio;
 mod conv;
 mod cross_fade;
 mod embedding;
-mod exchange;
 mod frame;
 mod head;
 mod layout;
@@ -43,6 +42,7 @@ mod rows;
 mod sampler;
 mod tile_stitch;
 mod transpose;
+mod ulysses;
 mod vsa;
 
 pub use activation::{GateBias, GatedActivation, Gelu, Halves, Rounding, Silu, Snake};
@@ -54,7 +54,6 @@ pub use audio::AudioActivation;
 pub use conv::{Conv1d, Conv3d, ConvGeometry, ConvTranspose1d};
 pub use cross_fade::CrossFade;
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
-pub use exchange::UlyssesExchange;
 pub use frame::FramePad;
 pub use head::ParallelLMHead;
 pub use layout::{Access, Copy, Patchify};
@@ -78,6 +77,7 @@ pub use rows::IndexRows;
 pub use sampler::{Candidates, Sampler, SamplerState, Samples};
 pub use tile_stitch::{TileGrid, TileStitch};
 pub use transpose::Transpose;
+pub use ulysses::{Interval, UlyssesAttention, UlyssesSpec};
 pub use vsa::{VsaAttention, VsaScratch, VsaSpec, VsaTables};
 
 /// The constants a layer's operator descriptor carries and the program package owns.

@@ -9,16 +9,9 @@
 //!
 //! ## The partition
 //!
-//! A rank holds a contiguous slice of the packed rows and every head; [`UlyssesExchange`] trades
-//! the row slice for a head shard of the whole sequence around the attention and back. With one
-//! rank the exchange is absent.
-//!
-//! [`HeadProjection`] is how a rank reaches its heads, and the deployment states which way
-//! (`Projection`): the exchange mode projects this rank's rows for every member's heads, one launch
-//! per member, so each member's block is contiguous and one all-to-all delivers it; the gather mode
-//! gathers every member's rows once and projects this rank's heads with a head-partitioned weight.
-//! After either, the attention reads `[rows of the whole sequence, this rank's heads, head width]`,
-//! and [`HeadsToRows`] sends each member its rows back with every head beside each other.
+//! A rank holds a contiguous slice of the packed rows and every head; `nn::layers::UlyssesAttention`
+//! trades the row slice for a head shard of the whole sequence around the attention and back, by
+//! the deployment's projection mode. With one rank nothing is exchanged.
 //!
 //! ## The two attention kinds
 //!
@@ -38,193 +31,14 @@
 //! FP32 when it lands - in its layer's dtype and in this doc - while the fine sparse attention over
 //! the prepared rows stays in the checkpoint's dtype like the dense one.
 
-use nn::family::Split;
-use nn::layers::{
-    Bias, DenseAttention, DenseSpec, Gains, Linear, Parallel, Rotary, UlyssesExchange, Varlen,
-};
+use nn::family::{Projection, Split};
+use nn::layers::{DenseAttention, DenseSpec, Gains, Rotary, UlyssesAttention, UlyssesSpec, Varlen};
 use nn::weights::{Weight, WeightLoader};
 use nn::{Forward, Shape, TensorView};
 
 use crate::config::TransformerConfig;
 use crate::partition::Partition;
 use crate::{Error, Result};
-use nn::family::Projection;
-
-/// A query, key, value or gate projection, as one rank's attention reads it: this rank's heads of
-/// every row of the sequence.
-pub(crate) struct HeadProjection {
-    /// One rank: the whole projection. The gather mode: this rank's head rows of it. The exchange
-    /// mode: one projection per member, in member order, each holding that member's head rows.
-    members: Vec<Linear>,
-}
-
-impl HeadProjection {
-    /// Reads the checkpoint's `[inner, hidden]` projection module `name` for `partition`.
-    ///
-    /// Each member's projection is its block of the module's heads: a column-parallel split of the
-    /// output channels over the sequence group's members.
-    pub(crate) fn load(
-        loader: &mut WeightLoader<'_>,
-        name: &str,
-        inner: u64,
-        hidden: u64,
-        partition: &Partition,
-    ) -> Result<Self> {
-        let (inner, hidden) = (width(inner)?, width(hidden)?);
-        let degree = u32::try_from(partition.ulysses_degree)
-            .map_err(|_| Error::config("a sequence degree wider than a u32".to_owned()))?;
-        let mut scope = loader.scope(name);
-        let mut member = |rank: u32| -> Result<Linear> {
-            let parallel = if degree == 1 {
-                Parallel::None
-            } else {
-                Parallel::Column(Split { size: degree, rank })
-            };
-            Ok(Linear::load(
-                &mut scope,
-                hidden,
-                inner,
-                Bias::Absent,
-                parallel,
-            )?)
-        };
-        let members = match (degree, partition.projection) {
-            (1, _) => vec![member(0)?],
-            (_, Projection::Gather) => {
-                let rank = u32::try_from(partition.sequence_rank)
-                    .map_err(|_| Error::config("a sequence rank wider than a u32".to_owned()))?;
-                vec![member(rank)?]
-            }
-            (_, Projection::Exchange) => (0..degree).map(member).collect::<Result<Vec<_>>>()?,
-        };
-        Ok(Self { members })
-    }
-
-    /// The element type of the projection's weight, which is the stack's.
-    pub(crate) fn dtype(&self) -> nn::DType {
-        self.members[0].weight().dtype
-    }
-
-    /// Projects this rank's `rows` for every member into `staging`, one member's block after
-    /// another, and starts delivering each member its heads of the whole sequence into `out`.
-    pub(crate) fn start(
-        &self,
-        f: &Forward,
-        exchange: &UlyssesExchange,
-        rows: TensorView,
-        staging: TensorView,
-        out: TensorView,
-    ) -> Result<nn::Transfer> {
-        self.project(f, rows, staging, out.shape.last())?;
-        Ok(exchange.start(f, staging, out)?)
-    }
-
-    /// Each member's heads of `rows`, `local` columns wide, as blocks of `staging`.
-    fn project(
-        &self,
-        f: &Forward,
-        rows: TensorView,
-        staging: TensorView,
-        local: u64,
-    ) -> Result<()> {
-        let shape = Shape::new(&[rows.rows(), local]);
-        let block = rows.rows() * local;
-        for (member, projection) in self.members.iter().enumerate() {
-            let at = staging.offset_elements(member as u64 * block);
-            projection.forward(f, rows, staging.at(at).reshape(shape))?;
-        }
-        Ok(())
-    }
-
-    /// Projects `rows` and writes this rank's heads of the whole sequence into `out`.
-    ///
-    /// `rows` is this rank's rows in the exchange mode and the gathered sequence otherwise, and
-    /// `staging` is the exchange's send buffer, one member's block after another.
-    pub(crate) fn forward(
-        &self,
-        f: &Forward,
-        exchange: Option<&UlyssesExchange>,
-        rows: TensorView,
-        staging: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        match (self.members.as_slice(), exchange) {
-            ([only], _) => Ok(only.forward(f, rows, out)?),
-            (_, Some(exchange)) => {
-                self.project(f, rows, staging, out.shape.last())?;
-                Ok(exchange.exchange(f, staging, out)?)
-            }
-            (members, None) => Err(Error::Unsupported(format!(
-                "a projection held as {} members has no exchange to deliver them",
-                members.len()
-            ))),
-        }
-    }
-}
-
-/// The rows a projection reads: this rank's, or the whole sequence's when the deployment gathers.
-pub(crate) fn projected_rows(
-    f: &Forward,
-    exchange: Option<&UlyssesExchange>,
-    projection: Projection,
-    normalized: TensorView,
-    gathered: TensorView,
-) -> Result<TensorView> {
-    match (exchange, projection) {
-        (Some(exchange), Projection::Gather) => {
-            exchange.gather(f, normalized, gathered)?;
-            Ok(gathered)
-        }
-        _ => Ok(normalized),
-    }
-}
-
-/// Sends each member its rows of this rank's attended heads and sets the heads side by side.
-pub(crate) struct HeadsToRows;
-
-impl HeadsToRows {
-    /// `attended` is `[whole sequence, this rank's heads · width]`, whose block `m` is member `m`'s
-    /// rows. `staging` receives this rank's rows of every member's heads, block by block; `out` is
-    /// those rows with the members' heads side by side, `[this rank's rows, every head · width]`.
-    pub(crate) fn forward(
-        f: &Forward,
-        exchange: &UlyssesExchange,
-        attended: TensorView,
-        staging: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        exchange.exchange(f, attended, staging)?;
-        Self::merge(f, exchange.ranks(), staging, out)
-    }
-
-    /// Sets the blocks of `received`, one per member, side by side in `out`.
-    pub(crate) fn merge(
-        f: &Forward,
-        members: u64,
-        received: TensorView,
-        out: TensorView,
-    ) -> Result<()> {
-        let rows = out.rows();
-        let local = out.shape.last() / members;
-        let block = [members, rows, 1, local];
-        let source = received.reshape(Shape::new(&block));
-        let destination = TensorView::with_strides(
-            out.ptr,
-            out.dtype,
-            Shape::new(&block),
-            nn::Strides::new(&[local, members * local, local, 1]),
-        );
-        let strides = [local as i64, (members * local) as i64, local as i64, 1];
-        Ok(
-            nn::layers::Copy::new(out.dtype, nn::layers::Access::Vector)?.forward(
-                f,
-                source,
-                destination,
-                &strides,
-            )?,
-        )
-    }
-}
 
 /// One layer's attention, of whichever kind its checkpoint composes.
 pub enum Layer {
@@ -343,20 +157,22 @@ pub struct Factors<'a> {
     pub sine: TensorView,
 }
 
-/// The dense attention of one diffusion layer.
+/// The dense attention of one diffusion layer: the stack's rotation and a dense attention over
+/// this rank's heads of the whole sequence, inside the sequence-parallel projections.
 pub struct Dense {
-    query: HeadProjection,
-    key: HeadProjection,
-    value: HeadProjection,
-    output: Linear,
+    ulysses: UlyssesAttention<DenseAttention>,
     query_gain: Weight,
     key_gain: Weight,
-    attention: DenseAttention,
-    exchange: Option<UlyssesExchange>,
-    projection: Projection,
-    heads: u32,
-    local_heads: u32,
     head_dim: u32,
+}
+
+/// The sequence-parallel split of a DiT partition: its member count and this rank's place.
+pub(crate) fn sequence_split(partition: &Partition) -> Result<Split> {
+    let size = u32::try_from(partition.ulysses_degree)
+        .map_err(|_| Error::config("a sequence degree wider than a u32".to_owned()))?;
+    let rank = u32::try_from(partition.sequence_rank)
+        .map_err(|_| Error::config("a sequence rank wider than a u32".to_owned()))?;
+    Ok(Split { size, rank })
 }
 
 impl Dense {
@@ -372,57 +188,43 @@ impl Dense {
         partition: &Partition,
         loader: &mut WeightLoader<'_>,
     ) -> Result<Self> {
-        let prefix = format!("transformer_blocks.{index}.attn");
-        let hidden = u64::from(config.hidden_size);
         let head = u64::from(config.head_dim);
-        let inner = u64::from(config.num_attention_heads) * head;
-
-        let mut attention = loader.scope(&prefix);
-        let query_gain = attention.scope("norm_q").tensor("weight", &[head])?;
-        let key_gain = attention.scope("norm_k").tensor("weight", &[head])?;
+        let mut scope = loader.scope(format!("transformer_blocks.{index}.attn"));
+        let query_gain = scope.scope("norm_q").tensor("weight", &[head])?;
+        let key_gain = scope.scope("norm_k").tensor("weight", &[head])?;
+        // The rotation and the attention read *this rank's* heads of the whole sequence.
         let local_heads = partition.denoiser_heads(config.num_attention_heads);
-
-        let head_projection = |loader: &mut WeightLoader<'_>, name: &str| {
-            HeadProjection::load(
-                loader,
-                &format!("{prefix}.{name}"),
-                inner,
-                hidden,
-                partition,
-            )
-        };
+        let attention = DenseAttention::new(DenseSpec {
+            head_dim: config.head_dim,
+            heads: local_heads,
+            kv_heads: local_heads,
+            max_keys: rows,
+            causal: false,
+            window: None,
+            scale: rotary.spectrum().score_scale(config.head_dim)?,
+        })?;
+        let ulysses = UlyssesAttention::load(
+            &mut scope,
+            UlyssesSpec {
+                hidden: config.hidden_size,
+                heads: config.num_attention_heads,
+                head_dim: config.head_dim,
+                inputs: &["to_q", "to_k", "to_v"],
+                output: "to_out.0",
+            },
+            sequence_split(partition)?,
+            partition.projection,
+            |_| Ok(attention),
+        )?;
         Ok(Self {
-            query: head_projection(loader, "to_q")?,
-            key: head_projection(loader, "to_k")?,
-            value: head_projection(loader, "to_v")?,
-            output: Linear::load(
-                &mut loader.scope(format!("{prefix}.to_out.0")),
-                width(inner)?,
-                width(hidden)?,
-                Bias::Absent,
-                Parallel::None,
-            )?,
+            ulysses,
             query_gain,
             key_gain,
-            attention: DenseAttention::new(DenseSpec {
-                head_dim: config.head_dim,
-                heads: local_heads,
-                kv_heads: local_heads,
-                max_keys: rows,
-                causal: false,
-                window: None,
-                scale: rotary.spectrum().score_scale(config.head_dim)?,
-            })?,
-            exchange: exchange(partition),
-            projection: partition.projection,
-            heads: config.num_attention_heads,
-            local_heads,
             head_dim: config.head_dim,
         })
     }
 
     /// Attend `normalized` `[rows, hidden]` of this rank and write `[rows, hidden]`.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         f: &Forward,
@@ -432,83 +234,46 @@ impl Dense {
         scratch: &Scratch,
         out: TensorView,
     ) -> Result<()> {
-        let exchange = self.exchange.as_ref();
-        let rows = projected_rows(
-            f,
-            exchange,
-            self.projection,
-            normalized,
-            scratch.gathered_rows,
-        )?;
-        self.query
-            .forward(f, exchange, rows, scratch.staging, scratch.query)?;
-        self.key
-            .forward(f, exchange, rows, scratch.staging, scratch.key)?;
-        self.value
-            .forward(f, exchange, rows, scratch.staging, scratch.value)?;
+        let ulysses = &self.ulysses;
+        let rows = ulysses.rows(f, normalized, scratch.gathered_rows)?;
+        for (index, projected) in [scratch.query, scratch.key, scratch.value]
+            .into_iter()
+            .enumerate()
+        {
+            ulysses.project(f, index, rows, scratch.staging, projected)?;
+        }
         // This rank's heads of every row: the normalization and the rotation are per head, and the
         // factor tables cover the whole sequence.
-        self.rotate(f, factors, scratch)?;
-        let (query, key, value) = (scratch.rotated_query, scratch.rotated_key, scratch.value);
-        // The operator's operands are one axis of tokens, then the heads, then a head's channels
-        // (`ops/src/attention/dense.rs` requires rank 3 of all four), while a projection writes
-        // `[rows, inner]`. The reshaping is by `heads`, which takes the token axis from the view's
-        // own element count - the rows differ between the exchanged and the local path, so a token
-        // count computed once outside would be right on one of them and wrong on the other.
-        let (local_heads, head_dim) = (self.local_heads, self.head_dim);
-        self.attention.forward(
+        let local_heads = ulysses.local_heads();
+        let headed = |view: TensorView| view.reshape(heads(view, local_heads, self.head_dim));
+        factors.rotary.apply(
             f,
-            query.reshape(heads(query, local_heads, head_dim)),
-            key.reshape(heads(key, local_heads, head_dim)),
-            value.reshape(heads(value, local_heads, head_dim)),
-            Some(*visible),
-            scratch
-                .attended
-                .reshape(heads(scratch.attended, local_heads, head_dim)),
-        )?;
-        let attended = match exchange {
-            None => scratch.attended,
-            Some(exchange) => {
-                HeadsToRows::forward(
-                    f,
-                    exchange,
-                    scratch.attended,
-                    scratch.staging,
-                    scratch.merged,
-                )?;
-                scratch.merged
-            }
-        };
-        Ok(self.output.forward(f, attended, out)?)
-    }
-
-    /// Normalize and rotate every head of the query and the key.
-    fn rotate(&self, f: &Forward, factors: Factors<'_>, scratch: &Scratch) -> Result<()> {
-        Ok(factors.rotary.apply(
-            f,
-            scratch
-                .query
-                .reshape(heads(scratch.query, self.local_heads, self.head_dim)),
-            scratch
-                .key
-                .reshape(heads(scratch.key, self.local_heads, self.head_dim)),
+            headed(scratch.query),
+            headed(scratch.key),
             Some(Gains {
                 query: self.query_gain.view(),
                 key: self.key_gain.view(),
             }),
             factors.cosine,
             factors.sine,
-            scratch.rotated_query.reshape(heads(
-                scratch.rotated_query,
-                self.local_heads,
-                self.head_dim,
-            )),
-            scratch.rotated_key.reshape(heads(
-                scratch.rotated_key,
-                self.local_heads,
-                self.head_dim,
-            )),
-        )?)
+            headed(scratch.rotated_query),
+            headed(scratch.rotated_key),
+        )?;
+        // The operator's operands are one axis of tokens, then the heads, then a head's channels,
+        // while a projection writes `[rows, inner]`. The reshaping is by `heads`, which takes the
+        // token axis from the view's own element count - the rows differ between the exchanged and
+        // the local path.
+        ulysses.inner().forward(
+            f,
+            headed(scratch.rotated_query),
+            headed(scratch.rotated_key),
+            headed(scratch.value),
+            Some(*visible),
+            headed(scratch.attended),
+        )?;
+        ulysses
+            .return_rows(f, scratch.attended, scratch.staging, scratch.merged, out)
+            .map_err(Error::from)
     }
 }
 
@@ -540,10 +305,12 @@ impl Scratch {
         normalized: TensorView,
         total_rows: u32,
     ) -> Result<Self> {
+        let ulysses = &layer.ulysses;
         let dtype = normalized.dtype;
         let rows = normalized.shape.dim(0);
-        let inner = u64::from(layer.heads) * u64::from(layer.head_dim);
-        let local_inner = u64::from(layer.local_heads) * u64::from(layer.head_dim);
+        let head = u64::from(layer.head_dim);
+        let inner = u64::from(ulysses.heads()) * head;
+        let local_inner = u64::from(ulysses.local_heads()) * head;
         let total = u64::from(total_rows);
         let arena = f.arena();
         let heads = |arena: &nn::Arena| arena.tensor(dtype, Shape::new(&[total, local_inner]));
@@ -553,18 +320,18 @@ impl Scratch {
         let attended = heads(arena)?;
         // A layer that does not communicate reserves nothing for it: on one rank these views are
         // buffers the layer already holds, and the branches that read them do not run.
-        let (staging, merged) = match layer.exchange {
-            Some(_) => (
+        let (staging, merged) = if ulysses.exchanges() {
+            (
                 arena.tensor(dtype, Shape::new(&[rows, inner]))?,
                 arena.tensor(dtype, Shape::new(&[rows, inner]))?,
-            ),
-            None => (query, attended),
+            )
+        } else {
+            (query, attended)
         };
-        let gathered_rows = match (&layer.exchange, layer.projection) {
-            (Some(_), Projection::Gather) => {
-                arena.tensor(dtype, Shape::new(&[total, normalized.shape.last()]))?
-            }
-            _ => normalized,
+        let gathered_rows = if ulysses.exchanges() && ulysses.projection() == Projection::Gather {
+            arena.tensor(dtype, Shape::new(&[total, normalized.shape.last()]))?
+        } else {
+            normalized
         };
         Ok(Self {
             query,
@@ -594,14 +361,6 @@ fn heads(view: TensorView, count: u32, head_dim: u32) -> Shape {
         u64::from(count),
         u64::from(head_dim),
     ])
-}
-
-/// The exchange of a partition's sequence degree, absent when one rank holds the sequence.
-fn exchange(partition: &Partition) -> Option<UlyssesExchange> {
-    match partition.ulysses_degree {
-        1 => None,
-        degree => UlyssesExchange::new(degree as u64).ok(),
-    }
 }
 
 /// A channel count as a projection's width.
