@@ -607,7 +607,9 @@ mod tests {
     /// they are newer than some `nccl.h` a host ships, which is why the crate
     /// treats their absence as a supported library rather than a broken one.
     #[test]
+    #[ignore = "requires nccl.h (UNISERVE_CUDA_HEADERS naming the NCCL include directory)"]
     fn every_required_nccl_entry_point_is_declared_by_the_header() {
+        crate::header::require("nccl.h");
         for name in [
             "ncclGetErrorString",
             "ncclGetUniqueId",
@@ -623,40 +625,39 @@ mod tests {
             "ncclGroupStart",
             "ncclGroupEnd",
         ] {
-            match crate::header::declares("nccl.h", name) {
-                Some(true) => {}
-                Some(false) => panic!("nccl.h does not declare {name}, which this crate binds"),
-                None => {
-                    eprintln!(
-                        "skipped: nccl.h is not provisioned here, so its entry points were not compared"
-                    );
-                    break;
-                }
-            }
+            assert_eq!(
+                crate::header::declares("nccl.h", name),
+                Some(true),
+                "nccl.h does not declare {name}, which this crate binds"
+            );
         }
     }
 
+    /// The unique id is the 128 bytes NCCL's ABI fixes, whatever header is
+    /// at hand.
     #[test]
+    fn the_unique_id_is_the_abis_128_bytes() {
+        assert_eq!(std::mem::size_of::<super::UniqueId>(), 128);
+    }
+
+    #[test]
+    #[ignore = "requires nccl.h (UNISERVE_CUDA_HEADERS naming the NCCL include directory)"]
     fn the_nccl_structures_are_sized_by_the_headers() {
-        use crate::header::struct_size;
+        crate::header::require("nccl.h");
         let ours = std::mem::size_of::<super::UniqueId>();
-        assert_eq!(ours, 128, "ncclUniqueId is 128 bytes in nccl.h");
-        match struct_size("nccl.h", "ncclUniqueId") {
-            Some(header) => assert_eq!(
-                header, ours,
-                "nccl.h lays ncclUniqueId out in {header} bytes, this crate in {ours}"
-            ),
-            None => eprintln!(
-                "skipped: nccl.h does not let ncclUniqueId be laid out here, so the crate's \
-                 {ours} bytes for it went uncompared"
-            ),
-        }
+        let header = crate::header::struct_size("nccl.h", "ncclUniqueId")
+            .expect("nccl.h declares ncclUniqueId in a form the scanner lays out");
+        assert_eq!(
+            header, ours,
+            "nccl.h lays ncclUniqueId out in {header} bytes, this crate in {ours}"
+        );
     }
 
     /// The one constant this crate takes from every `nccl.h` is compared with
     /// it: a split is only correct if the "not in this group" colour is the
     /// header's.
     #[test]
+    #[ignore = "requires nccl.h (UNISERVE_CUDA_HEADERS naming the NCCL include directory)"]
     fn the_nccl_constants_are_the_headers() {
         crate::header::assert_constants(
             "nccl.h",
@@ -664,44 +665,46 @@ mod tests {
         );
     }
 
-    /// NCCL reads a config by the header's layout up to the size it states, so
-    /// a field out of place would set another attribute than the one named.
-    /// The total size is compared, and the graph usage mode's offset, the one
-    /// attribute this crate sets, is fixed by the fields before it.
+    /// The graph usage mode, the one config attribute this crate sets, sits
+    /// where the 2.30 `ncclConfig_t` puts it: NCCL reads a config by the
+    /// header's layout, so a field out of place would set another attribute.
     #[test]
-    fn the_nccl_config_is_laid_out_as_the_header() {
-        let ours = std::mem::size_of::<super::ffi::RawConfig>();
+    fn the_graph_usage_mode_is_at_its_config_offset() {
         assert_eq!(
             std::mem::offset_of!(super::ffi::RawConfig, graph_usage_mode),
             80,
             "graphUsageMode follows sixteen bytes of header, four ints, a pointer, two ints, a \
              pointer and six ints"
         );
+    }
+
+    /// NCCL reads a config by the header's layout up to the size it states, so
+    /// the total size and the magic NCCL checks are compared with a 2.30
+    /// `nccl.h`, the release whose config the crate lays out.
+    #[test]
+    #[ignore = "requires nccl.h of release 2.30 or later (UNISERVE_CUDA_HEADERS naming the NCCL include directory)"]
+    fn the_nccl_config_is_laid_out_as_the_header() {
+        crate::header::require("nccl.h");
+        let ours = std::mem::size_of::<super::ffi::RawConfig>();
         // An older header lays out an older config, which NCCL reads by the version it states.
-        let version = crate::header::value("nccl.h", "NCCL_VERSION_CODE");
-        if version.is_some_and(|version| version < 23000) {
-            eprintln!(
-                "skipped: nccl.h is release {version:?}, older than the 2.30 config the crate's \
-                 {ours} bytes lay out"
-            );
-            return;
-        }
-        // NCCL refuses a config whose magic is not the header's; 2.30 names it, and older
-        // headers spell it only inside their initializer.
+        let version = crate::header::value("nccl.h", "NCCL_VERSION_CODE")
+            .expect("nccl.h defines NCCL_VERSION_CODE");
+        assert!(
+            version >= 23000,
+            "nccl.h is release {version}, older than the 2.30 config the crate's {ours} bytes \
+             lay out"
+        );
+        // NCCL refuses a config whose magic is not the header's.
         assert_eq!(
             crate::header::value("nccl.h", "NCCL_API_MAGIC"),
-            version.map(|_| i64::from(super::ffi::NCCL_API_MAGIC)),
+            Some(i64::from(super::ffi::NCCL_API_MAGIC)),
             "nccl.h and the crate disagree on NCCL_API_MAGIC"
         );
-        match crate::header::struct_size("nccl.h", "ncclConfig_t") {
-            Some(header) => assert_eq!(
-                header, ours,
-                "nccl.h lays ncclConfig_t out in {header} bytes, this crate in {ours}"
-            ),
-            None => eprintln!(
-                "skipped: nccl.h does not let ncclConfig_t be laid out here, so the crate's \
-                 {ours} bytes for it went uncompared"
-            ),
-        }
+        let header = crate::header::struct_size("nccl.h", "ncclConfig_t")
+            .expect("nccl.h declares ncclConfig_t in a form the scanner lays out");
+        assert_eq!(
+            header, ours,
+            "nccl.h lays ncclConfig_t out in {header} bytes, this crate in {ours}"
+        );
     }
 }

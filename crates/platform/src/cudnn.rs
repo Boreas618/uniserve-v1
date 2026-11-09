@@ -2511,6 +2511,7 @@ mod tests {
     /// it is a refused call, a silently ignored attribute, or a plan against the
     /// wrong descriptor — and the only way to notice used to be a GPU round trip.
     #[test]
+    #[ignore = "requires cudnn_graph_v9.h (UNISERVE_CUDA_HEADERS naming the cuDNN include directory)"]
     fn the_descriptor_numbers_are_the_headers() {
         crate::header::assert_constants(
             "cudnn_graph_v9.h",

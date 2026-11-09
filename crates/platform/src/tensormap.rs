@@ -285,6 +285,7 @@ mod tests {
     /// `CUtensorMap*` codes, passed to the driver unchanged: a wrong one is a
     /// refused encode or a differently swizzled read, never a compile error.
     #[test]
+    #[ignore = "requires cuda.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
     fn the_description_codes_are_the_headers() {
         crate::header::assert_constants(
             "cuda.h",

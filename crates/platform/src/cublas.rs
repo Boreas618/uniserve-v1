@@ -871,6 +871,7 @@ mod tests {
     /// mode attribute, and every heuristic call was refused for it. A wrong
     /// number here is never a compile error.
     #[test]
+    #[ignore = "requires cublasLt.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
     fn the_attribute_numbers_are_the_headers() {
         crate::header::assert_constants(
             "cublasLt.h",

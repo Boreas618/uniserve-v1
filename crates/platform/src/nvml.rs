@@ -305,8 +305,10 @@ mod tests {
     /// byte count rather than an error, which no test reading a number can tell
     /// from a real one.
     #[test]
+    #[ignore = "requires nvml.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
     fn the_nvml_structures_are_sized_by_the_headers() {
         use crate::header::struct_size;
+        crate::header::require("nvml.h");
         for (name, size) in [
             ("nvmlMemory_v2_t", std::mem::size_of::<super::RawMemory>()),
             (
@@ -314,16 +316,13 @@ mod tests {
                 std::mem::size_of::<super::ProcessInfo>(),
             ),
         ] {
-            match struct_size("nvml.h", name) {
-                Some(header) => assert_eq!(
-                    header, size,
-                    "{name}: nvml.h lays it out in {header} bytes, this crate in {size}"
-                ),
-                None => eprintln!(
-                    "skipped: nvml.h does not let {name} be laid out here, so the crate's {size} \
-                     bytes for it went uncompared"
-                ),
-            }
+            let header = struct_size("nvml.h", name).unwrap_or_else(|| {
+                panic!("nvml.h does not declare {name} in a form the scanner lays out")
+            });
+            assert_eq!(
+                header, size,
+                "{name}: nvml.h lays it out in {header} bytes, this crate in {size}"
+            );
         }
     }
 
@@ -331,7 +330,9 @@ mod tests {
     /// version suffix it binds: a wrong suffix is a load failure at start-up,
     /// and this says which name is wrong before a machine does.
     #[test]
+    #[ignore = "requires nvml.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
     fn every_nvml_entry_point_is_declared_by_the_header() {
+        crate::header::require("nvml.h");
         for name in [
             "nvmlInit_v2",
             "nvmlShutdown",
@@ -341,20 +342,16 @@ mod tests {
             "nvmlDeviceGetGraphicsRunningProcesses_v3",
             "nvmlDeviceGetMemoryInfo_v2",
         ] {
-            match crate::header::declares("nvml.h", name) {
-                Some(true) => {}
-                Some(false) => panic!("nvml.h does not declare {name}, which this crate binds"),
-                None => {
-                    eprintln!(
-                        "skipped: nvml.h is not provisioned here, so its entry points were not compared"
-                    );
-                    break;
-                }
-            }
+            assert_eq!(
+                crate::header::declares("nvml.h", name),
+                Some(true),
+                "nvml.h does not declare {name}, which this crate binds"
+            );
         }
     }
 
     #[test]
+    #[ignore = "requires nvml.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
     fn the_nvml_constants_are_the_headers() {
         crate::header::assert_constants(
             "nvml.h",

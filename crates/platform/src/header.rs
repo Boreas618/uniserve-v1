@@ -9,9 +9,13 @@
 //! heuristic call was refused). The tests that use this module therefore read
 //! the header the number came from and compare.
 //!
-//! The headers are provisioned on the machines that build device code; where
-//! they are absent (a sandbox with no CUDA toolkit) the comparison cannot run,
-//! and [`assert_constants`] says so on stderr instead of passing silently.
+//! The headers are found in the directories `UNISERVE_CUDA_HEADERS` lists
+//! (colon-separated) and in `$CUDA_HOME/include`. They are provisioned on the
+//! machines that build device code but not everywhere the crate builds, so
+//! every comparing test is `#[ignore]`d with the header it requires and fails
+//! ([`require`]) when it is requested without it. Run them with
+//! `cargo test -p platform --lib header -- --ignored` (each of their names
+//! ends in "header" or "headers"; no device is used).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -227,26 +231,27 @@ pub(crate) fn declares(header: &str, symbol: &str) -> Option<bool> {
     Some(false)
 }
 
-/// Whether `header` could be read at all.
-pub(crate) fn found(header: &str) -> bool {
-    text(header).is_some()
+/// Asserts that `header` can be read, for a test that compares the crate with
+/// it.
+///
+/// Such a test is `#[ignore]`d with the header it requires, so a run that
+/// asks for it without the header fails here instead of passing with nothing
+/// compared.
+pub(crate) fn require(header: &str) {
+    assert!(
+        text(header).is_some(),
+        "{header} is not provisioned: name its directory in UNISERVE_CUDA_HEADERS, or the CUDA \
+         toolkit that ships it with CUDA_HOME"
+    );
 }
 
 /// Compares every `(enumerator, our value)` pair with the header.
 ///
-/// Returns without asserting when the header is not provisioned on this
-/// machine, saying so on stderr: a comparison that did not run must not look
-/// like one that passed. When the header *is* there, an enumerator the header
-/// does not define fails the test, because a table naming an enumerator that
-/// does not exist cannot be checking anything.
+/// The header must be provisioned ([`require`]). An enumerator the header does
+/// not define fails the test, because a table naming an enumerator that does
+/// not exist cannot be checking anything.
 pub(crate) fn assert_constants(header: &str, constants: &[(&str, i64)]) {
-    if !found(header) {
-        eprintln!(
-            "skipped: {header} is not provisioned on this machine, so its {} constants were not compared",
-            constants.len()
-        );
-        return;
-    }
+    require(header);
     let mut wrong = Vec::new();
     let mut missing = Vec::new();
     for (name, ours) in constants {
@@ -271,8 +276,9 @@ pub(crate) fn assert_constants(header: &str, constants: &[(&str, i64)]) {
 ///
 /// Only the types this crate's own structures mirror are understood
 /// (`unsigned int`, `size_t`, pointers, fixed arrays of those, nested structs
-/// by name); the first field it cannot size makes it answer `None`, which the
-/// caller reports as a skipped comparison rather than a failure.
+/// by name); the first field it cannot size makes it answer `None`, which a
+/// comparing test reports as a failure: a structure the scanner cannot lay
+/// out is a structure the test did not check.
 pub(crate) fn struct_size(header: &str, name: &str) -> Option<usize> {
     struct_layout(header, name).map(|(size, _)| size)
 }
@@ -667,11 +673,9 @@ mod tests {
     /// aligned in `cuda.h`, which is what the crate's `#[repr(C, align(64))]`
     /// claims.
     #[test]
+    #[ignore = "requires cuda.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
     fn a_cuda_struct_is_sized_from_its_header() {
-        if !super::found("cuda.h") {
-            eprintln!("skipped: cuda.h is not provisioned on this machine");
-            return;
-        }
+        super::require("cuda.h");
         assert_eq!(struct_size("cuda.h", "CUtensorMap"), Some(128));
         assert_eq!(
             value("cuda.h", "CU_TENSOR_MAP_DATA_TYPE_FLOAT32"),

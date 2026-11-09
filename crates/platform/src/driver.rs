@@ -607,6 +607,7 @@ mod tests {
     /// wrong one is a refused call or, worse, an attribute the driver reads as
     /// a different attribute.
     #[test]
+    #[ignore = "requires cuda.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
     fn the_driver_constants_are_the_headers() {
         crate::header::assert_constants(
             "cuda.h",
@@ -675,23 +676,23 @@ mod tests {
     /// device tests' business: a field in the wrong place there produces a
     /// refused launch or a wrong grid, which the GPU tests see.
     #[test]
+    #[ignore = "requires cuda.h (CUDA_HOME or UNISERVE_CUDA_HEADERS)"]
     fn the_driver_structures_are_sized_by_the_headers() {
         use crate::header::struct_size;
+        crate::header::require("cuda.h");
         for (name, size) in [
             ("CUipcEventHandle", std::mem::size_of::<RawIpcEventHandle>()),
             ("CUmemLocation", std::mem::size_of::<MemLocation>()),
             ("CUmemAccessDesc", std::mem::size_of::<MemAccessDesc>()),
             ("CUtensorMap", std::mem::size_of::<TensorMap>()),
         ] {
-            match struct_size("cuda.h", name) {
-                Some(header) => assert_eq!(
-                    header, size,
-                    "{name}: cuda.h lays it out in {header} bytes, this crate in {size}"
-                ),
-                None => eprintln!(
-                    "skipped: cuda.h does not declare {name} in a form this scanner reads"
-                ),
-            }
+            let header = struct_size("cuda.h", name).unwrap_or_else(|| {
+                panic!("cuda.h does not declare {name} in a form the scanner lays out")
+            });
+            assert_eq!(
+                header, size,
+                "{name}: cuda.h lays it out in {header} bytes, this crate in {size}"
+            );
         }
     }
 }
