@@ -2112,13 +2112,12 @@ impl Denoiser {
         // so it takes the same mapping - and the anchor mixes them in place over the latent's rows.
         // `Axpby` is `y ← β · y + α · x`, so the reference's `t · clean + (1 - t) ·
         // draw` is β = t on the latent's rows and α = 1 - t on the draw's.
-        let patch = nn::layers::Patchify::new(self.config.transformer.video_channels, 1, 2)?;
         let rows = u64::from(piece.rows);
         let columns = video_channels * 4;
         let clean = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
-        patch.forward(f, latent, clean)?;
+        self.transformer.patchify(f, latent, clean)?;
         let anchored = f.arena().tensor(DType::F32, Shape::new(&[rows, columns]))?;
-        patch.forward(f, draw, anchored)?;
+        self.transformer.patchify(f, draw, anchored)?;
         // `y ← β · y + α · x` with `y` the latent's rows and `x` the
         // draw's: α weights the draw, β the latent, so the result is `t · clean + (1 - t) · draw`.
         nn::layers::Axpby
@@ -2316,16 +2315,9 @@ impl Denoiser {
         // evaluation, which no shape refuses and no page shows.
         let sample_dtype = SAMPLE_DTYPE;
         // The DiT's `1x2x2` tiles: packed here, and unpacked back into the latent raster after the
-        // prediction. The inverse reads the token grid from `out`, so a clip of another length
-        // replays the same launch.
-        let patchify = nn::layers::Patchify::new(
-            u32::try_from(channels)
-                .map_err(|_| Error::config(format!("{channels} latent channels")))?,
-            1,
-            2,
-        )?;
+        // prediction.
         let patched = arena.tensor(sample_dtype, Shape::new(&[video_rows, channels * 4]))?;
-        patchify.forward(f, video, patched)?;
+        self.transformer.patchify(f, video, patched)?;
         // The reference projects with `output_dtype=torch.float32` and narrows afterwards:
         // the projection's weights are the checkpoint's, its activation
         // and its output are FP32, and the one rounding into the packed rows is the narrowing.
@@ -2504,7 +2496,7 @@ impl Denoiser {
             tokens,
         )?;
         let velocity = arena.tensor(sample_dtype, video.shape)?;
-        patchify.inverse(f, velocity_rows, velocity)?;
+        self.transformer.unpatchify(f, velocity_rows, velocity)?;
         // The solver's coefficient is gathered on the device from the worker's `step` table, so
         // this launch addresses one staging word whose contents change per evaluation rather than
         // one buffer per evaluation; the same word serves the audio step's gather.

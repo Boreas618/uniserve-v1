@@ -20,8 +20,8 @@ use nn::blocks::{AdaLnBlock, AdaLnOut, AdaLnSpec, GateUp, GatedMlpSpec, Modulati
 use nn::diffusion::TimestepTable;
 use nn::family::Split;
 use nn::layers::{
-    Bias, Linear, Parallel, Precision, QkNorm, Rotary, RotarySpec, Rounding, Spectrum, StepIndexed,
-    Varlen,
+    Bias, Linear, Parallel, PatchEmbed, PatchEmbedSpec, Precision, QkNorm, Rotary, RotarySpec,
+    Rounding, Spectrum, StepIndexed, Varlen,
 };
 use nn::weights::WeightLoader;
 use nn::{Forward, Shape, TensorView};
@@ -458,7 +458,8 @@ impl Transformer {
 
 /// One H3 DiT partition: the projections, the stack and the two output heads.
 pub struct Transformer {
-    proj_in: Linear,
+    /// The video latent's `1x2x2` patch tokens and their projection into the hidden width.
+    patch: PatchEmbed,
     audio_proj_in: Option<Linear>,
     /// The stack's one rotary embedding, published once and applied by every layer.
     rotary: Rotary,
@@ -486,7 +487,7 @@ impl Transformer {
     pub fn dtype(&self) -> nn::DType {
         self.layers
             .first()
-            .map_or_else(|| self.proj_in.weight().dtype, |layer| layer.block.dtype())
+            .map_or_else(|| self.patch.weight().dtype, |layer| layer.block.dtype())
     }
 
     /// Read one DiT partition of the checkpoint.
@@ -570,12 +571,14 @@ impl Transformer {
             // `audio_output` are pinned at FP32 whatever the attention, MLP and VAE tiers are. So
             // the widening `wide` performs meets an FP32 weight and the product is FP32 on both
             // sides, which is what makes the released BF16 stack run a FP32 sample at all.
-            proj_in: Linear::load(
+            patch: PatchEmbed::load(
                 &mut loader.scope("proj_in").pinned(nn::DType::F32),
-                attention::width(video_in)?,
-                attention::width(hidden)?,
-                Bias::Present,
-                Parallel::None,
+                PatchEmbedSpec {
+                    channels: config.video_channels,
+                    temporal: 1,
+                    spatial: 2,
+                    hidden: config.hidden_size,
+                },
             )?,
             audio_proj_in: Some(Linear::load(
                 &mut loader.scope("audio_proj_in").pinned(nn::DType::F32),
@@ -635,10 +638,22 @@ impl Transformer {
         Ok(nn::layers::Cast.apply(f, source, nn::DType::F32)?)
     }
 
-    /// Project one modality's packed rows into the hidden width.
-    pub fn project(&self, f: &Forward, rows: TensorView, out: TensorView) -> Result<()> {
-        let wide = self.wide(f, rows)?;
-        Ok(self.proj_in.forward(f, wide, out)?)
+    /// Cut a video latent `[channels, frames, rows, columns]` into the DiT's `1x2x2` patch tokens
+    /// `[tokens, channels · 4]`.
+    pub fn patchify(&self, f: &Forward, latent: TensorView, tokens: TensorView) -> Result<()> {
+        Ok(self.patch.patchify(f, latent, tokens)?)
+    }
+
+    /// Unpack patch tokens back into the video latent's raster; `out`'s extents state the grid, so
+    /// a clip of another length replays the same launch.
+    pub fn unpatchify(&self, f: &Forward, tokens: TensorView, out: TensorView) -> Result<()> {
+        Ok(self.patch.unpatchify(f, tokens, out)?)
+    }
+
+    /// Project video patch tokens into the hidden width.
+    pub fn project(&self, f: &Forward, tokens: TensorView, out: TensorView) -> Result<()> {
+        let wide = self.wide(f, tokens)?;
+        Ok(self.patch.project(f, wide, out)?)
     }
 
     /// The output projection of `hidden` at one evaluation, for either form of the heads.

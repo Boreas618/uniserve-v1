@@ -751,3 +751,50 @@ fn a_timestep_table_holds_each_distinct_level_once() {
         "not whole steps"
     );
 }
+
+// ---- Patch embedding -----------------------------------------------------------------------------
+
+/// A patch embedding packs `1x2x2` patch tokens of every channel, projects them into its width,
+/// and unpacks tokens back into a raster; its projection is the module at its scope.
+#[test]
+fn a_patch_embedding_packs_projects_and_unpacks_its_tokens() {
+    use nn::layers::{PatchEmbed, PatchEmbedSpec};
+
+    let (channels, width) = (8_u64, 32_u64);
+    let directory = tempfile::tempdir().unwrap();
+    let checkpoint = checkpoint(
+        directory.path(),
+        &[
+            ("proj_in.weight", &[width, channels * 4]),
+            ("proj_in.bias", &[width]),
+        ],
+    );
+    let mut loader = WeightLoader::meta(&checkpoint, None, None);
+    let spec = PatchEmbedSpec {
+        channels: channels as u32,
+        temporal: 1,
+        spatial: 2,
+        hidden: width as u32,
+    };
+    let embed = PatchEmbed::load(&mut loader.scope("proj_in"), spec).unwrap();
+    assert_eq!(embed.token_width(), channels * 4);
+    assert_eq!(embed.weight().shape.dims(), &[width, channels * 4]);
+
+    let arena = Arena::counting();
+    let f = Forward::recording(&arena);
+    // Two frames of a 4x6 raster: 2 · 2 · 3 tokens.
+    let latent = view(&arena, &[channels, 2, 4, 6]);
+    let tokens = view(&arena, &[12, channels * 4]);
+    let hidden = view(&arena, &[12, width]);
+    let (result, launches) = launched(|| {
+        embed.patchify(&f, latent, tokens)?;
+        embed.project(&f, tokens, hidden)?;
+        embed.unpatchify(&f, tokens, latent)
+    });
+    result.unwrap();
+    assert_eq!(launches, ["patch", "gemm", "unpatchify_video"]);
+
+    // A patch of no rows is refused before any tensor is read.
+    let empty = PatchEmbedSpec { spatial: 0, ..spec };
+    assert!(PatchEmbed::load(&mut loader.scope("proj_in"), empty).is_err());
+}

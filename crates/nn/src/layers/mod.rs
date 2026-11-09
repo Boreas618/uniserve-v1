@@ -21,6 +21,7 @@ mod activation;
 mod affine;
 mod attention;
 mod conv;
+mod embed;
 mod embedding;
 mod head;
 mod indexed;
@@ -50,6 +51,7 @@ pub use attention::{
 pub use conv::{
     CausalPad, Conv1d, Conv3d, ConvSpec, ConvTranspose1d, Padding, ResnetBlock3d, ResnetSpec,
 };
+pub use embed::{PatchEmbed, PatchEmbedSpec};
 pub use embedding::{VocabParallelEmbedding, vocabulary_shard};
 pub use head::ParallelLMHead;
 pub use indexed::StepIndexed;
