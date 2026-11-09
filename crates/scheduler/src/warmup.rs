@@ -115,16 +115,28 @@ impl Warm {
     }
 }
 
-/// Runs the warm-up once the epoch's first policy serves, on a thread of its own
-/// ([`Warm`] is what it holds).
+/// Runs the warm-up on a thread of its own ([`Warm`] is what it holds), once
+/// the epoch's first policy serves and the engine opened admission.
+///
+/// A policy serves at the switchover, and the switchover only queues the
+/// captures of the generation's buckets (§4.5). A warm-up request submitted at
+/// the switchover reached a bucket before its capture, and the worker refused
+/// the batch for a graph that did not exist yet. The engine opens admission
+/// once every bucket is captured ([`SchedulerHandle::admit`]), which is when a
+/// request of the serving path can run.
 pub(crate) fn after_serving(core: &SchedulerHandle, args: &EngineArgs) {
+    if !on_cuda(args) {
+        return;
+    }
     let intent = core.warmup();
     let serving = core.serving();
+    let admission = core.admission();
     let args = args.clone();
     let spawned = std::thread::Builder::new()
         .name("warmup".to_owned())
         .spawn(move || {
             wait_serving(serving);
+            wait_serving(admission);
             if let Err(error) = warm(&intent, &args) {
                 // Serving continues: the shapes this warms are the ones a client
                 // request reaches anyway, where its failure is visible.
@@ -136,7 +148,8 @@ pub(crate) fn after_serving(core: &SchedulerHandle, args: &EngineArgs) {
     }
 }
 
-/// Blocks until a policy instance serves, given the scheduler's serving signal.
+/// Blocks until `serving` is set: the scheduler's serving signal, or its
+/// admission signal.
 ///
 /// The signal is the scheduler's `watch`, polled: the waiters are ordinary
 /// threads (the warm-up's), and a closed channel means the scheduler is gone.
@@ -298,15 +311,19 @@ pub(crate) fn groups(
     Ok(groups)
 }
 
-pub(crate) fn warm(core: &Warm, args: &EngineArgs) -> anyhow::Result<()> {
-    let on_cuda = args
-        .engine_config
+/// Whether a rank of the deployment runs on a CUDA device: the only place a
+/// warm-up has kernels or graphs to warm.
+fn on_cuda(args: &EngineArgs) -> bool {
+    args.engine_config
         .parallel
         .worker_groups
         .iter()
         .flat_map(|worker| &worker.ranks)
-        .any(|rank| rank.device == "cuda" || rank.device.starts_with("cuda:"));
-    if !on_cuda {
+        .any(|rank| rank.device == "cuda" || rank.device.starts_with("cuda:"))
+}
+
+pub(crate) fn warm(core: &Warm, args: &EngineArgs) -> anyhow::Result<()> {
+    if !on_cuda(args) {
         return Ok(());
     }
 
